@@ -1,0 +1,67 @@
+# config1.yaml — Stratum single-node configuration
+#
+# See doc/Stratum_代码风格v2.md "配置文件 Schema" for the authoritative
+# field reference. ${data_dir} is expanded at startup by the application.
+#
+# This file defines a minimal single-node deployment suitable for
+# development and testing against a local vecstore process and a mock
+# embed HTTP server.
+
+node:
+  node_id: 1
+  grpc_addr: "0.0.0.0:7000"         # KnowledgeBaseService / QueryService / AdminService
+  raft_addr: "0.0.0.0:8000"         # Raft internal communication
+  metrics_addr: "0.0.0.0:9000"      # Prometheus /metrics
+
+raft:
+  peers:
+    - id: 1
+      addr: "localhost:8000"
+
+storage:
+  data_dir: "/var/lib/stratum/node1"
+  doc_store_path: "${data_dir}/docstore"
+  chunkdoc_path: "${data_dir}/chunkdoc"
+  versiondoc_path: "${data_dir}/versiondoc"
+  wal_path: "${data_dir}/wal"
+  index_path: "${data_dir}/index"
+
+vecstore:
+  rocksdb_path: "${data_dir}/vecstore_rocksdb"
+  grpc_addr: "127.0.0.1:7100"
+  health_addr: "127.0.0.1:7101"
+
+write_coordinator:
+  max_retries: 3
+  retry_base_interval_ms: 100
+
+delete_coordinator:
+  max_retries: 5
+  retry_base_interval_ms: 500
+
+index_manager:
+  lru_capacity: 16
+  memory_threshold_mb: 4096
+  load_wait_timeout_ms: 5000
+  callback_max_retries: 3
+  callback_retry_base_interval_ms: 200
+
+bloom_filter:
+  false_positive_rate: 0.01
+
+knowledge_base_defaults:
+  chunk_window_size: 512
+  chunk_overlap_size: 64
+  index_type: "HNSW"
+  similarity: "COSINE"
+
+wal:
+  replay_retry_threshold: 3
+
+gc:
+  version_retention_count: 50
+  gc_interval_s: 3600
+  audit_log_retention_days: 30
+
+logging:
+  level: "info"

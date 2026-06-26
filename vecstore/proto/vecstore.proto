@@ -1,0 +1,84 @@
+// vecstore.proto — internal gRPC contract between the Go side (ChunkStore /
+// IndexManager) and the C++ vecstore process. Address configured via
+// vecstore.grpc_addr in the node config file.
+//
+// See Stratum_接口设计v9.md "vecstore 内部 gRPC（vecstore.proto）" for the
+// authoritative specification this file mirrors exactly.
+syntax = "proto3";
+package vecstore;
+
+option go_package = "stratum/api/proto/vecstore";
+
+service ChunkStorageService {
+  rpc Write(WriteChunkRequest) returns (WriteChunkResponse);
+  rpc Read(ReadChunkRequest) returns (ReadChunkResponse);
+  rpc Exists(ExistsChunkRequest) returns (ExistsChunkResponse);
+  rpc Delete(DeleteChunkRequest) returns (DeleteChunkResponse);
+  rpc DeleteByPrefix(DeleteByPrefixRequest) returns (DeleteByPrefixResponse);
+}
+
+service VectorIndexService {
+  rpc Build(BuildIndexRequest) returns (BuildIndexResponse);
+  rpc Search(SearchIndexRequest) returns (SearchIndexResponse);
+  rpc Save(SaveIndexRequest) returns (SaveIndexResponse);
+  rpc Load(LoadIndexRequest) returns (LoadIndexResponse);
+  rpc Reset(ResetIndexRequest) returns (ResetIndexResponse);
+}
+
+message WriteChunkRequest {
+  string key = 1;            // knowledge_base_id + chunk_id
+  repeated float vector = 2;
+}
+message WriteChunkResponse {}
+
+message ReadChunkRequest { string key = 1; }
+message ReadChunkResponse { repeated float vector = 1; }
+
+message ExistsChunkRequest { string key = 1; }
+message ExistsChunkResponse { bool exists = 1; }
+
+message DeleteChunkRequest { string key = 1; }
+message DeleteChunkResponse {}
+
+message DeleteByPrefixRequest { string prefix = 1; }
+message DeleteByPrefixResponse {}
+
+message ChunkVectorProto {
+  string chunk_id = 1;
+  repeated float vector = 2;
+}
+
+enum MetricTypeProto {
+  COSINE = 0;
+  EUCLIDEAN = 1;
+  INNER_PRODUCT = 2;
+}
+
+message BuildIndexRequest {
+  string kb_id = 1;
+  int64 version_id = 2;
+  repeated ChunkVectorProto chunks = 3;
+  MetricTypeProto metric = 4;
+}
+message BuildIndexResponse {}
+
+message SearchIndexRequest {
+  string kb_id = 1;
+  int64 version_id = 2;
+  repeated float vector = 3;
+  int32 top_k = 4;
+}
+message SearchResultProto {
+  string chunk_id = 1;
+  float score = 2;
+}
+message SearchIndexResponse { repeated SearchResultProto results = 1; }
+
+message SaveIndexRequest { string kb_id = 1; int64 version_id = 2; string path = 3; }
+message SaveIndexResponse {}
+
+message LoadIndexRequest { string kb_id = 1; int64 version_id = 2; string path = 3; }
+message LoadIndexResponse {}
+
+message ResetIndexRequest { string kb_id = 1; int64 version_id = 2; }
+message ResetIndexResponse {}

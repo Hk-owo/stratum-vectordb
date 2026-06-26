@@ -1,0 +1,87 @@
+# docker-compose.yml — Stratum 3-node cluster for T4 integration tests.
+#
+# See Stratum_测试顺序.md 第四批 for the test cases this environment supports.
+#
+# Usage:
+#   docker compose up -d
+#   go test ./integration/docker/... -tags=docker
+#   docker compose down
+
+version: "3.8"
+
+services:
+  # Mock embed HTTP server — deterministic vector generation for testing.
+  mock-embed:
+    image: golang:1.24-alpine
+    working_dir: /app
+    command: go run mock_embed_server.go
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./mock_embed_server.go:/app/mock_embed_server.go:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  # vecstore C++ process (optional — mock embed can serve as vecstore in tests)
+  # vecstore:
+  #   build:
+  #     context: ../../vecstore
+  #   ports:
+  #     - "17100:7100"
+  #     - "17101:7101"
+
+  stratum-node1:
+    build:
+      context: ../..
+      dockerfile: integration/docker/Dockerfile
+    ports:
+      - "17000:7000"   # gRPC API
+      - "18000:8000"   # Raft internal
+      - "19000:9000"   # Prometheus metrics
+    volumes:
+      - ./config1.yaml:/etc/stratum/config.yaml:ro
+      - node1_data:/var/lib/stratum/node1
+    depends_on:
+      mock-embed:
+        condition: service_healthy
+    restart: unless-stopped
+
+  stratum-node2:
+    build:
+      context: ../..
+      dockerfile: integration/docker/Dockerfile
+    ports:
+      - "17001:7000"
+      - "18001:8000"
+      - "19001:9000"
+    volumes:
+      - ./config2.yaml:/etc/stratum/config.yaml:ro
+      - node2_data:/var/lib/stratum/node2
+    depends_on:
+      mock-embed:
+        condition: service_healthy
+    restart: unless-stopped
+
+  stratum-node3:
+    build:
+      context: ../..
+      dockerfile: integration/docker/Dockerfile
+    ports:
+      - "17002:7000"
+      - "18002:8000"
+      - "19002:9000"
+    volumes:
+      - ./config3.yaml:/etc/stratum/config.yaml:ro
+      - node3_data:/var/lib/stratum/node3
+    depends_on:
+      mock-embed:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:

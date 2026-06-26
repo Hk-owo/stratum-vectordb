@@ -1,0 +1,39 @@
+# config1.yaml — Stratum node 1 of 3-node cluster
+node:
+  node_id: 1
+  grpc_addr: "0.0.0.0:7000"
+  raft_addr: "0.0.0.0:8000"
+  metrics_addr: "0.0.0.0:9000"
+
+raft:
+  peers:
+    - id: 1
+      addr: "stratum-node1:8000"
+    - id: 2
+      addr: "stratum-node2:8000"
+    - id: 3
+      addr: "stratum-node3:8000"
+
+storage:
+  data_dir: "/var/lib/stratum/node1"
+
+vecstore:
+  grpc_addr: "mock-embed:8080"
+
+index_manager:
+  lru_capacity: 16
+  memory_threshold_mb: 4096
+  load_wait_timeout_ms: 5000
+  callback_max_retries: 3
+  callback_retry_base_interval_ms: 200
+
+write_coordinator:
+  max_retries: 3
+  retry_base_interval_ms: 100
+
+delete_coordinator:
+  max_retries: 5
+  retry_base_interval_ms: 500
+
+logging:
+  level: "info"

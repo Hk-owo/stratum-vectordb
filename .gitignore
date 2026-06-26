@@ -1,0 +1,41 @@
+# === Binaries ===
+/stratum
+*.test
+*.out
+*.exe
+
+# === Go build cache ===
+/tmp/
+
+# === CMake / C++ build artifacts ===
+/build/
+/vecstore/build/
+/vecstore/CMakeCache.txt
+/vecstore/CMakeFiles/
+vecstore/CMakeCache.txt
+vecstore/CMakeFiles/
+
+# === IDE / Editor ===
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# === AI assistant ===
+.reasonix/
+reasonix.toml
+
+# === OS junk ===
+.DS_Store
+Thumbs.db
+__pycache__/
+
+# === Symlinks to external dependencies ===
+/faiss
+
+# === Runtime data directories ===
+/data/
+
+# === GitHub PAT ===
+.github_token

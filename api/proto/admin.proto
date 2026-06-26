@@ -1,0 +1,79 @@
+// admin.proto — external AdminService contract: health checks, system
+// diagnostics, and manual index maintenance operations.
+//
+// See Stratum_接口设计v9.md "AdminService" for the authoritative
+// specification.
+//
+// Reserved (not implemented): GetMetrics, GetAuditLog. Per
+// Stratum_代码风格v2.md's convention of not creating empty placeholder
+// files/stubs for unimplemented future work, these are documented here but
+// intentionally have no corresponding RPC or message definitions yet.
+syntax = "proto3";
+package stratum;
+
+option go_package = "stratum/api/proto/stratum";
+
+import "knowledgebase.proto";
+
+// HealthStatus is the three-state health summary returned by HealthCheck.
+enum HealthStatus {
+  HEALTH_STATUS_HEALTHY = 0;
+  HEALTH_STATUS_DEGRADED = 1;
+  HEALTH_STATUS_UNHEALTHY = 2;
+}
+
+message StuckVersion {
+  string kb_id = 1;
+  int64 version_id = 2;
+  IndexStatus index_status = 3;
+  int64 updated_at = 4;
+}
+
+message WALAlert {
+  string description = 1; // human-readable summary of the stuck PendingRecord
+  int32 retry_count = 2;
+}
+
+message ResourceUsage {
+  int32 loaded_index_count = 1;
+  int64 chunk_store_bytes = 2;
+  int64 doc_store_bytes = 3;
+}
+
+service AdminService {
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc GetSystemStatus(GetSystemStatusRequest) returns (GetSystemStatusResponse);
+  rpc RebuildIndex(RebuildIndexRequest) returns (RebuildIndexResponse);
+  rpc WarmupVersion(WarmupVersionRequest) returns (WarmupVersionResponse);
+}
+
+message HealthCheckRequest {}
+message HealthCheckResponse {
+  HealthStatus status = 1;
+  string details = 2;
+}
+
+message GetSystemStatusRequest {}
+message GetSystemStatusResponse {
+  HealthCheckResponse health = 1;
+  repeated StuckVersion stuck_versions = 2;
+  repeated string delete_failed_kbs = 3;
+  repeated WALAlert wal_alerts = 4;
+  ResourceUsage resource_usage = 5;
+}
+
+message RebuildIndexRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+}
+message RebuildIndexResponse {
+  bool success = 1; // asynchronous; does not wait for the build to complete
+}
+
+message WarmupVersionRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+}
+message WarmupVersionResponse {
+  bool success = 1; // asynchronous
+}

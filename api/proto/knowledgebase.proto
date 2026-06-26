@@ -1,0 +1,114 @@
+// knowledgebase.proto — external KnowledgeBaseService contract: knowledge
+// base lifecycle and version management.
+//
+// See Stratum_接口设计v9.md "KnowledgeBaseService" for the authoritative
+// specification.
+//
+// Reserved (not implemented): GetVersion, DiffVersions, TagVersion. Per
+// Stratum_代码风格v2.md's convention of not creating empty placeholder
+// files/stubs for unimplemented future work (see IVF/FLAT under vecstore),
+// these are documented here but intentionally have no corresponding RPC
+// or message definitions yet.
+syntax = "proto3";
+package stratum;
+
+option go_package = "stratum/api/proto/stratum";
+
+// IndexStatus mirrors internal/types.IndexStatus.
+enum IndexStatus {
+  INDEX_STATUS_PENDING = 0; // metadata allocated, storage-layer write in progress; not queryable
+  INDEX_STATUS_READY = 1;   // index build complete; queryable
+  INDEX_STATUS_FAILED = 2;  // build failed; RebuildIndex can re-trigger
+}
+
+// IndexType mirrors KnowledgeBaseMeta.IndexType. Only HNSW has a real
+// implementation today; IVF / FLAT are reserved for later iterations.
+enum IndexType {
+  INDEX_TYPE_HNSW = 0;
+  INDEX_TYPE_IVF = 1;
+  INDEX_TYPE_FLAT = 2;
+}
+
+// Similarity mirrors KnowledgeBaseMeta.Similarity.
+enum Similarity {
+  SIMILARITY_COSINE = 0;
+  SIMILARITY_EUCLIDEAN = 1;
+  SIMILARITY_INNER_PRODUCT = 2;
+}
+
+// ChangeOp mirrors internal/types.ChangeOp.
+enum ChangeOp {
+  CHANGE_OP_ADD = 0;
+  CHANGE_OP_DELETE = 1;
+  CHANGE_OP_UPDATE = 2;
+}
+
+message EmbedConfig {
+  string service_addr = 1;
+  string model_id = 2; // participates in chunk ID computation: SHA-256(chunk text + model_id)
+}
+
+message DocChange {
+  ChangeOp op = 1;
+  string doc_id = 2;
+  string content = 3; // required for ADD / UPDATE
+}
+
+message VersionInfo {
+  int64 version_id = 1;
+  int64 parent_version_id = 2;
+  int64 created_at = 3; // Unix timestamp, leader's local clock at apply time
+  IndexStatus index_status = 4;
+}
+
+service KnowledgeBaseService {
+  rpc CreateKnowledgeBase(CreateKnowledgeBaseRequest) returns (CreateKnowledgeBaseResponse);
+  rpc DeleteKnowledgeBase(DeleteKnowledgeBaseRequest) returns (DeleteKnowledgeBaseResponse);
+  rpc CreateVersion(CreateVersionRequest) returns (CreateVersionResponse);
+  rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+  rpc RollbackVersion(RollbackVersionRequest) returns (RollbackVersionResponse);
+}
+
+message CreateKnowledgeBaseRequest {
+  string name = 1;
+  int32 chunk_window_size = 2;
+  int32 chunk_overlap_size = 3;
+  IndexType index_type = 4;   // optional; defaults to HNSW
+  Similarity similarity = 5;  // optional; defaults to COSINE
+  EmbedConfig embed_config = 6;
+}
+message CreateKnowledgeBaseResponse {
+  string knowledge_base_id = 1;
+  int64 initial_version_id = 2;
+}
+
+message DeleteKnowledgeBaseRequest {
+  string knowledge_base_id = 1;
+}
+message DeleteKnowledgeBaseResponse {
+  bool success = 1; // returned immediately after marking for deletion; cleanup runs asynchronously
+}
+
+message CreateVersionRequest {
+  string knowledge_base_id = 1;
+  int64 parent_version_id = 2;
+  repeated DocChange changes = 3;
+}
+message CreateVersionResponse {
+  int64 version_id = 1; // newly created version; PENDING, index building asynchronously
+}
+
+message ListVersionsRequest {
+  string knowledge_base_id = 1;
+}
+message ListVersionsResponse {
+  repeated VersionInfo versions = 1;
+}
+
+message RollbackVersionRequest {
+  string knowledge_base_id = 1;
+  int64 target_version_id = 2;
+}
+message RollbackVersionResponse {
+  bool success = 1;
+}
