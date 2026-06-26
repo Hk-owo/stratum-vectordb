@@ -1,138 +1,196 @@
-# Stratum — 分布式向量搜索知识库引擎
+# Stratum
 
-面向 RAG 场景的分布式知识库存储系统，提供带版本管理的文档集合、向量索引和相似度查询服务。
+Distributed vector-search knowledge base engine with MVCC versioning,
+Raft consensus, and HNSW indexing — built for retrieval-augmented
+generation (RAG).
 
-## 架构
+## Overview
+
+Stratum manages versioned document collections. Documents are split into
+content-addressed chunks, embedded into vectors via an external embed
+service, indexed with Faiss HNSW, and served through a gRPC API.
+
+**What it solves:**
+
+- **Rollback** — a broken update is one call away from being undone.
+- **A/B testing** — multiple versions can coexist and be queried in
+  parallel.
+- **Auditability** — every query result is traceable to a specific
+  version.
+
+Stratum is the storage and retrieval layer for a RAG pipeline. It does
+not handle chat history, user sessions, or prompt construction — those
+belong to the application layer above it.
+
+## Architecture
 
 ```
-Go 侧（编排 / 元数据 / Raft 共识）    C++ 侧（向量存储 / HNSW 索引）
-         │                                        │
-         ├─ gRPC API ─────────────────────────    │
-         │  KnowledgeBaseService                   │
-         │  QueryService                           │
-         │  AdminService                           │
-         │                                        │
-         ├─ Coordinator ──────┐                    │
-         │  WriteCoordinator   │                    │
-         │  DeleteCoordinator  │                    │
-         │                     │                    │
-         ├─ Storage ───────────┤   内部 gRPC       │
-         │  DocStore (PebbleDB) │◄──────────►  ChunkStorage (RocksDB)
-         │  ChunkDocMapper      │               VectorIndex (Faiss HNSW)
-         │  VersionDocList      │                    │
-         │  BloomFilter         │                    │
-         │                     │                    │
-         ├─ IndexManager ───────┘                    │
-         │                                         │
-         └─ Raft (kvraft) ──── 强一致副本 ────      │
+                   External gRPC Clients
+                  ┌─────────────────────┐
+                  │ KnowledgeBaseService │
+                  │ QueryService         │
+                  │ AdminService         │
+                  └──────┬──────────────┘
+                         │
+  ┌──────────────────────┼──────────────────────────┐
+  │               Go (orchestration)                │
+  │                                                 │
+  │  ┌─────────────┐  ┌───────────┐  ┌───────────┐ │
+  │  │ WriteCoord  │  │QueryService│  │ AdminSvc  │ │
+  │  └──────┬──────┘  └─────┬─────┘  └─────┬─────┘ │
+  │         │               │               │       │
+  │  ┌──────┴───────────────┴───────────────┴─────┐ │
+  │  │              IndexManager                  │ │
+  │  │         (LRU + refcounting)                │ │
+  │  └──────────────────┬────────────────────────┘ │
+  │                     │                           │
+  │  ┌──────────────────┼────────────────────────┐ │
+  │  │    PebbleDB stores (Go)                   │ │
+  │  │    DocStore / ChunkDocMapper / VersionDoc │ │
+  │  └──────────────────┼────────────────────────┘ │
+  │                     │                           │
+  │  ┌──────────────────┴────────────────────────┐ │
+  │  │            Raft (kvraft)                   │ │
+  │  │      strongly-consistent metadata          │ │
+  │  └───────────────────────────────────────────┘ │
+  └──────────────────────┬──────────────────────────┘
+                         │  internal gRPC
+  ┌──────────────────────┴──────────────────────────┐
+  │              C++ (vector storage)               │
+  │                                                 │
+  │  ┌──────────────────┐  ┌──────────────────────┐ │
+  │  │  ChunkStorage    │  │   VectorIndex        │ │
+  │  │  (RocksDB)       │  │   (Faiss HNSW)       │ │
+  │  └──────────────────┘  └──────────────────────┘ │
+  └─────────────────────────────────────────────────┘
 ```
 
-## 快速开始
+## Quick start
 
 ```bash
-# 编译
+# Build
 go build ./cmd/stratum/
 
-# 测试
+# Run tests (17 packages)
 go test ./... -timeout 180s -count=1
 
-# Race 检测
+# Race detector
 go test -race ./internal/kvraft/... ./internal/raft/... ./internal/index/...
 
-# 单节点启动
+# Single-node server
 go run ./cmd/stratum/
 ```
 
-## 项目结构
+## gRPC API
+
+### KnowledgeBaseService
+
+| RPC | Description |
+|---|---|
+| `CreateKnowledgeBase` | Create a KB with embed config, chunk window, and index type |
+| `DeleteKnowledgeBase` | Mark a KB for deletion; cleanup runs asynchronously |
+| `CreateVersion` | Apply document changes (ADD / DELETE / UPDATE) and produce a new version |
+| `ListVersions` | Return the version chain for a KB |
+| `RollbackVersion` | Switch the active version (no downtime) |
+
+### QueryService
+
+| RPC | Description |
+|---|---|
+| `Query` | Vector similarity search with threshold, top-k, and aggregation |
+
+### AdminService
+
+| RPC | Description |
+|---|---|
+| `HealthCheck` | Three-state health (HEALTHY / DEGRADED / UNHEALTHY) |
+| `GetSystemStatus` | Stuck versions, delete-failed KBs, WAL alerts, resource usage |
+| `RebuildIndex` | Re-trigger index build for a failed version |
+| `WarmupVersion` | Load a version's index into memory without switching the active version |
+
+## Project structure
 
 ```
 stratum/
-├── api/proto/              # Protobuf 定义
-│   ├── knowledgebase.proto # KnowledgeBaseService
-│   ├── query.proto         # QueryService
-│   ├── admin.proto         # AdminService
-│   ├── kvraft/             # Raft RPC（内部）
-│   └── vecstore/           # Go↔C++ 内部 gRPC
-│
+├── api/proto/              # Protobuf definitions
+│   ├── knowledgebase.proto
+│   ├── query.proto
+│   ├── admin.proto
+│   ├── kvraft/             # Internal Raft RPC
+│   └── vecstore/           # Go ↔ C++ internal gRPC
 ├── internal/
-│   ├── types/              # 共享数据类型
-│   ├── errors/             # 错误码映射 (→ gRPC status)
-│   ├── pebbleutil/         # PebbleDB key 编码
-│   ├── docstore/           # MVCC 文档存储
-│   ├── chunkdoc/           # chunk↔doc 双向映射
-│   ├── versiondoc/         # 版本文档列表
-│   ├── bloom/              # 布隆过滤器
-│   ├── splitter/           # 滑动窗口文档切割
-│   ├── embed/              # 外部 Embed 服务客户端
-│   ├── chunkstore/         # vecstore gRPC 客户端
-│   ├── index/              # IndexManager（LRU + 引用计数）
-│   ├── raft/               # RaftNode（知识库/版本强一致）
-│   ├── kvraft/             # Raft 共识库（leader 选举/日志复制/快照）
-│   ├── kvstorage/          # Raft 持久化
-│   ├── wal/                # 写前日志（崩溃一致性）
-│   └── coordinator/        # WriteCoordinator + DeleteCoordinator
-│
-├── service/                # gRPC Service 实现
-│   ├── knowledgebase.go
-│   ├── query.go
-│   └── admin.go
-│
-├── integration/            # 集成测试 + T4 多节点测试
-│   └── docker/             # Docker 3 节点集群配置
-│
-├── cmd/stratum/main.go     # 启动入口
-├── configs/                # 配置文件
-├── doc/                    # 设计文档
-├── vecstore/               # C++ 向量存储（Faiss + RocksDB）
+│   ├── types/              # Shared data types
+│   ├── errors/             # Business errors → gRPC status mapping
+│   ├── docstore/           # MVCC document storage (PebbleDB)
+│   ├── chunkdoc/           # Bidirectional chunk ↔ document mapping
+│   ├── versiondoc/         # Per-version document ID sets
+│   ├── bloom/              # Bloom filters (chunk existence + version membership)
+│   ├── splitter/           # Sliding-window document chunking
+│   ├── embed/              # External embed service HTTP client
+│   ├── chunkstore/         # Vecstore gRPC client wrapper
+│   ├── index/              # IndexManager (LRU cache + refcounts + async builds)
+│   ├── kvraft/             # Raft consensus library (leader election / log replication / snapshots)
+│   ├── kvstorage/          # Raft hard-state persistence
+│   ├── raft/               # Stratum Raft state machine (KB + version metadata)
+│   ├── wal/                # Write-ahead log for crash consistency
+│   └── coordinator/        # WriteCoordinator + DeleteCoordinator orchestration
+├── service/                # gRPC service implementations
+├── integration/            # In-process integration tests + 3-node cluster tests
+├── cmd/stratum/main.go     # Entry point
+├── configs/                # Sample configuration files
+├── doc/                    # Design documents (Chinese)
+├── vecstore/               # C++ vector storage (Faiss HNSW + RocksDB)
 └── go.mod
 ```
 
-## 实现进度
+## Key design decisions
 
-| 阶段 | 说明 | 状态 |
-|------|------|------|
-| 0 | 接口定义与项目骨架 | ✅ |
-| 1 | 存储层基础模块（PebbleDB + C++ vecstore） | ✅ |
-| 2 | WAL + ChunkStore 客户端 | ✅ |
-| 3 | Raft 状态机（kvraft + RaftNodeImpl） | ✅ |
-| 4-A | EmbedClient（HTTP 实现） | ✅ |
-| 4-B | IndexManager（LRU + 引用计数 + 异步构建） | ✅ |
-| 5-A | WriteCoordinator（完整 7 步写路径编排） | ✅ |
-| 5-B | DeleteCoordinator（异步清理 + 崩溃恢复） | ✅ |
-| 6 | Service 层 + main.go + 配置 | ✅ |
-| 7 | 集成测试（单节点 + 3 节点集群） | ✅ |
+| Decision | Rationale |
+|---|---|
+| **Content-addressed chunks** | `ChunkID = SHA-256(text + model ID)` — deduplicates chunks naturally, no coordination needed |
+| **MVCC via PebbleDB prefixes** | Document history is compressed; unchanged documents cost zero in new versions |
+| **WAL for crash consistency** | Two-phase protocol (BEGIN → VERSION_ID → COMMIT) survives a crash at any point |
+| **Cosine via L2 normalization** | Faiss has no native cosine support; normalizing + inner product is mathematically equivalent |
+| **Unified score direction** | All three metrics return "higher is more similar" — Euclidean distance is negated |
+| **JSON-encoded Raft commands** | Low-volume control-plane commands; human-readable with `jq` for debugging |
+| **Interface-first, mock alongside** | Every module is an interface with a mock. Tests isolate cleanly; real implementations slot in behind the interface |
 
-## 测试覆盖
+## Raft consensus
 
+The consensus layer (`internal/kvraft`) is adapted from the
+[KVServer](https://github.com/Hk-owo/KVServer) teaching implementation
+(MIT 6.5840), rewritten to Stratum's code style and fixed for 6 bugs
+discovered through TDD:
+
+| # | Bug | Impact |
+|---|---|---|
+| 1 | Single-node clusters never elected a leader | Majority check only ran in peer-response handlers |
+| 2 | AppendEntries heartbeat skipped log consistency check | Follower could advance commitIndex past a divergent log |
+| 3 | InstallSnapshot held the mutex while sending on a channel | Deadlock risk |
+| 4 | RequestVote did not check `killed()` | A stopped node could still vote |
+| 5 | No no-op entry on election | Old log entries permanently invisible until new write traffic |
+| 6 | Leader added itself as a peer | Leader stepped down on its own heartbeat |
+
+## Testing
+
+| Batch | Scope | Status |
+|---|---|---|
+| T1 | Single-module contracts (8 modules) |  ✅ |
+| T2 | Cross-module integration (4 groups) |  ✅ |
+| T3 | Single-node full chain (15 scenarios) |  ✅ |
+| T4 | 3-node Raft cluster |  ✅ |
+
+```bash
+go test ./... -timeout 180s -count=1
+# 17 packages, all PASS
+
+go test ./integration/... -run TestMultiNode -v
+# 3-node cluster elects leader, replicates KB + version metadata
 ```
-17 个包全部 PASS（race 干净）:
 
-单模块测试（T1）： bloom, chunkdoc, chunkstore, docstore, embed, errors,
-                   pebbleutil, splitter, versiondoc, wal, kvstorage
-模块配合测试（T2）： coordinator, index, service
-集成测试（T3）：     integration（15 个端到端场景）
-集群测试（T4）：     integration（3 节点 Raft 集群）
-Raft 测试：          kvraft（15 个），raft（11 个）
-```
+## Prerequisites
 
-## kvraft Raft 共识库
+- **Go 1.24**
+- **C++17** (for vecstore): Faiss ≥ 1.9.0, RocksDB, gRPC, Protobuf, BLAS/LAPACK, OpenMP
+- C++ build only required if you need the Faiss HNSW backend. Go tests use an in-process mock.
 
-从 [KVServer](https://github.com/Hk-owo/KVServer)（MIT 6.5840 教学实现）改写而来，修复了 6 个真实 bug：
-
-| # | Bug | 修复 |
-|---|-----|------|
-| 1 | 单节点集群永远选不出 leader | 自投票立即检查多数 |
-| 2 | AppendEntries 心跳跳过日志一致性检查 | 统一走一致性检查 |
-| 3 | InstallSnapshot 持锁发送 channel → 死锁 | 释锁后发送 |
-| 4 | RequestVote 未检查 killed() | 入口加 killed() 检查 |
-| 5 | 无 no-op-on-election 提案 | 当选时立即追加空日志 |
-| 6 | 自己作为 peer 导致 leader 被自己心跳踢下台 | skip self in AddPeer |
-
-## 相关文档
-
-- `doc/Stratum_设计文档v10.md` — 系统架构与数据流
-- `doc/Stratum_设计目标.md` — 功能与性能目标
-- `doc/Stratum_接口设计v9.md` — 模块接口定义
-- `doc/Stratum_实现顺序.md` — 分阶段实现计划
-- `doc/Stratum_测试顺序.md` — 四批测试计划
-- `doc/Stratum_代码风格v2.md` — 编码规范
