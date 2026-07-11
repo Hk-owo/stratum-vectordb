@@ -2,22 +2,6 @@ module stratum
 
 go 1.24
 
-replace google.golang.org/grpc => github.com/grpc/grpc-go v1.69.4
-
-replace google.golang.org/protobuf => github.com/protocolbuffers/protobuf-go v1.34.2
-
-replace go.uber.org/zap => github.com/uber-go/zap v1.28.0
-
-replace github.com/bits-and-blooms/bloom/v3 => github.com/bits-and-blooms/bloom/v3 v3.7.1
-
-replace golang.org/x/net => github.com/golang/net v0.30.0
-
-replace golang.org/x/sys => github.com/golang/sys v0.26.0
-
-replace google.golang.org/genproto/googleapis/rpc => github.com/googleapis/go-genproto/googleapis/rpc v0.0.0-20241015192408-796eee8c2d53
-
-replace golang.org/x/text => github.com/golang/text v0.19.0
-
 require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/cockroachdb/pebble v1.1.5
@@ -56,19 +40,3 @@ require (
 	golang.org/x/text v0.19.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20241015192408-796eee8c2d53 // indirect
 )
-
-replace go.uber.org/multierr => github.com/uber-go/multierr v1.10.0
-
-replace golang.org/x/tools => github.com/golang/tools v0.25.0
-
-replace golang.org/x/sync => github.com/golang/sync v0.9.0
-
-replace golang.org/x/crypto => github.com/golang/crypto v0.28.0
-
-replace golang.org/x/term => github.com/golang/term v0.25.0
-
-replace golang.org/x/mod => github.com/golang/mod v0.17.0
-
-replace golang.org/x/telemetry => github.com/golang/telemetry v0.0.0-20240521205824-bda55230c457
-
-replace golang.org/x/exp => github.com/golang/exp v0.0.0-20230626212559-97b1e661b5df

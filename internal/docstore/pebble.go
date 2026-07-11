@@ -113,7 +113,7 @@ func (s *PebbleDocStore) Write(_ context.Context, kbID, docID string, versionID 
 // ReadAt implements DocStore: returns the content visible at maxVersionID,
 // i.e. the value of the entry with the largest versionID <= maxVersionID
 // within (kbID, docID). Uses an iterator bounded to
-// [docPrefix, docPrefix+EncodeVersionID(maxVersionID+1)) and seeks to the
+// [docPrefix, docPrefix+EncodeVersionID(maxVersionID+1)] and seeks to the
 // last key in that range, which is exactly the entry being sought — O(log
 // n) via PebbleDB's internal seek rather than a linear scan.
 func (s *PebbleDocStore) ReadAt(_ context.Context, kbID, docID string, maxVersionID int64) ([]byte, error) {
