@@ -56,6 +56,12 @@ func (s *VecstoreChunkStore) Close() error {
 	return s.conn.Close()
 }
 
+// VecstoreClient returns the underlying ChunkStorageServiceClient. Used
+// by the data-sync leader handler to read chunk vectors directly.
+func (s *VecstoreChunkStore) VecstoreClient() vecstorepb.ChunkStorageServiceClient {
+	return s.client
+}
+
 // encodeKey builds the vecstore key for (kbID, chunkID): a 4-byte
 // big-endian length prefix on kbID followed by kbID's raw bytes, followed
 // by chunkID's raw bytes. The length prefix on kbID (mirroring

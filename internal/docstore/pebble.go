@@ -53,6 +53,11 @@ func (s *PebbleDocStore) Close() error {
 	return s.db.Close()
 }
 
+// DB returns the underlying *pebble.DB handle. Used by the data-sync
+// leader handler to stream DocStore entries directly without going
+// through the DocStore interface.
+func (s *PebbleDocStore) DB() *pebble.DB { return s.db }
+
 func encodeDocKey(kbID, docID string, versionID int64) []byte {
 	key := pebbleutil.EncodeString(kbID)
 	key = append(key, pebbleutil.EncodeString(docID)...)

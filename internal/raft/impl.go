@@ -50,8 +50,9 @@ var errSuperseded = errors.New("raft: proposal superseded by a different leader'
 
 // PeerConfig identifies one other cluster member's Raft RPC address.
 type PeerConfig struct {
-	ID       int64
-	RaftAddr string
+	ID          int64
+	RaftAddr    string
+	ServiceAddr string // Stratum-level gRPC address used for data sync (leader→follower)
 }
 
 // Config configures a RaftNodeImpl.
@@ -97,6 +98,17 @@ type RaftNodeImpl struct {
 	pending   map[uint64]*pendingProposal
 
 	applyLoopDone chan struct{}
+
+	// onVersionCreated is an optional callback invoked after a
+	// cmdCreateVersion is applied on this node when this node is NOT
+	// the proposer (i.e. it is a follower receiving the entry via
+	// Raft replication). The leader (proposer) does its own
+	// storage-layer writes inline during the coordinator write flow
+	// and does not need this hook.
+	//
+	// Set by the startup wiring (main.go) to trigger data sync from
+	// the leader via internal/sync.FollowerSync.PullVersion.
+	onVersionCreated func(kbID string, versionID int64)
 }
 
 // NewRaftNodeImpl constructs and starts a RaftNodeImpl: it starts the
@@ -168,6 +180,15 @@ func (impl *RaftNodeImpl) Stop() {
 	<-impl.applyLoopDone
 }
 
+// SetOnVersionCreated registers a callback that is invoked when a
+// cmdCreateVersion is applied on a non-proposer node (follower). The
+// leader does its own storage-layer writes inline and does not use this
+// hook. Call before the first propose; not safe for concurrent use after
+// the apply loop has started.
+func (impl *RaftNodeImpl) SetOnVersionCreated(fn func(kbID string, versionID int64)) {
+	impl.onVersionCreated = fn
+}
+
 // runApplyLoop consumes committed entries (and snapshot requests) from
 // kvraft, applies them to the state machine, and delivers results to any
 // locally-waiting Propose* call. Exits when the underlying kvraft node's
@@ -218,7 +239,14 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	impl.pendingMu.Unlock()
 
 	if !ok {
-		return // no local caller waiting on this index (e.g. this is a follower)
+		// This node is not waiting on this index — it did not propose
+		// it. If the command was a CreateVersion, notify the data-sync
+		// layer so this follower pulls storage-layer data from the
+		// leader.
+		if err == nil && cmd.Type == cmdCreateVersion && impl.onVersionCreated != nil {
+			impl.onVersionCreated(cmd.KBID, result.VersionID)
+		}
+		return // no local caller waiting (e.g. this is a follower)
 	}
 	if waiter.term != msg.Term {
 		// The entry originally proposed at this index under waiter.term

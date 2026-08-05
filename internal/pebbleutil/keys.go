@@ -52,6 +52,22 @@ func EncodeVersionID(versionID int64) []byte {
 	return EncodeUint64(uint64(versionID))
 }
 
+// DecodeString reverses EncodeString: reads a 4-byte big-endian length
+// prefix and returns the string that follows. b may be longer than the
+// encoded string (e.g. b is a full compound key and the caller has
+// already sliced off the prefix components); DecodeString returns only the
+// decoded string, not the remaining suffix.
+func DecodeString(b []byte) string {
+	if len(b) < 4 {
+		return ""
+	}
+	n := int(binary.BigEndian.Uint32(b[:4]))
+	if n == 0 || len(b) < 4+n {
+		return ""
+	}
+	return string(b[4 : 4+n])
+}
+
 // PrefixSuccessor returns the smallest byte slice that is strictly greater
 // than every key with the given prefix, suitable as an exclusive upper
 // bound for a prefix scan or range delete covering exactly the keys

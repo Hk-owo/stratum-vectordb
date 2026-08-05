@@ -1,0 +1,52 @@
+// sync.proto — internal DataSyncService: leader-to-follower data
+// replication for the four PebbleDB/Vecstore layers that are NOT
+// replicated via Raft.
+//
+// See Stratum_设计文档v10.md "多副本构建" and "索引异步构建".
+//
+// Synchronised layers:
+//   - DocStore         (kbID + docID + versionID → content)
+//   - ChunkDocMapper   (forward + reverse)
+//   - VersionDocList   (kbID + versionID + docID)
+//   - ChunkStore       (kbID + chunkID → vector)
+//
+// NOT synchronised (each replica builds independently):
+//   - HNSW index           (via IndexManager.TriggerBuild)
+//   - Chunk bloom filter   (from local chunk store)
+//   - Version bloom filter (from local version doc list)
+syntax = "proto3";
+package stratum;
+
+option go_package = "stratum/api/proto/stratum";
+
+// DataSyncService is an internal-only gRPC service for leader→follower
+// data pull. Followers open a server-side streaming RPC per version and
+// apply each SyncEntry to their local storage layers.
+service DataSyncService {
+  rpc PullVersionData(PullVersionDataRequest) returns (stream SyncEntry);
+}
+
+message PullVersionDataRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+}
+
+// SyncEntry is one record in the stream. The entry_type field determines
+// which storage layer the record belongs to.
+message SyncEntry {
+  SyncEntryType entry_type = 1;
+  string kb_id = 2;
+  string doc_id = 3;
+  string chunk_id = 4;
+  int64 version_id = 5;
+  bytes payload = 6; // doc text (DOC_STORE), vector (CHUNK_VECTOR), or empty
+}
+
+enum SyncEntryType {
+  SYNC_ENTRY_TYPE_UNSPECIFIED = 0;
+  SYNC_ENTRY_TYPE_DOC_STORE = 1;         // kb_id + doc_id + version_id + payload
+  SYNC_ENTRY_TYPE_CHUNK_DOC_FORWARD = 2; // kb_id + chunk_id + doc_id
+  SYNC_ENTRY_TYPE_CHUNK_DOC_REVERSE = 3; // kb_id + doc_id + chunk_id
+  SYNC_ENTRY_TYPE_VERSION_DOC_LIST = 4;  // kb_id + version_id + doc_id
+  SYNC_ENTRY_TYPE_CHUNK_VECTOR = 5;      // kb_id + chunk_id + payload (float32 vector)
+}

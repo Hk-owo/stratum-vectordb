@@ -44,6 +44,10 @@ func (m *PebbleChunkDocMapper) Close() error {
 	return m.db.Close()
 }
 
+// DB returns the underlying *pebble.DB handle. Used by the data-sync
+// leader handler.
+func (m *PebbleChunkDocMapper) DB() *pebble.DB { return m.db }
+
 func encodeForwardKey(kbID, chunkID, docID string) []byte {
 	key := []byte{dirForward}
 	key = append(key, pebbleutil.EncodeString(kbID)...)

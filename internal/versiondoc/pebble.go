@@ -36,6 +36,10 @@ func (v *PebbleVersionDocList) Close() error {
 	return v.db.Close()
 }
 
+// DB returns the underlying *pebble.DB handle. Used by the data-sync
+// leader handler.
+func (v *PebbleVersionDocList) DB() *pebble.DB { return v.db }
+
 func encodeVersionDocKey(kbID string, versionID int64, docID string) []byte {
 	key := pebbleutil.EncodeString(kbID)
 	key = append(key, pebbleutil.EncodeVersionID(versionID)...)

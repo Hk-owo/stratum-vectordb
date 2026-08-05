@@ -28,6 +28,7 @@ import (
 	"stratum/internal/index"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
+	"stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 	"stratum/internal/wal"
@@ -167,6 +168,52 @@ func main() {
 		VersionDocList:      vd,
 	})
 
+	// --- Data sync (leader→follower) ---
+	// Leader handler: serves storage-layer data to followers via gRPC.
+	syncLeader := sync.NewLeaderHandler(
+		ds.DB(),
+		cdm.DB(),
+		vd.DB(),
+		chunkStore.VecstoreClient(),
+	)
+
+	// Build nodeID→ServiceAddr map for follower leader resolution.
+	peerAddrByID := make(map[int64]string, len(cfg.Peers))
+	for _, p := range cfg.Peers {
+		if p.ServiceAddr != "" {
+			peerAddrByID[p.ID] = p.ServiceAddr
+		}
+	}
+
+	// Follower: pulls data when this node applies a version written by
+	// the leader. The sync module is wired via OnVersionCreated.
+	syncFollower := sync.NewFollower(ds, cdm, vd, chunkStore, indexMgr)
+
+	raftImpl.SetOnVersionCreated(func(kbID string, versionID int64) {
+		ctx := context.Background()
+		status, err := raftImpl.GetClusterStatus(ctx)
+		if err != nil {
+			logger.Error("sync: GetClusterStatus failed, cannot pull version data",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			return
+		}
+		if !status.HasLeader {
+			logger.Warn("sync: no leader known, deferring version data pull",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+			return
+		}
+		leaderAddr, ok := peerAddrByID[status.LeaderID]
+		if !ok {
+			logger.Error("sync: leader address unknown for node ID",
+				zap.Int64("leader_id", status.LeaderID))
+			return
+		}
+		if err := syncFollower.PullVersion(ctx, leaderAddr, kbID, versionID); err != nil {
+			logger.Error("sync: PullVersion failed",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		}
+	})
+
 	// --- gRPC services ---
 	kbSvc := service.NewKnowledgeBaseService(raftImpl, writeCoord, deleteCoord)
 	querySvc := service.NewQueryService(raftImpl, indexMgr, cdm, vd, ds, versionBloom)
@@ -177,6 +224,7 @@ func main() {
 	pb.RegisterKnowledgeBaseServiceServer(grpcServer, kbSvc)
 	pb.RegisterQueryServiceServer(grpcServer, querySvc)
 	pb.RegisterAdminServiceServer(grpcServer, adminSvc)
+	pb.RegisterDataSyncServiceServer(grpcServer, syncLeader)
 
 	lis, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {
@@ -232,7 +280,7 @@ func defaultConfig() appConfig {
 		GRPCAddr: "0.0.0.0:7000",
 		RaftAddr: "0.0.0.0:8000",
 		Peers: []raft.PeerConfig{
-			{ID: 1, RaftAddr: "node1:8000"},
+			{ID: 1, RaftAddr: "node1:8000", ServiceAddr: "node1:7000"},
 		},
 
 		VecstoreGRPCAddr: "127.0.0.1:7100",
