@@ -39,7 +39,7 @@ message SyncEntry {
   string doc_id = 3;
   string chunk_id = 4;
   int64 version_id = 5;
-  bytes payload = 6; // doc text (DOC_STORE), vector (CHUNK_VECTOR), or empty
+  bytes payload = 6; // DOC_STORE: docstore tag byte (0x01=content, 0x00=tombstone) + doc text; CHUNK_VECTOR: float32 vector bytes
 }
 
 enum SyncEntryType {

@@ -36,6 +36,13 @@ enum Similarity {
   SIMILARITY_INNER_PRODUCT = 2;
 }
 
+// KBStatus mirrors internal/types.KBStatus.
+enum KBStatus {
+  KB_STATUS_ACTIVE = 0;
+  KB_STATUS_DELETING = 1;
+  KB_STATUS_DELETE_FAILED = 2;
+}
+
 // ChangeOp mirrors internal/types.ChangeOp.
 enum ChangeOp {
   CHANGE_OP_ADD = 0;
@@ -61,12 +68,28 @@ message VersionInfo {
   IndexStatus index_status = 4;
 }
 
+// KnowledgeBaseInfo is the console-facing metadata of a knowledge base,
+// returned by ListKnowledgeBases / GetKnowledgeBase.
+message KnowledgeBaseInfo {
+  string knowledge_base_id = 1;
+  string name = 2;
+  int32 chunk_window_size = 3;
+  int32 chunk_overlap_size = 4;
+  IndexType index_type = 5;
+  Similarity similarity = 6;
+  EmbedConfig embed_config = 7;
+  int64 active_version_id = 8;
+  KBStatus status = 9;
+}
+
 service KnowledgeBaseService {
   rpc CreateKnowledgeBase(CreateKnowledgeBaseRequest) returns (CreateKnowledgeBaseResponse);
   rpc DeleteKnowledgeBase(DeleteKnowledgeBaseRequest) returns (DeleteKnowledgeBaseResponse);
   rpc CreateVersion(CreateVersionRequest) returns (CreateVersionResponse);
   rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
   rpc RollbackVersion(RollbackVersionRequest) returns (RollbackVersionResponse);
+  rpc ListKnowledgeBases(ListKnowledgeBasesRequest) returns (ListKnowledgeBasesResponse);
+  rpc GetKnowledgeBase(GetKnowledgeBaseRequest) returns (GetKnowledgeBaseResponse);
 }
 
 message CreateKnowledgeBaseRequest {
@@ -111,4 +134,16 @@ message RollbackVersionRequest {
 }
 message RollbackVersionResponse {
   bool success = 1;
+}
+
+message ListKnowledgeBasesRequest {}
+message ListKnowledgeBasesResponse {
+  repeated KnowledgeBaseInfo knowledge_bases = 1;
+}
+
+message GetKnowledgeBaseRequest {
+  string knowledge_base_id = 1;
+}
+message GetKnowledgeBaseResponse {
+  KnowledgeBaseInfo knowledge_base = 1;
 }

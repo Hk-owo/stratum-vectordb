@@ -197,6 +197,81 @@ func (s *KnowledgeBaseServiceImpl) RollbackVersion(ctx context.Context, req *pb.
 	return &pb.RollbackVersionResponse{Success: true}, nil
 }
 
+// ListKnowledgeBases implements KnowledgeBaseServiceServer.
+func (s *KnowledgeBaseServiceImpl) ListKnowledgeBases(ctx context.Context, _ *pb.ListKnowledgeBasesRequest) (*pb.ListKnowledgeBasesResponse, error) {
+	kbs, err := s.raftNode.ListKnowledgeBases(ctx)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+
+	out := make([]*pb.KnowledgeBaseInfo, 0, len(kbs))
+	for _, kb := range kbs {
+		out = append(out, kbToProto(kb))
+	}
+	return &pb.ListKnowledgeBasesResponse{KnowledgeBases: out}, nil
+}
+
+// GetKnowledgeBase implements KnowledgeBaseServiceServer.
+func (s *KnowledgeBaseServiceImpl) GetKnowledgeBase(ctx context.Context, req *pb.GetKnowledgeBaseRequest) (*pb.GetKnowledgeBaseResponse, error) {
+	kb, err := s.raftNode.GetKB(ctx, req.KnowledgeBaseId)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	return &pb.GetKnowledgeBaseResponse{KnowledgeBase: kbToProto(kb)}, nil
+}
+
+// kbToProto converts internal knowledge base metadata to its console-facing
+// proto representation.
+func kbToProto(kb types.KnowledgeBaseMeta) *pb.KnowledgeBaseInfo {
+	return &pb.KnowledgeBaseInfo{
+		KnowledgeBaseId:  kb.KBID,
+		Name:             kb.Name,
+		ChunkWindowSize:  int32(kb.ChunkWindowSize),
+		ChunkOverlapSize: int32(kb.ChunkOverlapSize),
+		IndexType:        indexTypeToProto(kb.IndexType),
+		Similarity:       similarityToProto(kb.Similarity),
+		EmbedConfig: &pb.EmbedConfig{
+			ServiceAddr: kb.EmbedConfig.ServiceAddr,
+			ModelId:     kb.EmbedConfig.ModelID,
+		},
+		ActiveVersionId: kb.ActiveVersionID,
+		Status:          kbStatusToProto(kb.Status),
+	}
+}
+
+func indexTypeToProto(s string) pb.IndexType {
+	switch s {
+	case "IVF":
+		return pb.IndexType_INDEX_TYPE_IVF
+	case "FLAT":
+		return pb.IndexType_INDEX_TYPE_FLAT
+	default:
+		return pb.IndexType_INDEX_TYPE_HNSW
+	}
+}
+
+func similarityToProto(s string) pb.Similarity {
+	switch s {
+	case "EUCLIDEAN":
+		return pb.Similarity_SIMILARITY_EUCLIDEAN
+	case "INNER_PRODUCT":
+		return pb.Similarity_SIMILARITY_INNER_PRODUCT
+	default:
+		return pb.Similarity_SIMILARITY_COSINE
+	}
+}
+
+func kbStatusToProto(s types.KBStatus) pb.KBStatus {
+	switch s {
+	case types.KBStatusDeleting:
+		return pb.KBStatus_KB_STATUS_DELETING
+	case types.KBStatusDeleteFailed:
+		return pb.KBStatus_KB_STATUS_DELETE_FAILED
+	default:
+		return pb.KBStatus_KB_STATUS_ACTIVE
+	}
+}
+
 // generateKBID produces a unique knowledge base ID. Uses a simple
 // counter-based approach; in production, a UUID library would be used,
 // but the design docs do not specify a particular ID scheme, and a

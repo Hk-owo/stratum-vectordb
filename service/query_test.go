@@ -309,3 +309,35 @@ func TestQueryService_ActiveVersionDefault(t *testing.T) {
 		t.Errorf("expected active version %d, got %d", vID, resp.VersionId)
 	}
 }
+
+// aggregate() is package-private; these tests cover the aggregation
+// branches the RPC-level tests cannot reach (MAX / MEAN / MEDIAN with
+// even and odd cardinalities).
+func TestAggregate_AllMethods(t *testing.T) {
+	cases := []struct {
+		name   string
+		scores []float32
+		method pb.AggregationMethod
+		want   float32
+	}{
+		{"median odd", []float32{1, 3, 2}, pb.AggregationMethod_AGGREGATION_METHOD_MEDIAN, 2},
+		{"median even", []float32{1, 4, 2, 3}, pb.AggregationMethod_AGGREGATION_METHOD_MEDIAN, 2.5},
+		{"max", []float32{1, 5, 3}, pb.AggregationMethod_AGGREGATION_METHOD_MAX, 5},
+		{"mean", []float32{1, 2, 3, 4}, pb.AggregationMethod_AGGREGATION_METHOD_MEAN, 2.5},
+		{"default is median", []float32{1, 3, 2}, pb.AggregationMethod(0), 2},
+		{"single", []float32{7}, pb.AggregationMethod_AGGREGATION_METHOD_MEDIAN, 7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := aggregate(tc.scores, tc.method); got != tc.want {
+				t.Errorf("aggregate(%v, %v) = %v, want %v", tc.scores, tc.method, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAggregate_Empty(t *testing.T) {
+	if got := aggregate(nil, pb.AggregationMethod_AGGREGATION_METHOD_MEDIAN); got != 0 {
+		t.Errorf("aggregate(empty) = %v, want 0", got)
+	}
+}

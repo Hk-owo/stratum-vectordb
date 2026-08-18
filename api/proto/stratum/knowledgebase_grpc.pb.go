@@ -36,6 +36,8 @@ const (
 	KnowledgeBaseService_CreateVersion_FullMethodName       = "/stratum.KnowledgeBaseService/CreateVersion"
 	KnowledgeBaseService_ListVersions_FullMethodName        = "/stratum.KnowledgeBaseService/ListVersions"
 	KnowledgeBaseService_RollbackVersion_FullMethodName     = "/stratum.KnowledgeBaseService/RollbackVersion"
+	KnowledgeBaseService_ListKnowledgeBases_FullMethodName  = "/stratum.KnowledgeBaseService/ListKnowledgeBases"
+	KnowledgeBaseService_GetKnowledgeBase_FullMethodName    = "/stratum.KnowledgeBaseService/GetKnowledgeBase"
 )
 
 // KnowledgeBaseServiceClient is the client API for KnowledgeBaseService service.
@@ -47,6 +49,8 @@ type KnowledgeBaseServiceClient interface {
 	CreateVersion(ctx context.Context, in *CreateVersionRequest, opts ...grpc.CallOption) (*CreateVersionResponse, error)
 	ListVersions(ctx context.Context, in *ListVersionsRequest, opts ...grpc.CallOption) (*ListVersionsResponse, error)
 	RollbackVersion(ctx context.Context, in *RollbackVersionRequest, opts ...grpc.CallOption) (*RollbackVersionResponse, error)
+	ListKnowledgeBases(ctx context.Context, in *ListKnowledgeBasesRequest, opts ...grpc.CallOption) (*ListKnowledgeBasesResponse, error)
+	GetKnowledgeBase(ctx context.Context, in *GetKnowledgeBaseRequest, opts ...grpc.CallOption) (*GetKnowledgeBaseResponse, error)
 }
 
 type knowledgeBaseServiceClient struct {
@@ -107,6 +111,26 @@ func (c *knowledgeBaseServiceClient) RollbackVersion(ctx context.Context, in *Ro
 	return out, nil
 }
 
+func (c *knowledgeBaseServiceClient) ListKnowledgeBases(ctx context.Context, in *ListKnowledgeBasesRequest, opts ...grpc.CallOption) (*ListKnowledgeBasesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListKnowledgeBasesResponse)
+	err := c.cc.Invoke(ctx, KnowledgeBaseService_ListKnowledgeBases_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *knowledgeBaseServiceClient) GetKnowledgeBase(ctx context.Context, in *GetKnowledgeBaseRequest, opts ...grpc.CallOption) (*GetKnowledgeBaseResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetKnowledgeBaseResponse)
+	err := c.cc.Invoke(ctx, KnowledgeBaseService_GetKnowledgeBase_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KnowledgeBaseServiceServer is the server API for KnowledgeBaseService service.
 // All implementations must embed UnimplementedKnowledgeBaseServiceServer
 // for forward compatibility.
@@ -116,6 +140,8 @@ type KnowledgeBaseServiceServer interface {
 	CreateVersion(context.Context, *CreateVersionRequest) (*CreateVersionResponse, error)
 	ListVersions(context.Context, *ListVersionsRequest) (*ListVersionsResponse, error)
 	RollbackVersion(context.Context, *RollbackVersionRequest) (*RollbackVersionResponse, error)
+	ListKnowledgeBases(context.Context, *ListKnowledgeBasesRequest) (*ListKnowledgeBasesResponse, error)
+	GetKnowledgeBase(context.Context, *GetKnowledgeBaseRequest) (*GetKnowledgeBaseResponse, error)
 	mustEmbedUnimplementedKnowledgeBaseServiceServer()
 }
 
@@ -140,6 +166,12 @@ func (UnimplementedKnowledgeBaseServiceServer) ListVersions(context.Context, *Li
 }
 func (UnimplementedKnowledgeBaseServiceServer) RollbackVersion(context.Context, *RollbackVersionRequest) (*RollbackVersionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RollbackVersion not implemented")
+}
+func (UnimplementedKnowledgeBaseServiceServer) ListKnowledgeBases(context.Context, *ListKnowledgeBasesRequest) (*ListKnowledgeBasesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListKnowledgeBases not implemented")
+}
+func (UnimplementedKnowledgeBaseServiceServer) GetKnowledgeBase(context.Context, *GetKnowledgeBaseRequest) (*GetKnowledgeBaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetKnowledgeBase not implemented")
 }
 func (UnimplementedKnowledgeBaseServiceServer) mustEmbedUnimplementedKnowledgeBaseServiceServer() {}
 func (UnimplementedKnowledgeBaseServiceServer) testEmbeddedByValue()                              {}
@@ -252,6 +284,42 @@ func _KnowledgeBaseService_RollbackVersion_Handler(srv interface{}, ctx context.
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KnowledgeBaseService_ListKnowledgeBases_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListKnowledgeBasesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KnowledgeBaseServiceServer).ListKnowledgeBases(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KnowledgeBaseService_ListKnowledgeBases_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KnowledgeBaseServiceServer).ListKnowledgeBases(ctx, req.(*ListKnowledgeBasesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KnowledgeBaseService_GetKnowledgeBase_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetKnowledgeBaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KnowledgeBaseServiceServer).GetKnowledgeBase(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KnowledgeBaseService_GetKnowledgeBase_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KnowledgeBaseServiceServer).GetKnowledgeBase(ctx, req.(*GetKnowledgeBaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KnowledgeBaseService_ServiceDesc is the grpc.ServiceDesc for KnowledgeBaseService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -278,6 +346,14 @@ var KnowledgeBaseService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RollbackVersion",
 			Handler:    _KnowledgeBaseService_RollbackVersion_Handler,
+		},
+		{
+			MethodName: "ListKnowledgeBases",
+			Handler:    _KnowledgeBaseService_ListKnowledgeBases_Handler,
+		},
+		{
+			MethodName: "GetKnowledgeBase",
+			Handler:    _KnowledgeBaseService_GetKnowledgeBase_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

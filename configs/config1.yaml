@@ -12,6 +12,7 @@ node:
   grpc_addr: "0.0.0.0:7000"         # KnowledgeBaseService / QueryService / AdminService
   raft_addr: "0.0.0.0:8000"         # Raft internal communication
   metrics_addr: "0.0.0.0:9000"      # Prometheus /metrics
+  gateway_http_addr: "0.0.0.0:8081" # stratum-gateway HTTP (web console + REST /api)
 
 raft:
   peers:

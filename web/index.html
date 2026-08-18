@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stratum 控制台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='3' y='4' width='18' height='4' rx='1' fill='%2300aaff'/%3E%3Crect x='3' y='10' width='18' height='4' rx='1' fill='%2300aaff' opacity='.6'/%3E%3Crect x='3' y='16' width='18' height='4' rx='1' fill='%2300aaff' opacity='.3'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="3" y="4" width="18" height="4" rx="1"/>
+        <rect x="3" y="10" width="18" height="4" rx="1" opacity=".6"/>
+        <rect x="3" y="16" width="18" height="4" rx="1" opacity=".3"/>
+      </svg>
+      <span>Stratum <em>控制台</em></span>
+    </div>
+    <div class="topbar-right">
+      <span id="health-badge" class="badge badge-gray"><span class="dot"></span><span id="health-text">连接中…</span></span>
+      <span id="health-details" class="muted"></span>
+      <span id="last-refresh" class="muted"></span>
+      <button id="refresh-btn" class="btn btn-ghost">
+        <svg class="icon-refresh" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M20 3v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        刷新
+      </button>
+    </div>
+  </header>
+
+  <nav class="sidebar">
+    <button class="nav-item active" data-page="overview">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.8"/><rect x="13" y="3" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="13" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.8"/><rect x="13" y="13" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+      总览
+    </button>
+    <button class="nav-item" data-page="kb">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 6v6c0 1.66 3.58 3 8 3s8-1.34 8-3V6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M4 12v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+      知识库
+    </button>
+    <button class="nav-item" data-page="query">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      检索
+    </button>
+  </nav>
+
+  <main class="content">
+    <div id="error-banner" class="error-banner hidden">
+      <span id="error-banner-text"></span>
+      <button id="error-banner-close" class="banner-close" aria-label="关闭">×</button>
+    </div>
+
+    <!-- ============ 总览 ============ -->
+    <section id="page-overview" class="page">
+      <div class="grid">
+        <div class="card health-card" id="health-card">
+          <h2>健康状态</h2>
+          <div class="health-status" id="health-status">—</div>
+          <div class="muted" id="health-details-big"></div>
+        </div>
+
+        <div class="card">
+          <h2>资源使用</h2>
+          <dl class="kv">
+            <div><dt>已加载索引数</dt><dd id="res-loaded-index">—</dd></div>
+            <div><dt>chunk store</dt><dd id="res-chunk-bytes">—</dd></div>
+            <div><dt>doc store</dt><dd id="res-doc-bytes">—</dd></div>
+          </dl>
+        </div>
+
+        <div class="card">
+          <h2>长期 FAILED 版本</h2>
+          <ul id="stuck-versions" class="list"></ul>
+        </div>
+
+        <div class="card">
+          <h2>DeleteFailed 知识库</h2>
+          <ul id="delete-failed" class="list"></ul>
+        </div>
+
+        <div class="card">
+          <h2>WAL 重放告警</h2>
+          <ul id="wal-alerts" class="list"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 知识库 ============ -->
+    <section id="page-kb" class="page hidden">
+      <div class="kb-layout">
+        <div class="kb-left">
+          <button id="toggle-create-kb" class="btn btn-create">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            新建知识库
+          </button>
+
+          <div id="create-kb-panel" class="collapse">
+            <div class="collapse-inner">
+              <div class="card">
+                <h2>新建知识库</h2>
+                <form id="create-kb-form" class="form">
+                  <label>名称<input name="name" required placeholder="例如：产品文档库"></label>
+                  <fieldset>
+                    <legend>切割参数</legend>
+                    <div class="field-row">
+                      <label>窗口大小<input name="chunk_window_size" type="number" value="512"></label>
+                      <label>重叠大小<input name="chunk_overlap_size" type="number" value="64"></label>
+                    </div>
+                  </fieldset>
+                  <fieldset>
+                    <legend>索引与相似度</legend>
+                    <div class="field-row">
+                      <label>索引类型
+                        <select name="index_type">
+                          <option value="INDEX_TYPE_HNSW">HNSW</option>
+                          <option value="INDEX_TYPE_IVF" disabled>IVF（预留）</option>
+                          <option value="INDEX_TYPE_FLAT" disabled>FLAT（预留）</option>
+                        </select>
+                      </label>
+                      <label>相似度
+                        <select name="similarity">
+                          <option value="SIMILARITY_COSINE">COSINE</option>
+                          <option value="SIMILARITY_EUCLIDEAN">EUCLIDEAN</option>
+                          <option value="SIMILARITY_INNER_PRODUCT">INNER_PRODUCT</option>
+                        </select>
+                      </label>
+                    </div>
+                  </fieldset>
+                  <fieldset>
+                    <legend>embed 配置</legend>
+                    <label>服务地址<input name="service_addr" placeholder="http://localhost:8080"></label>
+                    <label>模型 ID<input name="model_id" required></label>
+                  </fieldset>
+                  <div class="form-actions">
+                    <button type="button" id="cancel-create-kb" class="btn">取消</button>
+                    <button type="submit" class="btn btn-primary">创建</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>知识库列表</h2>
+            <ul id="kb-list" class="list"></ul>
+          </div>
+        </div>
+
+        <div class="kb-right">
+          <!-- 空态：未选择时显示，选择后消失 -->
+          <div id="kb-empty" class="empty-state">
+            <svg viewBox="0 0 120 120" aria-hidden="true" class="empty-art">
+              <ellipse cx="60" cy="34" rx="34" ry="12" fill="none" stroke="currentColor" stroke-width="2"/>
+              <path d="M26 34v24c0 6.6 15.2 12 34 12s34-5.4 34-12V34" fill="none" stroke="currentColor" stroke-width="2" opacity=".6"/>
+              <path d="M26 58v24c0 6.6 15.2 12 34 12s34-5.4 34-12V58" fill="none" stroke="currentColor" stroke-width="2" opacity=".3"/>
+              <circle cx="60" cy="60" r="52" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 6" opacity=".35"/>
+            </svg>
+            <p class="empty-title">未选择知识库</p>
+            <p class="empty-hint">从左侧列表选择一个知识库，查看版本链并管理文档变更</p>
+          </div>
+
+          <!-- 详情：选择后出现 -->
+          <div id="kb-detail" class="card hidden">
+            <div class="row space-between">
+              <h2 id="kb-detail-title">—</h2>
+              <button id="delete-kb-btn" class="btn btn-danger">删除知识库</button>
+            </div>
+            <div id="kb-detail-meta" class="muted"></div>
+
+            <h3>版本链</h3>
+            <div id="kb-versions" class="versions"></div>
+
+            <h3>创建版本</h3>
+            <form id="create-version-form" class="form">
+              <label>父版本
+                <select name="parent_version_id" id="parent-version-select"></select>
+              </label>
+              <div id="changes-editor"></div>
+              <div class="changes-empty" id="changes-empty">
+                尚无文档变更 —— 点击下方按钮添加 ADD / UPDATE / DELETE 操作
+              </div>
+              <div class="form-actions">
+                <button type="button" id="add-change-btn" class="btn">＋ 添加一条变更</button>
+                <button type="submit" class="btn btn-primary">创建版本</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 检索 ============ -->
+    <section id="page-query" class="page hidden">
+      <div class="query-layout">
+        <div class="card">
+          <h2>向量检索</h2>
+          <form id="query-form" class="form">
+            <label>知识库 ID<input name="knowledge_base_id" required list="kb-datalist" placeholder="选择或输入 kb_id"></label>
+            <label>版本
+              <select id="query-version-mode">
+                <option value="active">活跃版本（默认）</option>
+                <option value="specific">指定版本</option>
+              </select>
+            </label>
+            <!-- 仅「指定版本」时滑入 -->
+            <div id="query-version-id-field" class="collapse">
+              <div class="collapse-inner">
+                <label>版本 ID<input name="version_id" type="number" min="1" placeholder="输入版本号"></label>
+              </div>
+            </div>
+            <label>top_k<input name="top_k" type="number" value="10" min="1"></label>
+            <details class="advanced">
+              <summary>高级选项</summary>
+              <div class="advanced-body">
+                <label>相似度阈值（可选）<input name="threshold" type="number" step="0.01"></label>
+                <label>聚合方式
+                  <select name="aggregation">
+                    <option value="AGGREGATION_METHOD_MEDIAN">MEDIAN（默认）</option>
+                    <option value="AGGREGATION_METHOD_MAX">MAX</option>
+                    <option value="AGGREGATION_METHOD_MEAN">MEAN</option>
+                  </select>
+                </label>
+              </div>
+            </details>
+            <label>查询向量（JSON 数组）
+              <textarea name="vector" rows="3" placeholder='[0.1, 0.2, 0.3, ...]'></textarea>
+            </label>
+            <button type="submit" class="btn btn-primary" id="query-submit">检索</button>
+          </form>
+          <datalist id="kb-datalist"></datalist>
+        </div>
+
+        <div class="card">
+          <h2>结果 <span id="query-version" class="muted"></span></h2>
+          <div id="query-empty" class="empty-state small">
+            <svg viewBox="0 0 120 120" aria-hidden="true" class="empty-art">
+              <circle cx="54" cy="54" r="26" fill="none" stroke="currentColor" stroke-width="2"/>
+              <path d="M73 73l20 20" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+              <circle cx="54" cy="54" r="46" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 6" opacity=".35"/>
+            </svg>
+            <p class="empty-hint">提交一次检索后，命中的文档会显示在这里</p>
+          </div>
+          <div id="query-results" class="results"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>

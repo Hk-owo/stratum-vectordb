@@ -262,3 +262,115 @@ func TestKnowledgeBaseService_ProtoConversion(t *testing.T) {
 		t.Error("round-trip broken")
 	}
 }
+
+func TestKnowledgeBaseService_ListKnowledgeBases(t *testing.T) {
+	h := newKBSvcTestHarness()
+	ctx := context.Background()
+
+	resp, err := h.svc.ListKnowledgeBases(ctx, &pb.ListKnowledgeBasesRequest{})
+	if err != nil {
+		t.Fatalf("ListKnowledgeBases on empty store: %v", err)
+	}
+	if len(resp.KnowledgeBases) != 0 {
+		t.Fatalf("expected 0 KBs initially, got %d", len(resp.KnowledgeBases))
+	}
+
+	for _, name := range []string{"kb-a", "kb-b"} {
+		if _, err := h.svc.CreateKnowledgeBase(ctx, &pb.CreateKnowledgeBaseRequest{
+			Name: name, ChunkWindowSize: 512, ChunkOverlapSize: 64,
+			EmbedConfig: &pb.EmbedConfig{ServiceAddr: "x", ModelId: "m1"},
+		}); err != nil {
+			t.Fatalf("CreateKnowledgeBase(%s): %v", name, err)
+		}
+	}
+
+	resp, err = h.svc.ListKnowledgeBases(ctx, &pb.ListKnowledgeBasesRequest{})
+	if err != nil {
+		t.Fatalf("ListKnowledgeBases: %v", err)
+	}
+	if len(resp.KnowledgeBases) != 2 {
+		t.Fatalf("expected 2 KBs, got %d", len(resp.KnowledgeBases))
+	}
+}
+
+func TestKnowledgeBaseService_GetKnowledgeBase_And_ProtoConversions(t *testing.T) {
+	h := newKBSvcTestHarness()
+	ctx := context.Background()
+
+	// Seed KBs directly through the mock raft to cover every enum branch
+	// of the proto conversion helpers.
+	for _, tc := range []struct {
+		kbID       string
+		indexType  string
+		similarity string
+		status     types.KBStatus
+	}{
+		{"kb-hnsw", "HNSW", "COSINE", types.KBStatusActive},
+		{"kb-ivf", "IVF", "EUCLIDEAN", types.KBStatusDeleting},
+		{"kb-flat", "FLAT", "INNER_PRODUCT", types.KBStatusDeleteFailed},
+		{"kb-unknown", "NOT_A_REAL_TYPE", "NOT_A_REAL_SIM", types.KBStatus(42)},
+	} {
+		kb := types.KnowledgeBaseMeta{
+			KBID: tc.kbID, Name: tc.kbID, ChunkWindowSize: 512, ChunkOverlapSize: 64,
+			IndexType: tc.indexType, Similarity: tc.similarity,
+			EmbedConfig:     types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
+			ActiveVersionID: 1,
+			Status:          tc.status,
+		}
+		if err := h.raftNode.ProposeCreateKB(ctx, kb); err != nil {
+			t.Fatalf("ProposeCreateKB(%s): %v", tc.kbID, err)
+		}
+	}
+
+	// GetKnowledgeBase + kbToProto conversions.
+	got, err := h.svc.GetKnowledgeBase(ctx, &pb.GetKnowledgeBaseRequest{KnowledgeBaseId: "kb-ivf"})
+	if err != nil {
+		t.Fatalf("GetKnowledgeBase: %v", err)
+	}
+	if got.KnowledgeBase.IndexType != pb.IndexType_INDEX_TYPE_IVF {
+		t.Errorf("IndexType = %v, want IVF", got.KnowledgeBase.IndexType)
+	}
+	if got.KnowledgeBase.Similarity != pb.Similarity_SIMILARITY_EUCLIDEAN {
+		t.Errorf("Similarity = %v, want EUCLIDEAN", got.KnowledgeBase.Similarity)
+	}
+	if got.KnowledgeBase.Status != pb.KBStatus_KB_STATUS_DELETING {
+		t.Errorf("Status = %v, want DELETING", got.KnowledgeBase.Status)
+	}
+	if got.KnowledgeBase.EmbedConfig.ServiceAddr != "x" || got.KnowledgeBase.EmbedConfig.ModelId != "m1" {
+		t.Errorf("EmbedConfig = %+v", got.KnowledgeBase.EmbedConfig)
+	}
+	if got.KnowledgeBase.ActiveVersionId != 1 {
+		t.Errorf("ActiveVersionId = %d, want 1", got.KnowledgeBase.ActiveVersionId)
+	}
+
+	// Unknown strings fall back to HNSW/COSINE; unknown status to ACTIVE.
+	gotUnknown, err := h.svc.GetKnowledgeBase(ctx, &pb.GetKnowledgeBaseRequest{KnowledgeBaseId: "kb-unknown"})
+	if err != nil {
+		t.Fatalf("GetKnowledgeBase(unknown): %v", err)
+	}
+	if gotUnknown.KnowledgeBase.IndexType != pb.IndexType_INDEX_TYPE_HNSW {
+		t.Errorf("unknown IndexType = %v, want HNSW fallback", gotUnknown.KnowledgeBase.IndexType)
+	}
+	if gotUnknown.KnowledgeBase.Similarity != pb.Similarity_SIMILARITY_COSINE {
+		t.Errorf("unknown Similarity = %v, want COSINE fallback", gotUnknown.KnowledgeBase.Similarity)
+	}
+	if gotUnknown.KnowledgeBase.Status != pb.KBStatus_KB_STATUS_ACTIVE {
+		t.Errorf("unknown Status = %v, want ACTIVE fallback", gotUnknown.KnowledgeBase.Status)
+	}
+
+	// GetKnowledgeBase on an unknown ID must map to a NotFound gRPC status.
+	if _, err := h.svc.GetKnowledgeBase(ctx, &pb.GetKnowledgeBaseRequest{KnowledgeBaseId: "nope"}); err == nil {
+		t.Fatal("expected error for unknown KB")
+	}
+
+	// FLAT / INNER_PRODUCT / DELETE_FAILED conversion branches.
+	gotFlat, err := h.svc.GetKnowledgeBase(ctx, &pb.GetKnowledgeBaseRequest{KnowledgeBaseId: "kb-flat"})
+	if err != nil {
+		t.Fatalf("GetKnowledgeBase(flat): %v", err)
+	}
+	if gotFlat.KnowledgeBase.IndexType != pb.IndexType_INDEX_TYPE_FLAT ||
+		gotFlat.KnowledgeBase.Similarity != pb.Similarity_SIMILARITY_INNER_PRODUCT ||
+		gotFlat.KnowledgeBase.Status != pb.KBStatus_KB_STATUS_DELETE_FAILED {
+		t.Errorf("flat/deleted conversion = %+v", gotFlat.KnowledgeBase)
+	}
+}

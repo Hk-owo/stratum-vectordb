@@ -31,6 +31,7 @@ const (
 	ChunkStorageService_Exists_FullMethodName         = "/vecstore.ChunkStorageService/Exists"
 	ChunkStorageService_Delete_FullMethodName         = "/vecstore.ChunkStorageService/Delete"
 	ChunkStorageService_DeleteByPrefix_FullMethodName = "/vecstore.ChunkStorageService/DeleteByPrefix"
+	ChunkStorageService_DiskUsage_FullMethodName      = "/vecstore.ChunkStorageService/DiskUsage"
 )
 
 // ChunkStorageServiceClient is the client API for ChunkStorageService service.
@@ -42,6 +43,7 @@ type ChunkStorageServiceClient interface {
 	Exists(ctx context.Context, in *ExistsChunkRequest, opts ...grpc.CallOption) (*ExistsChunkResponse, error)
 	Delete(ctx context.Context, in *DeleteChunkRequest, opts ...grpc.CallOption) (*DeleteChunkResponse, error)
 	DeleteByPrefix(ctx context.Context, in *DeleteByPrefixRequest, opts ...grpc.CallOption) (*DeleteByPrefixResponse, error)
+	DiskUsage(ctx context.Context, in *DiskUsageRequest, opts ...grpc.CallOption) (*DiskUsageResponse, error)
 }
 
 type chunkStorageServiceClient struct {
@@ -102,6 +104,16 @@ func (c *chunkStorageServiceClient) DeleteByPrefix(ctx context.Context, in *Dele
 	return out, nil
 }
 
+func (c *chunkStorageServiceClient) DiskUsage(ctx context.Context, in *DiskUsageRequest, opts ...grpc.CallOption) (*DiskUsageResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DiskUsageResponse)
+	err := c.cc.Invoke(ctx, ChunkStorageService_DiskUsage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ChunkStorageServiceServer is the server API for ChunkStorageService service.
 // All implementations must embed UnimplementedChunkStorageServiceServer
 // for forward compatibility.
@@ -111,6 +123,7 @@ type ChunkStorageServiceServer interface {
 	Exists(context.Context, *ExistsChunkRequest) (*ExistsChunkResponse, error)
 	Delete(context.Context, *DeleteChunkRequest) (*DeleteChunkResponse, error)
 	DeleteByPrefix(context.Context, *DeleteByPrefixRequest) (*DeleteByPrefixResponse, error)
+	DiskUsage(context.Context, *DiskUsageRequest) (*DiskUsageResponse, error)
 	mustEmbedUnimplementedChunkStorageServiceServer()
 }
 
@@ -135,6 +148,9 @@ func (UnimplementedChunkStorageServiceServer) Delete(context.Context, *DeleteChu
 }
 func (UnimplementedChunkStorageServiceServer) DeleteByPrefix(context.Context, *DeleteByPrefixRequest) (*DeleteByPrefixResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteByPrefix not implemented")
+}
+func (UnimplementedChunkStorageServiceServer) DiskUsage(context.Context, *DiskUsageRequest) (*DiskUsageResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DiskUsage not implemented")
 }
 func (UnimplementedChunkStorageServiceServer) mustEmbedUnimplementedChunkStorageServiceServer() {}
 func (UnimplementedChunkStorageServiceServer) testEmbeddedByValue()                             {}
@@ -247,6 +263,24 @@ func _ChunkStorageService_DeleteByPrefix_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ChunkStorageService_DiskUsage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DiskUsageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ChunkStorageServiceServer).DiskUsage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ChunkStorageService_DiskUsage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ChunkStorageServiceServer).DiskUsage(ctx, req.(*DiskUsageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ChunkStorageService_ServiceDesc is the grpc.ServiceDesc for ChunkStorageService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -274,17 +308,22 @@ var ChunkStorageService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "DeleteByPrefix",
 			Handler:    _ChunkStorageService_DeleteByPrefix_Handler,
 		},
+		{
+			MethodName: "DiskUsage",
+			Handler:    _ChunkStorageService_DiskUsage_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "vecstore.proto",
 }
 
 const (
-	VectorIndexService_Build_FullMethodName  = "/vecstore.VectorIndexService/Build"
-	VectorIndexService_Search_FullMethodName = "/vecstore.VectorIndexService/Search"
-	VectorIndexService_Save_FullMethodName   = "/vecstore.VectorIndexService/Save"
-	VectorIndexService_Load_FullMethodName   = "/vecstore.VectorIndexService/Load"
-	VectorIndexService_Reset_FullMethodName  = "/vecstore.VectorIndexService/Reset"
+	VectorIndexService_Build_FullMethodName     = "/vecstore.VectorIndexService/Build"
+	VectorIndexService_AddChunks_FullMethodName = "/vecstore.VectorIndexService/AddChunks"
+	VectorIndexService_Search_FullMethodName    = "/vecstore.VectorIndexService/Search"
+	VectorIndexService_Save_FullMethodName      = "/vecstore.VectorIndexService/Save"
+	VectorIndexService_Load_FullMethodName      = "/vecstore.VectorIndexService/Load"
+	VectorIndexService_Reset_FullMethodName     = "/vecstore.VectorIndexService/Reset"
 )
 
 // VectorIndexServiceClient is the client API for VectorIndexService service.
@@ -292,6 +331,11 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type VectorIndexServiceClient interface {
 	Build(ctx context.Context, in *BuildIndexRequest, opts ...grpc.CallOption) (*BuildIndexResponse, error)
+	// AddChunks appends chunk vectors to an index already opened (or created
+	// on first call) for (kb_id, version_id). The Go side splits a large
+	// build into one Build call followed by one or more AddChunks calls so a
+	// single gRPC message never exceeds the default 4 MiB limit.
+	AddChunks(ctx context.Context, in *AddChunksRequest, opts ...grpc.CallOption) (*AddChunksResponse, error)
 	Search(ctx context.Context, in *SearchIndexRequest, opts ...grpc.CallOption) (*SearchIndexResponse, error)
 	Save(ctx context.Context, in *SaveIndexRequest, opts ...grpc.CallOption) (*SaveIndexResponse, error)
 	Load(ctx context.Context, in *LoadIndexRequest, opts ...grpc.CallOption) (*LoadIndexResponse, error)
@@ -310,6 +354,16 @@ func (c *vectorIndexServiceClient) Build(ctx context.Context, in *BuildIndexRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BuildIndexResponse)
 	err := c.cc.Invoke(ctx, VectorIndexService_Build_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vectorIndexServiceClient) AddChunks(ctx context.Context, in *AddChunksRequest, opts ...grpc.CallOption) (*AddChunksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AddChunksResponse)
+	err := c.cc.Invoke(ctx, VectorIndexService_AddChunks_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -361,6 +415,11 @@ func (c *vectorIndexServiceClient) Reset(ctx context.Context, in *ResetIndexRequ
 // for forward compatibility.
 type VectorIndexServiceServer interface {
 	Build(context.Context, *BuildIndexRequest) (*BuildIndexResponse, error)
+	// AddChunks appends chunk vectors to an index already opened (or created
+	// on first call) for (kb_id, version_id). The Go side splits a large
+	// build into one Build call followed by one or more AddChunks calls so a
+	// single gRPC message never exceeds the default 4 MiB limit.
+	AddChunks(context.Context, *AddChunksRequest) (*AddChunksResponse, error)
 	Search(context.Context, *SearchIndexRequest) (*SearchIndexResponse, error)
 	Save(context.Context, *SaveIndexRequest) (*SaveIndexResponse, error)
 	Load(context.Context, *LoadIndexRequest) (*LoadIndexResponse, error)
@@ -377,6 +436,9 @@ type UnimplementedVectorIndexServiceServer struct{}
 
 func (UnimplementedVectorIndexServiceServer) Build(context.Context, *BuildIndexRequest) (*BuildIndexResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Build not implemented")
+}
+func (UnimplementedVectorIndexServiceServer) AddChunks(context.Context, *AddChunksRequest) (*AddChunksResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddChunks not implemented")
 }
 func (UnimplementedVectorIndexServiceServer) Search(context.Context, *SearchIndexRequest) (*SearchIndexResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Search not implemented")
@@ -425,6 +487,24 @@ func _VectorIndexService_Build_Handler(srv interface{}, ctx context.Context, dec
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VectorIndexServiceServer).Build(ctx, req.(*BuildIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VectorIndexService_AddChunks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddChunksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VectorIndexServiceServer).AddChunks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VectorIndexService_AddChunks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VectorIndexServiceServer).AddChunks(ctx, req.(*AddChunksRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -511,6 +591,10 @@ var VectorIndexService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Build",
 			Handler:    _VectorIndexService_Build_Handler,
+		},
+		{
+			MethodName: "AddChunks",
+			Handler:    _VectorIndexService_AddChunks_Handler,
 		},
 		{
 			MethodName: "Search",

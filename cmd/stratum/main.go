@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/grpc"
 
 	pb "stratum/api/proto/stratum"
+	vecstorepb "stratum/api/proto/vecstore"
 	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
@@ -45,14 +47,39 @@ func main() {
 
 	logger.Info("Stratum starting")
 
+	// --- Flags ---
+	// Minimal flag surface for local/dev runs (the one-click startup script
+	// and ad-hoc manual runs). Defaults match defaultConfig(); in a full
+	// deployment these would come from a config file (configs/config1.yaml).
+	dataDirFlag := flag.String("data-dir", "", "data directory (default /var/lib/stratum/node1)")
+	grpcAddrFlag := flag.String("grpc-addr", "", "gRPC listen address (default 0.0.0.0:7000)")
+	vecstoreAddrFlag := flag.String("vecstore-addr", "", "vecstore gRPC address (default 127.0.0.1:7100)")
+	embedAddrFlag := flag.String("embed-addr", "", "embed service address (default http://localhost:8080)")
+	flag.Parse()
+
 	// --- Configuration ---
 	// In a real deployment, this would be loaded from a YAML config file
 	// (see configs/config1.yaml). For now, use hardcoded defaults that
-	// match the sample config.
+	// match the sample config, overridable via flags for local runs.
 	cfg := defaultConfig()
+	if *dataDirFlag != "" {
+		cfg.DataDir = *dataDirFlag
+	}
+	if *grpcAddrFlag != "" {
+		cfg.GRPCAddr = *grpcAddrFlag
+	}
+	if *vecstoreAddrFlag != "" {
+		cfg.VecstoreGRPCAddr = *vecstoreAddrFlag
+	}
+	if *embedAddrFlag != "" {
+		cfg.EmbedServiceAddr = *embedAddrFlag
+	}
 	dataDir := cfg.DataDir
 	if dataDir == "" {
 		dataDir = "/var/lib/stratum/node1"
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		logger.Fatal("failed to create data directory", zap.String("path", dataDir), zap.Error(err))
 	}
 
 	// --- Storage paths ---
@@ -135,6 +162,25 @@ func main() {
 		VecstoreAddr:        vecstoreAddr,
 	})
 	indexMgr.SetLogger(logger.Named("index"))
+	// Build data sources: the IndexManager's async build reads the
+	// version's document set from VersionDocList, reverse-looks-up chunk
+	// IDs via ChunkDocMapper, and pulls each chunk vector from the
+	// vecstore's ChunkStorageService (the same keys the write path used).
+	// Without this wiring the build goroutine would invoke nil callbacks
+	// and crash the process on the first CreateVersion.
+	indexMgr.SetBuildDataSources(
+		vd.ListDocIDs,
+		cdm.ListChunkIDsByDocs,
+		func(ctx context.Context, kbID, chunkID string) ([]float32, error) {
+			resp, err := chunkStore.VecstoreClient().Read(ctx, &vecstorepb.ReadChunkRequest{
+				Key: chunkstore.EncodeKey(kbID, chunkID),
+			})
+			if err != nil {
+				return nil, err
+			}
+			return resp.GetVector(), nil
+		},
+	)
 	indexMgr.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
 		return raftImpl.ProposeUpdateVersionStatus(context.Background(), versionID, status)
 	})
@@ -202,22 +248,62 @@ func main() {
 				zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
 			return
 		}
+		// 本节点就是 leader:存储层数据已由写路径直接落盘,无需(也不应)
+		// 向自己发起拉取。尤其关键的是重启后 raft 重放历史日志时,每条
+		// CreateVersion 都会走"非本节点提案"分支触发本回调;若在此处向
+		// 不可达的 leader 地址发起阻塞式 PullVersion,整个 apply 循环会
+		// 卡死,后续所有日志永远无法应用。
+		if status.LeaderID == cfg.NodeID {
+			return
+		}
 		leaderAddr, ok := peerAddrByID[status.LeaderID]
 		if !ok {
 			logger.Error("sync: leader address unknown for node ID",
 				zap.Int64("leader_id", status.LeaderID))
 			return
 		}
-		if err := syncFollower.PullVersion(ctx, leaderAddr, kbID, versionID); err != nil {
-			logger.Error("sync: PullVersion failed",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+
+		if versionID <= 1 {
+			// Initial version, created by CreateKnowledgeBase with no
+			// document changes: there is nothing to pull, and no digest is
+			// ever committed for it. Pull once (a no-op stream) and done.
+			_ = syncFollower.PullVersion(ctx, leaderAddr, kbID, versionID)
+			return
+		}
+
+		// Pull with digest verification, retrying until the data is
+		// complete. The leader commits the version's document-ID set hash
+		// (VersionMeta.DocIDSetHash) only after its storage writes finish,
+		// so this node recomputes the hash from its local store after each
+		// pull and retries until it matches — closing the race where the
+		// pull arrives before the leader's writes land. If the digest never
+		// arrives (a missed propose on the leader), a pull that produced
+		// data is accepted (verifyVersionPull's fallback).
+		deadline := time.Now().Add(30 * time.Second)
+		backoff := 200 * time.Millisecond
+		for {
+			if err := syncFollower.PullVersion(ctx, leaderAddr, kbID, versionID); err != nil {
+				logger.Warn("sync: PullVersion failed, will retry",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			} else if verifyVersionPull(ctx, raftImpl, vd, kbID, versionID) {
+				return
+			}
+			if time.Now().After(deadline) {
+				logger.Error("sync: version data pull did not converge",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+				return
+			}
+			time.Sleep(backoff)
+			if backoff < 5*time.Second {
+				backoff *= 2
+			}
 		}
 	})
 
 	// --- gRPC services ---
 	kbSvc := service.NewKnowledgeBaseService(raftImpl, writeCoord, deleteCoord)
 	querySvc := service.NewQueryService(raftImpl, indexMgr, cdm, vd, ds, versionBloom)
-	adminSvc := service.NewAdminService(raftImpl, indexMgr, walImpl)
+	adminSvc := service.NewAdminService(raftImpl, indexMgr, ds, chunkStore, walImpl)
 
 	// --- gRPC server ---
 	grpcServer := grpc.NewServer()
@@ -247,6 +333,37 @@ func main() {
 	}
 
 	logger.Info("Stratum stopped")
+}
+
+// verifyVersionPull reports whether this node's local stores hold the
+// complete data for (kbID, versionID): the locally computed document-ID
+// set digest must match the digest the leader committed into the version
+// metadata (see sync.VerifyDocIDSet). If the leader has not committed a
+// digest yet (initial/empty version or a missed propose), a pull that
+// produced data is accepted.
+func verifyVersionPull(ctx context.Context, rn raft.RaftNode, vd versiondoc.VersionDocList, kbID string, versionID int64) bool {
+	var metaHash string
+	if versions, err := rn.ListVersions(ctx, kbID); err == nil {
+		for _, v := range versions {
+			if v.VersionID == versionID {
+				metaHash = v.DocIDSetHash
+				break
+			}
+		}
+	}
+
+	ok, _, err := sync.VerifyDocIDSet(ctx, vd, kbID, versionID, metaHash)
+	if err != nil {
+		return false
+	}
+	if ok {
+		return true
+	}
+	if metaHash == "" {
+		docs, err := vd.ListDocIDs(ctx, kbID, versionID)
+		return err == nil && len(docs) > 0
+	}
+	return false
 }
 
 // appConfig holds the startup configuration for a Stratum node.
@@ -280,7 +397,7 @@ func defaultConfig() appConfig {
 		GRPCAddr: "0.0.0.0:7000",
 		RaftAddr: "0.0.0.0:8000",
 		Peers: []raft.PeerConfig{
-			{ID: 1, RaftAddr: "node1:8000", ServiceAddr: "node1:7000"},
+			{ID: 1, RaftAddr: "127.0.0.1:8000", ServiceAddr: "127.0.0.1:7000"},
 		},
 
 		VecstoreGRPCAddr: "127.0.0.1:7100",

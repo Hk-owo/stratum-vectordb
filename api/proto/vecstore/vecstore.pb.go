@@ -527,6 +527,91 @@ func (*DeleteByPrefixResponse) Descriptor() ([]byte, []int) {
 	return file_vecstore_proto_rawDescGZIP(), []int{9}
 }
 
+type DiskUsageRequest struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+}
+
+func (x *DiskUsageRequest) Reset() {
+	*x = DiskUsageRequest{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_vecstore_proto_msgTypes[10]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *DiskUsageRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiskUsageRequest) ProtoMessage() {}
+
+func (x *DiskUsageRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vecstore_proto_msgTypes[10]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiskUsageRequest.ProtoReflect.Descriptor instead.
+func (*DiskUsageRequest) Descriptor() ([]byte, []int) {
+	return file_vecstore_proto_rawDescGZIP(), []int{10}
+}
+
+type DiskUsageResponse struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Bytes uint64 `protobuf:"varint,1,opt,name=bytes,proto3" json:"bytes,omitempty"`
+}
+
+func (x *DiskUsageResponse) Reset() {
+	*x = DiskUsageResponse{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_vecstore_proto_msgTypes[11]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *DiskUsageResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DiskUsageResponse) ProtoMessage() {}
+
+func (x *DiskUsageResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_vecstore_proto_msgTypes[11]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DiskUsageResponse.ProtoReflect.Descriptor instead.
+func (*DiskUsageResponse) Descriptor() ([]byte, []int) {
+	return file_vecstore_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *DiskUsageResponse) GetBytes() uint64 {
+	if x != nil {
+		return x.Bytes
+	}
+	return 0
+}
+
 type ChunkVectorProto struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -539,7 +624,7 @@ type ChunkVectorProto struct {
 func (x *ChunkVectorProto) Reset() {
 	*x = ChunkVectorProto{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[10]
+		mi := &file_vecstore_proto_msgTypes[12]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -552,7 +637,7 @@ func (x *ChunkVectorProto) String() string {
 func (*ChunkVectorProto) ProtoMessage() {}
 
 func (x *ChunkVectorProto) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[10]
+	mi := &file_vecstore_proto_msgTypes[12]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -565,7 +650,7 @@ func (x *ChunkVectorProto) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChunkVectorProto.ProtoReflect.Descriptor instead.
 func (*ChunkVectorProto) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{10}
+	return file_vecstore_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ChunkVectorProto) GetChunkId() string {
@@ -596,7 +681,7 @@ type BuildIndexRequest struct {
 func (x *BuildIndexRequest) Reset() {
 	*x = BuildIndexRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[11]
+		mi := &file_vecstore_proto_msgTypes[13]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -609,7 +694,7 @@ func (x *BuildIndexRequest) String() string {
 func (*BuildIndexRequest) ProtoMessage() {}
 
 func (x *BuildIndexRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[11]
+	mi := &file_vecstore_proto_msgTypes[13]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -622,7 +707,7 @@ func (x *BuildIndexRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BuildIndexRequest.ProtoReflect.Descriptor instead.
 func (*BuildIndexRequest) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{11}
+	return file_vecstore_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *BuildIndexRequest) GetKbId() string {
@@ -662,7 +747,7 @@ type BuildIndexResponse struct {
 func (x *BuildIndexResponse) Reset() {
 	*x = BuildIndexResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[12]
+		mi := &file_vecstore_proto_msgTypes[14]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -675,7 +760,7 @@ func (x *BuildIndexResponse) String() string {
 func (*BuildIndexResponse) ProtoMessage() {}
 
 func (x *BuildIndexResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[12]
+	mi := &file_vecstore_proto_msgTypes[14]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -688,7 +773,108 @@ func (x *BuildIndexResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BuildIndexResponse.ProtoReflect.Descriptor instead.
 func (*BuildIndexResponse) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{12}
+	return file_vecstore_proto_rawDescGZIP(), []int{14}
+}
+
+type AddChunksRequest struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	KbId      string              `protobuf:"bytes,1,opt,name=kb_id,json=kbId,proto3" json:"kb_id,omitempty"`
+	VersionId int64               `protobuf:"varint,2,opt,name=version_id,json=versionId,proto3" json:"version_id,omitempty"`
+	Chunks    []*ChunkVectorProto `protobuf:"bytes,3,rep,name=chunks,proto3" json:"chunks,omitempty"`
+}
+
+func (x *AddChunksRequest) Reset() {
+	*x = AddChunksRequest{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_vecstore_proto_msgTypes[15]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *AddChunksRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AddChunksRequest) ProtoMessage() {}
+
+func (x *AddChunksRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_vecstore_proto_msgTypes[15]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AddChunksRequest.ProtoReflect.Descriptor instead.
+func (*AddChunksRequest) Descriptor() ([]byte, []int) {
+	return file_vecstore_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *AddChunksRequest) GetKbId() string {
+	if x != nil {
+		return x.KbId
+	}
+	return ""
+}
+
+func (x *AddChunksRequest) GetVersionId() int64 {
+	if x != nil {
+		return x.VersionId
+	}
+	return 0
+}
+
+func (x *AddChunksRequest) GetChunks() []*ChunkVectorProto {
+	if x != nil {
+		return x.Chunks
+	}
+	return nil
+}
+
+type AddChunksResponse struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+}
+
+func (x *AddChunksResponse) Reset() {
+	*x = AddChunksResponse{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_vecstore_proto_msgTypes[16]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *AddChunksResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AddChunksResponse) ProtoMessage() {}
+
+func (x *AddChunksResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_vecstore_proto_msgTypes[16]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AddChunksResponse.ProtoReflect.Descriptor instead.
+func (*AddChunksResponse) Descriptor() ([]byte, []int) {
+	return file_vecstore_proto_rawDescGZIP(), []int{16}
 }
 
 type SearchIndexRequest struct {
@@ -705,7 +891,7 @@ type SearchIndexRequest struct {
 func (x *SearchIndexRequest) Reset() {
 	*x = SearchIndexRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[13]
+		mi := &file_vecstore_proto_msgTypes[17]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -718,7 +904,7 @@ func (x *SearchIndexRequest) String() string {
 func (*SearchIndexRequest) ProtoMessage() {}
 
 func (x *SearchIndexRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[13]
+	mi := &file_vecstore_proto_msgTypes[17]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -731,7 +917,7 @@ func (x *SearchIndexRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchIndexRequest.ProtoReflect.Descriptor instead.
 func (*SearchIndexRequest) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{13}
+	return file_vecstore_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *SearchIndexRequest) GetKbId() string {
@@ -774,7 +960,7 @@ type SearchResultProto struct {
 func (x *SearchResultProto) Reset() {
 	*x = SearchResultProto{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[14]
+		mi := &file_vecstore_proto_msgTypes[18]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -787,7 +973,7 @@ func (x *SearchResultProto) String() string {
 func (*SearchResultProto) ProtoMessage() {}
 
 func (x *SearchResultProto) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[14]
+	mi := &file_vecstore_proto_msgTypes[18]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -800,7 +986,7 @@ func (x *SearchResultProto) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchResultProto.ProtoReflect.Descriptor instead.
 func (*SearchResultProto) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{14}
+	return file_vecstore_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *SearchResultProto) GetChunkId() string {
@@ -828,7 +1014,7 @@ type SearchIndexResponse struct {
 func (x *SearchIndexResponse) Reset() {
 	*x = SearchIndexResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[15]
+		mi := &file_vecstore_proto_msgTypes[19]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -841,7 +1027,7 @@ func (x *SearchIndexResponse) String() string {
 func (*SearchIndexResponse) ProtoMessage() {}
 
 func (x *SearchIndexResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[15]
+	mi := &file_vecstore_proto_msgTypes[19]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -854,7 +1040,7 @@ func (x *SearchIndexResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchIndexResponse.ProtoReflect.Descriptor instead.
 func (*SearchIndexResponse) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{15}
+	return file_vecstore_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *SearchIndexResponse) GetResults() []*SearchResultProto {
@@ -877,7 +1063,7 @@ type SaveIndexRequest struct {
 func (x *SaveIndexRequest) Reset() {
 	*x = SaveIndexRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[16]
+		mi := &file_vecstore_proto_msgTypes[20]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -890,7 +1076,7 @@ func (x *SaveIndexRequest) String() string {
 func (*SaveIndexRequest) ProtoMessage() {}
 
 func (x *SaveIndexRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[16]
+	mi := &file_vecstore_proto_msgTypes[20]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -903,7 +1089,7 @@ func (x *SaveIndexRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SaveIndexRequest.ProtoReflect.Descriptor instead.
 func (*SaveIndexRequest) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{16}
+	return file_vecstore_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SaveIndexRequest) GetKbId() string {
@@ -936,7 +1122,7 @@ type SaveIndexResponse struct {
 func (x *SaveIndexResponse) Reset() {
 	*x = SaveIndexResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[17]
+		mi := &file_vecstore_proto_msgTypes[21]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -949,7 +1135,7 @@ func (x *SaveIndexResponse) String() string {
 func (*SaveIndexResponse) ProtoMessage() {}
 
 func (x *SaveIndexResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[17]
+	mi := &file_vecstore_proto_msgTypes[21]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -962,7 +1148,7 @@ func (x *SaveIndexResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SaveIndexResponse.ProtoReflect.Descriptor instead.
 func (*SaveIndexResponse) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{17}
+	return file_vecstore_proto_rawDescGZIP(), []int{21}
 }
 
 type LoadIndexRequest struct {
@@ -978,7 +1164,7 @@ type LoadIndexRequest struct {
 func (x *LoadIndexRequest) Reset() {
 	*x = LoadIndexRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[18]
+		mi := &file_vecstore_proto_msgTypes[22]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -991,7 +1177,7 @@ func (x *LoadIndexRequest) String() string {
 func (*LoadIndexRequest) ProtoMessage() {}
 
 func (x *LoadIndexRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[18]
+	mi := &file_vecstore_proto_msgTypes[22]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1004,7 +1190,7 @@ func (x *LoadIndexRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadIndexRequest.ProtoReflect.Descriptor instead.
 func (*LoadIndexRequest) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{18}
+	return file_vecstore_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *LoadIndexRequest) GetKbId() string {
@@ -1037,7 +1223,7 @@ type LoadIndexResponse struct {
 func (x *LoadIndexResponse) Reset() {
 	*x = LoadIndexResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[19]
+		mi := &file_vecstore_proto_msgTypes[23]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1050,7 +1236,7 @@ func (x *LoadIndexResponse) String() string {
 func (*LoadIndexResponse) ProtoMessage() {}
 
 func (x *LoadIndexResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[19]
+	mi := &file_vecstore_proto_msgTypes[23]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1063,7 +1249,7 @@ func (x *LoadIndexResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadIndexResponse.ProtoReflect.Descriptor instead.
 func (*LoadIndexResponse) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{19}
+	return file_vecstore_proto_rawDescGZIP(), []int{23}
 }
 
 type ResetIndexRequest struct {
@@ -1078,7 +1264,7 @@ type ResetIndexRequest struct {
 func (x *ResetIndexRequest) Reset() {
 	*x = ResetIndexRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[20]
+		mi := &file_vecstore_proto_msgTypes[24]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1091,7 +1277,7 @@ func (x *ResetIndexRequest) String() string {
 func (*ResetIndexRequest) ProtoMessage() {}
 
 func (x *ResetIndexRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[20]
+	mi := &file_vecstore_proto_msgTypes[24]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1104,7 +1290,7 @@ func (x *ResetIndexRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResetIndexRequest.ProtoReflect.Descriptor instead.
 func (*ResetIndexRequest) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{20}
+	return file_vecstore_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ResetIndexRequest) GetKbId() string {
@@ -1130,7 +1316,7 @@ type ResetIndexResponse struct {
 func (x *ResetIndexResponse) Reset() {
 	*x = ResetIndexResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_vecstore_proto_msgTypes[21]
+		mi := &file_vecstore_proto_msgTypes[25]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -1143,7 +1329,7 @@ func (x *ResetIndexResponse) String() string {
 func (*ResetIndexResponse) ProtoMessage() {}
 
 func (x *ResetIndexResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_vecstore_proto_msgTypes[21]
+	mi := &file_vecstore_proto_msgTypes[25]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1156,7 +1342,7 @@ func (x *ResetIndexResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResetIndexResponse.ProtoReflect.Descriptor instead.
 func (*ResetIndexResponse) Descriptor() ([]byte, []int) {
-	return file_vecstore_proto_rawDescGZIP(), []int{21}
+	return file_vecstore_proto_rawDescGZIP(), []int{25}
 }
 
 var File_vecstore_proto protoreflect.FileDescriptor
@@ -1188,23 +1374,36 @@ var file_vecstore_proto_rawDesc = []byte{
 	0x74, 0x12, 0x16, 0x0a, 0x06, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x18, 0x01, 0x20, 0x01, 0x28,
 	0x09, 0x52, 0x06, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x22, 0x18, 0x0a, 0x16, 0x44, 0x65, 0x6c,
 	0x65, 0x74, 0x65, 0x42, 0x79, 0x50, 0x72, 0x65, 0x66, 0x69, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f,
-	0x6e, 0x73, 0x65, 0x22, 0x45, 0x0a, 0x10, 0x43, 0x68, 0x75, 0x6e, 0x6b, 0x56, 0x65, 0x63, 0x74,
-	0x6f, 0x72, 0x50, 0x72, 0x6f, 0x74, 0x6f, 0x12, 0x19, 0x0a, 0x08, 0x63, 0x68, 0x75, 0x6e, 0x6b,
-	0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x63, 0x68, 0x75, 0x6e, 0x6b,
-	0x49, 0x64, 0x12, 0x16, 0x0a, 0x06, 0x76, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x18, 0x02, 0x20, 0x03,
-	0x28, 0x02, 0x52, 0x06, 0x76, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x22, 0xae, 0x01, 0x0a, 0x11, 0x42,
-	0x75, 0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74,
-	0x12, 0x13, 0x0a, 0x05, 0x6b, 0x62, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52,
-	0x04, 0x6b, 0x62, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e,
-	0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x03, 0x52, 0x09, 0x76, 0x65, 0x72, 0x73, 0x69,
-	0x6f, 0x6e, 0x49, 0x64, 0x12, 0x32, 0x0a, 0x06, 0x63, 0x68, 0x75, 0x6e, 0x6b, 0x73, 0x18, 0x03,
-	0x20, 0x03, 0x28, 0x0b, 0x32, 0x1a, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e,
-	0x43, 0x68, 0x75, 0x6e, 0x6b, 0x56, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x50, 0x72, 0x6f, 0x74, 0x6f,
-	0x52, 0x06, 0x63, 0x68, 0x75, 0x6e, 0x6b, 0x73, 0x12, 0x31, 0x0a, 0x06, 0x6d, 0x65, 0x74, 0x72,
-	0x69, 0x63, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0e, 0x32, 0x19, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74,
-	0x6f, 0x72, 0x65, 0x2e, 0x4d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x54, 0x79, 0x70, 0x65, 0x50, 0x72,
-	0x6f, 0x74, 0x6f, 0x52, 0x06, 0x6d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x22, 0x14, 0x0a, 0x12, 0x42,
-	0x75, 0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
+	0x6e, 0x73, 0x65, 0x22, 0x12, 0x0a, 0x10, 0x44, 0x69, 0x73, 0x6b, 0x55, 0x73, 0x61, 0x67, 0x65,
+	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x22, 0x29, 0x0a, 0x11, 0x44, 0x69, 0x73, 0x6b, 0x55,
+	0x73, 0x61, 0x67, 0x65, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x14, 0x0a, 0x05,
+	0x62, 0x79, 0x74, 0x65, 0x73, 0x18, 0x01, 0x20, 0x01, 0x28, 0x04, 0x52, 0x05, 0x62, 0x79, 0x74,
+	0x65, 0x73, 0x22, 0x45, 0x0a, 0x10, 0x43, 0x68, 0x75, 0x6e, 0x6b, 0x56, 0x65, 0x63, 0x74, 0x6f,
+	0x72, 0x50, 0x72, 0x6f, 0x74, 0x6f, 0x12, 0x19, 0x0a, 0x08, 0x63, 0x68, 0x75, 0x6e, 0x6b, 0x5f,
+	0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x63, 0x68, 0x75, 0x6e, 0x6b, 0x49,
+	0x64, 0x12, 0x16, 0x0a, 0x06, 0x76, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x18, 0x02, 0x20, 0x03, 0x28,
+	0x02, 0x52, 0x06, 0x76, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x22, 0xae, 0x01, 0x0a, 0x11, 0x42, 0x75,
+	0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12,
+	0x13, 0x0a, 0x05, 0x6b, 0x62, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04,
+	0x6b, 0x62, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x5f,
+	0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x03, 0x52, 0x09, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f,
+	0x6e, 0x49, 0x64, 0x12, 0x32, 0x0a, 0x06, 0x63, 0x68, 0x75, 0x6e, 0x6b, 0x73, 0x18, 0x03, 0x20,
+	0x03, 0x28, 0x0b, 0x32, 0x1a, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x43,
+	0x68, 0x75, 0x6e, 0x6b, 0x56, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x50, 0x72, 0x6f, 0x74, 0x6f, 0x52,
+	0x06, 0x63, 0x68, 0x75, 0x6e, 0x6b, 0x73, 0x12, 0x31, 0x0a, 0x06, 0x6d, 0x65, 0x74, 0x72, 0x69,
+	0x63, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0e, 0x32, 0x19, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f,
+	0x72, 0x65, 0x2e, 0x4d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x54, 0x79, 0x70, 0x65, 0x50, 0x72, 0x6f,
+	0x74, 0x6f, 0x52, 0x06, 0x6d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x22, 0x14, 0x0a, 0x12, 0x42, 0x75,
+	0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
+	0x22, 0x7a, 0x0a, 0x10, 0x41, 0x64, 0x64, 0x43, 0x68, 0x75, 0x6e, 0x6b, 0x73, 0x52, 0x65, 0x71,
+	0x75, 0x65, 0x73, 0x74, 0x12, 0x13, 0x0a, 0x05, 0x6b, 0x62, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20,
+	0x01, 0x28, 0x09, 0x52, 0x04, 0x6b, 0x62, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x76, 0x65, 0x72,
+	0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x03, 0x52, 0x09, 0x76,
+	0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x12, 0x32, 0x0a, 0x06, 0x63, 0x68, 0x75, 0x6e,
+	0x6b, 0x73, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x1a, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74,
+	0x6f, 0x72, 0x65, 0x2e, 0x43, 0x68, 0x75, 0x6e, 0x6b, 0x56, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x50,
+	0x72, 0x6f, 0x74, 0x6f, 0x52, 0x06, 0x63, 0x68, 0x75, 0x6e, 0x6b, 0x73, 0x22, 0x13, 0x0a, 0x11,
+	0x41, 0x64, 0x64, 0x43, 0x68, 0x75, 0x6e, 0x6b, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
 	0x65, 0x22, 0x75, 0x0a, 0x12, 0x53, 0x65, 0x61, 0x72, 0x63, 0x68, 0x49, 0x6e, 0x64, 0x65, 0x78,
 	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12, 0x13, 0x0a, 0x05, 0x6b, 0x62, 0x5f, 0x69, 0x64,
 	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x6b, 0x62, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a,
@@ -1245,8 +1444,8 @@ var file_vecstore_proto_rawDesc = []byte{
 	0x0f, 0x4d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x54, 0x79, 0x70, 0x65, 0x50, 0x72, 0x6f, 0x74, 0x6f,
 	0x12, 0x0a, 0x0a, 0x06, 0x43, 0x4f, 0x53, 0x49, 0x4e, 0x45, 0x10, 0x00, 0x12, 0x0d, 0x0a, 0x09,
 	0x45, 0x55, 0x43, 0x4c, 0x49, 0x44, 0x45, 0x41, 0x4e, 0x10, 0x01, 0x12, 0x11, 0x0a, 0x0d, 0x49,
-	0x4e, 0x4e, 0x45, 0x52, 0x5f, 0x50, 0x52, 0x4f, 0x44, 0x55, 0x43, 0x54, 0x10, 0x02, 0x32, 0xfd,
-	0x02, 0x0a, 0x13, 0x43, 0x68, 0x75, 0x6e, 0x6b, 0x53, 0x74, 0x6f, 0x72, 0x61, 0x67, 0x65, 0x53,
+	0x4e, 0x4e, 0x45, 0x52, 0x5f, 0x50, 0x52, 0x4f, 0x44, 0x55, 0x43, 0x54, 0x10, 0x02, 0x32, 0xc3,
+	0x03, 0x0a, 0x13, 0x43, 0x68, 0x75, 0x6e, 0x6b, 0x53, 0x74, 0x6f, 0x72, 0x61, 0x67, 0x65, 0x53,
 	0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x42, 0x0a, 0x05, 0x57, 0x72, 0x69, 0x74, 0x65, 0x12,
 	0x1b, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x57, 0x72, 0x69, 0x74, 0x65,
 	0x43, 0x68, 0x75, 0x6e, 0x6b, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1c, 0x2e, 0x76,
@@ -1269,32 +1468,41 @@ var file_vecstore_proto_rawDesc = []byte{
 	0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x44, 0x65, 0x6c, 0x65, 0x74, 0x65, 0x42, 0x79, 0x50,
 	0x72, 0x65, 0x66, 0x69, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x20, 0x2e, 0x76,
 	0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x44, 0x65, 0x6c, 0x65, 0x74, 0x65, 0x42, 0x79,
-	0x50, 0x72, 0x65, 0x66, 0x69, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x32, 0xe5,
-	0x02, 0x0a, 0x12, 0x56, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x53, 0x65,
-	0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x42, 0x0a, 0x05, 0x42, 0x75, 0x69, 0x6c, 0x64, 0x12, 0x1b,
-	0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x42, 0x75, 0x69, 0x6c, 0x64, 0x49,
-	0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1c, 0x2e, 0x76, 0x65,
-	0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x42, 0x75, 0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65,
-	0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x45, 0x0a, 0x06, 0x53, 0x65, 0x61,
-	0x72, 0x63, 0x68, 0x12, 0x1c, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x53,
-	0x65, 0x61, 0x72, 0x63, 0x68, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
-	0x74, 0x1a, 0x1d, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x53, 0x65, 0x61,
-	0x72, 0x63, 0x68, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
-	0x12, 0x3f, 0x0a, 0x04, 0x53, 0x61, 0x76, 0x65, 0x12, 0x1a, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74,
-	0x6f, 0x72, 0x65, 0x2e, 0x53, 0x61, 0x76, 0x65, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71,
-	0x75, 0x65, 0x73, 0x74, 0x1a, 0x1b, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e,
-	0x53, 0x61, 0x76, 0x65, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73,
-	0x65, 0x12, 0x3f, 0x0a, 0x04, 0x4c, 0x6f, 0x61, 0x64, 0x12, 0x1a, 0x2e, 0x76, 0x65, 0x63, 0x73,
-	0x74, 0x6f, 0x72, 0x65, 0x2e, 0x4c, 0x6f, 0x61, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65,
-	0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1b, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65,
-	0x2e, 0x4c, 0x6f, 0x61, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
-	0x73, 0x65, 0x12, 0x42, 0x0a, 0x05, 0x52, 0x65, 0x73, 0x65, 0x74, 0x12, 0x1b, 0x2e, 0x76, 0x65,
-	0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x52, 0x65, 0x73, 0x65, 0x74, 0x49, 0x6e, 0x64, 0x65,
-	0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1c, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74,
-	0x6f, 0x72, 0x65, 0x2e, 0x52, 0x65, 0x73, 0x65, 0x74, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65,
-	0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x42, 0x1c, 0x5a, 0x1a, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75,
-	0x6d, 0x2f, 0x61, 0x70, 0x69, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x76, 0x65, 0x63, 0x73,
-	0x74, 0x6f, 0x72, 0x65, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+	0x50, 0x72, 0x65, 0x66, 0x69, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x44,
+	0x0a, 0x09, 0x44, 0x69, 0x73, 0x6b, 0x55, 0x73, 0x61, 0x67, 0x65, 0x12, 0x1a, 0x2e, 0x76, 0x65,
+	0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x44, 0x69, 0x73, 0x6b, 0x55, 0x73, 0x61, 0x67, 0x65,
+	0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1b, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f,
+	0x72, 0x65, 0x2e, 0x44, 0x69, 0x73, 0x6b, 0x55, 0x73, 0x61, 0x67, 0x65, 0x52, 0x65, 0x73, 0x70,
+	0x6f, 0x6e, 0x73, 0x65, 0x32, 0xab, 0x03, 0x0a, 0x12, 0x56, 0x65, 0x63, 0x74, 0x6f, 0x72, 0x49,
+	0x6e, 0x64, 0x65, 0x78, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x42, 0x0a, 0x05, 0x42,
+	0x75, 0x69, 0x6c, 0x64, 0x12, 0x1b, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e,
+	0x42, 0x75, 0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
+	0x74, 0x1a, 0x1c, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x42, 0x75, 0x69,
+	0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12,
+	0x44, 0x0a, 0x09, 0x41, 0x64, 0x64, 0x43, 0x68, 0x75, 0x6e, 0x6b, 0x73, 0x12, 0x1a, 0x2e, 0x76,
+	0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x41, 0x64, 0x64, 0x43, 0x68, 0x75, 0x6e, 0x6b,
+	0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1b, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74,
+	0x6f, 0x72, 0x65, 0x2e, 0x41, 0x64, 0x64, 0x43, 0x68, 0x75, 0x6e, 0x6b, 0x73, 0x52, 0x65, 0x73,
+	0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x45, 0x0a, 0x06, 0x53, 0x65, 0x61, 0x72, 0x63, 0x68, 0x12,
+	0x1c, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x53, 0x65, 0x61, 0x72, 0x63,
+	0x68, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1d, 0x2e,
+	0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x53, 0x65, 0x61, 0x72, 0x63, 0x68, 0x49,
+	0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x3f, 0x0a, 0x04,
+	0x53, 0x61, 0x76, 0x65, 0x12, 0x1a, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e,
+	0x53, 0x61, 0x76, 0x65, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74,
+	0x1a, 0x1b, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x53, 0x61, 0x76, 0x65,
+	0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x3f, 0x0a,
+	0x04, 0x4c, 0x6f, 0x61, 0x64, 0x12, 0x1a, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65,
+	0x2e, 0x4c, 0x6f, 0x61, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
+	0x74, 0x1a, 0x1b, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e, 0x4c, 0x6f, 0x61,
+	0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x42,
+	0x0a, 0x05, 0x52, 0x65, 0x73, 0x65, 0x74, 0x12, 0x1b, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f,
+	0x72, 0x65, 0x2e, 0x52, 0x65, 0x73, 0x65, 0x74, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71,
+	0x75, 0x65, 0x73, 0x74, 0x1a, 0x1c, 0x2e, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2e,
+	0x52, 0x65, 0x73, 0x65, 0x74, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e,
+	0x73, 0x65, 0x42, 0x1c, 0x5a, 0x1a, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2f, 0x61, 0x70,
+	0x69, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x76, 0x65, 0x63, 0x73, 0x74, 0x6f, 0x72, 0x65,
+	0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
 }
 
 var (
@@ -1310,7 +1518,7 @@ func file_vecstore_proto_rawDescGZIP() []byte {
 }
 
 var file_vecstore_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_vecstore_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_vecstore_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_vecstore_proto_goTypes = []any{
 	(MetricTypeProto)(0),           // 0: vecstore.MetricTypeProto
 	(*WriteChunkRequest)(nil),      // 1: vecstore.WriteChunkRequest
@@ -1323,48 +1531,57 @@ var file_vecstore_proto_goTypes = []any{
 	(*DeleteChunkResponse)(nil),    // 8: vecstore.DeleteChunkResponse
 	(*DeleteByPrefixRequest)(nil),  // 9: vecstore.DeleteByPrefixRequest
 	(*DeleteByPrefixResponse)(nil), // 10: vecstore.DeleteByPrefixResponse
-	(*ChunkVectorProto)(nil),       // 11: vecstore.ChunkVectorProto
-	(*BuildIndexRequest)(nil),      // 12: vecstore.BuildIndexRequest
-	(*BuildIndexResponse)(nil),     // 13: vecstore.BuildIndexResponse
-	(*SearchIndexRequest)(nil),     // 14: vecstore.SearchIndexRequest
-	(*SearchResultProto)(nil),      // 15: vecstore.SearchResultProto
-	(*SearchIndexResponse)(nil),    // 16: vecstore.SearchIndexResponse
-	(*SaveIndexRequest)(nil),       // 17: vecstore.SaveIndexRequest
-	(*SaveIndexResponse)(nil),      // 18: vecstore.SaveIndexResponse
-	(*LoadIndexRequest)(nil),       // 19: vecstore.LoadIndexRequest
-	(*LoadIndexResponse)(nil),      // 20: vecstore.LoadIndexResponse
-	(*ResetIndexRequest)(nil),      // 21: vecstore.ResetIndexRequest
-	(*ResetIndexResponse)(nil),     // 22: vecstore.ResetIndexResponse
+	(*DiskUsageRequest)(nil),       // 11: vecstore.DiskUsageRequest
+	(*DiskUsageResponse)(nil),      // 12: vecstore.DiskUsageResponse
+	(*ChunkVectorProto)(nil),       // 13: vecstore.ChunkVectorProto
+	(*BuildIndexRequest)(nil),      // 14: vecstore.BuildIndexRequest
+	(*BuildIndexResponse)(nil),     // 15: vecstore.BuildIndexResponse
+	(*AddChunksRequest)(nil),       // 16: vecstore.AddChunksRequest
+	(*AddChunksResponse)(nil),      // 17: vecstore.AddChunksResponse
+	(*SearchIndexRequest)(nil),     // 18: vecstore.SearchIndexRequest
+	(*SearchResultProto)(nil),      // 19: vecstore.SearchResultProto
+	(*SearchIndexResponse)(nil),    // 20: vecstore.SearchIndexResponse
+	(*SaveIndexRequest)(nil),       // 21: vecstore.SaveIndexRequest
+	(*SaveIndexResponse)(nil),      // 22: vecstore.SaveIndexResponse
+	(*LoadIndexRequest)(nil),       // 23: vecstore.LoadIndexRequest
+	(*LoadIndexResponse)(nil),      // 24: vecstore.LoadIndexResponse
+	(*ResetIndexRequest)(nil),      // 25: vecstore.ResetIndexRequest
+	(*ResetIndexResponse)(nil),     // 26: vecstore.ResetIndexResponse
 }
 var file_vecstore_proto_depIdxs = []int32{
-	11, // 0: vecstore.BuildIndexRequest.chunks:type_name -> vecstore.ChunkVectorProto
+	13, // 0: vecstore.BuildIndexRequest.chunks:type_name -> vecstore.ChunkVectorProto
 	0,  // 1: vecstore.BuildIndexRequest.metric:type_name -> vecstore.MetricTypeProto
-	15, // 2: vecstore.SearchIndexResponse.results:type_name -> vecstore.SearchResultProto
-	1,  // 3: vecstore.ChunkStorageService.Write:input_type -> vecstore.WriteChunkRequest
-	3,  // 4: vecstore.ChunkStorageService.Read:input_type -> vecstore.ReadChunkRequest
-	5,  // 5: vecstore.ChunkStorageService.Exists:input_type -> vecstore.ExistsChunkRequest
-	7,  // 6: vecstore.ChunkStorageService.Delete:input_type -> vecstore.DeleteChunkRequest
-	9,  // 7: vecstore.ChunkStorageService.DeleteByPrefix:input_type -> vecstore.DeleteByPrefixRequest
-	12, // 8: vecstore.VectorIndexService.Build:input_type -> vecstore.BuildIndexRequest
-	14, // 9: vecstore.VectorIndexService.Search:input_type -> vecstore.SearchIndexRequest
-	17, // 10: vecstore.VectorIndexService.Save:input_type -> vecstore.SaveIndexRequest
-	19, // 11: vecstore.VectorIndexService.Load:input_type -> vecstore.LoadIndexRequest
-	21, // 12: vecstore.VectorIndexService.Reset:input_type -> vecstore.ResetIndexRequest
-	2,  // 13: vecstore.ChunkStorageService.Write:output_type -> vecstore.WriteChunkResponse
-	4,  // 14: vecstore.ChunkStorageService.Read:output_type -> vecstore.ReadChunkResponse
-	6,  // 15: vecstore.ChunkStorageService.Exists:output_type -> vecstore.ExistsChunkResponse
-	8,  // 16: vecstore.ChunkStorageService.Delete:output_type -> vecstore.DeleteChunkResponse
-	10, // 17: vecstore.ChunkStorageService.DeleteByPrefix:output_type -> vecstore.DeleteByPrefixResponse
-	13, // 18: vecstore.VectorIndexService.Build:output_type -> vecstore.BuildIndexResponse
-	16, // 19: vecstore.VectorIndexService.Search:output_type -> vecstore.SearchIndexResponse
-	18, // 20: vecstore.VectorIndexService.Save:output_type -> vecstore.SaveIndexResponse
-	20, // 21: vecstore.VectorIndexService.Load:output_type -> vecstore.LoadIndexResponse
-	22, // 22: vecstore.VectorIndexService.Reset:output_type -> vecstore.ResetIndexResponse
-	13, // [13:23] is the sub-list for method output_type
-	3,  // [3:13] is the sub-list for method input_type
-	3,  // [3:3] is the sub-list for extension type_name
-	3,  // [3:3] is the sub-list for extension extendee
-	0,  // [0:3] is the sub-list for field type_name
+	13, // 2: vecstore.AddChunksRequest.chunks:type_name -> vecstore.ChunkVectorProto
+	19, // 3: vecstore.SearchIndexResponse.results:type_name -> vecstore.SearchResultProto
+	1,  // 4: vecstore.ChunkStorageService.Write:input_type -> vecstore.WriteChunkRequest
+	3,  // 5: vecstore.ChunkStorageService.Read:input_type -> vecstore.ReadChunkRequest
+	5,  // 6: vecstore.ChunkStorageService.Exists:input_type -> vecstore.ExistsChunkRequest
+	7,  // 7: vecstore.ChunkStorageService.Delete:input_type -> vecstore.DeleteChunkRequest
+	9,  // 8: vecstore.ChunkStorageService.DeleteByPrefix:input_type -> vecstore.DeleteByPrefixRequest
+	11, // 9: vecstore.ChunkStorageService.DiskUsage:input_type -> vecstore.DiskUsageRequest
+	14, // 10: vecstore.VectorIndexService.Build:input_type -> vecstore.BuildIndexRequest
+	16, // 11: vecstore.VectorIndexService.AddChunks:input_type -> vecstore.AddChunksRequest
+	18, // 12: vecstore.VectorIndexService.Search:input_type -> vecstore.SearchIndexRequest
+	21, // 13: vecstore.VectorIndexService.Save:input_type -> vecstore.SaveIndexRequest
+	23, // 14: vecstore.VectorIndexService.Load:input_type -> vecstore.LoadIndexRequest
+	25, // 15: vecstore.VectorIndexService.Reset:input_type -> vecstore.ResetIndexRequest
+	2,  // 16: vecstore.ChunkStorageService.Write:output_type -> vecstore.WriteChunkResponse
+	4,  // 17: vecstore.ChunkStorageService.Read:output_type -> vecstore.ReadChunkResponse
+	6,  // 18: vecstore.ChunkStorageService.Exists:output_type -> vecstore.ExistsChunkResponse
+	8,  // 19: vecstore.ChunkStorageService.Delete:output_type -> vecstore.DeleteChunkResponse
+	10, // 20: vecstore.ChunkStorageService.DeleteByPrefix:output_type -> vecstore.DeleteByPrefixResponse
+	12, // 21: vecstore.ChunkStorageService.DiskUsage:output_type -> vecstore.DiskUsageResponse
+	15, // 22: vecstore.VectorIndexService.Build:output_type -> vecstore.BuildIndexResponse
+	17, // 23: vecstore.VectorIndexService.AddChunks:output_type -> vecstore.AddChunksResponse
+	20, // 24: vecstore.VectorIndexService.Search:output_type -> vecstore.SearchIndexResponse
+	22, // 25: vecstore.VectorIndexService.Save:output_type -> vecstore.SaveIndexResponse
+	24, // 26: vecstore.VectorIndexService.Load:output_type -> vecstore.LoadIndexResponse
+	26, // 27: vecstore.VectorIndexService.Reset:output_type -> vecstore.ResetIndexResponse
+	16, // [16:28] is the sub-list for method output_type
+	4,  // [4:16] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_vecstore_proto_init() }
@@ -1494,7 +1711,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[10].Exporter = func(v any, i int) any {
-			switch v := v.(*ChunkVectorProto); i {
+			switch v := v.(*DiskUsageRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1506,7 +1723,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[11].Exporter = func(v any, i int) any {
-			switch v := v.(*BuildIndexRequest); i {
+			switch v := v.(*DiskUsageResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1518,7 +1735,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[12].Exporter = func(v any, i int) any {
-			switch v := v.(*BuildIndexResponse); i {
+			switch v := v.(*ChunkVectorProto); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1530,7 +1747,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[13].Exporter = func(v any, i int) any {
-			switch v := v.(*SearchIndexRequest); i {
+			switch v := v.(*BuildIndexRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1542,7 +1759,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[14].Exporter = func(v any, i int) any {
-			switch v := v.(*SearchResultProto); i {
+			switch v := v.(*BuildIndexResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1554,7 +1771,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[15].Exporter = func(v any, i int) any {
-			switch v := v.(*SearchIndexResponse); i {
+			switch v := v.(*AddChunksRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1566,7 +1783,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[16].Exporter = func(v any, i int) any {
-			switch v := v.(*SaveIndexRequest); i {
+			switch v := v.(*AddChunksResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1578,7 +1795,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[17].Exporter = func(v any, i int) any {
-			switch v := v.(*SaveIndexResponse); i {
+			switch v := v.(*SearchIndexRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1590,7 +1807,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[18].Exporter = func(v any, i int) any {
-			switch v := v.(*LoadIndexRequest); i {
+			switch v := v.(*SearchResultProto); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1602,7 +1819,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[19].Exporter = func(v any, i int) any {
-			switch v := v.(*LoadIndexResponse); i {
+			switch v := v.(*SearchIndexResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1614,7 +1831,7 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[20].Exporter = func(v any, i int) any {
-			switch v := v.(*ResetIndexRequest); i {
+			switch v := v.(*SaveIndexRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -1626,6 +1843,54 @@ func file_vecstore_proto_init() {
 			}
 		}
 		file_vecstore_proto_msgTypes[21].Exporter = func(v any, i int) any {
+			switch v := v.(*SaveIndexResponse); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_vecstore_proto_msgTypes[22].Exporter = func(v any, i int) any {
+			switch v := v.(*LoadIndexRequest); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_vecstore_proto_msgTypes[23].Exporter = func(v any, i int) any {
+			switch v := v.(*LoadIndexResponse); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_vecstore_proto_msgTypes[24].Exporter = func(v any, i int) any {
+			switch v := v.(*ResetIndexRequest); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_vecstore_proto_msgTypes[25].Exporter = func(v any, i int) any {
 			switch v := v.(*ResetIndexResponse); i {
 			case 0:
 				return &v.state
@@ -1644,7 +1909,7 @@ func file_vecstore_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_vecstore_proto_rawDesc,
 			NumEnums:      1,
-			NumMessages:   22,
+			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

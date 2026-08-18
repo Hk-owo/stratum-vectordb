@@ -4,9 +4,12 @@ import (
 	"context"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/chunkstore"
+	"stratum/internal/docstore"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
 	"stratum/internal/raft"
+	"stratum/internal/types"
 	"stratum/internal/wal"
 )
 
@@ -16,6 +19,8 @@ type AdminServiceImpl struct {
 
 	raftNode     raft.RaftNode
 	indexManager index.IndexManager
+	docStore     docstore.DocStore
+	chunkStore   chunkstore.ChunkStore
 	wal          wal.WAL
 }
 
@@ -23,11 +28,15 @@ type AdminServiceImpl struct {
 func NewAdminService(
 	rn raft.RaftNode,
 	im index.IndexManager,
+	ds docstore.DocStore,
+	cs chunkstore.ChunkStore,
 	w wal.WAL,
 ) *AdminServiceImpl {
 	return &AdminServiceImpl{
 		raftNode:     rn,
 		indexManager: im,
+		docStore:     ds,
+		chunkStore:   cs,
 		wal:          w,
 	}
 }
@@ -66,15 +75,38 @@ func (s *AdminServiceImpl) HealthCheck(ctx context.Context, req *pb.HealthCheckR
 func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSystemStatusRequest) (*pb.GetSystemStatusResponse, error) {
 	health, _ := s.HealthCheck(ctx, &pb.HealthCheckRequest{})
 
-	// Scan all KBs for stuck versions (FAILED status for extended period).
-	// In a real implementation this would scan all KBs' versions.
-	// For now, return an empty list.
+	// Scan all KBs for stuck (FAILED) versions and delete-failed KBs.
+	var stuckVersions []*pb.StuckVersion
+	var deleteFailed []string
+	if kbs, err := s.raftNode.ListKnowledgeBases(ctx); err == nil {
+		for _, kb := range kbs {
+			if kb.Status == types.KBStatusDeleteFailed {
+				deleteFailed = append(deleteFailed, kb.KBID)
+			}
+			versions, err := s.raftNode.ListVersions(ctx, kb.KBID)
+			if err != nil {
+				continue
+			}
+			for _, v := range versions {
+				if v.IndexStatus == types.IndexStatusFailed {
+					stuckVersions = append(stuckVersions, &pb.StuckVersion{
+						KbId:        v.KBID,
+						VersionId:   v.VersionID,
+						IndexStatus: pb.IndexStatus(v.IndexStatus),
+						// VersionMeta has no separate status-updated timestamp;
+						// use the creation time as the best available proxy.
+						UpdatedAt: v.CreatedAt,
+					})
+				}
+			}
+		}
+	}
 
 	// WAL replay counters.
 	var walAlerts []*pb.WALAlert
 	for _, rc := range s.wal.GetReplayCounters() {
 		desc := "WAL record stuck"
-		if rc.Record.Type == 0 { // PendingRecordTypeDeleteMark
+		if rc.Record.Type == types.PendingRecordTypeDeleteMark {
 			desc = "delete mark for " + rc.Record.KBID
 		}
 		walAlerts = append(walAlerts, &pb.WALAlert{
@@ -83,10 +115,23 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 		})
 	}
 
+	// Resource usage snapshot.
+	resourceUsage := &pb.ResourceUsage{
+		LoadedIndexCount: int32(s.indexManager.LoadedCount()),
+	}
+	if n, err := s.docStore.DiskUsage(ctx); err == nil {
+		resourceUsage.DocStoreBytes = int64(n)
+	}
+	if n, err := s.chunkStore.DiskUsage(ctx); err == nil {
+		resourceUsage.ChunkStoreBytes = int64(n)
+	}
+
 	return &pb.GetSystemStatusResponse{
-		Health:      health,
-		WalAlerts:   walAlerts,
-		ResourceUsage: &pb.ResourceUsage{},
+		Health:          health,
+		StuckVersions:   stuckVersions,
+		DeleteFailedKbs: deleteFailed,
+		WalAlerts:       walAlerts,
+		ResourceUsage:   resourceUsage,
 	}, nil
 }
 
@@ -106,10 +151,15 @@ func (s *AdminServiceImpl) RebuildIndex(ctx context.Context, req *pb.RebuildInde
 
 // WarmupVersion implements AdminServiceServer.
 func (s *AdminServiceImpl) WarmupVersion(ctx context.Context, req *pb.WarmupVersionRequest) (*pb.WarmupVersionResponse, error) {
-	// Warmup loads the index (Search with a dummy vector triggers load).
-	// Use a zero-vector search with topK=0 just to force the index load.
-	// A real implementation would have a dedicated LoadIndex RPC, but
-	// the current interface uses Search for this purpose.
+	// Warmup rebuilds and re-homes the version's index in memory. Mark the
+	// version PENDING first so the console shows "warming up" and refuses
+	// rollback/parenting while the async build runs, then trigger the build
+	// exactly like RebuildIndex. Completion is reported via the registered
+	// BuildCompleteCallback, which flips the status back to READY/FAILED.
+	if err := s.raftNode.ProposeUpdateVersionStatus(ctx, req.VersionId, types.IndexStatusPending); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+
 	if err := s.indexManager.TriggerBuild(ctx, req.KnowledgeBaseId, req.VersionId); err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
