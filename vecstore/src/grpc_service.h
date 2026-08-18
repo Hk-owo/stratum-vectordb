@@ -44,6 +44,9 @@ class ChunkStorageServiceImpl final : public ::vecstore::ChunkStorageService::Se
   grpc::Status DeleteByPrefix(grpc::ServerContext* context,
                                const ::vecstore::DeleteByPrefixRequest* request,
                                ::vecstore::DeleteByPrefixResponse* response) override;
+  grpc::Status DiskUsage(grpc::ServerContext* context,
+                          const ::vecstore::DiskUsageRequest* request,
+                          ::vecstore::DiskUsageResponse* response) override;
 
  private:
   ChunkStorage* storage_;  // not owned; outlives this service
@@ -64,6 +67,9 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   grpc::Status Build(grpc::ServerContext* context,
                       const ::vecstore::BuildIndexRequest* request,
                       ::vecstore::BuildIndexResponse* response) override;
+  grpc::Status AddChunks(grpc::ServerContext* context,
+                          const ::vecstore::AddChunksRequest* request,
+                          ::vecstore::AddChunksResponse* response) override;
   grpc::Status Search(grpc::ServerContext* context,
                        const ::vecstore::SearchIndexRequest* request,
                        ::vecstore::SearchIndexResponse* response) override;

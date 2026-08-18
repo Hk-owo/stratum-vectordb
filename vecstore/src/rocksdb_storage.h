@@ -44,6 +44,7 @@ class RocksDBChunkStorage : public ChunkStorage {
   absl::StatusOr<bool> Exists(const std::string& key) override;
   absl::Status Delete(const std::string& key) override;
   absl::Status DeleteByPrefix(const std::string& prefix) override;
+  absl::StatusOr<uint64_t> DiskUsage() override;
 
  private:
   explicit RocksDBChunkStorage(std::unique_ptr<rocksdb::DB> db)

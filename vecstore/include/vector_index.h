@@ -42,6 +42,21 @@ class VectorIndex {
   virtual absl::Status Build(const std::vector<ChunkVector>& chunks,
                               MetricType metric) = 0;
 
+  // AddChunks appends chunk vectors to the index. If the index has not yet
+  // been built (or loaded), the first AddChunks call creates it using the
+  // metric established by the preceding Build call (or COSINE by default).
+  // The Go side splits a large build into one Build call followed by one or
+  // more AddChunks calls so a single gRPC message never exceeds the
+  // transport's size limit.
+  //
+  // Note: a batched build (Build followed by several AddChunks) is not
+  // atomic from a direct gRPC caller's perspective — a concurrent Search
+  // may observe the partially built index between batches. The product's
+  // Go-side IndexManager gates Search behind its loaded/loading state, so
+  // it only queries after the whole build completes; direct vecstore
+  // callers must provide their own ordering.
+  virtual absl::Status AddChunks(const std::vector<ChunkVector>& chunks) = 0;
+
   // Search returns up to topK approximate nearest neighbors to vector,
   // ordered by descending similarity score. Requires a prior successful
   // Build or Load.

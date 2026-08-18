@@ -157,5 +157,15 @@ absl::Status RocksDBChunkStorage::DeleteByPrefix(const std::string& prefix) {
   return ToAbslStatus(status);
 }
 
+absl::StatusOr<uint64_t> RocksDBChunkStorage::DiskUsage() {
+  uint64_t size = 0;
+  if (!db_->GetIntProperty("rocksdb.estimate-live-data-size", &size)) {
+    // Property unavailable (e.g. unsupported RocksDB build). Treat as zero
+    // rather than failing the resource-usage snapshot.
+    return uint64_t{0};
+  }
+  return size;
+}
+
 }  // namespace vecstore
 }  // namespace stratum

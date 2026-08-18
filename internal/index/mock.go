@@ -351,9 +351,8 @@ func (m *MockIndexManager) SetPingError(err error) {
 	m.pingErr = err
 }
 
-// LoadedCount returns how many indexes are currently in memory. Not part
-// of the IndexManager interface; a test helper for asserting LRU eviction
-// behavior.
+// LoadedCount implements IndexManager: returns how many indexes are
+// currently in memory.
 func (m *MockIndexManager) LoadedCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

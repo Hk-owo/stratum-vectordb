@@ -84,4 +84,8 @@ type IndexManager interface {
 	// itself is operating normally, without loading any index or touching
 	// reference counts.
 	Ping(ctx context.Context) error
+
+	// LoadedCount returns how many version indexes are currently held in
+	// memory. Used by GetSystemStatus's resource-usage snapshot.
+	LoadedCount() int
 }

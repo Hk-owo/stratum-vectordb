@@ -57,33 +57,46 @@ void NormalizeInPlace(std::vector<float>* vec) {
 absl::Status HNSWVectorIndex::Build(const std::vector<ChunkVector>& chunks,
                                      MetricType metric) {
   metric_ = metric;
-  id_to_chunk_id_.clear();
-  id_to_chunk_id_.reserve(chunks.size());
+  if (absl::Status reset_status = Reset(); !reset_status.ok()) {
+    return reset_status;
+  }
+  return AddChunks(chunks);
+}
 
+absl::Status HNSWVectorIndex::AddChunks(const std::vector<ChunkVector>& chunks) {
   if (chunks.empty()) {
-    dim_ = 0;
-    index_.reset();
     return absl::OkStatus();
   }
 
-  dim_ = static_cast<int>(chunks[0].vector.size());
+  const int dim = static_cast<int>(chunks[0].vector.size());
   for (const auto& c : chunks) {
-    if (static_cast<int>(c.vector.size()) != dim_) {
+    if (static_cast<int>(c.vector.size()) != dim) {
       return absl::InvalidArgumentError(
-          "hnsw_index: Build: all chunk vectors must share the same "
+          "hnsw_index: AddChunks: all chunk vectors must share the same "
           "dimension");
     }
   }
 
-  index_ = std::make_unique<faiss::IndexHNSWFlat>(dim_, kM, ToFaissMetric(metric));
-  index_->hnsw.efConstruction = kEfConstruction;
-  index_->hnsw.efSearch = kEfSearch;
+  if (index_ == nullptr) {
+    // First call (no prior Build/Load): create the index with the metric
+    // established by the preceding Build call (or COSINE, the member
+    // default), then fall through to append this batch.
+    index_ = std::make_unique<faiss::IndexHNSWFlat>(dim, kM, ToFaissMetric(metric_));
+    index_->hnsw.efConstruction = kEfConstruction;
+    index_->hnsw.efSearch = kEfSearch;
+    dim_ = dim;
+  } else if (dim != dim_) {
+    return absl::InvalidArgumentError(
+        "hnsw_index: AddChunks: dimension mismatch with existing index");
+  }
+
+  id_to_chunk_id_.reserve(id_to_chunk_id_.size() + chunks.size());
 
   std::vector<float> flat;
-  flat.reserve(chunks.size() * static_cast<size_t>(dim_));
+  flat.reserve(chunks.size() * static_cast<size_t>(dim));
   for (const auto& c : chunks) {
     std::vector<float> v = c.vector;
-    if (metric == MetricType::COSINE) {
+    if (metric_ == MetricType::COSINE) {
       NormalizeInPlace(&v);
     }
     flat.insert(flat.end(), v.begin(), v.end());

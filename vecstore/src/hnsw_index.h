@@ -47,6 +47,7 @@ class HNSWVectorIndex : public VectorIndex {
 
   absl::Status Build(const std::vector<ChunkVector>& chunks,
                       MetricType metric) override;
+  absl::Status AddChunks(const std::vector<ChunkVector>& chunks) override;
   absl::StatusOr<std::vector<SearchResult>> Search(
       const std::vector<float>& vector, int top_k) override;
   absl::Status Save(const std::string& path) override;

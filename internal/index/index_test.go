@@ -24,6 +24,8 @@ type mockVectorIndexClient struct {
 	built map[indexKey][]types.SearchResult // stored results for Search
 	buildErr error         // injectable build failure
 	searchFn func(kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) // per-call override
+	buildCalls     int // number of Build RPC invocations
+	addChunksCalls int // number of AddChunks RPC invocations
 }
 
 func newMockVectorIndexClient() *mockVectorIndexClient {
@@ -43,7 +45,26 @@ func (m *mockVectorIndexClient) Build(_ context.Context, in *vecstorepb.BuildInd
 		results[i] = types.SearchResult{ChunkID: c.ChunkId, Score: 1.0} // placeholder score
 	}
 	m.built[key] = results
+	m.buildCalls++
 	return &vecstorepb.BuildIndexResponse{}, nil
+}
+
+func (m *mockVectorIndexClient) AddChunks(_ context.Context, in *vecstorepb.AddChunksRequest, _ ...grpc.CallOption) (*vecstorepb.AddChunksResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.buildErr != nil {
+		return nil, m.buildErr
+	}
+	// Append to whatever Build already stored for this key, mirroring the
+	// real vecstore's incremental-add semantics.
+	key := indexKey{kbID: in.KbId, versionID: in.VersionId}
+	results := m.built[key]
+	for _, c := range in.Chunks {
+		results = append(results, types.SearchResult{ChunkID: c.ChunkId, Score: 1.0})
+	}
+	m.built[key] = results
+	m.addChunksCalls++
+	return &vecstorepb.AddChunksResponse{}, nil
 }
 
 func (m *mockVectorIndexClient) Search(_ context.Context, in *vecstorepb.SearchIndexRequest, _ ...grpc.CallOption) (*vecstorepb.SearchIndexResponse, error) {
@@ -242,6 +263,109 @@ func TestIndexManager_TriggerBuildFailure(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if cbCalled.Load() != 1 {
 		t.Fatalf("expected callback called once, got %d", cbCalled.Load())
+	}
+}
+
+// TestIndexManager_BuildBatchesChunks 验证大批量构建会按字节预算分批：
+// 第一批走 Build，后续批走 AddChunks，单条 RPC 载荷不超过预算。
+func TestIndexManager_BuildBatchesChunks(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+
+	// 每个 chunk 向量 2000 个 float32 ≈ 8000 字节，加上 chunk_id/字段头约
+	// 8100 字节；2 MiB 预算下每批约 259 个，600 个 chunk 应切成 3 批。
+	const numChunks = 600
+	const vecDim = 2000
+	chunkIDs := make([]string, numChunks)
+	vectors := make(map[string][]float32, numChunks)
+	vec := make([]float32, vecDim)
+	for i := 0; i < numChunks; i++ {
+		chunkID := fmt.Sprintf("chunk-%04d", i)
+		chunkIDs[i] = chunkID
+		vectors[chunkID] = vec
+	}
+	ds.addDoc(1, "doc-1", chunkIDs, vectors)
+
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: 5 * time.Second, VecstoreAddr: "unused"})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	var cbCalled atomic.Int32
+	im.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
+		cbCalled.Add(1)
+		if status != types.IndexStatusReady {
+			t.Errorf("expected READY, got %v", status)
+		}
+		return nil
+	})
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild failed: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if cbCalled.Load() != 1 {
+		t.Fatalf("expected callback called once, got %d", cbCalled.Load())
+	}
+
+	vc.mu.Lock()
+	buildCalls := vc.buildCalls
+	addCalls := vc.addChunksCalls
+	totalChunks := len(vc.built[indexKey{kbID: "kb-1", versionID: 1}])
+	vc.mu.Unlock()
+
+	if buildCalls != 1 {
+		t.Errorf("Build calls = %d, want 1 (first batch)", buildCalls)
+	}
+	if addCalls != 2 {
+		t.Errorf("AddChunks calls = %d, want 2 (600 chunks in 3 batches)", addCalls)
+	}
+	if totalChunks != numChunks {
+		t.Errorf("built chunk count = %d, want %d", totalChunks, numChunks)
+	}
+}
+
+// TestIndexManager_BuildEmptyVersionStillCallsBuild 验证空版本（无 chunk）
+// 仍会调用一次 Build，在 vecstore 侧建立 (kb, version) 索引条目，避免后续
+// Search 因 "no index built or loaded" 失败。
+func TestIndexManager_BuildEmptyVersionStillCallsBuild(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource() // 不添加任何 doc → ListDocIDs 返回空 → 无 chunk
+
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: 5 * time.Second, VecstoreAddr: "unused"})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	var cbCalled atomic.Int32
+	im.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
+		cbCalled.Add(1)
+		if status != types.IndexStatusReady {
+			t.Errorf("expected READY, got %v", status)
+		}
+		return nil
+	})
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild failed: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if cbCalled.Load() != 1 {
+		t.Fatalf("expected callback called once, got %d", cbCalled.Load())
+	}
+
+	vc.mu.Lock()
+	buildCalls := vc.buildCalls
+	addCalls := vc.addChunksCalls
+	vc.mu.Unlock()
+
+	if buildCalls != 1 {
+		t.Errorf("Build calls = %d, want 1 (empty version must still Build once)", buildCalls)
+	}
+	if addCalls != 0 {
+		t.Errorf("AddChunks calls = %d, want 0 (no chunks to append)", addCalls)
 	}
 }
 

@@ -98,6 +98,17 @@ grpc::Status ChunkStorageServiceImpl::DeleteByPrefix(
   return ToGrpcStatus(storage_->DeleteByPrefix(request->prefix()));
 }
 
+grpc::Status ChunkStorageServiceImpl::DiskUsage(
+    grpc::ServerContext* /*context*/, const ::vecstore::DiskUsageRequest* /*request*/,
+    ::vecstore::DiskUsageResponse* response) {
+  auto result = storage_->DiskUsage();
+  if (!result.ok()) {
+    return ToGrpcStatus(result.status());
+  }
+  response->set_bytes(result.value());
+  return grpc::Status::OK;
+}
+
 // ---------------------------------------------------------------------------
 // VectorIndexServiceImpl
 // ---------------------------------------------------------------------------
@@ -127,6 +138,24 @@ grpc::Status VectorIndexServiceImpl::Build(grpc::ServerContext* /*context*/,
   std::lock_guard<std::mutex> lock(mu_);
   VectorIndex* index = GetOrCreateLocked(key);
   return ToGrpcStatus(index->Build(chunks, FromProtoMetric(request->metric())));
+}
+
+grpc::Status VectorIndexServiceImpl::AddChunks(grpc::ServerContext* /*context*/,
+                                                const ::vecstore::AddChunksRequest* request,
+                                                ::vecstore::AddChunksResponse* /*response*/) {
+  std::vector<ChunkVector> chunks;
+  chunks.reserve(request->chunks_size());
+  for (const auto& proto_chunk : request->chunks()) {
+    ChunkVector cv;
+    cv.chunk_id = proto_chunk.chunk_id();
+    cv.vector.assign(proto_chunk.vector().begin(), proto_chunk.vector().end());
+    chunks.push_back(std::move(cv));
+  }
+
+  IndexKey key{request->kb_id(), request->version_id()};
+  std::lock_guard<std::mutex> lock(mu_);
+  VectorIndex* index = GetOrCreateLocked(key);
+  return ToGrpcStatus(index->AddChunks(chunks));
 }
 
 grpc::Status VectorIndexServiceImpl::Search(grpc::ServerContext* /*context*/,

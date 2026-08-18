@@ -230,26 +230,95 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 		return fmt.Errorf("index: ListChunkIDsByDocs: %w", err)
 	}
 
-	chunks := make([]*vecstorepb.ChunkVectorProto, 0, len(chunkIDs))
-	for _, chunkID := range chunkIDs {
-		v, err := im.readChunkVector(ctx, kbID, chunkID)
-		if err != nil {
-			return fmt.Errorf("index: read chunk vector %s: %w", chunkID, err)
-		}
-		chunks = append(chunks, &vecstorepb.ChunkVectorProto{ChunkId: chunkID, Vector: v})
+	// 分批读取并发送：单条 Build/AddChunks RPC 的载荷必须小于 gRPC 默认
+	// 4 MiB 上限。第一批用 Build 全量建索引，后续批用 AddChunks 增量追加。
+	batches, err := im.collectChunkBatches(ctx, kbID, chunkIDs)
+	if err != nil {
+		return err
 	}
 
-	_, err = im.vectorIndexClient.Build(ctx, &vecstorepb.BuildIndexRequest{
-		KbId:      kbID,
-		VersionId: versionID,
-		Chunks:    chunks,
-		Metric:    vecstorepb.MetricTypeProto_COSINE,
-	})
-	if err != nil {
-		return fmt.Errorf("index: Build RPC: %w", err)
+	// 空版本（没有 chunk）也必须调一次 Build，在 vecstore 侧建立该
+	// (kb, version) 的索引条目：否则后续 Search 会因 "no index built or
+	// loaded" 而失败（与分批前 Build(empty) 的语义保持一致）。
+	if len(batches) == 0 {
+		_, err = im.vectorIndexClient.Build(ctx, &vecstorepb.BuildIndexRequest{
+			KbId:      kbID,
+			VersionId: versionID,
+			Metric:    vecstorepb.MetricTypeProto_COSINE,
+		})
+		if err != nil {
+			return fmt.Errorf("index: Build RPC: %w", err)
+		}
+		return nil
+	}
+
+	for i, batch := range batches {
+		chunks := make([]*vecstorepb.ChunkVectorProto, 0, len(batch))
+		for _, cv := range batch {
+			chunks = append(chunks, &vecstorepb.ChunkVectorProto{ChunkId: cv.id, Vector: cv.vec})
+		}
+		if i == 0 {
+			_, err = im.vectorIndexClient.Build(ctx, &vecstorepb.BuildIndexRequest{
+				KbId:      kbID,
+				VersionId: versionID,
+				Chunks:    chunks,
+				Metric:    vecstorepb.MetricTypeProto_COSINE,
+			})
+			if err != nil {
+				return fmt.Errorf("index: Build RPC: %w", err)
+			}
+		} else {
+			_, err = im.vectorIndexClient.AddChunks(ctx, &vecstorepb.AddChunksRequest{
+				KbId:      kbID,
+				VersionId: versionID,
+				Chunks:    chunks,
+			})
+			if err != nil {
+				return fmt.Errorf("index: AddChunks RPC: %w", err)
+			}
+		}
 	}
 
 	return nil
+}
+
+// maxBuildMessageBytes 是单次 Build/AddChunks RPC 载荷的字节预算上限。
+// gRPC 默认最大消息 4 MiB（4194304 字节）；预算取一半，给 chunk_id 与
+// protobuf 序列化开销留出余量。预算按 chunk 粒度切分，若单个 chunk 的向量
+// 本身已超过预算，该批会如实超限（现实中 embedding 维度远达不到该量级）。
+const maxBuildMessageBytes = 2 * 1024 * 1024
+
+// chunkVec 是单个 chunk 的向量载荷（chunk_id + 向量）。
+type chunkVec struct {
+	id  string
+	vec []float32
+}
+
+// collectChunkBatches 逐个读取 chunk 向量，并按估算字节数切分成多个批次，
+// 使得每批序列化后都不会超过 maxBuildMessageBytes。
+func (im *IndexManagerImpl) collectChunkBatches(ctx context.Context, kbID string, chunkIDs []string) ([][]chunkVec, error) {
+	var batches [][]chunkVec
+	var cur []chunkVec
+	curBytes := 0
+	for _, chunkID := range chunkIDs {
+		v, err := im.readChunkVector(ctx, kbID, chunkID)
+		if err != nil {
+			return nil, fmt.Errorf("index: read chunk vector %s: %w", chunkID, err)
+		}
+		// 估算该 chunk 在请求中的字节开销：向量(float32) + chunk_id + 字段头。
+		est := 4*len(v) + len(chunkID) + 64
+		if len(cur) > 0 && curBytes+est > maxBuildMessageBytes {
+			batches = append(batches, cur)
+			cur = nil
+			curBytes = 0
+		}
+		cur = append(cur, chunkVec{id: chunkID, vec: v})
+		curBytes += est
+	}
+	if len(cur) > 0 {
+		batches = append(batches, cur)
+	}
+	return batches, nil
 }
 
 // acquire loads the index for key if not already in memory, blocking
@@ -417,7 +486,8 @@ func (im *IndexManagerImpl) Ping(_ context.Context) error {
 
 // --- Test helpers (not part of the IndexManager interface) ---
 
-// LoadedCount returns how many indexes are currently in memory.
+// LoadedCount implements IndexManager: returns how many indexes are
+// currently in memory.
 func (im *IndexManagerImpl) LoadedCount() int {
 	im.mu.Lock()
 	defer im.mu.Unlock()

@@ -52,6 +52,10 @@ class ChunkStorage {
   // knowledge-base-scoped deletion (ChunkStore.DeleteByKB), where prefix
   // is the knowledge base ID.
   virtual absl::Status DeleteByPrefix(const std::string& prefix) = 0;
+
+  // DiskUsage returns the approximate on-disk size in bytes used by the
+  // storage. Used by GetSystemStatus's resource-usage snapshot.
+  virtual absl::StatusOr<uint64_t> DiskUsage() = 0;
 };
 
 }  // namespace vecstore
