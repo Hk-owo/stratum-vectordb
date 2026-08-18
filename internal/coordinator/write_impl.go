@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"stratum/internal/bloom"
@@ -14,6 +15,7 @@ import (
 	"stratum/internal/index"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
+	"stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 	"stratum/internal/wal"
@@ -101,7 +103,8 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 
 	// Step 4: VersionDocList.Write — compute the full document set for
 	// the new version from the parent's set + this version's changes.
-	if err := c.writeVersionDocList(ctx, kbID, parentVersionID, versionID, changes); err != nil {
+	docIDs, err := c.writeVersionDocList(ctx, kbID, parentVersionID, versionID, changes)
+	if err != nil {
 		return 0, err
 	}
 
@@ -112,6 +115,15 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	// Step 6: WAL.WriteCommit
 	if err := c.cfg.WAL.WriteCommit(ctx, versionID); err != nil {
 		return 0, fmt.Errorf("coordinator: WAL.WriteCommit: %w", err)
+	}
+
+	// Step 6.5: commit the version's document-ID set hash so followers can
+	// verify their DataSync pulls are complete (see sync.VerifyDocIDSet and
+	// VersionMeta.DocIDSetHash). Non-fatal, like TriggerBuild below: a
+	// failed/missed propose leaves the version without a digest and
+	// followers fall back to best-effort pulls.
+	if err := c.cfg.RaftNode.ProposeUpdateVersionSummary(ctx, versionID, sync.ComputeDocIDSetHash(docIDs)); err != nil {
+		_ = err // logged upstream; digest is an optimization for follower verification
 	}
 
 	// Step 7: IndexManager.TriggerBuild (asynchronous).
@@ -209,13 +221,15 @@ func (c *WriteCoordinatorImpl) writeChunk(ctx context.Context, kbID string, chun
 
 // writeVersionDocList computes the new version's full document ID set by
 // taking the parent version's set and applying this version's changes.
-func (c *WriteCoordinatorImpl) writeVersionDocList(ctx context.Context, kbID string, parentVersionID, newVersionID int64, changes []types.DocChange) error {
+// It writes the set into VersionDocList and returns the sorted docIDs so
+// the caller can compute the version's document-ID set digest.
+func (c *WriteCoordinatorImpl) writeVersionDocList(ctx context.Context, kbID string, parentVersionID, newVersionID int64, changes []types.DocChange) ([]string, error) {
 	// Get parent version's full doc set.
 	parentDocs := make(map[string]bool)
 	if parentVersionID != 0 {
 		docIDs, err := c.cfg.VersionDocList.ListDocIDs(ctx, kbID, parentVersionID)
 		if err != nil {
-			return fmt.Errorf("coordinator: list parent version %d docs: %w", parentVersionID, err)
+			return nil, fmt.Errorf("coordinator: list parent version %d docs: %w", parentVersionID, err)
 		}
 		for _, id := range docIDs {
 			parentDocs[id] = true
@@ -233,15 +247,18 @@ func (c *WriteCoordinatorImpl) writeVersionDocList(ctx context.Context, kbID str
 	}
 
 	// Write each doc ID to the new version.
+	docIDs := make([]string, 0, len(parentDocs))
 	for docID := range parentDocs {
+		docIDs = append(docIDs, docID)
 		if err := c.retry(ctx, func() error {
 			return c.cfg.VersionDocList.Write(ctx, kbID, newVersionID, docID)
 		}); err != nil {
-			return fmt.Errorf("coordinator: version doc list write: %w", err)
+			return nil, fmt.Errorf("coordinator: version doc list write: %w", err)
 		}
 	}
+	sort.Strings(docIDs)
 
-	return nil
+	return docIDs, nil
 }
 
 // retry executes fn with exponential backoff up to MaxRetries times.

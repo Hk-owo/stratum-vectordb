@@ -183,4 +183,10 @@ func (s *PebbleDocStore) DeleteByKB(_ context.Context, kbID string) error {
 	return nil
 }
 
+// DiskUsage implements DocStore: returns PebbleDB's estimated total disk
+// usage (live data + internal structures) in bytes.
+func (s *PebbleDocStore) DiskUsage(_ context.Context) (uint64, error) {
+	return s.db.Metrics().DiskSpaceUsage(), nil
+}
+
 var _ DocStore = (*PebbleDocStore)(nil)

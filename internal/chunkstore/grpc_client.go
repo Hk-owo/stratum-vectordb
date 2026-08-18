@@ -72,6 +72,14 @@ func encodeKey(kbID, chunkID string) string {
 	return string(encodeKBPrefix(kbID)) + chunkID
 }
 
+// EncodeKey is the exported form of encodeKey. Used by IndexManager build
+// data-source wiring (cmd/stratum/main.go) to read chunk vectors back
+// from the vecstore's ChunkStorageService with the exact key the write
+// path used.
+func EncodeKey(kbID, chunkID string) string {
+	return encodeKey(kbID, chunkID)
+}
+
 // encodeKBPrefix returns the length-prefixed encoding of kbID alone,
 // usable both as the leading portion of encodeKey and as an exact,
 // collision-free DeleteByPrefix argument.
@@ -125,6 +133,16 @@ func (s *VecstoreChunkStore) DeleteByKB(ctx context.Context, kbID string) error 
 		return fmt.Errorf("chunkstore: DeleteByKB(%s): %w", kbID, err)
 	}
 	return nil
+}
+
+// DiskUsage implements ChunkStore: asks the C++ vecstore for its RocksDB
+// on-disk size.
+func (s *VecstoreChunkStore) DiskUsage(ctx context.Context) (uint64, error) {
+	resp, err := s.client.DiskUsage(ctx, &vecstorepb.DiskUsageRequest{})
+	if err != nil {
+		return 0, fmt.Errorf("chunkstore: DiskUsage: %w", err)
+	}
+	return resp.GetBytes(), nil
 }
 
 var _ ChunkStore = (*VecstoreChunkStore)(nil)

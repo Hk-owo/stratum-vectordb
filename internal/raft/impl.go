@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -364,6 +365,15 @@ func (impl *RaftNodeImpl) ProposeUpdateVersionStatus(ctx context.Context, versio
 	return res.Err
 }
 
+// ProposeUpdateVersionSummary implements RaftNode.
+func (impl *RaftNodeImpl) ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error {
+	res, err := impl.proposeAndWait(ctx, command{Type: cmdUpdateVersionSummary, VersionID: versionID, DocIDSetHash: docIDSetHash})
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
 func (impl *RaftNodeImpl) ProposeRollback(ctx context.Context, kbID string, targetVersionID int64) error {
 	res, err := impl.proposeAndWait(ctx, command{Type: cmdRollback, KBID: kbID, TargetVersionID: targetVersionID})
 	if err != nil {
@@ -393,6 +403,20 @@ func (impl *RaftNodeImpl) ListVersions(_ context.Context, kbID string) ([]types.
 	for _, id := range ids {
 		out = append(out, impl.sm.versions[id])
 	}
+	return out, nil
+}
+
+// ListKnowledgeBases returns metadata for every knowledge base in the
+// state machine. Order is not specified (map iteration).
+func (impl *RaftNodeImpl) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
+	impl.sm.mu.RLock()
+	defer impl.sm.mu.RUnlock()
+	out := make([]types.KnowledgeBaseMeta, 0, len(impl.sm.kbs))
+	for _, kb := range impl.sm.kbs {
+		out = append(out, kb)
+	}
+	// map 遍历顺序随机，按 KBID 字典序排序，保证列表顺序稳定可预期。
+	sort.Slice(out, func(i, j int) bool { return out[i].KBID < out[j].KBID })
 	return out, nil
 }
 

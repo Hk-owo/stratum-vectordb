@@ -100,3 +100,19 @@ func TestMockDeleteCoordinator_CustomFunc(t *testing.T) {
 		t.Fatalf("custom func saw kbID = %q, want kb-xyz", seen)
 	}
 }
+
+func TestMockDeleteCoordinator_Reset(t *testing.T) {
+	ctx := context.Background()
+	c := NewMockDeleteCoordinator()
+	c.SetExecuteResult(errors.New("boom"))
+	if err := c.Execute(ctx, "kb1"); err == nil {
+		t.Fatal("expected configured error before Reset")
+	}
+	c.Reset()
+	if err := c.Execute(ctx, "kb1"); err != nil {
+		t.Fatalf("Execute after Reset = %v, want nil", err)
+	}
+	if got := c.Calls(); len(got) != 1 {
+		t.Fatalf("calls not recorded after Reset: %v", got)
+	}
+}

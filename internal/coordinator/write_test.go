@@ -11,6 +11,7 @@ import (
 
 	"stratum/internal/bloom"
 	"stratum/internal/index"
+	stratumync "stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -70,6 +71,8 @@ func (s *testDocStore) DeleteByKB(_ context.Context, kbID string) error {
 	}
 	return nil
 }
+
+func (s *testDocStore) DiskUsage(_ context.Context) (uint64, error) { return 0, nil }
 
 func (s *testDocStore) count() int {
 	s.mu.Lock()
@@ -221,6 +224,7 @@ func (s *testChunkStore) Exists(_ context.Context, kbID, chunkID string) (bool, 
 
 func (s *testChunkStore) Delete(_ context.Context, kbID, chunkID string) error  { return nil }
 func (s *testChunkStore) DeleteByKB(_ context.Context, kbID string) error       { return nil }
+func (s *testChunkStore) DiskUsage(_ context.Context) (uint64, error)          { return 0, nil }
 
 func (s *testChunkStore) writtenCount() int {
 	s.mu.Lock()
@@ -283,6 +287,7 @@ func (im *testIndexManager) RegisterBuildCallback(cb index.BuildCompleteCallback
 func (im *testIndexManager) Evict(_ context.Context, kbID string, versionID int64) error { return nil }
 func (im *testIndexManager) EvictByKB(_ context.Context, kbID string) error              { return nil }
 func (im *testIndexManager) Ping(_ context.Context) error                                { return nil }
+func (im *testIndexManager) LoadedCount() int                                            { return 0 }
 
 func (im *testIndexManager) triggeredCount() int {
 	im.mu.Lock()
@@ -334,6 +339,17 @@ func (r *testRaftNode) ProposeCreateVersion(_ context.Context, kbID string, pare
 func (r *testRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
 	return nil
 }
+func (r *testRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.versions[versionID]
+	if !ok {
+		return fmt.Errorf("version %d not found", versionID)
+	}
+	v.DocIDSetHash = docIDSetHash
+	r.versions[versionID] = v
+	return nil
+}
 func (r *testRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) error  { return nil }
 func (r *testRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, kbID string) error { return nil }
 func (r *testRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error       { return nil }
@@ -350,6 +366,9 @@ func (r *testRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBas
 	return kb, nil
 }
 func (r *testRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) { return nil, nil }
+func (r *testRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
+	return nil, nil
+}
 func (r *testRaftNode) GetClusterStatus(_ context.Context) (types.ClusterStatus, error) {
 	return types.ClusterStatus{HasLeader: true, MemberCount: 1, LeaderID: 1}, nil
 }
@@ -806,3 +825,61 @@ func (s *mockSplitter) Split(content string, windowSize int, overlapSize int, em
 }
 
 var _ WriteCoordinator = (*WriteCoordinatorImpl)(nil)
+
+// TestWriteCoordinator_ProposesVersionSummary verifies that after a
+// successful write the coordinator commits the version's document-ID set
+// digest into the Raft metadata, matching what any follower would recompute
+// from the versiondoc store.
+func TestWriteCoordinator_ProposesVersionSummary(t *testing.T) {
+	ds := newTestDocStore()
+	cdm := newTestChunkDocMapper()
+	vdl := newTestVersionDocList()
+	cs := newTestChunkStore()
+	ec := &testEmbedClient{}
+	im := newTestIndexManager()
+	rn := newTestRaftNode()
+	w := wal.NewMockWAL()
+	chunkBF := bloom.NewMockBloomFilter()
+	splitter := &mockSplitter{windowSize: 100, overlapSize: 20}
+
+	ctx := context.Background()
+	rn.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID: "kb-1", Name: "test",
+		ChunkWindowSize: 100, ChunkOverlapSize: 20,
+		EmbedConfig: types.EmbedConfig{ServiceAddr: "emb:8080", ModelID: "m1"},
+	})
+
+	coord := NewWriteCoordinatorImpl(WriteCoordinatorConfig{
+		MaxRetries: 2, RetryBaseIntervalMS: 10,
+		WAL: w, RaftNode: rn, Splitter: splitter, EmbedClient: ec,
+		ChunkBloom: chunkBF, ChunkStore: cs, ChunkDocMapper: cdm,
+		DocStore: ds, VersionDocList: vdl, IndexManager: im,
+	})
+
+	changes := []types.DocChange{
+		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello world this is a test document"},
+		{Op: types.ChangeOpAdd, DocID: "doc-2", Content: "another document with different content"},
+	}
+	versionID, err := coord.Execute(ctx, "kb-1", 0, changes)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	// The committed digest must equal the hash of the version's full
+	// document set as stored in versiondoc.
+	stored, err := vdl.ListDocIDs(ctx, "kb-1", versionID)
+	if err != nil {
+		t.Fatalf("ListDocIDs: %v", err)
+	}
+	want := stratumync.ComputeDocIDSetHash(stored)
+
+	rn.mu.Lock()
+	got := rn.versions[versionID].DocIDSetHash
+	rn.mu.Unlock()
+	if got != want {
+		t.Errorf("committed digest = %q, want %q (from versiondoc set %v)", got, want, stored)
+	}
+	if got == "" {
+		t.Error("no digest committed for the new version")
+	}
+}

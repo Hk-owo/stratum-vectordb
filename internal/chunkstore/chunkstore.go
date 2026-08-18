@@ -34,4 +34,9 @@ type ChunkStore interface {
 	// DeleteByKB removes all chunk vectors for kbID. Used by knowledge
 	// base deletion.
 	DeleteByKB(ctx context.Context, kbID string) error
+
+	// DiskUsage returns the approximate on-disk size in bytes used by the
+	// chunk store (the C++ vecstore's RocksDB). Used by GetSystemStatus's
+	// resource-usage snapshot.
+	DiskUsage(ctx context.Context) (uint64, error)
 }

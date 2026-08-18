@@ -97,6 +97,12 @@ func (m *MockDocStore) DeleteByKB(_ context.Context, kbID string) error {
 	return nil
 }
 
+// DiskUsage implements DocStore: the in-memory mock has no disk footprint,
+// so it always reports zero.
+func (m *MockDocStore) DiskUsage(_ context.Context) (uint64, error) {
+	return 0, nil
+}
+
 // Reset clears all stored state. Convenience for tests; not part of the
 // DocStore interface.
 func (m *MockDocStore) Reset() {

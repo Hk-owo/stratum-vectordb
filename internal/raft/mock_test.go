@@ -225,3 +225,88 @@ func mustUpdateStatus(t *testing.T, r *MockRaftNode, versionID int64, status typ
 		t.Fatalf("ProposeUpdateVersionStatus(%d, %v): %v", versionID, status, err)
 	}
 }
+
+// TestMockRaftNode_MarkKBDeleting_And_DeleteFailed covers the KB lifecycle
+// transitions on the mock, including unknown-KB error paths.
+func TestMockRaftNode_MarkKBDeleting_And_DeleteFailed(t *testing.T) {
+	w := wal.NewMockWAL()
+	r := NewMockRaftNode(w)
+	ctx := context.Background()
+
+	if err := r.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ProposeMarkKBDeleting(ctx, "kb-1"); err != nil {
+		t.Fatalf("ProposeMarkKBDeleting: %v", err)
+	}
+	kb, _ := r.GetKB(ctx, "kb-1")
+	if kb.Status != types.KBStatusDeleting {
+		t.Errorf("status = %v, want DELETING", kb.Status)
+	}
+
+	if err := r.ProposeMarkKBDeleteFailed(ctx, "kb-1"); err != nil {
+		t.Fatalf("ProposeMarkKBDeleteFailed: %v", err)
+	}
+	kb, _ = r.GetKB(ctx, "kb-1")
+	if kb.Status != types.KBStatusDeleteFailed {
+		t.Errorf("status = %v, want DELETE_FAILED", kb.Status)
+	}
+
+	if err := r.ProposeMarkKBDeleting(ctx, "nope"); err == nil {
+		t.Error("expected error for unknown KB")
+	}
+	if err := r.ProposeMarkKBDeleteFailed(ctx, "nope"); err == nil {
+		t.Error("expected error for unknown KB")
+	}
+}
+
+// TestMockRaftNode_ListKnowledgeBases_And_Reset covers the full-KB scan
+// and the Reset helper on the mock.
+func TestMockRaftNode_ListKnowledgeBases_And_Reset(t *testing.T) {
+	w := wal.NewMockWAL()
+	r := NewMockRaftNode(w)
+	ctx := context.Background()
+
+	if err := r.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ProposeCreateKB(ctx, testKB("kb-2")); err != nil {
+		t.Fatal(err)
+	}
+	kbs, err := r.ListKnowledgeBases(ctx)
+	if err != nil || len(kbs) != 2 {
+		t.Fatalf("ListKnowledgeBases = %v, %v; want 2 KBs", kbs, err)
+	}
+
+	r.Reset()
+	kbs, err = r.ListKnowledgeBases(ctx)
+	if err != nil || len(kbs) != 0 {
+		t.Fatalf("after Reset, ListKnowledgeBases = %v, %v; want empty", kbs, err)
+	}
+}
+
+// TestMockRaftNode_ProposeUpdateVersionSummary covers the mock's digest
+// commit and its unknown-version error path.
+func TestMockRaftNode_ProposeUpdateVersionSummary(t *testing.T) {
+	w := wal.NewMockWAL()
+	r := NewMockRaftNode(w)
+	ctx := context.Background()
+	if err := r.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatal(err)
+	}
+	vID, err := r.ProposeCreateVersion(ctx, "kb-1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.ProposeUpdateVersionSummary(ctx, vID, "digest"); err != nil {
+		t.Fatalf("ProposeUpdateVersionSummary: %v", err)
+	}
+	if v, ok := r.GetVersion(vID); !ok || v.DocIDSetHash != "digest" {
+		t.Errorf("version digest = %q (ok=%v), want digest", v.DocIDSetHash, ok)
+	}
+
+	if err := r.ProposeUpdateVersionSummary(ctx, vID+999, "x"); err == nil {
+		t.Error("expected error for unknown version")
+	}
+}

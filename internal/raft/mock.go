@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -166,6 +167,19 @@ func (r *MockRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID i
 	return nil
 }
 
+// ProposeUpdateVersionSummary records the version's document-ID set hash.
+func (r *MockRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.versions[versionID]
+	if !ok {
+		return stratumerrors.ErrVersionNotFound
+	}
+	v.DocIDSetHash = docIDSetHash
+	r.versions[versionID] = v
+	return nil
+}
+
 // ProposeRollback switches kbID's active version to targetVersionID.
 // Callers are expected to have already validated targetVersionID is READY
 // via GetKB/ListVersions, per the documented RollbackVersion logical flow
@@ -208,6 +222,20 @@ func (r *MockRaftNode) ListVersions(_ context.Context, kbID string) ([]types.Ver
 	for _, id := range ids {
 		out = append(out, r.versions[id])
 	}
+	return out, nil
+}
+
+// ListKnowledgeBases returns metadata for every knowledge base in the
+// mock. Order is not specified (map iteration).
+func (r *MockRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]types.KnowledgeBaseMeta, 0, len(r.kbs))
+	for _, kb := range r.kbs {
+		out = append(out, kb)
+	}
+	// 与 RaftNodeImpl 保持一致：按 KBID 字典序排序。
+	sort.Slice(out, func(i, j int) bool { return out[i].KBID < out[j].KBID })
 	return out, nil
 }
 

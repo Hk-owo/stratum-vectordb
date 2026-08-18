@@ -97,3 +97,47 @@ func TestPrefixSuccessor_Empty(t *testing.T) {
 		t.Fatalf("PrefixSuccessor(empty) = %x, want nil", succ)
 	}
 }
+
+func TestDecodeString_RoundTrip(t *testing.T) {
+	for _, s := range []string{"", "a", "hello", "知识库文档", "with\000null\377bytes"} {
+		enc := EncodeString(s)
+		if got := DecodeString(enc); got != s {
+			t.Errorf("DecodeString(EncodeString(%q)) = %q", s, got)
+		}
+	}
+}
+
+func TestDecodeString_IgnoresSuffix(t *testing.T) {
+	// b is a full compound key; DecodeString must return only the first
+	// encoded component.
+	compound := append(EncodeString("kb"), EncodeString("doc")...)
+	if got := DecodeString(compound); got != "kb" {
+		t.Errorf("DecodeString(compound) = %q, want %q", got, "kb")
+	}
+}
+
+func TestDecodeString_Truncated(t *testing.T) {
+	// Fewer than 4 bytes.
+	if got := DecodeString([]byte{0x00}); got != "" {
+		t.Errorf("DecodeString(<4 bytes) = %q, want empty", got)
+	}
+	// Length prefix claims more than is present.
+	enc := EncodeString("abc")
+	if got := DecodeString(enc[:len(enc)-1]); got != "" {
+		t.Errorf("DecodeString(truncated) = %q, want empty", got)
+	}
+	// Zero-length prefix.
+	if got := DecodeString(EncodeString("")); got != "" {
+		t.Errorf("DecodeString(empty) = %q, want empty", got)
+	}
+}
+
+func TestEncodeVersionID_HappyPath(t *testing.T) {
+	for _, v := range []int64{0, 1, 2, 1 << 40, 1<<63 - 1} {
+		got := EncodeVersionID(v)
+		want := EncodeUint64(uint64(v))
+		if !bytes.Equal(got, want) {
+			t.Errorf("EncodeVersionID(%d) = %x, want %x", v, got, want)
+		}
+	}
+}

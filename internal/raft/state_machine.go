@@ -107,6 +107,15 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		sm.versions[cmd.VersionID] = v
 		return applyResult{}
 
+	case cmdUpdateVersionSummary:
+		v, ok := sm.versions[cmd.VersionID]
+		if !ok {
+			return applyResult{Err: stratumerrors.ErrVersionNotFound}
+		}
+		v.DocIDSetHash = cmd.DocIDSetHash
+		sm.versions[cmd.VersionID] = v
+		return applyResult{}
+
 	case cmdRollback:
 		kb, ok := sm.kbs[cmd.KBID]
 		if !ok {

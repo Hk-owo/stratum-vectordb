@@ -63,6 +63,12 @@ func (s *MockChunkStore) DeleteByKB(_ context.Context, kbID string) error {
 	return nil
 }
 
+// DiskUsage implements ChunkStore: the in-memory mock has no disk
+// footprint, so it always reports zero.
+func (s *MockChunkStore) DiskUsage(_ context.Context) (uint64, error) {
+	return 0, nil
+}
+
 // Read returns the stored vector for kbID + chunkID. Not part of the
 // ChunkStore interface (the real interface only exposes Exists, not Read,
 // at the Go layer — IndexManager reads chunk vectors via the C++ vecstore

@@ -122,7 +122,10 @@ func TestCluster_ElectsExactlyOneLeader(t *testing.T) {
 		if n.rf.IsLeader() {
 			t.Fatalf("node %d also claims leadership while node %d is leader", n.id, leader.id)
 		}
-		if n.rf.Term() != term {
+		// A follower's term only converges once it has received the
+		// leader's first heartbeat, which may lag a freshly won election —
+		// wait for convergence instead of asserting immediately.
+		if !waitFor(t, 2*time.Second, func() bool { return n.rf.Term() == term }) {
 			t.Fatalf("node %d term = %d, want %d (same as leader)", n.id, n.rf.Term(), term)
 		}
 	}

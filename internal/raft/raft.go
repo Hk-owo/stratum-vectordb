@@ -66,6 +66,13 @@ type RaftNode interface {
 	// READY after a successful index build, or FAILED after a failed one).
 	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus) error
 
+	// ProposeUpdateVersionSummary records the version's full document-ID
+	// set hash (VersionMeta.DocIDSetHash). The leader calls this after its
+	// storage-layer writes for the version have completed; followers use
+	// the committed digest to verify DataSync pulls are complete. No-op
+	// when the version does not exist (returns ErrVersionNotFound).
+	ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error
+
 	// ProposeRollback switches kbID's active version to targetVersionID.
 	ProposeRollback(ctx context.Context, kbID string, targetVersionID int64) error
 
@@ -74,6 +81,11 @@ type RaftNode interface {
 
 	// ListVersions returns the full version list for kbID.
 	ListVersions(ctx context.Context, kbID string) ([]types.VersionMeta, error)
+
+	// ListKnowledgeBases returns metadata for every knowledge base known to
+	// the Raft state machine. Used by the console (ListKnowledgeBases RPC)
+	// and by GetSystemStatus to scan for stuck versions / delete-failed KBs.
+	ListKnowledgeBases(ctx context.Context) ([]types.KnowledgeBaseMeta, error)
 
 	// GetClusterStatus returns Raft cluster connectivity information,
 	// independent of any specific knowledge base. Used by HealthCheck's

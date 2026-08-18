@@ -12,13 +12,14 @@ import (
 type commandType string
 
 const (
-	cmdCreateKB            commandType = "CreateKB"
-	cmdMarkKBDeleting      commandType = "MarkKBDeleting"
-	cmdMarkKBDeleteFailed  commandType = "MarkKBDeleteFailed"
-	cmdRemoveKBMeta        commandType = "RemoveKBMeta"
-	cmdCreateVersion       commandType = "CreateVersion"
-	cmdUpdateVersionStatus commandType = "UpdateVersionStatus"
-	cmdRollback            commandType = "Rollback"
+	cmdCreateKB             commandType = "CreateKB"
+	cmdMarkKBDeleting       commandType = "MarkKBDeleting"
+	cmdMarkKBDeleteFailed   commandType = "MarkKBDeleteFailed"
+	cmdRemoveKBMeta         commandType = "RemoveKBMeta"
+	cmdCreateVersion        commandType = "CreateVersion"
+	cmdUpdateVersionStatus  commandType = "UpdateVersionStatus"
+	cmdUpdateVersionSummary commandType = "UpdateVersionSummary"
+	cmdRollback             commandType = "Rollback"
 )
 
 // command is the JSON-encoded payload carried inside each kvraft log
@@ -42,6 +43,9 @@ type command struct {
 	// cmdUpdateVersionStatus
 	VersionID int64             `json:"version_id,omitempty"`
 	Status    types.IndexStatus `json:"status,omitempty"`
+
+	// cmdUpdateVersionSummary
+	DocIDSetHash string `json:"doc_id_set_hash,omitempty"`
 
 	// cmdRollback
 	TargetVersionID int64 `json:"target_version_id,omitempty"`

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 
 	"github.com/cockroachdb/pebble"
 	"google.golang.org/grpc/codes"
@@ -199,12 +200,31 @@ func (h *LeaderHandler) streamDocStore(
 			continue // doc not found at this version (shouldn't happen)
 		}
 
+		// The raw value carries docstore's internal tag byte
+		// (tagContent 0x01 / tagTombstone 0x00). The wire format
+		// PRESERVES the tag verbatim so the follower can reconstruct the
+		// MVCC state losslessly — critically, the distinction between a
+		// live document with empty content ({0x01}) and a tombstone
+		// ({0x00}), which proto3 bytes fields cannot express with a bare
+		// semantic payload (empty and absent both decode to nil). The
+		// follower strips the tag before writing to its own store.
+		if len(foundVal) == 0 {
+			return fmt.Errorf("sync: stream DocStore: empty stored value for %s/%s (missing tag byte)", kbID, docID)
+		}
+		switch foundVal[0] {
+		case tagTombstone, tagContent:
+			// pass through verbatim
+		default:
+			return fmt.Errorf("sync: stream DocStore: unknown value tag 0x%02x for %s/%s", foundVal[0], kbID, docID)
+		}
+		payload := foundVal
+
 		if err := stream.Send(&pb.SyncEntry{
 			EntryType: pb.SyncEntryType_SYNC_ENTRY_TYPE_DOC_STORE,
 			KbId:      kbID,
 			DocId:     docID,
 			VersionId: foundVersion,
-			Payload:   foundVal, // empty = tombstone
+			Payload:   payload,
 		}); err != nil {
 			return err
 		}
@@ -350,7 +370,7 @@ func (h *LeaderHandler) streamChunkVectors(
 	return nil
 }
 
-// encodeVecstoreKey mirrors chunkstore.encodeKey. Must stay in sync.
+// Vecstore key encoding mirrors chunkstore.encodeKey. Must stay in sync.
 func encodeVecstoreKey(kbID, chunkID string) string {
 	b := make([]byte, 4+len(kbID))
 	n := len(kbID)
@@ -362,11 +382,22 @@ func encodeVecstoreKey(kbID, chunkID string) string {
 	return string(b) + chunkID
 }
 
-// float32sToBytes serializes []float32 as raw bytes (little-endian).
+// docstore value tags, mirroring internal/docstore's private
+// tagTombstone/tagContent. The sync wire format for a DOC_STORE payload
+// is the *semantic* content (raw doc text, or empty for a tombstone), so
+// the leader must strip the tag byte before streaming. Must stay in sync
+// with docstore.encodeValue.
+const (
+	tagTombstone byte = 0x00
+	tagContent   byte = 0x01
+)
+
+// float32sToBytes serializes []float32 as raw IEEE-754 bytes
+// (little-endian bit patterns, one float32 per 4 bytes).
 func float32sToBytes(v []float32) []byte {
 	b := make([]byte, 4*len(v))
 	for i, f := range v {
-		binary.LittleEndian.PutUint32(b[i*4:], uint32(f))
+		binary.LittleEndian.PutUint32(b[i*4:], math.Float32bits(f))
 	}
 	return b
 }
@@ -375,7 +406,7 @@ func float32sToBytes(v []float32) []byte {
 func bytesToFloat32s(b []byte) []float32 {
 	v := make([]float32, len(b)/4)
 	for i := range v {
-		v[i] = float32(binary.LittleEndian.Uint32(b[i*4:]))
+		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
 	}
 	return v
 }

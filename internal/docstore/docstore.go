@@ -38,4 +38,8 @@ type DocStore interface {
 	// versions). Used by knowledge base deletion. Prefix-scan based;
 	// idempotent.
 	DeleteByKB(ctx context.Context, kbID string) error
+
+	// DiskUsage returns the approximate on-disk size in bytes of the store.
+	// Used by GetSystemStatus's resource-usage snapshot.
+	DiskUsage(ctx context.Context) (uint64, error)
 }

@@ -111,6 +111,18 @@ type VersionMeta struct {
 	CreatedAt       int64 // Unix timestamp; leader's local clock at apply time.
 	// Not required to be strictly monotonic across nodes.
 	IndexStatus IndexStatus
+
+	// DocIDSetHash is the SHA-256 digest of this version's full document-ID
+	// set (sorted docIDs, '\n'-separated — see sync.ComputeDocIDSetHash).
+	// The leader computes and commits it (via ProposeUpdateVersionSummary)
+	// only after its own storage writes have finished, so it doubles as a
+	// "storage writes complete" marker. Followers recompute the digest from
+	// their locally pulled VersionDocList and retry the DataSync pull until
+	// the two match, which closes the "follower pulled before the leader's
+	// writes landed" race without moving data into the Raft log. Empty
+	// string means no digest has been committed yet (initial/empty version,
+	// or a missed propose) — followers then skip verification.
+	DocIDSetHash string
 }
 
 // ChangeOp identifies the kind of mutation a DocChange represents.

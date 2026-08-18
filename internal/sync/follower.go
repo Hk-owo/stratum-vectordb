@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -52,6 +53,13 @@ func NewFollower(
 
 // PullVersion implements FollowerSync.
 func (f *Follower) PullVersion(ctx context.Context, leaderAddr string, kbID string, versionID int64) error {
+	// 兜底:不信任调用方 ctx 无超时(如 context.Background())。
+	// grpc.WithBlock() 在 leader 不可达(域名无法解析/拒绝连接)时会一直
+	// 等待连接建立;这里强制给整个拉取过程设上界,失败由调用方的 deadline
+	// 循环重试。否则一旦卡死会连带阻塞 raft 的 apply 循环。
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
 	conn, err := grpc.DialContext(ctx, leaderAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
@@ -92,6 +100,27 @@ func (f *Follower) PullVersion(ctx context.Context, leaderAddr string, kbID stri
 	return nil
 }
 
+// applyDocStoreEntry writes a DOC_STORE entry to the local docstore. The
+// wire payload carries docstore's tag byte verbatim (tagContent 0x01 +
+// content, or tagTombstone 0x00) so the follower can distinguish a live
+// document with empty content ({0x01}) from a tombstone ({0x00}) — see
+// LeaderHandler.streamDocStore. The tag is stripped before the value is
+// handed to DocStore.Write, which applies its own tag/tombstone semantics.
+func (f *Follower) applyDocStoreEntry(ctx context.Context, entry *pb.SyncEntry) error {
+	payload := entry.GetPayload()
+	if len(payload) == 0 {
+		return fmt.Errorf("sync: DOC_STORE entry for %s/%s v%d missing tag byte", entry.GetKbId(), entry.GetDocId(), entry.GetVersionId())
+	}
+	switch payload[0] {
+	case tagTombstone:
+		return f.docStore.Write(ctx, entry.GetKbId(), entry.GetDocId(), entry.GetVersionId(), nil)
+	case tagContent:
+		return f.docStore.Write(ctx, entry.GetKbId(), entry.GetDocId(), entry.GetVersionId(), payload[1:])
+	default:
+		return fmt.Errorf("sync: DOC_STORE entry for %s/%s v%d has unknown tag 0x%02x", entry.GetKbId(), entry.GetDocId(), entry.GetVersionId(), payload[0])
+	}
+}
+
 // applyEntry writes a single SyncEntry to the appropriate local store.
 // All writes are idempotent: re-applying the same entry is a no-op.
 func (f *Follower) applyEntry(ctx context.Context, entry *pb.SyncEntry) error {
@@ -100,7 +129,7 @@ func (f *Follower) applyEntry(ctx context.Context, entry *pb.SyncEntry) error {
 		return f.versionDoc.Write(ctx, entry.GetKbId(), entry.GetVersionId(), entry.GetDocId())
 
 	case pb.SyncEntryType_SYNC_ENTRY_TYPE_DOC_STORE:
-		return f.docStore.Write(ctx, entry.GetKbId(), entry.GetDocId(), entry.GetVersionId(), entry.GetPayload())
+		return f.applyDocStoreEntry(ctx, entry)
 
 	case pb.SyncEntryType_SYNC_ENTRY_TYPE_CHUNK_DOC_FORWARD:
 		// Forward and reverse are the same Write call (PebbleChunkDocMapper

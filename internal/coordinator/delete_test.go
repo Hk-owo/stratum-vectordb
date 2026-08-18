@@ -31,6 +31,9 @@ func (r *deleteTestRaftNode) ProposeCreateVersion(_ context.Context, kbID string
 func (r *deleteTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
 	return nil
 }
+func (r *deleteTestRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {
+	return nil
+}
 func (r *deleteTestRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) error { return nil }
 func (r *deleteTestRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, kbID string) error {
 	r.mu.Lock()
@@ -52,6 +55,9 @@ func (r *deleteTestRaftNode) GetKB(_ context.Context, kbID string) (types.Knowle
 	return types.KnowledgeBaseMeta{}, nil
 }
 func (r *deleteTestRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) { return nil, nil }
+func (r *deleteTestRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
+	return nil, nil
+}
 func (r *deleteTestRaftNode) GetClusterStatus(_ context.Context) (types.ClusterStatus, error) {
 	return types.ClusterStatus{}, nil
 }
@@ -79,6 +85,7 @@ func (s *deleteTestDocStore) DeleteByKB(_ context.Context, kbID string) error {
 	s.deleted = append(s.deleted, kbID)
 	return nil
 }
+func (s *deleteTestDocStore) DiskUsage(_ context.Context) (uint64, error) { return 0, nil }
 
 // deleteTestChunkStore tracks DeleteByKB calls.
 type deleteTestChunkStore struct {
@@ -102,6 +109,7 @@ func (s *deleteTestChunkStore) DeleteByKB(_ context.Context, kbID string) error 
 	s.deleted = append(s.deleted, kbID)
 	return nil
 }
+func (s *deleteTestChunkStore) DiskUsage(_ context.Context) (uint64, error) { return 0, nil }
 
 // deleteTestChunkDocMapper tracks DeleteByKB calls.
 type deleteTestChunkDocMapper struct {
@@ -182,6 +190,7 @@ func (im *deleteTestIndexManager) EvictByKB(_ context.Context, kbID string) erro
 	return nil
 }
 func (im *deleteTestIndexManager) Ping(_ context.Context) error { return nil }
+func (im *deleteTestIndexManager) LoadedCount() int               { return 0 }
 
 // === Tests ===
 
