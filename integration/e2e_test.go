@@ -408,6 +408,98 @@ func waitForLeader(t *testing.T, nodes ...*realNode) *realNode {
 	return nil
 }
 
+// wireSyncPull wires a node's onVersionCreated to the DataSync pull with
+// digest verification and retry. The leader address is resolved fresh on
+// every retry (via addrByID: nodeID → gRPC addr), so the pull keeps working
+// across leader changes. See sync.VerifyDocIDSet for the verification
+// contract. The initial version (v1, created by CreateKnowledgeBase) carries
+// no digest and no data — pull it once and move on.
+func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
+	t.Helper()
+	syncFollower := sync.NewFollower(n.docStore, n.chunkDoc, n.versionDoc, n.chunkStore, n.indexMgr)
+	n.raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
+		ctx := context.Background()
+		if versionID <= 1 {
+			if addr := leaderAddrOf(ctx, n, addrByID); addr != "" {
+				_ = syncFollower.PullVersion(ctx, addr, kbID, versionID)
+			}
+			return
+		}
+		deadline := time.Now().Add(15 * time.Second)
+		backoff := 50 * time.Millisecond
+		for {
+			if addr := leaderAddrOf(ctx, n, addrByID); addr != "" {
+				_ = syncFollower.PullVersion(ctx, addr, kbID, versionID)
+			}
+			if verifyFollowerPull(ctx, n, kbID, versionID) {
+				return
+			}
+			if time.Now().After(deadline) {
+				n.t.Logf("node %d: pull for %s v%d did not converge", n.nodeID, kbID, versionID)
+				return
+			}
+			time.Sleep(backoff)
+			if backoff < time.Second {
+				backoff *= 2
+			}
+		}
+	})
+}
+
+// leaderAddrOf resolves the current cluster leader's gRPC address from this
+// node's own raft view, or "" if unknown.
+func leaderAddrOf(ctx context.Context, n *realNode, addrByID map[int64]string) string {
+	st, err := n.raftNode.GetClusterStatus(ctx)
+	if err != nil || !st.HasLeader {
+		return ""
+	}
+	return addrByID[st.LeaderID]
+}
+
+// verifyFollowerPull reports whether the node's local stores hold the
+// version's complete data: the digest recomputed from the local
+// VersionDocList must match the digest the leader committed into the
+// version metadata; without a committed digest, local data non-empty is
+// accepted (see sync.VerifyDocIDSet).
+func verifyFollowerPull(ctx context.Context, n *realNode, kbID string, versionID int64) bool {
+	var metaHash string
+	if versions, err := n.raftNode.ListVersions(ctx, kbID); err == nil {
+		for _, v := range versions {
+			if v.VersionID == versionID {
+				metaHash = v.DocIDSetHash
+				break
+			}
+		}
+	}
+	ok, _, err := sync.VerifyDocIDSet(ctx, n.versionDoc, kbID, versionID, metaHash)
+	if err == nil && ok {
+		return true
+	}
+	if metaHash == "" {
+		docs, derr := n.versionDoc.ListDocIDs(ctx, kbID, versionID)
+		return derr == nil && len(docs) > 0
+	}
+	return false
+}
+
+// waitQueryDoc polls n's Query service until docID is retrievable for the
+// version (an eventually-consistent read: the follower's index build is
+// asynchronous and may transiently serve an empty index).
+func waitQueryDoc(t *testing.T, n *realNode, kbID string, versionID int64, vec []float32, docID string) *pb.QueryResult {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		res := n.query(context.Background(), kbID, versionID, vec, 10)
+		if r := findResult(res, docID); r != nil {
+			return r
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("node %d: query never returned %s on v%d; last results: %+v", n.nodeID, docID, versionID, res)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // versionHash returns the committed document-ID set digest for the
 // version, or "" if absent.
 func versionHash(t *testing.T, n *realNode, kbID string, versionID int64) string {
@@ -692,63 +784,9 @@ func TestRealStack_TwoNodeReplication(t *testing.T) {
 	}
 	t.Logf("leader = node %d, follower = node %d", leader.nodeID, follower.nodeID)
 
-	// Wire the follower's data-sync: when it applies a CreateVersion
-	// written by the leader, pull storage-layer data from the leader and
-	// build its own index. The pull may race ahead of the leader's
-	// post-propose storage writes, so retry until the pulled data is
-	// VERIFIED complete: the digest recomputed from the local
-	// VersionDocList must match the digest the leader committed into the
-	// version metadata (see sync.VerifyDocIDSet). The initial version
-	// (v1, created by CreateKnowledgeBase) carries no digest and no data —
-	// pull it once and move on.
-	leaderGRPC := leader.grpcAddr
-	syncFollower := sync.NewFollower(
-		follower.docStore, follower.chunkDoc, follower.versionDoc,
-		follower.chunkStore, follower.indexMgr,
-	)
-	follower.raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
-		ctx := context.Background()
-		if versionID <= 1 {
-			_ = syncFollower.PullVersion(ctx, leaderGRPC, kbID, versionID)
-			return
-		}
-		deadline := time.Now().Add(10 * time.Second)
-		backoff := 50 * time.Millisecond
-		for {
-			_ = syncFollower.PullVersion(ctx, leaderGRPC, kbID, versionID)
-
-			// Expected digest from this node's replicated metadata.
-			var metaHash string
-			if versions, err := follower.raftNode.ListVersions(ctx, kbID); err == nil {
-				for _, v := range versions {
-					if v.VersionID == versionID {
-						metaHash = v.DocIDSetHash
-						break
-					}
-				}
-			}
-			ok, _, err := sync.VerifyDocIDSet(ctx, follower.versionDoc, kbID, versionID, metaHash)
-			if err == nil && ok {
-				return
-			}
-			if metaHash == "" {
-				// Digest not committed yet (leader's propose races us, or a
-				// missed propose): accept a pull that produced data.
-				docs, derr := follower.versionDoc.ListDocIDs(ctx, kbID, versionID)
-				if derr == nil && len(docs) > 0 {
-					return
-				}
-			}
-			if time.Now().After(deadline) {
-				follower.t.Logf("follower pull for %s v%d did not converge (metaHash=%s)", kbID, versionID, metaHash)
-				return
-			}
-			time.Sleep(backoff)
-			if backoff < time.Second {
-				backoff *= 2
-			}
-		}
-	})
+	// Wire the follower's data-sync with digest-verified retry pulls.
+	addrByID := map[int64]string{1: grpc1, 2: grpc2}
+	wireSyncPull(t, follower, addrByID)
 
 	ctx := context.Background()
 	kbID, v1 := leader.createTestKB(ctx, "e2e-two-node")
