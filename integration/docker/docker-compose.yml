@@ -7,18 +7,16 @@
 #   go test ./integration/docker/... -tags=docker
 #   docker compose down
 
-version: "3.8"
-
 services:
   # Mock embed HTTP server — deterministic vector generation for testing.
+  # Runs a host-built static binary (no Go image available in this env).
   mock-embed:
-    image: golang:1.24-alpine
-    working_dir: /app
-    command: go run mock_embed_server.go
+    image: alpine:latest
+    command: /app/mock-embed
     ports:
       - "18080:8080"
     volumes:
-      - ./mock_embed_server.go:/app/mock_embed_server.go:ro
+      - ./mock-embed:/app/mock-embed:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
       interval: 5s
@@ -41,6 +39,8 @@ services:
       - "17000:7000"   # gRPC API
       - "18000:8000"   # Raft internal
       - "19000:9000"   # Prometheus metrics
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./config1.yaml:/etc/stratum/config.yaml:ro
       - node1_data:/var/lib/stratum/node1
@@ -57,6 +57,8 @@ services:
       - "17001:7000"
       - "18001:8000"
       - "19001:9000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./config2.yaml:/etc/stratum/config.yaml:ro
       - node2_data:/var/lib/stratum/node2
@@ -73,6 +75,8 @@ services:
       - "17002:7000"
       - "18002:8000"
       - "19002:9000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./config3.yaml:/etc/stratum/config.yaml:ro
       - node3_data:/var/lib/stratum/node3

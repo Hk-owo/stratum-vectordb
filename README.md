@@ -84,6 +84,18 @@ go run ./cmd/stratum/
 
 # One-click console: vecstore(C++) → stratum(gRPC) → gateway(HTTP) + web UI
 ./start.sh           # then open http://localhost:8081
+
+# 3-node Docker cluster (T4): compose + tagged tests
+docker compose -f integration/docker/docker-compose.yml up -d --wait
+go test ./integration/docker/... -tags=docker -timeout 300s
+docker compose -f integration/docker/docker-compose.yml down
+```
+
+`cmd/stratum` accepts an optional YAML config file for multi-node
+deployments; command-line flags override file values:
+
+```bash
+go run ./cmd/stratum/ -config integration/docker/config1.yaml
 ```
 
 ## gRPC API
@@ -159,8 +171,9 @@ stratum/
 │   └── coordinator/        # WriteCoordinator + DeleteCoordinator orchestration
 ├── service/                # gRPC service implementations
 ├── integration/            # Mock-based integration tests + real-stack e2e + cluster tests
+│   └── docker/             # 3-node Docker Compose cluster + T4 tests (`docker` build tag)
 ├── cmd/
-│   ├── stratum/main.go     # Entry point
+│   ├── stratum/main.go     # Entry point (−config YAML / flags)
 │   └── stratum-gateway/    # HTTP/JSON → gRPC gateway + web console static assets
 ├── configs/                # Sample configuration files
 ├── web/                    # Web console frontend (HTML/CSS/JS)
@@ -205,7 +218,7 @@ discovered through TDD:
 | T1 | Single-module contracts (8 modules) |  ✅ |
 | T2 | Cross-module integration (4 groups) |  ✅ |
 | T3 | Single-node full chain (15 scenarios) |  ✅ |
-| T4 | 3-node Raft cluster |  ✅ |
+| T4 | 3-node Raft cluster (in-process + Docker Compose + data-volume) |  ✅ |
 | T5 | Real-stack e2e (real Pebble/WAL/Raft/IndexManager + vecstore subprocess, zero mocks) |  ✅ |
 
 ```bash
@@ -218,7 +231,13 @@ go test ./integration/... -run TestRealStack -v
 # vecstore/CMakeLists.txt) and skips rather than fails if it is missing.
 
 go test ./integration/... -run TestMultiNode -v
-# 3-node cluster elects leader, replicates KB + version metadata
+# 3-node in-process cluster elects leader, replicates KB + version metadata
+
+docker compose -f integration/docker/docker-compose.yml up -d --wait
+go test ./integration/docker/... -tags=docker -v -timeout 300s
+# 3-node Docker cluster (docker_test.go) + data-volume cost sampling
+# (datavolume_test.go, scale with STRATUM_VOLUME_DOCS)
+docker compose -f integration/docker/docker-compose.yml down
 ```
 
 ## Prerequisites

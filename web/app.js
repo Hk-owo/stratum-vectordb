@@ -201,6 +201,19 @@ $('cancel-create-kb').addEventListener('click', () => {
 });
 
 // ---------- 知识库 ----------
+// 知识库显示名：name 优先。若 id 由 name 派生（id = name + 后缀，如 "name-N"），
+// 只额外显示后缀以区分同名库，避免 name 与 id 重复展示。
+function kbDisplayName(kb) {
+  const name = kb.name || '';
+  const id = kb.knowledge_base_id || '';
+  if (!name) return escapeHtml(id);
+  if (id === name) return escapeHtml(name);
+  if (id.startsWith(name)) {
+    return `${escapeHtml(name)} <span class="muted">${escapeHtml(id.slice(name.length))}</span>`;
+  }
+  return escapeHtml(name);
+}
+
 async function renderKBList() {
   const el = $('kb-list');
   try {
@@ -215,8 +228,7 @@ async function renderKBList() {
     el.innerHTML = kbs.map(kb => {
       const st = KB_STATUS[kb.status] || { label: kb.status, cls: 'gray' };
       return `<li data-id="${kb.knowledge_base_id}" class="${currentKB && currentKB.id === kb.knowledge_base_id ? 'selected' : ''}">
-        <span>${kb.name || kb.knowledge_base_id} ${badge(st.cls, st.label)}</span>
-        <span class="muted">${kb.knowledge_base_id}</span>
+        <span>${kbDisplayName(kb)} ${badge(st.cls, st.label)}</span>
       </li>`;
     }).join('');
     el.querySelectorAll('li').forEach(li => li.addEventListener('click', () => selectKB(li.dataset.id)));
@@ -307,14 +319,27 @@ function renderVersions(versions) {
   if (!versions.length) { el.innerHTML = '<span class="muted">暂无版本</span>'; return; }
   const active = currentKBMeta ? currentKBMeta.active_version_id : null;
 
+  // 本库内序号：按全局 version_id 升序排序后的位置（1-based）。
+  // version_id 全局单调递增，所以它等价于「该知识库内第 N 个版本」。
+  const localNo = {};
+  versions.slice().sort((a, b) => Number(a.version_id) - Number(b.version_id))
+    .forEach((v, i) => { localNo[String(v.version_id)] = i + 1; });
+
   // 按 parent_version_id 建树，支持分叉（同一父版本多个子版本，A/B 场景）。
+  // 注意：protojson 把 int64 序列化为字符串，统一 String() 比较，避免 "0" !== 0 这类坑。
   const byParent = {};
-  const ids = new Set(versions.map(v => v.version_id));
-  for (const v of versions) (byParent[v.parent_version_id] = byParent[v.parent_version_id] || []).push(v);
-  for (const k of Object.keys(byParent)) byParent[k].sort((a, b) => a.version_id - b.version_id);
-  // 根节点：parent=0，或 parent 不在本列表（历史被截断）时也作为根。
-  const roots = (byParent[0] || []).concat(
-    versions.filter(v => v.parent_version_id !== 0 && !ids.has(v.parent_version_id))
+  const ids = new Set(versions.map(v => String(v.version_id)));
+  for (const v of versions) {
+    const p = String(v.parent_version_id);
+    (byParent[p] = byParent[p] || []).push(v);
+  }
+  for (const k of Object.keys(byParent)) byParent[k].sort((a, b) => Number(a.version_id) - Number(b.version_id));
+  // 根节点：parent=0；孤儿节点（parent 不在本列表，历史被截断）也作为根。
+  const roots = (byParent["0"] || []).concat(
+    versions.filter(v => {
+      const p = String(v.parent_version_id);
+      return p !== "0" && !ids.has(p);
+    })
   );
 
   const rows = [];
@@ -333,10 +358,11 @@ function renderVersions(versions) {
       <span class="tree-corner">${depth > 0 ? '└─' : ''}</span>
       ${badge(st.cls, st.label)}
       <strong>v${v.version_id}</strong>
+      <span class="local-no">本库 #${localNo[String(v.version_id)]}</span>
       <span class="meta">父 v${v.parent_version_id} · ${fmtTime(v.created_at)} ${activeTag}</span>
       <span class="actions">${actions.join('')}</span>
     </div>`);
-    (byParent[v.version_id] || []).forEach(c => walk(c, depth + 1));
+    (byParent[String(v.version_id)] || []).forEach(c => walk(c, depth + 1));
   };
   roots.forEach(r => walk(r, 0));
 

@@ -18,6 +18,7 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"gopkg.in/yaml.v3"
 
 	pb "stratum/api/proto/stratum"
 	vecstorepb "stratum/api/proto/vecstore"
@@ -49,8 +50,10 @@ func main() {
 
 	// --- Flags ---
 	// Minimal flag surface for local/dev runs (the one-click startup script
-	// and ad-hoc manual runs). Defaults match defaultConfig(); in a full
-	// deployment these would come from a config file (configs/config1.yaml).
+	// and ad-hoc manual runs). Defaults match defaultConfig(); a YAML config
+	// file (see configs/config1.yaml) can supply the full multi-node
+	// deployment settings, with individual flags overriding file values.
+	configFlag := flag.String("config", "", "path to YAML config file (optional; flags override file values)")
 	dataDirFlag := flag.String("data-dir", "", "data directory (default /var/lib/stratum/node1)")
 	grpcAddrFlag := flag.String("grpc-addr", "", "gRPC listen address (default 0.0.0.0:7000)")
 	vecstoreAddrFlag := flag.String("vecstore-addr", "", "vecstore gRPC address (default 127.0.0.1:7100)")
@@ -58,10 +61,17 @@ func main() {
 	flag.Parse()
 
 	// --- Configuration ---
-	// In a real deployment, this would be loaded from a YAML config file
-	// (see configs/config1.yaml). For now, use hardcoded defaults that
-	// match the sample config, overridable via flags for local runs.
+	// Load a YAML config file if provided; individual flags override file
+	// values. With no config file, use the hardcoded single-node defaults
+	// (matching configs/config1.yaml).
 	cfg := defaultConfig()
+	if *configFlag != "" {
+		loaded, err := loadConfig(*configFlag)
+		if err != nil {
+			logger.Fatal("failed to load config file", zap.String("path", *configFlag), zap.Error(err))
+		}
+		cfg = loaded
+	}
 	if *dataDirFlag != "" {
 		cfg.DataDir = *dataDirFlag
 	}
@@ -131,12 +141,15 @@ func main() {
 
 	// --- Raft ---
 	raftImpl, err := raft.NewRaftNodeImpl(raft.Config{
-		NodeID:   cfg.NodeID,
-		DataDir:  dataDir,
-		RaftAddr: cfg.RaftAddr,
-		Peers:    cfg.Peers,
-		WAL:      walImpl,
-		Logger:   logger.Named("raft"),
+		NodeID:             cfg.NodeID,
+		DataDir:            dataDir,
+		RaftAddr:           cfg.RaftAddr,
+		Peers:              cfg.Peers,
+		WAL:                walImpl,
+		Logger:             logger.Named("raft"),
+		HeartbeatInterval:  cfg.HeartbeatInterval,
+		ElectionTimeoutMin: cfg.ElectionTimeoutMin,
+		ElectionTimeoutMax: cfg.ElectionTimeoutMax,
 	})
 	if err != nil {
 		logger.Fatal("failed to start RaftNode", zap.Error(err))
@@ -374,6 +387,13 @@ type appConfig struct {
 	RaftAddr string
 	Peers    []raft.PeerConfig
 
+	// Raft timing. The kvraft defaults ([150ms, 300ms) election timeout)
+	// are tuned for in-process tests; over a real network (e.g. Docker)
+	// they cause perpetual split votes, so we widen them here.
+	HeartbeatInterval  time.Duration
+	ElectionTimeoutMin time.Duration
+	ElectionTimeoutMax time.Duration
+
 	VecstoreGRPCAddr string
 	EmbedServiceAddr string
 
@@ -388,8 +408,128 @@ type appConfig struct {
 	DeleteRetryBaseMS int
 }
 
+// fileConfig mirrors the on-disk YAML schema (configs/config1.yaml and
+// integration/docker/config{1,2,3}.yaml). Fields left unset fall back to
+// defaultConfig()'s values.
+type fileConfig struct {
+	Node struct {
+		NodeID   int64  `yaml:"node_id"`
+		GRPCAddr string `yaml:"grpc_addr"`
+		RaftAddr string `yaml:"raft_addr"`
+	} `yaml:"node"`
+
+	Raft struct {
+		Peers []struct {
+			ID          int64  `yaml:"id"`
+			Addr        string `yaml:"addr"`
+			ServiceAddr string `yaml:"service_addr"`
+		} `yaml:"peers"`
+	} `yaml:"raft"`
+
+	Storage struct {
+		DataDir string `yaml:"data_dir"`
+	} `yaml:"storage"`
+
+	Vecstore struct {
+		GRPCAddr string `yaml:"grpc_addr"`
+	} `yaml:"vecstore"`
+
+	Embed struct {
+		ServiceAddr string `yaml:"service_addr"`
+	} `yaml:"embed"`
+
+	IndexManager struct {
+		LRUCapacity         int `yaml:"lru_capacity"`
+		LoadWaitTimeoutMS   int `yaml:"load_wait_timeout_ms"`
+		CallbackMaxRetries  int `yaml:"callback_max_retries"`
+		CallbackRetryBaseMS int `yaml:"callback_retry_base_interval_ms"`
+	} `yaml:"index_manager"`
+
+	WriteCoordinator struct {
+		MaxRetries          int `yaml:"max_retries"`
+		RetryBaseIntervalMS int `yaml:"retry_base_interval_ms"`
+	} `yaml:"write_coordinator"`
+
+	DeleteCoordinator struct {
+		MaxRetries          int `yaml:"max_retries"`
+		RetryBaseIntervalMS int `yaml:"retry_base_interval_ms"`
+	} `yaml:"delete_coordinator"`
+}
+
+// loadConfig reads a YAML config file and overlays it on the defaults.
+// Unset fields keep their defaultConfig() values.
+func loadConfig(path string) (appConfig, error) {
+	cfg := defaultConfig()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+
+	var fc fileConfig
+	if err := yaml.Unmarshal(data, &fc); err != nil {
+		return cfg, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	if fc.Node.NodeID != 0 {
+		cfg.NodeID = fc.Node.NodeID
+	}
+	if fc.Node.GRPCAddr != "" {
+		cfg.GRPCAddr = fc.Node.GRPCAddr
+	}
+	if fc.Node.RaftAddr != "" {
+		cfg.RaftAddr = fc.Node.RaftAddr
+	}
+	if len(fc.Raft.Peers) > 0 {
+		peers := make([]raft.PeerConfig, 0, len(fc.Raft.Peers))
+		for _, p := range fc.Raft.Peers {
+			peers = append(peers, raft.PeerConfig{
+				ID:          p.ID,
+				RaftAddr:    p.Addr,
+				ServiceAddr: p.ServiceAddr,
+			})
+		}
+		cfg.Peers = peers
+	}
+	if fc.Storage.DataDir != "" {
+		cfg.DataDir = fc.Storage.DataDir
+	}
+	if fc.Vecstore.GRPCAddr != "" {
+		cfg.VecstoreGRPCAddr = fc.Vecstore.GRPCAddr
+	}
+	if fc.Embed.ServiceAddr != "" {
+		cfg.EmbedServiceAddr = fc.Embed.ServiceAddr
+	}
+	if fc.IndexManager.LRUCapacity != 0 {
+		cfg.IndexLRUCapacity = fc.IndexManager.LRUCapacity
+	}
+	if fc.IndexManager.LoadWaitTimeoutMS != 0 {
+		cfg.IndexLoadWaitTimeout = time.Duration(fc.IndexManager.LoadWaitTimeoutMS) * time.Millisecond
+	}
+	if fc.IndexManager.CallbackMaxRetries != 0 {
+		cfg.IndexCallbackMaxRetries = fc.IndexManager.CallbackMaxRetries
+	}
+	if fc.IndexManager.CallbackRetryBaseMS != 0 {
+		cfg.IndexCallbackRetryBaseMS = fc.IndexManager.CallbackRetryBaseMS
+	}
+	if fc.WriteCoordinator.MaxRetries != 0 {
+		cfg.WriteMaxRetries = fc.WriteCoordinator.MaxRetries
+	}
+	if fc.WriteCoordinator.RetryBaseIntervalMS != 0 {
+		cfg.WriteRetryBaseMS = fc.WriteCoordinator.RetryBaseIntervalMS
+	}
+	if fc.DeleteCoordinator.MaxRetries != 0 {
+		cfg.DeleteMaxRetries = fc.DeleteCoordinator.MaxRetries
+	}
+	if fc.DeleteCoordinator.RetryBaseIntervalMS != 0 {
+		cfg.DeleteRetryBaseMS = fc.DeleteCoordinator.RetryBaseIntervalMS
+	}
+
+	return cfg, nil
+}
+
 // defaultConfig returns hardcoded defaults matching configs/config1.yaml.
-// In production, this would be loaded from the YAML file on disk.
+// A YAML config file (loadConfig) overlays these defaults.
 func defaultConfig() appConfig {
 	return appConfig{
 		NodeID:   1,
@@ -399,6 +539,10 @@ func defaultConfig() appConfig {
 		Peers: []raft.PeerConfig{
 			{ID: 1, RaftAddr: "127.0.0.1:8000", ServiceAddr: "127.0.0.1:7000"},
 		},
+
+		HeartbeatInterval:  200 * time.Millisecond,
+		ElectionTimeoutMin: 2000 * time.Millisecond,
+		ElectionTimeoutMax: 4000 * time.Millisecond,
 
 		VecstoreGRPCAddr: "127.0.0.1:7100",
 		EmbedServiceAddr: "http://localhost:8080",

@@ -1,6 +1,6 @@
-# config1.yaml — Stratum node 1 of 3-node cluster
+# config2.yaml — Stratum node 2 of 3-node cluster
 node:
-  node_id: 1
+  node_id: 2
   grpc_addr: "0.0.0.0:7000"
   raft_addr: "0.0.0.0:8000"
   metrics_addr: "0.0.0.0:9000"
@@ -18,7 +18,7 @@ raft:
       service_addr: "stratum-node3:7000"
 
 storage:
-  data_dir: "/var/lib/stratum/node1"
+  data_dir: "/var/lib/stratum/node2"
 
 vecstore:
   grpc_addr: "host.docker.internal:7100"

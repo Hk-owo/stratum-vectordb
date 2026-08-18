@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sort"
 
 	"google.golang.org/grpc/codes"
@@ -100,6 +101,14 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 
 	searchResults, err := s.indexManager.Search(ctx, kbID, versionID, req.Vector, searchTopK)
 	if err != nil {
+		// An empty version (no documents) has no index entry, so Search
+		// reports ErrIndexNotReady. Treat a genuinely empty version as an
+		// empty result set rather than an error.
+		if errors.Is(err, stratumerrors.ErrIndexNotReady) {
+			if docIDs, derr := s.versionDocList.ListDocIDs(ctx, kbID, versionID); derr == nil && len(docIDs) == 0 {
+				return &pb.QueryResponse{Results: nil, VersionId: versionID}, nil
+			}
+		}
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 

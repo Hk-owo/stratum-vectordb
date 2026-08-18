@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -189,6 +190,7 @@ type realNode struct {
 	nodeID     int64
 	raftAddr   string
 	grpcAddr   string
+	baseDir    string // root of this node's persistence ("" if ephemeral)
 	raftNode   *raft.RaftNodeImpl
 	fileWAL    *wal.FileWAL
 	docStore   *docstore.PebbleDocStore
@@ -203,6 +205,8 @@ type realNode struct {
 	KB    pb.KnowledgeBaseServiceClient
 	Query pb.QueryServiceClient
 	Admin pb.AdminServiceClient
+
+	stopOnce stdsync.Once
 }
 
 // newRealNode wires the complete real stack for one node using
@@ -216,22 +220,39 @@ func newRealNode(t *testing.T, nodeID int64, peers []raft.PeerConfig, vecstoreAd
 
 // newRealNodeWithAddrs is newRealNode with explicit raft/service
 // addresses, so multi-node tests can agree on peer addresses up front.
+// newRealNodeWithAddrs is newRealNode with explicit raft/service
+// addresses and an ephemeral data directory.
 func newRealNodeWithAddrs(t *testing.T, nodeID int64, peers []raft.PeerConfig, vecstoreAddr, embedAddr, raftAddr, grpcAddr string) *realNode {
 	t.Helper()
+	return newRealNodeWithAddrsAndDir(t, nodeID, peers, vecstoreAddr, embedAddr, raftAddr, grpcAddr, t.TempDir())
+}
 
-	w, err := wal.NewFileWAL(filepath.Join(t.TempDir(), "wal"))
+// newRealNodeWithAddrsAndDir is newRealNode with explicit addresses and a
+// caller-provided persistent base directory. Reusing the same baseDir (and
+// addresses) across a Stop()/restart cycle simulates a node reboot with
+// its on-disk state intact.
+func newRealNodeWithAddrsAndDir(t *testing.T, nodeID int64, peers []raft.PeerConfig, vecstoreAddr, embedAddr, raftAddr, grpcAddr, baseDir string) *realNode {
+	t.Helper()
+	if baseDir == "" {
+		baseDir = t.TempDir()
+	}
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		t.Fatalf("node %d: mkdir %s: %v", nodeID, baseDir, err)
+	}
+
+	w, err := wal.NewFileWAL(filepath.Join(baseDir, "wal"))
 	if err != nil {
 		t.Fatalf("node %d: NewFileWAL: %v", nodeID, err)
 	}
-	ds, err := docstore.NewPebbleDocStore(filepath.Join(t.TempDir(), "docstore"))
+	ds, err := docstore.NewPebbleDocStore(filepath.Join(baseDir, "docstore"))
 	if err != nil {
 		t.Fatalf("node %d: docstore: %v", nodeID, err)
 	}
-	cdm, err := chunkdoc.NewPebbleChunkDocMapper(filepath.Join(t.TempDir(), "chunkdoc"))
+	cdm, err := chunkdoc.NewPebbleChunkDocMapper(filepath.Join(baseDir, "chunkdoc"))
 	if err != nil {
 		t.Fatalf("node %d: chunkdoc: %v", nodeID, err)
 	}
-	vd, err := versiondoc.NewPebbleVersionDocList(filepath.Join(t.TempDir(), "versiondoc"))
+	vd, err := versiondoc.NewPebbleVersionDocList(filepath.Join(baseDir, "versiondoc"))
 	if err != nil {
 		t.Fatalf("node %d: versiondoc: %v", nodeID, err)
 	}
@@ -242,7 +263,7 @@ func newRealNodeWithAddrs(t *testing.T, nodeID int64, peers []raft.PeerConfig, v
 
 	rn, err := raft.NewRaftNodeImpl(raft.Config{
 		NodeID:             nodeID,
-		DataDir:            t.TempDir(),
+		DataDir:            filepath.Join(baseDir, "raft"),
 		RaftAddr:           raftAddr,
 		Peers:              peers,
 		WAL:                w,
@@ -333,6 +354,7 @@ func newRealNodeWithAddrs(t *testing.T, nodeID int64, peers []raft.PeerConfig, v
 		nodeID:     nodeID,
 		raftAddr:   raftAddr,
 		grpcAddr:   grpcAddr,
+		baseDir:    baseDir,
 		raftNode:   rn,
 		fileWAL:    w,
 		docStore:   ds,
@@ -346,18 +368,26 @@ func newRealNodeWithAddrs(t *testing.T, nodeID int64, peers []raft.PeerConfig, v
 		Query:      pb.NewQueryServiceClient(conn),
 		Admin:      pb.NewAdminServiceClient(conn),
 	}
-	t.Cleanup(func() {
-		conn.Close()
-		srv.GracefulStop()
-		rn.Stop()
-		im.Close()
-		cs.Close()
-		vd.Close()
-		cdm.Close()
-		ds.Close()
-		w.Close()
-	})
+	t.Cleanup(n.Stop)
 	return n
+}
+
+// Stop shuts the node down completely and idempotently: gRPC server, raft
+// node, index manager, vecstore client, and the PebbleDB stores/WAL. After
+// Stop the node can be restarted from the same baseDir/addresses, which
+// simulates a reboot with on-disk state intact.
+func (n *realNode) Stop() {
+	n.stopOnce.Do(func() {
+		n.conn.Close()
+		n.srv.GracefulStop()
+		n.raftNode.Stop()
+		_ = n.indexMgr.Close()
+		_ = n.chunkStore.Close()
+		_ = n.versionDoc.Close()
+		_ = n.chunkDoc.Close()
+		_ = n.docStore.Close()
+		_ = n.fileWAL.Close()
+	})
 }
 
 // waitForLeader polls GetClusterStatus on all nodes and returns the node

@@ -245,7 +245,11 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 		// layer so this follower pulls storage-layer data from the
 		// leader.
 		if err == nil && cmd.Type == cmdCreateVersion && impl.onVersionCreated != nil {
-			impl.onVersionCreated(cmd.KBID, result.VersionID)
+			// Run asynchronously: pulling storage-layer data can block
+			// (dial + stream + retries), and a blocked apply loop would
+			// stall every subsequent committed entry — most visible when
+			// a follower replays its log after a restart.
+			go impl.onVersionCreated(cmd.KBID, result.VersionID)
 		}
 		return // no local caller waiting (e.g. this is a follower)
 	}

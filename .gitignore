@@ -5,6 +5,10 @@
 *.out
 *.exe
 
+# === Docker test build artifacts (pre-built on host; see Dockerfile) ===
+/integration/docker/stratum
+/integration/docker/mock-embed
+
 # === Go build cache ===
 /tmp/
 
@@ -38,10 +42,11 @@ __pycache__/
 # === Runtime data directories ===
 /data/
 /run/
+/vecstore_rocksdb/
 
 # === Runtime logs / scratch output ===
 /Trans
-/scripts/log.txt
+/scripts/test.log
 
 # === GitHub PAT ===
 .github_token
