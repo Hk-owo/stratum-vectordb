@@ -121,9 +121,15 @@ func TestRealStack_ThreeNodeCluster_FaultTolerance(t *testing.T) {
 			n.waitVersionReady(ctx, kbID, v3)
 		}
 	}
-	survivor1 := nodes[0]
-	if survivor1 == leader || survivor1 == stopped {
-		survivor1 = nodes[1]
+	var survivor1 *realNode
+	for _, n := range nodes {
+		if n != leader && n != stopped {
+			survivor1 = n
+			break
+		}
+	}
+	if survivor1 == nil {
+		t.Fatalf("no surviving follower found after minority fault")
 	}
 	if r := waitQueryDoc(t, survivor1, kbID, v3, contentVector("gamma", 4), "doc-3"); r == nil || r.Content != "gamma" {
 		t.Errorf("survivor query after minority fault = %+v", r)

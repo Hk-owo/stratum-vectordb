@@ -25,12 +25,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	stdsync "sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
 	vecstorepb "stratum/api/proto/vecstore"
@@ -488,15 +491,19 @@ func verifyFollowerPull(ctx context.Context, n *realNode, kbID string, versionID
 func waitQueryDoc(t *testing.T, n *realNode, kbID string, versionID int64, vec []float32, docID string) *pb.QueryResult {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
+	backoff := 50 * time.Millisecond
 	for {
-		res := n.query(context.Background(), kbID, versionID, vec, 10)
+		res := n.queryTolerant(context.Background(), kbID, versionID, vec, 10)
 		if r := findResult(res, docID); r != nil {
 			return r
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("node %d: query never returned %s on v%d; last results: %+v", n.nodeID, docID, versionID, res)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(backoff)
+		if backoff < time.Second {
+			backoff *= 2
+		}
 	}
 }
 
@@ -549,6 +556,43 @@ func (n *realNode) query(ctx context.Context, kbID string, versionID int64, vec 
 		n.t.Fatalf("node %d: Query(kb=%s, v=%d): %v", n.nodeID, kbID, versionID, err)
 	}
 	return resp.Results
+}
+
+// queryTolerant runs a Query RPC like query, but treats transient errors
+// (the follower's index is still being built, or the version's
+// storage-layer write is still in flight) as an empty result set, so
+// callers can keep polling until the index is ready — an
+// eventually-consistent read. Permanent errors still fail the test.
+func (n *realNode) queryTolerant(ctx context.Context, kbID string, versionID int64, vec []float32, topK int32) []*pb.QueryResult {
+	n.t.Helper()
+	resp, err := n.Query.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &versionID,
+		Vector:          vec,
+		TopK:            topK,
+	})
+	if err != nil {
+		if isTransientQueryError(err) {
+			return nil
+		}
+		n.t.Fatalf("node %d: Query(kb=%s, v=%d): %v", n.nodeID, kbID, versionID, err)
+	}
+	return resp.Results
+}
+
+// isTransientQueryError reports whether err is a transient, retryable query
+// error — the follower's index is still being built (index not ready) or
+// the version's storage-layer write is still in flight (version is
+// pending). Permanent errors (version not found, index build failed,
+// invalid argument, …) are not retryable and must fail immediately.
+func isTransientQueryError(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	return st.Code() == codes.FailedPrecondition &&
+		(strings.Contains(st.Message(), "index not ready") ||
+			strings.Contains(st.Message(), "version is pending"))
 }
 
 func findResult(results []*pb.QueryResult, docID string) *pb.QueryResult {
@@ -850,7 +894,7 @@ func TestRealStack_TwoNodeReplication(t *testing.T) {
 	queryDeadline := time.Now().Add(15 * time.Second)
 	var res []*pb.QueryResult
 	for {
-		res = follower.query(ctx, kbID, v2, contentVector("alpha", 4), 5)
+		res = follower.queryTolerant(ctx, kbID, v2, contentVector("alpha", 4), 5)
 		if findResult(res, "doc-1") != nil {
 			break
 		}

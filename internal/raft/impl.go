@@ -99,6 +99,7 @@ type RaftNodeImpl struct {
 	pending   map[uint64]*pendingProposal
 
 	applyLoopDone chan struct{}
+	callbackWG    sync.WaitGroup
 
 	// onVersionCreated is an optional callback invoked after a
 	// cmdCreateVersion is applied on this node when this node is NOT
@@ -174,11 +175,15 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 
 // Stop gracefully shuts down this node: stops the underlying kvraft node
 // (which itself waits for its background goroutines and gRPC server to
-// finish), then waits for the apply-dispatch loop to exit. Safe to call
-// multiple times.
+// finish), then waits for the apply-dispatch loop to exit, and finally
+// waits for any onVersionCreated callback goroutines the apply loop may
+// have launched to finish — so that a caller which closes the storage
+// layer after Stop returns can never race an in-flight callback touching
+// an already-closed store. Safe to call multiple times.
 func (impl *RaftNodeImpl) Stop() {
 	impl.raft.Stop()
 	<-impl.applyLoopDone
+	impl.callbackWG.Wait()
 }
 
 // SetOnVersionCreated registers a callback that is invoked when a
@@ -249,7 +254,11 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 			// (dial + stream + retries), and a blocked apply loop would
 			// stall every subsequent committed entry — most visible when
 			// a follower replays its log after a restart.
-			go impl.onVersionCreated(cmd.KBID, result.VersionID)
+			impl.callbackWG.Add(1)
+			go func() {
+				defer impl.callbackWG.Done()
+				impl.onVersionCreated(cmd.KBID, result.VersionID)
+			}()
 		}
 		return // no local caller waiting (e.g. this is a follower)
 	}
