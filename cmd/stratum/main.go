@@ -424,6 +424,13 @@ type fileConfig struct {
 			Addr        string `yaml:"addr"`
 			ServiceAddr string `yaml:"service_addr"`
 		} `yaml:"peers"`
+
+		// Raft timing (ms). These are optional in the YAML; unset fields
+		// keep defaultConfig()'s values. The ops console generates them so
+		// startup timing can be tuned from the web UI.
+		HeartbeatIntervalMS  int64 `yaml:"heartbeat_interval_ms"`
+		ElectionTimeoutMinMS int64 `yaml:"election_timeout_min_ms"`
+		ElectionTimeoutMaxMS int64 `yaml:"election_timeout_max_ms"`
 	} `yaml:"raft"`
 
 	Storage struct {
@@ -490,6 +497,15 @@ func loadConfig(path string) (appConfig, error) {
 			})
 		}
 		cfg.Peers = peers
+	}
+	if fc.Raft.HeartbeatIntervalMS != 0 {
+		cfg.HeartbeatInterval = time.Duration(fc.Raft.HeartbeatIntervalMS) * time.Millisecond
+	}
+	if fc.Raft.ElectionTimeoutMinMS != 0 {
+		cfg.ElectionTimeoutMin = time.Duration(fc.Raft.ElectionTimeoutMinMS) * time.Millisecond
+	}
+	if fc.Raft.ElectionTimeoutMaxMS != 0 {
+		cfg.ElectionTimeoutMax = time.Duration(fc.Raft.ElectionTimeoutMaxMS) * time.Millisecond
 	}
 	if fc.Storage.DataDir != "" {
 		cfg.DataDir = fc.Storage.DataDir

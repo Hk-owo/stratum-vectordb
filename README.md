@@ -85,10 +85,10 @@ go run ./cmd/stratum/
 # One-click console: vecstore(C++) → stratum(gRPC) → gateway(HTTP) + web UI
 ./start.sh           # then open http://localhost:8081
 
-# 3-node Docker cluster (T4): compose + tagged tests
-docker compose -f integration/docker/docker-compose.yml up -d --wait
+# 3-node Docker cluster (T4): native docker CLI script + tagged tests
+scripts/docker-cluster.sh up 3 --with-embed
 go test ./integration/docker/... -tags=docker -timeout 300s
-docker compose -f integration/docker/docker-compose.yml down
+scripts/docker-cluster.sh down
 ```
 
 `cmd/stratum` accepts an optional YAML config file for multi-node
@@ -137,9 +137,60 @@ same origin, so no CORS is needed. It dials the core server's gRPC address
 adding no new Go module dependency. The internal `DataSyncService` is
 intentionally not exposed.
 
-`./start.sh` builds and launches the full stack in one go — vecstore(C++) →
-stratum(gRPC) → gateway(HTTP) → web UI (default `http://localhost:8081`),
-with per-process logs under `run/`.
+**Multi-node leader following**: `-grpc-addr` accepts a comma-separated list
+of node addresses. Write operations (create/delete KB, create version,
+rollback, rebuild, warmup) automatically run on the current leader; when the
+leader fails over or the current node goes down, the gateway retries against
+the next node (and caches the discovered leader). Raft itself never forwards
+writes, so a gateway pinned to a single non-leader node would otherwise
+reject every write with `kvraft: not leader`.
+
+**快捷启动**：`scripts/gateway.sh` 提供两种零参数启动方式（不需要手拼参数）：
+
+```bash
+scripts/gateway.sh               # Docker 集群模式（默认）：自动从 run/console.yaml
+                                 # 的 docker 段读取节点数/基础端口，拼接多节点
+                                 # 地址并启动（leader 自动跟随）
+scripts/gateway.sh single        # 单机模式：-grpc-addr 127.0.0.1:7000
+scripts/gateway.sh build         # 强制重新构建后（默认模式）启动
+scripts/gateway.sh stop          # 停止正在运行的 gateway
+```
+
+环境变量 `STRATUM_HTTP_ADDR`（监听地址，默认 `0.0.0.0:8081`）与
+`STRATUM_GRPC_ADDR`（单机模式 gRPC 地址，默认 `127.0.0.1:7000`）可覆盖默认值。
+手动启动等价于：
+
+```bash
+# 单机
+./run/bin/stratum-gateway -grpc-addr 127.0.0.1:7000
+# docker 集群（3 节点，leader 漂移自动跟随）
+./run/bin/stratum-gateway -grpc-addr localhost:17000,localhost:17001,localhost:17002
+```
+
+> Docker 集群模式下 vecstore 是宿主机上的外部依赖（节点配置
+> `vecstore.grpc_addr: host.docker.internal:7100`）。它必须监听宿主机的
+> **对外接口**（`--grpc_addr=0.0.0.0:7100`），仅绑 `127.0.0.1` 时容器内
+> 无法访问，会导致版本索引构建失败、删除（DELETE_FAILED）等连锁问题。
+
+`start.sh` builds and launches the full stack in one go. It starts the
+**console process** (`stratum-gateway`) and the database services
+(vecstore(C++) → stratum(gRPC)) are brought up through its `/ops/start`
+endpoint, so the web UI (default `http://localhost:8081`) — including the
+**「运维」** page — is available even before the database is running, and
+Ctrl+C stops everything cleanly. Logs live under `run/log/`.
+
+### Starting the console alone (ops only, database not running)
+
+```bash
+./run/bin/stratum-gateway          # default :8081, auto-creates run/console.yaml
+# open http://localhost:8081 → 「运维」page to edit startup parameters,
+# start/stop services, and tail logs before the database is up
+```
+
+The console keeps its own YAML (`run/console.yaml`) with the cluster node
+list and the local service startup parameters; edits from the web page are
+persisted there and take effect on the next service restart. Cluster-wide
+ops are driven from any node's console through `/ops/nodes/{id}/*`.
 
 ## Project structure
 
@@ -171,7 +222,7 @@ stratum/
 │   └── coordinator/        # WriteCoordinator + DeleteCoordinator orchestration
 ├── service/                # gRPC service implementations
 ├── integration/            # Mock-based integration tests + real-stack e2e + cluster tests
-│   └── docker/             # 3-node Docker Compose cluster + T4 tests (`docker` build tag)
+│   └── docker/             # 3-node Docker cluster (scripts/docker-cluster.sh) + T4 tests (`docker` build tag)
 ├── cmd/
 │   ├── stratum/main.go     # Entry point (−config YAML / flags)
 │   └── stratum-gateway/    # HTTP/JSON → gRPC gateway + web console static assets
@@ -218,7 +269,7 @@ discovered through TDD:
 | T1 | Single-module contracts (8 modules) |  ✅ |
 | T2 | Cross-module integration (4 groups) |  ✅ |
 | T3 | Single-node full chain (15 scenarios) |  ✅ |
-| T4 | 3-node Raft cluster (in-process + Docker Compose + data-volume) |  ✅ |
+| T4 | 3-node Raft cluster (in-process + Docker cluster + data-volume) |  ✅ |
 | T5 | Real-stack e2e (real Pebble/WAL/Raft/IndexManager + vecstore subprocess, zero mocks) |  ✅ |
 
 ```bash
@@ -233,11 +284,12 @@ go test ./integration/... -run TestRealStack -v
 go test ./integration/... -run TestMultiNode -v
 # 3-node in-process cluster elects leader, replicates KB + version metadata
 
-docker compose -f integration/docker/docker-compose.yml up -d --wait
+scripts/docker-cluster.sh up 3 --with-embed
 go test ./integration/docker/... -tags=docker -v -timeout 300s
 # 3-node Docker cluster (docker_test.go) + data-volume cost sampling
-# (datavolume_test.go, scale with STRATUM_VOLUME_DOCS)
-docker compose -f integration/docker/docker-compose.yml down
+# (datavolume_test.go, scale with STRATUM_VOLUME_DOCS; requires a vecstore_server
+# listening on the host's :7100 — start it via ./start.sh or build vecstore/CMakeLists.txt)
+scripts/docker-cluster.sh down
 ```
 
 ## Prerequisites

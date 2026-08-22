@@ -1,12 +1,13 @@
 // Package docker_test contains Stratum's T4 multi-node integration tests
 // (Stratum_测试顺序.md 第四批). These tests require a running 3-node
-// Docker Compose cluster and are protected by the "docker" build tag.
+// Docker cluster started by scripts/docker-cluster.sh and are protected by
+// the "docker" build tag.
 //
 // Run:
 //
-//	docker compose -f integration/docker/docker-compose.yml up -d --wait
+//	scripts/docker-cluster.sh up 3 --with-embed
 //	go test ./integration/docker/... -tags=docker -v -timeout 300s
-//	docker compose -f integration/docker/docker-compose.yml down
+//	scripts/docker-cluster.sh down
 //
 //go:build docker
 // +build docker
@@ -35,7 +36,7 @@ var nodeAddrs = []string{
 	"localhost:17002",
 }
 
-// nodeServices are the Compose service names, indexed the same as nodeAddrs.
+// nodeServices are the node container names, indexed the same as nodeAddrs.
 var nodeServices = []string{
 	"stratum-node1",
 	"stratum-node2",
@@ -54,16 +55,18 @@ func dialNode(addr string) (pb.KnowledgeBaseServiceClient, pb.QueryServiceClient
 		conn, nil
 }
 
-// === docker compose fault-injection helpers ===
+// === docker fault-injection helpers ===
+//
+// 集群由 scripts/docker-cluster.sh 以原生 docker 容器方式启动（替代 docker-compose），
+// 节点容器名即 stratum-node{1,2,3}（与上方 nodeServices 一致），故直接用 docker CLI 管理。
 
-// composeCmd runs a `docker compose` command from this package's directory
-// (which holds docker-compose.yml). It fails the test on error.
-func composeCmd(t *testing.T, args ...string) string {
+// dockerCmd runs a `docker` command. It fails the test on error.
+func dockerCmd(t *testing.T, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("docker", append([]string{"compose"}, args...)...)
+	cmd := exec.Command("docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("docker compose %s: %v\n%s", strings.Join(args, " "), err, out)
+		t.Fatalf("docker %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 	return string(out)
 }
@@ -72,14 +75,14 @@ func composeCmd(t *testing.T, args ...string) string {
 func killNode(t *testing.T, service string) {
 	t.Helper()
 	t.Logf("killing %s", service)
-	composeCmd(t, "kill", "-s", "SIGKILL", service)
+	dockerCmd(t, "kill", "-s", "SIGKILL", service)
 }
 
 // startNode restarts a previously killed node.
 func startNode(t *testing.T, service string) {
 	t.Helper()
 	t.Logf("starting %s", service)
-	composeCmd(t, "start", service)
+	dockerCmd(t, "start", service)
 }
 
 // === leader discovery / data-visibility helpers ===

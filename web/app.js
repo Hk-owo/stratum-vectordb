@@ -74,6 +74,39 @@ function toast(msg) {
   toast._timer = setTimeout(() => t.classList.add('hidden'), 3000);
 }
 
+// ---------- 通用确认弹窗 ----------
+let confirmCallback = null;
+
+function showConfirm(title, message, opts = {}) {
+  $('confirm-title').textContent = title;
+  $('confirm-message').textContent = message;
+  const ok = $('confirm-ok');
+  ok.textContent = opts.okText || '确认';
+  // 危险操作用红色按钮，普通操作用主题色按钮
+  ok.className = 'btn ' + (opts.danger === false ? 'btn-primary' : 'btn-danger');
+  confirmCallback = opts.onConfirm || null;
+  $('confirm-modal').classList.remove('hidden');
+  ok.focus();
+}
+
+function closeConfirm() {
+  $('confirm-modal').classList.add('hidden');
+  confirmCallback = null;
+}
+
+$('confirm-cancel').addEventListener('click', closeConfirm);
+$('confirm-ok').addEventListener('click', () => {
+  const cb = confirmCallback;
+  closeConfirm();
+  if (cb) cb();
+});
+$('confirm-modal').addEventListener('click', (e) => {
+  if (e.target === $('confirm-modal')) closeConfirm(); // 点击遮罩关闭
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('confirm-modal').classList.contains('hidden')) closeConfirm();
+});
+
 function showBanner(msg) {
   $('error-banner-text').textContent = msg;
   $('error-banner').classList.remove('hidden');
@@ -81,7 +114,10 @@ function showBanner(msg) {
 function hideBanner() {
   $('error-banner').classList.add('hidden');
 }
-$('error-banner-close').addEventListener('click', hideBanner);
+$('error-banner-close').addEventListener('click', () => {
+  bannerDismissed = true; // 用户手动关闭后，恢复健康前不再自动弹出
+  hideBanner();
+});
 
 function badge(cls, label) {
   return `<span class="badge badge-${cls}"><span class="dot"></span>${label}</span>`;
@@ -125,14 +161,30 @@ $('refresh-btn').addEventListener('click', () => {
   pollHealth();
   pollSystemStatus();
   renderKBList();
+  pollOps();
   if (currentKB) loadVersions();
 });
 
 // ---------- 健康轮询 ----------
+// 数据库连接状态跟踪：仅在“健康→异常”跃迁时提示一次；持续异常不反复
+// 触发；用户手动关闭后不再弹出（数据库恢复健康后重置，下次断连可再提示）。
+let healthWasUp = true;      // 上一轮轮询是否正常
+let bannerDismissed = false; // 用户是否手动关闭过错误横幅
+
 function setHealthBadge(status) {
   const h = HEALTH[status] || { label: status || 'UNKNOWN', cls: 'gray' };
   $('health-badge').className = `badge badge-${h.cls}`;
   $('health-text').textContent = h.label;
+}
+
+// 把连接失败转成友好文案：数据库未启动是正常运维场景（可在「运维」页
+// 启动服务或修改参数），不把底层错误堆给用户。
+function friendlyUnavailable(e) {
+  const m = (e && e.message) || '';
+  if (/unavailable|refused|connect|dial/i.test(m)) {
+    return '数据库未连接（可能已停止）——可在「运维」页启动服务或修改参数（此提示只出现一次）';
+  }
+  return '无法连接服务：' + m;
 }
 
 async function pollHealth() {
@@ -144,10 +196,15 @@ async function pollHealth() {
     $('health-details-big').textContent = h.details || 'ok';
     $('health-card').style.borderTop = '3px solid ' +
       ({ green: 'var(--green)', yellow: 'var(--yellow)', red: 'var(--red)' }[(HEALTH[h.status] || {}).cls] || 'var(--gray)');
+    healthWasUp = true;
+    bannerDismissed = false; // 恢复健康后重置：下次断连可再次提示
     hideBanner();
   } catch (e) {
     setHealthBadge('HEALTH_STATUS_UNHEALTHY');
-    showBanner('无法连接服务：' + e.message);
+    if (healthWasUp && !bannerDismissed) {
+      showBanner(friendlyUnavailable(e));
+    }
+    healthWasUp = false;
   } finally {
     $('last-refresh').textContent = '上次刷新 ' + new Date().toLocaleTimeString();
   }
@@ -386,12 +443,12 @@ function renderParentSelect(versions) {
 }
 
 async function rollback(versionId) {
-  if (!confirm(`回滚到 v${versionId}？活跃版本将切换，进行中的查询不中断。`)) return;
+  // 回滚可逆、无停机（随时可回退），无需确认弹窗，直接执行。
   try {
     await api(`/knowledge-bases/${encodeURIComponent(currentKB.id)}/rollback`, {
       method: 'POST', body: { target_version_id: Number(versionId) },
     });
-    toast('回滚成功');
+    toast(`已回滚到 v${versionId}`);
     selectKB(currentKB.id);
   } catch (e) { toast('回滚失败：' + e.message); }
 }
@@ -439,15 +496,20 @@ $('create-kb-form').addEventListener('submit', async (e) => {
   } catch (err) { toast('创建失败：' + err.message); }
 });
 
-$('delete-kb-btn').addEventListener('click', async () => {
+$('delete-kb-btn').addEventListener('click', () => {
   if (!currentKB) return;
-  if (!confirm(`删除知识库 ${currentKB.id}？将异步清理所有存储数据，不可撤销。`)) return;
-  try {
-    await api('/knowledge-bases/delete', { method: 'POST', body: { knowledge_base_id: currentKB.id } });
-    toast('已标记删除（异步清理）');
-    clearKBDetail();   // 详情消失，回到空态
-    renderKBList();
-  } catch (e) { toast('删除失败：' + e.message); }
+  // 删除不可逆（异步清理所有存储数据），保留确认，改用自定义弹窗。
+  showConfirm('删除知识库', `确定删除知识库 ${currentKB.id} 吗？将异步清理所有存储数据，不可撤销。`, {
+    okText: '删除',
+    onConfirm: async () => {
+      try {
+        await api('/knowledge-bases/delete', { method: 'POST', body: { knowledge_base_id: currentKB.id } });
+        toast('已标记删除（异步清理）');
+        clearKBDetail();   // 详情消失，回到空态
+        renderKBList();
+      } catch (e) { toast('删除失败：' + e.message); }
+    },
+  });
 });
 
 // ---------- 创建版本 / 变更编辑器 ----------
@@ -579,3 +641,232 @@ pollHealth();
 pollSystemStatus();
 setInterval(pollHealth, 5000);
 setInterval(pollSystemStatus, 5000);
+
+
+// ============================================================
+// 运维（Docker 集群控制台）
+// 集群参数是集群级统一配置（节点数/端口/网络/镜像等），不做单节点差异化
+// 修改：修改参数后需重建整个集群。所有请求走 /ops/docker/*，由网关转调
+// scripts/docker-cluster.sh 执行。
+// ============================================================
+const DK = { status: null, config: null, logNode: 1, busy: false };
+
+async function opsApi(path, opts = {}) {
+  const res = await fetch('/ops' + path, {
+    method: opts.method || 'GET',
+    headers: opts.body !== undefined ? { 'Content-Type': 'application/json' } : {},
+    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+  });
+  let data = {};
+  try { data = await res.json(); } catch (_) { /* non-JSON */ }
+  if (!res.ok) {
+    throw new Error(data.error || res.statusText);
+  }
+  return data;
+}
+
+// ---------- 集群状态 ----------
+
+async function dkPoll() {
+  try {
+    const st = await opsApi('/docker/status');
+    DK.status = st;
+    renderDkOverview(st);
+    renderDkNodes(st);
+    fillDkLogSelect(st);
+  } catch (e) {
+    const msg = `<span class="muted">加载失败：${escapeHtml(e.message)}</span>`;
+    $('dk-overview').innerHTML = msg;
+    $('dk-nodes').innerHTML = msg;
+  }
+}
+
+function dkBadge(v) {
+  const map = { running: 'green', healthy: 'green', starting: 'yellow', unhealthy: 'red', exited: 'gray', absent: 'gray', dead: 'red', created: 'gray' };
+  const color = map[v] || 'gray';
+  const label = { running: '运行中', healthy: '健康', starting: '启动中', unhealthy: '异常', exited: '已退出', absent: '不存在', dead: '已死', created: '已创建' }[v] || v;
+  return badge(color, label);
+}
+
+function renderDkOverview(st) {
+  const nodes = st.nodes || [];
+  const running = nodes.filter(n => n.status === 'running').length;
+  const healthy = nodes.filter(n => n.health === 'healthy').length;
+  const leader = nodes.find(n => n.leader);
+  $('dk-overview').innerHTML =
+    `网络 <b>${escapeHtml(st.network)}</b> · 节点 <b>${st.count}</b>（运行 ${running} / 健康 ${healthy}）` +
+    ` · 基础端口 <b>${st.base_port}</b> · 镜像 <b>${escapeHtml(st.image)}</b>` +
+    ` · leader <b>${leader ? escapeHtml(leader.name) : '—'}</b>`;
+}
+
+function renderDkNodes(st) {
+  const el = $('dk-nodes');
+  const nodes = st.nodes || [];
+  if (!nodes.length) { el.innerHTML = '<span class="muted">集群配置为空</span>'; return; }
+  const rows = nodes.map(n => {
+    const running = n.status === 'running';
+    const act = running
+      ? `<button class="btn btn-ghost" data-act="stop" data-id="${n.id}">停止</button>
+         <button class="btn btn-ghost" data-act="restart" data-id="${n.id}">重启</button>`
+      : `<button class="btn btn-ghost" data-act="start" data-id="${n.id}">启动</button>`;
+    return `<tr>
+      <td>node ${n.id} <span class="muted">${escapeHtml(n.name)}</span></td>
+      <td>${dkBadge(n.status)}</td>
+      <td>${dkBadge(n.health)}</td>
+      <td class="mono">:${n.grpc_port}</td>
+      <td>${n.leader ? '★' : ''}</td>
+      <td>${act} <button class="btn btn-ghost" data-act="logs" data-id="${n.id}">日志</button></td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<table class="dk-table">
+    <thead><tr><th>节点</th><th>状态</th><th>健康</th><th>gRPC 端口</th><th>leader</th><th>操作</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+  el.querySelectorAll('button[data-act]').forEach(b => {
+    b.addEventListener('click', () => {
+      const id = Number(b.dataset.id);
+      if (b.dataset.act === 'logs') {
+        DK.logNode = id;
+        fillDkLogSelect(DK.status);
+        dkLoadLogs();
+      } else {
+        dkNodeControl(id, b.dataset.act);
+      }
+    });
+  });
+}
+
+// ---------- 集群整体操作 ----------
+
+async function dkClusterAction(action, force, msg) {
+  if (DK.busy) { toast('上一步操作还在执行中'); return; }
+  DK.busy = true;
+  try {
+    toast('正在执行：' + msg + '（docker 操作可能耗时数十秒）');
+    await opsApi('/docker/' + action, { method: 'POST', body: force ? { force: true } : {} });
+    toast(msg + ' 完成');
+    setTimeout(dkPoll, 1500);
+  } catch (e) {
+    toast(msg + ' 失败：' + e.message);
+  } finally {
+    DK.busy = false;
+  }
+}
+
+$('dk-up').addEventListener('click', () => dkClusterAction('up', false, '启动集群'));
+$('dk-rebuild').addEventListener('click', () => dkClusterAction('up', true, '重建集群'));
+$('dk-down').addEventListener('click', () => dkClusterAction('down', false, '停止集群'));
+$('dk-clean').addEventListener('click', () => dkClusterAction('clean', false, '清理集群'));
+
+// ---------- 单节点操作 ----------
+
+async function dkNodeControl(id, action) {
+  if (DK.busy) { toast('上一步操作还在执行中'); return; }
+  DK.busy = true;
+  try {
+    await opsApi(`/docker/nodes/${id}/${action}`, { method: 'POST' });
+    toast(`node ${id} 已${action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启'}`);
+    setTimeout(dkPoll, 1500);
+  } catch (e) {
+    toast(`node ${id} 操作失败：` + e.message);
+  } finally {
+    DK.busy = false;
+  }
+}
+
+// ---------- 集群参数（集群级统一配置） ----------
+
+async function dkConfigLoad() {
+  try {
+    DK.config = await opsApi('/docker/config');
+    dkConfigFill(DK.config);
+  } catch (e) {
+    toast('加载集群参数失败：' + e.message);
+  }
+}
+
+function dkConfigFill(cfg) {
+  const set = (id, v) => { const el = $(id); if (el) el.value = (v == null ? '' : v); };
+  set('dk-cfg-nodes', cfg.nodes);
+  set('dk-cfg-baseport', cfg.base_port);
+  set('dk-cfg-network', cfg.network);
+  set('dk-cfg-image', cfg.image);
+  set('dk-cfg-prefix', cfg.container_prefix);
+  $('dk-cfg-embed').checked = !!cfg.with_embed;
+}
+
+function dkConfigRead() {
+  return {
+    enabled: true,
+    nodes: opsNum($('dk-cfg-nodes').value) || 3,
+    base_port: opsNum($('dk-cfg-baseport').value) || 17000,
+    network: $('dk-cfg-network').value.trim(),
+    image: $('dk-cfg-image').value.trim(),
+    container_prefix: $('dk-cfg-prefix').value.trim(),
+    with_embed: $('dk-cfg-embed').checked,
+  };
+}
+
+function opsNum(v) {
+  if (v === '' || v == null) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+async function dkConfigSave(rebuild) {
+  const body = dkConfigRead();
+  if (!body.network || !body.image || !body.container_prefix) {
+    toast('网络 / 镜像 / 容器前缀不能为空');
+    return;
+  }
+  try {
+    const resp = await opsApi('/docker/config', { method: 'PUT', body });
+    if (rebuild) {
+      await dkClusterAction('up', true, '按新参数重建集群');
+    } else {
+      toast('集群参数已保存' + (resp.note ? `：${resp.note}` : ''));
+      dkConfigLoad();
+    }
+  } catch (e) {
+    toast('保存集群参数失败：' + e.message);
+  }
+}
+
+$('dk-config-form').addEventListener('submit', (e) => { e.preventDefault(); dkConfigSave(false); });
+$('dk-config-apply').addEventListener('click', () => dkConfigSave(true));
+$('dk-config-reset').addEventListener('click', () => { if (DK.config) dkConfigFill(DK.config); });
+
+// ---------- 节点日志 ----------
+
+function fillDkLogSelect(st) {
+  const sel = $('dk-log-node');
+  const nodes = (st && st.nodes) || [];
+  if (!nodes.length) { sel.innerHTML = '<option value="">（无节点）</option>'; return; }
+  const cur = sel.value || String(DK.logNode);
+  sel.innerHTML = nodes.map(n => `<option value="${n.id}">node ${n.id}（${escapeHtml(n.name)}）</option>`).join('');
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+}
+
+async function dkLoadLogs() {
+  const id = $('dk-log-node').value;
+  if (!id) return;
+  DK.logNode = Number(id);
+  const view = $('dk-log-view');
+  view.innerHTML = '<span class="muted">加载中…</span>';
+  try {
+    const resp = await opsApi(`/docker/logs/${id}?lines=300`);
+    const text = resp.log || '';
+    view.innerHTML = text
+      ? text.split('\n').map(l => `<div class="log-line">${escapeHtml(l)}</div>`).join('')
+      : '<span class="muted">（空日志）</span>';
+  } catch (e) {
+    view.innerHTML = `<span class="muted">加载失败：${escapeHtml(e.message)}</span>`;
+  }
+}
+
+$('dk-log-node').addEventListener('change', dkLoadLogs);
+$('dk-log-refresh').addEventListener('click', dkLoadLogs);
+
+// ---------- 运维轮询 ----------
+dkConfigLoad();
+dkPoll();
+setInterval(dkPoll, 5000);

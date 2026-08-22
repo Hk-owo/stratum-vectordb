@@ -280,6 +280,8 @@ body {
 /* ---------- 表单 ---------- */
 .form { display: grid; gap: 12px; }
 .form label { display: grid; gap: 5px; font-size: 12.5px; color: var(--muted); }
+.form label.chk { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); align-self: end; }
+.form label.chk input[type="checkbox"] { width: auto; }
 .form input, .form select, .form textarea {
   padding: 9px 11px;
   border: 1px solid var(--border);
@@ -426,6 +428,13 @@ body {
 .kb-left { display: grid; gap: 16px; }
 .query-layout { display: grid; grid-template-columns: 380px 1fr; gap: 16px; align-items: start; }
 
+#kb-list {
+  max-height: calc(100vh - 300px);
+  min-height: 100px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+}
 #kb-list li { justify-content: space-between; cursor: pointer; }
 #kb-list li > span:first-child { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
 #kb-list li .muted { font-family: var(--font-mono); font-size: 11px; }
@@ -595,6 +604,65 @@ body {
   to   { opacity: 1; transform: none; }
 }
 
+/* ---------- 确认弹窗 ---------- */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(5, 5, 8, 0.62);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  animation: mask-in 0.2s var(--ease);
+}
+@keyframes mask-in { from { opacity: 0; } }
+.modal {
+  width: min(430px, calc(100vw - 48px));
+  background: var(--panel-solid);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  padding: 22px 24px;
+  animation: modal-in 0.22s var(--ease);
+}
+@keyframes modal-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+.modal h3 {
+  margin: 0 0 10px;
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.modal h3::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--red);
+  flex: none;
+  box-shadow: 0 0 10px rgba(244, 67, 54, 0.5);
+}
+.modal-message {
+  margin: 0 0 22px;
+  color: var(--text-secondary);
+  line-height: 1.75;
+  font-size: 13.5px;
+  word-break: break-all;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+.modal-actions .btn { min-width: 84px; }
+
 .hidden { display: none !important; }
 
 /* ---------- 滚动条 ---------- */
@@ -605,9 +673,123 @@ body {
 
 ::selection { background: rgba(0, 170, 255, 0.3); }
 
+/* ---------- 运维页 ---------- */
+.ops-layout { display: grid; grid-template-columns: 360px 1fr; gap: 16px; align-items: start; }
+.ops-left { display: grid; gap: 16px; }
+
+#ops-node-list li { cursor: pointer; flex-direction: column; align-items: stretch; gap: 6px; }
+#ops-node-list li:hover { border-color: var(--border-strong); }
+#ops-node-list li.selected {
+  border-color: var(--primary);
+  background: var(--primary-dim);
+  box-shadow: 0 0 0 1px var(--primary) inset;
+}
+#ops-node-list li > span:first-child { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 500; }
+.ops-gw { font-family: var(--font-mono); font-size: 11px; }
+.ops-node-svcs { display: flex; flex-wrap: wrap; gap: 5px; }
+.ops-node-svcs .badge { font-size: 10px; padding: 2px 8px; }
+
+.ops-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 14px 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+.tab-btn {
+  padding: 8px 18px;
+  border: none;
+  background: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition: color 0.2s var(--ease), border-color 0.2s var(--ease);
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+
+.ops-services { display: grid; gap: 10px; }
+.ops-service {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-raised);
+  font-size: 13px;
+  flex-wrap: wrap;
+  animation: item-in 0.25s var(--ease);
+}
+.ops-service .ops-svc-name { display: inline-flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-weight: 500; }
+.ops-service .ops-svc-log {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 380px;
+  flex: 1;
+  min-width: 0;
+}
+.ops-service .actions { margin-left: auto; display: flex; gap: 4px; }
+.ops-service .actions .btn { padding: 4px 12px; font-size: 12px; }
+
+.log-select {
+  padding: 7px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #0f0f14;
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-mono);
+}
+.log-select:focus { outline: none; border-color: var(--primary); }
+
+.log-viewer {
+  margin-top: 14px;
+  background: #0b0b10;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+  max-height: 560px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.75;
+}
+.log-line { white-space: pre-wrap; word-break: break-all; }
+.log-line:hover { background: rgba(255, 255, 255, 0.03); }
+.log-hint { padding-bottom: 8px; border-bottom: 1px dashed var(--border); margin-bottom: 8px; }
+
+.form textarea.mono { font-family: var(--font-mono); font-size: 12px; }
+
+/* ---------- Docker 集群运维 ---------- */
+.dk-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+  font-size: 13px;
+}
+.dk-table th, .dk-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.dk-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: .04em;
+}
+.dk-table td .btn-ghost { margin-right: 4px; }
+.dk-table tr:hover td { background: rgba(255, 255, 255, 0.02); }
+.dk-table .mono { font-family: var(--font-mono); font-size: 12px; }
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 1080px) {
-  .kb-layout, .query-layout { grid-template-columns: 1fr; }
+  .kb-layout, .query-layout, .ops-layout { grid-template-columns: 1fr; }
 }
 @media (max-width: 860px) {
   body {
