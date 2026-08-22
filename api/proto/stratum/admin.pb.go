@@ -1,5 +1,10 @@
-// admin.proto — external AdminService contract: health checks, system
-// diagnostics, and manual index maintenance operations.
+// admin.proto — external AdminService contract: health checks, cluster
+// status, system diagnostics, and manual index maintenance operations.
+//
+// GetClusterStatus exists for the routing layer (cmd/stratum-router): it
+// lets a router discover the current Raft leader without scanning the
+// whole cluster state. External applications should prefer
+// GetSystemStatus for diagnostics.
 //
 // See Stratum_接口设计v9.md "AdminService" for the authoritative
 // specification.
@@ -480,6 +485,120 @@ func (x *GetSystemStatusResponse) GetResourceUsage() *ResourceUsage {
 	return nil
 }
 
+// GetClusterStatusRequest is empty: the node reports its own view of the
+// Raft cluster.
+type GetClusterStatusRequest struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+}
+
+func (x *GetClusterStatusRequest) Reset() {
+	*x = GetClusterStatusRequest{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_admin_proto_msgTypes[7]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *GetClusterStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetClusterStatusRequest) ProtoMessage() {}
+
+func (x *GetClusterStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[7]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetClusterStatusRequest.ProtoReflect.Descriptor instead.
+func (*GetClusterStatusRequest) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{7}
+}
+
+// GetClusterStatusResponse is this node's view of Raft cluster
+// connectivity. The routing layer uses node_id + leader_id to resolve the
+// leader's gRPC address from its node list.
+type GetClusterStatusResponse struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	NodeId      int64 `protobuf:"varint,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                // this node's ID
+	HasLeader   bool  `protobuf:"varint,2,opt,name=has_leader,json=hasLeader,proto3" json:"has_leader,omitempty"`       // whether this node currently knows a leader
+	LeaderId    int64 `protobuf:"varint,3,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`          // node ID this node believes is the leader
+	MemberCount int64 `protobuf:"varint,4,opt,name=member_count,json=memberCount,proto3" json:"member_count,omitempty"` // configured cluster size
+}
+
+func (x *GetClusterStatusResponse) Reset() {
+	*x = GetClusterStatusResponse{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_admin_proto_msgTypes[8]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *GetClusterStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetClusterStatusResponse) ProtoMessage() {}
+
+func (x *GetClusterStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[8]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetClusterStatusResponse.ProtoReflect.Descriptor instead.
+func (*GetClusterStatusResponse) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GetClusterStatusResponse) GetNodeId() int64 {
+	if x != nil {
+		return x.NodeId
+	}
+	return 0
+}
+
+func (x *GetClusterStatusResponse) GetHasLeader() bool {
+	if x != nil {
+		return x.HasLeader
+	}
+	return false
+}
+
+func (x *GetClusterStatusResponse) GetLeaderId() int64 {
+	if x != nil {
+		return x.LeaderId
+	}
+	return 0
+}
+
+func (x *GetClusterStatusResponse) GetMemberCount() int64 {
+	if x != nil {
+		return x.MemberCount
+	}
+	return 0
+}
+
 type RebuildIndexRequest struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -492,7 +611,7 @@ type RebuildIndexRequest struct {
 func (x *RebuildIndexRequest) Reset() {
 	*x = RebuildIndexRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_admin_proto_msgTypes[7]
+		mi := &file_admin_proto_msgTypes[9]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -505,7 +624,7 @@ func (x *RebuildIndexRequest) String() string {
 func (*RebuildIndexRequest) ProtoMessage() {}
 
 func (x *RebuildIndexRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[7]
+	mi := &file_admin_proto_msgTypes[9]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -518,7 +637,7 @@ func (x *RebuildIndexRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RebuildIndexRequest.ProtoReflect.Descriptor instead.
 func (*RebuildIndexRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{7}
+	return file_admin_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *RebuildIndexRequest) GetKnowledgeBaseId() string {
@@ -546,7 +665,7 @@ type RebuildIndexResponse struct {
 func (x *RebuildIndexResponse) Reset() {
 	*x = RebuildIndexResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_admin_proto_msgTypes[8]
+		mi := &file_admin_proto_msgTypes[10]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -559,7 +678,7 @@ func (x *RebuildIndexResponse) String() string {
 func (*RebuildIndexResponse) ProtoMessage() {}
 
 func (x *RebuildIndexResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[8]
+	mi := &file_admin_proto_msgTypes[10]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -572,7 +691,7 @@ func (x *RebuildIndexResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RebuildIndexResponse.ProtoReflect.Descriptor instead.
 func (*RebuildIndexResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{8}
+	return file_admin_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *RebuildIndexResponse) GetSuccess() bool {
@@ -594,7 +713,7 @@ type WarmupVersionRequest struct {
 func (x *WarmupVersionRequest) Reset() {
 	*x = WarmupVersionRequest{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_admin_proto_msgTypes[9]
+		mi := &file_admin_proto_msgTypes[11]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -607,7 +726,7 @@ func (x *WarmupVersionRequest) String() string {
 func (*WarmupVersionRequest) ProtoMessage() {}
 
 func (x *WarmupVersionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[9]
+	mi := &file_admin_proto_msgTypes[11]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -620,7 +739,7 @@ func (x *WarmupVersionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WarmupVersionRequest.ProtoReflect.Descriptor instead.
 func (*WarmupVersionRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{9}
+	return file_admin_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *WarmupVersionRequest) GetKnowledgeBaseId() string {
@@ -648,7 +767,7 @@ type WarmupVersionResponse struct {
 func (x *WarmupVersionResponse) Reset() {
 	*x = WarmupVersionResponse{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_admin_proto_msgTypes[10]
+		mi := &file_admin_proto_msgTypes[12]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -661,7 +780,7 @@ func (x *WarmupVersionResponse) String() string {
 func (*WarmupVersionResponse) ProtoMessage() {}
 
 func (x *WarmupVersionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[10]
+	mi := &file_admin_proto_msgTypes[12]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -674,7 +793,7 @@ func (x *WarmupVersionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WarmupVersionResponse.ProtoReflect.Descriptor instead.
 func (*WarmupVersionResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{10}
+	return file_admin_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *WarmupVersionResponse) GetSuccess() bool {
@@ -741,7 +860,18 @@ var file_admin_proto_rawDesc = []byte{
 	0x6f, 0x75, 0x72, 0x63, 0x65, 0x5f, 0x75, 0x73, 0x61, 0x67, 0x65, 0x18, 0x05, 0x20, 0x01, 0x28,
 	0x0b, 0x32, 0x16, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x52, 0x65, 0x73, 0x6f,
 	0x75, 0x72, 0x63, 0x65, 0x55, 0x73, 0x61, 0x67, 0x65, 0x52, 0x0d, 0x72, 0x65, 0x73, 0x6f, 0x75,
-	0x72, 0x63, 0x65, 0x55, 0x73, 0x61, 0x67, 0x65, 0x22, 0x60, 0x0a, 0x13, 0x52, 0x65, 0x62, 0x75,
+	0x72, 0x63, 0x65, 0x55, 0x73, 0x61, 0x67, 0x65, 0x22, 0x19, 0x0a, 0x17, 0x47, 0x65, 0x74, 0x43,
+	0x6c, 0x75, 0x73, 0x74, 0x65, 0x72, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x71, 0x75,
+	0x65, 0x73, 0x74, 0x22, 0x92, 0x01, 0x0a, 0x18, 0x47, 0x65, 0x74, 0x43, 0x6c, 0x75, 0x73, 0x74,
+	0x65, 0x72, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
+	0x12, 0x17, 0x0a, 0x07, 0x6e, 0x6f, 0x64, 0x65, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28,
+	0x03, 0x52, 0x06, 0x6e, 0x6f, 0x64, 0x65, 0x49, 0x64, 0x12, 0x1d, 0x0a, 0x0a, 0x68, 0x61, 0x73,
+	0x5f, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x18, 0x02, 0x20, 0x01, 0x28, 0x08, 0x52, 0x09, 0x68,
+	0x61, 0x73, 0x4c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x12, 0x1b, 0x0a, 0x09, 0x6c, 0x65, 0x61, 0x64,
+	0x65, 0x72, 0x5f, 0x69, 0x64, 0x18, 0x03, 0x20, 0x01, 0x28, 0x03, 0x52, 0x08, 0x6c, 0x65, 0x61,
+	0x64, 0x65, 0x72, 0x49, 0x64, 0x12, 0x21, 0x0a, 0x0c, 0x6d, 0x65, 0x6d, 0x62, 0x65, 0x72, 0x5f,
+	0x63, 0x6f, 0x75, 0x6e, 0x74, 0x18, 0x04, 0x20, 0x01, 0x28, 0x03, 0x52, 0x0b, 0x6d, 0x65, 0x6d,
+	0x62, 0x65, 0x72, 0x43, 0x6f, 0x75, 0x6e, 0x74, 0x22, 0x60, 0x0a, 0x13, 0x52, 0x65, 0x62, 0x75,
 	0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x12,
 	0x2a, 0x0a, 0x11, 0x6b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x5f, 0x62, 0x61, 0x73,
 	0x65, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0f, 0x6b, 0x6e, 0x6f, 0x77,
@@ -766,7 +896,7 @@ var file_admin_proto_rawDesc = []byte{
 	0x16, 0x48, 0x45, 0x41, 0x4c, 0x54, 0x48, 0x5f, 0x53, 0x54, 0x41, 0x54, 0x55, 0x53, 0x5f, 0x44,
 	0x45, 0x47, 0x52, 0x41, 0x44, 0x45, 0x44, 0x10, 0x01, 0x12, 0x1b, 0x0a, 0x17, 0x48, 0x45, 0x41,
 	0x4c, 0x54, 0x48, 0x5f, 0x53, 0x54, 0x41, 0x54, 0x55, 0x53, 0x5f, 0x55, 0x4e, 0x48, 0x45, 0x41,
-	0x4c, 0x54, 0x48, 0x59, 0x10, 0x02, 0x32, 0xcb, 0x02, 0x0a, 0x0c, 0x41, 0x64, 0x6d, 0x69, 0x6e,
+	0x4c, 0x54, 0x48, 0x59, 0x10, 0x02, 0x32, 0xa4, 0x03, 0x0a, 0x0c, 0x41, 0x64, 0x6d, 0x69, 0x6e,
 	0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x48, 0x0a, 0x0b, 0x48, 0x65, 0x61, 0x6c, 0x74,
 	0x68, 0x43, 0x68, 0x65, 0x63, 0x6b, 0x12, 0x1b, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d,
 	0x2e, 0x48, 0x65, 0x61, 0x6c, 0x74, 0x68, 0x43, 0x68, 0x65, 0x63, 0x6b, 0x52, 0x65, 0x71, 0x75,
@@ -777,19 +907,25 @@ var file_admin_proto_rawDesc = []byte{
 	0x65, 0x74, 0x53, 0x79, 0x73, 0x74, 0x65, 0x6d, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52, 0x65,
 	0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x20, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e,
 	0x47, 0x65, 0x74, 0x53, 0x79, 0x73, 0x74, 0x65, 0x6d, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52,
-	0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x4b, 0x0a, 0x0c, 0x52, 0x65, 0x62, 0x75, 0x69,
-	0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x12, 0x1c, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75,
-	0x6d, 0x2e, 0x52, 0x65, 0x62, 0x75, 0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65,
-	0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1d, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e,
-	0x52, 0x65, 0x62, 0x75, 0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70,
-	0x6f, 0x6e, 0x73, 0x65, 0x12, 0x4e, 0x0a, 0x0d, 0x57, 0x61, 0x72, 0x6d, 0x75, 0x70, 0x56, 0x65,
-	0x72, 0x73, 0x69, 0x6f, 0x6e, 0x12, 0x1d, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e,
-	0x57, 0x61, 0x72, 0x6d, 0x75, 0x70, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x71,
-	0x75, 0x65, 0x73, 0x74, 0x1a, 0x1e, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x57,
-	0x61, 0x72, 0x6d, 0x75, 0x70, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70,
-	0x6f, 0x6e, 0x73, 0x65, 0x42, 0x1b, 0x5a, 0x19, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2f,
-	0x61, 0x70, 0x69, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75,
-	0x6d, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+	0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x57, 0x0a, 0x10, 0x47, 0x65, 0x74, 0x43, 0x6c,
+	0x75, 0x73, 0x74, 0x65, 0x72, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x12, 0x20, 0x2e, 0x73, 0x74,
+	0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x47, 0x65, 0x74, 0x43, 0x6c, 0x75, 0x73, 0x74, 0x65, 0x72,
+	0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x21, 0x2e,
+	0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x47, 0x65, 0x74, 0x43, 0x6c, 0x75, 0x73, 0x74,
+	0x65, 0x72, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
+	0x12, 0x4b, 0x0a, 0x0c, 0x52, 0x65, 0x62, 0x75, 0x69, 0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78,
+	0x12, 0x1c, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x52, 0x65, 0x62, 0x75, 0x69,
+	0x6c, 0x64, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1d,
+	0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x52, 0x65, 0x62, 0x75, 0x69, 0x6c, 0x64,
+	0x49, 0x6e, 0x64, 0x65, 0x78, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x4e, 0x0a,
+	0x0d, 0x57, 0x61, 0x72, 0x6d, 0x75, 0x70, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x12, 0x1d,
+	0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x57, 0x61, 0x72, 0x6d, 0x75, 0x70, 0x56,
+	0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x1e, 0x2e,
+	0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x57, 0x61, 0x72, 0x6d, 0x75, 0x70, 0x56, 0x65,
+	0x72, 0x73, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x42, 0x1b, 0x5a,
+	0x19, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2f, 0x61, 0x70, 0x69, 0x2f, 0x70, 0x72, 0x6f,
+	0x74, 0x6f, 0x2f, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74,
+	0x6f, 0x33,
 }
 
 var (
@@ -805,24 +941,26 @@ func file_admin_proto_rawDescGZIP() []byte {
 }
 
 var file_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_admin_proto_goTypes = []any{
-	(HealthStatus)(0),               // 0: stratum.HealthStatus
-	(*StuckVersion)(nil),            // 1: stratum.StuckVersion
-	(*WALAlert)(nil),                // 2: stratum.WALAlert
-	(*ResourceUsage)(nil),           // 3: stratum.ResourceUsage
-	(*HealthCheckRequest)(nil),      // 4: stratum.HealthCheckRequest
-	(*HealthCheckResponse)(nil),     // 5: stratum.HealthCheckResponse
-	(*GetSystemStatusRequest)(nil),  // 6: stratum.GetSystemStatusRequest
-	(*GetSystemStatusResponse)(nil), // 7: stratum.GetSystemStatusResponse
-	(*RebuildIndexRequest)(nil),     // 8: stratum.RebuildIndexRequest
-	(*RebuildIndexResponse)(nil),    // 9: stratum.RebuildIndexResponse
-	(*WarmupVersionRequest)(nil),    // 10: stratum.WarmupVersionRequest
-	(*WarmupVersionResponse)(nil),   // 11: stratum.WarmupVersionResponse
-	(IndexStatus)(0),                // 12: stratum.IndexStatus
+	(HealthStatus)(0),                // 0: stratum.HealthStatus
+	(*StuckVersion)(nil),             // 1: stratum.StuckVersion
+	(*WALAlert)(nil),                 // 2: stratum.WALAlert
+	(*ResourceUsage)(nil),            // 3: stratum.ResourceUsage
+	(*HealthCheckRequest)(nil),       // 4: stratum.HealthCheckRequest
+	(*HealthCheckResponse)(nil),      // 5: stratum.HealthCheckResponse
+	(*GetSystemStatusRequest)(nil),   // 6: stratum.GetSystemStatusRequest
+	(*GetSystemStatusResponse)(nil),  // 7: stratum.GetSystemStatusResponse
+	(*GetClusterStatusRequest)(nil),  // 8: stratum.GetClusterStatusRequest
+	(*GetClusterStatusResponse)(nil), // 9: stratum.GetClusterStatusResponse
+	(*RebuildIndexRequest)(nil),      // 10: stratum.RebuildIndexRequest
+	(*RebuildIndexResponse)(nil),     // 11: stratum.RebuildIndexResponse
+	(*WarmupVersionRequest)(nil),     // 12: stratum.WarmupVersionRequest
+	(*WarmupVersionResponse)(nil),    // 13: stratum.WarmupVersionResponse
+	(IndexStatus)(0),                 // 14: stratum.IndexStatus
 }
 var file_admin_proto_depIdxs = []int32{
-	12, // 0: stratum.StuckVersion.index_status:type_name -> stratum.IndexStatus
+	14, // 0: stratum.StuckVersion.index_status:type_name -> stratum.IndexStatus
 	0,  // 1: stratum.HealthCheckResponse.status:type_name -> stratum.HealthStatus
 	5,  // 2: stratum.GetSystemStatusResponse.health:type_name -> stratum.HealthCheckResponse
 	1,  // 3: stratum.GetSystemStatusResponse.stuck_versions:type_name -> stratum.StuckVersion
@@ -830,14 +968,16 @@ var file_admin_proto_depIdxs = []int32{
 	3,  // 5: stratum.GetSystemStatusResponse.resource_usage:type_name -> stratum.ResourceUsage
 	4,  // 6: stratum.AdminService.HealthCheck:input_type -> stratum.HealthCheckRequest
 	6,  // 7: stratum.AdminService.GetSystemStatus:input_type -> stratum.GetSystemStatusRequest
-	8,  // 8: stratum.AdminService.RebuildIndex:input_type -> stratum.RebuildIndexRequest
-	10, // 9: stratum.AdminService.WarmupVersion:input_type -> stratum.WarmupVersionRequest
-	5,  // 10: stratum.AdminService.HealthCheck:output_type -> stratum.HealthCheckResponse
-	7,  // 11: stratum.AdminService.GetSystemStatus:output_type -> stratum.GetSystemStatusResponse
-	9,  // 12: stratum.AdminService.RebuildIndex:output_type -> stratum.RebuildIndexResponse
-	11, // 13: stratum.AdminService.WarmupVersion:output_type -> stratum.WarmupVersionResponse
-	10, // [10:14] is the sub-list for method output_type
-	6,  // [6:10] is the sub-list for method input_type
+	8,  // 8: stratum.AdminService.GetClusterStatus:input_type -> stratum.GetClusterStatusRequest
+	10, // 9: stratum.AdminService.RebuildIndex:input_type -> stratum.RebuildIndexRequest
+	12, // 10: stratum.AdminService.WarmupVersion:input_type -> stratum.WarmupVersionRequest
+	5,  // 11: stratum.AdminService.HealthCheck:output_type -> stratum.HealthCheckResponse
+	7,  // 12: stratum.AdminService.GetSystemStatus:output_type -> stratum.GetSystemStatusResponse
+	9,  // 13: stratum.AdminService.GetClusterStatus:output_type -> stratum.GetClusterStatusResponse
+	11, // 14: stratum.AdminService.RebuildIndex:output_type -> stratum.RebuildIndexResponse
+	13, // 15: stratum.AdminService.WarmupVersion:output_type -> stratum.WarmupVersionResponse
+	11, // [11:16] is the sub-list for method output_type
+	6,  // [6:11] is the sub-list for method input_type
 	6,  // [6:6] is the sub-list for extension type_name
 	6,  // [6:6] is the sub-list for extension extendee
 	0,  // [0:6] is the sub-list for field type_name
@@ -935,7 +1075,7 @@ func file_admin_proto_init() {
 			}
 		}
 		file_admin_proto_msgTypes[7].Exporter = func(v any, i int) any {
-			switch v := v.(*RebuildIndexRequest); i {
+			switch v := v.(*GetClusterStatusRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -947,7 +1087,7 @@ func file_admin_proto_init() {
 			}
 		}
 		file_admin_proto_msgTypes[8].Exporter = func(v any, i int) any {
-			switch v := v.(*RebuildIndexResponse); i {
+			switch v := v.(*GetClusterStatusResponse); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -959,7 +1099,7 @@ func file_admin_proto_init() {
 			}
 		}
 		file_admin_proto_msgTypes[9].Exporter = func(v any, i int) any {
-			switch v := v.(*WarmupVersionRequest); i {
+			switch v := v.(*RebuildIndexRequest); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -971,6 +1111,30 @@ func file_admin_proto_init() {
 			}
 		}
 		file_admin_proto_msgTypes[10].Exporter = func(v any, i int) any {
+			switch v := v.(*RebuildIndexResponse); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_admin_proto_msgTypes[11].Exporter = func(v any, i int) any {
+			switch v := v.(*WarmupVersionRequest); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_admin_proto_msgTypes[12].Exporter = func(v any, i int) any {
 			switch v := v.(*WarmupVersionResponse); i {
 			case 0:
 				return &v.state
@@ -989,7 +1153,7 @@ func file_admin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_admin_proto_rawDesc,
 			NumEnums:      1,
-			NumMessages:   11,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

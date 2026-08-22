@@ -17,6 +17,7 @@ import (
 type AdminServiceImpl struct {
 	pb.UnimplementedAdminServiceServer
 
+	nodeID       int64
 	raftNode     raft.RaftNode
 	indexManager index.IndexManager
 	docStore     docstore.DocStore
@@ -24,8 +25,11 @@ type AdminServiceImpl struct {
 	wal          wal.WAL
 }
 
-// NewAdminService constructs an AdminServiceImpl.
+// NewAdminService constructs an AdminServiceImpl. nodeID identifies this
+// node in the Raft cluster; it is reported by GetClusterStatus so the
+// routing layer can resolve the leader's gRPC address from its node list.
 func NewAdminService(
+	nodeID int64,
 	rn raft.RaftNode,
 	im index.IndexManager,
 	ds docstore.DocStore,
@@ -33,6 +37,7 @@ func NewAdminService(
 	w wal.WAL,
 ) *AdminServiceImpl {
 	return &AdminServiceImpl{
+		nodeID:       nodeID,
 		raftNode:     rn,
 		indexManager: im,
 		docStore:     ds,
@@ -132,6 +137,20 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 		DeleteFailedKbs: deleteFailed,
 		WalAlerts:       walAlerts,
 		ResourceUsage:   resourceUsage,
+	}, nil
+}
+
+// GetClusterStatus implements AdminServiceServer.
+func (s *AdminServiceImpl) GetClusterStatus(ctx context.Context, req *pb.GetClusterStatusRequest) (*pb.GetClusterStatusResponse, error) {
+	cluster, err := s.raftNode.GetClusterStatus(ctx)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	return &pb.GetClusterStatusResponse{
+		NodeId:      s.nodeID,
+		HasLeader:   cluster.HasLeader,
+		LeaderId:    cluster.LeaderID,
+		MemberCount: int64(cluster.MemberCount),
 	}, nil
 }
 

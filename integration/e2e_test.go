@@ -333,7 +333,7 @@ func newRealNodeWithAddrsAndDir(t *testing.T, nodeID int64, peers []raft.PeerCon
 
 	kbSvc := service.NewKnowledgeBaseService(rn, wc, dc)
 	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, versionBF)
-	adminSvc := service.NewAdminService(rn, im, ds, cs, w)
+	adminSvc := service.NewAdminService(nodeID, rn, im, ds, cs, w)
 
 	srv := grpc.NewServer()
 	pb.RegisterKnowledgeBaseServiceServer(srv, kbSvc)

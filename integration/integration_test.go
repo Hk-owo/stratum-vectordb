@@ -113,7 +113,7 @@ func newTestCluster(t testing.TB) *testCluster {
 
 	kbSvc := service.NewKnowledgeBaseService(rn, wc, dc)
 	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, versionBF)
-	adminSvc := service.NewAdminService(rn, im, ds, cs, w)
+	adminSvc := service.NewAdminService(1, rn, im, ds, cs, w)
 
 	srv := grpc.NewServer()
 	pb.RegisterKnowledgeBaseServiceServer(srv, kbSvc)

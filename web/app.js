@@ -187,20 +187,28 @@ function friendlyUnavailable(e) {
   return '无法连接服务：' + m;
 }
 
+// setHealthUI 统一更新健康状态 UI（顶栏徽标 + 总览页大字/详情/卡片边框）。
+// 成功与失败分支都走这里，避免两处不一致（例如断连时只有顶栏变红而总览页
+// 仍停留在最后一次成功的状态）。
+function setHealthUI(status, details) {
+  const h = HEALTH[status] || { label: status || 'UNKNOWN', cls: 'gray' };
+  setHealthBadge(status);
+  $('health-details').textContent = details;
+  $('health-status').textContent = h.label;
+  $('health-details-big').textContent = details;
+  $('health-card').style.borderTop = '3px solid ' +
+    ({ green: 'var(--green)', yellow: 'var(--yellow)', red: 'var(--red)' }[h.cls] || 'var(--gray)');
+}
+
 async function pollHealth() {
   try {
     const h = await api('/health');
-    setHealthBadge(h.status);
-    $('health-details').textContent = h.details || '';
-    $('health-status').textContent = (HEALTH[h.status] || {}).label || h.status;
-    $('health-details-big').textContent = h.details || 'ok';
-    $('health-card').style.borderTop = '3px solid ' +
-      ({ green: 'var(--green)', yellow: 'var(--yellow)', red: 'var(--red)' }[(HEALTH[h.status] || {}).cls] || 'var(--gray)');
+    setHealthUI(h.status, h.details || 'ok');
     healthWasUp = true;
     bannerDismissed = false; // 恢复健康后重置：下次断连可再次提示
     hideBanner();
   } catch (e) {
-    setHealthBadge('HEALTH_STATUS_UNHEALTHY');
+    setHealthUI('HEALTH_STATUS_UNHEALTHY', friendlyUnavailable(e));
     if (healthWasUp && !bannerDismissed) {
       showBanner(friendlyUnavailable(e));
     }

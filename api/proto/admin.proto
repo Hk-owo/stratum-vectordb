@@ -1,5 +1,10 @@
-// admin.proto — external AdminService contract: health checks, system
-// diagnostics, and manual index maintenance operations.
+// admin.proto — external AdminService contract: health checks, cluster
+// status, system diagnostics, and manual index maintenance operations.
+//
+// GetClusterStatus exists for the routing layer (cmd/stratum-router): it
+// lets a router discover the current Raft leader without scanning the
+// whole cluster state. External applications should prefer
+// GetSystemStatus for diagnostics.
 //
 // See Stratum_接口设计v9.md "AdminService" for the authoritative
 // specification.
@@ -43,6 +48,7 @@ message ResourceUsage {
 service AdminService {
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
   rpc GetSystemStatus(GetSystemStatusRequest) returns (GetSystemStatusResponse);
+  rpc GetClusterStatus(GetClusterStatusRequest) returns (GetClusterStatusResponse);
   rpc RebuildIndex(RebuildIndexRequest) returns (RebuildIndexResponse);
   rpc WarmupVersion(WarmupVersionRequest) returns (WarmupVersionResponse);
 }
@@ -60,6 +66,20 @@ message GetSystemStatusResponse {
   repeated string delete_failed_kbs = 3;
   repeated WALAlert wal_alerts = 4;
   ResourceUsage resource_usage = 5;
+}
+
+// GetClusterStatusRequest is empty: the node reports its own view of the
+// Raft cluster.
+message GetClusterStatusRequest {}
+
+// GetClusterStatusResponse is this node's view of Raft cluster
+// connectivity. The routing layer uses node_id + leader_id to resolve the
+// leader's gRPC address from its node list.
+message GetClusterStatusResponse {
+  int64 node_id = 1;        // this node's ID
+  bool has_leader = 2;      // whether this node currently knows a leader
+  int64 leader_id = 3;      // node ID this node believes is the leader
+  int64 member_count = 4;   // configured cluster size
 }
 
 message RebuildIndexRequest {

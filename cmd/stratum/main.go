@@ -316,7 +316,7 @@ func main() {
 	// --- gRPC services ---
 	kbSvc := service.NewKnowledgeBaseService(raftImpl, writeCoord, deleteCoord)
 	querySvc := service.NewQueryService(raftImpl, indexMgr, cdm, vd, ds, versionBloom)
-	adminSvc := service.NewAdminService(raftImpl, indexMgr, ds, chunkStore, walImpl)
+	adminSvc := service.NewAdminService(cfg.NodeID, raftImpl, indexMgr, ds, chunkStore, walImpl)
 
 	// --- gRPC server ---
 	grpcServer := grpc.NewServer()

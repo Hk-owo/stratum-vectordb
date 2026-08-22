@@ -53,9 +53,10 @@ else
 fi
 
 # ---------- 2. 构建 Go 二进制 ----------
-echo "==> [2/4] 构建 Go 二进制（stratum / stratum-gateway / mock-embed）…"
+echo "==> [2/4] 构建 Go 二进制（stratum / stratum-gateway / stratum-router / mock-embed）…"
 go build -o "$BIN/stratum" ./cmd/stratum/
 go build -o "$BIN/stratum-gateway" ./cmd/stratum-gateway/
+go build -o "$BIN/stratum-router" ./cmd/stratum-router/
 go build -o "$BIN/mock-embed" ./integration/docker/mock_embed_server.go
 
 # ---------- 3. 控制台配置 ----------
@@ -96,12 +97,15 @@ else
   echo "==> [3/4] 控制台配置已存在，保留 $CONSOLE_YAML（如需重置请删除后重跑）"
 fi
 
-# ---------- 4. 启动控制台并拉起服务 ----------
-echo "==> [4/4] 启动控制台（stratum-gateway）…"
+# ---------- 4. 启动路由层、控制台并拉起服务 ----------
+# 拓扑：gateway → stratum-router（路由层）→ 集群节点。router 负责 leader
+# 发现与写转发/读均衡，gateway 只连 router 一个地址。
+echo "==> [4/4] 启动路由层（stratum-router）与控制台（stratum-gateway）…"
+ROUTER_ADDR="${STRATUM_ROUTER_ADDR:-127.0.0.1:7009}"
 PIDS=()
 cleanup() {
   echo
-  echo "==> 停止服务（/ops/stop）并退出控制台…"
+  echo "==> 停止服务（/ops/stop）并退出路由层与控制台…"
   curl -sf -X POST "http://127.0.0.1:${HTTP_PORT}/ops/stop" -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
   sleep 1
   kill "${PIDS[@]:-}" 2>/dev/null || true
@@ -109,8 +113,14 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+"$BIN/stratum-router" \
+  -listen "$ROUTER_ADDR" \
+  -nodes "127.0.0.1:$GRPC_PORT" \
+  >"$LOG/router.log" 2>&1 &
+PIDS+=($!)
+
 "$BIN/stratum-gateway" \
-  -grpc-addr "$GRPC_ADDR" \
+  -grpc-addr "$ROUTER_ADDR" \
   -http-addr "$HTTP_ADDR" \
   -static "$ROOT/web" \
   -ops-config "$CONSOLE_YAML" \

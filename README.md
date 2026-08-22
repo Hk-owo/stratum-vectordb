@@ -127,44 +127,55 @@ go run ./cmd/stratum/ -config integration/docker/config1.yaml
 | `RebuildIndex` | Re-trigger index build for a failed version |
 | `WarmupVersion` | Load a version's index into memory without switching the active version |
 
-## HTTP gateway & Web console
+## HTTP gateway, routing layer & Web console
 
 `cmd/stratum-gateway` is a separate process that exposes the three external
 gRPC services (`KnowledgeBaseService` / `QueryService` / `AdminService`) over
 a small REST/JSON API and serves the frontend static assets (`web/`) from the
-same origin, so no CORS is needed. It dials the core server's gRPC address
-(default `:7000`) using the already-generated client stubs plus `protojson`,
-adding no new Go module dependency. The internal `DataSyncService` is
-intentionally not exposed.
+same origin, so no CORS is needed. It uses the already-generated client stubs
+plus `protojson`, adding no new Go module dependency. The internal
+`DataSyncService` is intentionally not exposed.
 
-**Multi-node leader following**: `-grpc-addr` accepts a comma-separated list
-of node addresses. Write operations (create/delete KB, create version,
-rollback, rebuild, warmup) automatically run on the current leader; when the
-leader fails over or the current node goes down, the gateway retries against
-the next node (and caches the discovered leader). Raft itself never forwards
-writes, so a gateway pinned to a single non-leader node would otherwise
-reject every write with `kvraft: not leader`.
+**Routing layer**：`cmd/stratum-router` is the cluster front: it dials every
+node, discovers the Raft leader, forwards **writes to the leader** (re-discovering
+on failover) and **load-balances reads** across nodes (round-robin with
+failover). The gateway dials the **router** (`-grpc-addr 127.0.0.1:7009` by
+default) instead of individual nodes — leader discovery and write/read routing
+are the router's job, so the gateway keeps a single gRPC connection and no
+cluster awareness of its own:
 
-**快捷启动**：`scripts/gateway.sh` 提供两种零参数启动方式（不需要手拼参数）：
-
-```bash
-scripts/gateway.sh               # Docker 集群模式（默认）：自动从 run/console.yaml
-                                 # 的 docker 段读取节点数/基础端口，拼接多节点
-                                 # 地址并启动（leader 自动跟随）
-scripts/gateway.sh single        # 单机模式：-grpc-addr 127.0.0.1:7000
-scripts/gateway.sh build         # 强制重新构建后（默认模式）启动
-scripts/gateway.sh stop          # 停止正在运行的 gateway
+```
+web UI ⇄ gateway (:8081) ⇄ router (:7009) ⇄ node1 / node2 / node3
 ```
 
-环境变量 `STRATUM_HTTP_ADDR`（监听地址，默认 `0.0.0.0:8081`）与
-`STRATUM_GRPC_ADDR`（单机模式 gRPC 地址，默认 `127.0.0.1:7000`）可覆盖默认值。
-手动启动等价于：
+**快捷启动**：`scripts/gateway.sh` 提供两种零参数启动方式（gateway 总是经路由层
+访问集群；路由层未监听时会自动构建并后台拉起它，退出/`stop` 时一并清理）：
+`scripts/router.sh` 可单独管理路由层：
 
 ```bash
-# 单机
-./run/bin/stratum-gateway -grpc-addr 127.0.0.1:7000
-# docker 集群（3 节点，leader 漂移自动跟随）
-./run/bin/stratum-gateway -grpc-addr localhost:17000,localhost:17001,localhost:17002
+scripts/gateway.sh               # Docker 集群模式（默认）：从 run/console.yaml
+                                 # 的 docker 段读取节点数/基础端口，自动启动
+                                 # 路由层 + gateway
+scripts/gateway.sh single        # 单机模式：路由层连 127.0.0.1:7000，启动 gateway
+scripts/gateway.sh build         # 强制重新构建后（默认模式）启动
+scripts/gateway.sh stop          # 停止 gateway 与本脚本拉起的路由层
+
+scripts/router.sh status         # 查看路由层是否在监听
+scripts/router.sh stop           # 单独停止路由层
+```
+
+环境变量 `STRATUM_HTTP_ADDR`（监听地址，默认 `0.0.0.0:8081`）、
+`STRATUM_ROUTER_ADDR`（路由层地址，默认 `127.0.0.1:7009`）与
+`STRATUM_GRPC_ADDR`（单机模式路由层应连接的节点地址，默认 `127.0.0.1:7000`）
+可覆盖默认值。手动启动等价于：
+
+```bash
+# 路由层（先起；-nodes 为集群节点 gRPC 地址列表）
+./run/bin/stratum-router -listen 0.0.0.0:7009 -nodes 127.0.0.1:7000
+./run/bin/stratum-router -listen 0.0.0.0:7009 -nodes localhost:17000,localhost:17001,localhost:17002
+
+# gateway（后起；始终指向路由层）
+./run/bin/stratum-gateway -grpc-addr 127.0.0.1:7009
 ```
 
 > Docker 集群模式下 vecstore 是宿主机上的外部依赖（节点配置
@@ -173,11 +184,12 @@ scripts/gateway.sh stop          # 停止正在运行的 gateway
 > 无法访问，会导致版本索引构建失败、删除（DELETE_FAILED）等连锁问题。
 
 `start.sh` builds and launches the full stack in one go. It starts the
-**console process** (`stratum-gateway`) and the database services
-(vecstore(C++) → stratum(gRPC)) are brought up through its `/ops/start`
-endpoint, so the web UI (default `http://localhost:8081`) — including the
-**「运维」** page — is available even before the database is running, and
-Ctrl+C stops everything cleanly. Logs live under `run/log/`.
+**routing layer** (`stratum-router`) and the **console process**
+(`stratum-gateway`), and the database services (vecstore(C++) → stratum(gRPC))
+are brought up through the console's `/ops/start` endpoint, so the web UI
+(default `http://localhost:8081`) — including the **「运维」** page — is
+available even before the database is running, and Ctrl+C stops everything
+cleanly. Logs live under `run/log/`.
 
 ### Starting the console alone (ops only, database not running)
 

@@ -6,7 +6,11 @@
 //
 // Design notes:
 //   - This is a separate process from cmd/stratum. The core Stratum server
-//     is untouched; the gateway dials its gRPC address (default :7000).
+//     is untouched.
+//   - The gateway dials the **routing layer** (cmd/stratum-router): leader
+//     discovery, write-to-leader forwarding, and read load-balancing are
+//     handled by the router, so the gateway keeps a single gRPC connection
+//     and no cluster awareness of its own.
 //   - It uses the already-generated gRPC client stubs plus protojson
 //     (google.golang.org/protobuf, an existing dependency), so it adds no
 //     new Go module dependency and requires no proto regeneration.
@@ -17,7 +21,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"io"
 	"log"
@@ -25,8 +28,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,70 +50,19 @@ var (
 	unmarshalOpts = protojson.UnmarshalOptions{DiscardUnknown: true}
 )
 
+// gateway holds the three external service clients, all dialing the
+// routing layer (stratum-router). The router handles leader discovery,
+// write forwarding and read load-balancing across the cluster.
 type gateway struct {
-	addrs  []string // 全部节点地址（逗号分隔 -grpc-addr 传入）
-	leader atomic.Int32
-	conns  []*grpc.ClientConn
-	kbs    []pb.KnowledgeBaseServiceClient
-	querys []pb.QueryServiceClient
-	admins []pb.AdminServiceClient
-}
-
-// cur 返回当前 leader 地址对应的客户端三元组。
-func (g *gateway) cur() (pb.KnowledgeBaseServiceClient, pb.QueryServiceClient, pb.AdminServiceClient) {
-	i := int(g.leader.Load())
-	return g.kbs[i], g.querys[i], g.admins[i]
-}
-
-// rotate 把 leader 指针轮换到下一个节点。
-func (g *gateway) rotate() {
-	i := g.leader.Load()
-	g.leader.Store((i + 1) % int32(len(g.addrs)))
-}
-
-// isRetryableErr 判断写操作是否应该轮换到下一个节点重试：
-//   - kvraft.ErrNotLeader（codes.Internal + "not leader"）：本节点不是 leader
-//   - codes.Unavailable：节点宕机/连接失败（leader 漂移或容器停止）
-//
-// 其余错误（参数错误、索引失败等）不重试。
-func isRetryableErr(err error) bool {
-	st, ok := status.FromError(err)
-	if !ok {
-		return false
-	}
-	if st.Code() == codes.Unavailable {
-		return true
-	}
-	return st.Code() == codes.Internal && strings.Contains(st.Message(), "not leader")
-}
-
-// withLeaderRetry 包装写方法：在 leader 上执行，遇 not leader 或节点不可用
-// 自动轮换到下一个节点重试（最多 len(addrs) 次），成功后更新 leader 指针。
-// 其余错误直接返回，不重试。
-// （泛型函数；方法不支持类型参数，故为包级函数。）
-func withLeaderRetry[Req, Resp proto.Message](
-	g *gateway,
-	fn func(int, context.Context, Req) (Resp, error),
-) func(context.Context, Req) (Resp, error) {
-	return func(ctx context.Context, req Req) (Resp, error) {
-		var zero Resp
-		for i := 0; i < len(g.addrs); i++ {
-			idx := int(g.leader.Load())
-			resp, err := fn(idx, ctx, req)
-			if err == nil {
-				return resp, nil
-			}
-			if !isRetryableErr(err) {
-				return zero, err
-			}
-			g.rotate()
-		}
-		return zero, errors.New("no leader available")
-	}
+	kb    pb.KnowledgeBaseServiceClient
+	query pb.QueryServiceClient
+	admin pb.AdminServiceClient
 }
 
 func main() {
-	grpcAddr := flag.String("grpc-addr", "127.0.0.1:7000", "Stratum gRPC address")
+	// -grpc-addr 指向路由层（stratum-router，默认 0.0.0.0:7009），由 router
+	// 负责 leader 发现、写转发与读负载均衡；gateway 只维护一条 gRPC 连接。
+	grpcAddr := flag.String("grpc-addr", "127.0.0.1:7009", "routing layer (stratum-router) gRPC address")
 	httpAddr := flag.String("http-addr", "0.0.0.0:8081", "gateway HTTP listen address")
 	staticDir := flag.String("static", "./web", "frontend static asset directory")
 	opsConfigPath := flag.String("ops-config", "", "console ops config YAML (default ./run/console.yaml)")
@@ -123,31 +73,18 @@ func main() {
 	// and /api calls return UNAVAILABLE until the connection is established
 	// (so the frontend health badge can report the outage instead of the
 	// gateway itself hanging on startup).
-	//
-	// -grpc-addr 支持逗号分隔的多个节点地址：写操作自动在 leader 上执行，
-	// leader 漂移时自动轮换重试（见 withLeaderRetry）。
-	addrs := []string{}
-	for _, a := range strings.Split(*grpcAddr, ",") {
-		if a = strings.TrimSpace(a); a != "" {
-			addrs = append(addrs, a)
-		}
+	conn, err := grpc.Dial(*grpcAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		log.Fatalf("failed to dial %s: %v", *grpcAddr, err)
 	}
-	if len(addrs) == 0 {
-		log.Fatalf("invalid -grpc-addr %q", *grpcAddr)
-	}
-	g := &gateway{addrs: addrs}
-	for _, a := range addrs {
-		conn, err := grpc.Dial(a,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		)
-		if err != nil {
-			log.Fatalf("failed to dial %s: %v", a, err)
-		}
-		defer conn.Close()
-		g.conns = append(g.conns, conn)
-		g.kbs = append(g.kbs, pb.NewKnowledgeBaseServiceClient(conn))
-		g.querys = append(g.querys, pb.NewQueryServiceClient(conn))
-		g.admins = append(g.admins, pb.NewAdminServiceClient(conn))
+	defer conn.Close()
+
+	g := &gateway{
+		kb:    pb.NewKnowledgeBaseServiceClient(conn),
+		query: pb.NewQueryServiceClient(conn),
+		admin: pb.NewAdminServiceClient(conn),
 	}
 
 	// --- Ops console (control plane) ---
@@ -214,35 +151,31 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/health", handle(
 		func() *pb.HealthCheckRequest { return &pb.HealthCheckRequest{} },
 		func(ctx context.Context, r *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
-			_, _, admin := g.cur()
-			return admin.HealthCheck(ctx, r)
+			return g.admin.HealthCheck(ctx, r)
 		},
 	))
 	mux.HandleFunc("GET /api/system-status", handle(
 		func() *pb.GetSystemStatusRequest { return &pb.GetSystemStatusRequest{} },
 		func(ctx context.Context, r *pb.GetSystemStatusRequest) (*pb.GetSystemStatusResponse, error) {
-			_, _, admin := g.cur()
-			return admin.GetSystemStatus(ctx, r)
+			return g.admin.GetSystemStatus(ctx, r)
 		},
 	))
 
 	// --- KnowledgeBaseService ---
 	mux.HandleFunc("POST /api/knowledge-bases", handle(
 		func() *pb.CreateKnowledgeBaseRequest { return &pb.CreateKnowledgeBaseRequest{} },
-		withLeaderRetry(g, func(i int, ctx context.Context, r *pb.CreateKnowledgeBaseRequest) (*pb.CreateKnowledgeBaseResponse, error) {
-			return g.kbs[i].CreateKnowledgeBase(ctx, r)
-		}),
+		func(ctx context.Context, r *pb.CreateKnowledgeBaseRequest) (*pb.CreateKnowledgeBaseResponse, error) {
+			return g.kb.CreateKnowledgeBase(ctx, r)
+		},
 	))
 	mux.HandleFunc("GET /api/knowledge-bases", handle(
 		func() *pb.ListKnowledgeBasesRequest { return &pb.ListKnowledgeBasesRequest{} },
 		func(ctx context.Context, r *pb.ListKnowledgeBasesRequest) (*pb.ListKnowledgeBasesResponse, error) {
-			kb, _, _ := g.cur()
-			return kb.ListKnowledgeBases(ctx, r)
+			return g.kb.ListKnowledgeBases(ctx, r)
 		},
 	))
 	mux.HandleFunc("GET /api/knowledge-bases/{id}", func(w http.ResponseWriter, r *http.Request) {
-		kb, _, _ := g.cur()
-		resp, err := kb.GetKnowledgeBase(r.Context(), &pb.GetKnowledgeBaseRequest{KnowledgeBaseId: r.PathValue("id")})
+		resp, err := g.kb.GetKnowledgeBase(r.Context(), &pb.GetKnowledgeBaseRequest{KnowledgeBaseId: r.PathValue("id")})
 		if err != nil {
 			writeError(w, err)
 			return
@@ -251,13 +184,12 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("POST /api/knowledge-bases/delete", handle(
 		func() *pb.DeleteKnowledgeBaseRequest { return &pb.DeleteKnowledgeBaseRequest{} },
-		withLeaderRetry(g, func(i int, ctx context.Context, r *pb.DeleteKnowledgeBaseRequest) (*pb.DeleteKnowledgeBaseResponse, error) {
-			return g.kbs[i].DeleteKnowledgeBase(ctx, r)
-		}),
+		func(ctx context.Context, r *pb.DeleteKnowledgeBaseRequest) (*pb.DeleteKnowledgeBaseResponse, error) {
+			return g.kb.DeleteKnowledgeBase(ctx, r)
+		},
 	))
 	mux.HandleFunc("GET /api/knowledge-bases/{id}/versions", func(w http.ResponseWriter, r *http.Request) {
-		kb, _, _ := g.cur()
-		resp, err := kb.ListVersions(r.Context(), &pb.ListVersionsRequest{KnowledgeBaseId: r.PathValue("id")})
+		resp, err := g.kb.ListVersions(r.Context(), &pb.ListVersionsRequest{KnowledgeBaseId: r.PathValue("id")})
 		if err != nil {
 			writeError(w, err)
 			return
@@ -267,38 +199,37 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/knowledge-bases/{id}/versions", handleWithID(
 		func() *pb.CreateVersionRequest { return &pb.CreateVersionRequest{} },
 		func(r *pb.CreateVersionRequest, id string) { r.KnowledgeBaseId = id },
-		withLeaderRetry(g, func(i int, ctx context.Context, r *pb.CreateVersionRequest) (*pb.CreateVersionResponse, error) {
-			return g.kbs[i].CreateVersion(ctx, r)
-		}),
+		func(ctx context.Context, r *pb.CreateVersionRequest) (*pb.CreateVersionResponse, error) {
+			return g.kb.CreateVersion(ctx, r)
+		},
 	))
 	mux.HandleFunc("POST /api/knowledge-bases/{id}/rollback", handleWithID(
 		func() *pb.RollbackVersionRequest { return &pb.RollbackVersionRequest{} },
 		func(r *pb.RollbackVersionRequest, id string) { r.KnowledgeBaseId = id },
-		withLeaderRetry(g, func(i int, ctx context.Context, r *pb.RollbackVersionRequest) (*pb.RollbackVersionResponse, error) {
-			return g.kbs[i].RollbackVersion(ctx, r)
-		}),
+		func(ctx context.Context, r *pb.RollbackVersionRequest) (*pb.RollbackVersionResponse, error) {
+			return g.kb.RollbackVersion(ctx, r)
+		},
 	))
 	mux.HandleFunc("POST /api/knowledge-bases/{id}/rebuild", handleWithID(
 		func() *pb.RebuildIndexRequest { return &pb.RebuildIndexRequest{} },
 		func(r *pb.RebuildIndexRequest, id string) { r.KnowledgeBaseId = id },
-		withLeaderRetry(g, func(i int, ctx context.Context, r *pb.RebuildIndexRequest) (*pb.RebuildIndexResponse, error) {
-			return g.admins[i].RebuildIndex(ctx, r)
-		}),
+		func(ctx context.Context, r *pb.RebuildIndexRequest) (*pb.RebuildIndexResponse, error) {
+			return g.admin.RebuildIndex(ctx, r)
+		},
 	))
 	mux.HandleFunc("POST /api/knowledge-bases/{id}/warmup", handleWithID(
 		func() *pb.WarmupVersionRequest { return &pb.WarmupVersionRequest{} },
 		func(r *pb.WarmupVersionRequest, id string) { r.KnowledgeBaseId = id },
-		withLeaderRetry(g, func(i int, ctx context.Context, r *pb.WarmupVersionRequest) (*pb.WarmupVersionResponse, error) {
-			return g.admins[i].WarmupVersion(ctx, r)
-		}),
+		func(ctx context.Context, r *pb.WarmupVersionRequest) (*pb.WarmupVersionResponse, error) {
+			return g.admin.WarmupVersion(ctx, r)
+		},
 	))
 
 	// --- QueryService ---
 	mux.HandleFunc("POST /api/query", handle(
 		func() *pb.QueryRequest { return &pb.QueryRequest{} },
 		func(ctx context.Context, r *pb.QueryRequest) (*pb.QueryResponse, error) {
-			_, query, _ := g.cur()
-			return query.Query(ctx, r)
+			return g.query.Query(ctx, r)
 		},
 	))
 }

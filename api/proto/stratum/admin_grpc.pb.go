@@ -1,5 +1,10 @@
-// admin.proto — external AdminService contract: health checks, system
-// diagnostics, and manual index maintenance operations.
+// admin.proto — external AdminService contract: health checks, cluster
+// status, system diagnostics, and manual index maintenance operations.
+//
+// GetClusterStatus exists for the routing layer (cmd/stratum-router): it
+// lets a router discover the current Raft leader without scanning the
+// whole cluster state. External applications should prefer
+// GetSystemStatus for diagnostics.
 //
 // See Stratum_接口设计v9.md "AdminService" for the authoritative
 // specification.
@@ -30,10 +35,11 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	AdminService_HealthCheck_FullMethodName     = "/stratum.AdminService/HealthCheck"
-	AdminService_GetSystemStatus_FullMethodName = "/stratum.AdminService/GetSystemStatus"
-	AdminService_RebuildIndex_FullMethodName    = "/stratum.AdminService/RebuildIndex"
-	AdminService_WarmupVersion_FullMethodName   = "/stratum.AdminService/WarmupVersion"
+	AdminService_HealthCheck_FullMethodName      = "/stratum.AdminService/HealthCheck"
+	AdminService_GetSystemStatus_FullMethodName  = "/stratum.AdminService/GetSystemStatus"
+	AdminService_GetClusterStatus_FullMethodName = "/stratum.AdminService/GetClusterStatus"
+	AdminService_RebuildIndex_FullMethodName     = "/stratum.AdminService/RebuildIndex"
+	AdminService_WarmupVersion_FullMethodName    = "/stratum.AdminService/WarmupVersion"
 )
 
 // AdminServiceClient is the client API for AdminService service.
@@ -42,6 +48,7 @@ const (
 type AdminServiceClient interface {
 	HealthCheck(ctx context.Context, in *HealthCheckRequest, opts ...grpc.CallOption) (*HealthCheckResponse, error)
 	GetSystemStatus(ctx context.Context, in *GetSystemStatusRequest, opts ...grpc.CallOption) (*GetSystemStatusResponse, error)
+	GetClusterStatus(ctx context.Context, in *GetClusterStatusRequest, opts ...grpc.CallOption) (*GetClusterStatusResponse, error)
 	RebuildIndex(ctx context.Context, in *RebuildIndexRequest, opts ...grpc.CallOption) (*RebuildIndexResponse, error)
 	WarmupVersion(ctx context.Context, in *WarmupVersionRequest, opts ...grpc.CallOption) (*WarmupVersionResponse, error)
 }
@@ -74,6 +81,16 @@ func (c *adminServiceClient) GetSystemStatus(ctx context.Context, in *GetSystemS
 	return out, nil
 }
 
+func (c *adminServiceClient) GetClusterStatus(ctx context.Context, in *GetClusterStatusRequest, opts ...grpc.CallOption) (*GetClusterStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetClusterStatusResponse)
+	err := c.cc.Invoke(ctx, AdminService_GetClusterStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *adminServiceClient) RebuildIndex(ctx context.Context, in *RebuildIndexRequest, opts ...grpc.CallOption) (*RebuildIndexResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RebuildIndexResponse)
@@ -100,6 +117,7 @@ func (c *adminServiceClient) WarmupVersion(ctx context.Context, in *WarmupVersio
 type AdminServiceServer interface {
 	HealthCheck(context.Context, *HealthCheckRequest) (*HealthCheckResponse, error)
 	GetSystemStatus(context.Context, *GetSystemStatusRequest) (*GetSystemStatusResponse, error)
+	GetClusterStatus(context.Context, *GetClusterStatusRequest) (*GetClusterStatusResponse, error)
 	RebuildIndex(context.Context, *RebuildIndexRequest) (*RebuildIndexResponse, error)
 	WarmupVersion(context.Context, *WarmupVersionRequest) (*WarmupVersionResponse, error)
 	mustEmbedUnimplementedAdminServiceServer()
@@ -117,6 +135,9 @@ func (UnimplementedAdminServiceServer) HealthCheck(context.Context, *HealthCheck
 }
 func (UnimplementedAdminServiceServer) GetSystemStatus(context.Context, *GetSystemStatusRequest) (*GetSystemStatusResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetSystemStatus not implemented")
+}
+func (UnimplementedAdminServiceServer) GetClusterStatus(context.Context, *GetClusterStatusRequest) (*GetClusterStatusResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetClusterStatus not implemented")
 }
 func (UnimplementedAdminServiceServer) RebuildIndex(context.Context, *RebuildIndexRequest) (*RebuildIndexResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RebuildIndex not implemented")
@@ -181,6 +202,24 @@ func _AdminService_GetSystemStatus_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AdminService_GetClusterStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetClusterStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).GetClusterStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_GetClusterStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).GetClusterStatus(ctx, req.(*GetClusterStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _AdminService_RebuildIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RebuildIndexRequest)
 	if err := dec(in); err != nil {
@@ -231,6 +270,10 @@ var AdminService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetSystemStatus",
 			Handler:    _AdminService_GetSystemStatus_Handler,
+		},
+		{
+			MethodName: "GetClusterStatus",
+			Handler:    _AdminService_GetClusterStatus_Handler,
 		},
 		{
 			MethodName: "RebuildIndex",
