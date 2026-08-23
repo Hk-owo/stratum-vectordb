@@ -16,6 +16,8 @@
 #
 # 命令:
 #   build                      构建二进制与 Docker 镜像
+#   update [N]                 更新集群：重新编译 → 重建镜像 → --force 重建
+#                              全部节点容器（数据卷保留，一条命令跑上最新代码）
 #   init [N]                   初始化 N 节点配置与网络（幂等，不启动）
 #   up [N]                     init + 启动 N 节点（幂等，默认等待 leader）
 #   start [node...]            启动节点（默认全部）
@@ -285,6 +287,40 @@ cmd_up() {
   cmd_status "$count"
 }
 
+# 等待全部节点 running + healthy
+wait_healthy() {
+  local count=$1 timeout=${2:-90}
+  for _ in $(seq 1 "$timeout"); do
+    local all_healthy=1 id name st h
+    for ((id=1; id<=count; id++)); do
+      name="$(node_name "$id")"
+      if ! container_exists "$name"; then all_healthy=0; break; fi
+      st="$(docker inspect -f '{{.State.Status}}' "$name")"
+      h="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$name" 2>/dev/null || echo none)"
+      if [[ "$st" != "running" || "$h" != "healthy" ]]; then all_healthy=0; break; fi
+    done
+    if [[ "$all_healthy" -eq 1 ]]; then
+      log "全部 ${count} 个节点 healthy"
+      return 0
+    fi
+    sleep 2
+  done
+  warn "等待全部节点 healthy 超时（${timeout}s）"
+  return 1
+}
+
+# update：重新编译 → 重建镜像 → --force 重建全部容器（数据卷保留）。
+# 一条命令让集群跑上最新代码；等价于 build + up N --force。
+cmd_update() {
+  local count=${1:-$DEFAULT_NODES}
+  log "== 更新 docker 集群（编译 → 镜像 → 重建容器，数据卷保留）=="
+  cmd_build
+  FORCE=1
+  cmd_up "$count"
+  wait_healthy "$count"
+  log "更新完成：${count} 个节点已运行最新实现"
+}
+
 cmd_down() {
   # 按前缀匹配删除所有 stratum 节点容器
   local ids
@@ -459,6 +495,7 @@ case "$CMD" in
   build)    cmd_build ;;
   init)     cmd_init "${1:-$DEFAULT_NODES}" ;;
   up)       cmd_up "${1:-$DEFAULT_NODES}" ;;
+  update)   cmd_update "${1:-$DEFAULT_NODES}" ;;
   start)    cmd_start "$@" ;;
   stop)     cmd_stop "$@" ;;
   restart)  cmd_restart "$@" ;;
