@@ -146,6 +146,52 @@ func TestFileWAL(t *testing.T) {
 		}
 	})
 
+	t.Run("recover: VERSION_DELETE_MARK without complete is pending", func(t *testing.T) {
+		path := tempWALPath(t)
+		w := mustOpenFileWAL(t, path)
+		if err := w.WriteVersionDeleteMark(ctx, "kb1", 7); err != nil {
+			t.Fatalf("WriteVersionDeleteMark: %v", err)
+		}
+		// Idempotent re-write must not duplicate.
+		if err := w.WriteVersionDeleteMark(ctx, "kb1", 7); err != nil {
+			t.Fatalf("WriteVersionDeleteMark (idempotent): %v", err)
+		}
+		mustCloseFileWAL(t, w)
+
+		w2 := mustOpenFileWAL(t, path)
+		defer mustCloseFileWAL(t, w2)
+		pending, err := w2.Recover(ctx)
+		if err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		if len(pending) != 1 || pending[0].Type != types.PendingRecordTypeVersionDelete ||
+			pending[0].KBID != "kb1" || pending[0].VersionID != 7 {
+			t.Fatalf("Recover() = %v, want [{VersionDelete, kb1, 7}]", pending)
+		}
+	})
+
+	t.Run("recover: VERSION_DELETE_MARK + COMPLETE has nothing pending", func(t *testing.T) {
+		path := tempWALPath(t)
+		w := mustOpenFileWAL(t, path)
+		if err := w.WriteVersionDeleteMark(ctx, "kb1", 7); err != nil {
+			t.Fatalf("WriteVersionDeleteMark: %v", err)
+		}
+		if err := w.WriteVersionDeleteComplete(ctx, "kb1", 7); err != nil {
+			t.Fatalf("WriteVersionDeleteComplete: %v", err)
+		}
+		mustCloseFileWAL(t, w)
+
+		w2 := mustOpenFileWAL(t, path)
+		defer mustCloseFileWAL(t, w2)
+		pending, err := w2.Recover(ctx)
+		if err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		if len(pending) != 0 {
+			t.Fatalf("Recover() = %v, want empty", pending)
+		}
+	})
+
 	t.Run("replay counter accumulates", func(t *testing.T) {
 		w := newTestFileWAL(t)
 		rec := types.PendingRecord{Type: types.PendingRecordTypeDeleteMark, KBID: "kb1"}

@@ -72,6 +72,14 @@ type WAL interface {
 	// kbID has finished.
 	WriteDeleteComplete(ctx context.Context, kbID string) error
 
+	// WriteVersionDeleteMark records that a DeleteVersion flow has started
+	// for versionID within kbID. Idempotent per versionID.
+	WriteVersionDeleteMark(ctx context.Context, kbID string, versionID int64) error
+
+	// WriteVersionDeleteComplete records that the DeleteVersion cleanup
+	// for versionID has finished. Idempotent per versionID.
+	WriteVersionDeleteComplete(ctx context.Context, kbID string, versionID int64) error
+
 	// Recover scans the WAL at startup and returns every PendingRecord
 	// requiring crash-recovery handling. An empty slice means there is
 	// nothing to recover.

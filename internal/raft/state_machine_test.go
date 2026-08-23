@@ -312,6 +312,8 @@ func TestCommandEncodeDecode_RoundTrip(t *testing.T) {
 		{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: 3},
 		{Type: cmdUpdateVersionStatus, VersionID: 5, Status: types.IndexStatusFailed},
 		{Type: cmdRollback, KBID: "kb-1", TargetVersionID: 2},
+		{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: 4},
+		{Type: cmdRemoveVersionMeta, KBID: "kb-1", VersionID: 4},
 	}
 	for _, c := range cases {
 		data, err := encodeCommand(c)
@@ -360,5 +362,241 @@ func TestStateMachine_Apply_UpdateVersionSummary(t *testing.T) {
 	res = sm.apply(ctx, command{Type: cmdUpdateVersionSummary, VersionID: 999, DocIDSetHash: "x"}, w, zap.NewNop())
 	if !errors.Is(res.Err, stratumerrors.ErrVersionNotFound) {
 		t.Errorf("expected ErrVersionNotFound, got %v", res.Err)
+	}
+}
+
+// TestStateMachine_Apply_MarkVersionDeleting covers the basic DeleteVersion
+// constraint checks: active versions and PENDING versions (in the whole
+// recursive subtree) are rejected.
+func TestStateMachine_Apply_MarkVersionDeleting(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := context.Background()
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
+
+	// v1: active (set via Rollback below), READY.
+	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
+	// v2: child of v1, READY.
+	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+
+	// Active version must be rejected.
+	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v1.VersionID}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionIsActive) {
+		t.Errorf("expected ErrVersionIsActive for active v%d, got %v", v1.VersionID, res.Err)
+	}
+	if sm.versions[v1.VersionID].Deleting {
+		t.Error("active version must not be marked Deleting")
+	}
+
+	// Non-active version marks fine; v1 stays untouched.
+	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
+	if res.Err != nil {
+		t.Fatalf("MarkVersionDeleting(v%d): %v", v2.VersionID, res.Err)
+	}
+	if !sm.versions[v2.VersionID].Deleting {
+		t.Error("v2 should be marked Deleting")
+	}
+	if sm.versions[v1.VersionID].Deleting {
+		t.Error("v1 must not be marked Deleting")
+	}
+
+	// Idempotent re-mark succeeds.
+	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
+	if res.Err != nil {
+		t.Errorf("re-mark of Deleting version should be idempotent, got %v", res.Err)
+	}
+
+	// Unknown version / cross-KB version.
+	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: 999}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionNotFound) {
+		t.Errorf("expected ErrVersionNotFound, got %v", res.Err)
+	}
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-2"))}, w, zap.NewNop())
+	other := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2"}, w, zap.NewNop())
+	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: other.VersionID}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionNotFound) {
+		t.Errorf("expected ErrVersionNotFound for cross-KB version, got %v", res.Err)
+	}
+}
+
+// TestStateMachine_Apply_MarkVersionDeleting_Recursive covers the recursive
+// subtree semantics: deleting a version marks all descendants too, and a
+// PENDING or active version anywhere in the subtree rejects the whole
+// deletion.
+func TestStateMachine_Apply_MarkVersionDeleting_Recursive(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := context.Background()
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
+
+	// Chain v1 -> v2 -> v3, all READY; v1 active.
+	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	v3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
+
+	// Delete v2: v2 and v3 both marked; v1 untouched.
+	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
+	if res.Err != nil {
+		t.Fatalf("MarkVersionDeleting(v%d): %v", v2.VersionID, res.Err)
+	}
+	if !sm.versions[v2.VersionID].Deleting || !sm.versions[v3.VersionID].Deleting {
+		t.Errorf("expected v%d and v%d Deleting, got v2=%v v3=%v", v2.VersionID, v3.VersionID, sm.versions[v2.VersionID].Deleting, sm.versions[v3.VersionID].Deleting)
+	}
+	if sm.versions[v1.VersionID].Deleting {
+		t.Error("v1 must not be marked Deleting")
+	}
+
+	// New tree where the subtree contains the active version: rejected
+	// wholesale. v4 -> v5, v5 active.
+	v4 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v4.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	v5 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v4.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v5.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v5.VersionID}, w, zap.NewNop())
+
+	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v4.VersionID}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionIsActive) {
+		t.Errorf("expected ErrVersionIsActive for subtree containing active v%d, got %v", v5.VersionID, res.Err)
+	}
+	if sm.versions[v4.VersionID].Deleting || sm.versions[v5.VersionID].Deleting {
+		t.Error("rejected deletion must not mark any version")
+	}
+
+	// PENDING version anywhere in the subtree rejects the whole deletion.
+	// v6 -> v7 (v7 stays PENDING), v1 active again.
+	v6 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v6.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	v7 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v6.VersionID}, w, zap.NewNop()) // stays PENDING
+	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
+
+	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v6.VersionID}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionPending) {
+		t.Errorf("expected ErrVersionPending for subtree containing pending v%d, got %v", v7.VersionID, res.Err)
+	}
+	if sm.versions[v6.VersionID].Deleting || sm.versions[v7.VersionID].Deleting {
+		t.Error("rejected deletion must not mark any version")
+	}
+}
+
+// TestStateMachine_Apply_RemoveVersionMeta covers single-version metadata
+// removal and its idempotency.
+func TestStateMachine_Apply_RemoveVersionMeta(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := context.Background()
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
+	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+
+	res := sm.apply(ctx, command{Type: cmdRemoveVersionMeta, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
+	if res.Err != nil {
+		t.Fatalf("RemoveVersionMeta(v%d): %v", v2.VersionID, res.Err)
+	}
+	if _, ok := sm.versions[v2.VersionID]; ok {
+		t.Error("v2 metadata should be gone")
+	}
+	if len(sm.versionsByKB["kb-1"]) != 1 || sm.versionsByKB["kb-1"][0] != v1.VersionID {
+		t.Errorf("versionsByKB = %v, want [v%d]", sm.versionsByKB["kb-1"], v1.VersionID)
+	}
+
+	// Idempotent: removing an already-removed version succeeds.
+	res = sm.apply(ctx, command{Type: cmdRemoveVersionMeta, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
+	if res.Err != nil {
+		t.Errorf("re-remove should be idempotent, got %v", res.Err)
+	}
+
+	// Unknown version succeeds (idempotent); cross-KB is rejected.
+	res = sm.apply(ctx, command{Type: cmdRemoveVersionMeta, KBID: "kb-1", VersionID: 999}, w, zap.NewNop())
+	if res.Err != nil {
+		t.Errorf("remove of absent version should be idempotent, got %v", res.Err)
+	}
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-2"))}, w, zap.NewNop())
+	other := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2"}, w, zap.NewNop())
+	res = sm.apply(ctx, command{Type: cmdRemoveVersionMeta, KBID: "kb-1", VersionID: other.VersionID}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionNotFound) {
+		t.Errorf("expected ErrVersionNotFound for cross-KB version, got %v", res.Err)
+	}
+}
+
+// TestStateMachine_Apply_Rollback_RejectsDeleting ensures a Deleting version
+// cannot become active again.
+func TestStateMachine_Apply_Rollback_RejectsDeleting(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := context.Background()
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
+	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
+	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
+
+	res := sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v2.VersionID}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionDeleting) {
+		t.Errorf("expected ErrVersionDeleting, got %v", res.Err)
+	}
+	if sm.kbs["kb-1"].ActiveVersionID != v1.VersionID {
+		t.Errorf("active version must stay v%d, got %d", v1.VersionID, sm.kbs["kb-1"].ActiveVersionID)
+	}
+}
+
+// TestStateMachine_Apply_CreateVersion_RejectsDeletingParent ensures a
+// Deleting version cannot become a parent.
+func TestStateMachine_Apply_CreateVersion_RejectsDeletingParent(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := context.Background()
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
+	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
+	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
+
+	res := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrInvalidParentVersion) {
+		t.Errorf("expected ErrInvalidParentVersion for Deleting parent, got %v", res.Err)
+	}
+}
+
+// TestStateMachine_Apply_MarkVersionDeleting_AncestorOfActive pins down the
+// ancestor protection: the active version's parent (and any ancestor) can
+// never be deleted, because its recursive subtree contains the active
+// version. Chain v1 -> v2 -> v3 with v3 active.
+func TestStateMachine_Apply_MarkVersionDeleting_AncestorOfActive(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := context.Background()
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
+
+	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	v3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v3.VersionID}, w, zap.NewNop())
+
+	// Parent of the active version: rejected.
+	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionIsActive) {
+		t.Errorf("delete parent of active: expected ErrVersionIsActive, got %v", res.Err)
+	}
+
+	// Grandparent of the active version: rejected too.
+	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v1.VersionID}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionIsActive) {
+		t.Errorf("delete grandparent of active: expected ErrVersionIsActive, got %v", res.Err)
+	}
+
+	// Nothing may have been marked Deleting by the rejected attempts.
+	for _, vid := range []int64{v1.VersionID, v2.VersionID, v3.VersionID} {
+		if sm.versions[vid].Deleting {
+			t.Errorf("v%d must not be marked Deleting after rejected attempts", vid)
+		}
 	}
 }

@@ -196,9 +196,99 @@ func (r *MockRaftNode) ProposeRollback(_ context.Context, kbID string, targetVer
 	if !ok || v.KBID != kbID {
 		return stratumerrors.ErrVersionNotFound
 	}
+	if v.Deleting {
+		return stratumerrors.ErrVersionDeleting
+	}
 	kb.ActiveVersionID = targetVersionID
 	r.kbs[kbID] = kb
 	return nil
+}
+
+// ProposeMarkVersionDeleting implements RaftNode, mirroring the real state
+// machine's constraint checks: the version must exist and belong to kbID,
+// and the whole recursive subtree (version + descendants) must not contain
+// the active version or any PENDING version. Idempotent for an already
+// Deleting subtree.
+func (r *MockRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.kbs[kbID]; !ok {
+		return stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	root, ok := r.versions[versionID]
+	if !ok {
+		return stratumerrors.ErrVersionNotFound
+	}
+	if root.KBID != kbID {
+		return stratumerrors.ErrVersionNotFound
+	}
+	subtree := r.mockVersionSubtree(kbID, versionID)
+	for _, id := range subtree {
+		if r.kbs[kbID].ActiveVersionID == id {
+			return stratumerrors.ErrVersionIsActive
+		}
+		if r.versions[id].IndexStatus == types.IndexStatusPending {
+			return stratumerrors.ErrVersionPending
+		}
+	}
+	for _, id := range subtree {
+		v := r.versions[id]
+		v.Deleting = true
+		r.versions[id] = v
+	}
+	return nil
+}
+
+// ProposeRemoveVersionMeta implements RaftNode: removes a single version's
+// metadata. Idempotent — an already-absent version succeeds, mirroring the
+// real apply path so the delete flow's crash-recovery re-execution is safe.
+func (r *MockRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.versions[versionID]
+	if !ok {
+		return nil
+	}
+	if v.KBID != kbID {
+		return stratumerrors.ErrVersionNotFound
+	}
+	delete(r.versions, versionID)
+	list := r.versionsByKB[kbID]
+	for i, id := range list {
+		if id == versionID {
+			r.versionsByKB[kbID] = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+// mockVersionSubtree returns rootID plus every descendant of rootID within
+// kbID (following ParentVersionID edges), mirroring the state machine's
+// collectVersionSubtree.
+func (r *MockRaftNode) mockVersionSubtree(kbID string, rootID int64) []int64 {
+	visited := make(map[int64]bool)
+	queue := []int64{rootID}
+	var out []int64
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if visited[id] {
+			continue
+		}
+		visited[id] = true
+		out = append(out, id)
+		for _, candidate := range r.versionsByKB[kbID] {
+			if candidate == id {
+				continue
+			}
+			child, ok := r.versions[candidate]
+			if ok && child.ParentVersionID == id && !visited[candidate] {
+				queue = append(queue, candidate)
+			}
+		}
+	}
+	return out
 }
 
 func (r *MockRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {

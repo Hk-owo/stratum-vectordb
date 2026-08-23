@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/bloom"
@@ -35,9 +37,9 @@ import (
 // testCluster bundles all the wired-up dependencies for an in-process
 // Stratum node, and exposes gRPC clients for each service.
 type testCluster struct {
-	t      testing.TB
-	srv    *grpc.Server
-	lis    net.Listener
+	t   testing.TB
+	srv *grpc.Server
+	lis net.Listener
 
 	KBClient    pb.KnowledgeBaseServiceClient
 	QueryClient pb.QueryServiceClient
@@ -111,7 +113,15 @@ func newTestCluster(t testing.TB) *testCluster {
 		VersionDocList:      vd,
 	})
 
-	kbSvc := service.NewKnowledgeBaseService(rn, wc, dc)
+	kbSvc := service.NewKnowledgeBaseService(rn, wc, dc, coordinator.NewDeleteVersionCoordinatorImpl(coordinator.DeleteVersionCoordinatorConfig{
+		MaxRetries:          2,
+		RetryBaseIntervalMS: 10,
+		WAL:                 w,
+		RaftNode:            rn,
+		IndexManager:        im,
+		DocStore:            ds,
+		VersionDocList:      vd,
+	}))
 	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, versionBF)
 	adminSvc := service.NewAdminService(1, rn, im, ds, cs, w)
 
@@ -295,7 +305,7 @@ func TestIntegration_RollbackVersion(t *testing.T) {
 
 	// Rollback to version 1.
 	_, err = cluster.KBClient.RollbackVersion(ctx, &pb.RollbackVersionRequest{
-		KnowledgeBaseId:  kbID,
+		KnowledgeBaseId: kbID,
 		TargetVersionId: 1,
 	})
 	if err != nil {
@@ -342,6 +352,135 @@ func TestIntegration_DeleteKnowledgeBase(t *testing.T) {
 	_, err = cluster.RaftNode.GetKB(ctx, createResp.KnowledgeBaseId)
 	if err == nil {
 		t.Error("expected error fetching deleted KB, got nil")
+	}
+}
+
+// TestIntegration_DeleteVersion covers the end-to-end DeleteVersion flow:
+// active-version rejection, recursive subtree deletion, and physical data
+// cleanup in VersionDocList / DocStore.
+func TestIntegration_DeleteVersion(t *testing.T) {
+	cluster := newTestCluster(t)
+	defer cluster.Close()
+	ctx := context.Background()
+
+	createResp, err := cluster.KBClient.CreateKnowledgeBase(ctx, &pb.CreateKnowledgeBaseRequest{
+		Name:             "test-kb",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig: &pb.EmbedConfig{
+			ServiceAddr: "mock:8080",
+			ModelId:     "m1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateKnowledgeBase failed: %v", err)
+	}
+	kbID := createResp.KnowledgeBaseId
+	v1 := createResp.InitialVersionId
+
+	// Build a chain v1 -> v2 -> v3, each READY (bypassing async index
+	// build by setting status directly, like the other integration tests).
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady)
+
+	v2Resp, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
+		KnowledgeBaseId: kbID,
+		ParentVersionId: v1,
+		Changes: []*pb.DocChange{
+			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-a", Content: "alpha"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVersion(v2): %v", err)
+	}
+	v2 := v2Resp.VersionId
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady)
+
+	v3Resp, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
+		KnowledgeBaseId: kbID,
+		ParentVersionId: v2,
+		Changes: []*pb.DocChange{
+			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-b", Content: "beta"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVersion(v3): %v", err)
+	}
+	v3 := v3Resp.VersionId
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady)
+
+	// Deleting the active version is rejected.
+	_, err = cluster.KBClient.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v1,
+	})
+	if err == nil {
+		t.Fatal("expected error deleting the active version")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("active-delete error code = %v, want FailedPrecondition", status.Code(err))
+	}
+
+	// Deleting v2 must recursively remove v2 AND v3; v1 stays.
+	if _, err := cluster.KBClient.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v2,
+	}); err != nil {
+		t.Fatalf("DeleteVersion(v%d): %v", v2, err)
+	}
+
+	// Wait for the async cleanup to converge.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		versions, err := cluster.RaftNode.ListVersions(ctx, kbID)
+		if err == nil && len(versions) == 1 && versions[0].VersionID == v1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delete did not converge: versions = %+v", versions)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Raft metadata: only v1 remains, still active.
+	kb, err := cluster.RaftNode.GetKB(ctx, kbID)
+	if err != nil {
+		t.Fatalf("GetKB: %v", err)
+	}
+	if kb.ActiveVersionID != v1 {
+		t.Errorf("active version = %d, want %d", kb.ActiveVersionID, v1)
+	}
+
+	// VersionDocList: v2/v3 document sets physically removed.
+	for _, vid := range []int64{v2, v3} {
+		docs, err := cluster.VersionDocs.ListDocIDs(ctx, kbID, vid)
+		if err != nil {
+			t.Fatalf("ListDocIDs(v%d): %v", vid, err)
+		}
+		if len(docs) != 0 {
+			t.Errorf("VersionDocList for v%d = %v, want empty", vid, docs)
+		}
+	}
+
+	// DocStore: v2/v3 records physically gone. doc-a was only ever written
+	// at v2 and doc-b only at v3, so reads at any version must now fail —
+	// proving the MVCC records were physically removed, not just hidden.
+	if _, err := cluster.DocStore.ReadAt(ctx, kbID, "doc-a", v2); err == nil {
+		t.Error("doc-a@v2 should be gone after DeleteByVersion")
+	}
+	if _, err := cluster.DocStore.ReadAt(ctx, kbID, "doc-b", v3); err == nil {
+		t.Error("doc-b@v3 should be gone after DeleteByVersion")
+	}
+	if _, err := cluster.DocStore.ReadAt(ctx, kbID, "doc-a", 1<<30); err == nil {
+		t.Error("doc-a@any-version should be gone after deleting v2 (its only record)")
+	}
+
+	// Deleting a nonexistent version is rejected.
+	_, err = cluster.KBClient.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       999,
+	})
+	if err == nil {
+		t.Error("expected error deleting nonexistent version")
 	}
 }
 

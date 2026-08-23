@@ -12,6 +12,7 @@
      GET  /api/knowledge-bases/{id}/versions
      POST /api/knowledge-bases/{id}/versions
      POST /api/knowledge-bases/{id}/rollback
+     POST /api/knowledge-bases/{id}/delete-version
      POST /api/knowledge-bases/{id}/rebuild
      POST /api/knowledge-bases/{id}/warmup
      POST /api/query
@@ -227,6 +228,7 @@ async function pollSystemStatus() {
     $('res-doc-bytes').textContent = fmtBytes(ru.doc_store_bytes);
 
     renderStuck(s.stuck_versions || []);
+    renderDeletingVersions(s.deleting_versions || []);
     renderDeleteFailed(s.delete_failed_kbs || []);
     renderWAL(s.wal_alerts || []);
   } catch (e) {
@@ -239,6 +241,13 @@ function renderStuck(list) {
   if (!list.length) return emptyList(el);
   el.innerHTML = list.map(v =>
     `<li>${v.kb_id} / v${v.version_id} ${badge((INDEX_STATUS[v.index_status] || {}).cls || 'gray', (INDEX_STATUS[v.index_status] || {}).label || v.index_status)}
+     <span class="muted">${fmtTime(v.updated_at)}</span></li>`).join('');
+}
+function renderDeletingVersions(list) {
+  const el = $('deleting-versions');
+  if (!list.length) return emptyList(el);
+  el.innerHTML = list.map(v =>
+    `<li>${v.kb_id} / v${v.version_id} ${badge('yellow', '删除中')}
      <span class="muted">${fmtTime(v.updated_at)}</span></li>`).join('');
 }
 function renderDeleteFailed(list) {
@@ -411,17 +420,31 @@ function renderVersions(versions) {
   const walk = (v, depth) => {
     const st = INDEX_STATUS[v.index_status] || { label: v.index_status, cls: 'gray' };
     const actions = [];
-    if (v.index_status === 'INDEX_STATUS_READY') {
-      actions.push(`<button class="btn btn-ghost" data-act="rollback" data-v="${v.version_id}">回滚</button>`);
-      actions.push(`<button class="btn btn-ghost" data-act="warmup" data-v="${v.version_id}">预热</button>`);
-    }
-    if (v.index_status === 'INDEX_STATUS_FAILED') {
-      actions.push(`<button class="btn btn-ghost" data-act="rebuild" data-v="${v.version_id}">重建索引</button>`);
+    // 删除中：异步清理尚未完成，除刷新外无操作可用。
+    if (v.deleting) {
+      actions.push(`<button class="btn btn-ghost" disabled title="删除清理进行中…">删除中…</button>`);
+    } else {
+      if (v.index_status === 'INDEX_STATUS_READY') {
+        actions.push(`<button class="btn btn-ghost" data-act="rollback" data-v="${v.version_id}">回滚</button>`);
+        actions.push(`<button class="btn btn-ghost" data-act="warmup" data-v="${v.version_id}">预热</button>`);
+      }
+      if (v.index_status === 'INDEX_STATUS_FAILED') {
+        actions.push(`<button class="btn btn-ghost" data-act="rebuild" data-v="${v.version_id}">重建索引</button>`);
+      }
+      // 删除版本：活跃版本不可删除（后端也会拒绝），禁用并提示；其余版本
+      // 可删，会递归删除其全部子版本，需确认弹窗。
+      if (v.version_id === active) {
+        actions.push(`<button class="btn btn-ghost" disabled title="活跃版本不可删除，请先回滚到其他版本">删除</button>`);
+      } else {
+        actions.push(`<button class="btn btn-danger" data-act="delete" data-v="${v.version_id}">删除</button>`);
+      }
     }
     const activeTag = v.version_id === active ? '<span class="muted">（活跃）</span>' : '';
+    const deletingTag = v.deleting ? badge('yellow', '删除中') : '';
     rows.push(`<div class="version-node ${v.version_id === active ? 'active' : ''}" style="margin-left:${depth * 26}px">
       <span class="tree-corner">${depth > 0 ? '└─' : ''}</span>
       ${badge(st.cls, st.label)}
+      ${deletingTag}
       <strong>v${v.version_id}</strong>
       <span class="local-no">本库 #${localNo[String(v.version_id)]}</span>
       <span class="meta">父 v${v.parent_version_id} · ${fmtTime(v.created_at)} ${activeTag}</span>
@@ -440,6 +463,7 @@ function renderVersions(versions) {
       if (act === 'rollback') rollback(vid);
       else if (act === 'rebuild') rebuild(vid);
       else if (act === 'warmup') warmup(vid);
+      else if (act === 'delete') deleteVersion(vid);
     });
   });
 }
@@ -481,6 +505,26 @@ async function warmup(versionId) {
     warmupWatchVersion = Number(versionId);
     setTimeout(loadVersions, 1000);
   } catch (e) { toast('预热失败：' + e.message); }
+}
+
+async function deleteVersion(versionId) {
+  // 删除不可撤销（递归删除该版本及其全部子版本），必须二次确认。
+  showConfirm(
+    `删除版本 v${versionId}？`,
+    `将删除 v${versionId} 及其所有子版本，不可撤销；删除后无法再回滚到该版本。`,
+    {
+      okText: '删除',
+      onConfirm: async () => {
+        try {
+          await api(`/knowledge-bases/${encodeURIComponent(currentKB.id)}/delete-version`, {
+            method: 'POST', body: { version_id: Number(versionId) },
+          });
+          toast(`已开始删除 v${versionId}（异步清理，完成后将从列表消失）`);
+          selectKB(currentKB.id);
+        } catch (e) { toast('删除失败：' + e.message); }
+      },
+    }
+  );
 }
 
 $('create-kb-form').addEventListener('submit', async (e) => {

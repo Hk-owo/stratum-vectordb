@@ -213,6 +213,81 @@ func newTestPebbleDocStore(t *testing.T) *PebbleDocStore {
 	return s
 }
 
+// TestPebbleDocStore_DeleteByVersion covers the per-version physical
+// cleanup used by the DeleteVersion flow: only the matching version's
+// entries are removed, other versions and other knowledge bases survive,
+// and re-deletion is a no-op.
+func TestPebbleDocStore_DeleteByVersion(t *testing.T) {
+	ctx := context.Background()
+	s := newTestPebbleDocStore(t)
+
+	// kb1/doc1: versions 1, 2, 3; kb1/doc2: versions 1, 2; kb2/doc1: version 1.
+	mustWritePebble(t, s, "kb1", "doc1", 1, "v1")
+	mustWritePebble(t, s, "kb1", "doc1", 2, "v2")
+	mustWritePebble(t, s, "kb1", "doc1", 3, "v3")
+	mustWritePebble(t, s, "kb1", "doc2", 1, "d2-v1")
+	mustWritePebble(t, s, "kb1", "doc2", 2, "d2-v2")
+	mustWritePebble(t, s, "kb2", "doc1", 1, "other-kb")
+
+	if err := s.DeleteByVersion(ctx, "kb1", 2); err != nil {
+		t.Fatalf("DeleteByVersion(kb1, 2): %v", err)
+	}
+
+	// doc1: version 2 gone; 1 and 3 still readable at their own versions.
+	for v, want := range map[int64]string{1: "v1", 3: "v3"} {
+		got, err := s.ReadAt(ctx, "kb1", "doc1", v)
+		if err != nil {
+			t.Fatalf("ReadAt(doc1, %d) after delete: %v", v, err)
+		}
+		if string(got) != want {
+			t.Errorf("ReadAt(doc1, %d) = %q, want %q", v, got, want)
+		}
+	}
+	// doc1 at maxV=2 now falls back to version 1 (the largest remaining <= 2).
+	got, err := s.ReadAt(ctx, "kb1", "doc1", 2)
+	if err != nil {
+		t.Fatalf("ReadAt(doc1, 2) after delete: %v", err)
+	}
+	if string(got) != "v1" {
+		t.Errorf("ReadAt(doc1, 2) = %q, want fallback %q", got, "v1")
+	}
+
+	// doc2: version 2 gone, version 1 remains.
+	got, err = s.ReadAt(ctx, "kb1", "doc2", 2)
+	if err != nil {
+		t.Fatalf("ReadAt(doc2, 2) after delete: %v", err)
+	}
+	if string(got) != "d2-v1" {
+		t.Errorf("ReadAt(doc2, 2) = %q, want %q", got, "d2-v1")
+	}
+
+	// Other knowledge base untouched.
+	got, err = s.ReadAt(ctx, "kb2", "doc1", 1)
+	if err != nil {
+		t.Fatalf("ReadAt(kb2, doc1, 1): %v", err)
+	}
+	if string(got) != "other-kb" {
+		t.Errorf("ReadAt(kb2) = %q, want %q", got, "other-kb")
+	}
+
+	// Idempotent: deleting the same version again is a no-op.
+	if err := s.DeleteByVersion(ctx, "kb1", 2); err != nil {
+		t.Fatalf("second DeleteByVersion(kb1, 2): %v", err)
+	}
+
+	// Deleting a version that removes a document's last entry clears it
+	// entirely (tombstones included).
+	if err := s.Write(ctx, "kb1", "doc3", 5, nil); err != nil { // tombstone only
+		t.Fatalf("Write tombstone: %v", err)
+	}
+	if err := s.DeleteByVersion(ctx, "kb1", 5); err != nil {
+		t.Fatalf("DeleteByVersion(kb1, 5): %v", err)
+	}
+	if _, err := s.ReadAt(ctx, "kb1", "doc3", 5); !errors.Is(err, stratumerrors.ErrVersionNotFound) {
+		t.Errorf("ReadAt(doc3, 5) after tombstone deletion err = %v, want ErrVersionNotFound", err)
+	}
+}
+
 func mustWritePebble(t *testing.T, s *PebbleDocStore, kbID, docID string, versionID int64, content string) {
 	t.Helper()
 	if err := s.Write(context.Background(), kbID, docID, versionID, []byte(content)); err != nil {

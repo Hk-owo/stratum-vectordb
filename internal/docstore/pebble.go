@@ -2,6 +2,7 @@ package docstore
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 
 	"github.com/cockroachdb/pebble"
@@ -179,6 +180,54 @@ func (s *PebbleDocStore) DeleteByKB(_ context.Context, kbID string) error {
 	}
 	if err := s.db.DeleteRange(prefix, upperBound, pebble.Sync); err != nil {
 		return fmt.Errorf("docstore: DeleteByKB(%s): %w", kbID, err)
+	}
+	return nil
+}
+
+// DeleteByVersion implements DocStore: removes every entry for (kbID,
+// versionID) across all documents. versionID sits at the END of the key
+// (kbID + docID + versionID), so unlike DeleteByKB this cannot be a single
+// prefix range delete — it prefix-scans kbID and batches up the keys whose
+// trailing versionID matches. O(keys in the knowledge base), acceptable for
+// the DeleteVersion cleanup path.
+func (s *PebbleDocStore) DeleteByVersion(_ context.Context, kbID string, versionID int64) error {
+	prefix := encodeKBPrefix(kbID)
+	upperBound := pebbleutil.PrefixSuccessor(prefix)
+	if upperBound == nil {
+		return fmt.Errorf("docstore: DeleteByVersion(%s,%d): prefix has no successor (unexpected)", kbID, versionID)
+	}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound})
+	if err != nil {
+		return fmt.Errorf("docstore: DeleteByVersion(%s,%d): new iterator: %w", kbID, versionID, err)
+	}
+	defer iter.Close()
+
+	// Collect matching keys first, then delete in a single batch: mutating
+	// the keyspace while iterating is not safe in PebbleDB.
+	var keys [][]byte
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := iter.Key()
+		if len(k) >= 8 && binary.BigEndian.Uint64(k[len(k)-8:]) == uint64(versionID) {
+			keys = append(keys, append([]byte(nil), k...))
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("docstore: DeleteByVersion(%s,%d): iterator error: %w", kbID, versionID, err)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	for _, k := range keys {
+		if err := batch.Delete(k, nil); err != nil {
+			return fmt.Errorf("docstore: DeleteByVersion(%s,%d): batch delete: %w", kbID, versionID, err)
+		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("docstore: DeleteByVersion(%s,%d): commit: %w", kbID, versionID, err)
 	}
 	return nil
 }

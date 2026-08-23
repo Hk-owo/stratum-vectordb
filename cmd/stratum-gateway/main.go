@@ -224,6 +224,13 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 			return g.admin.WarmupVersion(ctx, r)
 		},
 	))
+	mux.HandleFunc("POST /api/knowledge-bases/{id}/delete-version", handleWithID(
+		func() *pb.DeleteVersionRequest { return &pb.DeleteVersionRequest{} },
+		func(r *pb.DeleteVersionRequest, id string) { r.KnowledgeBaseId = id },
+		func(ctx context.Context, r *pb.DeleteVersionRequest) (*pb.DeleteVersionResponse, error) {
+			return g.kb.DeleteVersion(ctx, r)
+		},
+	))
 
 	// --- QueryService ---
 	mux.HandleFunc("POST /api/query", handle(

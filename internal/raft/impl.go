@@ -395,6 +395,24 @@ func (impl *RaftNodeImpl) ProposeRollback(ctx context.Context, kbID string, targ
 	return res.Err
 }
 
+// ProposeMarkVersionDeleting implements RaftNode.
+func (impl *RaftNodeImpl) ProposeMarkVersionDeleting(ctx context.Context, kbID string, versionID int64) error {
+	res, err := impl.proposeAndWait(ctx, command{Type: cmdMarkVersionDeleting, KBID: kbID, VersionID: versionID})
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
+// ProposeRemoveVersionMeta implements RaftNode.
+func (impl *RaftNodeImpl) ProposeRemoveVersionMeta(ctx context.Context, kbID string, versionID int64) error {
+	res, err := impl.proposeAndWait(ctx, command{Type: cmdRemoveVersionMeta, KBID: kbID, VersionID: versionID})
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
 func (impl *RaftNodeImpl) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
 	impl.sm.mu.RLock()
 	defer impl.sm.mu.RUnlock()

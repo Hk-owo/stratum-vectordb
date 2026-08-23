@@ -26,9 +26,10 @@ import (
 type KnowledgeBaseServiceImpl struct {
 	pb.UnimplementedKnowledgeBaseServiceServer
 
-	raftNode    raft.RaftNode
-	writeCoord  coordinator.WriteCoordinator
-	deleteCoord coordinator.DeleteCoordinator
+	raftNode           raft.RaftNode
+	writeCoord         coordinator.WriteCoordinator
+	deleteCoord        coordinator.DeleteCoordinator
+	deleteVersionCoord coordinator.DeleteVersionCoordinator
 }
 
 // NewKnowledgeBaseService constructs a KnowledgeBaseServiceImpl.
@@ -36,11 +37,13 @@ func NewKnowledgeBaseService(
 	rn raft.RaftNode,
 	wc coordinator.WriteCoordinator,
 	dc coordinator.DeleteCoordinator,
+	dvc coordinator.DeleteVersionCoordinator,
 ) *KnowledgeBaseServiceImpl {
 	return &KnowledgeBaseServiceImpl{
-		raftNode:    rn,
-		writeCoord:  wc,
-		deleteCoord: dc,
+		raftNode:           rn,
+		writeCoord:         wc,
+		deleteCoord:        dc,
+		deleteVersionCoord: dvc,
 	}
 }
 
@@ -160,6 +163,7 @@ func (s *KnowledgeBaseServiceImpl) ListVersions(ctx context.Context, req *pb.Lis
 			ParentVersionId: v.ParentVersionID,
 			CreatedAt:       v.CreatedAt,
 			IndexStatus:     pb.IndexStatus(v.IndexStatus),
+			Deleting:        v.Deleting,
 		}
 	}
 	return &pb.ListVersionsResponse{Versions: out}, nil
@@ -195,6 +199,30 @@ func (s *KnowledgeBaseServiceImpl) RollbackVersion(ctx context.Context, req *pb.
 	}
 
 	return &pb.RollbackVersionResponse{Success: true}, nil
+}
+
+// DeleteVersion implements KnowledgeBaseServiceServer.
+//
+// Marks the version (and, recursively, every descendant version) within
+// the knowledge base as Deleting, then launches the asynchronous cleanup
+// (index discard, VersionDocList / DocStore removal, metadata removal).
+// All constraint checks — the version exists and belongs to the KB, is not
+// the active version, and no version in the recursive subtree is PENDING —
+// are enforced deterministically in the Raft state machine's apply phase,
+// so this method performs no additional validation.
+func (s *KnowledgeBaseServiceImpl) DeleteVersion(ctx context.Context, req *pb.DeleteVersionRequest) (*pb.DeleteVersionResponse, error) {
+	if err := s.raftNode.ProposeMarkVersionDeleting(ctx, req.KnowledgeBaseId, req.VersionId); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+
+	// Launch async cleanup. The coordinator re-discovers every Deleting
+	// version of the KB (including any left over from a previous crashed
+	// cleanup) and is idempotent end-to-end.
+	go func() {
+		_ = s.deleteVersionCoord.Execute(context.Background(), req.KnowledgeBaseId)
+	}()
+
+	return &pb.DeleteVersionResponse{Success: true}, nil
 }
 
 // ListKnowledgeBases implements KnowledgeBaseServiceServer.

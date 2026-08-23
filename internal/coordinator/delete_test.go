@@ -6,8 +6,8 @@ import (
 	"sync"
 	"testing"
 
-	"stratum/internal/index"
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/index"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -24,7 +24,9 @@ func newDeleteTestRaftNode() *deleteTestRaftNode {
 	return &deleteTestRaftNode{}
 }
 
-func (r *deleteTestRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBaseMeta) error { return nil }
+func (r *deleteTestRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBaseMeta) error {
+	return nil
+}
 func (r *deleteTestRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64) (int64, error) {
 	return 0, nil
 }
@@ -50,11 +52,24 @@ func (r *deleteTestRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string)
 	r.removedMetadata = append(r.removedMetadata, kbID)
 	return nil
 }
-func (r *deleteTestRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error { return nil }
+func (r *deleteTestRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
+	return nil
+}
+func (r *deleteTestRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64) error {
+	return nil
+}
+func (r *deleteTestRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.removedMetadata = append(r.removedMetadata, kbID)
+	return nil
+}
 func (r *deleteTestRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
 	return types.KnowledgeBaseMeta{}, nil
 }
-func (r *deleteTestRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) { return nil, nil }
+func (r *deleteTestRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
+	return nil, nil
+}
 func (r *deleteTestRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
 	return nil, nil
 }
@@ -64,8 +79,8 @@ func (r *deleteTestRaftNode) GetClusterStatus(_ context.Context) (types.ClusterS
 
 // deleteTestDocStore tracks DeleteByKB calls.
 type deleteTestDocStore struct {
-	mu       sync.Mutex
-	deleted  []string
+	mu        sync.Mutex
+	deleted   []string
 	deleteErr error
 }
 
@@ -85,12 +100,21 @@ func (s *deleteTestDocStore) DeleteByKB(_ context.Context, kbID string) error {
 	s.deleted = append(s.deleted, kbID)
 	return nil
 }
+func (s *deleteTestDocStore) DeleteByVersion(_ context.Context, kbID string, versionID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	s.deleted = append(s.deleted, kbID)
+	return nil
+}
 func (s *deleteTestDocStore) DiskUsage(_ context.Context) (uint64, error) { return 0, nil }
 
 // deleteTestChunkStore tracks DeleteByKB calls.
 type deleteTestChunkStore struct {
-	mu       sync.Mutex
-	deleted  []string
+	mu        sync.Mutex
+	deleted   []string
 	deleteErr error
 }
 
@@ -98,8 +122,10 @@ func newDeleteTestChunkStore() *deleteTestChunkStore { return &deleteTestChunkSt
 func (s *deleteTestChunkStore) Write(_ context.Context, kbID, chunkID string, vector []float32) error {
 	return nil
 }
-func (s *deleteTestChunkStore) Exists(_ context.Context, kbID, chunkID string) (bool, error) { return false, nil }
-func (s *deleteTestChunkStore) Delete(_ context.Context, kbID, chunkID string) error         { return nil }
+func (s *deleteTestChunkStore) Exists(_ context.Context, kbID, chunkID string) (bool, error) {
+	return false, nil
+}
+func (s *deleteTestChunkStore) Delete(_ context.Context, kbID, chunkID string) error { return nil }
 func (s *deleteTestChunkStore) DeleteByKB(_ context.Context, kbID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -113,8 +139,8 @@ func (s *deleteTestChunkStore) DiskUsage(_ context.Context) (uint64, error) { re
 
 // deleteTestChunkDocMapper tracks DeleteByKB calls.
 type deleteTestChunkDocMapper struct {
-	mu       sync.Mutex
-	deleted  []string
+	mu        sync.Mutex
+	deleted   []string
 	deleteErr error
 }
 
@@ -128,7 +154,9 @@ func (m *deleteTestChunkDocMapper) ListDocIDs(_ context.Context, kbID, chunkID s
 func (m *deleteTestChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, docIDs []string) ([]string, error) {
 	return nil, nil
 }
-func (m *deleteTestChunkDocMapper) DeleteByDoc(_ context.Context, kbID, docID string) error { return nil }
+func (m *deleteTestChunkDocMapper) DeleteByDoc(_ context.Context, kbID, docID string) error {
+	return nil
+}
 func (m *deleteTestChunkDocMapper) DeleteByKB(_ context.Context, kbID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -141,8 +169,8 @@ func (m *deleteTestChunkDocMapper) DeleteByKB(_ context.Context, kbID string) er
 
 // deleteTestVersionDocList tracks DeleteByKB calls.
 type deleteTestVersionDocList struct {
-	mu       sync.Mutex
-	deleted  []string
+	mu        sync.Mutex
+	deleted   []string
 	deleteErr error
 }
 
@@ -166,20 +194,39 @@ func (v *deleteTestVersionDocList) DeleteByKB(_ context.Context, kbID string) er
 	return nil
 }
 
-// deleteTestIndexManager tracks EvictByKB calls.
+// deleteTestIndexManager tracks EvictByKB / Discard calls.
 type deleteTestIndexManager struct {
 	mu        sync.Mutex
 	evictedKB []string
 	evictErr  error
+	discarded []indexVersionKey
+}
+
+type indexVersionKey struct {
+	kbID      string
+	versionID int64
 }
 
 func newDeleteTestIndexManager() *deleteTestIndexManager { return &deleteTestIndexManager{} }
 func (im *deleteTestIndexManager) Search(_ context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) {
 	return nil, nil
 }
-func (im *deleteTestIndexManager) TriggerBuild(_ context.Context, kbID string, versionID int64) error { return nil }
+func (im *deleteTestIndexManager) TriggerBuild(_ context.Context, kbID string, versionID int64) error {
+	return nil
+}
 func (im *deleteTestIndexManager) RegisterBuildCallback(cb index.BuildCompleteCallback) {}
-func (im *deleteTestIndexManager) Evict(_ context.Context, kbID string, versionID int64) error       { return nil }
+func (im *deleteTestIndexManager) Evict(_ context.Context, kbID string, versionID int64) error {
+	return nil
+}
+func (im *deleteTestIndexManager) Discard(_ context.Context, kbID string, versionID int64) error {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	if im.evictErr != nil {
+		return im.evictErr
+	}
+	im.discarded = append(im.discarded, indexVersionKey{kbID: kbID, versionID: versionID})
+	return nil
+}
 func (im *deleteTestIndexManager) EvictByKB(_ context.Context, kbID string) error {
 	im.mu.Lock()
 	defer im.mu.Unlock()
@@ -190,7 +237,7 @@ func (im *deleteTestIndexManager) EvictByKB(_ context.Context, kbID string) erro
 	return nil
 }
 func (im *deleteTestIndexManager) Ping(_ context.Context) error { return nil }
-func (im *deleteTestIndexManager) LoadedCount() int               { return 0 }
+func (im *deleteTestIndexManager) LoadedCount() int             { return 0 }
 
 // === Tests ===
 

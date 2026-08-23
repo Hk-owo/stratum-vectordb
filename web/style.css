@@ -382,6 +382,8 @@ body {
 }
 .btn-primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
 .btn-primary:disabled { opacity: 0.55; cursor: wait; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn:disabled:hover { background: transparent; border-color: transparent; }
 .btn-danger { background: transparent; border-color: rgba(244, 67, 54, 0.45); color: #ff7066; }
 .btn-danger:hover { background: rgba(244, 67, 54, 0.12); border-color: var(--red); }
 .btn-ghost { border-color: transparent; background: transparent; color: var(--text-secondary); }

@@ -66,6 +66,7 @@ message VersionInfo {
   int64 parent_version_id = 2;
   int64 created_at = 3; // Unix timestamp, leader's local clock at apply time
   IndexStatus index_status = 4;
+  bool deleting = 5; // true while an asynchronous DeleteVersion cleanup is in progress
 }
 
 // KnowledgeBaseInfo is the console-facing metadata of a knowledge base,
@@ -88,6 +89,7 @@ service KnowledgeBaseService {
   rpc CreateVersion(CreateVersionRequest) returns (CreateVersionResponse);
   rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
   rpc RollbackVersion(RollbackVersionRequest) returns (RollbackVersionResponse);
+  rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse);
   rpc ListKnowledgeBases(ListKnowledgeBasesRequest) returns (ListKnowledgeBasesResponse);
   rpc GetKnowledgeBase(GetKnowledgeBaseRequest) returns (GetKnowledgeBaseResponse);
 }
@@ -134,6 +136,14 @@ message RollbackVersionRequest {
 }
 message RollbackVersionResponse {
   bool success = 1;
+}
+
+message DeleteVersionRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+}
+message DeleteVersionResponse {
+  bool success = 1; // returned immediately after marking the version (and its descendants) for deletion; cleanup runs asynchronously
 }
 
 message ListKnowledgeBasesRequest {}

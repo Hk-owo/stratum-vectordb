@@ -125,13 +125,118 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		if !ok || v.KBID != cmd.KBID {
 			return applyResult{Err: stratumerrors.ErrVersionNotFound}
 		}
+		if v.Deleting {
+			return applyResult{Err: fmt.Errorf("target version %d is being deleted: %w", cmd.TargetVersionID, stratumerrors.ErrVersionDeleting)}
+		}
 		kb.ActiveVersionID = cmd.TargetVersionID
 		sm.kbs[cmd.KBID] = kb
 		return applyResult{}
 
+	case cmdMarkVersionDeleting:
+		return sm.applyMarkVersionDeleting(cmd)
+
+	case cmdRemoveVersionMeta:
+		return sm.applyRemoveVersionMeta(cmd)
+
 	default:
 		return applyResult{Err: fmt.Errorf("raft: unknown command type %q", cmd.Type)}
 	}
+}
+
+// applyMarkVersionDeleting handles cmdMarkVersionDeleting: validates the
+// DeleteVersion constraints (version exists and belongs to kbID, is not the
+// active version, is not PENDING — for the whole recursive subtree), then
+// marks the version and every one of its descendants as Deleting.
+//
+// Constraints are evaluated against the state machine snapshot at apply
+// time, so the descendant set is deterministic across nodes regardless of
+// which node proposed the command. Idempotent: re-proposing for an
+// already-Deleting subtree passes validation and re-marks it (a no-op).
+func (sm *stateMachine) applyMarkVersionDeleting(cmd command) applyResult {
+	if _, ok := sm.kbs[cmd.KBID]; !ok {
+		return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
+	}
+	root, ok := sm.versions[cmd.VersionID]
+	if !ok {
+		return applyResult{Err: stratumerrors.ErrVersionNotFound}
+	}
+	if root.KBID != cmd.KBID {
+		return applyResult{Err: fmt.Errorf("version %d belongs to a different knowledge base: %w", cmd.VersionID, stratumerrors.ErrVersionNotFound)}
+	}
+
+	subtree := sm.collectVersionSubtree(cmd.KBID, cmd.VersionID)
+
+	// Validate the entire subtree before marking anything: a partial mark
+	// followed by a rejection would leave the tree half-deleting.
+	for _, versionID := range subtree {
+		v := sm.versions[versionID]
+		if sm.kbs[cmd.KBID].ActiveVersionID == versionID {
+			return applyResult{Err: fmt.Errorf("version %d is the active version of %s: %w", versionID, cmd.KBID, stratumerrors.ErrVersionIsActive)}
+		}
+		if v.IndexStatus == types.IndexStatusPending {
+			return applyResult{Err: fmt.Errorf("version %d is PENDING: %w", versionID, stratumerrors.ErrVersionPending)}
+		}
+	}
+
+	for _, versionID := range subtree {
+		v := sm.versions[versionID]
+		v.Deleting = true
+		sm.versions[versionID] = v
+	}
+	return applyResult{}
+}
+
+// applyRemoveVersionMeta handles cmdRemoveVersionMeta: removes a single
+// version's metadata from the state machine. Idempotent: deleting an
+// already-absent version succeeds, mirroring cmdRemoveKBMeta's
+// crash-recovery semantics.
+func (sm *stateMachine) applyRemoveVersionMeta(cmd command) applyResult {
+	v, ok := sm.versions[cmd.VersionID]
+	if !ok {
+		return applyResult{} // idempotent
+	}
+	if v.KBID != cmd.KBID {
+		return applyResult{Err: fmt.Errorf("version %d belongs to a different knowledge base: %w", cmd.VersionID, stratumerrors.ErrVersionNotFound)}
+	}
+	delete(sm.versions, cmd.VersionID)
+	list := sm.versionsByKB[cmd.KBID]
+	for i, id := range list {
+		if id == cmd.VersionID {
+			sm.versionsByKB[cmd.KBID] = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	return applyResult{}
+}
+
+// collectVersionSubtree returns rootID plus every descendant of rootID
+// within kbID (following ParentVersionID edges), in an unspecified order.
+// Deterministic given the state machine contents; used by both the
+// mark-deleting and metadata-removal paths so leader and followers agree on
+// the deleted set.
+func (sm *stateMachine) collectVersionSubtree(kbID string, rootID int64) []int64 {
+	visited := make(map[int64]bool)
+	queue := []int64{rootID}
+	var out []int64
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if visited[id] {
+			continue
+		}
+		visited[id] = true
+		out = append(out, id)
+		for _, candidate := range sm.versionsByKB[kbID] {
+			if candidate == id {
+				continue
+			}
+			child, ok := sm.versions[candidate]
+			if ok && child.ParentVersionID == id && !visited[candidate] {
+				queue = append(queue, candidate)
+			}
+		}
+	}
+	return out
 }
 
 // applyCreateVersion handles cmdCreateVersion: validates the parent-version
@@ -155,6 +260,9 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 		}
 		if parent.IndexStatus == types.IndexStatusPending {
 			return applyResult{Err: fmt.Errorf("parent version %d is PENDING: %w", cmd.ParentVersionID, stratumerrors.ErrInvalidParentVersion)}
+		}
+		if parent.Deleting {
+			return applyResult{Err: fmt.Errorf("parent version %d is being deleted: %w", cmd.ParentVersionID, stratumerrors.ErrInvalidParentVersion)}
 		}
 	}
 

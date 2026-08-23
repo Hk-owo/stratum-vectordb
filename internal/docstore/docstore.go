@@ -39,6 +39,13 @@ type DocStore interface {
 	// idempotent.
 	DeleteByKB(ctx context.Context, kbID string) error
 
+	// DeleteByVersion removes every entry for (kbID, versionID) across all
+	// documents. Used by the DeleteVersion cleanup to physically reclaim
+	// the version's MVCC records. The version ID sits at the end of the
+	// key, so this requires a full scan of kbID's keyspace (O(keys in the
+	// knowledge base)); idempotent.
+	DeleteByVersion(ctx context.Context, kbID string, versionID int64) error
+
 	// DiskUsage returns the approximate on-disk size in bytes of the store.
 	// Used by GetSystemStatus's resource-usage snapshot.
 	DiskUsage(ctx context.Context) (uint64, error)

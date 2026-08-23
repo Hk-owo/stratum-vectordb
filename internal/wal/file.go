@@ -21,11 +21,13 @@ import (
 type recordType byte
 
 const (
-	recordTypeBegin          recordType = 0x01
-	recordTypeVersionID      recordType = 0x02
-	recordTypeCommit         recordType = 0x03
-	recordTypeDeleteMark     recordType = 0x04
-	recordTypeDeleteComplete recordType = 0x05
+	recordTypeBegin                 recordType = 0x01
+	recordTypeVersionID             recordType = 0x02
+	recordTypeCommit                recordType = 0x03
+	recordTypeDeleteMark            recordType = 0x04
+	recordTypeDeleteComplete        recordType = 0x05
+	recordTypeVersionDeleteMark     recordType = 0x06
+	recordTypeVersionDeleteComplete recordType = 0x07
 )
 
 // On-disk record framing: [1 byte type][4 byte big-endian payload
@@ -47,6 +49,9 @@ const (
 //   - DELETE_MARK, DELETE_COMPLETE: raw kbID bytes (no length prefix
 //     needed within the payload, since the outer record framing already
 //     carries the total payload length).
+//   - VERSION_DELETE_MARK, VERSION_DELETE_COMPLETE: 8-byte big-endian
+//     versionID followed by raw kbID bytes (kbID for recovery context;
+//     the versionID alone keys idempotency).
 const (
 	recordHeaderLen = 1 + 4 // type + length
 	recordCRCLen    = 4
@@ -71,10 +76,12 @@ type FileWAL struct {
 
 	// idempotency / pending-state tracking, rebuilt from the file on Open
 	// and kept up to date on every write thereafter.
-	versionIDsWritten map[int64]bool
-	committedVersions map[int64]bool
-	deleteMarked      map[string]bool
-	deleteCompleted   map[string]bool
+	versionIDsWritten   map[int64]bool
+	committedVersions   map[int64]bool
+	deleteMarked        map[string]bool
+	deleteCompleted     map[string]bool
+	versionDeleteMarked map[int64]string // versionID -> kbID
+	versionDeleteDone   map[int64]bool
 
 	replayCounters map[types.PendingRecord]int
 }
@@ -89,12 +96,14 @@ func NewFileWAL(path string) (*FileWAL, error) {
 	}
 
 	w := &FileWAL{
-		file:              f,
-		versionIDsWritten: make(map[int64]bool),
-		committedVersions: make(map[int64]bool),
-		deleteMarked:      make(map[string]bool),
-		deleteCompleted:   make(map[string]bool),
-		replayCounters:    make(map[types.PendingRecord]int),
+		file:                f,
+		versionIDsWritten:   make(map[int64]bool),
+		committedVersions:   make(map[int64]bool),
+		deleteMarked:        make(map[string]bool),
+		deleteCompleted:     make(map[string]bool),
+		versionDeleteMarked: make(map[int64]string),
+		versionDeleteDone:   make(map[int64]bool),
+		replayCounters:      make(map[types.PendingRecord]int),
 	}
 
 	if err := w.rebuildIndex(); err != nil {
@@ -206,6 +215,12 @@ func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 		rec.versionID = int64(binary.BigEndian.Uint64(payload))
 	case recordTypeDeleteMark, recordTypeDeleteComplete:
 		rec.kbID = string(payload)
+	case recordTypeVersionDeleteMark, recordTypeVersionDeleteComplete:
+		if len(payload) < 8 {
+			return parsedRecord{}, 0, fmt.Errorf("wal: malformed version-delete payload length %d", len(payload))
+		}
+		rec.versionID = int64(binary.BigEndian.Uint64(payload[:8]))
+		rec.kbID = string(payload[8:])
 	default:
 		return parsedRecord{}, 0, fmt.Errorf("wal: unknown record type 0x%02x", kind)
 	}
@@ -227,6 +242,10 @@ func (w *FileWAL) applyRecordLocked(rec parsedRecord) {
 		w.deleteMarked[rec.kbID] = true
 	case recordTypeDeleteComplete:
 		w.deleteCompleted[rec.kbID] = true
+	case recordTypeVersionDeleteMark:
+		w.versionDeleteMarked[rec.versionID] = rec.kbID
+	case recordTypeVersionDeleteComplete:
+		w.versionDeleteDone[rec.versionID] = true
 	case recordTypeBegin:
 		// BEGIN carries no state of its own to track; its presence only
 		// matters as a transaction-start marker for whoever reads the raw
@@ -325,6 +344,46 @@ func (w *FileWAL) WriteDeleteComplete(_ context.Context, kbID string) error {
 	return nil
 }
 
+// WriteVersionDeleteMark records that a DeleteVersion flow has started.
+// Payload: 8-byte versionID + kbID. Idempotent per versionID.
+func (w *FileWAL) WriteVersionDeleteMark(_ context.Context, kbID string, versionID int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, done := w.versionDeleteMarked[versionID]; done {
+		return nil // idempotent
+	}
+	if err := w.writeRecordLocked(recordTypeVersionDeleteMark, versionDeletePayload(versionID, kbID)); err != nil {
+		return fmt.Errorf("wal: WriteVersionDeleteMark(%s,%d): %w", kbID, versionID, err)
+	}
+	w.versionDeleteMarked[versionID] = kbID
+	return nil
+}
+
+// WriteVersionDeleteComplete records that the DeleteVersion cleanup for
+// versionID has finished. Payload: 8-byte versionID + kbID. Idempotent per
+// versionID.
+func (w *FileWAL) WriteVersionDeleteComplete(_ context.Context, kbID string, versionID int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.versionDeleteDone[versionID] {
+		return nil // idempotent
+	}
+	if err := w.writeRecordLocked(recordTypeVersionDeleteComplete, versionDeletePayload(versionID, kbID)); err != nil {
+		return fmt.Errorf("wal: WriteVersionDeleteComplete(%s,%d): %w", kbID, versionID, err)
+	}
+	w.versionDeleteDone[versionID] = true
+	return nil
+}
+
+// versionDeletePayload encodes the version-delete record payload: 8-byte
+// big-endian versionID followed by the raw kbID bytes.
+func versionDeletePayload(versionID int64, kbID string) []byte {
+	payload := make([]byte, 8+len(kbID))
+	binary.BigEndian.PutUint64(payload[:8], uint64(versionID))
+	copy(payload[8:], kbID)
+	return payload
+}
+
 // Recover returns every PendingRecord implied by the current in-memory
 // idempotency state (populated by rebuildIndex on Open, and kept current
 // by every Write* call since). It does not re-scan the file — the index
@@ -342,6 +401,11 @@ func (w *FileWAL) Recover(_ context.Context) ([]types.PendingRecord, error) {
 	for kbID := range w.deleteMarked {
 		if !w.deleteCompleted[kbID] {
 			out = append(out, types.PendingRecord{Type: types.PendingRecordTypeDeleteMark, KBID: kbID})
+		}
+	}
+	for versionID, kbID := range w.versionDeleteMarked {
+		if !w.versionDeleteDone[versionID] {
+			out = append(out, types.PendingRecord{Type: types.PendingRecordTypeVersionDelete, KBID: kbID, VersionID: versionID})
 		}
 	}
 	return out, nil

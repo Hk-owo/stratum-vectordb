@@ -331,7 +331,15 @@ func newRealNodeWithAddrsAndDir(t *testing.T, nodeID int64, peers []raft.PeerCon
 		VersionDocList:      vd,
 	})
 
-	kbSvc := service.NewKnowledgeBaseService(rn, wc, dc)
+	kbSvc := service.NewKnowledgeBaseService(rn, wc, dc, coordinator.NewDeleteVersionCoordinatorImpl(coordinator.DeleteVersionCoordinatorConfig{
+		MaxRetries:          2,
+		RetryBaseIntervalMS: 10,
+		WAL:                 w,
+		RaftNode:            rn,
+		IndexManager:        im,
+		DocStore:            ds,
+		VersionDocList:      vd,
+	}))
 	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, versionBF)
 	adminSvc := service.NewAdminService(nodeID, rn, im, ds, cs, w)
 
@@ -542,6 +550,41 @@ func (n *realNode) waitVersionReady(ctx context.Context, kbID string, versionID 
 	n.t.Fatalf("node %d: version %d did not become READY within timeout", n.nodeID, versionID)
 }
 
+// waitVersions polls ListVersions until the version-ID set exactly matches
+// want (order-insensitive), failing the test after a deadline. Used to wait
+// for the asynchronous DeleteVersion cleanup to converge.
+func waitVersions(t *testing.T, n *realNode, ctx context.Context, kbID string, want []int64) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	wantSet := make(map[int64]bool, len(want))
+	for _, v := range want {
+		wantSet[v] = true
+	}
+	for {
+		versions, err := n.raftNode.ListVersions(ctx, kbID)
+		if err == nil && len(versions) == len(want) {
+			all := true
+			for _, v := range versions {
+				if !wantSet[v.VersionID] {
+					all = false
+					break
+				}
+			}
+			if all {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			got := make([]int64, 0, len(versions))
+			for _, v := range versions {
+				got = append(got, v.VersionID)
+			}
+			t.Fatalf("node %d: version set did not converge to %v: got %v", n.nodeID, want, got)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // query runs a Query RPC with the given explicit version, failing the
 // test on error.
 func (n *realNode) query(ctx context.Context, kbID string, versionID int64, vec []float32, topK int32) []*pb.QueryResult {
@@ -740,6 +783,65 @@ func TestRealStack_FullLifecycle(t *testing.T) {
 	}
 	if kb.ActiveVersionID != v1 {
 		t.Errorf("active version = %d, want %d", kb.ActiveVersionID, v1)
+	}
+
+	// --- DeleteVersion: active rejection + recursive subtree cleanup ---
+
+	// Deleting the active version is rejected with a precondition error.
+	_, err = leader.KB.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v1,
+	})
+	if err == nil {
+		t.Fatal("expected error deleting the active version")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("active-delete error code = %v, want FailedPrecondition", status.Code(err))
+	}
+
+	// Deleting v3 removes it (and its data) while v1/v2 survive.
+	if _, err := leader.KB.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v3,
+	}); err != nil {
+		t.Fatalf("DeleteVersion(v%d): %v", v3, err)
+	}
+	waitVersions(t, leader, ctx, kbID, []int64{v1, v2})
+	docsV3, _ := leader.versionDoc.ListDocIDs(ctx, kbID, v3)
+	if len(docsV3) != 0 {
+		t.Errorf("versiondoc still holds %d docs for deleted v%d", len(docsV3), v3)
+	}
+	// doc-1's v3 UPDATE record and doc-2's v3 tombstone must be physically
+	// gone: reads now fall back to the v2 records ("alpha" / "beta")
+	// instead of seeing the v3 state.
+	if content, err := leader.docStore.ReadAt(ctx, kbID, "doc-1", v3); err != nil || string(content) != "alpha" {
+		t.Errorf("doc-1@v3 after deleting v3 = %q, %v; want fallback 'alpha' from v2 (v3 record gone)", content, err)
+	}
+	if content, err := leader.docStore.ReadAt(ctx, kbID, "doc-2", 1<<30); err != nil || string(content) != "beta" {
+		t.Errorf("doc-2 after deleting v3 = %q, %v; want fallback 'beta' from v2 (v3 tombstone gone)", content, err)
+	}
+
+	// Deleting v2 recursively removes its remaining subtree (v2 itself);
+	// v1 stays and remains active.
+	if _, err := leader.KB.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v2,
+	}); err != nil {
+		t.Fatalf("DeleteVersion(v%d): %v", v2, err)
+	}
+	waitVersions(t, leader, ctx, kbID, []int64{v1})
+	if _, err := leader.docStore.ReadAt(ctx, kbID, "doc-1", 1<<30); err == nil {
+		t.Error("doc-1@any-version should be gone after deleting v2/v3 (its only records)")
+	}
+	if _, err := leader.docStore.ReadAt(ctx, kbID, "doc-2", 1<<30); err == nil {
+		t.Error("doc-2@any-version should be gone after deleting v2 (its only record)")
+	}
+	kb, err = leader.raftNode.GetKB(ctx, kbID)
+	if err != nil {
+		t.Fatalf("GetKB after DeleteVersion: %v", err)
+	}
+	if kb.ActiveVersionID != v1 {
+		t.Errorf("active version after DeleteVersion = %d, want %d", kb.ActiveVersionID, v1)
 	}
 
 	// --- Delete: async cleanup empties every store ---

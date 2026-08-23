@@ -97,6 +97,29 @@ func (m *MockDocStore) DeleteByKB(_ context.Context, kbID string) error {
 	return nil
 }
 
+// DeleteByVersion implements DocStore: removes every entry for (kbID,
+// versionID) across all documents; a document whose entry list becomes
+// empty is dropped entirely. Idempotent.
+func (m *MockDocStore) DeleteByVersion(_ context.Context, kbID string, versionID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	docs := m.entries[kbID]
+	for docID, entries := range docs {
+		kept := entries[:0]
+		for _, e := range entries {
+			if e.versionID != versionID {
+				kept = append(kept, e)
+			}
+		}
+		if len(kept) == 0 {
+			delete(docs, docID)
+		} else {
+			docs[docID] = kept
+		}
+	}
+	return nil
+}
+
 // DiskUsage implements DocStore: the in-memory mock has no disk footprint,
 // so it always reports zero.
 func (m *MockDocStore) DiskUsage(_ context.Context) (uint64, error) {

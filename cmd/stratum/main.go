@@ -227,6 +227,16 @@ func main() {
 		VersionDocList:      vd,
 	})
 
+	deleteVersionCoord := coordinator.NewDeleteVersionCoordinatorImpl(coordinator.DeleteVersionCoordinatorConfig{
+		MaxRetries:          cfg.DeleteMaxRetries,
+		RetryBaseIntervalMS: cfg.DeleteRetryBaseMS,
+		WAL:                 walImpl,
+		RaftNode:            raftImpl,
+		IndexManager:        indexMgr,
+		DocStore:            ds,
+		VersionDocList:      vd,
+	})
+
 	// --- Data sync (leader→follower) ---
 	// Leader handler: serves storage-layer data to followers via gRPC.
 	syncLeader := sync.NewLeaderHandler(
@@ -314,7 +324,7 @@ func main() {
 	})
 
 	// --- gRPC services ---
-	kbSvc := service.NewKnowledgeBaseService(raftImpl, writeCoord, deleteCoord)
+	kbSvc := service.NewKnowledgeBaseService(raftImpl, writeCoord, deleteCoord, deleteVersionCoord)
 	querySvc := service.NewQueryService(raftImpl, indexMgr, cdm, vd, ds, versionBloom)
 	adminSvc := service.NewAdminService(cfg.NodeID, raftImpl, indexMgr, ds, chunkStore, walImpl)
 

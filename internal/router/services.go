@@ -49,6 +49,12 @@ func (s *KBServer) RollbackVersion(ctx context.Context, req *pb.RollbackVersionR
 	})
 }
 
+func (s *KBServer) DeleteVersion(ctx context.Context, req *pb.DeleteVersionRequest) (*pb.DeleteVersionResponse, error) {
+	return Forward(s.r, ctx, pb.KnowledgeBaseService_DeleteVersion_FullMethodName, func(idx int, ctx context.Context) (*pb.DeleteVersionResponse, error) {
+		return s.r.kbs[idx].DeleteVersion(ctx, req)
+	})
+}
+
 func (s *KBServer) ListKnowledgeBases(ctx context.Context, req *pb.ListKnowledgeBasesRequest) (*pb.ListKnowledgeBasesResponse, error) {
 	return Forward(s.r, ctx, pb.KnowledgeBaseService_ListKnowledgeBases_FullMethodName, func(idx int, ctx context.Context) (*pb.ListKnowledgeBasesResponse, error) {
 		return s.r.kbs[idx].ListKnowledgeBases(ctx, req)

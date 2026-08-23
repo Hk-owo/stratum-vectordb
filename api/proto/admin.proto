@@ -66,6 +66,7 @@ message GetSystemStatusResponse {
   repeated string delete_failed_kbs = 3;
   repeated WALAlert wal_alerts = 4;
   ResourceUsage resource_usage = 5;
+  repeated StuckVersion deleting_versions = 6; // versions whose DeleteVersion cleanup is in progress or unfinished
 }
 
 // GetClusterStatusRequest is empty: the node reports its own view of the

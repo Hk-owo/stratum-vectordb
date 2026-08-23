@@ -155,3 +155,59 @@ func (c *MockDeleteCoordinator) Reset() {
 }
 
 var _ DeleteCoordinator = (*MockDeleteCoordinator)(nil)
+
+// MockDeleteVersionCoordinator is the DeleteVersionCoordinator analog of
+// MockDeleteCoordinator: a configurable, call-recording stand-in for use
+// in Service-layer tests.
+type MockDeleteVersionCoordinator struct {
+	mu sync.Mutex
+
+	nextErr     error
+	executeFunc func(ctx context.Context, kbID string) error
+
+	calls []string // kbIDs passed to Execute, in call order
+}
+
+// NewMockDeleteVersionCoordinator constructs a MockDeleteVersionCoordinator
+// that returns nil error by default.
+func NewMockDeleteVersionCoordinator() *MockDeleteVersionCoordinator {
+	return &MockDeleteVersionCoordinator{}
+}
+
+func (c *MockDeleteVersionCoordinator) Execute(ctx context.Context, kbID string) error {
+	c.mu.Lock()
+	c.calls = append(c.calls, kbID)
+	fn := c.executeFunc
+	err := c.nextErr
+	c.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, kbID)
+	}
+	return err
+}
+
+// SetExecuteResult configures the error returned by subsequent Execute
+// calls, overriding any SetExecuteFunc configuration.
+func (c *MockDeleteVersionCoordinator) SetExecuteResult(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextErr = err
+	c.executeFunc = nil
+}
+
+// SetExecuteFunc configures a full custom Execute implementation.
+func (c *MockDeleteVersionCoordinator) SetExecuteFunc(fn func(ctx context.Context, kbID string) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.executeFunc = fn
+}
+
+// Calls returns every kbID passed to Execute so far, in call order.
+func (c *MockDeleteVersionCoordinator) Calls() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.calls...)
+}
+
+var _ DeleteVersionCoordinator = (*MockDeleteVersionCoordinator)(nil)

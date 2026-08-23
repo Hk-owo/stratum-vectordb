@@ -76,6 +76,13 @@ type IndexManager interface {
 	// no-op otherwise).
 	Evict(ctx context.Context, kbID string, versionID int64) error
 
+	// Discard removes a single version's index entirely: evicts the
+	// in-memory entry and resets the (kbID, versionID) index on the
+	// vecstore side. Used by the DeleteVersion cleanup. Resetting a
+	// never-built index is a no-op server-side; the local evict is
+	// idempotent too.
+	Discard(ctx context.Context, kbID string, versionID int64) error
+
 	// EvictByKB removes every loaded index belonging to kbID. Used by
 	// knowledge base deletion.
 	EvictByKB(ctx context.Context, kbID string) error

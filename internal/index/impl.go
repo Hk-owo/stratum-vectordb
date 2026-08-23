@@ -100,8 +100,8 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		conn, err := grpc.NewClient(cfg.VecstoreAddr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				Time:    10 * time.Second,
-				Timeout: 3 * time.Second,
+				Time:                10 * time.Second,
+				Timeout:             3 * time.Second,
 				PermitWithoutStream: true,
 			}),
 		)
@@ -475,6 +475,25 @@ func (im *IndexManagerImpl) EvictByKB(_ context.Context, kbID string) error {
 		if k.kbID == kbID {
 			delete(im.loaded, k)
 		}
+	}
+	return nil
+}
+
+// Discard implements IndexManager: evicts the in-memory entry and resets
+// the vecstore-side index for (kbID, versionID). Resetting a never-built
+// index is a no-op server-side; the local evict is idempotent too.
+func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID int64) error {
+	if err := im.Evict(ctx, kbID, versionID); err != nil {
+		return err
+	}
+	if im.vectorIndexClient == nil {
+		return fmt.Errorf("index: Discard(%s,%d): vectorIndexClient not set", kbID, versionID)
+	}
+	if _, err := im.vectorIndexClient.Reset(ctx, &vecstorepb.ResetIndexRequest{
+		KbId:      kbID,
+		VersionId: versionID,
+	}); err != nil {
+		return fmt.Errorf("index: Discard(%s,%d): Reset RPC: %w", kbID, versionID, err)
 	}
 	return nil
 }

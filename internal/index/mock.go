@@ -334,6 +334,12 @@ func (m *MockIndexManager) EvictByKB(_ context.Context, kbID string) error {
 	return nil
 }
 
+// Discard implements IndexManager: evicts the in-memory entry. The mock
+// has no vecstore side to reset, so this is exactly Evict's semantics.
+func (m *MockIndexManager) Discard(ctx context.Context, kbID string, versionID int64) error {
+	return m.Evict(ctx, kbID, versionID)
+}
+
 // Ping never loads an index or touches reference counts, per the
 // documented contract. It returns pingErr if a test has configured one via
 // SetPingError, to exercise HealthCheck's DEGRADED/UNHEALTHY paths.

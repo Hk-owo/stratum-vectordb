@@ -23,6 +23,8 @@ var (
 	ErrVersionNotFound       = errors.New("version not found")
 	ErrVersionPending        = errors.New("version is pending")   // storage-layer write for the version still in progress; not queryable
 	ErrVersionFailed         = errors.New("version index failed") // index build failed; not queryable
+	ErrVersionDeleting       = errors.New("version is being deleted")
+	ErrVersionIsActive       = errors.New("version is the active version")
 	ErrKnowledgeBaseNotFound = errors.New("knowledge base not found")
 	ErrKnowledgeBaseDeleted  = errors.New("knowledge base is deleted")
 	ErrIndexNotReady         = errors.New("index not ready")
@@ -37,6 +39,8 @@ var grpcCodeMap = map[error]codes.Code{
 	ErrVersionNotFound:       codes.NotFound,
 	ErrVersionPending:        codes.FailedPrecondition,
 	ErrVersionFailed:         codes.FailedPrecondition,
+	ErrVersionDeleting:       codes.FailedPrecondition,
+	ErrVersionIsActive:       codes.FailedPrecondition,
 	ErrKnowledgeBaseNotFound: codes.NotFound,
 	ErrKnowledgeBaseDeleted:  codes.FailedPrecondition,
 	ErrIndexNotReady:         codes.FailedPrecondition,

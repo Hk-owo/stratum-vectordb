@@ -12,6 +12,7 @@ func TestIsWriteMethod(t *testing.T) {
 		pb.KnowledgeBaseService_DeleteKnowledgeBase_FullMethodName,
 		pb.KnowledgeBaseService_CreateVersion_FullMethodName,
 		pb.KnowledgeBaseService_RollbackVersion_FullMethodName,
+		pb.KnowledgeBaseService_DeleteVersion_FullMethodName,
 		pb.AdminService_RebuildIndex_FullMethodName,
 		pb.AdminService_WarmupVersion_FullMethodName,
 	}

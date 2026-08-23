@@ -18,6 +18,8 @@ const (
 	recordCommit
 	recordDeleteMark
 	recordDeleteComplete
+	recordVersionDeleteMark
+	recordVersionDeleteComplete
 )
 
 type record struct {
@@ -43,10 +45,12 @@ type MockWAL struct {
 	records []record
 
 	// idempotency tracking
-	versionIDsWritten map[int64]bool
-	committedVersions map[int64]bool
-	deleteMarked      map[string]bool
-	deleteCompleted   map[string]bool
+	versionIDsWritten   map[int64]bool
+	committedVersions   map[int64]bool
+	deleteMarked        map[string]bool
+	deleteCompleted     map[string]bool
+	versionDeleteMarked map[int64]string // versionID -> kbID
+	versionDeleteDone   map[int64]bool
 
 	replayCounters map[types.PendingRecord]int
 }
@@ -54,11 +58,13 @@ type MockWAL struct {
 // NewMockWAL constructs an empty MockWAL.
 func NewMockWAL() *MockWAL {
 	return &MockWAL{
-		versionIDsWritten: make(map[int64]bool),
-		committedVersions: make(map[int64]bool),
-		deleteMarked:      make(map[string]bool),
-		deleteCompleted:   make(map[string]bool),
-		replayCounters:    make(map[types.PendingRecord]int),
+		versionIDsWritten:   make(map[int64]bool),
+		committedVersions:   make(map[int64]bool),
+		deleteMarked:        make(map[string]bool),
+		deleteCompleted:     make(map[string]bool),
+		versionDeleteMarked: make(map[int64]string),
+		versionDeleteDone:   make(map[int64]bool),
+		replayCounters:      make(map[types.PendingRecord]int),
 	}
 }
 
@@ -113,6 +119,30 @@ func (w *MockWAL) WriteDeleteComplete(_ context.Context, kbID string) error {
 	return nil
 }
 
+// WriteVersionDeleteMark records the start of a DeleteVersion flow.
+func (w *MockWAL) WriteVersionDeleteMark(_ context.Context, kbID string, versionID int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, done := w.versionDeleteMarked[versionID]; done {
+		return nil // idempotent
+	}
+	w.versionDeleteMarked[versionID] = kbID
+	w.records = append(w.records, record{kind: recordVersionDeleteMark, kbID: kbID, versionID: versionID})
+	return nil
+}
+
+// WriteVersionDeleteComplete records the end of a DeleteVersion flow.
+func (w *MockWAL) WriteVersionDeleteComplete(_ context.Context, kbID string, versionID int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.versionDeleteDone[versionID] {
+		return nil // idempotent
+	}
+	w.versionDeleteDone[versionID] = true
+	w.records = append(w.records, record{kind: recordVersionDeleteComplete, kbID: kbID, versionID: versionID})
+	return nil
+}
+
 // Recover replays the in-memory record log and returns PendingRecords for
 // any flow that began but did not reach its terminal record:
 //   - a BEGIN with no following VERSION_ID for the same transaction slot
@@ -136,6 +166,11 @@ func (w *MockWAL) Recover(_ context.Context) ([]types.PendingRecord, error) {
 	for kbID := range w.deleteMarked {
 		if !w.deleteCompleted[kbID] {
 			out = append(out, types.PendingRecord{Type: types.PendingRecordTypeDeleteMark, KBID: kbID})
+		}
+	}
+	for versionID, kbID := range w.versionDeleteMarked {
+		if !w.versionDeleteDone[versionID] {
+			out = append(out, types.PendingRecord{Type: types.PendingRecordTypeVersionDelete, KBID: kbID, VersionID: versionID})
 		}
 	}
 	return out, nil
@@ -204,6 +239,10 @@ func (w *MockWAL) Truncate(n int) {
 			delete(w.deleteMarked, r.kbID)
 		case recordDeleteComplete:
 			delete(w.deleteCompleted, r.kbID)
+		case recordVersionDeleteMark:
+			delete(w.versionDeleteMarked, r.versionID)
+		case recordVersionDeleteComplete:
+			delete(w.versionDeleteDone, r.versionID)
 		}
 	}
 }
@@ -218,6 +257,8 @@ func (w *MockWAL) Reset() {
 	w.committedVersions = make(map[int64]bool)
 	w.deleteMarked = make(map[string]bool)
 	w.deleteCompleted = make(map[string]bool)
+	w.versionDeleteMarked = make(map[int64]string)
+	w.versionDeleteDone = make(map[int64]bool)
 	w.replayCounters = make(map[types.PendingRecord]int)
 }
 

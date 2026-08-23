@@ -5,6 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/coordinator"
 	"stratum/internal/raft"
@@ -14,11 +17,12 @@ import (
 
 // kbSvcTestHarness bundles the dependencies for KnowledgeBaseService tests.
 type kbSvcTestHarness struct {
-	svc      *KnowledgeBaseServiceImpl
-	raftNode *raft.MockRaftNode
-	writeC   *coordinator.MockWriteCoordinator
-	deleteC  *coordinator.MockDeleteCoordinator
-	wal      *wal.MockWAL
+	svc            *KnowledgeBaseServiceImpl
+	raftNode       *raft.MockRaftNode
+	writeC         *coordinator.MockWriteCoordinator
+	deleteC        *coordinator.MockDeleteCoordinator
+	deleteVersionC *coordinator.MockDeleteVersionCoordinator
+	wal            *wal.MockWAL
 }
 
 func newKBSvcTestHarness() *kbSvcTestHarness {
@@ -26,13 +30,15 @@ func newKBSvcTestHarness() *kbSvcTestHarness {
 	rn := raft.NewMockRaftNode(w)
 	wc := coordinator.NewMockWriteCoordinator()
 	dc := coordinator.NewMockDeleteCoordinator()
-	svc := NewKnowledgeBaseService(rn, wc, dc)
+	dvc := coordinator.NewMockDeleteVersionCoordinator()
+	svc := NewKnowledgeBaseService(rn, wc, dc, dvc)
 	return &kbSvcTestHarness{
-		svc:      svc,
-		raftNode: rn,
-		writeC:   wc,
-		deleteC:  dc,
-		wal:      w,
+		svc:            svc,
+		raftNode:       rn,
+		writeC:         wc,
+		deleteC:        dc,
+		deleteVersionC: dvc,
+		wal:            w,
 	}
 }
 
@@ -202,7 +208,7 @@ func TestKnowledgeBaseService_RollbackVersion(t *testing.T) {
 	h.raftNode.ProposeUpdateVersionStatus(context.Background(), 1, types.IndexStatusReady)
 
 	_, err := h.svc.RollbackVersion(context.Background(), &pb.RollbackVersionRequest{
-		KnowledgeBaseId:  createResp.KnowledgeBaseId,
+		KnowledgeBaseId: createResp.KnowledgeBaseId,
 		TargetVersionId: 1,
 	})
 	if err != nil {
@@ -372,5 +378,76 @@ func TestKnowledgeBaseService_GetKnowledgeBase_And_ProtoConversions(t *testing.T
 		gotFlat.KnowledgeBase.Similarity != pb.Similarity_SIMILARITY_INNER_PRODUCT ||
 		gotFlat.KnowledgeBase.Status != pb.KBStatus_KB_STATUS_DELETE_FAILED {
 		t.Errorf("flat/deleted conversion = %+v", gotFlat.KnowledgeBase)
+	}
+}
+
+// TestKnowledgeBaseService_DeleteVersion covers the DeleteVersion RPC: it
+// marks the target version (not the active one) for deletion and launches
+// the async cleanup; deleting the active version is rejected.
+func TestKnowledgeBaseService_DeleteVersion(t *testing.T) {
+	h := newKBSvcTestHarness()
+	ctx := context.Background()
+
+	createResp, err := h.svc.CreateKnowledgeBase(ctx, &pb.CreateKnowledgeBaseRequest{
+		Name:             "test-kb",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig: &pb.EmbedConfig{
+			ServiceAddr: "localhost:8080",
+			ModelId:     "test-model",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateKnowledgeBase: %v", err)
+	}
+	// Initial version (v1) is active. Fork a second version and make it READY.
+	v2, err := h.raftNode.ProposeCreateVersion(ctx, createResp.KnowledgeBaseId, createResp.InitialVersionId)
+	if err != nil {
+		t.Fatalf("create v2: %v", err)
+	}
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady); err != nil {
+		t.Fatalf("v2 READY: %v", err)
+	}
+
+	// Deleting the active version is rejected.
+	_, err = h.svc.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: createResp.KnowledgeBaseId,
+		VersionId:       createResp.InitialVersionId,
+	})
+	if err == nil {
+		t.Fatal("expected error deleting the active version")
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("active-delete error code = %v, want FailedPrecondition", status.Code(err))
+	}
+
+	// Deleting a non-active version succeeds and launches async cleanup.
+	h.deleteVersionC.SetExecuteResult(nil)
+	resp, err := h.svc.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: createResp.KnowledgeBaseId,
+		VersionId:       v2,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVersion: %v", err)
+	}
+	if !resp.Success {
+		t.Error("expected success=true")
+	}
+
+	// Wait briefly for the async cleanup to launch.
+	time.Sleep(10 * time.Millisecond)
+	if calls := h.deleteVersionC.Calls(); len(calls) != 1 || calls[0] != createResp.KnowledgeBaseId {
+		t.Errorf("DeleteVersionCoordinator.Execute calls = %v, want [%s]", calls, createResp.KnowledgeBaseId)
+	}
+
+	// The version is marked Deleting in the state machine.
+	versions, err := h.raftNode.ListVersions(ctx, createResp.KnowledgeBaseId)
+	if err != nil {
+		t.Fatalf("ListVersions: %v", err)
+	}
+	for _, v := range versions {
+		if v.VersionID == v2 && !v.Deleting {
+			t.Error("v2 should be marked Deleting")
+		}
 	}
 }

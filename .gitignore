@@ -1,6 +1,7 @@
 # === Binaries ===
 /stratum
 /stratum-gateway
+/stratum-router
 *.test
 *.out
 *.exe

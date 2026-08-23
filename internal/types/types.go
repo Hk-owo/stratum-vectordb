@@ -123,6 +123,15 @@ type VersionMeta struct {
 	// string means no digest has been committed yet (initial/empty version,
 	// or a missed propose) — followers then skip verification.
 	DocIDSetHash string
+
+	// Deleting marks the version as being removed asynchronously (the
+	// DeleteVersion flow). Set by cmdMarkVersionDeleting; while true the
+	// version cannot be used as a parent for CreateVersion, cannot be
+	// queried, and is skipped by normal reads. The version's metadata is
+	// removed entirely by cmdRemoveVersionMeta once the background cleanup
+	// finishes. Versions marked Deleting that never reach RemoveVersionMeta
+	// (e.g. a crashed cleanup) are surfaced via GetSystemStatus.
+	Deleting bool
 }
 
 // ChangeOp identifies the kind of mutation a DocChange represents.
@@ -177,6 +186,13 @@ const (
 	// directly surface a pending versionID for this scenario rather than
 	// requiring callers to discover it through a separate accessor.
 	PendingRecordTypeVersionWrite
+	// PendingRecordTypeVersionDelete indicates a DeleteVersion flow that
+	// wrote its delete mark but never reached the delete-complete record:
+	// the versions in the state machine are marked Deleting but the
+	// background cleanup may not have finished. Recovery re-runs the
+	// DeleteVersion cleanup for the affected (kbID, versionID), which is
+	// idempotent end-to-end.
+	PendingRecordTypeVersionDelete
 )
 
 // PendingRecord is a WAL record requiring crash-recovery handling.

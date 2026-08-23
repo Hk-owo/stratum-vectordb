@@ -36,6 +36,7 @@ const (
 	KnowledgeBaseService_CreateVersion_FullMethodName       = "/stratum.KnowledgeBaseService/CreateVersion"
 	KnowledgeBaseService_ListVersions_FullMethodName        = "/stratum.KnowledgeBaseService/ListVersions"
 	KnowledgeBaseService_RollbackVersion_FullMethodName     = "/stratum.KnowledgeBaseService/RollbackVersion"
+	KnowledgeBaseService_DeleteVersion_FullMethodName       = "/stratum.KnowledgeBaseService/DeleteVersion"
 	KnowledgeBaseService_ListKnowledgeBases_FullMethodName  = "/stratum.KnowledgeBaseService/ListKnowledgeBases"
 	KnowledgeBaseService_GetKnowledgeBase_FullMethodName    = "/stratum.KnowledgeBaseService/GetKnowledgeBase"
 )
@@ -49,6 +50,7 @@ type KnowledgeBaseServiceClient interface {
 	CreateVersion(ctx context.Context, in *CreateVersionRequest, opts ...grpc.CallOption) (*CreateVersionResponse, error)
 	ListVersions(ctx context.Context, in *ListVersionsRequest, opts ...grpc.CallOption) (*ListVersionsResponse, error)
 	RollbackVersion(ctx context.Context, in *RollbackVersionRequest, opts ...grpc.CallOption) (*RollbackVersionResponse, error)
+	DeleteVersion(ctx context.Context, in *DeleteVersionRequest, opts ...grpc.CallOption) (*DeleteVersionResponse, error)
 	ListKnowledgeBases(ctx context.Context, in *ListKnowledgeBasesRequest, opts ...grpc.CallOption) (*ListKnowledgeBasesResponse, error)
 	GetKnowledgeBase(ctx context.Context, in *GetKnowledgeBaseRequest, opts ...grpc.CallOption) (*GetKnowledgeBaseResponse, error)
 }
@@ -111,6 +113,16 @@ func (c *knowledgeBaseServiceClient) RollbackVersion(ctx context.Context, in *Ro
 	return out, nil
 }
 
+func (c *knowledgeBaseServiceClient) DeleteVersion(ctx context.Context, in *DeleteVersionRequest, opts ...grpc.CallOption) (*DeleteVersionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteVersionResponse)
+	err := c.cc.Invoke(ctx, KnowledgeBaseService_DeleteVersion_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *knowledgeBaseServiceClient) ListKnowledgeBases(ctx context.Context, in *ListKnowledgeBasesRequest, opts ...grpc.CallOption) (*ListKnowledgeBasesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListKnowledgeBasesResponse)
@@ -140,6 +152,7 @@ type KnowledgeBaseServiceServer interface {
 	CreateVersion(context.Context, *CreateVersionRequest) (*CreateVersionResponse, error)
 	ListVersions(context.Context, *ListVersionsRequest) (*ListVersionsResponse, error)
 	RollbackVersion(context.Context, *RollbackVersionRequest) (*RollbackVersionResponse, error)
+	DeleteVersion(context.Context, *DeleteVersionRequest) (*DeleteVersionResponse, error)
 	ListKnowledgeBases(context.Context, *ListKnowledgeBasesRequest) (*ListKnowledgeBasesResponse, error)
 	GetKnowledgeBase(context.Context, *GetKnowledgeBaseRequest) (*GetKnowledgeBaseResponse, error)
 	mustEmbedUnimplementedKnowledgeBaseServiceServer()
@@ -166,6 +179,9 @@ func (UnimplementedKnowledgeBaseServiceServer) ListVersions(context.Context, *Li
 }
 func (UnimplementedKnowledgeBaseServiceServer) RollbackVersion(context.Context, *RollbackVersionRequest) (*RollbackVersionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RollbackVersion not implemented")
+}
+func (UnimplementedKnowledgeBaseServiceServer) DeleteVersion(context.Context, *DeleteVersionRequest) (*DeleteVersionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteVersion not implemented")
 }
 func (UnimplementedKnowledgeBaseServiceServer) ListKnowledgeBases(context.Context, *ListKnowledgeBasesRequest) (*ListKnowledgeBasesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListKnowledgeBases not implemented")
@@ -284,6 +300,24 @@ func _KnowledgeBaseService_RollbackVersion_Handler(srv interface{}, ctx context.
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KnowledgeBaseService_DeleteVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteVersionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KnowledgeBaseServiceServer).DeleteVersion(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KnowledgeBaseService_DeleteVersion_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KnowledgeBaseServiceServer).DeleteVersion(ctx, req.(*DeleteVersionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _KnowledgeBaseService_ListKnowledgeBases_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListKnowledgeBasesRequest)
 	if err := dec(in); err != nil {
@@ -346,6 +380,10 @@ var KnowledgeBaseService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RollbackVersion",
 			Handler:    _KnowledgeBaseService_RollbackVersion_Handler,
+		},
+		{
+			MethodName: "DeleteVersion",
+			Handler:    _KnowledgeBaseService_DeleteVersion_Handler,
 		},
 		{
 			MethodName: "ListKnowledgeBases",

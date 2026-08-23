@@ -72,6 +72,10 @@ func (s *testDocStore) DeleteByKB(_ context.Context, kbID string) error {
 	return nil
 }
 
+func (s *testDocStore) DeleteByVersion(_ context.Context, kbID string, versionID int64) error {
+	return nil
+}
+
 func (s *testDocStore) DiskUsage(_ context.Context) (uint64, error) { return 0, nil }
 
 func (s *testDocStore) count() int {
@@ -140,7 +144,7 @@ func (m *testChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, 
 	return out, nil
 }
 
-func (m *testChunkDocMapper) DeleteByKB(_ context.Context, kbID string) error { return nil }
+func (m *testChunkDocMapper) DeleteByKB(_ context.Context, kbID string) error         { return nil }
 func (m *testChunkDocMapper) DeleteByDoc(_ context.Context, kbID, docID string) error { return nil }
 
 func (m *testChunkDocMapper) forwardCount() int {
@@ -183,7 +187,9 @@ func (v *testVersionDocList) ListDocIDs(_ context.Context, kbID string, versionI
 	return out, nil
 }
 
-func (v *testVersionDocList) DeleteByVersion(_ context.Context, kbID string, versionID int64) error { return nil }
+func (v *testVersionDocList) DeleteByVersion(_ context.Context, kbID string, versionID int64) error {
+	return nil
+}
 func (v *testVersionDocList) DeleteByKB(_ context.Context, kbID string) error { return nil }
 
 func (v *testVersionDocList) count() int {
@@ -222,8 +228,8 @@ func (s *testChunkStore) Exists(_ context.Context, kbID, chunkID string) (bool, 
 	return ok, nil
 }
 
-func (s *testChunkStore) Delete(_ context.Context, kbID, chunkID string) error  { return nil }
-func (s *testChunkStore) DeleteByKB(_ context.Context, kbID string) error       { return nil }
+func (s *testChunkStore) Delete(_ context.Context, kbID, chunkID string) error { return nil }
+func (s *testChunkStore) DeleteByKB(_ context.Context, kbID string) error      { return nil }
 func (s *testChunkStore) DiskUsage(_ context.Context) (uint64, error)          { return 0, nil }
 
 func (s *testChunkStore) writtenCount() int {
@@ -285,9 +291,12 @@ func (im *testIndexManager) RegisterBuildCallback(cb index.BuildCompleteCallback
 }
 
 func (im *testIndexManager) Evict(_ context.Context, kbID string, versionID int64) error { return nil }
-func (im *testIndexManager) EvictByKB(_ context.Context, kbID string) error              { return nil }
-func (im *testIndexManager) Ping(_ context.Context) error                                { return nil }
-func (im *testIndexManager) LoadedCount() int                                            { return 0 }
+func (im *testIndexManager) Discard(_ context.Context, kbID string, versionID int64) error {
+	return nil
+}
+func (im *testIndexManager) EvictByKB(_ context.Context, kbID string) error { return nil }
+func (im *testIndexManager) Ping(_ context.Context) error                   { return nil }
+func (im *testIndexManager) LoadedCount() int                               { return 0 }
 
 func (im *testIndexManager) triggeredCount() int {
 	im.mu.Lock()
@@ -350,10 +359,16 @@ func (r *testRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID 
 	r.versions[versionID] = v
 	return nil
 }
-func (r *testRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) error  { return nil }
+func (r *testRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) error     { return nil }
 func (r *testRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, kbID string) error { return nil }
 func (r *testRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error       { return nil }
 func (r *testRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
+	return nil
+}
+func (r *testRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64) error {
+	return nil
+}
+func (r *testRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
 	return nil
 }
 func (r *testRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
@@ -365,7 +380,9 @@ func (r *testRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBas
 	}
 	return kb, nil
 }
-func (r *testRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) { return nil, nil }
+func (r *testRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
+	return nil, nil
+}
 func (r *testRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
 	return nil, nil
 }

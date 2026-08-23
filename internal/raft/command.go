@@ -20,6 +20,8 @@ const (
 	cmdUpdateVersionStatus  commandType = "UpdateVersionStatus"
 	cmdUpdateVersionSummary commandType = "UpdateVersionSummary"
 	cmdRollback             commandType = "Rollback"
+	cmdMarkVersionDeleting  commandType = "MarkVersionDeleting"
+	cmdRemoveVersionMeta    commandType = "RemoveVersionMeta"
 )
 
 // command is the JSON-encoded payload carried inside each kvraft log
@@ -34,13 +36,14 @@ type command struct {
 	KB *types.KnowledgeBaseMeta `json:"kb,omitempty"`
 
 	// cmdMarkKBDeleting / cmdMarkKBDeleteFailed / cmdRemoveKBMeta /
-	// cmdCreateVersion / cmdRollback
+	// cmdCreateVersion / cmdRollback / cmdMarkVersionDeleting /
+	// cmdRemoveVersionMeta
 	KBID string `json:"kb_id,omitempty"`
 
 	// cmdCreateVersion
 	ParentVersionID int64 `json:"parent_version_id,omitempty"`
 
-	// cmdUpdateVersionStatus
+	// cmdUpdateVersionStatus / cmdMarkVersionDeleting / cmdRemoveVersionMeta
 	VersionID int64             `json:"version_id,omitempty"`
 	Status    types.IndexStatus `json:"status,omitempty"`
 

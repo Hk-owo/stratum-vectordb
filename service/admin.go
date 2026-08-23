@@ -80,8 +80,10 @@ func (s *AdminServiceImpl) HealthCheck(ctx context.Context, req *pb.HealthCheckR
 func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSystemStatusRequest) (*pb.GetSystemStatusResponse, error) {
 	health, _ := s.HealthCheck(ctx, &pb.HealthCheckRequest{})
 
-	// Scan all KBs for stuck (FAILED) versions and delete-failed KBs.
+	// Scan all KBs for stuck (FAILED) versions, Deleting versions, and
+	// delete-failed KBs.
 	var stuckVersions []*pb.StuckVersion
+	var deletingVersions []*pb.StuckVersion
 	var deleteFailed []string
 	if kbs, err := s.raftNode.ListKnowledgeBases(ctx); err == nil {
 		for _, kb := range kbs {
@@ -93,6 +95,17 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 				continue
 			}
 			for _, v := range versions {
+				if v.Deleting {
+					deletingVersions = append(deletingVersions, &pb.StuckVersion{
+						KbId:      v.KBID,
+						VersionId: v.VersionID,
+						// UpdatedAt carries the version's creation time as
+						// the best available proxy for "when did this
+						// deletion start".
+						UpdatedAt: v.CreatedAt,
+					})
+					continue
+				}
 				if v.IndexStatus == types.IndexStatusFailed {
 					stuckVersions = append(stuckVersions, &pb.StuckVersion{
 						KbId:        v.KBID,
@@ -132,11 +145,12 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 	}
 
 	return &pb.GetSystemStatusResponse{
-		Health:          health,
-		StuckVersions:   stuckVersions,
-		DeleteFailedKbs: deleteFailed,
-		WalAlerts:       walAlerts,
-		ResourceUsage:   resourceUsage,
+		Health:           health,
+		StuckVersions:    stuckVersions,
+		DeleteFailedKbs:  deleteFailed,
+		DeletingVersions: deletingVersions,
+		WalAlerts:        walAlerts,
+		ResourceUsage:    resourceUsage,
 	}, nil
 }
 

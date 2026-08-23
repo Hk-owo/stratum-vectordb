@@ -74,7 +74,22 @@ type RaftNode interface {
 	ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error
 
 	// ProposeRollback switches kbID's active version to targetVersionID.
+	// Rejected (ErrVersionDeleting) if the target version is being deleted.
 	ProposeRollback(ctx context.Context, kbID string, targetVersionID int64) error
+
+	// ProposeMarkVersionDeleting marks versionID (and, recursively, every
+	// descendant version) within kbID as Deleting, kicking off the
+	// asynchronous DeleteVersion cleanup. Rejected with ErrVersionIsActive
+	// if the active version is in the subtree, or ErrVersionPending if any
+	// version in the subtree is still PENDING. Idempotent for an already
+	// Deleting subtree.
+	ProposeMarkVersionDeleting(ctx context.Context, kbID string, versionID int64) error
+
+	// ProposeRemoveVersionMeta removes a single version's metadata from the
+	// state machine. Idempotent: returns success if the version is already
+	// gone, so the DeleteVersion cleanup's crash-recovery path can safely
+	// re-propose this any number of times.
+	ProposeRemoveVersionMeta(ctx context.Context, kbID string, versionID int64) error
 
 	// GetKB returns kbID's current metadata.
 	GetKB(ctx context.Context, kbID string) (types.KnowledgeBaseMeta, error)
