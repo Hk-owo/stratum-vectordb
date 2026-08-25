@@ -473,6 +473,17 @@ func (rf *Raft) LastApplied() uint64 {
 	return rf.lastApplied
 }
 
+// LogBase returns the (index, term) of the first entry in this node's
+// in-memory log — normally 0/0, but after log compaction (local snapshot
+// or an installed one) it is the snapshot's last included entry. A peer
+// whose nextIndex has fallen to or below this index needs a snapshot, not
+// incremental replication, to catch up.
+func (rf *Raft) LogBase() (index, term uint64) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.log[0].Index, rf.log[0].Term
+}
+
 // IsLeader reports whether this node currently believes itself to be the
 // Raft leader.
 func (rf *Raft) IsLeader() bool {

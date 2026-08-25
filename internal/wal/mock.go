@@ -26,6 +26,7 @@ type record struct {
 	kind      recordKind
 	versionID int64
 	kbID      string
+	begin     beginData // populated for recordBegin
 }
 
 // MockWAL is an in-memory WAL for use in unit tests of modules that depend
@@ -52,7 +53,12 @@ type MockWAL struct {
 	versionDeleteMarked map[int64]string // versionID -> kbID
 	versionDeleteDone   map[int64]bool
 
-	replayCounters map[types.PendingRecord]int
+	// beginDataByVersion mirrors FileWAL: VERSION_ID records bind to the
+	// replay input of the most recent unpaired BEGIN (see WriteBegin /
+	// WriteVersionID).
+	beginDataByVersion map[int64]beginData
+
+	replayCounters map[replayKey]int
 }
 
 // NewMockWAL constructs an empty MockWAL.
@@ -64,14 +70,15 @@ func NewMockWAL() *MockWAL {
 		deleteCompleted:     make(map[string]bool),
 		versionDeleteMarked: make(map[int64]string),
 		versionDeleteDone:   make(map[int64]bool),
-		replayCounters:      make(map[types.PendingRecord]int),
+		beginDataByVersion:  make(map[int64]beginData),
+		replayCounters:      make(map[replayKey]int),
 	}
 }
 
-func (w *MockWAL) WriteBegin(_ context.Context) error {
+func (w *MockWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int64, changes []types.DocChange) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.records = append(w.records, record{kind: recordBegin})
+	w.records = append(w.records, record{kind: recordBegin, begin: beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}})
 	return nil
 }
 
@@ -83,6 +90,14 @@ func (w *MockWAL) WriteVersionID(_ context.Context, versionID int64) error {
 	}
 	w.versionIDsWritten[versionID] = true
 	w.records = append(w.records, record{kind: recordVersionID, versionID: versionID})
+	// Bind the most recent unpaired BEGIN's replay input to this version,
+	// mirroring FileWAL.rebuildIndex.
+	for i := len(w.records) - 1; i >= 0; i-- {
+		if w.records[i].kind == recordBegin {
+			w.beginDataByVersion[versionID] = w.records[i].begin
+			break
+		}
+	}
 	return nil
 }
 
@@ -143,6 +158,14 @@ func (w *MockWAL) WriteVersionDeleteComplete(_ context.Context, kbID string, ver
 	return nil
 }
 
+// IsDeleteMarked reports whether a DeleteKnowledgeBase marker was written
+// for kbID. Test helper, not part of the WAL interface.
+func (w *MockWAL) IsDeleteMarked(kbID string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.deleteMarked[kbID]
+}
+
 // Recover replays the in-memory record log and returns PendingRecords for
 // any flow that began but did not reach its terminal record:
 //   - a BEGIN with no following VERSION_ID for the same transaction slot
@@ -160,7 +183,13 @@ func (w *MockWAL) Recover(_ context.Context) ([]types.PendingRecord, error) {
 	var out []types.PendingRecord
 	for versionID, written := range w.versionIDsWritten {
 		if written && !w.committedVersions[versionID] {
-			out = append(out, types.PendingRecord{Type: types.PendingRecordTypeVersionWrite, VersionID: versionID})
+			rec := types.PendingRecord{Type: types.PendingRecordTypeVersionWrite, VersionID: versionID}
+			if bd, ok := w.beginDataByVersion[versionID]; ok {
+				rec.KBID = bd.kbID
+				rec.ParentVersionID = bd.parentVersionID
+				rec.Changes = bd.changes
+			}
+			out = append(out, rec)
 		}
 	}
 	for kbID := range w.deleteMarked {
@@ -194,12 +223,25 @@ func (w *MockWAL) PendingVersionIDs() []int64 {
 	return out
 }
 
+// RecordCount returns the number of records in the mock's ordered log.
+// Test-only helper for asserting that an operation appended the expected
+// number of records (e.g. that a replay wrote exactly one COMMIT and no
+// new BEGIN/VERSION_ID).
+func (w *MockWAL) RecordCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.records)
+}
+
 func (w *MockWAL) GetReplayCounters() []types.ReplayCounter {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	out := make([]types.ReplayCounter, 0, len(w.replayCounters))
 	for rec, count := range w.replayCounters {
-		out = append(out, types.ReplayCounter{Record: rec, RetryCount: count})
+		out = append(out, types.ReplayCounter{
+			Record:     types.PendingRecord{Type: rec.typ, KBID: rec.kbID, VersionID: rec.versionID},
+			RetryCount: count,
+		})
 	}
 	return out
 }
@@ -211,7 +253,7 @@ func (w *MockWAL) GetReplayCounters() []types.ReplayCounter {
 func (w *MockWAL) IncrementReplayCounter(rec types.PendingRecord) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.replayCounters[rec]++
+	w.replayCounters[makeReplayKey(rec)]++
 }
 
 // Truncate discards the last n records from the in-memory log, simulating
@@ -259,7 +301,7 @@ func (w *MockWAL) Reset() {
 	w.deleteCompleted = make(map[string]bool)
 	w.versionDeleteMarked = make(map[int64]string)
 	w.versionDeleteDone = make(map[int64]bool)
-	w.replayCounters = make(map[types.PendingRecord]int)
+	w.replayCounters = make(map[replayKey]int)
 }
 
 var _ WAL = (*MockWAL)(nil)

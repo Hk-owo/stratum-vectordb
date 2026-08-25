@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 	"time"
 
 	"stratum/internal/bloom"
@@ -15,7 +16,7 @@ import (
 	"stratum/internal/index"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
-	"stratum/internal/sync"
+	stratinternalsync "stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 	"stratum/internal/wal"
@@ -37,6 +38,12 @@ type WriteCoordinatorConfig struct {
 	// write path to skip ChunkStore.Exists round-trips for new chunks.
 	ChunkBloom bloom.BloomFilter
 
+	// VersionBloom persists each version's document bloom filter (one per
+	// version). May be nil in tests that do not exercise filter
+	// persistence; the write path then skips step 5 and the read path
+	// rebuilds filters lazily from VersionDocList.
+	VersionBloom *bloom.VersionBloomStore
+
 	ChunkStore     chunkstore.ChunkStore
 	ChunkDocMapper chunkdoc.ChunkDocMapper
 	DocStore       docstore.DocStore
@@ -49,6 +56,13 @@ type WriteCoordinatorConfig struct {
 // in Stratum_接口设计v9.md "CreateVersion" and Stratum_设计文档v10.md "写路径".
 type WriteCoordinatorImpl struct {
 	cfg WriteCoordinatorConfig
+
+	// txnMu serializes CreateVersion transactions end to end (BEGIN through
+	// COMMIT) so the WAL record order is BEGIN -> VERSION_ID per
+	// transaction with no interleaved BEGIN from a concurrent transaction —
+	// the property FileWAL.rebuildIndex relies on to bind each VERSION_ID
+	// to the correct transaction's replay input (see internal/wal/file.go).
+	txnMu sync.Mutex
 }
 
 // NewWriteCoordinatorImpl constructs a WriteCoordinatorImpl.
@@ -64,8 +78,16 @@ func NewWriteCoordinatorImpl(cfg WriteCoordinatorConfig) *WriteCoordinatorImpl {
 
 // Execute implements WriteCoordinator.
 func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange) (int64, error) {
-	// Step 1: WAL.WriteBegin
-	if err := c.cfg.WAL.WriteBegin(ctx); err != nil {
+	// Serialize the whole transaction (BEGIN through COMMIT) so the WAL's
+	// BEGIN -> VERSION_ID binding per version stays unambiguous (see
+	// txnMu's doc comment).
+	c.txnMu.Lock()
+	defer c.txnMu.Unlock()
+
+	// Step 1: WAL.WriteBegin, persisting the transaction's replay input
+	// (kbID, parentVersionID, changes) so crash recovery can replay the
+	// storage writes if this process dies before COMMIT.
+	if err := c.cfg.WAL.WriteBegin(ctx, kbID, parentVersionID, changes); err != nil {
 		return 0, fmt.Errorf("coordinator: WAL.WriteBegin: %w", err)
 	}
 
@@ -83,38 +105,10 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 		return 0, fmt.Errorf("coordinator: GetKB: %w", err)
 	}
 
-	// Step 3: Per changed document: split -> embed -> per chunk: bloom
-	// test -> exists confirm -> write -> chunk-doc map -> doc store.
-	for _, change := range changes {
-		switch change.Op {
-		case types.ChangeOpAdd, types.ChangeOpUpdate:
-			if err := c.writeDocument(ctx, kbID, versionID, change, kbMeta); err != nil {
-				return 0, err
-			}
-		case types.ChangeOpDelete:
-			// Write a tombstone for the deleted document.
-			if err := c.retry(ctx, func() error {
-				return c.cfg.DocStore.Write(ctx, kbID, change.DocID, versionID, nil)
-			}); err != nil {
-				return 0, fmt.Errorf("coordinator: write tombstone for %s: %w", change.DocID, err)
-			}
-		}
-	}
-
-	// Step 4: VersionDocList.Write — compute the full document set for
-	// the new version from the parent's set + this version's changes.
-	docIDs, err := c.writeVersionDocList(ctx, kbID, parentVersionID, versionID, changes)
+	// Steps 3-6: storage-layer writes + WAL COMMIT.
+	docIDs, err := c.writeVersionStorage(ctx, kbID, parentVersionID, versionID, changes, kbMeta)
 	if err != nil {
 		return 0, err
-	}
-
-	// Step 5: Version-document bloom filter is built as part of
-	// writeVersionDocList (the filter itself is serialized for persistence).
-	// The chunk bloom filter is updated incrementally in writeDocument.
-
-	// Step 6: WAL.WriteCommit
-	if err := c.cfg.WAL.WriteCommit(ctx, versionID); err != nil {
-		return 0, fmt.Errorf("coordinator: WAL.WriteCommit: %w", err)
 	}
 
 	// Step 6.5: commit the version's document-ID set hash so followers can
@@ -122,7 +116,7 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	// VersionMeta.DocIDSetHash). Non-fatal, like TriggerBuild below: a
 	// failed/missed propose leaves the version without a digest and
 	// followers fall back to best-effort pulls.
-	if err := c.cfg.RaftNode.ProposeUpdateVersionSummary(ctx, versionID, sync.ComputeDocIDSetHash(docIDs)); err != nil {
+	if err := c.cfg.RaftNode.ProposeUpdateVersionSummary(ctx, versionID, stratinternalsync.ComputeDocIDSetHash(docIDs)); err != nil {
 		_ = err // logged upstream; digest is an optimization for follower verification
 	}
 
@@ -135,6 +129,82 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	}
 
 	return versionID, nil
+}
+
+// ReplayVersionStorageWrites implements WriteCoordinator: replays steps
+// 3-6 (plus summary + async build) for an already-committed version after
+// a crash, without writing a BEGIN record or proposing a new version.
+func (c *WriteCoordinatorImpl) ReplayVersionStorageWrites(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) error {
+	c.txnMu.Lock()
+	defer c.txnMu.Unlock()
+
+	kbMeta, err := c.cfg.RaftNode.GetKB(ctx, kbID)
+	if err != nil {
+		return fmt.Errorf("coordinator: replay GetKB: %w", err)
+	}
+
+	docIDs, err := c.writeVersionStorage(ctx, kbID, parentVersionID, versionID, changes, kbMeta)
+	if err != nil {
+		return fmt.Errorf("coordinator: replay version %d storage writes: %w", versionID, err)
+	}
+
+	if err := c.cfg.RaftNode.ProposeUpdateVersionSummary(ctx, versionID, stratinternalsync.ComputeDocIDSetHash(docIDs)); err != nil {
+		_ = err
+	}
+	if err := c.cfg.IndexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
+		_ = err
+	}
+	return nil
+}
+
+// writeVersionStorage executes the synchronous storage-layer steps of the
+// write path (3-6) for (kbID, versionID): per-change split/embed/write,
+// the version's full document-ID set, the version-document bloom filter,
+// and the WAL COMMIT. Shared by Execute and the crash-recovery replay;
+// every write is idempotent, so re-running it for an already-partially-
+// written version is always safe. Returns the version's sorted docIDs.
+func (c *WriteCoordinatorImpl) writeVersionStorage(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange, kbMeta types.KnowledgeBaseMeta) ([]string, error) {
+	// Step 3: Per changed document: split -> embed -> per chunk: bloom
+	// test -> exists confirm -> write -> chunk-doc map -> doc store.
+	for _, change := range changes {
+		switch change.Op {
+		case types.ChangeOpAdd, types.ChangeOpUpdate:
+			if err := c.writeDocument(ctx, kbID, versionID, change, kbMeta); err != nil {
+				return nil, err
+			}
+		case types.ChangeOpDelete:
+			// Write a tombstone for the deleted document.
+			if err := c.retry(ctx, func() error {
+				return c.cfg.DocStore.Write(ctx, kbID, change.DocID, versionID, nil)
+			}); err != nil {
+				return nil, fmt.Errorf("coordinator: write tombstone for %s: %w", change.DocID, err)
+			}
+		}
+	}
+
+	// Step 4: VersionDocList.Write — compute the full document set for
+	// the new version from the parent's set + this version's changes.
+	docIDs, err := c.writeVersionDocList(ctx, kbID, parentVersionID, versionID, changes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 5: version-document bloom filter, built from the full docID
+	// set and persisted to disk. Non-fatal: a failed persist leaves the
+	// filter absent, and the read path rebuilds it lazily from
+	// VersionDocList on demand.
+	if c.cfg.VersionBloom != nil {
+		if _, err := c.cfg.VersionBloom.BuildAndPersist(kbID, versionID, docIDs); err != nil {
+			_ = err // non-fatal; read path rebuilds lazily
+		}
+	}
+
+	// Step 6: WAL.WriteCommit
+	if err := c.cfg.WAL.WriteCommit(ctx, versionID); err != nil {
+		return nil, fmt.Errorf("coordinator: WAL.WriteCommit: %w", err)
+	}
+
+	return docIDs, nil
 }
 
 // writeDocument handles a single ADD or UPDATE document change: split,

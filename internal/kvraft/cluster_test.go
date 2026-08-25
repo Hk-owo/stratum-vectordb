@@ -19,12 +19,14 @@ type testNode struct {
 	rf        *Raft
 	applyCh   chan ApplyMsg
 	transport *Transport
+	persister *kvstorage.Persister
 }
 
 // newTestCluster starts n Raft nodes, fully cross-connected, each
 // listening on a free loopback port and running its background loops.
-// Returns the nodes in ID order (1..n).
-func newTestCluster(t *testing.T, n int) []*testNode {
+// Extra opts (e.g. WithMaxLogLength) are applied to every node. Returns
+// the nodes in ID order (1..n).
+func newTestCluster(t *testing.T, n int, opts ...Option) []*testNode {
 	t.Helper()
 
 	addrs := make([]string, n)
@@ -38,17 +40,17 @@ func newTestCluster(t *testing.T, n int) []*testNode {
 		transport := NewTransport(nil)
 		applyCh := make(chan ApplyMsg, 256)
 		persister := kvstorage.NewPersister(filepath.Join(t.TempDir(), fmt.Sprintf("raft-%d", id)))
-		rf := NewRaft(id, transport, applyCh, persister,
+		allOpts := append([]Option{
 			WithElectionTimeoutRange(50*time.Millisecond, 100*time.Millisecond),
-			WithHeartbeatInterval(20*time.Millisecond),
-		)
-		nodes[i] = &testNode{id: id, addr: addrs[i], rf: rf, applyCh: applyCh, transport: transport}
+			WithHeartbeatInterval(20 * time.Millisecond),
+		}, opts...)
+		rf := NewRaft(id, transport, applyCh, persister, allOpts...)
+		nodes[i] = &testNode{id: id, addr: addrs[i], rf: rf, applyCh: applyCh, transport: transport, persister: persister}
 	}
 
 	// Cross-connect: every node's Transport gets a peer entry for every
-	// OTHER node. kvAddr (used only for snapshot transfer, a
-	// Stratum-level concern not exercised by these kvraft-level tests) is
-	// left as a placeholder.
+	// OTHER node. kvAddr (used for Stratum-level data sync, a concern not
+	// exercised by these kvraft-level tests) is left as a placeholder.
 	for i, nd := range nodes {
 		for j, peer := range nodes {
 			if i == j {

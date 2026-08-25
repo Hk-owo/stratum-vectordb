@@ -26,26 +26,29 @@ type querySvcHarness struct {
 	chunkMapper *chunkdoc.MockChunkDocMapper
 	versionDocs *versiondoc.MockVersionDocList
 	docStore    *docstore.MockDocStore
-	verBloom    *bloom.MockBloomFilter
+	vBloomStore *bloom.VersionBloomStore
 }
 
-func newQuerySvcHarness() *querySvcHarness {
+func newQuerySvcHarness(t *testing.T) *querySvcHarness {
 	w := wal.NewMockWAL()
 	rn := raft.NewMockRaftNode(w)
 	cdm := chunkdoc.NewMockChunkDocMapper()
 	vd := versiondoc.NewMockVersionDocList()
 	ds := docstore.NewMockDocStore()
-	verBF := bloom.NewMockBloomFilter()
 
 	im := index.NewMockIndexManager(index.MockIndexManagerDeps{
-		ListDocIDs:      vd.ListDocIDs,
+		ListDocIDs:         vd.ListDocIDs,
 		ListChunkIDsByDocs: cdm.ListChunkIDsByDocs,
 		ReadChunkVector: func(ctx context.Context, kbID, chunkID string) ([]float32, error) {
 			return nil, nil
 		},
 	}, 4, 5*1000*1000*1000) // 5s timeout
 
-	svc := NewQueryService(rn, im, cdm, vd, ds, verBF)
+	// Version bloom filters are stored under a per-test temp dir and
+	// rebuilt lazily from the version doc list.
+	vBloomStore := bloom.NewVersionBloomStore(t.TempDir(), 1000, 0.01, vd)
+
+	svc := NewQueryService(rn, im, cdm, vd, ds, vBloomStore)
 	return &querySvcHarness{
 		svc:         svc,
 		raftNode:    rn,
@@ -53,7 +56,7 @@ func newQuerySvcHarness() *querySvcHarness {
 		chunkMapper: cdm,
 		versionDocs: vd,
 		docStore:    ds,
-		verBloom:    verBF,
+		vBloomStore: vBloomStore,
 	}
 }
 
@@ -78,7 +81,7 @@ func (h *querySvcHarness) setupQueryableKB(t *testing.T, docChunks map[string][]
 			h.chunkMapper.Write(ctx, kbID, cid, docID)
 		}
 		h.versionDocs.Write(ctx, kbID, vID, docID)
-		h.verBloom.Add(docID)
+		h.versionDocs.Write(ctx, kbID, vID, docID)
 		h.docStore.Write(ctx, kbID, docID, vID, []byte("content of "+docID))
 	}
 
@@ -91,7 +94,7 @@ func (h *querySvcHarness) setupQueryableKB(t *testing.T, docChunks map[string][]
 }
 
 func TestQueryService_VersionIsolation(t *testing.T) {
-	h := newQuerySvcHarness()
+	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
 	kbID, v1ID := h.setupQueryableKB(t, map[string][]string{
@@ -104,7 +107,7 @@ func TestQueryService_VersionIsolation(t *testing.T) {
 	h.raftNode.ProposeUpdateVersionStatus(ctx, v2ID, types.IndexStatusReady)
 	h.chunkMapper.Write(ctx, kbID, "chunk-2", "doc-b")
 	h.versionDocs.Write(ctx, kbID, v2ID, "doc-b")
-	h.verBloom.Add("doc-b")
+	h.versionDocs.Write(ctx, kbID, v2ID, "doc-b")
 	h.docStore.Write(ctx, kbID, "doc-b", v2ID, []byte("content of doc-b"))
 	_ = h.indexMgr.TriggerBuild(ctx, kbID, v2ID)
 
@@ -126,7 +129,7 @@ func TestQueryService_VersionIsolation(t *testing.T) {
 }
 
 func TestQueryService_ThresholdFiltering(t *testing.T) {
-	h := newQuerySvcHarness()
+	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
 	kbID, vID := h.setupQueryableKB(t, map[string][]string{
@@ -153,7 +156,7 @@ func TestQueryService_ThresholdFiltering(t *testing.T) {
 }
 
 func TestQueryService_TopKLimit(t *testing.T) {
-	h := newQuerySvcHarness()
+	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
 	kbID, vID := h.setupQueryableKB(t, map[string][]string{
@@ -177,7 +180,7 @@ func TestQueryService_TopKLimit(t *testing.T) {
 }
 
 func TestQueryService_AggregationMedian(t *testing.T) {
-	h := newQuerySvcHarness()
+	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
 	kbID, vID := h.setupQueryableKB(t, map[string][]string{
@@ -198,17 +201,19 @@ func TestQueryService_AggregationMedian(t *testing.T) {
 }
 
 func TestQueryService_BloomFilterFalsePositive(t *testing.T) {
-	h := newQuerySvcHarness()
+	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
 	kbID, vID := h.setupQueryableKB(t, map[string][]string{
 		"doc-real": {"chunk-1"},
 	})
 
-	// Add a key to the bloom filter that is NOT in VersionDocList.
+	// Add a key to the version's bloom filter that is NOT in VersionDocList.
 	// This simulates a false positive: bloom says "maybe present",
 	// but VersionDocList confirms it's not.
-	h.verBloom.Add("doc-fake")
+	if _, err := h.vBloomStore.BuildAndPersist(kbID, vID, []string{"doc-real", "doc-fake"}); err != nil {
+		t.Fatalf("BuildAndPersist: %v", err)
+	}
 
 	// Make the search return chunks that belong to both doc-real and doc-fake.
 	// Since doc-fake is not in VDL, it should be filtered out.
@@ -230,7 +235,7 @@ func TestQueryService_BloomFilterFalsePositive(t *testing.T) {
 }
 
 func TestQueryService_PendingVersionRejected(t *testing.T) {
-	h := newQuerySvcHarness()
+	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
 	kbID := "kb-test"
@@ -258,7 +263,7 @@ func TestQueryService_PendingVersionRejected(t *testing.T) {
 }
 
 func TestQueryService_FailedVersionRejected(t *testing.T) {
-	h := newQuerySvcHarness()
+	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
 	kbID := "kb-test"
@@ -286,7 +291,7 @@ func TestQueryService_FailedVersionRejected(t *testing.T) {
 }
 
 func TestQueryService_ActiveVersionDefault(t *testing.T) {
-	h := newQuerySvcHarness()
+	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
 	kbID, vID := h.setupQueryableKB(t, map[string][]string{

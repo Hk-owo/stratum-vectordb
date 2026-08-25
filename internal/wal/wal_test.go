@@ -42,7 +42,7 @@ func TestFileWAL(t *testing.T) {
 	t.Run("recover: only BEGIN means nothing to resume", func(t *testing.T) {
 		path := tempWALPath(t)
 		w := mustOpenFileWAL(t, path)
-		if err := w.WriteBegin(ctx); err != nil {
+		if err := w.WriteBegin(ctx, "", 0, nil); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
 		mustCloseFileWAL(t, w)
@@ -61,7 +61,7 @@ func TestFileWAL(t *testing.T) {
 	t.Run("recover: BEGIN + VERSION_ID returns the versionID needing resumption", func(t *testing.T) {
 		path := tempWALPath(t)
 		w := mustOpenFileWAL(t, path)
-		if err := w.WriteBegin(ctx); err != nil {
+		if err := w.WriteBegin(ctx, "", 0, nil); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
 		if err := w.WriteVersionID(ctx, 5); err != nil {
@@ -80,10 +80,81 @@ func TestFileWAL(t *testing.T) {
 		}
 	})
 
+	t.Run("recover: BEGIN carries replay input (kbID/parentVersionID/changes)", func(t *testing.T) {
+		path := tempWALPath(t)
+		w := mustOpenFileWAL(t, path)
+		changes := []types.DocChange{
+			{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello world"},
+			{Op: types.ChangeOpUpdate, DocID: "doc-2", Content: "更新后的文档内容"},
+			{Op: types.ChangeOpDelete, DocID: "doc-3"},
+		}
+		if err := w.WriteBegin(ctx, "kb-1", 7, changes); err != nil {
+			t.Fatalf("WriteBegin: %v", err)
+		}
+		if err := w.WriteVersionID(ctx, 5); err != nil {
+			t.Fatalf("WriteVersionID: %v", err)
+		}
+		mustCloseFileWAL(t, w)
+
+		// Reopen: rebuildIndex must re-derive the BEGIN→VERSION_ID binding
+		// from the on-disk record order.
+		w2 := mustOpenFileWAL(t, path)
+		defer mustCloseFileWAL(t, w2)
+		pending, err := w2.Recover(ctx)
+		if err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		if len(pending) != 1 {
+			t.Fatalf("Recover() = %v, want exactly 1 pending record", pending)
+		}
+		got := pending[0]
+		if got.Type != types.PendingRecordTypeVersionWrite || got.VersionID != 5 ||
+			got.KBID != "kb-1" || got.ParentVersionID != 7 || len(got.Changes) != 3 {
+			t.Fatalf("Recover() = %+v, want {VersionWrite, VersionID:5, KBID:kb-1, ParentVersionID:7, Changes:3 entries}", got)
+		}
+		if got.Changes[0].Op != types.ChangeOpAdd || got.Changes[0].DocID != "doc-1" || got.Changes[0].Content != "hello world" {
+			t.Fatalf("Changes[0] = %+v, want {Add, doc-1, hello world}", got.Changes[0])
+		}
+		if got.Changes[1].Op != types.ChangeOpUpdate || got.Changes[1].Content != "更新后的文档内容" {
+			t.Fatalf("Changes[1] = %+v, want {Update, doc-2, 更新后的文档内容}", got.Changes[1])
+		}
+		if got.Changes[2].Op != types.ChangeOpDelete || got.Changes[2].DocID != "doc-3" {
+			t.Fatalf("Changes[2] = %+v, want {Delete, doc-3}", got.Changes[2])
+		}
+	})
+
+	t.Run("begin payload round-trips through encode/decode", func(t *testing.T) {
+		changes := []types.DocChange{
+			{Op: types.ChangeOpAdd, DocID: "a", Content: "内容 A"},
+			{Op: types.ChangeOpDelete, DocID: "b"},
+		}
+		payload := encodeBeginPayload("kb-9", 42, changes)
+		got, err := decodeBeginPayload(payload)
+		if err != nil {
+			t.Fatalf("decodeBeginPayload: %v", err)
+		}
+		if got.kbID != "kb-9" || got.parentVersionID != 42 || len(got.changes) != 2 {
+			t.Fatalf("decoded = %+v, want {kb-9, 42, 2 changes}", got)
+		}
+		if got.changes[0] != changes[0] || got.changes[1] != changes[1] {
+			t.Fatalf("decoded changes = %+v, want %+v", got.changes, changes)
+		}
+	})
+
+	t.Run("begin payload: legacy empty payload decodes to zero data", func(t *testing.T) {
+		got, err := decodeBeginPayload(nil)
+		if err != nil {
+			t.Fatalf("decodeBeginPayload(nil): %v", err)
+		}
+		if got.kbID != "" || got.parentVersionID != 0 || got.changes != nil {
+			t.Fatalf("decoded = %+v, want all-zero beginData (legacy BEGIN)", got)
+		}
+	})
+
 	t.Run("recover: full transaction has nothing pending", func(t *testing.T) {
 		path := tempWALPath(t)
 		w := mustOpenFileWAL(t, path)
-		if err := w.WriteBegin(ctx); err != nil {
+		if err := w.WriteBegin(ctx, "", 0, nil); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
 		if err := w.WriteVersionID(ctx, 5); err != nil {
@@ -230,7 +301,7 @@ func TestFileWAL_PhysicalTruncation(t *testing.T) {
 	t.Run("truncating mid-write of the last record does not corrupt earlier records", func(t *testing.T) {
 		path := tempWALPath(t)
 		w := mustOpenFileWAL(t, path)
-		if err := w.WriteBegin(ctx); err != nil {
+		if err := w.WriteBegin(ctx, "", 0, nil); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
 		if err := w.WriteVersionID(ctx, 5); err != nil {
@@ -258,7 +329,7 @@ func TestFileWAL_PhysicalTruncation(t *testing.T) {
 	t.Run("truncating to exactly zero bytes recovers to nothing pending", func(t *testing.T) {
 		path := tempWALPath(t)
 		w := mustOpenFileWAL(t, path)
-		if err := w.WriteBegin(ctx); err != nil {
+		if err := w.WriteBegin(ctx, "", 0, nil); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
 		mustCloseFileWAL(t, w)

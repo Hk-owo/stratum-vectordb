@@ -79,6 +79,9 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   grpc::Status Load(grpc::ServerContext* context,
                      const ::vecstore::LoadIndexRequest* request,
                      ::vecstore::LoadIndexResponse* response) override;
+  grpc::Status ExistsIndex(grpc::ServerContext* context,
+                            const ::vecstore::ExistsIndexRequest* request,
+                            ::vecstore::ExistsIndexResponse* response) override;
   grpc::Status Reset(grpc::ServerContext* context,
                       const ::vecstore::ResetIndexRequest* request,
                       ::vecstore::ResetIndexResponse* response) override;
@@ -90,6 +93,10 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // HNSWVectorIndex if one does not already exist. Must be called with
   // mu_ held.
   VectorIndex* GetOrCreateLocked(const IndexKey& key);
+
+  // FileExists reports whether path exists and is a regular file. Used by
+  // ExistsIndex's stateless on-disk existence check.
+  static bool FileExists(const std::string& path);
 
   std::mutex mu_;
   std::map<IndexKey, std::unique_ptr<VectorIndex>> indexes_;

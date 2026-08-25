@@ -44,7 +44,7 @@ const (
 // condition, not a real error condition.
 //
 // Payload layouts:
-//   - BEGIN: empty.
+//   - BEGIN: encoded transaction replay input — see encodeBeginPayload.
 //   - VERSION_ID, COMMIT: 8-byte big-endian versionID.
 //   - DELETE_MARK, DELETE_COMPLETE: raw kbID bytes (no length prefix
 //     needed within the payload, since the outer record framing already
@@ -56,6 +56,136 @@ const (
 	recordHeaderLen = 1 + 4 // type + length
 	recordCRCLen    = 4
 )
+
+// maxSanePayload bounds the payload length readRecord will accept before
+// treating a record as corrupt garbage. The largest legitimate payload is
+// a BEGIN record carrying a CreateVersion's full changes list (documents
+// can be arbitrarily large), so this is deliberately generous; the bound
+// still protects against a corrupt length prefix claiming a multi-GB
+// payload and forcing a huge allocation.
+const maxSanePayload = 1 << 26 // 64 MiB
+
+// beginData is the replay input persisted inside a BEGIN record. The
+// recovery path for a VERSION_ID-without-COMMIT record needs the original
+// kbID, parentVersionID and changes to replay the storage writes from
+// scratch (steps 3-6 of the write path); a crash may have left only a
+// subset of those writes on disk, and that subset cannot be inferred back
+// into the missing documents.
+type beginData struct {
+	kbID            string
+	parentVersionID int64
+	changes         []types.DocChange
+}
+
+// encodeBeginPayload serializes a BEGIN record's replay input:
+//
+//	kbID:            uint32 big-endian length + raw bytes
+//	parentVersionID: int64 big-endian
+//	changeCount:     uint32 big-endian
+//	per change:
+//	  op:      single byte (types.ChangeOp)
+//	  docID:   uint32 big-endian length + raw bytes
+//	  content: uint32 big-endian length + raw bytes
+func encodeBeginPayload(kbID string, parentVersionID int64, changes []types.DocChange) []byte {
+	payload := make([]byte, 4+len(kbID)+8+4)
+	binary.BigEndian.PutUint32(payload[:4], uint32(len(kbID)))
+	copy(payload[4:], kbID)
+	off := 4 + len(kbID)
+	binary.BigEndian.PutUint64(payload[off:off+8], uint64(parentVersionID))
+	off += 8
+	binary.BigEndian.PutUint32(payload[off:off+4], uint32(len(changes)))
+	off += 4
+	for _, ch := range changes {
+		payload = append(payload, 0)
+		payload[off] = byte(ch.Op)
+		off++
+		payload = append(payload, make([]byte, 4+len(ch.DocID)+4+len(ch.Content))...)
+		binary.BigEndian.PutUint32(payload[off:off+4], uint32(len(ch.DocID)))
+		off += 4
+		copy(payload[off:], ch.DocID)
+		off += len(ch.DocID)
+		binary.BigEndian.PutUint32(payload[off:off+4], uint32(len(ch.Content)))
+		off += 4
+		copy(payload[off:], ch.Content)
+		off += len(ch.Content)
+	}
+	return payload
+}
+
+// decodeBeginPayload parses a BEGIN record's payload back into its replay
+// input. An empty payload (written by an older WAL format whose BEGIN
+// records carried no data) yields a zero beginData with nil changes.
+func decodeBeginPayload(payload []byte) (beginData, error) {
+	if len(payload) == 0 {
+		// Legacy empty BEGIN record: no replay input available.
+		return beginData{}, nil
+	}
+	need := func(n int) error {
+		if len(payload) < n {
+			return fmt.Errorf("wal: truncated BEGIN payload (need %d bytes, have %d)", n, len(payload))
+		}
+		return nil
+	}
+	if err := need(4 + 8 + 4); err != nil {
+		return beginData{}, err
+	}
+	kbLen := binary.BigEndian.Uint32(payload[:4])
+	off := 4
+	if err := need(off + int(kbLen)); err != nil {
+		return beginData{}, err
+	}
+	kbID := string(payload[off : off+int(kbLen)])
+	off += int(kbLen)
+	parentVersionID := int64(binary.BigEndian.Uint64(payload[off : off+8]))
+	off += 8
+	count := binary.BigEndian.Uint32(payload[off : off+4])
+	off += 4
+	changes := make([]types.DocChange, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if err := need(off + 1); err != nil {
+			return beginData{}, err
+		}
+		op := types.ChangeOp(payload[off])
+		off++
+		readStr := func() (string, error) {
+			if err := need(off + 4); err != nil {
+				return "", err
+			}
+			n := binary.BigEndian.Uint32(payload[off : off+4])
+			off += 4
+			if err := need(off + int(n)); err != nil {
+				return "", err
+			}
+			s := string(payload[off : off+int(n)])
+			off += int(n)
+			return s, nil
+		}
+		docID, err := readStr()
+		if err != nil {
+			return beginData{}, err
+		}
+		content, err := readStr()
+		if err != nil {
+			return beginData{}, err
+		}
+		changes = append(changes, types.DocChange{Op: op, DocID: docID, Content: content})
+	}
+	return beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}, nil
+}
+
+// replayKey is the map key for replay-failure counters. PendingRecord
+// itself cannot be a map key (it carries a slice: Changes), and the
+// counters only need to identify a record by type + KB + version — not by
+// its full replay payload.
+type replayKey struct {
+	typ       types.PendingRecordType
+	kbID      string
+	versionID int64
+}
+
+func makeReplayKey(rec types.PendingRecord) replayKey {
+	return replayKey{typ: rec.Type, kbID: rec.KBID, versionID: rec.VersionID}
+}
 
 // FileWAL is the real, disk-persistent WAL implementation: an append-only
 // binary log plus an in-memory index (rebuilt by scanning the file once,
@@ -83,7 +213,16 @@ type FileWAL struct {
 	versionDeleteMarked map[int64]string // versionID -> kbID
 	versionDeleteDone   map[int64]bool
 
-	replayCounters map[types.PendingRecord]int
+	// beginDataByVersion maps each versionID whose VERSION_ID record is in
+	// the log to the replay input of the BEGIN record that preceded it.
+	// Populated during rebuildIndex (sequential scan: the most recent
+	// unpaired BEGIN binds to the next VERSION_ID; correctness relies on
+	// the coordinator serializing each CreateVersion transaction end to
+	// end, so no other BEGIN can interleave) and consulted by Recover to
+	// fill PendingRecord.ParentVersionID / Changes.
+	beginDataByVersion map[int64]beginData
+
+	replayCounters map[replayKey]int
 }
 
 // NewFileWAL opens (creating if necessary) the WAL file at path, scans any
@@ -103,7 +242,8 @@ func NewFileWAL(path string) (*FileWAL, error) {
 		deleteCompleted:     make(map[string]bool),
 		versionDeleteMarked: make(map[int64]string),
 		versionDeleteDone:   make(map[int64]bool),
-		replayCounters:      make(map[types.PendingRecord]int),
+		beginDataByVersion:  make(map[int64]beginData),
+		replayCounters:      make(map[replayKey]int),
 	}
 
 	if err := w.rebuildIndex(); err != nil {
@@ -134,10 +274,20 @@ func (w *FileWAL) rebuildIndex() error {
 	r := bufio.NewReader(w.file)
 
 	var validEnd int64
+	var lastBegin *beginData // most recent unpaired BEGIN, binds to the next VERSION_ID
 	for {
 		rec, recLen, err := readRecord(r)
 		if err != nil {
 			break // incomplete/corrupt trailing record, or clean EOF: stop here
+		}
+		if rec.kind == recordTypeBegin {
+			bd := rec.begin
+			lastBegin = &bd
+		} else if rec.kind == recordTypeVersionID {
+			if lastBegin != nil {
+				w.beginDataByVersion[rec.versionID] = *lastBegin
+				lastBegin = nil
+			}
 		}
 		w.applyRecordLocked(rec)
 		validEnd += recLen
@@ -162,6 +312,7 @@ type parsedRecord struct {
 	kind      recordType
 	versionID int64
 	kbID      string
+	begin     beginData // populated for recordTypeBegin
 }
 
 // readRecord reads and validates a single record from r, returning the
@@ -179,10 +330,9 @@ func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 
 	// Sanity bound: a corrupt length prefix (e.g. from garbage bytes
 	// matching the partial-record test scenario) could otherwise claim an
-	// enormous payload and force a huge allocation. No real WAL payload
-	// approaches this size (the largest payload is an 8-byte versionID or
-	// a kbID string), so treat anything over 1 MiB as corrupt.
-	const maxSanePayload = 1 << 20
+	// enormous payload and force a huge allocation. The bound (see
+	// maxSanePayload) is generous enough for legitimate BEGIN records
+	// carrying a full changes list.
 	if payloadLen > maxSanePayload {
 		return parsedRecord{}, 0, fmt.Errorf("wal: implausible payload length %d, treating as corrupt trailing record", payloadLen)
 	}
@@ -207,7 +357,11 @@ func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 	rec := parsedRecord{kind: kind}
 	switch kind {
 	case recordTypeBegin:
-		// no payload
+		bd, err := decodeBeginPayload(payload)
+		if err != nil {
+			return parsedRecord{}, 0, fmt.Errorf("wal: corrupt BEGIN payload: %w", err)
+		}
+		rec.begin = bd
 	case recordTypeVersionID, recordTypeCommit:
 		if len(payload) != 8 {
 			return parsedRecord{}, 0, fmt.Errorf("wal: malformed versionID payload length %d", len(payload))
@@ -279,10 +433,10 @@ func (w *FileWAL) writeRecordLocked(kind recordType, payload []byte) error {
 	return w.file.Sync()
 }
 
-func (w *FileWAL) WriteBegin(_ context.Context) error {
+func (w *FileWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int64, changes []types.DocChange) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := w.writeRecordLocked(recordTypeBegin, nil); err != nil {
+	if err := w.writeRecordLocked(recordTypeBegin, encodeBeginPayload(kbID, parentVersionID, changes)); err != nil {
 		return fmt.Errorf("wal: WriteBegin: %w", err)
 	}
 	return nil
@@ -395,7 +549,18 @@ func (w *FileWAL) Recover(_ context.Context) ([]types.PendingRecord, error) {
 	var out []types.PendingRecord
 	for versionID, written := range w.versionIDsWritten {
 		if written && !w.committedVersions[versionID] {
-			out = append(out, types.PendingRecord{Type: types.PendingRecordTypeVersionWrite, VersionID: versionID})
+			rec := types.PendingRecord{Type: types.PendingRecordTypeVersionWrite, VersionID: versionID}
+			if bd, ok := w.beginDataByVersion[versionID]; ok {
+				rec.KBID = bd.kbID
+				rec.ParentVersionID = bd.parentVersionID
+				rec.Changes = bd.changes
+			}
+			// A versionID without bound BEGIN data (nil Changes) means the
+			// VERSION_ID was applied by a node that never ran the local
+			// Execute (a follower applying leader's log), or was written
+			// by an older WAL format. It cannot be replayed locally; the
+			// caller decides how to handle it (see Recover's doc comment).
+			out = append(out, rec)
 		}
 	}
 	for kbID := range w.deleteMarked {
@@ -416,7 +581,10 @@ func (w *FileWAL) GetReplayCounters() []types.ReplayCounter {
 	defer w.mu.Unlock()
 	out := make([]types.ReplayCounter, 0, len(w.replayCounters))
 	for rec, count := range w.replayCounters {
-		out = append(out, types.ReplayCounter{Record: rec, RetryCount: count})
+		out = append(out, types.ReplayCounter{
+			Record:     types.PendingRecord{Type: rec.typ, KBID: rec.kbID, VersionID: rec.versionID},
+			RetryCount: count,
+		})
 	}
 	return out
 }
@@ -429,7 +597,7 @@ func (w *FileWAL) GetReplayCounters() []types.ReplayCounter {
 func (w *FileWAL) IncrementReplayCounter(rec types.PendingRecord) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.replayCounters[rec]++
+	w.replayCounters[makeReplayKey(rec)]++
 }
 
 var _ WAL = (*FileWAL)(nil)

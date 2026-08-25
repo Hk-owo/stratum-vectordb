@@ -28,7 +28,7 @@ type QueryServiceImpl struct {
 	chunkDocMapper chunkdoc.ChunkDocMapper
 	versionDocList versiondoc.VersionDocList
 	docStore       docstore.DocStore
-	versionBloom   bloom.BloomFilter
+	vBloomStore    *bloom.VersionBloomStore
 }
 
 // NewQueryService constructs a QueryServiceImpl.
@@ -38,7 +38,7 @@ func NewQueryService(
 	cdm chunkdoc.ChunkDocMapper,
 	vdl versiondoc.VersionDocList,
 	ds docstore.DocStore,
-	vBloom bloom.BloomFilter,
+	vBloomStore *bloom.VersionBloomStore,
 ) *QueryServiceImpl {
 	return &QueryServiceImpl{
 		raftNode:       rn,
@@ -46,7 +46,7 @@ func NewQueryService(
 		chunkDocMapper: cdm,
 		versionDocList: vdl,
 		docStore:       ds,
-		versionBloom:   vBloom,
+		vBloomStore:    vBloomStore,
 	}
 }
 
@@ -125,6 +125,12 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	}
 	docMap := make(map[string]*docScore)
 
+	// Per-version document bloom filter. A Get failure (e.g. the version's
+	// doc list is temporarily unavailable) degrades to no filtering: the
+	// authoritative confirmations below still keep results correct, at the
+	// cost of extra work.
+	vBloom, vBloomErr := s.vBloomStore.Get(ctx, kbID, versionID)
+
 	for _, r := range searchResults {
 		if r.Score < threshold {
 			continue
@@ -134,9 +140,15 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 			continue
 		}
 		for _, docID := range docIDs {
-			// Version filter: bloom check then authoritative check.
-			if s.versionBloom.Test(docID) {
-				// Confirm against version doc list.
+			// Version filter: a bloom miss means the document is
+			// definitely not in this version's document set (no false
+			// negatives), so it is skipped without an authoritative
+			// check. A bloom hit may be a false positive, so it is
+			// confirmed against the version doc list.
+			if vBloomErr == nil {
+				if !vBloom.Test(docID) {
+					continue
+				}
 				vdocs, err := s.versionDocList.ListDocIDs(ctx, kbID, versionID)
 				if err != nil {
 					continue

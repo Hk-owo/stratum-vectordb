@@ -48,9 +48,8 @@ type BuildCompleteCallback func(kbID string, versionID int64, status types.Index
 //
 // Build-callback retries: when a BuildCompleteCallback returns an error
 // (e.g. the underlying RaftNode.ProposeUpdateVersionStatus call failed),
-// the implementation retries with exponential backoff; once retries are
-// exhausted the (kbID, versionID) is added to an in-memory "needs repair"
-// set that a background goroutine periodically rescans.
+// the implementation retries with exponential backoff up to
+// CallbackMaxRetries, then logs the failure.
 type IndexManager interface {
 	// Search loads versionID's index (LRU semantics; a cold version is
 	// loaded on demand), increments its reference count for the duration
@@ -72,6 +71,15 @@ type IndexManager interface {
 	// beyond "registered callbacks are invoked."
 	RegisterBuildCallback(cb BuildCompleteCallback)
 
+	// IndexExists reports whether a persisted index for (kbID, versionID)
+	// exists on disk at this node's index directory (both the Faiss file
+	// and its sidecar). Stateless on the vecstore side — it inspects the
+	// filesystem, so it answers correctly even right after a vecstore
+	// restart. This is the authoritative "is this version's index built
+	// and durable" fact that the startup reconcile derives READY status
+	// from.
+	IndexExists(ctx context.Context, kbID string, versionID int64) (bool, error)
+
 	// Evict removes a single version's index from memory (if loaded; a
 	// no-op otherwise).
 	Evict(ctx context.Context, kbID string, versionID int64) error
@@ -86,6 +94,21 @@ type IndexManager interface {
 	// EvictByKB removes every loaded index belonging to kbID. Used by
 	// knowledge base deletion.
 	EvictByKB(ctx context.Context, kbID string) error
+
+	// DeleteFilesByKB deletes kbID's on-disk persisted index files
+	// (<IndexDataDir>/index/<kbID>/), ignoring a missing directory
+	// (ErrNotExist) so re-running the delete flow after a crash is safe.
+	// In-memory entries are NOT touched — callers pair this with
+	// EvictByKB. Used by knowledge base deletion (Stratum_设计文档v10.md
+	// "删除知识库" 第 4 步). No-op when disk persistence is unconfigured.
+	DeleteFilesByKB(ctx context.Context, kbID string) error
+
+	// EnforceDiskRetention applies the per-KB on-disk retention policy:
+	// keeps the most recent cfg.IndexRetentionCount index files per
+	// knowledge base and deletes older ones (plus sidecars). protectedIDs
+	// are never deleted (used to shield the active version). Missing
+	// files/directories are ignored; no-op when retention is unconfigured.
+	EnforceDiskRetention(ctx context.Context, kbID string, protectedIDs []int64) error
 
 	// Ping is a lightweight health probe: it reports whether IndexManager
 	// itself is operating normally, without loading any index or touching

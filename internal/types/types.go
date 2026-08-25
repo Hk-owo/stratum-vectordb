@@ -200,6 +200,17 @@ type PendingRecord struct {
 	Type      PendingRecordType
 	KBID      string // used by PendingRecordTypeDeleteMark
 	VersionID int64  // used by PendingRecordTypeVersionWrite
+
+	// ParentVersionID and Changes are carried by
+	// PendingRecordTypeVersionWrite only: the recovery path replays the
+	// version's storage writes (steps 3-6 of the write path) from scratch
+	// using these, so the WAL must persist them alongside the transaction.
+	// A PendingRecord whose Changes is nil was written by an older WAL
+	// format (BEGIN carried no payload) and cannot be replayed
+	// automatically — the operator must intervene (see the WAL package
+	// doc comment).
+	ParentVersionID int64
+	Changes         []DocChange
 }
 
 // ClusterStatus is Raft cluster connectivity status; it does not depend on

@@ -69,7 +69,7 @@ func newTestCluster(t testing.TB) *testCluster {
 	vd := versiondoc.NewMockVersionDocList()
 	ec := embed.NewMockEmbedClient(4) // 4-dim vectors
 	chunkBF := bloom.NewMockBloomFilter()
-	versionBF := bloom.NewMockBloomFilter()
+	vBloomStore := bloom.NewVersionBloomStore(t.TempDir(), 4096, 0.01, vd)
 
 	// Use mock index manager that integrates with the mock stores.
 	im := index.NewMockIndexManager(index.MockIndexManagerDeps{
@@ -122,7 +122,7 @@ func newTestCluster(t testing.TB) *testCluster {
 		DocStore:            ds,
 		VersionDocList:      vd,
 	}))
-	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, versionBF)
+	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, vBloomStore)
 	adminSvc := service.NewAdminService(1, rn, im, ds, cs, w)
 
 	srv := grpc.NewServer()
@@ -724,7 +724,7 @@ func TestIntegration_CrashRecovery_VersionWriteResume(t *testing.T) {
 
 	// WAL has versionID=1 (from CreateKB) and any further versions from
 	// the initial setup. Add versionID=5 as a simulated crash residual.
-	cluster.WAL.WriteBegin(ctx)
+	cluster.WAL.WriteBegin(ctx, "", 0, nil)
 	cluster.WAL.WriteVersionID(ctx, 5)
 
 	records, err := cluster.WAL.Recover(ctx)

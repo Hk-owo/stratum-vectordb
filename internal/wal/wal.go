@@ -22,7 +22,14 @@ import (
 //     WriteDeleteComplete.
 //
 // Record semantics:
-//   - WriteBegin: transaction-start marker, no parameters.
+//   - WriteBegin: transaction-start marker carrying the transaction's full
+//     replay input — kbID, parentVersionID and the complete changes list.
+//     The recovery path for a VERSION_ID-without-COMMIT record replays
+//     steps 3-6 of the write path from scratch, which requires the
+//     original changes; persisting them here is what makes a full replay
+//     possible (a crash before WriteCommit may have left only a subset of
+//     the storage writes on disk, and that subset alone cannot be
+//     inferred back into the missing documents).
 //   - WriteVersionID: called by the Raft state machine's apply phase,
 //     written before the version ID is assigned into the state machine.
 //     Idempotent: writing the same versionID again returns success. On
@@ -38,10 +45,14 @@ import (
 //     re-proposes from scratch. Recover returns no PendingRecord for this
 //     case — there is nothing to resume.
 //   - VERSION_ID with no COMMIT: Raft apply completed; Recover returns a
-//     PendingRecord{Type: PendingRecordTypeVersionWrite, VersionID: ...}
-//     so the caller can skip re-proposing and replay storage writes from
-//     the start using the recorded versionID. Every storage write is
-//     idempotent, so a full replay is always safe.
+//     PendingRecord{Type: PendingRecordTypeVersionWrite, VersionID: ...,
+//     ParentVersionID: ..., Changes: ...} so the caller can skip
+//     re-proposing and replay storage writes from the start using the
+//     recorded versionID and the transaction's persisted changes. Every
+//     storage write is idempotent, so a full replay is always safe.
+//     A PendingRecord with nil Changes was written by an older WAL format
+//     (BEGIN carried an empty payload); it cannot be replayed
+//     automatically and requires operator intervention.
 //   - COMMIT present but the version's IndexStatus is still PENDING: the
 //     caller checks whether the index file already exists on disk — if
 //     so, propose READY directly; if not, trigger an async build. (This
@@ -50,10 +61,15 @@ import (
 //   - DELETE_MARK with no DELETE_COMPLETE: Recover returns a
 //     PendingRecord{Type: PendingRecordTypeDeleteMark, KBID: ...} so the
 //     caller can resume the DeleteKnowledgeBase cleanup flow.
+//   - VERSION_DELETE_MARK with no VERSION_DELETE_COMPLETE: Recover
+//     returns a PendingRecord{Type: PendingRecordTypeVersionDelete,
+//     KBID: ..., VersionID: ...} so the caller can resume the DeleteVersion
+//     cleanup flow.
 type WAL interface {
 	// WriteBegin writes a transaction-start marker for a new CreateVersion
-	// flow.
-	WriteBegin(ctx context.Context) error
+	// flow, persisting the replay input (kbID, parentVersionID, changes)
+	// inside the record so crash recovery can replay the storage writes.
+	WriteBegin(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange) error
 
 	// WriteVersionID records that Raft apply has assigned versionID to
 	// the in-flight transaction. Idempotent: repeated calls with the same
@@ -90,4 +106,9 @@ type WAL interface {
 	// GetSystemStatus so operators can see WAL records whose replay keeps
 	// failing.
 	GetReplayCounters() []types.ReplayCounter
+
+	// IncrementReplayCounter records a replay failure against rec. Called
+	// by the crash-recovery path when a PendingRecord cannot be replayed
+	// (transient error or missing replay input). In-memory only.
+	IncrementReplayCounter(rec types.PendingRecord)
 }

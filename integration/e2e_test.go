@@ -280,7 +280,7 @@ func newRealNodeWithAddrsAndDir(t *testing.T, nodeID int64, peers []raft.PeerCon
 
 	ec := embed.NewHTTPEmbedClient(embedAddr, 30*time.Second)
 	chunkBF := bloom.NewBitsAndBloomsFilter(4096, 0.01)
-	versionBF := bloom.NewBitsAndBloomsFilter(4096, 0.01)
+	vBloomStore := bloom.NewVersionBloomStore(t.TempDir(), 4096, 0.01, vd)
 	sp := splitter.NewSlidingWindowSplitter()
 
 	im := index.NewIndexManager(index.IndexManagerConfig{
@@ -340,7 +340,7 @@ func newRealNodeWithAddrsAndDir(t *testing.T, nodeID int64, peers []raft.PeerCon
 		DocStore:            ds,
 		VersionDocList:      vd,
 	}))
-	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, versionBF)
+	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, vBloomStore)
 	adminSvc := service.NewAdminService(nodeID, rn, im, ds, cs, w)
 
 	srv := grpc.NewServer()

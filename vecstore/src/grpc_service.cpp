@@ -1,5 +1,7 @@
 #include "vecstore/src/grpc_service.h"
 
+#include <sys/stat.h>
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -209,6 +211,26 @@ grpc::Status VectorIndexServiceImpl::Load(grpc::ServerContext* /*context*/,
   std::lock_guard<std::mutex> lock(mu_);
   VectorIndex* index = GetOrCreateLocked(key);
   return ToGrpcStatus(index->Load(request->path()));
+}
+
+grpc::Status VectorIndexServiceImpl::ExistsIndex(grpc::ServerContext* /*context*/,
+                                                  const ::vecstore::ExistsIndexRequest* request,
+                                                  ::vecstore::ExistsIndexResponse* response) {
+  // Stateless: inspect the filesystem only. A persisted index consists of
+  // the Faiss file plus the .ids sidecar — both must exist for Load to
+  // succeed (see HNSWVectorIndex::Load). This answers correctly even right
+  // after this process restarted, when indexes_ is empty but the on-disk
+  // files from a previous run are still there.
+  const std::string path = request->path();
+  response->set_exists(FileExists(path) && FileExists(path + ".ids"));
+  return grpc::Status::OK;
+}
+
+// FileExists reports whether path exists and is a regular file. Used by
+// ExistsIndex.
+bool VectorIndexServiceImpl::FileExists(const std::string& path) {
+  struct stat st {};
+  return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
 grpc::Status VectorIndexServiceImpl::Reset(grpc::ServerContext* /*context*/,

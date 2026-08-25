@@ -4,12 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	vecstorepb "stratum/api/proto/vecstore"
 	stratumerrors "stratum/internal/errors"
@@ -20,12 +24,12 @@ import (
 
 // mockVectorIndexClient implements vecstorepb.VectorIndexServiceClient for tests.
 type mockVectorIndexClient struct {
-	mu    sync.Mutex
-	built map[indexKey][]types.SearchResult // stored results for Search
-	buildErr error         // injectable build failure
-	searchFn func(kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) // per-call override
-	buildCalls     int // number of Build RPC invocations
-	addChunksCalls int // number of AddChunks RPC invocations
+	mu             sync.Mutex
+	built          map[indexKey][]types.SearchResult                                                            // stored results for Search
+	buildErr       error                                                                                        // injectable build failure
+	searchFn       func(kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) // per-call override
+	buildCalls     int                                                                                          // number of Build RPC invocations
+	addChunksCalls int                                                                                          // number of AddChunks RPC invocations
 }
 
 func newMockVectorIndexClient() *mockVectorIndexClient {
@@ -107,8 +111,21 @@ func (m *mockVectorIndexClient) Save(_ context.Context, _ *vecstorepb.SaveIndexR
 	return &vecstorepb.SaveIndexResponse{}, nil
 }
 
-func (m *mockVectorIndexClient) Load(_ context.Context, _ *vecstorepb.LoadIndexRequest, _ ...grpc.CallOption) (*vecstorepb.LoadIndexResponse, error) {
+func (m *mockVectorIndexClient) Load(_ context.Context, in *vecstorepb.LoadIndexRequest, _ ...grpc.CallOption) (*vecstorepb.LoadIndexResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.built[indexKey{kbID: in.KbId, versionID: in.VersionId}]; !ok {
+		// Mirrors the real vecstore: loading a never-built index fails.
+		return nil, status.Error(codes.NotFound, "no index built or loaded")
+	}
 	return &vecstorepb.LoadIndexResponse{}, nil
+}
+
+func (m *mockVectorIndexClient) ExistsIndex(_ context.Context, in *vecstorepb.ExistsIndexRequest, _ ...grpc.CallOption) (*vecstorepb.ExistsIndexResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.built[indexKey{kbID: in.KbId, versionID: in.VersionId}]
+	return &vecstorepb.ExistsIndexResponse{Exists: ok}, nil
 }
 
 func (m *mockVectorIndexClient) Reset(_ context.Context, _ *vecstorepb.ResetIndexRequest, _ ...grpc.CallOption) (*vecstorepb.ResetIndexResponse, error) {
@@ -118,10 +135,10 @@ func (m *mockVectorIndexClient) Reset(_ context.Context, _ *vecstorepb.ResetInde
 // docSource is a test double providing VersionDocList + ChunkDocMapper + ChunkStore
 // data for IndexManagerImpl builds.
 type docSource struct {
-	mu        sync.Mutex
-	docs      map[int64][]string           // versionID -> []docID
-	chunks    map[string][]string           // docID -> []chunkID
-	vectors   map[string][]float32          // chunkID -> vector
+	mu      sync.Mutex
+	docs    map[int64][]string   // versionID -> []docID
+	chunks  map[string][]string  // docID -> []chunkID
+	vectors map[string][]float32 // chunkID -> vector
 }
 
 func newDocSource() *docSource {
@@ -236,10 +253,10 @@ func TestIndexManager_TriggerBuildFailure(t *testing.T) {
 	ds.addDoc(1, "doc-1", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.1}})
 
 	cfg := IndexManagerConfig{
-		LRUCapacity:            4,
-		LoadWaitTimeout:        5 * time.Second,
-		CallbackMaxRetries:     2,
-		CallbackRetryBaseMS:    10,
+		LRUCapacity:         4,
+		LoadWaitTimeout:     5 * time.Second,
+		CallbackMaxRetries:  2,
+		CallbackRetryBaseMS: 10,
 	}
 	im := NewIndexManager(cfg)
 	im.vectorIndexClient = vc
@@ -605,10 +622,10 @@ func TestIndexManager_BuildCallbackRetrySuccess(t *testing.T) {
 	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
 
 	cfg := IndexManagerConfig{
-		LRUCapacity:          4,
-		LoadWaitTimeout:      5 * time.Second,
-		CallbackMaxRetries:   3,
-		CallbackRetryBaseMS:  10,
+		LRUCapacity:         4,
+		LoadWaitTimeout:     5 * time.Second,
+		CallbackMaxRetries:  3,
+		CallbackRetryBaseMS: 10,
 	}
 	im := NewIndexManager(cfg)
 	im.vectorIndexClient = vc
@@ -651,5 +668,314 @@ func TestIndexManager_SearchRespectsContext(t *testing.T) {
 	_, err := im.Search(ctx, "kb-1", 1, []float32{0.1, 0.2, 0.3}, 2)
 	if err == nil {
 		t.Fatal("expected context error, got nil")
+	}
+}
+
+// TestIndexManager_BuildPersistsAndExists verifies that a build with a
+// configured IndexDataDir persists the index (Save RPC) and that
+// IndexExists reflects the on-disk fact.
+func TestIndexManager_BuildPersistsAndExists(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+
+	cfg := IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+		IndexDataDir:    t.TempDir(),
+	}
+	im := NewIndexManager(cfg)
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+	defer im.Close()
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	exists, err := im.IndexExists(context.Background(), "kb-1", 1)
+	if err != nil {
+		t.Fatalf("IndexExists: %v", err)
+	}
+	if !exists {
+		t.Error("IndexExists = false after a persisted build, want true")
+	}
+	// A never-built version must report false.
+	exists2, err := im.IndexExists(context.Background(), "kb-1", 99)
+	if err != nil {
+		t.Fatalf("IndexExists (unbuilt): %v", err)
+	}
+	if exists2 {
+		t.Error("IndexExists = true for a never-built version, want false")
+	}
+}
+
+// TestIndexManager_SearchRestoresFromDisk verifies that after the in-memory
+// entry is gone (evicted / process restart), Search restores the index via
+// the Load RPC instead of failing with ErrIndexNotReady.
+func TestIndexManager_SearchRestoresFromDisk(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+
+	cfg := IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+		IndexDataDir:    t.TempDir(),
+	}
+	im := NewIndexManager(cfg)
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+	defer im.Close()
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := im.Evict(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	// Search must restore from disk (Load RPC) and succeed.
+	_, err := im.Search(context.Background(), "kb-1", 1, []float32{0.5, 0.5}, 5)
+	if err != nil {
+		t.Fatalf("Search after evict: %v", err)
+	}
+	if !im.IsLoaded("kb-1", 1) {
+		t.Error("index should be loaded again after Search restore")
+	}
+}
+
+// TestIndexManager_MemoryThresholdEviction verifies that when
+// MemoryThresholdMB is set, a new build evicts least-recently-used,
+// ref-count-zero indexes once the estimated in-memory footprint exceeds
+// the threshold — even while len(loaded) is still below LRUCapacity.
+func TestIndexManager_MemoryThresholdEviction(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	// 768-dim vectors, 342 chunks => ~1.05 MiB of vector payload per index,
+	// just over the 1 MiB threshold.
+	vec := make([]float32, 768)
+	for i := range vec {
+		vec[i] = float32(i % 7)
+	}
+	for v, prefix := range map[int64]string{1: "a-", 2: "b-"} {
+		chunks := make([]string, 342)
+		vectors := make(map[string][]float32, 342)
+		for i := range chunks {
+			id := fmt.Sprintf("%s%d", prefix, i)
+			chunks[i] = id
+			vectors[id] = vec
+		}
+		ds.addDoc(v, fmt.Sprintf("doc-%d", v), chunks, vectors)
+	}
+
+	cfg := IndexManagerConfig{
+		LRUCapacity:       4, // count limit high enough that only bytes trigger eviction
+		LoadWaitTimeout:   5 * time.Second,
+		MemoryThresholdMB: 1, // 1 MiB threshold, each index ~1.05 MiB
+		VecstoreAddr:      "unused",
+		IndexDataDir:      t.TempDir(),
+	}
+	im := NewIndexManager(cfg)
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+	defer im.Close()
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild(1): %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := im.TriggerBuild(context.Background(), "kb-1", 2); err != nil {
+		t.Fatalf("TriggerBuild(2): %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if im.IsLoaded("kb-1", 1) {
+		t.Error("version 1 index should have been evicted by the memory threshold")
+	}
+	if !im.IsLoaded("kb-1", 2) {
+		t.Error("version 2 index should be loaded")
+	}
+	im.mu.Lock()
+	bytes := im.loadedBytes
+	im.mu.Unlock()
+	if bytes <= 0 {
+		t.Errorf("loadedBytes = %d, want > 0 (size accounting)", bytes)
+	}
+}
+
+// TestIndexManager_EnforceDiskRetention verifies the on-disk retention
+// policy: only the most recent IndexRetentionCount index files (per KB)
+// survive, older files and their sidecars are deleted, protectedIDs are
+// never deleted, and missing files/dirs are ignored (idempotent).
+func TestIndexManager_EnforceDiskRetention(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "index", "kb-1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, base := range []string{"1", "2", "3"} {
+		for _, suffix := range []string{".index", ".index.ids", ".index.mem"} {
+			if err := os.WriteFile(filepath.Join(dir, base+suffix), []byte("x"), 0o644); err != nil {
+				t.Fatalf("write %s: %v", base+suffix, err)
+			}
+		}
+	}
+	// Unrelated KB directory must not be touched.
+	otherDir := filepath.Join(t.TempDir(), "index", "kb-other")
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatalf("mkdir other: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(otherDir, "9.index"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write other: %v", err)
+	}
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:         4,
+		LoadWaitTimeout:     5 * time.Second,
+		IndexDataDir:        filepath.Dir(filepath.Dir(dir)), // t.TempDir()
+		IndexRetentionCount: 1,                               // keep the newest 1, unless protected
+	})
+	im.vectorIndexClient = newMockVectorIndexClient()
+
+	// Protect version 2: with retention 1 the newest would be 3 only, but
+	// 2 must survive too.
+	if err := im.EnforceDiskRetention(context.Background(), "kb-1", []int64{2}); err != nil {
+		t.Fatalf("EnforceDiskRetention: %v", err)
+	}
+
+	for _, base := range []string{"2", "3"} {
+		for _, suffix := range []string{".index", ".index.ids", ".index.mem"} {
+			if _, err := os.Stat(filepath.Join(dir, base+suffix)); err != nil {
+				t.Errorf("expected %s to survive retention, got: %v", base+suffix, err)
+			}
+		}
+	}
+	for _, suffix := range []string{".index", ".index.ids", ".index.mem"} {
+		if _, err := os.Stat(filepath.Join(dir, "1"+suffix)); !os.IsNotExist(err) {
+			t.Errorf("expected 1%s to be deleted by retention, stat err: %v", suffix, err)
+		}
+	}
+	// Unrelated KB untouched.
+	if _, err := os.Stat(filepath.Join(otherDir, "9.index")); err != nil {
+		t.Errorf("unrelated KB index deleted: %v", err)
+	}
+
+	// Idempotent: a second run (with everything already gone) must not error.
+	if err := im.EnforceDiskRetention(context.Background(), "kb-1", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention (idempotent re-run): %v", err)
+	}
+	// Missing KB directory is a no-op, not an error.
+	if err := im.EnforceDiskRetention(context.Background(), "kb-missing", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention (missing kb): %v", err)
+	}
+	// Retention unconfigured (0) is a no-op.
+	im2 := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: 5 * time.Second, IndexDataDir: t.TempDir()})
+	if err := im2.EnforceDiskRetention(context.Background(), "kb-1", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention (unconfigured): %v", err)
+	}
+}
+
+// TestIndexManager_DeleteFilesByKB verifies that knowledge-base deletion
+// removes the whole on-disk index directory and tolerates a missing one.
+func TestIndexManager_DeleteFilesByKB(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "index", "kb-1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "1.index"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: 5 * time.Second, IndexDataDir: root})
+	im.vectorIndexClient = newMockVectorIndexClient()
+
+	if err := im.DeleteFilesByKB(context.Background(), "kb-1"); err != nil {
+		t.Fatalf("DeleteFilesByKB: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("index dir should be gone, stat err: %v", err)
+	}
+	// Missing directory: idempotent no-error.
+	if err := im.DeleteFilesByKB(context.Background(), "kb-1"); err != nil {
+		t.Fatalf("DeleteFilesByKB (re-run): %v", err)
+	}
+}
+
+// TestIndexManager_DeletePreventsResurrection verifies that after a KB or
+// version deletion, a Search-triggered restore cannot resurrect the
+// index: the tombstone set by DeleteFilesByKB / Discard makes loadFromDisk
+// refuse, and Search reports ErrIndexNotReady.
+func TestIndexManager_DeletePreventsResurrection(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+
+	root := t.TempDir()
+	cfg := IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+		IndexDataDir:    root,
+	}
+	im := NewIndexManager(cfg)
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+	defer im.Close()
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !im.IsLoaded("kb-1", 1) {
+		t.Fatal("index should be loaded after build")
+	}
+
+	// KB deletion: evict + delete files + tombstone.
+	if err := im.EvictByKB(context.Background(), "kb-1"); err != nil {
+		t.Fatalf("EvictByKB: %v", err)
+	}
+	if err := im.DeleteFilesByKB(context.Background(), "kb-1"); err != nil {
+		t.Fatalf("DeleteFilesByKB: %v", err)
+	}
+
+	_, err := im.Search(context.Background(), "kb-1", 1, []float32{0.5, 0.5}, 5)
+	if !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+		t.Fatalf("Search after KB deletion = %v, want ErrIndexNotReady", err)
+	}
+	if im.IsLoaded("kb-1", 1) {
+		t.Error("index must not be resurrected after KB deletion")
+	}
+
+	// Version deletion (Discard): also removes the on-disk files.
+	if err := im.TriggerBuild(context.Background(), "kb-2", 7); err != nil {
+		t.Fatalf("TriggerBuild(kb-2): %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := im.Evict(context.Background(), "kb-2", 7); err != nil {
+		t.Fatalf("Evict(kb-2,7): %v", err)
+	}
+	if err := im.Discard(context.Background(), "kb-2", 7); err != nil {
+		t.Fatalf("Discard: %v", err)
+	}
+	// On-disk index files must be gone.
+	if _, err := os.Stat(filepath.Join(root, "index", "kb-2", "7.index")); !os.IsNotExist(err) {
+		t.Errorf("discarded version's index file should be gone, stat err: %v", err)
+	}
+	_, err = im.Search(context.Background(), "kb-2", 7, []float32{0.5, 0.5}, 5)
+	if !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+		t.Fatalf("Search after Discard = %v, want ErrIndexNotReady", err)
+	}
+	if im.IsLoaded("kb-2", 7) {
+		t.Error("index must not be resurrected after version deletion")
 	}
 }

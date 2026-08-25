@@ -4,6 +4,11 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +43,27 @@ type IndexManagerConfig struct {
 	// VecstoreAddr is the vecstore gRPC address for the VectorIndexService.
 	// If empty, the implementation must set vectorIndexClient before use.
 	VecstoreAddr string
+
+	// IndexDataDir is the directory under which each version's persisted
+	// index lives at dataDir/index/<kbID>/<versionID>.index. Shared with
+	// the local vecstore process (same filesystem). Used to derive READY
+	// status from disk facts and to restore indexes after a restart.
+	IndexDataDir string
+
+	// IndexRetentionCount bounds how many on-disk index files are kept
+	// per knowledge base (Stratum_设计文档v10.md "磁盘保留策略": the most
+	// recent N versions stay persisted; older ones are deleted and
+	// rebuilt on demand via RebuildIndex). Applied after every successful
+	// build and at startup. <= 0 disables the policy (keep everything).
+	IndexRetentionCount int
+
+	// MemoryThresholdMB bounds the estimated in-memory footprint of all
+	// loaded indexes (vector payload bytes, summed and tracked per loaded
+	// index). When the estimate exceeds the threshold, new loads/builds
+	// evict least-recently-used, ref-count-zero indexes first
+	// (Stratum_设计文档v10.md "内存换入换出"). <= 0 disables the byte
+	// threshold; LRUCapacity still applies.
+	MemoryThresholdMB int64
 }
 
 // IndexManagerImpl is the real IndexManager implementation, backed by the
@@ -49,10 +75,10 @@ type IndexManagerConfig struct {
 //	ChunkStore.Read (batched per chunk) -> VectorIndexService.Build.
 //
 // Build-callback retries: when a BuildCompleteCallback returns an error,
-// it is retried with exponential backoff up to CallbackMaxRetries. Once
-// retries are exhausted, the version's status is left as FAILED and the
-// version is recorded in a "needs repair" set for operator visibility
-// via GetSystemStatus.
+// it is retried with exponential backoff up to CallbackMaxRetries; once
+// retries are exhausted the failure is logged and the version's status
+// stays as-is (PENDING), to be resumed by an explicit rebuild or a node
+// restart.
 type IndexManagerImpl struct {
 	cfg IndexManagerConfig
 
@@ -70,6 +96,25 @@ type IndexManagerImpl struct {
 	cond    *sync.Cond
 	loaded  map[indexKey]*loadedIndex
 	loading map[indexKey]bool // builds or loads currently in progress
+
+	// sizeByKey tracks each loaded index's estimated in-memory footprint
+	// (vector payload bytes from the last build; 0 when unknown, e.g. a
+	// pre-policy index loaded without a size sidecar). loadedBytes is
+	// their sum, consulted by makeRoomLocked when MemoryThresholdMB is
+	// set. Both are guarded by mu.
+	sizeByKey   map[indexKey]int64
+	loadedBytes int64
+
+	// deletedKBs / deletedVersions are tombstones set by knowledge-base
+	// deletion (DeleteFilesByKB) and version deletion (Discard). They
+	// close the "resurrection" race where a Search-triggered Load RPC
+	// started before the deletion but finished after it: loadFromDisk
+	// checks the tombstones (under mu) and refuses to re-insert the
+	// index. KB IDs are generated (UUIDs) and never reused, and deleted
+	// versions are removed from the Raft state machine, so tombstones
+	// never block a legitimate later load.
+	deletedKBs      map[string]bool
+	deletedVersions map[indexKey]bool
 
 	callbacks []BuildCompleteCallback
 
@@ -89,10 +134,13 @@ var _ IndexManager = (*IndexManagerImpl)(nil)
 // use (used by tests).
 func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 	im := &IndexManagerImpl{
-		cfg:     cfg,
-		loaded:  make(map[indexKey]*loadedIndex),
-		loading: make(map[indexKey]bool),
-		logger:  zap.NewNop(),
+		cfg:             cfg,
+		loaded:          make(map[indexKey]*loadedIndex),
+		loading:         make(map[indexKey]bool),
+		sizeByKey:       make(map[indexKey]int64),
+		deletedKBs:      make(map[string]bool),
+		deletedVersions: make(map[indexKey]bool),
+		logger:          zap.NewNop(),
 	}
 	im.cond = sync.NewCond(&im.mu)
 
@@ -151,6 +199,20 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 
 	key := indexKey{kbID, versionID}
 
+	// Restore path: if the version's index is not already loaded (e.g.
+	// this Go process restarted, or the index was LRU-evicted and the
+	// vecstore side lost it), try loading it from the persisted file on
+	// disk before falling back to ErrIndexNotReady. The load is
+	// idempotent and concurrency-safe; failure here is non-fatal — a
+	// truly unbuilt version still reports ErrIndexNotReady below.
+	im.mu.Lock()
+	_, loaded := im.loaded[key]
+	_, loading := im.loading[key]
+	im.mu.Unlock()
+	if !loaded && !loading {
+		_ = im.loadFromDisk(ctx, kbID, versionID)
+	}
+
 	// Acquire the index: load if needed, increment ref count.
 	if err := im.acquire(ctx, key); err != nil {
 		return nil, err
@@ -194,7 +256,8 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64) {
 	key := indexKey{kbID, versionID}
 
 	status := types.IndexStatusReady
-	if err := im.build(context.Background(), kbID, versionID); err != nil {
+	sizeBytes, err := im.build(context.Background(), kbID, versionID)
+	if err != nil {
 		im.logger.Error("index build failed",
 			zap.String("kb_id", kbID),
 			zap.Int64("version_id", versionID),
@@ -208,33 +271,51 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64) {
 		// Make room before inserting the new index.
 		im.makeRoomLocked()
 		im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
+		im.sizeByKey[key] = sizeBytes
+		im.loadedBytes += sizeBytes
 	}
 	callbacks := append([]BuildCompleteCallback(nil), im.callbacks...)
 	im.cond.Broadcast()
 	im.mu.Unlock()
 
-	// Invoke callbacks with retry.
+	// Persist the size sidecar next to the index file so a later restart
+	// (loadFromDisk) can account for this version's memory footprint.
+	// Best-effort: a failed sidecar write only degrades the estimate to 0.
+	if status == types.IndexStatusReady {
+		im.persistSizeSidecar(kbID, versionID, sizeBytes)
+	}
+
+	// Invoke callbacks with retry. The on-disk retention policy is NOT
+	// enforced here: EnforceDiskRetention needs to know the KB's active
+	// version (to avoid dropping a rolled-back active version's index),
+	// which requires the Raft layer — the registered BuildCompleteCallback
+	// in cmd/stratum/main.go applies the policy instead.
 	for _, cb := range callbacks {
 		im.invokeCallback(cb, kbID, versionID, status)
 	}
 }
 
-func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID int64) error {
+// build executes the full build data flow and returns the estimated
+// in-memory footprint of the built index (sum of vector payload bytes;
+// 0 for an empty version). It reports success only if the index was also
+// persisted to disk (see saveToDisk), so a failed save surfaces as a
+// build failure.
+func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID int64) (int64, error) {
 	docIDs, err := im.listDocIDs(ctx, kbID, versionID)
 	if err != nil {
-		return fmt.Errorf("index: ListDocIDs: %w", err)
+		return 0, fmt.Errorf("index: ListDocIDs: %w", err)
 	}
 
 	chunkIDs, err := im.listChunkIDsByDocs(ctx, kbID, docIDs)
 	if err != nil {
-		return fmt.Errorf("index: ListChunkIDsByDocs: %w", err)
+		return 0, fmt.Errorf("index: ListChunkIDsByDocs: %w", err)
 	}
 
 	// 分批读取并发送：单条 Build/AddChunks RPC 的载荷必须小于 gRPC 默认
 	// 4 MiB 上限。第一批用 Build 全量建索引，后续批用 AddChunks 增量追加。
-	batches, err := im.collectChunkBatches(ctx, kbID, chunkIDs)
+	batches, sizeBytes, err := im.collectChunkBatches(ctx, kbID, chunkIDs)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// 空版本（没有 chunk）也必须调一次 Build，在 vecstore 侧建立该
@@ -247,9 +328,9 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 			Metric:    vecstorepb.MetricTypeProto_COSINE,
 		})
 		if err != nil {
-			return fmt.Errorf("index: Build RPC: %w", err)
+			return 0, fmt.Errorf("index: Build RPC: %w", err)
 		}
-		return nil
+		return 0, im.saveToDisk(ctx, kbID, versionID)
 	}
 
 	for i, batch := range batches {
@@ -265,7 +346,7 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 				Metric:    vecstorepb.MetricTypeProto_COSINE,
 			})
 			if err != nil {
-				return fmt.Errorf("index: Build RPC: %w", err)
+				return 0, fmt.Errorf("index: Build RPC: %w", err)
 			}
 		} else {
 			_, err = im.vectorIndexClient.AddChunks(ctx, &vecstorepb.AddChunksRequest{
@@ -274,11 +355,107 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 				Chunks:    chunks,
 			})
 			if err != nil {
-				return fmt.Errorf("index: AddChunks RPC: %w", err)
+				return 0, fmt.Errorf("index: AddChunks RPC: %w", err)
 			}
 		}
 	}
 
+	// Persist the finished index to disk — the durable fact that READY
+	// status is derived from. A failed save means the build is not
+	// durable, so it is reported as a build failure (the caller marks the
+	// version FAILED instead of READY).
+	return sizeBytes, im.saveToDisk(ctx, kbID, versionID)
+}
+
+// saveToDisk persists the just-built index for (kbID, versionID) to
+// <IndexDataDir>/index/<kbID>/<versionID>.index (plus the .ids sidecar
+// written by the vecstore side). The directory is created here because
+// this node and the vecstore process share the filesystem; the vecstore
+// side's Save writes both files. Idempotent: a repeat save overwrites.
+// With an empty IndexDataDir (unconfigured, as in in-process tests) the
+// save is skipped and the index stays in-memory only.
+func (im *IndexManagerImpl) saveToDisk(ctx context.Context, kbID string, versionID int64) error {
+	if im.cfg.IndexDataDir == "" {
+		return nil // persistence not configured
+	}
+	path := im.indexPath(kbID, versionID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("index: save mkdir: %w", err)
+	}
+	if _, err := im.vectorIndexClient.Save(ctx, &vecstorepb.SaveIndexRequest{
+		KbId: kbID, VersionId: versionID, Path: path,
+	}); err != nil {
+		return fmt.Errorf("index: Save RPC: %w", err)
+	}
+	return nil
+}
+
+// indexPath returns the on-disk path of (kbID, versionID)'s persisted
+// index. kbID is generated by the system (a UUID) and never contains path
+// separators.
+func (im *IndexManagerImpl) indexPath(kbID string, versionID int64) string {
+	return filepath.Join(im.cfg.IndexDataDir, "index", kbID, fmt.Sprintf("%d.index", versionID))
+}
+
+// IndexExists implements IndexManager: asks the vecstore side whether the
+// persisted index files for (kbID, versionID) exist on disk. Stateless on
+// the vecstore side, so the answer reflects disk facts even right after a
+// vecstore restart. With an empty IndexDataDir (persistence unconfigured)
+// it reports false — there is no on-disk index.
+func (im *IndexManagerImpl) IndexExists(ctx context.Context, kbID string, versionID int64) (bool, error) {
+	if im.cfg.IndexDataDir == "" {
+		return false, nil
+	}
+	resp, err := im.vectorIndexClient.ExistsIndex(ctx, &vecstorepb.ExistsIndexRequest{
+		KbId: kbID, VersionId: versionID, Path: im.indexPath(kbID, versionID),
+	})
+	if err != nil {
+		return false, fmt.Errorf("index: ExistsIndex RPC: %w", err)
+	}
+	return resp.GetExists(), nil
+}
+
+// loadFromDisk restores (kbID, versionID)'s index from its persisted file
+// via the vecstore Load RPC and marks it loaded (respecting the LRU
+// capacity). Safe to call concurrently: if a load/build finished while the
+// RPC was in flight, the existing entry wins. A missing file (never
+// built, or file deleted) or an empty IndexDataDir (persistence
+// unconfigured) returns an error that callers map to ErrIndexNotReady.
+func (im *IndexManagerImpl) loadFromDisk(ctx context.Context, kbID string, versionID int64) error {
+	if im.cfg.IndexDataDir == "" {
+		return fmt.Errorf("index: persistence not configured")
+	}
+	key := indexKey{kbID, versionID}
+	// Refuse to load an index whose KB or version is being deleted (see
+	// the tombstone fields on IndexManagerImpl). Checked before the RPC
+	// AND after it: a Load that started before the deletion but finished
+	// after it must not resurrect the index.
+	im.mu.Lock()
+	if im.deletedKBs[kbID] || im.deletedVersions[key] {
+		im.mu.Unlock()
+		return fmt.Errorf("index: %s/%d is deleted", kbID, versionID)
+	}
+	im.mu.Unlock()
+
+	if _, err := im.vectorIndexClient.Load(ctx, &vecstorepb.LoadIndexRequest{
+		KbId: kbID, VersionId: versionID, Path: im.indexPath(kbID, versionID),
+	}); err != nil {
+		return fmt.Errorf("index: Load RPC: %w", err)
+	}
+
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	if im.deletedKBs[kbID] || im.deletedVersions[key] {
+		return fmt.Errorf("index: %s/%d was deleted while loading", kbID, versionID)
+	}
+	if _, ok := im.loaded[key]; ok {
+		return nil // a concurrent load/build already brought it in
+	}
+	im.makeRoomLocked()
+	im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
+	size := im.readSizeSidecar(kbID, versionID)
+	im.sizeByKey[key] = size
+	im.loadedBytes += size
 	return nil
 }
 
@@ -295,15 +472,17 @@ type chunkVec struct {
 }
 
 // collectChunkBatches 逐个读取 chunk 向量，并按估算字节数切分成多个批次，
-// 使得每批序列化后都不会超过 maxBuildMessageBytes。
-func (im *IndexManagerImpl) collectChunkBatches(ctx context.Context, kbID string, chunkIDs []string) ([][]chunkVec, error) {
+// 使得每批序列化后都不会超过 maxBuildMessageBytes。同时返回所有 chunk 向量
+// 载荷的总字节数（4 × 维度 × chunk 数），作为该版本索引内存占用的估算。
+func (im *IndexManagerImpl) collectChunkBatches(ctx context.Context, kbID string, chunkIDs []string) ([][]chunkVec, int64, error) {
 	var batches [][]chunkVec
 	var cur []chunkVec
 	curBytes := 0
+	var sizeBytes int64
 	for _, chunkID := range chunkIDs {
 		v, err := im.readChunkVector(ctx, kbID, chunkID)
 		if err != nil {
-			return nil, fmt.Errorf("index: read chunk vector %s: %w", chunkID, err)
+			return nil, 0, fmt.Errorf("index: read chunk vector %s: %w", chunkID, err)
 		}
 		// 估算该 chunk 在请求中的字节开销：向量(float32) + chunk_id + 字段头。
 		est := 4*len(v) + len(chunkID) + 64
@@ -314,11 +493,12 @@ func (im *IndexManagerImpl) collectChunkBatches(ctx context.Context, kbID string
 		}
 		cur = append(cur, chunkVec{id: chunkID, vec: v})
 		curBytes += est
+		sizeBytes += int64(4 * len(v))
 	}
 	if len(cur) > 0 {
 		batches = append(batches, cur)
 	}
-	return batches, nil
+	return batches, sizeBytes, nil
 }
 
 // acquire loads the index for key if not already in memory, blocking
@@ -398,13 +578,19 @@ func (im *IndexManagerImpl) release(key indexKey) {
 }
 
 // makeRoomLocked evicts least-recently-used, ref-count-zero indexes until
-// len(loaded) < LRUCapacity or no evictable index remains. Must be called
-// with im.mu held.
+// there is room for one more entry: len(loaded) < LRUCapacity AND (if
+// MemoryThresholdMB is set) loadedBytes <= threshold. If no evictable
+// index remains (everything is pinned), it stops and returns. Must be
+// called with im.mu held; called BEFORE inserting the new entry so the
+// brand-new index (refCount 0, nothing has acquired it yet) is never
+// itself chosen as the eviction candidate.
 func (im *IndexManagerImpl) makeRoomLocked() {
-	if im.cfg.LRUCapacity <= 0 {
-		return
+	var threshold int64
+	if im.cfg.MemoryThresholdMB > 0 {
+		threshold = im.cfg.MemoryThresholdMB << 20 // MiB → bytes
 	}
-	for len(im.loaded) >= im.cfg.LRUCapacity {
+	for (im.cfg.LRUCapacity > 0 && len(im.loaded) >= im.cfg.LRUCapacity) ||
+		(threshold > 0 && im.loadedBytes > threshold) {
 		var oldestKey indexKey
 		var oldestTime time.Time
 		found := false
@@ -422,6 +608,10 @@ func (im *IndexManagerImpl) makeRoomLocked() {
 			return // everything is pinned
 		}
 		delete(im.loaded, oldestKey)
+		if size, ok := im.sizeByKey[oldestKey]; ok {
+			im.loadedBytes -= size
+			delete(im.sizeByKey, oldestKey)
+		}
 	}
 }
 
@@ -463,7 +653,12 @@ func (im *IndexManagerImpl) RegisterBuildCallback(cb BuildCompleteCallback) {
 func (im *IndexManagerImpl) Evict(_ context.Context, kbID string, versionID int64) error {
 	im.mu.Lock()
 	defer im.mu.Unlock()
-	delete(im.loaded, indexKey{kbID, versionID})
+	key := indexKey{kbID, versionID}
+	delete(im.loaded, key)
+	if size, ok := im.sizeByKey[key]; ok {
+		im.loadedBytes -= size
+		delete(im.sizeByKey, key)
+	}
 	return nil
 }
 
@@ -474,18 +669,164 @@ func (im *IndexManagerImpl) EvictByKB(_ context.Context, kbID string) error {
 	for k := range im.loaded {
 		if k.kbID == kbID {
 			delete(im.loaded, k)
+			if size, ok := im.sizeByKey[k]; ok {
+				im.loadedBytes -= size
+				delete(im.sizeByKey, k)
+			}
 		}
 	}
 	return nil
 }
 
-// Discard implements IndexManager: evicts the in-memory entry and resets
-// the vecstore-side index for (kbID, versionID). Resetting a never-built
-// index is a no-op server-side; the local evict is idempotent too.
-func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID int64) error {
-	if err := im.Evict(ctx, kbID, versionID); err != nil {
-		return err
+// DeleteFilesByKB implements IndexManager: removes kbID's on-disk index
+// directory (<IndexDataDir>/index/<kbID>/) entirely — the Faiss file, the
+// .ids sidecar, and any size sidecars. A missing directory is not an
+// error (idempotent re-run after a crash). It also drops every in-memory
+// entry for the KB (idempotent with EvictByKB) and sets a KB tombstone so
+// an in-flight Search-triggered Load RPC cannot resurrect the index after
+// the deletion. No-op when disk persistence is unconfigured.
+func (im *IndexManagerImpl) DeleteFilesByKB(_ context.Context, kbID string) error {
+	im.mu.Lock()
+	im.deletedKBs[kbID] = true
+	for k := range im.loaded {
+		if k.kbID == kbID {
+			delete(im.loaded, k)
+			if size, ok := im.sizeByKey[k]; ok {
+				im.loadedBytes -= size
+				delete(im.sizeByKey, k)
+			}
+		}
 	}
+	im.mu.Unlock()
+
+	if im.cfg.IndexDataDir == "" {
+		return nil
+	}
+	dir := filepath.Join(im.cfg.IndexDataDir, "index", kbID)
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("index: DeleteFilesByKB(%s): %w", kbID, err)
+	}
+	return nil
+}
+
+// EnforceDiskRetention implements the per-KB on-disk retention policy
+// (Stratum_设计文档v10.md "磁盘保留策略"): keeps the most recent
+// IndexRetentionCount index files per knowledge base and deletes older
+// ones (plus their .ids / size sidecars). protectedIDs are never
+// deleted — used to shield the active version at startup. Missing files
+// and missing directories are ignored (idempotent). No-op when retention
+// is unconfigured (IndexRetentionCount <= 0) or disk persistence is off.
+//
+// Deleting an index file does not affect a loaded in-memory index; a
+// later query against an evicted, retention-dropped version reports
+// ErrIndexNotReady and can be recovered via RebuildIndex ("需要时重建").
+func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string, protectedIDs []int64) error {
+	if im.cfg.IndexRetentionCount <= 0 || im.cfg.IndexDataDir == "" {
+		return nil
+	}
+	dir := filepath.Join(im.cfg.IndexDataDir, "index", kbID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("index: EnforceDiskRetention(%s): read dir: %w", kbID, err)
+	}
+
+	protected := make(map[int64]bool, len(protectedIDs))
+	for _, id := range protectedIDs {
+		protected[id] = true
+	}
+
+	type idxFile struct {
+		versionID int64
+		base      string // file base name without the ".index" suffix
+	}
+	var files []idxFile
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".index") {
+			continue
+		}
+		base := strings.TrimSuffix(name, ".index")
+		id, perr := strconv.ParseInt(base, 10, 64)
+		if perr != nil || protected[id] {
+			continue
+		}
+		files = append(files, idxFile{versionID: id, base: base})
+	}
+
+	if len(files) <= im.cfg.IndexRetentionCount {
+		return nil
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].versionID < files[j].versionID })
+
+	// Drop the oldest (len(files) - retentionCount) versions' files.
+	// Sidecar names mirror the vecstore's Save layout: the Faiss file is
+	// <versionID>.index, its chunk-ID sidecar is <versionID>.index.ids,
+	// and the size sidecar is <versionID>.index.mem.
+	for _, f := range files[:len(files)-im.cfg.IndexRetentionCount] {
+		for _, suffix := range []string{".index", ".index.ids", ".index.mem"} {
+			path := filepath.Join(dir, f.base+suffix)
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("index: EnforceDiskRetention(%s): remove %s: %w", kbID, f.base+suffix, err)
+			}
+		}
+	}
+	return nil
+}
+
+// persistSizeSidecar writes the version's estimated index footprint (in
+// bytes) next to its on-disk index file, so loadFromDisk after a restart
+// can account for it against MemoryThresholdMB. Best-effort: failures are
+// ignored and the estimate simply degrades to 0.
+func (im *IndexManagerImpl) persistSizeSidecar(kbID string, versionID int64, sizeBytes int64) {
+	if im.cfg.IndexDataDir == "" {
+		return
+	}
+	path := im.sizeSidecarPath(kbID, versionID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, []byte(strconv.FormatInt(sizeBytes, 10)), 0o644)
+}
+
+// readSizeSidecar loads the persisted size estimate for (kbID, versionID),
+// returning 0 when the sidecar is absent (pre-policy indexes) or corrupt.
+func (im *IndexManagerImpl) readSizeSidecar(kbID string, versionID int64) int64 {
+	data, err := os.ReadFile(im.sizeSidecarPath(kbID, versionID))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// sizeSidecarPath returns the on-disk path of (kbID, versionID)'s size
+// sidecar: <IndexDataDir>/index/<kbID>/<versionID>.index.mem.
+func (im *IndexManagerImpl) sizeSidecarPath(kbID string, versionID int64) string {
+	return filepath.Join(im.cfg.IndexDataDir, "index", kbID, fmt.Sprintf("%d.index.mem", versionID))
+}
+
+// Discard implements IndexManager: evicts the in-memory entry, sets a
+// version tombstone (closing the Load-RPC resurrection race), resets the
+// vecstore-side index, and removes the version's on-disk index files.
+// Resetting a never-built index is a no-op server-side; the local evict,
+// the tombstone, and the file deletions are all idempotent.
+func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID int64) error {
+	im.mu.Lock()
+	key := indexKey{kbID, versionID}
+	delete(im.loaded, key)
+	if size, ok := im.sizeByKey[key]; ok {
+		im.loadedBytes -= size
+		delete(im.sizeByKey, key)
+	}
+	im.deletedVersions[key] = true
+	im.mu.Unlock()
+
 	if im.vectorIndexClient == nil {
 		return fmt.Errorf("index: Discard(%s,%d): vectorIndexClient not set", kbID, versionID)
 	}
@@ -494,6 +835,20 @@ func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID 
 		VersionId: versionID,
 	}); err != nil {
 		return fmt.Errorf("index: Discard(%s,%d): Reset RPC: %w", kbID, versionID, err)
+	}
+
+	// Remove the version's on-disk index files (Faiss file + its .ids
+	// sidecar + the size sidecar; indexPath already ends in ".index").
+	// Missing files are ignored; a no-op when persistence is unconfigured.
+	// Without this, a deleted version's files would linger and skew the
+	// disk retention window (see EnforceDiskRetention).
+	if im.cfg.IndexDataDir != "" {
+		for _, suffix := range []string{"", ".ids", ".mem"} {
+			path := im.indexPath(kbID, versionID) + suffix
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("index: Discard(%s,%d): remove %q: %w", kbID, versionID, filepath.Base(path), err)
+			}
+		}
 	}
 	return nil
 }

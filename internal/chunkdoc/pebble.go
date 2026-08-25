@@ -132,6 +132,38 @@ func (m *PebbleChunkDocMapper) ListDocIDs(_ context.Context, kbID, chunkID strin
 	return docIDs, nil
 }
 
+// ListChunkIDs implements ChunkDocMapper: forward-prefix-scans kbID's
+// entire keyspace (dirForward + kbID) and returns every distinct chunkID,
+// de-duplicated. Consecutive keys sharing a chunkID (same chunk mapped to
+// multiple documents) are adjacent in key order, so de-dup only needs to
+// compare against the previously emitted chunkID.
+func (m *PebbleChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) ([]string, error) {
+	prefix := []byte{dirForward}
+	prefix = append(prefix, pebbleutil.EncodeString(kbID)...)
+	upperBound := pebbleutil.PrefixSuccessor(prefix)
+
+	iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound})
+	if err != nil {
+		return nil, fmt.Errorf("chunkdoc: ListChunkIDs(%s): new iterator: %w", kbID, err)
+	}
+	defer iter.Close()
+
+	var out []string
+	for iter.First(); iter.Valid(); iter.Next() {
+		chunkID, err := decodeSuffixString(iter.Key(), prefix)
+		if err != nil {
+			return nil, fmt.Errorf("chunkdoc: ListChunkIDs(%s): %w", kbID, err)
+		}
+		if len(out) == 0 || out[len(out)-1] != chunkID {
+			out = append(out, chunkID)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("chunkdoc: ListChunkIDs(%s): iterator error: %w", kbID, err)
+	}
+	return out, nil
+}
+
 // ListChunkIDsByDocs implements ChunkDocMapper: reverse-prefix-scans each
 // docID in turn, merging and de-duplicating the resulting chunk IDs.
 func (m *PebbleChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, docIDs []string) ([]string, error) {

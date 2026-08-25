@@ -181,6 +181,7 @@ func (rf *Raft) InstallSnapshot(_ context.Context, req *kvraftpb.InstallSnapshot
 		IsSnapshot:    true,
 		SnapshotData:  req.Data,
 		SnapshotIndex: req.LastIncludedIndex,
+		SnapshotTerm:  req.LastIncludedTerm,
 	}
 	select {
 	case rf.applyCh <- msg:

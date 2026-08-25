@@ -12,8 +12,11 @@ import "context"
 // documented in Stratum_接口设计v9.md's "DeleteKnowledgeBase" logical flow
 // and Stratum_设计文档v10.md's "删除知识库" section:
 //
+//  0. WAL.WriteDeleteMark (durable "deletion started" marker; idempotent)
 //  1. IndexManager.EvictByKB
-//  2. delete on-disk index files (ignore ErrNotExist)
+//  2. delete on-disk index files (IndexManager.DeleteFilesByKB) and
+//     version-document bloom files (VersionBloom.DeleteByKB); both
+//     ignore ErrNotExist
 //  3. DocStore.DeleteByKB
 //  4. ChunkStore.DeleteByKB
 //  5. ChunkDocMapper.DeleteByKB
@@ -21,11 +24,11 @@ import "context"
 //  7. RaftNode.ProposeRemoveKBMeta (ErrKnowledgeBaseNotFound treated as success)
 //  8. WAL.WriteDeleteComplete
 //
-// Idempotency: on-disk file deletion ignores ErrNotExist;
-// ProposeRemoveKBMeta receiving ErrKnowledgeBaseNotFound is treated as
-// success; every other step is a prefix-scan delete and therefore
-// naturally idempotent. This lets the whole flow safely re-run from
-// scratch after a crash at any step.
+// Idempotency: WAL marks are idempotent per kbID; on-disk file deletion
+// ignores ErrNotExist; ProposeRemoveKBMeta receiving
+// ErrKnowledgeBaseNotFound is treated as success; every other step is a
+// prefix-scan delete and therefore naturally idempotent. This lets the
+// whole flow safely re-run from scratch after a crash at any step.
 //
 // Permanent error handling: each step retries with exponential backoff on
 // failure; once delete_coordinator.max_retries is exhausted, Execute calls

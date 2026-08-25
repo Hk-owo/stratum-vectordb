@@ -28,6 +28,14 @@ service VectorIndexService {
   rpc Search(SearchIndexRequest) returns (SearchIndexResponse);
   rpc Save(SaveIndexRequest) returns (SaveIndexResponse);
   rpc Load(LoadIndexRequest) returns (LoadIndexResponse);
+  // ExistsIndex reports whether a persisted index exists at path for
+  // (kb_id, version_id): both the Faiss index file and its .ids sidecar
+  // must be present for Load to succeed. Stateless — it inspects the
+  // filesystem only, so it also answers correctly after this process
+  // restarted (the in-memory indexes_ map is empty then). Used by the
+  // startup reconcile to derive a version's READY status from disk facts
+  // instead of trusting that a build-completion callback was delivered.
+  rpc ExistsIndex(ExistsIndexRequest) returns (ExistsIndexResponse);
   rpc Reset(ResetIndexRequest) returns (ResetIndexResponse);
 }
 
@@ -95,6 +103,9 @@ message SaveIndexResponse {}
 
 message LoadIndexRequest { string kb_id = 1; int64 version_id = 2; string path = 3; }
 message LoadIndexResponse {}
+
+message ExistsIndexRequest { string kb_id = 1; int64 version_id = 2; string path = 3; }
+message ExistsIndexResponse { bool exists = 1; }
 
 message ResetIndexRequest { string kb_id = 1; int64 version_id = 2; }
 message ResetIndexResponse {}

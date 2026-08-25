@@ -21,7 +21,10 @@ type MockWriteCoordinator struct {
 	nextErr       error
 	executeFunc   func(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange) (int64, error)
 
-	calls []WriteCoordinatorCall
+	replayErr error
+
+	calls       []WriteCoordinatorCall
+	replayCalls []ReplayVersionCall
 }
 
 // WriteCoordinatorCall records a single Execute invocation for test
@@ -29,6 +32,15 @@ type MockWriteCoordinator struct {
 type WriteCoordinatorCall struct {
 	KBID            string
 	ParentVersionID int64
+	Changes         []types.DocChange
+}
+
+// ReplayVersionCall records a single ReplayVersionStorageWrites
+// invocation for test assertions.
+type ReplayVersionCall struct {
+	KBID            string
+	ParentVersionID int64
+	VersionID       int64
 	Changes         []types.DocChange
 }
 
@@ -49,6 +61,32 @@ func (c *MockWriteCoordinator) Execute(ctx context.Context, kbID string, parentV
 		return fn(ctx, kbID, parentVersionID, changes)
 	}
 	return versionID, err
+}
+
+// ReplayVersionStorageWrites implements WriteCoordinator for the mock: it
+// records the call for assertions and returns nil by default (or the
+// configured replayErr when set).
+func (c *MockWriteCoordinator) ReplayVersionStorageWrites(_ context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.replayCalls = append(c.replayCalls, ReplayVersionCall{KBID: kbID, ParentVersionID: parentVersionID, VersionID: versionID, Changes: changes})
+	return c.replayErr
+}
+
+// SetReplayResult configures the error returned by subsequent
+// ReplayVersionStorageWrites calls.
+func (c *MockWriteCoordinator) SetReplayResult(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.replayErr = err
+}
+
+// ReplayCalls returns every ReplayVersionStorageWrites call recorded so
+// far.
+func (c *MockWriteCoordinator) ReplayCalls() []ReplayVersionCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]ReplayVersionCall(nil), c.replayCalls...)
 }
 
 // SetExecuteResult configures the (versionID, error) pair returned by
@@ -83,9 +121,11 @@ func (c *MockWriteCoordinator) Reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls = nil
+	c.replayCalls = nil
 	c.nextVersionID = 1
 	c.nextErr = nil
 	c.executeFunc = nil
+	c.replayErr = nil
 }
 
 var _ WriteCoordinator = (*MockWriteCoordinator)(nil)

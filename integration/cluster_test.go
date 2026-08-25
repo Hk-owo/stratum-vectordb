@@ -59,12 +59,12 @@ func TestMultiNode_RaftNodeImpl_3Node(t *testing.T) {
 		id := int64(i + 1)
 		w := wal.NewMockWAL()
 		impl, err := raft.NewRaftNodeImpl(raft.Config{
-			NodeID:   id,
-			DataDir:  t.TempDir(),
-			RaftAddr: raftAddrs[i],
-			Peers:    peers,
-			WAL:      w,
-			Logger:   logger,
+			NodeID:             id,
+			DataDir:            t.TempDir(),
+			RaftAddr:           raftAddrs[i],
+			Peers:              peers,
+			WAL:                w,
+			Logger:             logger,
 			HeartbeatInterval:  200 * time.Millisecond,
 			ElectionTimeoutMin: 2000 * time.Millisecond,
 			ElectionTimeoutMax: 4000 * time.Millisecond,

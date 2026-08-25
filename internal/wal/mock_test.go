@@ -29,7 +29,7 @@ func TestMockWAL(t *testing.T) {
 
 	t.Run("recover: only BEGIN means nothing to resume", func(t *testing.T) {
 		w := NewMockWAL()
-		if err := w.WriteBegin(ctx); err != nil {
+		if err := w.WriteBegin(ctx, "", 0, nil); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
 		pending, err := w.Recover(ctx)
@@ -178,7 +178,7 @@ func TestMockWAL(t *testing.T) {
 
 func mustWriteBegin(t *testing.T, w *MockWAL) {
 	t.Helper()
-	if err := w.WriteBegin(context.Background()); err != nil {
+	if err := w.WriteBegin(context.Background(), "", 0, nil); err != nil {
 		t.Fatalf("WriteBegin: %v", err)
 	}
 }

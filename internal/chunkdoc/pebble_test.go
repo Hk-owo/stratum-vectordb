@@ -39,6 +39,19 @@ func TestPebbleChunkDocMapper(t *testing.T) {
 		assertSetEqualPebble(t, got, []string{"chunk1", "chunk2"})
 	})
 
+	t.Run("ListChunkIDs returns every distinct chunk per KB, deduped", func(t *testing.T) {
+		m := newTestPebbleChunkDocMapper(t)
+		mustWritePebble(t, m, "kb1", "chunk1", "doc1")
+		mustWritePebble(t, m, "kb1", "chunk1", "doc2") // shared chunk: must dedupe
+		mustWritePebble(t, m, "kb1", "chunk2", "doc1")
+		mustWritePebble(t, m, "kb2", "chunkA", "docX") // other KB: must not leak in
+		got, err := m.ListChunkIDs(ctx, "kb1")
+		if err != nil {
+			t.Fatalf("ListChunkIDs: %v", err)
+		}
+		assertSetEqualPebble(t, got, []string{"chunk1", "chunk2"})
+	})
+
 	t.Run("multi-doc reverse batch query dedups", func(t *testing.T) {
 		m := newTestPebbleChunkDocMapper(t)
 		mustWritePebble(t, m, "kb1", "chunk1", "doc1")

@@ -60,6 +60,17 @@ func (m *MockChunkDocMapper) ListDocIDs(_ context.Context, kbID, chunkID string)
 	return out, nil
 }
 
+func (m *MockChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]string, 0, len(m.forward[kbID]))
+	for chunkID := range m.forward[kbID] {
+		out = append(out, chunkID)
+	}
+	return out, nil
+}
+
 func (m *MockChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, docIDs []string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

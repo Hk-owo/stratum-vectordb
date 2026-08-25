@@ -36,6 +36,43 @@ func dataVolumeDocs() int {
 	return 1000
 }
 
+// dataVolumeTimeout is the overall deadline for the whole test (write +
+// index build + sampling). It scales with the document count — at 1000 docs
+// a 15-minute budget is ample, while 100000 docs need much longer. Override
+// with STRATUM_VOLUME_TIMEOUT (a Go duration, e.g. "60m").
+func dataVolumeTimeout() time.Duration {
+	if v := os.Getenv("STRATUM_VOLUME_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 15 * time.Minute
+}
+
+// indexBuildTimeout is how long we wait for the async index build to reach
+// READY. Override with STRATUM_INDEX_BUILD_TIMEOUT (a Go duration).
+func indexBuildTimeout() time.Duration {
+	if v := os.Getenv("STRATUM_INDEX_BUILD_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 10 * time.Minute
+}
+
+// dataVolumeBatch is how many documents go into one CreateVersion call.
+// A single request must stay under the 4 MiB gRPC message limit (~1400 docs
+// at ~2.8 KB/doc), so large volumes are written as a chain of batches, each
+// version inheriting the previous one. Override with STRATUM_VOLUME_BATCH.
+func dataVolumeBatch() int {
+	if v := os.Getenv("STRATUM_VOLUME_BATCH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 1000
+}
+
 // docUnit is a (doc_id, content) pair used to populate a version.
 type docUnit struct {
 	id      string
@@ -85,10 +122,11 @@ func duBytes(path string) (int64, error) {
 }
 
 // duNodeBytes returns the recursive byte size of a path inside a running
-// compose service container.
+// node container. The cluster is started by scripts/docker-cluster.sh with
+// plain `docker run` (no compose project), so plain `docker exec` is used.
 func duNodeBytes(t *testing.T, service, path string) int64 {
 	t.Helper()
-	out, err := exec.Command("docker", "compose", "exec", "-T", service, "du", "-sb", path).CombinedOutput()
+	out, err := exec.Command("docker", "exec", service, "du", "-sb", path).CombinedOutput()
 	if err != nil {
 		t.Fatalf("du in %s: %v\n%s", service, err, out)
 	}
@@ -138,7 +176,7 @@ func waitVersionStatus(t *testing.T, ctx context.Context, addr, kbID string, ver
 // TestT4_DataVolume fills the cluster with documents and samples volume cost.
 func TestT4_DataVolume(t *testing.T) {
 	docCount := dataVolumeDocs()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), dataVolumeTimeout())
 	defer cancel()
 
 	leaderIdx, kbID := waitForLeader(t, ctx, "datavolume", 30*time.Second)
@@ -152,7 +190,10 @@ func TestT4_DataVolume(t *testing.T) {
 	defer conn.Close()
 	kb := pb.NewKnowledgeBaseServiceClient(conn)
 
-	// --- Write a big version ---
+	// --- Write the documents as a chain of CreateVersion batches ---
+	// A single CreateVersion request must stay under the gRPC 4 MiB message
+	// limit, so large volumes are split into batches; each batch becomes a
+	// version inheriting the previous one.
 	docs := genDataVolumeDocs(docCount, 1000)
 	changes := make([]*pb.DocChange, len(docs))
 	for i, d := range docs {
@@ -163,23 +204,38 @@ func TestT4_DataVolume(t *testing.T) {
 		}
 	}
 
+	batch := dataVolumeBatch()
 	writeStart := time.Now()
-	createResp, err := kb.CreateVersion(ctx, &pb.CreateVersionRequest{
-		KnowledgeBaseId: kbID,
-		ParentVersionId: 0,
-		Changes:         changes,
-	})
-	writeDur := time.Since(writeStart)
-	if err != nil {
-		t.Fatalf("CreateVersion(%d docs) failed: %v", docCount, err)
+	parentVersion := int64(0)
+	var lastVersionID int64
+	writeDur := time.Duration(0)
+	buildDur := time.Duration(0)
+	for offset := 0; offset < len(changes); offset += batch {
+		end := offset + batch
+		if end > len(changes) {
+			end = len(changes)
+		}
+		// A parent version must not be PENDING (index build pending), so each
+		// batch is only chained after the previous version reaches READY.
+		b0 := time.Now()
+		createResp, err := kb.CreateVersion(ctx, &pb.CreateVersionRequest{
+			KnowledgeBaseId: kbID,
+			ParentVersionId: parentVersion,
+			Changes:         changes[offset:end],
+		})
+		writeDur += time.Since(b0)
+		if err != nil {
+			t.Fatalf("CreateVersion(batch %d-%d / %d docs) failed: %v", offset, end, docCount, err)
+		}
+		parentVersion = createResp.VersionId
+		lastVersionID = createResp.VersionId
+		b1 := time.Now()
+		waitVersionStatus(t, ctx, leaderAddr, kbID, lastVersionID, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
+		buildDur += time.Since(b1)
 	}
-	t.Logf("CreateVersion(%d docs) returned in %v", docCount, writeDur)
-
-	// --- Wait for the async index build ---
-	buildStart := time.Now()
-	waitVersionStatus(t, ctx, leaderAddr, kbID, createResp.VersionId, pb.IndexStatus_INDEX_STATUS_READY, 10*time.Minute)
-	buildDur := time.Since(buildStart)
-	t.Logf("index build ready in %v (version %d)", buildDur, createResp.VersionId)
+	writeTotal := time.Since(writeStart)
+	t.Logf("CreateVersion(%d docs, %d batches of %d): write=%v build-accum=%v total=%v",
+		docCount, (len(changes)+batch-1)/batch, batch, writeDur, buildDur, writeTotal)
 
 	// --- Sample storage usage ---
 	var totalNodeBytes int64
@@ -202,7 +258,7 @@ func TestT4_DataVolume(t *testing.T) {
 	defer qconn.Close()
 	queryResp, err := q.Query(ctx, &pb.QueryRequest{
 		KnowledgeBaseId: kbID,
-		VersionId:       &createResp.VersionId,
+		VersionId:       &lastVersionID,
 		Vector:          make([]float32, 768),
 		TopK:            10,
 	})

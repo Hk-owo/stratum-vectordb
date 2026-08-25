@@ -21,7 +21,11 @@ package kvraft
 // log has grown past its size threshold; serialize your own state and
 // call Raft.Snapshot" (a locally-triggered snapshot). SnapshotData != nil
 // means "here is a snapshot received from the leader via InstallSnapshot;
-// replace your state with it" (a remotely-installed snapshot).
+// replace your state with it" (a remotely-installed snapshot). For
+// remotely-installed snapshots, SnapshotIndex and SnapshotTerm identify
+// the log entry the snapshot covers (the leader's log base), which the
+// state-machine layer passes back to Raft.InstallDone so the local log
+// can be replaced by a single sentinel entry at that position.
 type ApplyMsg struct {
 	Index   uint64
 	Term    uint64
@@ -30,4 +34,5 @@ type ApplyMsg struct {
 	IsSnapshot    bool
 	SnapshotData  []byte
 	SnapshotIndex uint64
+	SnapshotTerm  uint64
 }

@@ -304,6 +304,30 @@ go test ./integration/docker/... -tags=docker -v -timeout 300s
 scripts/docker-cluster.sh down
 ```
 
+### Data-volume measurements (3-node Docker cluster)
+
+Sampled with `TestT4_DataVolume` against a real vecstore (Faiss HNSW +
+RocksDB, 768-dim) on a 3-node Docker cluster; docs are chunked at
+window=512 and embedded by the mock embed service at 10 ms/chunk.
+
+| Metric | 1,000 docs (earlier) | 10,000 docs (measured) | Doc target |
+|---|---|---|---|
+| CreateVersion write (10×1,000-doc batches) | 17.0 s | 195.5 s | T3-4: < 30 s per 1,000 docs ✅ |
+| Index build (accumulated, per batch READY) | 0.5 s | 5.2 s | — |
+| Storage per node | 3.84 MiB (leader) | 44.5 / 52.8 / 55.0 MiB | — |
+| Storage, 3 nodes total | — | 152.2 MiB | — |
+| vecstore RocksDB (host, deduped chunks) | 0.25 MiB | 4.9 MiB | — |
+| Query top-k=10 | 10 hits | 10 hits | — |
+| Total test time | 18.1 s | 201.6 s | — |
+
+Note: writes are batched because a single `CreateVersion` request must stay
+under the 4 MiB gRPC message limit (~1,400 docs at ~2.8 KB/doc); each batch
+becomes a version and is chained only after the previous one reaches READY
+(a PENDING parent is rejected). 100,000 docs could not be completed: the
+raft log grows past kvraft's snapshot threshold (1000 entries) and the
+leader blocks inside snapshotting, stalling heartbeats and build callbacks —
+see 改动内容.md for details.
+
 ## Prerequisites
 
 - **Go 1.24**

@@ -3,9 +3,12 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
+	"stratum/internal/bloom"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
 	"stratum/internal/types"
@@ -154,6 +157,9 @@ func (m *deleteTestChunkDocMapper) ListDocIDs(_ context.Context, kbID, chunkID s
 func (m *deleteTestChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, docIDs []string) ([]string, error) {
 	return nil, nil
 }
+func (m *deleteTestChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) ([]string, error) {
+	return nil, nil
+}
 func (m *deleteTestChunkDocMapper) DeleteByDoc(_ context.Context, kbID, docID string) error {
 	return nil
 }
@@ -200,6 +206,8 @@ type deleteTestIndexManager struct {
 	evictedKB []string
 	evictErr  error
 	discarded []indexVersionKey
+
+	deletedFilesKB []string
 }
 
 type indexVersionKey struct {
@@ -236,8 +244,23 @@ func (im *deleteTestIndexManager) EvictByKB(_ context.Context, kbID string) erro
 	im.evictedKB = append(im.evictedKB, kbID)
 	return nil
 }
+func (im *deleteTestIndexManager) DeleteFilesByKB(_ context.Context, kbID string) error {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	if im.evictErr != nil {
+		return im.evictErr
+	}
+	im.deletedFilesKB = append(im.deletedFilesKB, kbID)
+	return nil
+}
+func (im *deleteTestIndexManager) EnforceDiskRetention(_ context.Context, _ string, _ []int64) error {
+	return nil
+}
 func (im *deleteTestIndexManager) Ping(_ context.Context) error { return nil }
 func (im *deleteTestIndexManager) LoadedCount() int             { return 0 }
+func (im *deleteTestIndexManager) IndexExists(_ context.Context, kbID string, versionID int64) (bool, error) {
+	return false, nil
+}
 
 // === Tests ===
 
@@ -262,9 +285,8 @@ func TestDeleteCoordinator_FullCleanup(t *testing.T) {
 		VersionDocList:      vdl,
 	})
 
-	// Write delete mark first, as the Service layer would.
-	w.WriteDeleteMark(context.Background(), "kb-1")
-
+	// The delete mark is written by Execute itself (Step 0), so the
+	// Service layer does not need to write it beforehand.
 	err := coord.Execute(context.Background(), "kb-1")
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
@@ -289,6 +311,12 @@ func TestDeleteCoordinator_FullCleanup(t *testing.T) {
 	if len(im.evictedKB) != 1 || im.evictedKB[0] != "kb-1" {
 		t.Error("IndexManager.EvictByKB should have been called for kb-1")
 	}
+	if len(im.deletedFilesKB) != 1 || im.deletedFilesKB[0] != "kb-1" {
+		t.Error("IndexManager.DeleteFilesByKB should have been called for kb-1")
+	}
+	if !w.IsDeleteMarked("kb-1") {
+		t.Error("WAL delete mark should have been written for kb-1")
+	}
 
 	// WAL should have DeleteComplete record.
 	records, err := w.Recover(context.Background())
@@ -297,6 +325,45 @@ func TestDeleteCoordinator_FullCleanup(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Errorf("expected 0 pending records after complete cleanup, got %d", len(records))
+	}
+}
+
+// TestDeleteCoordinator_DeletesVersionBloomFiles verifies that when a
+// VersionBloomStore is wired, the cleanup removes its on-disk files for
+// the KB.
+func TestDeleteCoordinator_DeletesVersionBloomFiles(t *testing.T) {
+	w := wal.NewMockWAL()
+	rn := newDeleteTestRaftNode()
+	vdl := newDeleteTestVersionDocList()
+	im := newDeleteTestIndexManager()
+
+	dir := t.TempDir()
+	vBloom := bloom.NewVersionBloomStore(dir, 1000, 0.01, vdl)
+	if _, err := vBloom.BuildAndPersist("kb-1", 1, []string{"doc-a"}); err != nil {
+		t.Fatalf("BuildAndPersist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bloom-version", "kb-1", "1.bloom")); err != nil {
+		t.Fatalf("bloom file should exist before cleanup: %v", err)
+	}
+
+	coord := NewDeleteCoordinatorImpl(DeleteCoordinatorConfig{
+		MaxRetries:          2,
+		RetryBaseIntervalMS: 10,
+		WAL:                 w,
+		RaftNode:            rn,
+		IndexManager:        im,
+		DocStore:            newDeleteTestDocStore(),
+		ChunkStore:          newDeleteTestChunkStore(),
+		ChunkDocMapper:      newDeleteTestChunkDocMapper(),
+		VersionDocList:      vdl,
+		VersionBloom:        vBloom,
+	})
+
+	if err := coord.Execute(context.Background(), "kb-1"); err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bloom-version", "kb-1")); !os.IsNotExist(err) {
+		t.Errorf("version-bloom directory should be gone, stat err: %v", err)
 	}
 }
 

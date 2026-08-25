@@ -316,6 +316,15 @@ func (m *MockIndexManager) RegisterBuildCallback(cb BuildCompleteCallback) {
 	m.callbacks = append(m.callbacks, cb)
 }
 
+// IndexExists implements IndexManager: the mock reports whether the
+// version has a loaded (built) index.
+func (m *MockIndexManager) IndexExists(_ context.Context, kbID string, versionID int64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.loaded[indexKey{kbID, versionID}]
+	return ok, nil
+}
+
 func (m *MockIndexManager) Evict(_ context.Context, kbID string, versionID int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -338,6 +347,18 @@ func (m *MockIndexManager) EvictByKB(_ context.Context, kbID string) error {
 // has no vecstore side to reset, so this is exactly Evict's semantics.
 func (m *MockIndexManager) Discard(ctx context.Context, kbID string, versionID int64) error {
 	return m.Evict(ctx, kbID, versionID)
+}
+
+// DeleteFilesByKB implements IndexManager: the mock keeps no on-disk
+// index files, so there is nothing to delete.
+func (m *MockIndexManager) DeleteFilesByKB(_ context.Context, _ string) error {
+	return nil
+}
+
+// EnforceDiskRetention implements IndexManager: the mock keeps no on-disk
+// index files, so the retention policy is a no-op.
+func (m *MockIndexManager) EnforceDiskRetention(_ context.Context, _ string, _ []int64) error {
+	return nil
 }
 
 // Ping never loads an index or touches reference counts, per the

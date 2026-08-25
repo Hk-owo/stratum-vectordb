@@ -70,8 +70,10 @@ func (rf *Raft) SnapshotDone(peerID int64, lastIndex uint64) {
 // applying a snapshot received via InstallSnapshot (an
 // ApplyMsg{IsSnapshot: true, SnapshotData: non-nil} message), so Raft can
 // advance its own bookkeeping (lastApplied/lastCommitIndex) and compact
-// its log to match.
-func (rf *Raft) InstallDone(lastIndex uint64) {
+// its log to match. lastTerm is the term of the log entry the snapshot
+// covers (the leader's log base), used as the sentinel entry's term when
+// the snapshot covers more than this node's whole log.
+func (rf *Raft) InstallDone(lastIndex, lastTerm uint64) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -81,7 +83,7 @@ func (rf *Raft) InstallDone(lastIndex uint64) {
 	if lastIndex > rf.lastCommitIndex {
 		rf.lastCommitIndex = lastIndex
 	}
-	rf.trimLogLocked(lastIndex)
+	rf.trimLogLocked(lastIndex, lastTerm)
 }
 
 // TrimLog compacts the log up to and including index without persisting
@@ -91,16 +93,30 @@ func (rf *Raft) InstallDone(lastIndex uint64) {
 func (rf *Raft) TrimLog(index uint64) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.trimLogLocked(index)
+	term := rf.lastLogTerm()
+	if offset := rf.logIndex(index); offset < uint64(len(rf.log)) {
+		term = rf.log[offset].Term
+	}
+	rf.trimLogLocked(index, term)
 }
 
-// trimLogLocked must be called with rf.mu held.
-func (rf *Raft) trimLogLocked(index uint64) {
+// trimLogLocked must be called with rf.mu held. It compacts the log up to
+// and including index, replacing the covered prefix with a single sentinel
+// entry (index, term). When index is beyond the end of the local log —
+// the snapshot covers more than this node has ever held, the typical
+// lagging-follower case — the whole log is replaced by the sentinel;
+// otherwise the sentinel's term is taken from the log entry at index.
+func (rf *Raft) trimLogLocked(index uint64, term uint64) {
 	if index <= rf.log[0].Index {
 		return
 	}
 	offset := rf.logIndex(index)
 	if offset >= uint64(len(rf.log)) {
+		// The snapshot reaches past the end of our log; there is nothing
+		// to preserve after it.
+		rf.log = []*kvraftpb.Entry{{Index: index, Term: term}}
+		rf.persist()
+		rf.snapshotting = false
 		return
 	}
 	newLog := []*kvraftpb.Entry{{Index: index, Term: rf.log[offset].Term}}

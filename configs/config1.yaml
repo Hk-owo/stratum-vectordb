@@ -48,6 +48,7 @@ index_manager:
   callback_retry_base_interval_ms: 200
 
 bloom_filter:
+  expected_items: 1000000
   false_positive_rate: 0.01
 
 knowledge_base_defaults:
@@ -63,6 +64,7 @@ gc:
   version_retention_count: 50
   gc_interval_s: 3600
   audit_log_retention_days: 30
+  sweep_interval_s: 300
 
 logging:
   level: "info"

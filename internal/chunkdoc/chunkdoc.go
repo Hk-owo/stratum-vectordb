@@ -31,6 +31,12 @@ type ChunkDocMapper interface {
 	// kbID, via a forward-prefix scan. Used by the Query read path.
 	ListDocIDs(ctx context.Context, kbID, chunkID string) ([]string, error)
 
+	// ListChunkIDs returns every chunk ID that has at least one mapping
+	// entry within kbID, via a forward-prefix scan, de-duplicated. Used by
+	// the chunk-existence bloom filter's crash-recovery rebuild and by the
+	// orphan-chunk GC sweep.
+	ListChunkIDs(ctx context.Context, kbID string) ([]string, error)
+
 	// ListChunkIDsByDocs batch-reverse-looks-up all chunk IDs associated
 	// with any of docIDs within kbID, merging and de-duplicating results
 	// across documents. Used by IndexManager.TriggerBuild to gather the

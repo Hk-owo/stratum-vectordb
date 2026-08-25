@@ -318,12 +318,13 @@ var ChunkStorageService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	VectorIndexService_Build_FullMethodName     = "/vecstore.VectorIndexService/Build"
-	VectorIndexService_AddChunks_FullMethodName = "/vecstore.VectorIndexService/AddChunks"
-	VectorIndexService_Search_FullMethodName    = "/vecstore.VectorIndexService/Search"
-	VectorIndexService_Save_FullMethodName      = "/vecstore.VectorIndexService/Save"
-	VectorIndexService_Load_FullMethodName      = "/vecstore.VectorIndexService/Load"
-	VectorIndexService_Reset_FullMethodName     = "/vecstore.VectorIndexService/Reset"
+	VectorIndexService_Build_FullMethodName       = "/vecstore.VectorIndexService/Build"
+	VectorIndexService_AddChunks_FullMethodName   = "/vecstore.VectorIndexService/AddChunks"
+	VectorIndexService_Search_FullMethodName      = "/vecstore.VectorIndexService/Search"
+	VectorIndexService_Save_FullMethodName        = "/vecstore.VectorIndexService/Save"
+	VectorIndexService_Load_FullMethodName        = "/vecstore.VectorIndexService/Load"
+	VectorIndexService_ExistsIndex_FullMethodName = "/vecstore.VectorIndexService/ExistsIndex"
+	VectorIndexService_Reset_FullMethodName       = "/vecstore.VectorIndexService/Reset"
 )
 
 // VectorIndexServiceClient is the client API for VectorIndexService service.
@@ -339,6 +340,14 @@ type VectorIndexServiceClient interface {
 	Search(ctx context.Context, in *SearchIndexRequest, opts ...grpc.CallOption) (*SearchIndexResponse, error)
 	Save(ctx context.Context, in *SaveIndexRequest, opts ...grpc.CallOption) (*SaveIndexResponse, error)
 	Load(ctx context.Context, in *LoadIndexRequest, opts ...grpc.CallOption) (*LoadIndexResponse, error)
+	// ExistsIndex reports whether a persisted index exists at path for
+	// (kb_id, version_id): both the Faiss index file and its .ids sidecar
+	// must be present for Load to succeed. Stateless — it inspects the
+	// filesystem only, so it also answers correctly after this process
+	// restarted (the in-memory indexes_ map is empty then). Used by the
+	// startup reconcile to derive a version's READY status from disk facts
+	// instead of trusting that a build-completion callback was delivered.
+	ExistsIndex(ctx context.Context, in *ExistsIndexRequest, opts ...grpc.CallOption) (*ExistsIndexResponse, error)
 	Reset(ctx context.Context, in *ResetIndexRequest, opts ...grpc.CallOption) (*ResetIndexResponse, error)
 }
 
@@ -400,6 +409,16 @@ func (c *vectorIndexServiceClient) Load(ctx context.Context, in *LoadIndexReques
 	return out, nil
 }
 
+func (c *vectorIndexServiceClient) ExistsIndex(ctx context.Context, in *ExistsIndexRequest, opts ...grpc.CallOption) (*ExistsIndexResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExistsIndexResponse)
+	err := c.cc.Invoke(ctx, VectorIndexService_ExistsIndex_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vectorIndexServiceClient) Reset(ctx context.Context, in *ResetIndexRequest, opts ...grpc.CallOption) (*ResetIndexResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ResetIndexResponse)
@@ -423,6 +442,14 @@ type VectorIndexServiceServer interface {
 	Search(context.Context, *SearchIndexRequest) (*SearchIndexResponse, error)
 	Save(context.Context, *SaveIndexRequest) (*SaveIndexResponse, error)
 	Load(context.Context, *LoadIndexRequest) (*LoadIndexResponse, error)
+	// ExistsIndex reports whether a persisted index exists at path for
+	// (kb_id, version_id): both the Faiss index file and its .ids sidecar
+	// must be present for Load to succeed. Stateless — it inspects the
+	// filesystem only, so it also answers correctly after this process
+	// restarted (the in-memory indexes_ map is empty then). Used by the
+	// startup reconcile to derive a version's READY status from disk facts
+	// instead of trusting that a build-completion callback was delivered.
+	ExistsIndex(context.Context, *ExistsIndexRequest) (*ExistsIndexResponse, error)
 	Reset(context.Context, *ResetIndexRequest) (*ResetIndexResponse, error)
 	mustEmbedUnimplementedVectorIndexServiceServer()
 }
@@ -448,6 +475,9 @@ func (UnimplementedVectorIndexServiceServer) Save(context.Context, *SaveIndexReq
 }
 func (UnimplementedVectorIndexServiceServer) Load(context.Context, *LoadIndexRequest) (*LoadIndexResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Load not implemented")
+}
+func (UnimplementedVectorIndexServiceServer) ExistsIndex(context.Context, *ExistsIndexRequest) (*ExistsIndexResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ExistsIndex not implemented")
 }
 func (UnimplementedVectorIndexServiceServer) Reset(context.Context, *ResetIndexRequest) (*ResetIndexResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Reset not implemented")
@@ -563,6 +593,24 @@ func _VectorIndexService_Load_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VectorIndexService_ExistsIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExistsIndexRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VectorIndexServiceServer).ExistsIndex(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VectorIndexService_ExistsIndex_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VectorIndexServiceServer).ExistsIndex(ctx, req.(*ExistsIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VectorIndexService_Reset_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ResetIndexRequest)
 	if err := dec(in); err != nil {
@@ -607,6 +655,10 @@ var VectorIndexService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Load",
 			Handler:    _VectorIndexService_Load_Handler,
+		},
+		{
+			MethodName: "ExistsIndex",
+			Handler:    _VectorIndexService_ExistsIndex_Handler,
 		},
 		{
 			MethodName: "Reset",

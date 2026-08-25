@@ -147,6 +147,17 @@ func (m *testChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, 
 func (m *testChunkDocMapper) DeleteByKB(_ context.Context, kbID string) error         { return nil }
 func (m *testChunkDocMapper) DeleteByDoc(_ context.Context, kbID, docID string) error { return nil }
 
+func (m *testChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.forward))
+	for c := range m.forward {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 func (m *testChunkDocMapper) forwardCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -295,8 +306,17 @@ func (im *testIndexManager) Discard(_ context.Context, kbID string, versionID in
 	return nil
 }
 func (im *testIndexManager) EvictByKB(_ context.Context, kbID string) error { return nil }
-func (im *testIndexManager) Ping(_ context.Context) error                   { return nil }
-func (im *testIndexManager) LoadedCount() int                               { return 0 }
+func (im *testIndexManager) DeleteFilesByKB(_ context.Context, _ string) error {
+	return nil
+}
+func (im *testIndexManager) EnforceDiskRetention(_ context.Context, _ string, _ []int64) error {
+	return nil
+}
+func (im *testIndexManager) Ping(_ context.Context) error { return nil }
+func (im *testIndexManager) LoadedCount() int             { return 0 }
+func (im *testIndexManager) IndexExists(_ context.Context, kbID string, versionID int64) (bool, error) {
+	return false, nil
+}
 
 func (im *testIndexManager) triggeredCount() int {
 	im.mu.Lock()
@@ -653,7 +673,7 @@ func TestWriteCoordinator_WALCommit(t *testing.T) {
 
 func TestWriteCoordinator_CrashBeforeRaftPropose(t *testing.T) {
 	w := wal.NewMockWAL()
-	w.WriteBegin(context.Background())
+	w.WriteBegin(context.Background(), "", 0, nil)
 
 	records, err := w.Recover(context.Background())
 	if err != nil {
@@ -666,7 +686,7 @@ func TestWriteCoordinator_CrashBeforeRaftPropose(t *testing.T) {
 
 func TestWriteCoordinator_CrashAfterRaftBeforeCommit(t *testing.T) {
 	w := wal.NewMockWAL()
-	w.WriteBegin(context.Background())
+	w.WriteBegin(context.Background(), "", 0, nil)
 	w.WriteVersionID(context.Background(), 5)
 
 	records, err := w.Recover(context.Background())
@@ -898,5 +918,164 @@ func TestWriteCoordinator_ProposesVersionSummary(t *testing.T) {
 	}
 	if got == "" {
 		t.Error("no digest committed for the new version")
+	}
+}
+
+func TestWriteCoordinator_ReplayVersionStorageWrites(t *testing.T) {
+	ctx := context.Background()
+	ds := newTestDocStore()
+	cdm := newTestChunkDocMapper()
+	vdl := newTestVersionDocList()
+	cs := newTestChunkStore()
+	ec := &testEmbedClient{}
+	im := newTestIndexManager()
+	rn := newTestRaftNode()
+	w := wal.NewMockWAL()
+	chunkBF := bloom.NewMockBloomFilter()
+	splitter := &mockSplitter{windowSize: 100, overlapSize: 20}
+
+	rn.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID: "kb-1", Name: "test",
+		ChunkWindowSize: 100, ChunkOverlapSize: 20,
+		EmbedConfig: types.EmbedConfig{ServiceAddr: "emb:8080", ModelID: "m1"},
+	})
+
+	coord := NewWriteCoordinatorImpl(WriteCoordinatorConfig{
+		MaxRetries:          2,
+		RetryBaseIntervalMS: 10,
+		WAL:                 w,
+		RaftNode:            rn,
+		Splitter:            splitter,
+		EmbedClient:         ec,
+		ChunkBloom:          chunkBF,
+		ChunkStore:          cs,
+		ChunkDocMapper:      cdm,
+		DocStore:            ds,
+		VersionDocList:      vdl,
+		IndexManager:        im,
+	})
+
+	// Parent version exists (fully committed).
+	if _, err := coord.Execute(ctx, "kb-1", 0, []types.DocChange{
+		{Op: types.ChangeOpAdd, DocID: "parent-doc", Content: "parent content"},
+	}); err != nil {
+		t.Fatalf("parent Execute: %v", err)
+	}
+
+	// Simulate a crash after Raft apply but before storage writes: the
+	// version exists in the state machine (PENDING) but nothing was
+	// written to the storage layer yet.
+	versionID, err := rn.ProposeCreateVersion(ctx, "kb-1", 1)
+	if err != nil {
+		t.Fatalf("ProposeCreateVersion (crash point): %v", err)
+	}
+
+	recordsBefore := w.RecordCount()
+
+	changes := []types.DocChange{
+		{Op: types.ChangeOpAdd, DocID: "doc-a", Content: "content A"},
+		{Op: types.ChangeOpAdd, DocID: "doc-b", Content: "content B"},
+	}
+	if err := coord.ReplayVersionStorageWrites(ctx, "kb-1", 1, versionID, changes); err != nil {
+		t.Fatalf("ReplayVersionStorageWrites: %v", err)
+	}
+
+	// Replay must not write a new BEGIN or VERSION_ID record — only the
+	// COMMIT (one new record).
+	if got := w.RecordCount() - recordsBefore; got != 1 {
+		t.Errorf("replay wrote %d new WAL records, want exactly 1 (COMMIT)", got)
+	}
+
+	// Storage writes must have landed.
+	docs, err := vdl.ListDocIDs(ctx, "kb-1", versionID)
+	if err != nil {
+		t.Fatalf("ListDocIDs: %v", err)
+	}
+	gotDocs := make(map[string]bool)
+	for _, d := range docs {
+		gotDocs[d] = true
+	}
+	for _, want := range []string{"parent-doc", "doc-a", "doc-b"} {
+		if !gotDocs[want] {
+			t.Errorf("version %d doc set missing %q (got %v)", versionID, want, docs)
+		}
+	}
+	if _, err := ds.ReadAt(ctx, "kb-1", "doc-a", versionID); err != nil {
+		t.Errorf("doc-a content missing after replay: %v", err)
+	}
+
+	// Index build must have been triggered.
+	if im.triggeredCount() != 2 { // parent Execute + replay
+		t.Errorf("TriggerBuild calls = %d, want 2", im.triggeredCount())
+	}
+
+	// The WAL must now consider the version committed (no pending
+	// VersionWrite record for it).
+	pending, err := w.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	for _, p := range pending {
+		if p.Type == types.PendingRecordTypeVersionWrite && p.VersionID == versionID {
+			t.Errorf("version %d still pending after replay: %v", versionID, pending)
+		}
+	}
+}
+
+func TestWriteCoordinator_VersionBloomPersisted(t *testing.T) {
+	ctx := context.Background()
+	ds := newTestDocStore()
+	cdm := newTestChunkDocMapper()
+	vdl := newTestVersionDocList()
+	cs := newTestChunkStore()
+	ec := &testEmbedClient{}
+	im := newTestIndexManager()
+	rn := newTestRaftNode()
+	w := wal.NewMockWAL()
+	chunkBF := bloom.NewMockBloomFilter()
+	splitter := &mockSplitter{windowSize: 100, overlapSize: 20}
+
+	rn.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID: "kb-1", Name: "test",
+		ChunkWindowSize: 100, ChunkOverlapSize: 20,
+		EmbedConfig: types.EmbedConfig{ServiceAddr: "emb:8080", ModelID: "m1"},
+	})
+
+	vbs := bloom.NewVersionBloomStore(t.TempDir(), 1000, 0.01, vdl)
+	coord := NewWriteCoordinatorImpl(WriteCoordinatorConfig{
+		MaxRetries:          2,
+		RetryBaseIntervalMS: 10,
+		WAL:                 w,
+		RaftNode:            rn,
+		Splitter:            splitter,
+		EmbedClient:         ec,
+		ChunkBloom:          chunkBF,
+		VersionBloom:        vbs,
+		ChunkStore:          cs,
+		ChunkDocMapper:      cdm,
+		DocStore:            ds,
+		VersionDocList:      vdl,
+		IndexManager:        im,
+	})
+
+	versionID, err := coord.Execute(ctx, "kb-1", 0, []types.DocChange{
+		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello bloom"},
+		{Op: types.ChangeOpAdd, DocID: "doc-2", Content: "second doc"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// The version's filter must be available (from disk or cache) and
+	// contain exactly that version's document IDs.
+	f, err := vbs.Get(ctx, "kb-1", versionID)
+	if err != nil {
+		t.Fatalf("VersionBloomStore.Get: %v", err)
+	}
+	if !f.Test("doc-1") || !f.Test("doc-2") {
+		t.Error("version bloom filter missing version's document IDs")
+	}
+	if f.Test("doc-never-added") {
+		t.Error("version bloom filter must not contain unrelated doc IDs")
 	}
 }

@@ -25,7 +25,7 @@ const defaultRPCTimeout = 1 * time.Second
 // peerConn is a single peer's Raft gRPC client connection.
 type peerConn struct {
 	client kvraftpb.RaftClient
-	kvAddr string // address of the peer's Stratum-level service, used for snapshot transfer
+	kvAddr string // address of the peer's Stratum-level service, used for data sync (leader→follower)
 }
 
 // Transport manages this node's gRPC connections to its Raft peers and
@@ -47,7 +47,7 @@ type Transport struct {
 
 	mu             sync.RWMutex
 	peers          map[int64]*peerConn
-	onNeedSnapshot func(peerID int64, lastIndex uint64)
+	onNeedSnapshot func(peerID int64, lastIndex uint64) []byte
 }
 
 // NewTransport constructs a Transport. logger may be nil, in which case a
@@ -65,8 +65,9 @@ func NewTransport(logger *zap.Logger) *Transport {
 }
 
 // AddPeer registers a peer's Raft RPC address (raftAddr) and Stratum-level
-// service address (kvAddr, used only for out-of-band snapshot transfer —
-// see SetSnapshotHandler). See the Transport doc comment for the
+// service address (kvAddr, used only for data sync — snapshot transfer
+// goes over the peer's Raft RPC connection via InstallSnapshot, see
+// SendInstallSnapshot). See the Transport doc comment for the
 // call-before-Run invariant.
 func (t *Transport) AddPeer(id int64, raftAddr string, kvAddr string) error {
 	conn, err := grpc.NewClient(raftAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -92,10 +93,14 @@ func (t *Transport) PeerCount() int {
 
 // SetSnapshotHandler registers the callback invoked when a peer falls far
 // enough behind that it needs a full snapshot rather than incremental log
-// replication. The Stratum-level node wiring (analogous to KVServer's
-// Node.sendSnapshot) is responsible for actually transferring the
-// snapshot out-of-band and then calling SnapshotDone.
-func (t *Transport) SetSnapshotHandler(fn func(peerID int64, lastIndex uint64)) {
+// replication. The callback supplies the snapshot data covering up to
+// lastIndex (nil means "no snapshot available right now", which clears
+// the in-flight flag so a later replication round can retry); actually
+// transferring the data to the peer is Transport's job (see
+// SendInstallSnapshot). The Stratum-level node wiring provides this via
+// its persisted snapshot, falling back to serializing the live state
+// machine.
+func (t *Transport) SetSnapshotHandler(fn func(peerID int64, lastIndex uint64) []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.onNeedSnapshot = fn
@@ -144,8 +149,9 @@ func (t *Transport) replicateToPeer(rf *Raft, id int64, peer *peerConn) {
 		}
 		rf.snapshotPending[id] = true
 		lastIndex := rf.log[0].Index
+		lastTerm := rf.log[0].Term
 		rf.mu.Unlock()
-		t.SendInstallSnapshot(id, lastIndex)
+		t.SendInstallSnapshot(rf, id, lastIndex, lastTerm)
 		return
 	}
 
@@ -250,16 +256,73 @@ func (t *Transport) ReplicateLog(rf *Raft) {
 	}
 }
 
-// SendInstallSnapshot invokes the registered snapshot handler (see
-// SetSnapshotHandler) so the Stratum-level node wiring can transfer a
-// snapshot to peerID out-of-band.
-func (t *Transport) SendInstallSnapshot(peerID int64, lastIndex uint64) {
+// SendInstallSnapshot pushes a snapshot covering up to lastIndex to
+// peerID over the peer's existing Raft gRPC connection, using snapshot
+// data supplied by the handler registered via SetSnapshotHandler. Called
+// when the peer has fallen behind the start of this node's trimmed log
+// (see replicateToPeer).
+//
+// On success it advances the leader's bookkeeping for the peer via
+// SnapshotDone so normal incremental replication resumes from
+// lastIndex+1. On any failure (no handler, no data, RPC error, or a
+// discovered higher term) it clears the in-flight flag via
+// ResetSnapshotPending so a future replication round can retry — a
+// permanently-set pending flag would wedge the peer forever.
+func (t *Transport) SendInstallSnapshot(rf *Raft, peerID int64, lastIndex, lastTerm uint64) {
 	t.mu.RLock()
 	handler := t.onNeedSnapshot
 	t.mu.RUnlock()
+
+	var data []byte
 	if handler != nil {
-		handler(peerID, lastIndex)
+		data = handler(peerID, lastIndex)
+	} else {
+		t.logger.Debug("InstallSnapshot: no snapshot handler registered", zap.Int64("peer_id", peerID))
 	}
+	if data == nil {
+		rf.ResetSnapshotPending(peerID)
+		return
+	}
+
+	peer, ok := t.peer(peerID)
+	if !ok {
+		rf.ResetSnapshotPending(peerID)
+		return
+	}
+
+	req := &kvraftpb.InstallSnapshotRequest{
+		Term:              rf.Term(),
+		LeaderId:          rf.NodeID(),
+		LastIncludedIndex: lastIndex,
+		LastIncludedTerm:  lastTerm,
+		Data:              data,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), t.rpcTimeout)
+	defer cancel()
+	resp, err := peer.client.InstallSnapshot(ctx, req)
+	if err != nil {
+		t.logger.Debug("InstallSnapshot RPC failed", zap.Int64("peer_id", peerID), zap.Error(err))
+		rf.ResetSnapshotPending(peerID)
+		return
+	}
+
+	if resp.Term > rf.Term() {
+		t.logger.Info("stepping down: discovered higher term from InstallSnapshot response",
+			zap.Int64("node_id", rf.me), zap.Uint64("old_term", rf.Term()), zap.Uint64("new_term", resp.Term))
+		rf.mu.Lock()
+		if resp.Term > rf.term {
+			rf.term = resp.Term
+			rf.state = Follower
+			rf.voteFor = -1
+			rf.leaderID = -1
+			rf.persist()
+		}
+		rf.mu.Unlock()
+		rf.ResetSnapshotPending(peerID)
+		return
+	}
+
+	rf.SnapshotDone(peerID, lastIndex)
 }
 
 // SendVoteRequest fans out RequestVote to every peer and tallies the

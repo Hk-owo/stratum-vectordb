@@ -1,0 +1,64 @@
+# vecstore C++ 侧构建与测试 — 手动触发（workflow_dispatch）。
+#
+# 不进常规 push CI：需要 Faiss 源码构建 + RocksDB/gRPC/Protobuf/
+# prometheus-cpp 等系统依赖，一次运行约 15-20 分钟。Go 测试使用
+# 进程内 mock，不依赖 C++ 产物（见 README「Prerequisites」）。
+#
+# 触发方式：GitHub → Actions → 「vecstore C++ 构建」 → Run workflow。
+
+name: vecstore C++ 构建
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: CMake 构建 + ctest
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
+            libgrpc++-dev \
+            librocksdb-dev \
+            libblas-dev liblapack-dev \
+            libgtest-dev \
+            libprometheus-cpp-dev
+
+      # Ubuntu 的 libgtest-dev 只带源码与 CMake 配置，需本地编译一次，
+      # 否则 find_package(GTest) 找不到目标，ctest 无测试可跑。
+      - name: 编译并安装 GTest
+        run: |
+          sudo cmake -S /usr/src/googletest -B /tmp/gtest-build
+          sudo cmake --build /tmp/gtest-build -j"$(nproc)"
+          sudo cmake --install /tmp/gtest-build
+
+      - name: 构建 Faiss (v1.9.0, HNSW 后端)
+        run: |
+          git clone --depth 1 --branch v1.9.0 \
+            https://github.com/facebookresearch/faiss.git "$HOME/faiss"
+          cmake -B "$HOME/faiss/build" -S "$HOME/faiss" \
+            -DFAISS_ENABLE_GPU=OFF -DFAISS_ENABLE_PYTHON=OFF \
+            -DFAISS_ENABLE_C_API=OFF -DBUILD_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$HOME/faiss/build" -j"$(nproc)" --target faiss
+
+      - name: 配置 Stratum vecstore
+        run: cmake -B build -S vecstore \
+          -DFAISS_SOURCE_DIR="$HOME/faiss" \
+          -DFAISS_BUILD_DIR="$HOME/faiss/build"
+
+      - name: 构建
+        run: cmake --build build -j"$(nproc)"
+
+      - name: 运行 ctest
+        run: ctest --test-dir build --output-on-failure

@@ -88,10 +88,11 @@ type pendingProposal struct {
 // RaftNodeImpl is the real RaftNode implementation, built on
 // internal/kvraft.
 type RaftNodeImpl struct {
-	raft   *kvraft.Raft
-	wal    wal.WAL
-	sm     *stateMachine
-	logger *zap.Logger
+	raft      *kvraft.Raft
+	wal       wal.WAL
+	sm        *stateMachine
+	logger    *zap.Logger
+	persister *kvstorage.Persister // kvraft's on-disk hard state + snapshots
 
 	applyCh chan kvraft.ApplyMsg
 
@@ -159,10 +160,47 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 		wal:           cfg.WAL,
 		sm:            newStateMachine(),
 		logger:        logger,
+		persister:     persister,
 		applyCh:       applyCh,
 		pending:       make(map[uint64]*pendingProposal),
 		applyLoopDone: make(chan struct{}),
 	}
+
+	// Restore the state machine from any persisted snapshot (taken
+	// locally before a shutdown, or installed from a leader) BEFORE the
+	// apply loop starts. Without this, a restart after log compaction
+	// would boot an empty state machine whose lastApplied bookkeeping
+	// (also restored from the snapshot by kvraft.NewRaft) claims all the
+	// compacted entries were applied — subsequent commands would then be
+	// applied on top of nothing, losing every pre-snapshot KB/version.
+	if data, _, err := persister.LoadSnapshot(); err != nil {
+		impl.logger.Error("failed to load persisted snapshot; starting with empty state machine",
+			zap.Int64("node_id", cfg.NodeID), zap.Error(err))
+	} else if data != nil {
+		if err := impl.sm.restore(data); err != nil {
+			impl.logger.Error("failed to restore state machine from persisted snapshot; starting with empty state machine",
+				zap.Int64("node_id", cfg.NodeID), zap.Error(err))
+		}
+	}
+
+	// Provide snapshot data when a peer falls behind the start of this
+	// node's trimmed log: prefer the durable snapshot (its index is at
+	// least log[0].Index, since every local compaction persists one at
+	// LastApplied >= log[0].Index); fall back to serializing the live
+	// state machine, which covers everything applied so far.
+	transport.SetSnapshotHandler(func(peerID int64, lastIndex uint64) []byte {
+		data, snapIndex, err := persister.LoadSnapshot()
+		if err == nil && len(data) > 0 && snapIndex >= lastIndex {
+			return data
+		}
+		data, err = impl.sm.serialize()
+		if err != nil {
+			impl.logger.Error("failed to serialize state machine for snapshot transfer",
+				zap.Int64("node_id", cfg.NodeID), zap.Int64("peer_id", peerID), zap.Error(err))
+			return nil
+		}
+		return data
+	})
 
 	if err := rf.StartGRPC(cfg.RaftAddr); err != nil {
 		return nil, fmt.Errorf("raft: start gRPC on %s: %w", cfg.RaftAddr, err)
@@ -294,7 +332,16 @@ func (impl *RaftNodeImpl) handleSnapshotMsg(msg kvraft.ApplyMsg) {
 			zap.Uint64("snapshot_index", msg.SnapshotIndex), zap.Error(err))
 		return
 	}
-	impl.raft.InstallDone(msg.SnapshotIndex)
+	// Persist the installed snapshot: InstallDone (via trimLogLocked)
+	// discards every covered log entry, so without durable snapshot data
+	// a restart would find a trimmed log but no matching state-machine
+	// state — the state machine would boot empty while lastApplied claims
+	// the compacted entries were applied.
+	if err := impl.persister.SaveSnapshot(msg.SnapshotData, msg.SnapshotIndex); err != nil {
+		impl.logger.Error("failed to persist installed snapshot; restart after compaction may not recover state",
+			zap.Uint64("snapshot_index", msg.SnapshotIndex), zap.Error(err))
+	}
+	impl.raft.InstallDone(msg.SnapshotIndex, msg.SnapshotTerm)
 }
 
 // proposeAndWait encodes cmd, proposes it via kvraft, registers a waiter
