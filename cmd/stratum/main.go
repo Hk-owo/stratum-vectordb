@@ -199,14 +199,14 @@ func main() {
 
 	// --- IndexManager ---
 	indexMgr := index.NewIndexManager(index.IndexManagerConfig{
-		LRUCapacity:          cfg.IndexLRUCapacity,
-		LoadWaitTimeout:      cfg.IndexLoadWaitTimeout,
-		CallbackMaxRetries:   cfg.IndexCallbackMaxRetries,
-		CallbackRetryBaseMS:  cfg.IndexCallbackRetryBaseMS,
-		VecstoreAddr:         vecstoreAddr,
-		IndexDataDir:         dataDir,
-		IndexRetentionCount:  cfg.IndexRetentionCount,
-		MemoryThresholdMB:    cfg.IndexMemoryThresholdMB,
+		LRUCapacity:         cfg.IndexLRUCapacity,
+		LoadWaitTimeout:     cfg.IndexLoadWaitTimeout,
+		CallbackMaxRetries:  cfg.IndexCallbackMaxRetries,
+		CallbackRetryBaseMS: cfg.IndexCallbackRetryBaseMS,
+		VecstoreAddr:        vecstoreAddr,
+		IndexDataDir:        dataDir,
+		IndexRetentionCount: cfg.IndexRetentionCount,
+		MemoryThresholdMB:   cfg.IndexMemoryThresholdMB,
 	})
 	indexMgr.SetLogger(logger.Named("index"))
 	// Build data sources: the IndexManager's async build reads the
