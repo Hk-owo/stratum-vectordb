@@ -10,7 +10,11 @@ Stratum manages versioned document collections. Documents are split into
 content-addressed chunks, embedded into vectors via an external embed
 service, indexed with Faiss HNSW, and served through a gRPC API — plus an
 optional HTTP gateway (`cmd/stratum-gateway`) and web console (`web/`) for
-monitoring and administration.
+monitoring and administration. Storage hygiene is automated: unreferenced
+chunks are swept by a periodic garbage collector, and per-version document
+bloom filters make membership checks cheap while a startup reconcile derives
+version readiness from on-disk index files instead of trusting callback
+delivery.
 
 **What it solves:**
 
@@ -111,6 +115,7 @@ go run ./cmd/stratum/ -config integration/docker/config1.yaml
 | `RollbackVersion` | Switch the active version (no downtime) |
 | `ListKnowledgeBases` | List all KBs with their active versions |
 | `GetKnowledgeBase` | Fetch a single KB's config and active version |
+| `DeleteVersion` | Mark a version (and its descendants) for deletion; cleanup runs asynchronously |
 
 ### QueryService
 
@@ -123,9 +128,25 @@ go run ./cmd/stratum/ -config integration/docker/config1.yaml
 | RPC | Description |
 |---|---|
 | `HealthCheck` | Three-state health (HEALTHY / DEGRADED / UNHEALTHY) |
-| `GetSystemStatus` | Stuck versions, delete-failed KBs, WAL alerts, resource usage |
+| `GetSystemStatus` | Stuck versions, delete-failed KBs, WAL alerts, resource usage, in-flight version deletions |
+| `GetClusterStatus` | Node's own Raft view (node_id / leader_id / member_count) — used by the routing layer for leader discovery |
 | `RebuildIndex` | Re-trigger index build for a failed version |
 | `WarmupVersion` | Load a version's index into memory without switching the active version |
+
+## Background jobs & storage hygiene
+
+- **Chunk garbage collection** — `ChunkGarbageCollector` (`internal/coordinator`)
+  periodically sweeps chunks no longer referenced by any version (default
+  sweep interval 5 minutes, configurable via `chunk_gc.sweep_interval_sec`).
+- **Per-version document bloom filters** — `VersionBloomStore`
+  (`internal/bloom`) keeps one bloom filter per version containing its full
+  document ID set. Written on version creation (cached + persisted to disk),
+  loaded on read; a missing or corrupt on-disk copy is rebuilt from the
+  `VersionDocList`.
+- **Startup reconcile** — on boot the IndexManager queries vecstore's
+  `ExistsIndex` RPC to derive a version's READY status from on-disk facts
+  (Faiss index file + `.ids` sidecar), instead of trusting that a
+  build-completion callback was delivered (e.g. after a crash).
 
 ## HTTP gateway, routing layer & Web console
 
@@ -208,6 +229,7 @@ ops are driven from any node's console through `/ops/nodes/{id}/*`.
 
 ```
 stratum/
+├── .github/workflows/      # CI (Go full checks + Docker T4 cluster) & manual vecstore-cpp
 ├── api/proto/              # Protobuf definitions
 │   ├── knowledgebase.proto
 │   ├── query.proto
@@ -220,7 +242,7 @@ stratum/
 │   ├── docstore/           # MVCC document storage (PebbleDB)
 │   ├── chunkdoc/           # Bidirectional chunk ↔ document mapping
 │   ├── versiondoc/         # Per-version document ID sets
-│   ├── bloom/              # Bloom filters (chunk existence + version membership)
+│   ├── bloom/              # Bloom filters (chunk existence + version membership) + per-version document bloom store
 │   ├── splitter/           # Sliding-window document chunking
 │   ├── embed/              # External embed service HTTP client
 │   ├── chunkstore/         # Vecstore gRPC client wrapper
@@ -231,16 +253,18 @@ stratum/
 │   ├── wal/                # Write-ahead log for crash consistency
 │   ├── sync/               # Leader→Follower data sync (DataSync) + summary
 │   ├── pebbleutil/         # PebbleDB helpers (keys, iteration)
-│   └── coordinator/        # WriteCoordinator + DeleteCoordinator orchestration
+│   ├── router/             # gRPC front: writes → leader, reads load-balanced
+│   └── coordinator/        # Write / Delete / DeleteVersion / chunk-GC orchestration
 ├── service/                # gRPC service implementations
 ├── integration/            # Mock-based integration tests + real-stack e2e + cluster tests
 │   └── docker/             # 3-node Docker cluster (scripts/docker-cluster.sh) + T4 tests (`docker` build tag)
 ├── cmd/
 │   ├── stratum/main.go     # Entry point (−config YAML / flags)
-│   └── stratum-gateway/    # HTTP/JSON → gRPC gateway + web console static assets
+│   ├── stratum-gateway/    # HTTP/JSON → gRPC gateway + /ops console control plane
+│   └── stratum-router/     # Routing layer: single address into a Raft cluster
 ├── configs/                # Sample configuration files
 ├── web/                    # Web console frontend (HTML/CSS/JS)
-├── scripts/                # Dev/test helper scripts (test-data generation etc.)
+├── scripts/                # Dev/test helper scripts + ops scripts (scripts/ops)
 ├── vecstore/               # C++ vector storage (Faiss HNSW + RocksDB)
 └── go.mod
 ```
@@ -304,6 +328,12 @@ go test ./integration/docker/... -tags=docker -v -timeout 300s
 scripts/docker-cluster.sh down
 ```
 
+CI is wired in `.github/workflows/ci.yml` (push to `main` and pull
+requests): gofmt + `go vet` + `go build` + unit tests (23 packages) +
+race detector on raft/kvraft/index + a 3-node Docker cluster (T4) fault
+tolerance run. The C++ vecstore side is covered by a separate
+manually-triggered workflow (`.github/workflows/vecstore-cpp.yml`).
+
 ### Data-volume measurements (3-node Docker cluster)
 
 Sampled with `TestT4_DataVolume` against a real vecstore (Faiss HNSW +
@@ -323,10 +353,11 @@ window=512 and embedded by the mock embed service at 10 ms/chunk.
 Note: writes are batched because a single `CreateVersion` request must stay
 under the 4 MiB gRPC message limit (~1,400 docs at ~2.8 KB/doc); each batch
 becomes a version and is chained only after the previous one reaches READY
-(a PENDING parent is rejected). 100,000 docs could not be completed: the
-raft log grows past kvraft's snapshot threshold (1000 entries) and the
-leader blocks inside snapshotting, stalling heartbeats and build callbacks —
-see 改动内容.md for details.
+(a PENDING parent is rejected). A 100,000-doc run previously stalled when
+the raft log crossed kvraft's snapshot threshold and the leader serialized
+the state machine synchronously inside the apply loop; snapshots are now
+deep-copied under RLock and serialized/persisted asynchronously, so the
+apply loop and heartbeats are never blocked by snapshotting.
 
 ## Prerequisites
 
