@@ -309,17 +309,43 @@ type snapshotState struct {
 	NextVersionID int64
 }
 
-// serialize encodes the full current state machine for a Raft snapshot.
-func (sm *stateMachine) serialize() ([]byte, error) {
+// deepCopy returns a stable copy of the current state machine under RLock.
+// It is the fast, lock-bounded step of the async snapshot path: the copy
+// is cheap (KB/version metadata only), so apply is blocked for a moment;
+// the slow gob encoding and disk write happen later on the copy without
+// holding any lock, so a slow snapshot can never stall the apply loop.
+func (sm *stateMachine) deepCopy() snapshotState {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	snap := snapshotState{
-		KBs:           sm.kbs,
-		Versions:      sm.versions,
-		VersionsByKB:  sm.versionsByKB,
+	kbs := make(map[string]types.KnowledgeBaseMeta, len(sm.kbs))
+	for k, v := range sm.kbs {
+		kbs[k] = v
+	}
+	versions := make(map[int64]types.VersionMeta, len(sm.versions))
+	for k, v := range sm.versions {
+		versions[k] = v
+	}
+	versionsByKB := make(map[string][]int64, len(sm.versionsByKB))
+	for k, v := range sm.versionsByKB {
+		versionsByKB[k] = append([]int64(nil), v...)
+	}
+	return snapshotState{
+		KBs:           kbs,
+		Versions:      versions,
+		VersionsByKB:  versionsByKB,
 		NextVersionID: sm.nextVersionID,
 	}
+}
+
+// serialize encodes the full current state machine for a Raft snapshot.
+func (sm *stateMachine) serialize() ([]byte, error) {
+	return encodeSnapshot(sm.deepCopy())
+}
+
+// encodeSnapshot gob-encodes a (copied) snapshotState without touching the
+// live state machine, so it can run off the state-machine lock.
+func encodeSnapshot(snap snapshotState) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(snap); err != nil {
 		return nil, fmt.Errorf("raft: serialize state machine snapshot: %w", err)
@@ -351,4 +377,26 @@ func (sm *stateMachine) restore(data []byte) error {
 		sm.versionsByKB = make(map[string][]int64)
 	}
 	return nil
+}
+
+// listAllVersions returns a snapshot of every version that still needs
+// storage-layer data sync: PENDING versions (their writes have not
+// completed and no digest is committed yet) and Deleting versions (their
+// data is being cleaned up) are excluded.
+//
+// Used after installing a leader-pushed snapshot: the snapshot covers log
+// entries that are never applied individually on this node, so the normal
+// per-version onVersionCreated hook would never fire for them — the caller
+// triggers it explicitly for every version returned here.
+func (sm *stateMachine) listAllVersions() []types.VersionMeta {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	out := make([]types.VersionMeta, 0, len(sm.versions))
+	for _, v := range sm.versions {
+		if v.IndexStatus == types.IndexStatusPending || v.Deleting {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
 }

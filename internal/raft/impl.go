@@ -313,15 +313,30 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 func (impl *RaftNodeImpl) handleSnapshotMsg(msg kvraft.ApplyMsg) {
 	if msg.SnapshotData == nil {
 		// Locally triggered: the log has grown past the configured
-		// threshold; serialize current state and hand it to kvraft for
-		// compaction.
-		data, err := impl.sm.serialize()
-		if err != nil {
-			impl.logger.Error("failed to serialize state machine for snapshot", zap.Error(err))
-		} else {
-			impl.raft.Snapshot(impl.raft.LastApplied(), data)
+		// threshold. Deep-copy the state machine (fast, under RLock),
+		// then serialize + persist asynchronously so a slow snapshot can
+		// never stall the apply loop (the "snapshot blocking" hang).
+		// The snapshot index is the one frozen by kvraft when the request
+		// was sent — not LastApplied() read later, which may have
+		// advanced past what the copied data covers.
+		snap := impl.sm.deepCopy()
+		snapIndex := msg.SnapshotIndex
+		if snapIndex == 0 {
+			// Fallback for a zero value (shouldn't happen with the
+			// current kvraft, which always fills it).
+			snapIndex = impl.raft.LastApplied()
 		}
-		impl.raft.ResetSnapshotting()
+		impl.callbackWG.Add(1)
+		go func() {
+			defer impl.callbackWG.Done()
+			data, err := encodeSnapshot(snap)
+			if err != nil {
+				impl.logger.Error("failed to serialize state machine for snapshot", zap.Error(err))
+			} else {
+				impl.raft.Snapshot(snapIndex, data)
+			}
+			impl.raft.ResetSnapshotting()
+		}()
 		return
 	}
 
@@ -342,6 +357,25 @@ func (impl *RaftNodeImpl) handleSnapshotMsg(msg kvraft.ApplyMsg) {
 			zap.Uint64("snapshot_index", msg.SnapshotIndex), zap.Error(err))
 	}
 	impl.raft.InstallDone(msg.SnapshotIndex, msg.SnapshotTerm)
+
+	// The installed snapshot restored every pre-compaction version into
+	// the state machine, but those entries were never applied individually
+	// on this node, so the per-version onVersionCreated hook (which drives
+	// the DataSync pull of storage-layer data + index build) would never
+	// fire for them. Trigger it explicitly for every snapshot-covered
+	// version, exactly like handleEntryMsg does for a freshly replicated
+	// cmdCreateVersion. PullVersion is idempotent (re-pulls are no-ops),
+	// and the callback runs asynchronously so the apply loop is not
+	// blocked; Stop() waits for these goroutines via callbackWG.
+	if impl.onVersionCreated != nil {
+		for _, v := range impl.sm.listAllVersions() {
+			impl.callbackWG.Add(1)
+			go func(kbID string, versionID int64) {
+				defer impl.callbackWG.Done()
+				impl.onVersionCreated(kbID, versionID)
+			}(v.KBID, v.VersionID)
+		}
+	}
 }
 
 // proposeAndWait encodes cmd, proposes it via kvraft, registers a waiter

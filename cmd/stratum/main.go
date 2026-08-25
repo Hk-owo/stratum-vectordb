@@ -149,6 +149,7 @@ func main() {
 		Peers:              cfg.Peers,
 		WAL:                walImpl,
 		Logger:             logger.Named("raft"),
+		MaxLogLength:       cfg.MaxLogLength,
 		HeartbeatInterval:  cfg.HeartbeatInterval,
 		ElectionTimeoutMin: cfg.ElectionTimeoutMin,
 		ElectionTimeoutMax: cfg.ElectionTimeoutMax,
@@ -655,6 +656,10 @@ type appConfig struct {
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
 
+	// MaxLogLength bounds the raft log before a local snapshot is
+	// requested; 0 = kvraft default (1000).
+	MaxLogLength uint64
+
 	VecstoreGRPCAddr string
 	EmbedServiceAddr string
 
@@ -708,6 +713,12 @@ type fileConfig struct {
 		HeartbeatIntervalMS  int64 `yaml:"heartbeat_interval_ms"`
 		ElectionTimeoutMinMS int64 `yaml:"election_timeout_min_ms"`
 		ElectionTimeoutMaxMS int64 `yaml:"election_timeout_max_ms"`
+
+		// MaxLogLength bounds the raft log before a local snapshot is
+		// requested (kvraft default 1000). Optional; 0 = kvraft default.
+		// Exposed so large-volume deployments (or snapshot tests) can
+		// tune compaction frequency without a code change.
+		MaxLogLength int64 `yaml:"max_log_length"`
 	} `yaml:"raft"`
 
 	Storage struct {
@@ -794,6 +805,9 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	if fc.Raft.ElectionTimeoutMaxMS != 0 {
 		cfg.ElectionTimeoutMax = time.Duration(fc.Raft.ElectionTimeoutMaxMS) * time.Millisecond
+	}
+	if fc.Raft.MaxLogLength > 0 {
+		cfg.MaxLogLength = uint64(fc.Raft.MaxLogLength)
 	}
 	if fc.Storage.DataDir != "" {
 		cfg.DataDir = fc.Storage.DataDir

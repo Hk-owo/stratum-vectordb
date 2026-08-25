@@ -37,9 +37,12 @@ func NewVecstoreChunkStore(addr string) (*VecstoreChunkStore, error) {
 	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                10 * time.Second, // ping interval to detect dead connections promptly
-			Timeout:             3 * time.Second,  // time to wait for a ping ack before considering the connection dead
-			PermitWithoutStream: true,
+			// 10s 无流 ping + PermitWithoutStream 会被 vecstore 的 C++
+			// 服务端以 too_many_pings GoAway 踢掉连接；改为仅在活动流
+			// 上以 60s 间隔探测。
+			Time:                60 * time.Second,
+			Timeout:             3 * time.Second,
+			PermitWithoutStream: false,
 		}),
 	)
 	if err != nil {

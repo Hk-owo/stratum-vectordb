@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	kvraftpb "stratum/api/proto/kvraft"
 )
@@ -46,6 +47,16 @@ type snapshotState struct {
 type Persister struct {
 	statePath    string
 	snapshotPath string
+
+	// mu serializes snapshot-file writes and guards snapshotIndex.
+	// Local async snapshots (raft.Snapshot, now off the raft lock) and
+	// leader-installed snapshots (InstallSnapshot restore) both call
+	// SaveSnapshot; without this mutex the two can race on the same
+	// file, and a stale local snapshot could overwrite a newer
+	// installed one. snapshotIndex is the highest snapshot index ever
+	// persisted this process, so older snapshots are refused.
+	mu            sync.Mutex
+	snapshotIndex uint64
 }
 
 // NewPersister returns a Persister rooted at path. Neither file is
@@ -90,12 +101,20 @@ func (p *Persister) LoadState() (term uint64, voteFor int64, log []*kvraftpb.Ent
 // SaveSnapshot durably persists a state-machine snapshot and the Raft log
 // index it covers up to (inclusive). Independent of SaveState: saving a
 // snapshot does not alter the separately persisted hard state, and vice
-// versa.
+// versa. A snapshot with lastIndex below the highest already persisted is
+// refused (returning nil): an async local snapshot may finish after a
+// newer leader-installed snapshot was written, and must not overwrite it.
 func (p *Persister) SaveSnapshot(data []byte, lastIndex uint64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if lastIndex < p.snapshotIndex {
+		return nil // stale snapshot; keep the newer one
+	}
 	snap := snapshotState{Data: data, LastIndex: lastIndex}
 	if err := atomicWriteGob(p.snapshotPath, snap); err != nil {
 		return fmt.Errorf("kvstorage: SaveSnapshot: %w", err)
 	}
+	p.snapshotIndex = lastIndex
 	return nil
 }
 
@@ -104,6 +123,8 @@ func (p *Persister) SaveSnapshot(data []byte, lastIndex uint64) error {
 // a zero index, and a nil error — this is the expected condition when a
 // node has never taken a snapshot, not an error condition.
 func (p *Persister) LoadSnapshot() (data []byte, lastIndex uint64, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	raw, err := os.ReadFile(p.snapshotPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -115,6 +136,7 @@ func (p *Persister) LoadSnapshot() (data []byte, lastIndex uint64, err error) {
 	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&snap); err != nil {
 		return nil, 0, fmt.Errorf("kvstorage: LoadSnapshot: decode %s: %w", p.snapshotPath, err)
 	}
+	p.snapshotIndex = snap.LastIndex
 	return snap.Data, snap.LastIndex, nil
 }
 

@@ -26,6 +26,7 @@
 #   status                     查看集群状态与 leader
 #   logs [node]                查看节点日志（默认全部，-f 跟踪）
 #   embed start|stop|status    管理可选 mock-embed 依赖容器
+#   vecstore start|stop|status 管理每节点独立 vecstore（宿主进程 :7101-710N）
 #   down                       停止并删除容器（保留数据卷）
 #   clean                      down + 删除数据卷/网络/配置（完全清理）
 #   help                       显示帮助
@@ -53,6 +54,12 @@ IMAGE=stratum-node:latest
 CONTAINER_PREFIX=stratum-node
 WITH_EMBED=0
 FORCE=0
+
+# 每节点独立 vecstore（设计文档 v11「多副本构建」：每个副本独立构建自己的
+# HNSW 索引）。第 N 个节点的 vecstore 实例监听宿主 710N，RocksDB 数据目录
+# run/docker/vecstore/nodeN 各自独立；节点容器经 host.docker.internal 访问。
+VECSTORE_BASE_PORT=7101
+VECSTORE_DIR="$RUN_DIR/vecstore"
 
 # ---------- 基础工具函数 ----------
 
@@ -127,6 +134,9 @@ raft:
   heartbeat_interval_ms: 200
   election_timeout_min_ms: 2000
   election_timeout_max_ms: 4000
+  # 0 = kvraft 默认 1000。压测/大写入量场景可调小以主动触发快照
+  # （scripts/docker-cluster.sh 支持 STRATUM_RAFT_MAX_LOG_LENGTH 覆盖）。
+  max_log_length: ${STRATUM_RAFT_MAX_LOG_LENGTH:-0}
   peers:
 $(for ((p=1; p<=count; p++)); do
     printf '    - id: %s\n      addr: "%s:8000"\n      service_addr: "%s:7000"\n' \
@@ -137,7 +147,9 @@ storage:
   data_dir: "/var/lib/stratum/node${id}"
 
 vecstore:
-  grpc_addr: "host.docker.internal:7100"
+  # 每节点独立 vecstore：节点 N 连宿主 710N（每副本独立构建索引，见
+  # Stratum_设计文档v11.md「多副本构建」）。
+  grpc_addr: "host.docker.internal:$((VECSTORE_BASE_PORT + id - 1))"
 
 embed:
   service_addr: "http://host.docker.internal:8080"
@@ -193,7 +205,18 @@ run_node() {
   local gport=$((BASE_PORT + id - 1))
   local rport=$((BASE_PORT + 1000 + id - 1))
   local mport=$((BASE_PORT + 2000 + id - 1))
-  local vol="stratum-node${id}-data"
+  # 节点数据目录 bind mount 宿主机 /var/lib/stratum/nodeN（容器内外同一路径），
+  # 使宿主机上的 vecstore 进程能按路径访问节点持久化的索引文件
+  # (index/<kb>/<version>.index)。docker 命名卷无法被宿主机进程按路径打开，
+  # 会让 976b636 引入的 saveToDisk 在集群形态下失败（faiss 写容器路径报错）。
+  local hostdir="/var/lib/stratum/node${id}"
+  if [[ ! -d "$hostdir" ]]; then
+    # docker 自动创建宿主目录（root 属主）后改为当前用户可写：节点容器内以
+    # root 运行不受属主限制，宿主机 vecstore 以普通用户运行需要写权限。
+    docker run --rm -v "$hostdir:/x" alpine:latest sh -c \
+      "chown $(id -u):$(id -g) /x && chmod 775 /x" >/dev/null 2>&1 || \
+      { mkdir -p "$hostdir" && chmod 775 "$hostdir"; }
+  fi
 
   if container_exists "$name"; then
     if [[ "$FORCE" -eq 1 ]]; then
@@ -211,7 +234,7 @@ run_node() {
     --network "$NETWORK" \
     -p "${gport}:7000" -p "${rport}:8000" -p "${mport}:9000" \
     -v "$(node_cfg "$id"):/etc/stratum/config.yaml:ro" \
-    -v "${vol}:/var/lib/stratum/node${id}" \
+    -v "${hostdir}:/var/lib/stratum/node${id}" \
     --add-host host.docker.internal:host-gateway \
     --restart unless-stopped \
     --health-cmd "nc -z -w2 127.0.0.1 7000" \
@@ -279,6 +302,8 @@ wait_for_leader() {
 cmd_up() {
   local count=${1:-$DEFAULT_NODES}
   cmd_init "$count"
+  # 每节点独立 vecstore（先于节点启动，节点启动时的索引 reconcile 需要它）
+  vecstore_start
   # 启动全部节点（幂等）
   local id
   for ((id=1; id<=count; id++)); do run_node "$id"; done
@@ -336,10 +361,19 @@ cmd_down() {
 cmd_clean() {
   cmd_down
   docker rm -f "stratum-embed" >/dev/null 2>&1 || true
-  # 删除命名数据卷
+  vecstore_stop
+  rm -rf "$VECSTORE_DIR" && log "删除 vecstore 数据目录 $VECSTORE_DIR"
+  # 删除旧命名数据卷（bind mount 迁移前的遗留）
   for id in $(seq 1 32); do
     local vol="stratum-node${id}-data"
     docker volume rm "$vol" >/dev/null 2>&1 && log "删除数据卷 $vol"
+  done
+  # 删除 bind mount 的宿主机节点数据目录（root 属主，借容器删）
+  for id in $(seq 1 32); do
+    local hostdir="/var/lib/stratum/node${id}"
+    if [[ -d "$hostdir" ]]; then
+      docker run --rm -v "/var/lib/stratum:/s" alpine:latest rm -rf "/s/node${id}" >/dev/null 2>&1 && log "删除节点数据目录 $hostdir"
+    fi
   done
   docker network rm "$NETWORK" >/dev/null 2>&1 && log "删除网络 $NETWORK" || true
   if [[ -d "$RUN_DIR" ]]; then
@@ -461,6 +495,63 @@ embed_status() {
   fi
 }
 
+# ---------- 6. 每节点独立 vecstore（宿主进程，端口 710N） ----------
+
+vecstore_ids() { seq 1 "$(count_from_config)"; }
+vecstore_port() { echo $((VECSTORE_BASE_PORT + $1 - 1)); }
+
+vecstore_start() {
+  mkdir -p "$VECSTORE_DIR" "$LOG_DIR"
+  local id port
+  for id in $(vecstore_ids); do
+    port="$(vecstore_port "$id")"
+    if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+      log "vecstore-$id 已在运行（:${port}）"
+      continue
+    fi
+    log "启动 vecstore-$id（:${port}，数据目录 $VECSTORE_DIR/node${id}）…"
+    mkdir -p "$VECSTORE_DIR/node${id}"
+    # setsid：完全脱离调用进程组，避免脚本/会话退出时被连带清理
+    setsid nohup "$ROOT/run/bin/vecstore_server" \
+      --rocksdb_path="$VECSTORE_DIR/node${id}" \
+      --grpc_addr="0.0.0.0:${port}" \
+      >> "$LOG_DIR/vecstore-node${id}.log" 2>&1 &
+    sleep 0.5
+  done
+  # 等待全部就绪
+  local ok=1
+  for id in $(vecstore_ids); do
+    port="$(vecstore_port "$id")"
+    if ! ss -tlnp 2>/dev/null | grep -q ":$port "; then
+      warn "vecstore-$id 未监听 :${port}（见 $LOG_DIR/vecstore-node${id}.log）"
+      ok=0
+    fi
+  done
+  [[ "$ok" -eq 1 ]] && log "全部 vecstore 实例就绪（${VECSTORE_BASE_PORT}-$((VECSTORE_BASE_PORT + $(count_from_config) - 1))）"
+}
+
+vecstore_stop() {
+  local id port
+  for id in $(vecstore_ids); do
+    port="$(vecstore_port "$id")"
+    if pgrep -f "vecstore_server.*grpc_addr=0.0.0.0:${port}" >/dev/null; then
+      pkill -f "vecstore_server.*grpc_addr=0.0.0.0:${port}" >/dev/null && log "停止 vecstore-$id（:${port}）"
+    fi
+  done
+}
+
+vecstore_status() {
+  local id port
+  for id in $(vecstore_ids); do
+    port="$(vecstore_port "$id")"
+    if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+      echo "vecstore-$id  running  :${port}  $VECSTORE_DIR/node${id}"
+    else
+      echo "vecstore-$id  stopped  :${port}"
+    fi
+  done
+}
+
 # ---------- 参数解析 ----------
 
 usage() {
@@ -507,6 +598,14 @@ case "$CMD" in
       stop)   embed_stop ;;
       status) embed_status ;;
       *) die "embed 子命令: start|stop|status" ;;
+    esac
+    ;;
+  vecstore)
+    case "${1:-status}" in
+      start)  vecstore_start ;;
+      stop)   vecstore_stop ;;
+      status) vecstore_status ;;
+      *) die "vecstore 子命令: start|stop|status" ;;
     esac
     ;;
   down)  cmd_down ;;

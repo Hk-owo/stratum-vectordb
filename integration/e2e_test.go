@@ -230,11 +230,30 @@ func newRealNodeWithAddrs(t *testing.T, nodeID int64, peers []raft.PeerConfig, v
 	return newRealNodeWithAddrsAndDir(t, nodeID, peers, vecstoreAddr, embedAddr, raftAddr, grpcAddr, t.TempDir())
 }
 
+// realNodeConfig carries optional overrides for realNode construction.
+// Zero values mean "default", so newRealNodeWithAddrsAndDir (which passes
+// an empty realNodeConfig) is unchanged.
+type realNodeConfig struct {
+	// maxLogLength overrides kvraft's log-compaction threshold. A small
+	// value (e.g. 32) lets tests force a local Raft snapshot (log trim +
+	// persisted snapshot) quickly, which is what makes a lagging follower
+	// fall behind the leader's log base and trigger the InstallSnapshot
+	// path on reconnect.
+	maxLogLength uint64
+}
+
 // newRealNodeWithAddrsAndDir is newRealNode with explicit addresses and a
 // caller-provided persistent base directory. Reusing the same baseDir (and
 // addresses) across a Stop()/restart cycle simulates a node reboot with
 // its on-disk state intact.
 func newRealNodeWithAddrsAndDir(t *testing.T, nodeID int64, peers []raft.PeerConfig, vecstoreAddr, embedAddr, raftAddr, grpcAddr, baseDir string) *realNode {
+	t.Helper()
+	return newRealNodeWithAddrsAndDirOpts(t, nodeID, peers, vecstoreAddr, embedAddr, raftAddr, grpcAddr, baseDir, realNodeConfig{})
+}
+
+// newRealNodeWithAddrsAndDirOpts is newRealNodeWithAddrsAndDir with
+// optional per-node configuration overrides (see realNodeConfig).
+func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.PeerConfig, vecstoreAddr, embedAddr, raftAddr, grpcAddr, baseDir string, cfg realNodeConfig) *realNode {
 	t.Helper()
 	if baseDir == "" {
 		baseDir = t.TempDir()
@@ -273,6 +292,7 @@ func newRealNodeWithAddrsAndDir(t *testing.T, nodeID int64, peers []raft.PeerCon
 		ElectionTimeoutMin: 50 * time.Millisecond,
 		ElectionTimeoutMax: 120 * time.Millisecond,
 		HeartbeatInterval:  20 * time.Millisecond,
+		MaxLogLength:       cfg.maxLogLength,
 	})
 	if err != nil {
 		t.Fatalf("node %d: NewRaftNodeImpl: %v", nodeID, err)

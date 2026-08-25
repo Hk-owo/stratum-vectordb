@@ -33,26 +33,37 @@ func (rf *Raft) ResetSnapshotting() {
 // serialized snapshot) is durably persisted alongside it. A no-op if
 // index does not exceed the current snapshot base or exceeds what's
 // actually in the log.
+//
+// The memory trim is done under rf.mu (cheap); the durable snapshot write
+// happens AFTER releasing it, so a slow disk can no longer stall the raft
+// loop (heartbeats, proposals, apply) — this was the direct cause of the
+// "snapshot blocking" hang observed under large write volumes. Order is
+// preserved: the snapshot file is written before persist() flushes the
+// trimmed log, so a crash between the two leaves a log whose base is no
+// newer than the persisted snapshot.
 func (rf *Raft) Snapshot(index uint64, data []byte) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if index <= rf.log[0].Index {
+		rf.mu.Unlock()
 		return
 	}
 	offset := rf.logIndex(index)
 	if offset >= uint64(len(rf.log)) {
+		rf.mu.Unlock()
 		return
 	}
 
 	newLog := []*kvraftpb.Entry{{Index: index, Term: rf.log[offset].Term}}
 	newLog = append(newLog, rf.log[offset+1:]...)
 	rf.log = newLog
+	rf.mu.Unlock()
 
 	if err := rf.persister.SaveSnapshot(data, index); err != nil {
 		rf.logger.Error("SaveSnapshot failed", zap.Int64("node_id", rf.me), zap.Uint64("index", index), zap.Error(err))
 	}
+	rf.mu.Lock()
 	rf.persist()
+	rf.mu.Unlock()
 }
 
 // SnapshotDone is called by the state-machine layer once an out-of-band

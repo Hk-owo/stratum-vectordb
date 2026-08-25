@@ -14,8 +14,10 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 
 	vecstorepb "stratum/api/proto/vecstore"
 	stratumerrors "stratum/internal/errors"
@@ -148,9 +150,14 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		conn, err := grpc.NewClient(cfg.VecstoreAddr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				Time:                10 * time.Second,
+				// 10s 无流 ping + PermitWithoutStream 会被 vecstore 的
+				// C++ 服务端以 too_many_pings GoAway 踢掉连接（压测中
+				// 导致 build RPC 挂起、版本永久 PENDING）。改为仅在
+				// 活动流上以 60s 间隔探测：既保留死连接检测，又不再
+				// 触发服务端 keepalive 强制策略。
+				Time:                60 * time.Second,
 				Timeout:             3 * time.Second,
-				PermitWithoutStream: true,
+				PermitWithoutStream: false,
 			}),
 		)
 		if err != nil {
@@ -256,7 +263,54 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64) {
 	key := indexKey{kbID, versionID}
 
 	status := types.IndexStatusReady
-	sizeBytes, err := im.build(context.Background(), kbID, versionID)
+	var sizeBytes int64
+
+	// Deferred cleanup guarantees that loading is ALWAYS cleared and
+	// waiters are ALWAYS woken, even if build()/makeRoomLocked/panics
+	// below blow up. Without this a wedged build goroutine leaves
+	// loading[key] true forever and every acquire() on that version spins
+	// in cond.Wait until its context dies — the pressure-test Query hang.
+	defer func() {
+		if r := recover(); r != nil {
+			im.logger.Error("index build panicked; marking version FAILED",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Any("panic", r))
+			status = types.IndexStatusFailed
+		}
+		im.mu.Lock()
+		delete(im.loading, key)
+		if status == types.IndexStatusReady {
+			// Make room before inserting the new index.
+			im.makeRoomLocked()
+			im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
+			im.sizeByKey[key] = sizeBytes
+			im.loadedBytes += sizeBytes
+		}
+		callbacks := append([]BuildCompleteCallback(nil), im.callbacks...)
+		im.cond.Broadcast()
+		im.mu.Unlock()
+
+		// Persist the size sidecar next to the index file so a later
+		// restart (loadFromDisk) can account for this version's memory
+		// footprint. Best-effort: a failed sidecar write only degrades
+		// the estimate to 0.
+		if status == types.IndexStatusReady {
+			im.persistSizeSidecar(kbID, versionID, sizeBytes)
+		}
+
+		// Invoke callbacks with retry. The on-disk retention policy is
+		// NOT enforced here: EnforceDiskRetention needs to know the KB's
+		// active version (to avoid dropping a rolled-back active
+		// version's index), which requires the Raft layer — the
+		// registered BuildCompleteCallback in cmd/stratum/main.go
+		// applies the policy instead.
+		for _, cb := range callbacks {
+			im.invokeCallback(cb, kbID, versionID, status)
+		}
+	}()
+
+	var err error
+	sizeBytes, err = im.buildWithRetry(kbID, versionID)
 	if err != nil {
 		im.logger.Error("index build failed",
 			zap.String("kb_id", kbID),
@@ -264,34 +318,64 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64) {
 			zap.Error(err))
 		status = types.IndexStatusFailed
 	}
+}
 
-	im.mu.Lock()
-	delete(im.loading, key)
-	if status == types.IndexStatusReady {
-		// Make room before inserting the new index.
-		im.makeRoomLocked()
-		im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
-		im.sizeByKey[key] = sizeBytes
-		im.loadedBytes += sizeBytes
+// buildWithRetry runs build() inside a bounded window, retrying on
+// failure so transient conditions self-heal instead of leaving the
+// version FAILED/PENDING. Observed transient failures:
+//   - vecstore "Save: no index has been built or loaded": a concurrent
+//     build of the same (kb, version) can reset the shared HNSW index
+//     between this node's Build and Save RPCs; a retry typically
+//     succeeds once the other build finishes.
+//   - follower builds racing the data sync: a pull may not yet have
+//     landed all chunk-doc/version-doc entries when the build reads them,
+//     so the chunk set comes back empty; a retry after the sync
+//     converges succeeds.
+//
+// build() is idempotent (Build/AddChunks/Save re-write the same keys), so
+// retrying is safe. The whole retry loop is bounded by buildRetryTimeout
+// so a permanently-failing build still surfaces as FAILED instead of
+// wedging the version forever.
+const buildRetryTimeout = 5 * time.Minute
+const buildRetryInterval = 2 * time.Second
+
+// isTransientBuildErr reports whether a build failure is worth retrying:
+// vecstore RPC failures of the "data not ready / index reset by a
+// concurrent build / connection teardown" kind (FailedPrecondition,
+// Unavailable, DeadlineExceeded, Internal). Deterministic errors (e.g. a
+// caller-level error string) fail immediately so callers see a FAILED
+// status promptly instead of a silent retry loop.
+func isTransientBuildErr(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
 	}
-	callbacks := append([]BuildCompleteCallback(nil), im.callbacks...)
-	im.cond.Broadcast()
-	im.mu.Unlock()
-
-	// Persist the size sidecar next to the index file so a later restart
-	// (loadFromDisk) can account for this version's memory footprint.
-	// Best-effort: a failed sidecar write only degrades the estimate to 0.
-	if status == types.IndexStatusReady {
-		im.persistSizeSidecar(kbID, versionID, sizeBytes)
+	switch st.Code() {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.FailedPrecondition, codes.Internal:
+		return true
 	}
+	return false
+}
 
-	// Invoke callbacks with retry. The on-disk retention policy is NOT
-	// enforced here: EnforceDiskRetention needs to know the KB's active
-	// version (to avoid dropping a rolled-back active version's index),
-	// which requires the Raft layer — the registered BuildCompleteCallback
-	// in cmd/stratum/main.go applies the policy instead.
-	for _, cb := range callbacks {
-		im.invokeCallback(cb, kbID, versionID, status)
+func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), buildRetryTimeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		sizeBytes, err := im.build(ctx, kbID, versionID)
+		if err == nil {
+			return sizeBytes, nil
+		}
+		lastErr = err
+		if !isTransientBuildErr(err) {
+			return 0, err
+		}
+		select {
+		case <-ctx.Done():
+			return 0, lastErr
+		case <-time.After(buildRetryInterval):
+		}
 	}
 }
 
@@ -379,8 +463,16 @@ func (im *IndexManagerImpl) saveToDisk(ctx context.Context, kbID string, version
 		return nil // persistence not configured
 	}
 	path := im.indexPath(kbID, versionID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// 0777: this node and the vecstore process share the filesystem but may
+	// run as different users (docker 集群形态：节点容器内 root、宿主机
+	// vecstore 普通用户)。放宽目录权限让共享的 vecstore 能写入索引文件。
+	// MkdirAll 的权限位会被进程 umask(022) 收窄，故创建后显式 Chmod。
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return fmt.Errorf("index: save mkdir: %w", err)
+	}
+	if err := os.Chmod(dir, 0o777); err != nil {
+		return fmt.Errorf("index: save chmod: %w", err)
 	}
 	if _, err := im.vectorIndexClient.Save(ctx, &vecstorepb.SaveIndexRequest{
 		KbId: kbID, VersionId: versionID, Path: path,
@@ -528,37 +620,32 @@ func (im *IndexManagerImpl) acquire(ctx context.Context, key indexKey) error {
 	}
 }
 
-// waitLocked blocks on im.cond until woken, ctx is done, or deadline
-// passes, returning false in the latter two cases. Must be called with
-// im.mu held.
+// waitLocked blocks until the loading condition is re-checkable, ctx is
+// done, or deadline passes, returning false in the latter two cases. Must
+// be called with im.mu held.
+//
+// Deliberately NOT implemented with cond.Wait: a lost wakeup (e.g. the
+// build goroutine dies between setting loading and broadcasting) would
+// park the caller forever — exactly the pressure-test Query hang where a
+// goroutine sat in sync.Cond.Wait for minutes. Polling with a bounded
+// deadline is slightly less efficient but cannot wedge.
 func (im *IndexManagerImpl) waitLocked(ctx context.Context, deadline time.Time) bool {
-	// Use a timer to wake the cond when deadline passes, and a goroutine
-	// to wake when ctx is done.
-	wakerDone := make(chan struct{})
-	timer := time.AfterFunc(time.Until(deadline), func() {
-		im.mu.Lock()
-		im.cond.Broadcast()
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return false
+		}
+		// Drop the lock briefly so the build goroutine (which needs
+		// im.mu to clear loading) can make progress, then re-check.
 		im.mu.Unlock()
-	})
-	defer timer.Stop()
-
-	go func() {
 		select {
 		case <-ctx.Done():
 			im.mu.Lock()
-			im.cond.Broadcast()
-			im.mu.Unlock()
-		case <-wakerDone:
+			return false
+		case <-time.After(50 * time.Millisecond):
 		}
-	}()
-	defer close(wakerDone)
-
-	im.cond.Wait()
-
-	if ctx.Err() != nil {
-		return false
+		im.mu.Lock()
 	}
-	return time.Now().Before(deadline)
+	return ctx.Err() == nil && time.Now().Before(deadline)
 }
 
 func (im *IndexManagerImpl) waitTimeoutErr(ctx context.Context) error {

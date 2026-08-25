@@ -302,9 +302,14 @@ func (rf *Raft) applyLoop() {
 			rf.snapshotting = true
 			rf.logger.Info("requesting snapshot: log length threshold exceeded",
 				zap.Int64("node_id", rf.me), zap.Int("log_len", len(rf.log)), zap.Uint64("threshold", rf.maxLogLength))
+			// Carry the frozen lastApplied with the request: the consumer
+			// serializes its state asynchronously, so it must bind the
+			// snapshot data to THIS index — not to LastApplied() read
+			// later, which may have advanced past what the data covers.
+			snapIndex := rf.lastApplied
 			rf.mu.Unlock()
 			select {
-			case rf.applyCh <- ApplyMsg{IsSnapshot: true}:
+			case rf.applyCh <- ApplyMsg{IsSnapshot: true, SnapshotIndex: snapIndex}:
 			case <-rf.done:
 				return
 			}
