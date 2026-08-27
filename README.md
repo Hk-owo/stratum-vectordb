@@ -338,26 +338,33 @@ manually-triggered workflow (`.github/workflows/vecstore-cpp.yml`).
 
 Sampled with `TestT4_DataVolume` against a real vecstore (Faiss HNSW +
 RocksDB, 768-dim) on a 3-node Docker cluster; docs are chunked at
-window=512 and embedded by the mock embed service at 10 ms/chunk.
+window=512 and embedded by the mock embed service at 10 ms/chunk. Each
+node now runs its own independent vecstore (`run/docker/vecstore/nodeN`)
+— sharing one vecstore across nodes caused concurrent `Build = Reset +
+AddChunks` races.
 
-| Metric | 1,000 docs (earlier) | 10,000 docs (measured) | Doc target |
-|---|---|---|---|
-| CreateVersion write (10×1,000-doc batches) | 17.0 s | 195.5 s | T3-4: < 30 s per 1,000 docs ✅ |
-| Index build (accumulated, per batch READY) | 0.5 s | 5.2 s | — |
-| Storage per node | 3.84 MiB (leader) | 44.5 / 52.8 / 55.0 MiB | — |
-| Storage, 3 nodes total | — | 152.2 MiB | — |
-| vecstore RocksDB (host, deduped chunks) | 0.25 MiB | 4.9 MiB | — |
-| Query top-k=10 | 10 hits | 10 hits | — |
-| Total test time | 18.1 s | 201.6 s | — |
+| Metric | 1,000 docs (earlier) | 10,000 docs | 100,000 docs | Doc target |
+|---|---|---|---|---|
+| CreateVersion write | 17.0 s | 3m25s (10×1,000) | 42m14s (100×1,000) | T3-4: < 30 s per 1,000 docs ✅ |
+| Index build (accumulated) | 0.5 s | 5.1 s | 2m23s | — |
+| Storage per node | 3.84 MiB (leader) | 42.5 / 41.8 / 79.6 MiB | 608.7 (leader) / 132.0 / 136.4 MiB | — |
+| Storage, 3 nodes total | — | 163.9 MiB | 877.1 MiB | — |
+| vecstore RocksDB (host, deduped) | 0.25 MiB | 4.9 MiB | — (per-node vecstore) | — |
+| Query top-k=10 | 10 hits | 10 hits | 主体完成（收尾 Query 卡死已修复） | — |
+| Total test time | 18.1 s | 3m30s | 44m37s（旧实现 30 分钟即卡死） | — |
 
 Note: writes are batched because a single `CreateVersion` request must stay
 under the 4 MiB gRPC message limit (~1,400 docs at ~2.8 KB/doc); each batch
 becomes a version and is chained only after the previous one reaches READY
-(a PENDING parent is rejected). A 100,000-doc run previously stalled when
-the raft log crossed kvraft's snapshot threshold and the leader serialized
-the state machine synchronously inside the apply loop; snapshots are now
-deep-copied under RLock and serialized/persisted asynchronously, so the
-apply loop and heartbeats are never blocked by snapshotting.
+(a PENDING parent is rejected). Write time grows with version number —
+every version rewrites the full doc-ID set and rebuilds the complete index
+(last 100k batch ≈ 40s), an inherent cost of the per-version independent
+index data model. The 100,000-doc run also exercised raft snapshots:
+`max_log_length=150` triggered 2 snapshots with immediate log trim and no
+write/heartbeat stall — snapshots are deep-copied under RLock and
+serialized/persisted asynchronously, so the apply loop and heartbeats are
+never blocked by snapshotting (previously the leader froze for 14 minutes
+with no heartbeats and followers could not elect a new leader).
 
 ## Prerequisites
 
