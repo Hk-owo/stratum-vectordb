@@ -1,34 +1,25 @@
 # Stratum
 
-Distributed vector-search knowledge base engine with MVCC versioning,
-Raft consensus, and HNSW indexing — built for retrieval-augmented
-generation (RAG).
+分布式向量检索知识库引擎,支持 MVCC 版本化、Raft 共识与 HNSW 索引——为检索增强生成(RAG)而构建。
 
-## Overview
+## 概述
 
-Stratum manages versioned document collections. Documents are split into
-content-addressed chunks, embedded into vectors via an external embed
-service, indexed with Faiss HNSW, and served through a gRPC API — plus an
-optional HTTP gateway (`cmd/stratum-gateway`) and web console (`web/`) for
-monitoring and administration. Storage hygiene is automated: unreferenced
-chunks are swept by a periodic garbage collector, and per-version document
-bloom filters make membership checks cheap while a startup reconcile derives
-version readiness from on-disk index files instead of trusting callback
-delivery.
+Stratum 管理带版本号的文档集合。文档被切分为内容寻址的 chunk,经外部 embed 服务
+转为向量,以 Faiss HNSW 建索引,并通过 gRPC API 对外服务;另提供可选的 HTTP 网关
+(`cmd/stratum-gateway`) 与 Web 控制台(`web/`)用于监控与运维。存储卫生自动维护:
+未被任何版本引用的 chunk 由周期性垃圾回收器清扫;每版本一份文档布隆过滤器让成员
+检查开销极低;启动 reconcile 从磁盘上的索引文件推导版本 READY 状态,而非依赖回调送达。
 
-**What it solves:**
+**解决的问题:**
 
-- **Rollback** — a broken update is one call away from being undone.
-- **A/B testing** — multiple versions can coexist and be queried in
-  parallel.
-- **Auditability** — every query result is traceable to a specific
-  version.
+- **回滚** — 一次有问题的更新,一条调用即可撤销。
+- **A/B 测试** — 多个版本可并存并被并行查询。
+- **可审计** — 每个查询结果都能追溯到具体版本。
 
-Stratum is the storage and retrieval layer for a RAG pipeline. It does
-not handle chat history, user sessions, or prompt construction — those
-belong to the application layer above it.
+Stratum 是 RAG 管线的存储与检索层。它不处理聊天历史、用户会话或 prompt 构造——
+这些属于其上方的应用层。
 
-## Architecture
+## 架构
 
 ```
                    External gRPC Clients
@@ -71,32 +62,31 @@ belong to the application layer above it.
   └─────────────────────────────────────────────────┘
 ```
 
-## Quick start
+## 快速开始
 
 ```bash
-# Build
+# 构建
 go build ./cmd/stratum/
 
-# Run tests (23 packages)
+# 运行测试(23 个包)
 go test ./... -timeout 180s -count=1
 
-# Race detector
+# 竞态检测
 go test -race ./internal/kvraft/... ./internal/raft/... ./internal/index/...
 
-# Single-node server
+# 单节点服务
 go run ./cmd/stratum/
 
-# One-click console: vecstore(C++) → stratum(gRPC) → gateway(HTTP) + web UI
-./start.sh           # then open http://localhost:8081
+# 一键控制台:vecstore(C++) → stratum(gRPC) → gateway(HTTP) + web UI
+./start.sh           # 然后打开 http://localhost:8081
 
-# 3-node Docker cluster (T4): native docker CLI script + tagged tests
+# 3 节点 Docker 集群(T4):docker CLI 脚本 + 标签测试
 scripts/docker-cluster.sh up 3 --with-embed
 go test ./integration/docker/... -tags=docker -timeout 300s
 scripts/docker-cluster.sh down
 ```
 
-`cmd/stratum` accepts an optional YAML config file for multi-node
-deployments; command-line flags override file values:
+`cmd/stratum` 接受可选的 YAML 配置文件用于多节点部署;命令行 flag 优先于文件值:
 
 ```bash
 go run ./cmd/stratum/ -config integration/docker/config1.yaml
@@ -106,269 +96,248 @@ go run ./cmd/stratum/ -config integration/docker/config1.yaml
 
 ### KnowledgeBaseService
 
-| RPC | Description |
+| RPC | 说明 |
 |---|---|
-| `CreateKnowledgeBase` | Create a KB with embed config, chunk window, and index type |
-| `DeleteKnowledgeBase` | Mark a KB for deletion; cleanup runs asynchronously |
-| `CreateVersion` | Apply document changes (ADD / DELETE / UPDATE) and produce a new version |
-| `ListVersions` | Return the version chain for a KB |
-| `RollbackVersion` | Switch the active version (no downtime) |
-| `ListKnowledgeBases` | List all KBs with their active versions |
-| `GetKnowledgeBase` | Fetch a single KB's config and active version |
-| `DeleteVersion` | Mark a version (and its descendants) for deletion; cleanup runs asynchronously |
+| `CreateKnowledgeBase` | 创建知识库(embed 配置、chunk 窗口、索引类型) |
+| `DeleteKnowledgeBase` | 标记知识库删除;清理异步执行 |
+| `CreateVersion` | 应用文档变更(ADD / DELETE / UPDATE)并产出新版本 |
+| `ListVersions` | 返回知识库的版本链 |
+| `RollbackVersion` | 切换活跃版本(无停机) |
+| `ListKnowledgeBases` | 列出所有知识库及其活跃版本 |
+| `GetKnowledgeBase` | 获取单个知识库的配置与活跃版本 |
+| `DeleteVersion` | 标记版本(及其后代)删除;清理异步执行 |
 
 ### QueryService
 
-| RPC | Description |
+| RPC | 说明 |
 |---|---|
-| `Query` | Vector similarity search with threshold, top-k, and aggregation |
+| `Query` | 向量相似度检索(阈值、top-k、聚合) |
 
 ### AdminService
 
-| RPC | Description |
+| RPC | 说明 |
 |---|---|
-| `HealthCheck` | Three-state health (HEALTHY / DEGRADED / UNHEALTHY) |
-| `GetSystemStatus` | Stuck versions, delete-failed KBs, WAL alerts, resource usage, in-flight version deletions |
-| `GetClusterStatus` | Node's own Raft view (node_id / leader_id / member_count) — used by the routing layer for leader discovery |
-| `RebuildIndex` | Re-trigger index build for a failed version |
-| `WarmupVersion` | Load a version's index into memory without switching the active version |
+| `HealthCheck` | 三态健康检查(HEALTHY / DEGRADED / UNHEALTHY) |
+| `GetSystemStatus` | 卡住版本、删除失败的知识库、WAL 告警、资源占用、进行中的版本删除 |
+| `GetClusterStatus` | 节点自身的 Raft 视图(node_id / leader_id / member_count)——供路由层发现 leader |
+| `RebuildIndex` | 为失败版本重新触发索引构建 |
+| `WarmupVersion` | 将版本索引载入内存而不切换活跃版本 |
 
-## Background jobs & storage hygiene
+## 后台任务与存储卫生
 
-- **Chunk garbage collection** — `ChunkGarbageCollector` (`internal/coordinator`)
-  periodically sweeps chunks no longer referenced by any version (default
-  sweep interval 5 minutes, configurable via `chunk_gc.sweep_interval_sec`).
-- **Per-version document bloom filters** — `VersionBloomStore`
-  (`internal/bloom`) keeps one bloom filter per version containing its full
-  document ID set. Written on version creation (cached + persisted to disk),
-  loaded on read; a missing or corrupt on-disk copy is rebuilt from the
-  `VersionDocList`.
-- **Startup reconcile** — on boot the IndexManager queries vecstore's
-  `ExistsIndex` RPC to derive a version's READY status from on-disk facts
-  (Faiss index file + `.ids` sidecar), instead of trusting that a
-  build-completion callback was delivered (e.g. after a crash).
+- **Chunk 垃圾回收** — `ChunkGarbageCollector`(`internal/coordinator`)周期性清扫
+  不再被任何版本引用的 chunk(默认清扫间隔 5 分钟,可通过 `chunk_gc.sweep_interval_sec` 配置)。
+- **每版本文档布隆过滤器** — `VersionBloomStore`(`internal/bloom`)为每个版本维护
+  一份包含其完整文档 ID 集合的布隆过滤器。版本创建时写入(缓存并持久化到磁盘),
+  读取时加载;磁盘副本缺失或损坏时从 `VersionDocList` 重建。
+- **启动 reconcile** — 启动时 IndexManager 通过 vecstore 的 `ExistsIndex` RPC,
+  从磁盘事实(Faiss 索引文件 + `.ids` 侧车文件)推导版本 READY 状态,而不是信任
+  构建完成回调确实送达(例如崩溃之后)。
 
-## HTTP gateway, routing layer & Web console
+## HTTP 网关、路由层与 Web 控制台
 
-`cmd/stratum-gateway` is a separate process that exposes the three external
-gRPC services (`KnowledgeBaseService` / `QueryService` / `AdminService`) over
-a small REST/JSON API and serves the frontend static assets (`web/`) from the
-same origin, so no CORS is needed. It uses the already-generated client stubs
-plus `protojson`, adding no new Go module dependency. The internal
-`DataSyncService` is intentionally not exposed.
+`cmd/stratum-gateway` 是独立进程,把三个外部 gRPC 服务(`KnowledgeBaseService` /
+`QueryService` / `AdminService`)暴露为小型 REST/JSON API,并从同源提供前端静态资源
+(`web/`),因此无需 CORS。它使用已生成的客户端桩 + `protojson`,不引入新的 Go 模块
+依赖。内部 `DataSyncService` 有意不对外暴露。
 
-**Routing layer**：`cmd/stratum-router` is the cluster front: it dials every
-node, discovers the Raft leader, forwards **writes to the leader** (re-discovering
-on failover) and **load-balances reads** across nodes (round-robin with
-failover). The gateway dials the **router** (`-grpc-addr 127.0.0.1:7009` by
-default) instead of individual nodes — leader discovery and write/read routing
-are the router's job, so the gateway keeps a single gRPC connection and no
-cluster awareness of its own:
+**路由层**:`cmd/stratum-router` 是集群前端:它拨号所有节点、发现 Raft leader,
+将**写操作转发给 leader**(故障转移时重新发现),并将**读操作负载均衡**到各节点
+(round-robin + 故障转移)。网关拨号**路由层**(默认 `-grpc-addr 127.0.0.1:7009`)
+而非单个节点——leader 发现与读写路由都是路由层的职责,网关因此只需保持单条 gRPC
+连接、自身不感知集群:
 
 ```
 web UI ⇄ gateway (:8081) ⇄ router (:7009) ⇄ node1 / node2 / node3
 ```
 
-**快捷启动**：`scripts/gateway.sh` 提供两种零参数启动方式（gateway 总是经路由层
-访问集群；路由层未监听时会自动构建并后台拉起它，退出/`stop` 时一并清理）：
-`scripts/router.sh` 可单独管理路由层：
+**快捷启动**:`scripts/gateway.sh` 提供两种零参数启动方式(gateway 总是经路由层
+访问集群;路由层未监听时会自动构建并后台拉起它,退出/`stop` 时一并清理):
+`scripts/router.sh` 可单独管理路由层:
 
 ```bash
-scripts/gateway.sh               # Docker 集群模式（默认）：从 run/console.yaml
-                                 # 的 docker 段读取节点数/基础端口，自动启动
+scripts/gateway.sh               # Docker 集群模式(默认):从 run/console.yaml
+                                 # 的 docker 段读取节点数/基础端口,自动启动
                                  # 路由层 + gateway
-scripts/gateway.sh single        # 单机模式：路由层连 127.0.0.1:7000，启动 gateway
-scripts/gateway.sh build         # 强制重新构建后（默认模式）启动
+scripts/gateway.sh single        # 单机模式:路由层连 127.0.0.1:7000,启动 gateway
+scripts/gateway.sh build         # 强制重新构建后(默认模式)启动
 scripts/gateway.sh stop          # 停止 gateway 与本脚本拉起的路由层
 
 scripts/router.sh status         # 查看路由层是否在监听
 scripts/router.sh stop           # 单独停止路由层
 ```
 
-环境变量 `STRATUM_HTTP_ADDR`（监听地址，默认 `0.0.0.0:8081`）、
-`STRATUM_ROUTER_ADDR`（路由层地址，默认 `127.0.0.1:7009`）与
-`STRATUM_GRPC_ADDR`（单机模式路由层应连接的节点地址，默认 `127.0.0.1:7000`）
-可覆盖默认值。手动启动等价于：
+环境变量 `STRATUM_HTTP_ADDR`(监听地址,默认 `0.0.0.0:8081`)、
+`STRATUM_ROUTER_ADDR`(路由层地址,默认 `127.0.0.1:7009`)与
+`STRATUM_GRPC_ADDR`(单机模式路由层应连接的节点地址,默认 `127.0.0.1:7000`)
+可覆盖默认值。手动启动等价于:
 
 ```bash
-# 路由层（先起；-nodes 为集群节点 gRPC 地址列表）
+# 路由层(先起;-nodes 为集群节点 gRPC 地址列表)
 ./run/bin/stratum-router -listen 0.0.0.0:7009 -nodes 127.0.0.1:7000
 ./run/bin/stratum-router -listen 0.0.0.0:7009 -nodes localhost:17000,localhost:17001,localhost:17002
 
-# gateway（后起；始终指向路由层）
+# gateway(后起;始终指向路由层)
 ./run/bin/stratum-gateway -grpc-addr 127.0.0.1:7009
 ```
 
-> Docker 集群模式下 vecstore 是宿主机上的外部依赖（节点配置
-> `vecstore.grpc_addr: host.docker.internal:7100`）。它必须监听宿主机的
-> **对外接口**（`--grpc_addr=0.0.0.0:7100`），仅绑 `127.0.0.1` 时容器内
-> 无法访问，会导致版本索引构建失败、删除（DELETE_FAILED）等连锁问题。
+> Docker 集群模式下 vecstore 是宿主机上的外部依赖(节点配置
+> `vecstore.grpc_addr: host.docker.internal:7100`)。它必须监听宿主机的
+> **对外接口**(`--grpc_addr=0.0.0.0:7100`),仅绑 `127.0.0.1` 时容器内
+> 无法访问,会导致版本索引构建失败、删除(DELETE_FAILED)等连锁问题。
 
-`start.sh` builds and launches the full stack in one go. It starts the
-**routing layer** (`stratum-router`) and the **console process**
-(`stratum-gateway`), and the database services (vecstore(C++) → stratum(gRPC))
-are brought up through the console's `/ops/start` endpoint, so the web UI
-(default `http://localhost:8081`) — including the **「运维」** page — is
-available even before the database is running, and Ctrl+C stops everything
-cleanly. Logs live under `run/log/`.
+`start.sh` 一键构建并启动完整链路。它启动**路由层**(`stratum-router`)与
+**控制台进程**(`stratum-gateway`),数据库服务(vecstore(C++) → stratum(gRPC))
+通过控制台的 `/ops/start` 端点拉起,因此 Web UI(默认 `http://localhost:8081`)
+——包括**「运维」**页面——在数据库尚未运行时也可用,Ctrl+C 干净地停止一切。
+日志位于 `run/log/`。
 
-### Starting the console alone (ops only, database not running)
+### 仅启动控制台(仅运维,数据库未运行)
 
 ```bash
-./run/bin/stratum-gateway          # default :8081, auto-creates run/console.yaml
-# open http://localhost:8081 → 「运维」page to edit startup parameters,
-# start/stop services, and tail logs before the database is up
+./run/bin/stratum-gateway          # 默认 :8081,自动创建 run/console.yaml
+# 打开 http://localhost:8081 → 「运维」页面:编辑启动参数、
+# 启停服务、在数据库启动前查看日志
 ```
 
-The console keeps its own YAML (`run/console.yaml`) with the cluster node
-list and the local service startup parameters; edits from the web page are
-persisted there and take effect on the next service restart. Cluster-wide
-ops are driven from any node's console through `/ops/nodes/{id}/*`.
+控制台维护自己的 YAML(`run/console.yaml`),包含集群节点列表与本地服务启动参数;
+网页上的修改会持久化到该文件,并在下次服务重启时生效。集群级运维操作可从任意
+节点的控制台通过 `/ops/nodes/{id}/*` 驱动。
 
-## Project structure
+## 项目结构
 
 ```
 stratum/
-├── .github/workflows/      # CI (Go full checks + Docker T4 cluster) & manual vecstore-cpp
-├── api/proto/              # Protobuf definitions
+├── .github/workflows/      # CI(Go 全量检查 + Docker T4 集群)与手动 vecstore-cpp
+├── api/proto/              # Protobuf 定义
 │   ├── knowledgebase.proto
 │   ├── query.proto
 │   ├── admin.proto
-│   ├── kvraft/             # Internal Raft RPC
-│   └── vecstore/           # Go ↔ C++ internal gRPC
+│   ├── kvraft/             # 内部 Raft RPC
+│   └── vecstore/           # Go ↔ C++ 内部 gRPC
 ├── internal/
-│   ├── types/              # Shared data types
-│   ├── errors/             # Business errors → gRPC status mapping
-│   ├── docstore/           # MVCC document storage (PebbleDB)
-│   ├── chunkdoc/           # Bidirectional chunk ↔ document mapping
-│   ├── versiondoc/         # Per-version document ID sets
-│   ├── bloom/              # Bloom filters (chunk existence + version membership) + per-version document bloom store
-│   ├── splitter/           # Sliding-window document chunking
-│   ├── embed/              # External embed service HTTP client
-│   ├── chunkstore/         # Vecstore gRPC client wrapper
-│   ├── index/              # IndexManager (LRU cache + refcounts + async builds)
-│   ├── kvraft/             # Raft consensus library (leader election / log replication / snapshots)
-│   ├── kvstorage/          # Raft hard-state persistence
-│   ├── raft/               # Stratum Raft state machine (KB + version metadata)
-│   ├── wal/                # Write-ahead log for crash consistency
-│   ├── sync/               # Leader→Follower data sync (DataSync) + summary
-│   ├── pebbleutil/         # PebbleDB helpers (keys, iteration)
-│   ├── router/             # gRPC front: writes → leader, reads load-balanced
-│   └── coordinator/        # Write / Delete / DeleteVersion / chunk-GC orchestration
-├── service/                # gRPC service implementations
-├── integration/            # Mock-based integration tests + real-stack e2e + cluster tests
-│   └── docker/             # 3-node Docker cluster (scripts/docker-cluster.sh) + T4 tests (`docker` build tag)
+│   ├── types/              # 共享数据类型
+│   ├── errors/             # 业务错误 → gRPC 状态映射
+│   ├── docstore/           # MVCC 文档存储(PebbleDB)
+│   ├── chunkdoc/           # chunk ↔ 文档双向映射
+│   ├── versiondoc/         # 每版本文档 ID 集合
+│   ├── bloom/              # 布隆过滤器(chunk 存在性 + 版本成员)+ 每版本文档布隆存储
+│   ├── splitter/           # 滑窗文档切分
+│   ├── embed/              # 外部 embed 服务 HTTP 客户端
+│   ├── chunkstore/         # Vecstore gRPC 客户端封装
+│   ├── index/              # IndexManager(LRU 缓存 + 引用计数 + 异步构建)
+│   ├── kvraft/             # Raft 共识库(选主 / 日志复制 / 快照)
+│   ├── kvstorage/          # Raft 硬状态持久化
+│   ├── raft/               # Stratum Raft 状态机(KB + 版本元数据)
+│   ├── wal/                # 崩溃一致性写前日志
+│   ├── sync/               # Leader→Follower 数据同步(DataSync)+ 摘要
+│   ├── pebbleutil/         # PebbleDB 工具(keys、迭代)
+│   ├── router/             # gRPC 前端:写 → leader,读负载均衡
+│   └── coordinator/        # Write / Delete / DeleteVersion / chunk-GC 编排
+├── service/                # gRPC 服务实现
+├── integration/            # 基于 mock 的集成测试 + 真实栈 e2e + 集群测试
+│   └── docker/             # 3 节点 Docker 集群(scripts/docker-cluster.sh)+ T4 测试(`docker` 构建标签)
 ├── cmd/
-│   ├── stratum/main.go     # Entry point (−config YAML / flags)
-│   ├── stratum-gateway/    # HTTP/JSON → gRPC gateway + /ops console control plane
-│   └── stratum-router/     # Routing layer: single address into a Raft cluster
-├── configs/                # Sample configuration files
-├── web/                    # Web console frontend (HTML/CSS/JS)
-├── scripts/                # Dev/test helper scripts + ops scripts (scripts/ops)
-├── vecstore/               # C++ vector storage (Faiss HNSW + RocksDB)
+│   ├── stratum/main.go     # 入口(−config YAML / flags)
+│   ├── stratum-gateway/    # HTTP/JSON → gRPC 网关 + /ops 控制台控制面
+│   └── stratum-router/     # 路由层:单地址接入 Raft 集群
+├── configs/                # 示例配置文件
+├── web/                    # Web 控制台前端(HTML/CSS/JS)
+├── scripts/                # 开发/测试辅助脚本 + 运维脚本(scripts/ops)
+├── vecstore/               # C++ 向量存储(Faiss HNSW + RocksDB)
 └── go.mod
 ```
 
-## Key design decisions
+## 关键设计决策
 
-| Decision | Rationale |
+| 决策 | 理由 |
 |---|---|
-| **Content-addressed chunks** | `ChunkID = SHA-256(text + model ID)` — deduplicates chunks naturally, no coordination needed |
-| **MVCC via PebbleDB prefixes** | Document history is compressed; unchanged documents cost zero in new versions |
-| **WAL for crash consistency** | Two-phase protocol (BEGIN → VERSION_ID → COMMIT) survives a crash at any point |
-| **Cosine via L2 normalization** | Faiss has no native cosine support; normalizing + inner product is mathematically equivalent |
-| **Unified score direction** | All three metrics return "higher is more similar" — Euclidean distance is negated |
-| **JSON-encoded Raft commands** | Low-volume control-plane commands; human-readable with `jq` for debugging |
-| **Interface-first, mock alongside** | Every module is an interface with a mock. Tests isolate cleanly; real implementations slot in behind the interface |
-| **Batched index build** | A build splits into one `Build` + multiple `AddChunks` RPCs so each gRPC message stays under the 4 MiB transport limit on large KBs; empty versions still get an index entry |
+| **内容寻址 chunk** | `ChunkID = SHA-256(text + model ID)` — 天然去重,无需协调 |
+| **基于 PebbleDB 前缀的 MVCC** | 文档历史被压缩;未变更文档在新版本中零成本 |
+| **WAL 保证崩溃一致性** | 两阶段协议(BEGIN → VERSION_ID → COMMIT)在任何时刻崩溃都可存活 |
+| **L2 归一化实现余弦** | Faiss 无原生余弦支持;归一化 + 内积在数学上等价 |
+| **统一分数方向** | 三种度量都返回"越相似分数越高" — 欧氏距离取负 |
+| **JSON 编码的 Raft 命令** | 控制面命令量小;可用 `jq` 人类可读地调试 |
+| **接口优先、mock 同行** | 每个模块都是接口配 mock;测试干净隔离;真实实现从接口后插入 |
+| **分批索引构建** | 构建拆分为一次 `Build` + 多次 `AddChunks` RPC,使每个 gRPC 消息不超过 4 MiB 传输上限;空版本仍建索引条目 |
 
-## Raft consensus
+## Raft 共识
 
-The consensus layer (`internal/kvraft`) is adapted from the
-[KVServer](https://github.com/Hk-owo/KVServer) teaching implementation
-(MIT 6.5840), rewritten to Stratum's code style and fixed for 6 bugs
-discovered through TDD:
+共识层(`internal/kvraft`)改编自 [KVServer](https://github.com/Hk-owo/KVServer)
+教学实现(MIT 6.5840),重写为 Stratum 代码风格,并通过 TDD 修复了 6 个缺陷:
 
-| # | Bug | Impact |
+| # | Bug | 影响 |
 |---|---|---|
-| 1 | Single-node clusters never elected a leader | Majority check only ran in peer-response handlers |
-| 2 | AppendEntries heartbeat skipped log consistency check | Follower could advance commitIndex past a divergent log |
-| 3 | InstallSnapshot held the mutex while sending on a channel | Deadlock risk |
-| 4 | RequestVote did not check `killed()` | A stopped node could still vote |
-| 5 | No no-op entry on election | Old log entries permanently invisible until new write traffic |
-| 6 | Leader added itself as a peer | Leader stepped down on its own heartbeat |
+| 1 | 单节点集群永远选不出 leader | 多数派检查只在 peer 响应处理器里执行 |
+| 2 | AppendEntries 心跳跳过了日志一致性检查 | follower 可能把 commitIndex 推进到分叉日志之后 |
+| 3 | InstallSnapshot 持锁时向 channel 发送 | 死锁风险 |
+| 4 | RequestVote 未检查 `killed()` | 已停止的节点仍可能投票 |
+| 5 | 选举后无 no-op 条目 | 旧日志条目在新写入流量到来前永久不可见 |
+| 6 | leader 把自己加为 peer | leader 因自己的心跳而退位 |
 
-## Testing
+## 测试
 
-| Batch | Scope | Status |
+| 批次 | 范围 | 状态 |
 |---|---|---|
-| T1 | Single-module contracts (8 modules) |  ✅ |
-| T2 | Cross-module integration (4 groups) |  ✅ |
-| T3 | Single-node full chain (15 scenarios) |  ✅ |
-| T4 | 3-node Raft cluster (in-process + Docker cluster + data-volume) |  ✅ |
-| T5 | Real-stack e2e (real Pebble/WAL/Raft/IndexManager + vecstore subprocess, zero mocks) |  ✅ |
+| T1 | 单模块契约(8 个模块) |  ✅ |
+| T2 | 跨模块集成(4 组) |  ✅ |
+| T3 | 单节点全链路(15 个场景) |  ✅ |
+| T4 | 3 节点 Raft 集群(进程内 + Docker 集群 + 数据量) |  ✅ |
+| T5 | 真实栈 e2e(真实 Pebble/WAL/Raft/IndexManager + vecstore 子进程,零 mock) |  ✅ |
 
 ```bash
 go test ./... -timeout 180s -count=1
-# 23 packages, all PASS
+# 23 个包,全部 PASS
 
 go test ./integration/... -run TestRealStack -v
-# Full real-stack end-to-end: real DocStore/WAL/Raft/IndexManager plus a real
-# vecstore_server subprocess; requires the C++ binary (built by ./start.sh or
-# vecstore/CMakeLists.txt) and skips rather than fails if it is missing.
+# 全真实栈端到端:真实 DocStore/WAL/Raft/IndexManager + 真实 vecstore_server
+# 子进程;需要 C++ 二进制(由 ./start.sh 或 vecstore/CMakeLists.txt 构建),
+# 缺失时跳过而非失败。
 
 go test ./integration/... -run TestMultiNode -v
-# 3-node in-process cluster elects leader, replicates KB + version metadata
+# 3 节点进程内集群选出 leader,复制 KB + 版本元数据
 
 scripts/docker-cluster.sh up 3 --with-embed
 go test ./integration/docker/... -tags=docker -v -timeout 300s
-# 3-node Docker cluster (docker_test.go) + data-volume cost sampling
-# (datavolume_test.go, scale with STRATUM_VOLUME_DOCS; requires a vecstore_server
-# listening on the host's :7100 — start it via ./start.sh or build vecstore/CMakeLists.txt)
+# 3 节点 Docker 集群(docker_test.go)+ 数据量成本采样
+# (datavolume_test.go,用 STRATUM_VOLUME_DOCS 调规模;要求宿主机 :7100 上
+# 有 vecstore_server 监听 — 通过 ./start.sh 启动或构建 vecstore/CMakeLists.txt)
 scripts/docker-cluster.sh down
 ```
 
-CI is wired in `.github/workflows/ci.yml` (push to `main` and pull
-requests): gofmt + `go vet` + `go build` + unit tests (23 packages) +
-race detector on raft/kvraft/index + a 3-node Docker cluster (T4) fault
-tolerance run. The C++ vecstore side is covered by a separate
-manually-triggered workflow (`.github/workflows/vecstore-cpp.yml`).
+CI 配置在 `.github/workflows/ci.yml`(推送到 `main` 与 pull request 时运行):
+gofmt + `go vet` + `go build` + 单元测试(23 个包)+ raft/kvraft/index 竞态检测 +
+3 节点 Docker 集群(T4)容错运行。C++ vecstore 侧由单独的
+手动触发工作流(`.github/workflows/vecstore-cpp.yml`)覆盖。
 
-### Data-volume measurements (3-node Docker cluster)
+### 数据量实测(3 节点 Docker 集群)
 
-Sampled with `TestT4_DataVolume` against a real vecstore (Faiss HNSW +
-RocksDB, 768-dim) on a 3-node Docker cluster; docs are chunked at
-window=512 and embedded by the mock embed service at 10 ms/chunk. Each
-node now runs its own independent vecstore (`run/docker/vecstore/nodeN`)
-— sharing one vecstore across nodes caused concurrent `Build = Reset +
-AddChunks` races.
+通过 `TestT4_DataVolume` 在 3 节点 Docker 集群上对真实 vecstore(Faiss HNSW +
+RocksDB,768 维)采样;文档按 window=512 切分,mock embed 服务按 10 ms/chunk 嵌入。
+现在每个节点运行自己独立的 vecstore(`run/docker/vecstore/nodeN`)
+——共享一个 vecstore 会引发并发的 `Build = Reset + AddChunks` 竞态。
 
-| Metric | 1,000 docs (earlier) | 10,000 docs | 100,000 docs | Doc target |
+| 指标 | 1,000 篇(早期) | 10,000 篇 | 100,000 篇 | 文档目标 |
 |---|---|---|---|---|
-| CreateVersion write | 17.0 s | 3m25s (10×1,000) | 42m14s (100×1,000) | T3-4: < 30 s per 1,000 docs ✅ |
-| Index build (accumulated) | 0.5 s | 5.1 s | 2m23s | — |
-| Storage per node | 3.84 MiB (leader) | 42.5 / 41.8 / 79.6 MiB | 608.7 (leader) / 132.0 / 136.4 MiB | — |
-| Storage, 3 nodes total | — | 163.9 MiB | 877.1 MiB | — |
-| vecstore RocksDB (host, deduped) | 0.25 MiB | 4.9 MiB | — (per-node vecstore) | — |
-| Query top-k=10 | 10 hits | 10 hits | 主体完成（收尾 Query 卡死已修复） | — |
-| Total test time | 18.1 s | 3m30s | 44m37s（旧实现 30 分钟即卡死） | — |
+| CreateVersion 写入 | 17.0 s | 3m25s(10×1,000) | 42m14s(100×1,000) | T3-4:每 1,000 篇 < 30 s ✅ |
+| 索引构建(累计) | 0.5 s | 5.1 s | 2m23s | — |
+| 每节点存储 | 3.84 MiB(leader) | 42.5 / 41.8 / 79.6 MiB | 608.7(leader)/ 132.0 / 136.4 MiB | — |
+| 3 节点存储合计 | — | 163.9 MiB | 877.1 MiB | — |
+| vecstore RocksDB(宿主,去重) | 0.25 MiB | 4.9 MiB | —(每节点独立 vecstore) | — |
+| Query top-k=10 | 10 条命中 | 10 条命中 | 主体完成(收尾 Query 卡死已修复) | — |
+| 总测试耗时 | 18.1 s | 3m30s | 44m37s(旧实现 30 分钟即卡死) | — |
 
-Note: writes are batched because a single `CreateVersion` request must stay
-under the 4 MiB gRPC message limit (~1,400 docs at ~2.8 KB/doc); each batch
-becomes a version and is chained only after the previous one reaches READY
-(a PENDING parent is rejected). Write time grows with version number —
-every version rewrites the full doc-ID set and rebuilds the complete index
-(last 100k batch ≈ 40s), an inherent cost of the per-version independent
-index data model. The 100,000-doc run also exercised raft snapshots:
-`max_log_length=150` triggered 2 snapshots with immediate log trim and no
-write/heartbeat stall — snapshots are deep-copied under RLock and
-serialized/persisted asynchronously, so the apply loop and heartbeats are
-never blocked by snapshotting (previously the leader froze for 14 minutes
-with no heartbeats and followers could not elect a new leader).
+说明:写入须分批,因为单条 `CreateVersion` 请求必须保持在 4 MiB gRPC 消息上限内
+(约 1,400 篇 / 2.8 KB 每篇);每批成为一个版本,且只有前一批达到 READY 后才链接
+(PENDING 父版本会被拒绝)。写入耗时随版本号递增——每个版本都重写完整 doc-ID 集并
+重建完整索引(100k 末批 ≈ 40s),这是"每版本独立索引"数据模型的固有开销。
+100,000 篇运行还实测了 raft 快照:`max_log_length=150` 触发 2 次快照,日志立即
+trim 且写入/心跳不停摆——快照在 RLock 下深拷贝、异步序列化持久化,因此 apply
+循环与心跳永不被快照阻塞(此前 leader 会冻结 14 分钟无心跳,follower 无法选出
+新 leader)。
 
-## Prerequisites
+## 前置依赖
 
 - **Go 1.24**
-- **C++17** (for vecstore): Faiss ≥ 1.9.0, RocksDB, gRPC, Protobuf, BLAS/LAPACK, OpenMP
-- C++ build only required if you need the Faiss HNSW backend. Go tests use an in-process mock.
-
+- **C++17**(vecstore):Faiss ≥ 1.9.0、RocksDB、gRPC、Protobuf、BLAS/LAPACK、OpenMP
+- 仅当需要 Faiss HNSW 后端时才需要 C++ 构建。Go 测试使用进程内 mock。
