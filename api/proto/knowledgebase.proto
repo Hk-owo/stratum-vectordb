@@ -36,6 +36,19 @@ enum Similarity {
   SIMILARITY_INNER_PRODUCT = 2;
 }
 
+// QuantizerType mirrors the vecstore-side QuantizerTypeProto
+// (Stratum_设计文档v12.md 2.4): how the in-memory index stores vector
+// payloads. QUANTIZER_OFF keeps full-precision HNSW (single-stage exact
+// search); the others build quantized coarse retrievers whose results are
+// re-ranked against full-precision vectors on disk.
+enum QuantizerType {
+  QUANTIZER_OFF = 0;
+  QUANTIZER_SQ8 = 1;
+  QUANTIZER_SQ_BF16 = 2;
+  QUANTIZER_SQ_FP16 = 3;
+  QUANTIZER_PQ = 4;
+}
+
 // KBStatus mirrors internal/types.KBStatus.
 enum KBStatus {
   KB_STATUS_ACTIVE = 0;
@@ -81,6 +94,9 @@ message KnowledgeBaseInfo {
   EmbedConfig embed_config = 7;
   int64 active_version_id = 8;
   KBStatus status = 9;
+  QuantizerType quantizer = 10; // immutable after creation; default OFF
+  int32 pq_m = 11;              // PQ only; default 96
+  int32 pq_nbits = 12;          // PQ only; default 8
 }
 
 service KnowledgeBaseService {
@@ -101,6 +117,9 @@ message CreateKnowledgeBaseRequest {
   IndexType index_type = 4;   // optional; defaults to HNSW
   Similarity similarity = 5;  // optional; defaults to COSINE
   EmbedConfig embed_config = 6;
+  QuantizerType quantizer = 7;  // optional; defaults to QUANTIZER_OFF
+  int32 pq_m = 8;               // PQ only; 0 = default 96
+  int32 pq_nbits = 9;           // PQ only; 0 = default 8
 }
 message CreateKnowledgeBaseResponse {
   string knowledge_base_id = 1;

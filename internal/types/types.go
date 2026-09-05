@@ -98,9 +98,15 @@ type KnowledgeBaseMeta struct {
 	// Only HNSW has a real implementation today.
 	Similarity string // COSINE / EUCLIDEAN / INNER_PRODUCT; immutable after
 	// creation; defaults to COSINE.
-	EmbedConfig     EmbedConfig
-	ActiveVersionID int64
-	Status          KBStatus
+	// QuantizerType selects the in-memory index payload storage:
+	// OFF / SQ8 / SQ_BF16 / SQ_FP16 / PQ (Stratum_设计文档v12.md). Immutable
+	// after creation; defaults to OFF (full precision, current behavior).
+	QuantizerType    string
+	QuantizerPQM     int // PQ sub-vectors; used only when QuantizerType == "PQ".
+	QuantizerPQNBits int // PQ bits per sub-quantizer; used only when QuantizerType == "PQ".
+	EmbedConfig      EmbedConfig
+	ActiveVersionID  int64
+	Status           KBStatus
 }
 
 // VersionMeta is version metadata stored in the Raft state machine.

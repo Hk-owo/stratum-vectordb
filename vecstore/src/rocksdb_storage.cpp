@@ -3,6 +3,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -111,6 +112,39 @@ absl::StatusOr<std::vector<float>> RocksDBChunkStorage::Read(
     return ToAbslStatus(status);
   }
   return DecodeVector(raw);
+}
+
+absl::StatusOr<ChunkStorage::MultiReadResult> RocksDBChunkStorage::ReadMulti(
+    const std::vector<std::string>& keys) {
+  if (keys.empty()) {
+    return ChunkStorage::MultiReadResult{};
+  }
+
+  std::vector<rocksdb::Slice> key_slices;
+  key_slices.reserve(keys.size());
+  for (const auto& key : keys) {
+    key_slices.emplace_back(key);
+  }
+
+  std::vector<std::string> values(keys.size());
+  std::vector<rocksdb::Status> statuses =
+      db_->MultiGet(rocksdb::ReadOptions(), key_slices, &values);
+
+  MultiReadResult result;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (statuses[i].ok()) {
+      auto vector_or = DecodeVector(values[i]);
+      if (!vector_or.ok()) {
+        return vector_or.status();
+      }
+      result.found.emplace(keys[i], std::move(vector_or.value()));
+    } else if (statuses[i].IsNotFound()) {
+      result.missing.push_back(keys[i]);
+    } else {
+      return ToAbslStatus(statuses[i]);
+    }
+  }
+  return result;
 }
 
 absl::StatusOr<bool> RocksDBChunkStorage::Exists(const std::string& key) {

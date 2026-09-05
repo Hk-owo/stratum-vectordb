@@ -9,12 +9,15 @@
 // compile until VecstoreGrpcServer is added.
 #include <filesystem>
 #include <memory>
+#include <random>
 #include <string>
+#include <vector>
 
 #include "absl/status/statusor.h"
 #include "gtest/gtest.h"
 #include "grpcpp/grpcpp.h"
 #include "vecstore.grpc.pb.h"
+#include "vecstore/include/key_codec.h"
 #include "vecstore/src/grpc_service.h"
 #include "vecstore/src/hnsw_index.h"
 #include "vecstore/src/rocksdb_storage.h"
@@ -147,6 +150,17 @@ TEST_F(GrpcServiceTest, VectorIndexBuildThenSearchRoundTrip) {
   auto status = index_stub_->Build(&build_ctx, build_req, &build_resp);
   ASSERT_TRUE(status.ok()) << status.error_message();
 
+  // Strict lifecycle (v12 2.6): seal BUILDING→READY via Save before
+  // searching, mirroring the product sequence (Build → … → Save → Search).
+  std::string save_path = (test_dir_ / "bt_saved.bin").string();
+  grpc::ClientContext save_ctx;
+  ::vecstore::SaveIndexRequest save_req;
+  save_req.set_kb_id("kb1");
+  save_req.set_version_id(1);
+  save_req.set_path(save_path);
+  ::vecstore::SaveIndexResponse save_resp;
+  ASSERT_TRUE(index_stub_->Save(&save_ctx, save_req, &save_resp).ok());
+
   grpc::ClientContext search_ctx;
   ::vecstore::SearchIndexRequest search_req;
   search_req.set_kb_id("kb1");
@@ -213,6 +227,109 @@ TEST_F(GrpcServiceTest, VectorIndexSaveLoadResetRoundTrip) {
   ASSERT_TRUE(status.ok()) << status.error_message();
   ASSERT_GT(search_resp.results_size(), 0);
   EXPECT_EQ(search_resp.results(0).chunk_id(), "chunk-0");
+}
+
+// QuantizedBuildSearchRunsTwoStageRerank exercises the full gRPC path for
+// a quantized index: Build with QUANTIZER_SQ8 creates a quantized coarse
+// retriever, and Search must run the two-stage pipeline (coarse pass →
+// full-precision vectors read back from the chunk store → exact rerank)
+// inside the vecstore service. Querying with an indexed chunk's own
+// vector must surface that chunk at the top.
+TEST_F(GrpcServiceTest, QuantizedBuildSearchRunsTwoStageRerank) {
+  const std::string kb_id = "kb-quant-e2e";
+  constexpr int kDim = 16;
+  constexpr int kNumChunks = 60;
+
+  std::mt19937 rng(2026);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  std::vector<std::vector<float>> vecs;
+  for (int i = 0; i < kNumChunks; ++i) {
+    std::vector<float> v(kDim);
+    for (auto& x : v) x = dist(rng);
+    vecs.push_back(v);
+
+    ::vecstore::WriteChunkRequest write_req;
+    write_req.set_key(EncodeKey(kb_id, "chunk-" + std::to_string(i)));
+    for (float x : v) write_req.add_vector(x);
+    ::vecstore::WriteChunkResponse write_resp;
+    grpc::ClientContext write_ctx;
+    auto st = chunk_stub_->Write(&write_ctx, write_req, &write_resp);
+    ASSERT_TRUE(st.ok()) << st.error_message();
+  }
+
+  ::vecstore::BuildIndexRequest build_req;
+  build_req.set_kb_id(kb_id);
+  build_req.set_version_id(1);
+  build_req.set_metric(::vecstore::COSINE);
+  build_req.set_quantizer(::vecstore::QUANTIZER_SQ8);
+  for (int i = 0; i < kNumChunks; ++i) {
+    auto* chunk = build_req.add_chunks();
+    chunk->set_chunk_id("chunk-" + std::to_string(i));
+    for (float x : vecs[i]) chunk->add_vector(x);
+  }
+  ::vecstore::BuildIndexResponse build_resp;
+  grpc::ClientContext build_ctx;
+  auto status = index_stub_->Build(&build_ctx, build_req, &build_resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  // The vecstore reports the quantized index's memory estimate (used by
+  // the Go IndexManager's byte-budget LRU accounting, v12.md 3.3).
+  EXPECT_GT(build_resp.mem_bytes(), 0);
+
+  // Strict lifecycle (v12 2.6): seal BUILDING→READY via Save before
+  // searching, mirroring the product sequence.
+  std::string save_path = (test_dir_ / "quant_saved.bin").string();
+  grpc::ClientContext save_ctx2;
+  ::vecstore::SaveIndexRequest save_req2;
+  save_req2.set_kb_id(kb_id);
+  save_req2.set_version_id(1);
+  save_req2.set_path(save_path);
+  ::vecstore::SaveIndexResponse save_resp2;
+  ASSERT_TRUE(index_stub_->Save(&save_ctx2, save_req2, &save_resp2).ok());
+
+  ::vecstore::SearchIndexRequest search_req;
+  search_req.set_kb_id(kb_id);
+  search_req.set_version_id(1);
+  search_req.set_top_k(3);
+  search_req.set_candidate_n(200);
+  for (float x : vecs[0]) search_req.add_vector(x);
+  ::vecstore::SearchIndexResponse search_resp;
+  grpc::ClientContext search_ctx2;
+  status = index_stub_->Search(&search_ctx2, search_req, &search_resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  ASSERT_GT(search_resp.results_size(), 0);
+  EXPECT_EQ(search_resp.results(0).chunk_id(), "chunk-0");
+  // Two-stage rerank returns exact cosine scores in [-1, 1].
+  EXPECT_GE(search_resp.results(0).score(), -1.0f - 1e-4f);
+  EXPECT_LE(search_resp.results(0).score(), 1.0f + 1e-4f);
+}
+
+// SearchWhileBuildingIsRejected verifies the strict lifecycle (v12 2.6):
+// an index that was built but not yet Save-sealed is BUILDING, and Search
+// must fail with FAILED_PRECONDITION instead of racing the build.
+TEST_F(GrpcServiceTest, SearchWhileBuildingIsRejected) {
+  ::vecstore::BuildIndexRequest build_req;
+  build_req.set_kb_id("kb-building");
+  build_req.set_version_id(1);
+  build_req.set_metric(::vecstore::COSINE);
+  for (int i = 0; i < 10; ++i) {
+    auto* chunk = build_req.add_chunks();
+    chunk->set_chunk_id("chunk-" + std::to_string(i));
+    for (int d = 0; d < 8; ++d) chunk->add_vector(static_cast<float>(i + d));
+  }
+  ::vecstore::BuildIndexResponse build_resp;
+  grpc::ClientContext build_ctx;
+  ASSERT_TRUE(index_stub_->Build(&build_ctx, build_req, &build_resp).ok());
+  // NOTE: no Save — the index stays BUILDING.
+
+  ::vecstore::SearchIndexRequest search_req;
+  search_req.set_kb_id("kb-building");
+  search_req.set_version_id(1);
+  search_req.set_top_k(3);
+  for (int d = 0; d < 8; ++d) search_req.add_vector(static_cast<float>(d));
+  ::vecstore::SearchIndexResponse search_resp;
+  grpc::ClientContext search_ctx;
+  auto status = index_stub_->Search(&search_ctx, search_req, &search_resp);
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::FAILED_PRECONDITION);
 }
 
 }  // namespace

@@ -30,6 +30,13 @@ type mockVectorIndexClient struct {
 	searchFn       func(kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) // per-call override
 	buildCalls     int                                                                                          // number of Build RPC invocations
 	addChunksCalls int                                                                                          // number of AddChunks RPC invocations
+	// last Build RPC's quantizer fields, for asserting config forwarding.
+	lastBuildQuantizer vecstorepb.QuantizerTypeProto
+	lastBuildPqM       int32
+	lastBuildPqNbits   int32
+	// memToReport, when > 0, is returned as the mem_bytes in Build /
+	// AddChunks responses, simulating the vecstore's memory estimate.
+	memToReport int64
 }
 
 func newMockVectorIndexClient() *mockVectorIndexClient {
@@ -50,6 +57,12 @@ func (m *mockVectorIndexClient) Build(_ context.Context, in *vecstorepb.BuildInd
 	}
 	m.built[key] = results
 	m.buildCalls++
+	m.lastBuildQuantizer = in.Quantizer
+	m.lastBuildPqM = in.PqM
+	m.lastBuildPqNbits = in.PqNbits
+	if m.memToReport > 0 {
+		return &vecstorepb.BuildIndexResponse{MemBytes: m.memToReport}, nil
+	}
 	return &vecstorepb.BuildIndexResponse{}, nil
 }
 
@@ -68,6 +81,9 @@ func (m *mockVectorIndexClient) AddChunks(_ context.Context, in *vecstorepb.AddC
 	}
 	m.built[key] = results
 	m.addChunksCalls++
+	if m.memToReport > 0 {
+		return &vecstorepb.AddChunksResponse{MemBytes: m.memToReport}, nil
+	}
 	return &vecstorepb.AddChunksResponse{}, nil
 }
 

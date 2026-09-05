@@ -16,6 +16,7 @@
 #ifndef STRATUM_VECSTORE_CHUNK_STORAGE_H_
 #define STRATUM_VECSTORE_CHUNK_STORAGE_H_
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,13 @@ class ChunkStorage {
  public:
   virtual ~ChunkStorage() = default;
 
+  // MultiReadResult is the outcome of a batch read: the found key→vector
+  // pairs plus the ordered list of keys that were not present.
+  struct MultiReadResult {
+    std::map<std::string, std::vector<float>> found;
+    std::vector<std::string> missing;
+  };
+
   // Write stores vector under key, overwriting any existing value.
   virtual absl::Status Write(const std::string& key,
                               const std::vector<float>& vector) = 0;
@@ -40,6 +48,15 @@ class ChunkStorage {
   // Read returns the vector stored under key, or a NotFound status if no
   // such key exists.
   virtual absl::StatusOr<std::vector<float>> Read(const std::string& key) = 0;
+
+  // ReadMulti reads every present key in one call and reports which keys
+  // were missing. Used by the two-stage search rerank: given the coarse
+  // pass's candidate chunk_ids (encoded into keys with the knowledge
+  // base), read back their full-precision vectors for exact re-scoring.
+  // Missing keys are collected in MultiReadResult::missing and skipped,
+  // never fatal.
+  virtual absl::StatusOr<MultiReadResult> ReadMulti(
+      const std::vector<std::string>& keys) = 0;
 
   // Exists reports whether key is currently stored.
   virtual absl::StatusOr<bool> Exists(const std::string& key) = 0;

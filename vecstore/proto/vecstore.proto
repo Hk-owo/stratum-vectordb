@@ -71,26 +71,60 @@ enum MetricTypeProto {
   INNER_PRODUCT = 2;
 }
 
+// QuantizerTypeProto selects how the in-memory index stores vector
+// payloads (Stratum_设计文档v12.md 2.4). QUANTIZER_OFF keeps the
+// full-precision IndexHNSWFlat behavior (single-stage exact search); the
+// other types build quantized HNSW indexes (IndexHNSWSQ / IndexHNSWPQ)
+// whose search results are coarse candidates re-ranked against
+// full-precision vectors read from the chunk store.
+enum QuantizerTypeProto {
+  QUANTIZER_OFF = 0;
+  QUANTIZER_SQ8 = 1;      // 8-bit scalar quantization
+  QUANTIZER_SQ_BF16 = 2;  // bfloat16 scalar quantization
+  QUANTIZER_SQ_FP16 = 3;  // fp16 scalar quantization
+  QUANTIZER_PQ = 4;       // product quantization
+}
+
 message BuildIndexRequest {
   string kb_id = 1;
   int64 version_id = 2;
   repeated ChunkVectorProto chunks = 3;
   MetricTypeProto metric = 4;
+  // Quantizer selection. KB-level and immutable after knowledge-base
+  // creation; per-version indexes each carry their own trained quantizer.
+  QuantizerTypeProto quantizer = 5;  // default QUANTIZER_OFF
+  int32 pq_m = 6;                    // PQ sub-vectors; must divide dim; PQ only
+  int32 pq_nbits = 7;                // PQ bits per sub-quantizer; 0 = default 8
 }
-message BuildIndexResponse {}
+message BuildIndexResponse {
+  // Estimated in-memory footprint of the (kb_id, version_id) index after
+  // this build, in bytes, on the "coarse retriever" accounting basis
+  // (HNSW graph edges + quantized codes for quantized indexes; vector
+  // payload bytes otherwise). 0 = unknown/unreported (callers fall back
+  // to their own estimate). See Stratum_设计文档v12.md 3.3.
+  int64 mem_bytes = 1;
+}
 
 message AddChunksRequest {
   string kb_id = 1;
   int64 version_id = 2;
   repeated ChunkVectorProto chunks = 3;
 }
-message AddChunksResponse {}
+message AddChunksResponse {
+  // Cumulative estimated in-memory footprint of the index after this
+  // append (same basis as BuildIndexResponse.mem_bytes). 0 = unknown.
+  int64 mem_bytes = 1;
+}
 
 message SearchIndexRequest {
   string kb_id = 1;
   int64 version_id = 2;
   repeated float vector = 3;
   int32 top_k = 4;
+  // Coarse-pass candidate count for the two-stage search; 0 = server
+  // default (clamp(top_k * multiplier)). Ignored for full-precision
+  // (unquantized) indexes, which resolve exactly in memory.
+  int32 candidate_n = 5;
 }
 message SearchResultProto {
   string chunk_id = 1;

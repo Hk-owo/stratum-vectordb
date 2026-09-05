@@ -90,6 +90,12 @@ type IndexManagerImpl struct {
 	listChunkIDsByDocs func(ctx context.Context, kbID string, docIDs []string) ([]string, error)
 	readChunkVector    func(ctx context.Context, kbID, chunkID string) ([]float32, error)
 
+	// kbMetaGetter, when set, supplies the KB metadata (from the Raft
+	// state machine via cmd/stratum/main.go wiring) so async builds can
+	// forward the KB-level quantizer config to the vecstore. Nil means the
+	// default (full precision / OFF) is used for every build.
+	kbMetaGetter func(ctx context.Context, kbID string) (types.KnowledgeBaseMeta, error)
+
 	// vecstore gRPC client for Build/Search/Save/Load/Reset.
 	vectorIndexClient vecstorepb.VectorIndexServiceClient
 	vecstoreConn      *grpc.ClientConn // owned; closed on shutdown
@@ -379,12 +385,64 @@ func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64) (int64,
 	}
 }
 
+// SetKBMetaGetter wires a function returning a KB's metadata (e.g.
+// RaftNode.GetKB). Used by async builds to read the KB-level quantizer
+// configuration and forward it in the Build RPC.
+func (im *IndexManagerImpl) SetKBMetaGetter(
+	getter func(ctx context.Context, kbID string) (types.KnowledgeBaseMeta, error)) {
+	im.kbMetaGetter = getter
+}
+
+// quantizerForKB maps a knowledge base's quantizer metadata to the
+// vecstore Build RPC fields. OFF (or an unknown value) maps to no
+// quantization, keeping the historical full-precision behavior.
+func quantizerForKB(kb types.KnowledgeBaseMeta) (vecstorepb.QuantizerTypeProto, int32, int32) {
+	var q vecstorepb.QuantizerTypeProto
+	switch kb.QuantizerType {
+	case "SQ8":
+		q = vecstorepb.QuantizerTypeProto_QUANTIZER_SQ8
+	case "SQ_BF16":
+		q = vecstorepb.QuantizerTypeProto_QUANTIZER_SQ_BF16
+	case "SQ_FP16":
+		q = vecstorepb.QuantizerTypeProto_QUANTIZER_SQ_FP16
+	case "PQ":
+		q = vecstorepb.QuantizerTypeProto_QUANTIZER_PQ
+	default:
+		return vecstorepb.QuantizerTypeProto_QUANTIZER_OFF, 0, 0
+	}
+	pqM, pqNBits := int32(0), int32(0)
+	if kb.QuantizerType == "PQ" {
+		pqM = int32(kb.QuantizerPQM)
+		pqNBits = int32(kb.QuantizerPQNBits)
+	}
+	return q, pqM, pqNBits
+}
+
+// buildQuantizerFromKB returns the vecstore Build RPC quantizer fields
+// for kbID, consulting kbMetaGetter when set (default OFF otherwise).
+func (im *IndexManagerImpl) buildQuantizerFromKB(ctx context.Context, kbID string) (vecstorepb.QuantizerTypeProto, int32, int32) {
+	if im.kbMetaGetter == nil {
+		return vecstorepb.QuantizerTypeProto_QUANTIZER_OFF, 0, 0
+	}
+	kb, err := im.kbMetaGetter(ctx, kbID)
+	if err != nil {
+		return vecstorepb.QuantizerTypeProto_QUANTIZER_OFF, 0, 0
+	}
+	return quantizerForKB(kb)
+}
+
 // build executes the full build data flow and returns the estimated
 // in-memory footprint of the built index (sum of vector payload bytes;
 // 0 for an empty version). It reports success only if the index was also
 // persisted to disk (see saveToDisk), so a failed save surfaces as a
 // build failure.
 func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID int64) (int64, error) {
+	// Forward the KB-level quantizer config with every Build RPC; OFF
+	// (default) keeps the historical full-precision index type.
+	quantizerType, pqM, pqNBits := im.buildQuantizerFromKB(ctx, kbID)
+	// Last reported in-memory estimate from the vecstore (0 = unreported).
+	reportedMemBytes := int64(0)
+
 	docIDs, err := im.listDocIDs(ctx, kbID, versionID)
 	if err != nil {
 		return 0, fmt.Errorf("index: ListDocIDs: %w", err)
@@ -410,6 +468,9 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 			KbId:      kbID,
 			VersionId: versionID,
 			Metric:    vecstorepb.MetricTypeProto_COSINE,
+			Quantizer: quantizerType,
+			PqM:       pqM,
+			PqNbits:   pqNBits,
 		})
 		if err != nil {
 			return 0, fmt.Errorf("index: Build RPC: %w", err)
@@ -423,25 +484,40 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 			chunks = append(chunks, &vecstorepb.ChunkVectorProto{ChunkId: cv.id, Vector: cv.vec})
 		}
 		if i == 0 {
-			_, err = im.vectorIndexClient.Build(ctx, &vecstorepb.BuildIndexRequest{
+			resp, buildErr := im.vectorIndexClient.Build(ctx, &vecstorepb.BuildIndexRequest{
 				KbId:      kbID,
 				VersionId: versionID,
 				Chunks:    chunks,
 				Metric:    vecstorepb.MetricTypeProto_COSINE,
+				Quantizer: quantizerType,
+				PqM:       pqM,
+				PqNbits:   pqNBits,
 			})
-			if err != nil {
-				return 0, fmt.Errorf("index: Build RPC: %w", err)
+			if buildErr != nil {
+				return 0, fmt.Errorf("index: Build RPC: %w", buildErr)
 			}
+			reportedMemBytes = resp.GetMemBytes()
 		} else {
-			_, err = im.vectorIndexClient.AddChunks(ctx, &vecstorepb.AddChunksRequest{
+			resp, addErr := im.vectorIndexClient.AddChunks(ctx, &vecstorepb.AddChunksRequest{
 				KbId:      kbID,
 				VersionId: versionID,
 				Chunks:    chunks,
 			})
-			if err != nil {
-				return 0, fmt.Errorf("index: AddChunks RPC: %w", err)
+			if addErr != nil {
+				return 0, fmt.Errorf("index: AddChunks RPC: %w", addErr)
 			}
+			reportedMemBytes = resp.GetMemBytes()
 		}
+	}
+
+	// Memory accounting (Stratum_设计文档v12.md 3.3): for quantized KBs the
+	// vecstore reports the index's resident estimate on the coarse-
+	// retriever basis (HNSW graph edges + quantized codes); prefer that
+	// over the 4×d×n vector-payload estimate (which is only right for
+	// full-precision OFF indexes). OFF KBs and unreported quantized
+	// builds keep the historical sizeBytes estimate.
+	if quantizerType != vecstorepb.QuantizerTypeProto_QUANTIZER_OFF && reportedMemBytes > 0 {
+		sizeBytes = reportedMemBytes
 	}
 
 	// Persist the finished index to disk — the durable fact that READY

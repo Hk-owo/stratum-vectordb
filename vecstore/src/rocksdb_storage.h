@@ -41,6 +41,8 @@ class RocksDBChunkStorage : public ChunkStorage {
   absl::Status Write(const std::string& key,
                       const std::vector<float>& vector) override;
   absl::StatusOr<std::vector<float>> Read(const std::string& key) override;
+  absl::StatusOr<MultiReadResult> ReadMulti(
+      const std::vector<std::string>& keys) override;
   absl::StatusOr<bool> Exists(const std::string& key) override;
   absl::Status Delete(const std::string& key) override;
   absl::Status DeleteByPrefix(const std::string& prefix) override;

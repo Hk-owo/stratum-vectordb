@@ -35,6 +35,30 @@ struct SearchResult {
   float score;
 };
 
+// QuantizerType selects how the in-memory index stores vector payloads.
+// kOff keeps the current full-precision IndexHNSWFlat behavior; the other
+// types store quantized codes (ScalarQuantizer / ProductQuantizer) inside
+// the HNSW structure and act as approximate coarse retrievers whose
+// results are re-ranked against full-precision vectors read from the
+// chunk store (see VectorIndex::SearchWithRerank and Stratum_设计文档v12.md).
+enum class QuantizerType {
+  kOff,       // full-precision flat storage (现状)
+  kSQ8,       // 8-bit scalar quantization (1 byte/component)
+  kSQBF16,    // bfloat16 scalar quantization (2 bytes/component)
+  kSQFP16,    // fp16 scalar quantization (2 bytes/component)
+  kPQ,        // product quantization (pq_m * pq_nbits / 8 bytes/vector)
+};
+
+// QuantizerConfig is the per-knowledge-base quantization setting. It is
+// fixed at knowledge-base creation time and never changes afterwards;
+// each version's index carries its own quantizer (per-version full
+// rebuilds do not share codebooks).
+struct QuantizerConfig {
+  QuantizerType type = QuantizerType::kOff;
+  int pq_m = 96;      // PQ sub-vectors; must divide the vector dimension
+  int pq_nbits = 8;   // PQ bits per sub-quantizer
+};
+
 }  // namespace vecstore
 }  // namespace stratum
 

@@ -59,6 +59,15 @@ func (s *KnowledgeBaseServiceImpl) CreateKnowledgeBase(ctx context.Context, req 
 	if similarity == "" || similarity == "SIMILARITY_COSINE" {
 		similarity = "COSINE"
 	}
+	quantizer := quantizerFromProto(req.Quantizer)
+	pqM := int(req.PqM)
+	if quantizer == "PQ" && pqM <= 0 {
+		pqM = 96 // default
+	}
+	pqNBits := int(req.PqNbits)
+	if quantizer == "PQ" && pqNBits <= 0 {
+		pqNBits = 8 // default
+	}
 
 	windowSize := int(req.ChunkWindowSize)
 	if windowSize <= 0 {
@@ -76,6 +85,9 @@ func (s *KnowledgeBaseServiceImpl) CreateKnowledgeBase(ctx context.Context, req 
 		ChunkOverlapSize: overlapSize,
 		IndexType:        indexType,
 		Similarity:       similarity,
+		QuantizerType:    quantizer,
+		QuantizerPQM:     pqM,
+		QuantizerPQNBits: pqNBits,
 		EmbedConfig: types.EmbedConfig{
 			ServiceAddr: req.EmbedConfig.GetServiceAddr(),
 			ModelID:     req.EmbedConfig.GetModelId(),
@@ -258,6 +270,9 @@ func kbToProto(kb types.KnowledgeBaseMeta) *pb.KnowledgeBaseInfo {
 		ChunkOverlapSize: int32(kb.ChunkOverlapSize),
 		IndexType:        indexTypeToProto(kb.IndexType),
 		Similarity:       similarityToProto(kb.Similarity),
+		Quantizer:        quantizerToProto(kb.QuantizerType),
+		PqM:              int32(kb.QuantizerPQM),
+		PqNbits:          int32(kb.QuantizerPQNBits),
 		EmbedConfig: &pb.EmbedConfig{
 			ServiceAddr: kb.EmbedConfig.ServiceAddr,
 			ModelId:     kb.EmbedConfig.ModelID,
@@ -286,6 +301,38 @@ func similarityToProto(s string) pb.Similarity {
 		return pb.Similarity_SIMILARITY_INNER_PRODUCT
 	default:
 		return pb.Similarity_SIMILARITY_COSINE
+	}
+}
+
+// quantizerFromProto maps the console-facing proto enum to the short
+// internal name stored in KnowledgeBaseMeta ("" / "QUANTIZER_OFF" ⇒ OFF).
+func quantizerFromProto(q pb.QuantizerType) string {
+	switch q {
+	case pb.QuantizerType_QUANTIZER_SQ8:
+		return "SQ8"
+	case pb.QuantizerType_QUANTIZER_SQ_BF16:
+		return "SQ_BF16"
+	case pb.QuantizerType_QUANTIZER_SQ_FP16:
+		return "SQ_FP16"
+	case pb.QuantizerType_QUANTIZER_PQ:
+		return "PQ"
+	default:
+		return "OFF"
+	}
+}
+
+func quantizerToProto(s string) pb.QuantizerType {
+	switch s {
+	case "SQ8":
+		return pb.QuantizerType_QUANTIZER_SQ8
+	case "SQ_BF16":
+		return pb.QuantizerType_QUANTIZER_SQ_BF16
+	case "SQ_FP16":
+		return pb.QuantizerType_QUANTIZER_SQ_FP16
+	case "PQ":
+		return pb.QuantizerType_QUANTIZER_PQ
+	default:
+		return pb.QuantizerType_QUANTIZER_OFF
 	}
 }
 

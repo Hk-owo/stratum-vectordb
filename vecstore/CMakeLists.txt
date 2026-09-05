@@ -111,6 +111,7 @@ set(VECSTORE_SOURCES
   ${VECSTORE_PROTO_SRCS}
   src/rocksdb_storage.cpp
   src/hnsw_index.cpp
+  src/key_codec.cpp
   src/grpc_service.cpp
   # src/health_service.cpp    # not yet scheduled in any implementation phase
 )

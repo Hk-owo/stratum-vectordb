@@ -42,6 +42,10 @@ delete_coordinator:
 
 index_manager:
   lru_capacity: 16
+  # 内存字节阈值。记账口径见 Stratum_设计文档v12.md 3.3：OFF(全精度)KB
+  # 按 4×d×n 向量载荷记账；SQ/PQ 量化 KB 按 vecstore 报告的「图边+量化码」
+  # 粗筛器口径记账（单条目显著变小）。启用量化后同样预算可驻留更多版本，
+  # 阈值可按部署内存压力自行调整（调低 = 更早换出冷版本粗筛器）。
   memory_threshold_mb: 4096
   load_wait_timeout_ms: 5000
   callback_max_retries: 3

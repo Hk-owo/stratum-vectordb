@@ -14,11 +14,13 @@
 #ifndef STRATUM_VECSTORE_VECTOR_INDEX_H_
 #define STRATUM_VECSTORE_VECTOR_INDEX_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "vecstore/include/chunk_storage.h"
 #include "vecstore/include/types.h"
 
 namespace stratum {
@@ -60,8 +62,43 @@ class VectorIndex {
   // Search returns up to topK approximate nearest neighbors to vector,
   // ordered by descending similarity score. Requires a prior successful
   // Build or Load.
+  //
+  // Precision contract: on a full-precision (unquantized) index this is
+  // an exact search and the returned scores are final. On a quantized
+  // index the scores are coarse-approximate and must NOT be surfaced to
+  // callers as final scores — use SearchWithRerank instead, which reads
+  // full-precision vectors back from the chunk store and re-scores.
   virtual absl::StatusOr<std::vector<SearchResult>> Search(
       const std::vector<float>& vector, int top_k) = 0;
+
+  // SearchCandidates is the coarse-retrieval stage of the two-stage
+  // search: it returns up to top_n candidate chunk_ids (approximate for a
+  // quantized index, exact for a full-precision one), ordered by the
+  // index's internal distance. Returned scores are only for candidate
+  // ordering and are never surfaced as final scores.
+  virtual absl::StatusOr<std::vector<SearchResult>> SearchCandidates(
+      const std::vector<float>& vector, int top_n) = 0;
+
+  // SearchWithRerank returns the final top_k for vector, running the
+  // two-stage search when the index is quantized: coarse candidates via
+  // SearchCandidates (candidate_n of them), full-precision vectors read
+  // back from storage via ChunkStorage::ReadMulti keyed by
+  // EncodeKey(kb_id, chunk_id), then an exact re-score. On a
+  // full-precision index this degrades to Search (single-stage, exact).
+  // The default implementation is that single-stage path; quantized
+  // implementations override it.
+  virtual absl::StatusOr<std::vector<SearchResult>> SearchWithRerank(
+      ChunkStorage* storage, const std::string& kb_id,
+      const std::vector<float>& vector, int top_k, int candidate_n) {
+    return Search(vector, top_k);
+  }
+
+  // EstimatedMemoryBytes returns an estimate of this index's in-memory
+  // footprint (bytes), reported through the Build/AddChunks RPC responses
+  // so the Go IndexManager can run its byte-budget LRU accounting on the
+  // actual resident structure (Stratum_设计文档v12.md 3.3). The default
+  // reports 0 (unknown); concrete indexes override with their basis.
+  virtual int64_t EstimatedMemoryBytes() const { return 0; }
 
   // Save persists the current in-memory index to path on disk.
   virtual absl::Status Save(const std::string& path) = 0;

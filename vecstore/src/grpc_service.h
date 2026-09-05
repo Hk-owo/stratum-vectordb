@@ -62,7 +62,7 @@ class ChunkStorageServiceImpl final : public ::vecstore::ChunkStorageService::Se
 // HNSW").
 class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Service {
  public:
-  VectorIndexServiceImpl() = default;
+  explicit VectorIndexServiceImpl(ChunkStorage* storage) : storage_(storage) {}
 
   grpc::Status Build(grpc::ServerContext* context,
                       const ::vecstore::BuildIndexRequest* request,
@@ -90,9 +90,10 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   using IndexKey = std::pair<std::string, int64_t>;  // (kb_id, version_id)
 
   // GetOrCreateLocked returns the VectorIndex for key, constructing a new
-  // HNSWVectorIndex if one does not already exist. Must be called with
-  // mu_ held.
-  VectorIndex* GetOrCreateLocked(const IndexKey& key);
+  // HNSWVectorIndex (with config, which is only applied on creation) if
+  // one does not already exist. Must be called with mu_ held.
+  VectorIndex* GetOrCreateLocked(const IndexKey& key,
+                                 const QuantizerConfig& config = {});
 
   // FileExists reports whether path exists and is a regular file. Used by
   // ExistsIndex's stateless on-disk existence check.
@@ -100,6 +101,7 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
 
   std::mutex mu_;
   std::map<IndexKey, std::unique_ptr<VectorIndex>> indexes_;
+  ChunkStorage* storage_;  // not owned; supplied by VecstoreGrpcServer
 };
 
 // VecstoreGrpcServer owns a ChunkStorage, a VectorIndexServiceImpl, and a

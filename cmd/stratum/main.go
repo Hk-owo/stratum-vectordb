@@ -229,6 +229,10 @@ func main() {
 			return resp.GetVector(), nil
 		},
 	)
+	// KB metadata source: async builds read the KB-level quantizer
+	// configuration from the Raft state machine and forward it to the
+	// vecstore with each Build RPC (Stratum_设计文档v12.md 2.4).
+	indexMgr.SetKBMetaGetter(raftImpl.GetKB)
 	indexMgr.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
 		// Apply the on-disk retention policy after every successful build:
 		// keep the newest cfg.IndexRetentionCount index files per KB, drop
