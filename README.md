@@ -1,11 +1,11 @@
 # Stratum
 
-分布式向量检索知识库引擎,支持 MVCC 版本化、Raft 共识与 HNSW 索引——为检索增强生成(RAG)而构建。
+分布式向量检索知识库引擎,支持 MVCC 版本化、Raft 共识与 HNSW 索引——为检索增强生成(RAG)而构建。向量检索默认全精度单段;按知识库可选**量化两段式**(内存量化 HNSW 粗筛 + 磁盘全精度 rerank,见「关键设计决策」)。
 
 ## 概述
 
 Stratum 管理带版本号的文档集合。文档被切分为内容寻址的 chunk,经外部 embed 服务
-转为向量,以 Faiss HNSW 建索引,并通过 gRPC API 对外服务;另提供可选的 HTTP 网关
+转为向量,以 Faiss HNSW 建索引(默认全精度;KB 可选量化,见「关键设计决策」),并通过 gRPC API 对外服务;另提供可选的 HTTP 网关
 (`cmd/stratum-gateway`) 与 Web 控制台(`web/`)用于监控与运维。存储卫生自动维护:
 未被任何版本引用的 chunk 由周期性垃圾回收器清扫;每版本一份文档布隆过滤器让成员
 检查开销极低;启动 reconcile 从磁盘上的索引文件推导版本 READY 状态,而非依赖回调送达。
@@ -58,9 +58,12 @@ Stratum 是 RAG 管线的存储与检索层。它不处理聊天历史、用户�
   │  ┌──────────────────┐  ┌──────────────────────┐ │
   │  │  ChunkStorage    │  │   VectorIndex        │ │
   │  │  (RocksDB)       │  │   (Faiss HNSW)       │ │
+  │  │   全精度原向量权威 │  │   · 全精度(默认,单段) │ │
   │  └──────────────────┘  └──────────────────────┘ │
   └─────────────────────────────────────────────────┘
 ```
+
+> 检索路径:**默认全精度 HNSW 单段**(内存直接出 top-k);KB 可选量化后,**内存只驻留量化粗筛器**(图+量化码),全精度向量存于 RocksDB,查询 = 粗筛候选 → 按候选读全精度原向量 → 精确 rerank(两段式)。
 
 ## 快速开始
 
@@ -225,7 +228,7 @@ stratum/
 │   ├── splitter/           # 滑窗文档切分
 │   ├── embed/              # 外部 embed 服务 HTTP 客户端
 │   ├── chunkstore/         # Vecstore gRPC 客户端封装
-│   ├── index/              # IndexManager(LRU 缓存 + 引用计数 + 异步构建)
+│   ├── index/              # IndexManager(LRU 缓存 + 引用计数 + 分级记账 + 异步构建)
 │   ├── kvraft/             # Raft 共识库(选主 / 日志复制 / 快照)
 │   ├── kvstorage/          # Raft 硬状态持久化
 │   ├── raft/               # Stratum Raft 状态机(KB + 版本元数据)
@@ -244,7 +247,7 @@ stratum/
 ├── configs/                # 示例配置文件
 ├── web/                    # Web 控制台前端(HTML/CSS/JS)
 ├── scripts/                # 开发/测试辅助脚本 + 运维脚本(scripts/ops)
-├── vecstore/               # C++ 向量存储(Faiss HNSW + RocksDB)
+├── vecstore/               # C++ 向量存储(Faiss HNSW + RocksDB;支持量化两段式检索)
 └── go.mod
 ```
 
@@ -260,6 +263,7 @@ stratum/
 | **JSON 编码的 Raft 命令** | 控制面命令量小;可用 `jq` 人类可读地调试 |
 | **接口优先、mock 同行** | 每个模块都是接口配 mock;测试干净隔离;真实实现从接口后插入 |
 | **分批索引构建** | 构建拆分为一次 `Build` + 多次 `AddChunks` RPC,使每个 gRPC 消息不超过 4 MiB 传输上限;空版本仍建索引条目 |
+| **量化两段式检索(可选,默认全精度)** | KB 级开关(创建后不可变):量化后内存只驻留粗筛器(图+量化码),全精度向量在 RocksDB;查询 = 粗筛 → 读盘 → 精确 rerank;索引对象以 EMPTY/BUILDING/READY 状态机 + 每实例锁保护读写(详见 `Stratum_设计文档v12.md`) |
 
 ## Raft 共识
 
@@ -313,7 +317,7 @@ gofmt + `go vet` + `go build` + 单元测试(23 个包)+ raft/kvraft/index 竞�
 ### 数据量实测(3 节点 Docker 集群)
 
 通过 `TestT4_DataVolume` 在 3 节点 Docker 集群上对真实 vecstore(Faiss HNSW +
-RocksDB,768 维)采样;文档按 window=512 切分,mock embed 服务按 10 ms/chunk 嵌入。
+RocksDB,768 维,默认全精度)采样;文档按 window=512 切分,mock embed 服务按 10 ms/chunk 嵌入。
 现在每个节点运行自己独立的 vecstore(`run/docker/vecstore/nodeN`)
 ——共享一个 vecstore 会引发并发的 `Build = Reset + AddChunks` 竞态。
 
