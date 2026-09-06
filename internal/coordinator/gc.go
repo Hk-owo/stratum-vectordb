@@ -3,6 +3,7 @@ package coordinator
 
 import (
 	"context"
+	"sync"
 
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
@@ -20,6 +21,17 @@ type ChunkGarbageCollectorConfig struct {
 	ChunkDocMapper chunkdoc.ChunkDocMapper
 	DocStore       docstore.DocStore
 	ChunkStore     chunkstore.ChunkStore
+
+	// WriteMu is the mutex shared with WriteCoordinatorImpl (its txnMu):
+	// the GC's reclaim phase takes it per orphan chunk, re-checks
+	// orphanhood against the raft CURRENT version while holding it, then
+	// deletes the mapping and the vector. Mutual exclusion with the write
+	// transaction closes the stale-snapshot race (a sweep erasing data a
+	// newer version committed between the snapshot and the delete).
+	// When nil a private lock is allocated — sufficient only for tests
+	// without concurrent writes; production wiring MUST inject the same
+	// mutex as WriteCoordinatorConfig.WriteMu.
+	WriteMu *sync.Mutex
 }
 
 // ChunkGarbageCollector periodically reclaims orphan chunks — chunk
@@ -34,6 +46,15 @@ type ChunkGarbageCollectorConfig struct {
 // state that the next sweep can safely re-run (both deletions are
 // idempotent; a vector whose mapping was already removed is simply not
 // scanned again).
+//
+// A sweep has two passes. The first (lock-free) pass judges liveness
+// against the version list snapshot taken at sweep start and only marks
+// reclaim candidates; the reclaim pass re-validates each candidate
+// against the raft CURRENT version while holding the write mutex shared
+// with WriteCoordinatorImpl, then deletes mapping and vector inside that
+// critical section (see reclaimOrphan). This keeps a sweep from erasing
+// data committed by a newer version between the snapshot and the delete
+// (the stale-snapshot race).
 type ChunkGarbageCollector interface {
 	// Run launches the background sweep loop; it returns when ctx is
 	// cancelled. Non-blocking startup: the first sweep runs after one

@@ -218,4 +218,221 @@ func contains(xs []string, want string) bool {
 	return false
 }
 
+// hookDocStore wraps a testDocStore and runs hook exactly once, on the
+// first ReadAt. It lets a test inject a "concurrent committed write"
+// deterministically between the GC's liveness read (its stale version
+// snapshot) and its reclaim action — reproducing a real interleaving
+// without racing on wall-clock timing.
+type hookDocStore struct {
+	*testDocStore
+	once sync.Once
+	hook func()
+}
+
+func (s *hookDocStore) ReadAt(ctx context.Context, kbID, docID string, maxVersionID int64) ([]byte, error) {
+	s.once.Do(s.hook)
+	return s.testDocStore.ReadAt(ctx, kbID, docID, maxVersionID)
+}
+
+// TestChunkGarbageCollector_StaleSnapshotRace_DeletesCommittedData is a
+// regression test for the stale-snapshot race analysed in review: the
+// first sweep pass judges liveness against the version list snapshot
+// taken at sweepKB start, and a concurrent CreateVersion commits V3
+// (resurrecting the document and finishing its storage-layer writes —
+// successfully returned to the client) while the sweep is still judging.
+// Without the fix this reclaim erased the V3 data (DeleteByDoc removed
+// the mapping V3 just wrote, ChunkStore.Delete removed the vector).
+//
+// The fix (reclaimOrphan) re-validates each candidate against the raft
+// CURRENT version while holding the write mutex shared with
+// WriteCoordinatorImpl: the reclaim's re-check sees V3 in the version
+// list, reads the document as alive, and keeps the chunk. The test
+// orchestrates the interleaving deterministically (no wall-clock
+// racing): the hook below lands V3's committed writes — including its
+// entry in the raft version view — exactly when the first-pass liveness
+// read happens on the stale snapshot.
+func TestChunkGarbageCollector_StaleSnapshotRace_DeletesCommittedData(t *testing.T) {
+	ctx := context.Background()
+
+	const (
+		kbID    = "kb-race"
+		docID   = "doc-revived"
+		chunkID = "chunk-shared"
+	)
+
+	cdm, err := chunkdoc.NewPebbleChunkDocMapper(t.TempDir())
+	if err != nil {
+		t.Fatalf("open pebble chunkdoc: %v", err)
+	}
+	defer cdm.Close()
+
+	ds := newTestDocStore()
+	cs := newGCChunkStore()
+
+	// V1: doc alive with content. V2: doc deleted (tombstone). The GC's
+	// version view is (V1, V2), so the doc is dead at maxVersion = V2.
+	if err := ds.Write(ctx, kbID, docID, 1, []byte("v1-content")); err != nil {
+		t.Fatalf("ds.Write v1: %v", err)
+	}
+	if err := ds.Write(ctx, kbID, docID, 2, nil); err != nil { // tombstone
+		t.Fatalf("ds.Write tombstone: %v", err)
+	}
+	if err := cdm.Write(ctx, kbID, chunkID, docID); err != nil {
+		t.Fatalf("cdm.Write: %v", err)
+	}
+	if err := cs.Write(ctx, kbID, chunkID, nil); err != nil {
+		t.Fatalf("cs.Write: %v", err)
+	}
+
+	// The raft view starts at (V1, V2): this models the first-pass
+	// snapshot (taken at sweepKB start) predating V3's apply. The hook
+	// below advances the view to include V3 — exactly what happens on a
+	// real node when V3 commits between the sweep's snapshot and its
+	// reclaim — so the reclaim's current-version re-check must see it.
+	rn := &gcTestRaftNode{
+		kbs: []types.KnowledgeBaseMeta{{KBID: kbID}},
+		versions: map[string][]types.VersionMeta{
+			kbID: {{VersionID: 1, KBID: kbID}, {VersionID: 2, KBID: kbID}},
+		},
+	}
+
+	// Inject the concurrent V3 commit exactly when the GC performs its
+	// first-pass liveness read on the stale snapshot (first ReadAt): the
+	// document becomes alive again at V3 with content, mapping and vector
+	// written, and V3 enters the raft version view. From the reclaim's
+	// perspective this is the race window — V3 committed and returned
+	// success while the sweep was mid-flight.
+	hooked := &hookDocStore{
+		testDocStore: ds,
+		hook: func() {
+			rn.versions[kbID] = append(rn.versions[kbID], types.VersionMeta{VersionID: 3, KBID: kbID})
+			if err := ds.Write(ctx, kbID, docID, 3, []byte("v3-content")); err != nil {
+				t.Errorf("concurrent v3 ds.Write: %v", err)
+			}
+			if err := cdm.Write(ctx, kbID, chunkID, docID); err != nil {
+				t.Errorf("concurrent v3 cdm.Write: %v", err)
+			}
+			if err := cs.Write(ctx, kbID, chunkID, nil); err != nil {
+				t.Errorf("concurrent v3 cs.Write: %v", err)
+			}
+		},
+	}
+
+	gc := NewChunkGarbageCollectorImpl(ChunkGarbageCollectorConfig{
+		SweepIntervalSec: 1,
+		RaftNode:         rn,
+		ChunkDocMapper:   cdm,
+		DocStore:         hooked,
+		ChunkStore:       cs,
+	})
+
+	if err := gc.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	// Correctness invariant: V3 was committed (the client saw success);
+	// a stale-snapshot GC must not erase its data.
+	if got, err := ds.ReadAt(ctx, kbID, docID, 3); err != nil || string(got) != "v3-content" {
+		t.Errorf("v3 doc content lost after sweep: got %q, err %v", got, err)
+	}
+	if ok, err := cs.Exists(ctx, kbID, chunkID); err != nil || !ok {
+		t.Errorf("BUG reproduced: GC reclaimed a chunk vector committed by a newer version (stale snapshot race); exists=%v err=%v", ok, err)
+	}
+	docs, err := cdm.ListDocIDs(ctx, kbID, chunkID)
+	if err != nil {
+		t.Fatalf("ListDocIDs: %v", err)
+	}
+	if !contains(docs, docID) {
+		t.Errorf("BUG reproduced: GC cleared the (chunk, doc) mapping committed by a newer version (stale snapshot race); docs=%v", docs)
+	}
+}
+
+// TestChunkGarbageCollector_ReclaimBeforeConcurrentWrite_Recovers pins
+// down the other side of the same interleaving: when the GC's reclaim
+// finishes BEFORE the concurrent V3 write-path lands its storage writes,
+// the content-addressed idempotent write re-creates the vector and
+// mapping, and the data ends up intact. This is the only branch
+// idempotency actually protects.
+func TestChunkGarbageCollector_ReclaimBeforeConcurrentWrite_Recovers(t *testing.T) {
+	ctx := context.Background()
+
+	const (
+		kbID    = "kb-race"
+		docID   = "doc-revived"
+		chunkID = "chunk-shared"
+	)
+
+	cdm, err := chunkdoc.NewPebbleChunkDocMapper(t.TempDir())
+	if err != nil {
+		t.Fatalf("open pebble chunkdoc: %v", err)
+	}
+	defer cdm.Close()
+
+	ds := newTestDocStore()
+	cs := newGCChunkStore()
+
+	if err := ds.Write(ctx, kbID, docID, 1, []byte("v1-content")); err != nil {
+		t.Fatalf("ds.Write v1: %v", err)
+	}
+	if err := ds.Write(ctx, kbID, docID, 2, nil); err != nil { // tombstone
+		t.Fatalf("ds.Write tombstone: %v", err)
+	}
+	if err := cdm.Write(ctx, kbID, chunkID, docID); err != nil {
+		t.Fatalf("cdm.Write: %v", err)
+	}
+	if err := cs.Write(ctx, kbID, chunkID, nil); err != nil {
+		t.Fatalf("cs.Write: %v", err)
+	}
+
+	rn := &gcTestRaftNode{
+		kbs: []types.KnowledgeBaseMeta{{KBID: kbID}},
+		versions: map[string][]types.VersionMeta{
+			kbID: {{VersionID: 1, KBID: kbID}, {VersionID: 2, KBID: kbID}},
+		},
+	}
+
+	gc := NewChunkGarbageCollectorImpl(ChunkGarbageCollectorConfig{
+		SweepIntervalSec: 1,
+		RaftNode:         rn,
+		ChunkDocMapper:   cdm,
+		DocStore:         ds,
+		ChunkStore:       cs,
+	})
+
+	// GC reclaims first (doc dead at V2): mapping + vector removed.
+	if err := gc.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if ok, err := cs.Exists(ctx, kbID, chunkID); err != nil || ok {
+		t.Fatalf("precondition: chunk should be reclaimed; exists=%v err=%v", ok, err)
+	}
+
+	// The concurrent V3 write path lands afterwards and re-creates the
+	// content-addressed chunk, mapping and doc content.
+	if err := ds.Write(ctx, kbID, docID, 3, []byte("v3-content")); err != nil {
+		t.Fatalf("ds.Write v3: %v", err)
+	}
+	if err := cdm.Write(ctx, kbID, chunkID, docID); err != nil {
+		t.Fatalf("cdm.Write: %v", err)
+	}
+	if err := cs.Write(ctx, kbID, chunkID, nil); err != nil {
+		t.Fatalf("cs.Write: %v", err)
+	}
+
+	// V3 data is fully intact.
+	if got, err := ds.ReadAt(ctx, kbID, docID, 3); err != nil || string(got) != "v3-content" {
+		t.Errorf("v3 doc content missing after idempotent re-write: got %q, err %v", got, err)
+	}
+	if ok, err := cs.Exists(ctx, kbID, chunkID); err != nil || !ok {
+		t.Errorf("v3 chunk vector missing after idempotent re-write: exists=%v err=%v", ok, err)
+	}
+	docs, err := cdm.ListDocIDs(ctx, kbID, chunkID)
+	if err != nil {
+		t.Fatalf("ListDocIDs: %v", err)
+	}
+	if !contains(docs, docID) {
+		t.Errorf("v3 (chunk, doc) mapping missing after idempotent re-write: docs=%v", docs)
+	}
+}
+
 var _ chunkstore.ChunkStore = (*gcChunkStore)(nil)

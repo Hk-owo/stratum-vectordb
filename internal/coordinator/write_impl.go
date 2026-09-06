@@ -49,6 +49,17 @@ type WriteCoordinatorConfig struct {
 	DocStore       docstore.DocStore
 	VersionDocList versiondoc.VersionDocList
 	IndexManager   index.IndexManager
+
+	// WriteMu is the lock serializing CreateVersion write transactions
+	// (BEGIN through COMMIT). It is shared with the orphan-chunk
+	// garbage collector so the GC's reclaim phase (current-version
+	// re-check + mapping/vector deletion) is mutually exclusive with
+	// concurrent writes — closing the stale-snapshot race where a sweep
+	// erases data committed by a newer version. When nil, the
+	// WriteCoordinatorImpl allocates a private lock (fine for single
+	// writer; callers that also run a ChunkGarbageCollector MUST inject
+	// the same mutex into both).
+	WriteMu *sync.Mutex
 }
 
 // WriteCoordinatorImpl is the real WriteCoordinator implementation,
@@ -62,7 +73,9 @@ type WriteCoordinatorImpl struct {
 	// transaction with no interleaved BEGIN from a concurrent transaction —
 	// the property FileWAL.rebuildIndex relies on to bind each VERSION_ID
 	// to the correct transaction's replay input (see internal/wal/file.go).
-	txnMu sync.Mutex
+	// It is the cfg.WriteMu instance (or a private fallback when nil), and
+	// is shared with ChunkGarbageCollectorImpl's reclaim phase.
+	txnMu *sync.Mutex
 }
 
 // NewWriteCoordinatorImpl constructs a WriteCoordinatorImpl.
@@ -73,7 +86,11 @@ func NewWriteCoordinatorImpl(cfg WriteCoordinatorConfig) *WriteCoordinatorImpl {
 	if cfg.RetryBaseIntervalMS <= 0 {
 		cfg.RetryBaseIntervalMS = 100
 	}
-	return &WriteCoordinatorImpl{cfg: cfg}
+	mu := cfg.WriteMu
+	if mu == nil {
+		mu = &sync.Mutex{}
+	}
+	return &WriteCoordinatorImpl{cfg: cfg, txnMu: mu}
 }
 
 // Execute implements WriteCoordinator.

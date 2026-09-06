@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,7 +33,7 @@ import (
 	"stratum/internal/index"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
-	"stratum/internal/sync"
+	stratumsync "stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 	"stratum/internal/wal"
@@ -250,9 +251,16 @@ func main() {
 	defer indexMgr.Close()
 
 	// --- Coordinators ---
+	// writeMu serializes CreateVersion write transactions (BEGIN through
+	// COMMIT) and is shared with the orphan-chunk GC's reclaim phase so a
+	// sweep re-validates and deletes candidates under mutual exclusion
+	// with concurrent writes (see gc_impl.go reclaimOrphan). Both sides
+	// MUST receive the same mutex.
+	var writeMu sync.Mutex
 	writeCoord := coordinator.NewWriteCoordinatorImpl(coordinator.WriteCoordinatorConfig{
 		MaxRetries:          cfg.WriteMaxRetries,
 		RetryBaseIntervalMS: cfg.WriteRetryBaseMS,
+		WriteMu:             &writeMu,
 		WAL:                 walImpl,
 		RaftNode:            raftImpl,
 		Splitter:            chunkSplitter,
@@ -330,6 +338,7 @@ func main() {
 	// --- Orphan-chunk garbage collector ---
 	gcImpl := coordinator.NewChunkGarbageCollectorImpl(coordinator.ChunkGarbageCollectorConfig{
 		SweepIntervalSec: cfg.GCSweepIntervalSec,
+		WriteMu:          &writeMu, // same mutex as WriteCoordinatorConfig.WriteMu
 		RaftNode:         raftImpl,
 		ChunkDocMapper:   cdm,
 		DocStore:         ds,
@@ -340,7 +349,7 @@ func main() {
 
 	// --- Data sync (leader→follower) ---
 	// Leader handler: serves storage-layer data to followers via gRPC.
-	syncLeader := sync.NewLeaderHandler(
+	syncLeader := stratumsync.NewLeaderHandler(
 		ds.DB(),
 		cdm.DB(),
 		vd.DB(),
@@ -357,7 +366,7 @@ func main() {
 
 	// Follower: pulls data when this node applies a version written by
 	// the leader. The sync module is wired via OnVersionCreated.
-	syncFollower := sync.NewFollower(ds, cdm, vd, chunkStore, indexMgr)
+	syncFollower := stratumsync.NewFollower(ds, cdm, vd, chunkStore, indexMgr)
 
 	raftImpl.SetOnVersionCreated(func(kbID string, versionID int64) {
 		ctx := context.Background()
@@ -617,7 +626,7 @@ func reconcileIndexStatus(ctx context.Context, logger *zap.Logger, rn raft.RaftN
 // verifyVersionPull reports whether this node's local stores hold the
 // complete data for (kbID, versionID): the locally computed document-ID
 // set digest must match the digest the leader committed into the version
-// metadata (see sync.VerifyDocIDSet). If the leader has not committed a
+// metadata (see stratumsync.VerifyDocIDSet). If the leader has not committed a
 // digest yet (initial/empty version or a missed propose), a pull that
 // produced data is accepted.
 func verifyVersionPull(ctx context.Context, rn raft.RaftNode, vd versiondoc.VersionDocList, kbID string, versionID int64) bool {
@@ -631,7 +640,7 @@ func verifyVersionPull(ctx context.Context, rn raft.RaftNode, vd versiondoc.Vers
 		}
 	}
 
-	ok, _, err := sync.VerifyDocIDSet(ctx, vd, kbID, versionID, metaHash)
+	ok, _, err := stratumsync.VerifyDocIDSet(ctx, vd, kbID, versionID, metaHash)
 	if err != nil {
 		return false
 	}
