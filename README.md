@@ -142,7 +142,12 @@ go run ./cmd/stratum/ -config integration/docker/config1.yaml
 ## 后台任务与存储卫生
 
 - **Chunk 垃圾回收** — `ChunkGarbageCollector`(`internal/coordinator`)周期性清扫
-  不再被任何版本引用的 chunk(默认清扫间隔 5 分钟,可通过 `chunk_gc.sweep_interval_sec` 配置)。
+  不再被任何版本引用的 chunk(默认清扫间隔 5 分钟,可通过 `chunk_gc.sweep_interval_sec`
+  配置)。一轮 sweep 分两遍:第一遍无锁,按开始时的版本快照枚举孤儿**候选**;第二遍对
+  每个候选持与 `CreateVersion` 写事务共享的写锁(即 `txnMu`),按 raft **当前**版本
+  复查确认仍无存活文档引用后,才在同一临界区内删除映射与向量——回收与并发写入互斥,
+  且判定不依赖过期快照,避免误删"快照之后才提交的新版本"数据(stale-snapshot race)。
+  锁粒度为一个 chunk(含一次 vecstore RPC),并发写事务最多被阻塞毫秒级,而非整个 sweep。
 - **每版本文档布隆过滤器** — `VersionBloomStore`(`internal/bloom`)为每个版本维护
   一份包含其完整文档 ID 集合的布隆过滤器。版本创建时写入(缓存并持久化到磁盘),
   读取时加载;磁盘副本缺失或损坏时从 `VersionDocList` 重建。
