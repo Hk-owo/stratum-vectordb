@@ -5,13 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 
 	"stratum/internal/coordinator"
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
 	"stratum/internal/types"
 	"stratum/internal/wal"
@@ -173,9 +173,7 @@ func TestRunCrashRecovery(t *testing.T) {
 		{Type: types.PendingRecordTypeVersionWrite, KBID: "kb-x", VersionID: 11},
 	}
 
-	if err := runCrashRecovery(ctx, logger, records, wc, dc, dvc, w); err != nil {
-		t.Fatalf("runCrashRecovery: %v", err)
-	}
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
 
 	if got := dc.Calls(); len(got) != 1 || got[0] != "kb-del" {
 		t.Errorf("DeleteCoordinator calls = %v, want [kb-del]", got)
@@ -199,9 +197,11 @@ func TestRunCrashRecovery(t *testing.T) {
 	}
 }
 
-// TestRunCrashRecovery_FailurePropagates verifies a failing coordinator
-// call aborts recovery and bumps the counter.
-func TestRunCrashRecovery_FailurePropagates(t *testing.T) {
+// TestRunCrashRecovery_ReplayFailuresSkipped verifies the crash-recovery
+// replay policy: a PendingRecord that cannot be replayed (after the
+// bounded in-process retries) is skipped and counted instead of aborting
+// startup, and later records are still processed.
+func TestRunCrashRecovery_ReplayFailuresSkipped(t *testing.T) {
 	ctx := context.Background()
 	logger := zap.NewNop()
 
@@ -210,18 +210,117 @@ func TestRunCrashRecovery_FailurePropagates(t *testing.T) {
 	dvc := coordinator.NewMockDeleteVersionCoordinator()
 	w := wal.NewMockWAL()
 
+	changes := []types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello"}}
+
+	// Every coordinator call fails — recovery must skip each record
+	// (bumping the replay counter) and keep going, never aborting.
 	dc.SetExecuteResult(errors.New("boom"))
+	dvc.SetExecuteResult(errors.New("boom"))
+	wc.SetReplayResult(errors.New("embed down"))
 
 	records := []types.PendingRecord{
 		{Type: types.PendingRecordTypeDeleteMark, KBID: "kb-del"},
+		{Type: types.PendingRecordTypeVersionDelete, KBID: "kb-vdel", VersionID: 7},
+		{Type: types.PendingRecordTypeVersionWrite, KBID: "kb-w", VersionID: 9, ParentVersionID: 3, Changes: changes},
+		// No replay input: skipped without replaying, counter bumped.
+		{Type: types.PendingRecordTypeVersionWrite, KBID: "kb-x", VersionID: 11},
 	}
-	err := runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
-	if err == nil || !strings.Contains(err.Error(), "kb-del") {
-		t.Fatalf("runCrashRecovery err = %v, want failure mentioning kb-del", err)
+
+	// Must not abort: runCrashRecovery has no error return — all four
+	// records are skipped and surfaced via the replay counter.
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
+
+	// Each record was attempted (with retries) or skipped exactly once.
+	if got := dc.Calls(); len(got) != crashReplayMaxAttempts {
+		t.Errorf("DeleteCoordinator calls = %v, want %d retries of kb-del", got, crashReplayMaxAttempts)
 	}
+	if got := dvc.Calls(); len(got) != crashReplayMaxAttempts {
+		t.Errorf("DeleteVersionCoordinator calls = %v, want %d retries of kb-vdel", got, crashReplayMaxAttempts)
+	}
+	if got := wc.ReplayCalls(); len(got) != crashReplayMaxAttempts {
+		t.Errorf("ReplayVersionStorageWrites calls = %v, want %d retries of kb-w", got, crashReplayMaxAttempts)
+	}
+
 	got := w.GetReplayCounters()
-	if len(got) != 1 || got[0].Record.KBID != "kb-del" {
-		t.Errorf("replay counters = %+v, want 1 bump for {DeleteMark, kb-del}", got)
+	if len(got) != 4 {
+		t.Fatalf("replay counters = %+v, want 4 bumped records", got)
+	}
+	byType := map[types.PendingRecordType]bool{}
+	for _, c := range got {
+		byType[c.Record.Type] = true
+		if c.RetryCount != 1 {
+			t.Errorf("counter for %+v: RetryCount = %d, want 1", c.Record, c.RetryCount)
+		}
+	}
+	if !byType[types.PendingRecordTypeDeleteMark] ||
+		!byType[types.PendingRecordTypeVersionDelete] ||
+		!byType[types.PendingRecordTypeVersionWrite] {
+		t.Errorf("replay counters missing a record type: %+v", got)
+	}
+}
+
+// TestRunCrashRecovery_VersionWriteKBNotFoundSkipped is the regression
+// test for the reported crash loop: a node whose WAL holds a
+// VERSION_ID-without-COMMIT record whose KB is absent from the (not yet
+// caught-up) raft state machine must start up instead of dying on
+// "crash recovery failed".
+func TestRunCrashRecovery_VersionWriteKBNotFoundSkipped(t *testing.T) {
+	ctx := context.Background()
+	logger := zap.NewNop()
+
+	wc := coordinator.NewMockWriteCoordinator()
+	dc := coordinator.NewMockDeleteCoordinator()
+	dvc := coordinator.NewMockDeleteVersionCoordinator()
+	w := wal.NewMockWAL()
+
+	changes := []types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello"}}
+	wc.SetReplayResult(stratumerrors.ErrKnowledgeBaseNotFound)
+
+	records := []types.PendingRecord{
+		{Type: types.PendingRecordTypeVersionWrite, KBID: "kb-gone", VersionID: 2, ParentVersionID: 1, Changes: changes},
+	}
+
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
+
+	got := w.GetReplayCounters()
+	if len(got) != 1 || got[0].Record.VersionID != 2 || got[0].Record.KBID != "kb-gone" {
+		t.Fatalf("replay counters = %+v, want one bump for {VersionWrite, kb-gone, v2}", got)
+	}
+}
+
+// TestRunCrashRecovery_VersionWriteRetrySucceeds verifies the bounded
+// in-process retry window: a replay that fails transiently and then
+// succeeds must not be skipped or counted.
+func TestRunCrashRecovery_VersionWriteRetrySucceeds(t *testing.T) {
+	ctx := context.Background()
+	logger := zap.NewNop()
+
+	wc := coordinator.NewMockWriteCoordinator()
+	dc := coordinator.NewMockDeleteCoordinator()
+	dvc := coordinator.NewMockDeleteVersionCoordinator()
+	w := wal.NewMockWAL()
+
+	changes := []types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello"}}
+	attempts := 0
+	wc.SetReplayFunc(func(_ context.Context, _ string, _, _ int64, _ []types.DocChange) error {
+		attempts++
+		if attempts < crashReplayMaxAttempts {
+			return errors.New("transient")
+		}
+		return nil
+	})
+
+	records := []types.PendingRecord{
+		{Type: types.PendingRecordTypeVersionWrite, KBID: "kb-ok", VersionID: 9, ParentVersionID: 3, Changes: changes},
+	}
+
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
+
+	if got := wc.ReplayCalls(); len(got) != crashReplayMaxAttempts {
+		t.Errorf("ReplayVersionStorageWrites calls = %d, want %d (retried until success)", len(got), crashReplayMaxAttempts)
+	}
+	if got := w.GetReplayCounters(); len(got) != 0 {
+		t.Errorf("replay counters = %+v, want none (replay eventually succeeded)", got)
 	}
 }
 

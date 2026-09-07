@@ -50,9 +50,17 @@ import (
 //     re-proposing and replay storage writes from the start using the
 //     recorded versionID and the transaction's persisted changes. Every
 //     storage write is idempotent, so a full replay is always safe.
+//     If a replay still fails — the KB/version is absent from the (not
+//     yet caught-up) raft state machine, the KB was deleted meanwhile, or
+//     a storage dependency (vecstore/embed) is down — startup must not
+//     abort: the record is skipped after bounded in-process retries,
+//     surfaced via the replay counter (GetSystemStatus), and retried on
+//     the next restart. See runCrashRecovery in cmd/stratum for the
+//     policy.
 //     A PendingRecord with nil Changes was written by an older WAL format
-//     (BEGIN carried an empty payload); it cannot be replayed
-//     automatically and requires operator intervention.
+//     (BEGIN carried an empty payload); it cannot be replayed locally.
+//     Recovery skips it — the node's data for it is restored by Raft log
+//     replay + DataSync — and retries it on the next restart.
 //   - COMMIT present but the version's IndexStatus is still PENDING: the
 //     caller checks whether the index file already exists on disk — if
 //     so, propose READY directly; if not, trigger an async build. (This

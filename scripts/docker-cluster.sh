@@ -152,7 +152,9 @@ vecstore:
   grpc_addr: "host.docker.internal:$((VECSTORE_BASE_PORT + id - 1))"
 
 embed:
-  service_addr: "http://host.docker.internal:8080"
+  # mock-embed 容器与节点同处 stratum-net：容器网络内直接用容器名访问
+  # （宿主的 18080:8080 端口映射仅供宿主机/外部访问，节点容器走 8080 直连）。
+  service_addr: "http://stratum-embed:8080"
 
 index_manager:
   lru_capacity: 16

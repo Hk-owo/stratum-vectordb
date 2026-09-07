@@ -308,9 +308,12 @@ func main() {
 	//     legacy WAL) cannot be replayed here — the node's data integrity
 	//     for it is restored by Raft log replay + DataSync instead — so it
 	//     is surfaced via the replay counter for operators.
-	if err := runCrashRecovery(ctx, logger, records, writeCoord, deleteCoord, deleteVersionCoord, walImpl); err != nil {
-		logger.Fatal("crash recovery failed", zap.Error(err))
-	}
+	//
+	// A record that still cannot be replayed (after bounded in-process
+	// retries) is skipped and counted, never fatal: it stays in the WAL
+	// for the next restart and the node keeps starting up. See the policy
+	// comment above runCrashRecovery.
+	runCrashRecovery(ctx, logger, records, writeCoord, deleteCoord, deleteVersionCoord, walImpl)
 
 	// --- Index status reconcile (derive state from disk facts) ---
 	// The authoritative fact for "this version's index is built and
@@ -468,11 +471,53 @@ func main() {
 	logger.Info("Stratum stopped")
 }
 
+// Crash-recovery replay policy. A PendingRecord that cannot be replayed
+// must not abort startup: the failure modes it covers (dependency down,
+// KB/version not yet raft-committed on a restarting follower, KB deleted
+// meanwhile) are all authoritatively restored by Raft log replay +
+// DataSync, and a fatal error here wedges the node in a crash loop —
+// it can never get far enough to sync. Each record therefore gets a
+// bounded in-process retry window (covering a transient vecstore/embed
+// outage at boot), then is skipped and surfaced via the replay counter
+// (GetSystemStatus). The record stays in the WAL and is retried on the
+// next restart.
+const (
+	// crashReplayMaxAttempts bounds in-process replay retries per record.
+	crashReplayMaxAttempts = 3
+	// crashReplayRetryBaseMillis is the initial backoff between attempts
+	// (doubled each retry: 100ms, 200ms — the whole window is <1s).
+	crashReplayRetryBaseMillis = 100
+)
+
+// replayCoordinatorCall runs fn with bounded in-process retries and
+// exponential backoff. On the first success it returns nil; if every
+// attempt fails it returns the last error (the caller then skips the
+// record — see runCrashRecovery).
+func replayCoordinatorCall(ctx context.Context, fn func() error) error {
+	var err error
+	for attempt := 1; attempt <= crashReplayMaxAttempts; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if attempt < crashReplayMaxAttempts {
+			select {
+			case <-time.After(time.Duration(crashReplayRetryBaseMillis<<(attempt-1)) * time.Millisecond):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return err
+}
+
 // runCrashRecovery replays every WAL PendingRecord through the
 // coordinator layer after startup. See the WAL package doc comment for
-// the record semantics. Any failure aborts startup with a fatal error
-// (the record is left in the WAL and the replay counter is bumped so
-// operators can see it via GetSystemStatus); the next restart retries.
+// the record semantics. Records that cannot be replayed — after the
+// bounded in-process retry window — are skipped: the replay counter is
+// bumped (visible via GetSystemStatus), the record stays in the WAL for
+// the next restart, and startup continues. Startup is never aborted by a
+// replay failure; data convergence is delegated to Raft log replay +
+// DataSync.
 func runCrashRecovery(
 	ctx context.Context,
 	logger *zap.Logger,
@@ -481,23 +526,27 @@ func runCrashRecovery(
 	dc coordinator.DeleteCoordinator,
 	dvc coordinator.DeleteVersionCoordinator,
 	w wal.WAL,
-) error {
+) {
 	for _, rec := range records {
 		switch rec.Type {
 		case types.PendingRecordTypeDeleteMark:
 			logger.Info("crash recovery: resuming interrupted knowledge-base deletion",
 				zap.String("kb_id", rec.KBID))
-			if err := dc.Execute(ctx, rec.KBID); err != nil {
+			if err := replayCoordinatorCall(ctx, func() error { return dc.Execute(ctx, rec.KBID) }); err != nil {
+				logger.Warn("crash recovery: skipping KB-deletion resume after retries exhausted",
+					zap.String("kb_id", rec.KBID), zap.Error(err))
 				w.IncrementReplayCounter(rec)
-				return fmt.Errorf("crash recovery: resume KB deletion for %s: %w", rec.KBID, err)
+				continue
 			}
 
 		case types.PendingRecordTypeVersionDelete:
 			logger.Info("crash recovery: resuming interrupted version deletion",
 				zap.String("kb_id", rec.KBID), zap.Int64("version_id", rec.VersionID))
-			if err := dvc.Execute(ctx, rec.KBID); err != nil {
+			if err := replayCoordinatorCall(ctx, func() error { return dvc.Execute(ctx, rec.KBID) }); err != nil {
+				logger.Warn("crash recovery: skipping version-deletion resume after retries exhausted",
+					zap.String("kb_id", rec.KBID), zap.Int64("version_id", rec.VersionID), zap.Error(err))
 				w.IncrementReplayCounter(rec)
-				return fmt.Errorf("crash recovery: resume version deletion for %s: %w", rec.KBID, err)
+				continue
 			}
 
 		case types.PendingRecordTypeVersionWrite:
@@ -515,13 +564,17 @@ func runCrashRecovery(
 			}
 			logger.Info("crash recovery: replaying interrupted version write",
 				zap.String("kb_id", rec.KBID), zap.Int64("version_id", rec.VersionID))
-			if err := wc.ReplayVersionStorageWrites(ctx, rec.KBID, rec.ParentVersionID, rec.VersionID, rec.Changes); err != nil {
+			err := replayCoordinatorCall(ctx, func() error {
+				return wc.ReplayVersionStorageWrites(ctx, rec.KBID, rec.ParentVersionID, rec.VersionID, rec.Changes)
+			})
+			if err != nil {
+				logger.Warn("crash recovery: skipping version-write replay after retries exhausted (restored by Raft log replay + DataSync)",
+					zap.String("kb_id", rec.KBID), zap.Int64("version_id", rec.VersionID), zap.Error(err))
 				w.IncrementReplayCounter(rec)
-				return fmt.Errorf("crash recovery: replay version %d storage writes: %w", rec.VersionID, err)
+				continue
 			}
 		}
 	}
-	return nil
 }
 
 // enforceRetentionAtStartup applies the disk retention policy once at

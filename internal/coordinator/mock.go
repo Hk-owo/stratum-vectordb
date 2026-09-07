@@ -21,7 +21,8 @@ type MockWriteCoordinator struct {
 	nextErr       error
 	executeFunc   func(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange) (int64, error)
 
-	replayErr error
+	replayErr  error
+	replayFunc func(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) error
 
 	calls       []WriteCoordinatorCall
 	replayCalls []ReplayVersionCall
@@ -64,13 +65,20 @@ func (c *MockWriteCoordinator) Execute(ctx context.Context, kbID string, parentV
 }
 
 // ReplayVersionStorageWrites implements WriteCoordinator for the mock: it
-// records the call for assertions and returns nil by default (or the
-// configured replayErr when set).
-func (c *MockWriteCoordinator) ReplayVersionStorageWrites(_ context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) error {
+// records the call for assertions and returns nil by default, the
+// configured replayErr when set, or the result of the configured
+// replayFunc (which takes precedence over replayErr).
+func (c *MockWriteCoordinator) ReplayVersionStorageWrites(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.replayCalls = append(c.replayCalls, ReplayVersionCall{KBID: kbID, ParentVersionID: parentVersionID, VersionID: versionID, Changes: changes})
-	return c.replayErr
+	fn := c.replayFunc
+	err := c.replayErr
+	c.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, kbID, parentVersionID, versionID, changes)
+	}
+	return err
 }
 
 // SetReplayResult configures the error returned by subsequent
@@ -79,6 +87,18 @@ func (c *MockWriteCoordinator) SetReplayResult(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.replayErr = err
+	c.replayFunc = nil
+}
+
+// SetReplayFunc configures a full custom ReplayVersionStorageWrites
+// implementation, for tests that need per-call behaviour (e.g. failing a
+// fixed number of times before succeeding, to exercise the crash-recovery
+// retry path). Overrides any SetReplayResult configuration.
+func (c *MockWriteCoordinator) SetReplayFunc(fn func(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.replayFunc = fn
+	c.replayErr = nil
 }
 
 // ReplayCalls returns every ReplayVersionStorageWrites call recorded so
@@ -126,6 +146,7 @@ func (c *MockWriteCoordinator) Reset() {
 	c.nextErr = nil
 	c.executeFunc = nil
 	c.replayErr = nil
+	c.replayFunc = nil
 }
 
 var _ WriteCoordinator = (*MockWriteCoordinator)(nil)
