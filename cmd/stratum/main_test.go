@@ -361,8 +361,8 @@ func (r *reconcileRaftNode) ProposeUpdateVersionSummary(_ context.Context, versi
 func (r *reconcileRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
 	return nil
 }
-func (r *reconcileRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64) error {
-	return nil
+func (r *reconcileRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string, _ int64, _ types.VersionDeleteMode) ([]int64, error) {
+	return nil, nil
 }
 func (r *reconcileRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
 	return nil

@@ -215,15 +215,25 @@ func (s *KnowledgeBaseServiceImpl) RollbackVersion(ctx context.Context, req *pb.
 
 // DeleteVersion implements KnowledgeBaseServiceServer.
 //
-// Marks the version (and, recursively, every descendant version) within
-// the knowledge base as Deleting, then launches the asynchronous cleanup
-// (index discard, VersionDocList / DocStore removal, metadata removal).
-// All constraint checks — the version exists and belongs to the KB, is not
-// the active version, and no version in the recursive subtree is PENDING —
-// are enforced deterministically in the Raft state machine's apply phase,
-// so this method performs no additional validation.
+// Marks the version set selected by req.Mode relative to req.VersionId as
+// Deleting, then launches the asynchronous cleanup (index discard,
+// VersionDocList / DocStore removal, metadata removal). The three modes
+// cover "remove this subtree" (default), "remove just this middle version,
+// splicing its children onto its parent", and "remove every preceding
+// version, making this one the new base".
+//
+// All constraint checks — the version exists and belongs to the KB, and no
+// version in the selected set is the active version or still PENDING — are
+// enforced deterministically in the Raft state machine's apply phase, so
+// this method performs no additional validation. The response echoes the
+// exact set of versions marked for deletion.
 func (s *KnowledgeBaseServiceImpl) DeleteVersion(ctx context.Context, req *pb.DeleteVersionRequest) (*pb.DeleteVersionResponse, error) {
-	if err := s.raftNode.ProposeMarkVersionDeleting(ctx, req.KnowledgeBaseId, req.VersionId); err != nil {
+	mode, err := versionDeleteModeFromProto(req.Mode)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	deleted, err := s.raftNode.ProposeMarkVersionDeleting(ctx, req.KnowledgeBaseId, req.VersionId, mode)
+	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
@@ -234,7 +244,27 @@ func (s *KnowledgeBaseServiceImpl) DeleteVersion(ctx context.Context, req *pb.De
 		_ = s.deleteVersionCoord.Execute(context.Background(), req.KnowledgeBaseId)
 	}()
 
-	return &pb.DeleteVersionResponse{Success: true}, nil
+	return &pb.DeleteVersionResponse{Success: true, DeletedVersionIds: deleted}, nil
+}
+
+// versionDeleteModeFromProto maps the wire enum onto the internal type.
+// The zero value (VERSION_DELETE_MODE_SUBTREE, also the value an unset
+// field carries) preserves the historical DeleteVersion semantics.
+//
+// An unrecognized value is rejected rather than silently downgraded to
+// SUBTREE: the caller clearly meant something specific, and guessing wrong
+// would turn a mistyped mode into a destructive "delete the whole subtree".
+func versionDeleteModeFromProto(m pb.VersionDeleteMode) (types.VersionDeleteMode, error) {
+	switch m {
+	case pb.VersionDeleteMode_VERSION_DELETE_MODE_SUBTREE:
+		return types.VersionDeleteSubtree, nil
+	case pb.VersionDeleteMode_VERSION_DELETE_MODE_SINGLE:
+		return types.VersionDeleteSingle, nil
+	case pb.VersionDeleteMode_VERSION_DELETE_MODE_ANCESTORS:
+		return types.VersionDeleteAncestors, nil
+	default:
+		return types.VersionDeleteSubtree, fmt.Errorf("unknown version delete mode %d: %w", m, stratumerrors.ErrInvalidArgument)
+	}
 }
 
 // ListKnowledgeBases implements KnowledgeBaseServiceServer.

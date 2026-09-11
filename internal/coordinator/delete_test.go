@@ -58,8 +58,8 @@ func (r *deleteTestRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string)
 func (r *deleteTestRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
 	return nil
 }
-func (r *deleteTestRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64) error {
-	return nil
+func (r *deleteTestRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string, _ int64, _ types.VersionDeleteMode) ([]int64, error) {
+	return nil, nil
 }
 func (r *deleteTestRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
 	r.mu.Lock()
@@ -104,6 +104,15 @@ func (s *deleteTestDocStore) DeleteByKB(_ context.Context, kbID string) error {
 	return nil
 }
 func (s *deleteTestDocStore) DeleteByVersion(_ context.Context, kbID string, versionID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	s.deleted = append(s.deleted, kbID)
+	return nil
+}
+func (s *deleteTestDocStore) DeleteByVersionExceptVisibleFrom(_ context.Context, kbID string, versionID, anchorVersionID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.deleteErr != nil {

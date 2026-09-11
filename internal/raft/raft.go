@@ -77,13 +77,17 @@ type RaftNode interface {
 	// Rejected (ErrVersionDeleting) if the target version is being deleted.
 	ProposeRollback(ctx context.Context, kbID string, targetVersionID int64) error
 
-	// ProposeMarkVersionDeleting marks versionID (and, recursively, every
-	// descendant version) within kbID as Deleting, kicking off the
-	// asynchronous DeleteVersion cleanup. Rejected with ErrVersionIsActive
-	// if the active version is in the subtree, or ErrVersionPending if any
-	// version in the subtree is still PENDING. Idempotent for an already
-	// Deleting subtree.
-	ProposeMarkVersionDeleting(ctx context.Context, kbID string, versionID int64) error
+	// ProposeMarkVersionDeleting marks the version set selected by mode
+	// relative to versionID (SUBTREE: versionID + descendants; SINGLE:
+	// versionID alone, its children spliced onto its parent; ANCESTORS:
+	// every ancestor of versionID, making versionID the new base) within
+	// kbID as Deleting, kicking off the asynchronous DeleteVersion cleanup.
+	// Returns the IDs actually marked. Rejected with ErrVersionIsActive if
+	// the active version is in that set, or ErrVersionPending if any
+	// version in it is still PENDING. Idempotent for an already-Deleting
+	// set; ANCESTORS on a version that is already the base is a no-op and
+	// returns an empty slice.
+	ProposeMarkVersionDeleting(ctx context.Context, kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error)
 
 	// ProposeRemoveVersionMeta removes a single version's metadata from the
 	// state machine. Idempotent: returns success if the version is already

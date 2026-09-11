@@ -140,6 +140,43 @@ type VersionMeta struct {
 	Deleting bool
 }
 
+// VersionDeleteMode selects which versions DeleteVersion removes relative
+// to the target version. It is the internal counterpart of the
+// VersionDeleteMode proto enum; the service layer maps one to the other.
+type VersionDeleteMode int
+
+const (
+	// VersionDeleteSubtree removes the target version together with every
+	// descendant version. This is the original DeleteVersion semantics and
+	// the default for callers that do not select a mode.
+	VersionDeleteSubtree VersionDeleteMode = iota
+	// VersionDeleteSingle removes only the target version itself: its
+	// direct children are re-parented onto the target's parent, so the
+	// branch structure below it is preserved. This is what lets an
+	// arbitrary "middle" version be removed without dragging its
+	// descendants along.
+	VersionDeleteSingle
+	// VersionDeleteAncestors removes every ancestor (前置版本) of the
+	// target version, making the target the new base (root) of the
+	// knowledge base. Sibling branches hanging off those ancestors are
+	// removed together with them.
+	VersionDeleteAncestors
+)
+
+// String returns a human-readable name for the mode, primarily for logging.
+func (m VersionDeleteMode) String() string {
+	switch m {
+	case VersionDeleteSubtree:
+		return "SUBTREE"
+	case VersionDeleteSingle:
+		return "SINGLE"
+	case VersionDeleteAncestors:
+		return "ANCESTORS"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // ChangeOp identifies the kind of mutation a DocChange represents.
 type ChangeOp int
 

@@ -47,6 +47,11 @@ type command struct {
 	VersionID int64             `json:"version_id,omitempty"`
 	Status    types.IndexStatus `json:"status,omitempty"`
 
+	// cmdMarkVersionDeleting: which versions to remove relative to
+	// VersionID (subtree / single-with-splice / ancestors). Zero value
+	// (VersionDeleteSubtree) keeps the historical behavior.
+	Mode types.VersionDeleteMode `json:"mode,omitempty"`
+
 	// cmdUpdateVersionSummary
 	DocIDSetHash string `json:"doc_id_set_hash,omitempty"`
 

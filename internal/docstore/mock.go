@@ -120,6 +120,46 @@ func (m *MockDocStore) DeleteByVersion(_ context.Context, kbID string, versionID
 	return nil
 }
 
+// DeleteByVersionExceptVisibleFrom implements DocStore: like DeleteByVersion
+// but keeps the entries that are still the read source at anchorVersionID
+// (the newest entry at or before that version is the (kbID, versionID) one),
+// because a surviving later version still reads them.
+// anchorVersionID == 0 removes everything.
+func (m *MockDocStore) DeleteByVersionExceptVisibleFrom(ctx context.Context, kbID string, versionID, anchorVersionID int64) error {
+	if anchorVersionID <= 0 {
+		return m.DeleteByVersion(ctx, kbID, versionID)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	docs := m.entries[kbID]
+	for docID, entries := range docs {
+		visible := int64(0)
+		found := false
+		for _, e := range entries {
+			if e.versionID <= anchorVersionID && (!found || e.versionID > visible) {
+				visible = e.versionID
+				found = true
+			}
+		}
+		if found && visible == versionID {
+			continue // still the read source for a surviving later version
+		}
+		kept := entries[:0]
+		for _, e := range entries {
+			if e.versionID != versionID {
+				kept = append(kept, e)
+			}
+		}
+		if len(kept) == 0 {
+			delete(docs, docID)
+		} else {
+			docs[docID] = kept
+		}
+	}
+	return nil
+}
+
 // DiskUsage implements DocStore: the in-memory mock has no disk footprint,
 // so it always reports zero.
 func (m *MockDocStore) DiskUsage(_ context.Context) (uint64, error) {

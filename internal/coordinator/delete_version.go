@@ -3,8 +3,10 @@ package coordinator
 import "context"
 
 // DeleteVersionCoordinator owns the asynchronous cleanup orchestration that
-// runs after DeleteVersion marks a version (and its recursive descendants)
-// as Deleting in the Raft state machine.
+// runs after DeleteVersion marks a version set (the target version plus
+// whichever other versions the requested mode selects — descendants,
+// nothing but itself, or its ancestors) as Deleting in the Raft state
+// machine.
 //
 // The full cleanup flow, executed for every version of kbID currently
 // marked Deleting (discovered via RaftNode.ListVersions — the mark step
@@ -15,9 +17,13 @@ import "context"
 //  2. IndexManager.Discard (evict in-memory + reset the vecstore-side
 //     index for the version)
 //  3. VersionDocList.DeleteByVersion
-//  4. DocStore.DeleteByVersion (physical MVCC record cleanup, full scan)
+//  4. DocStore.DeleteByVersionExceptVisibleFrom (reclaim the version's MVCC
+//     records, keeping the ones a surviving later version still reads)
 //  5. RaftNode.ProposeRemoveVersionMeta (idempotent)
-//  6. WAL.WriteVersionDeleteComplete
+//  6. VersionBloomStore.DeleteByVersion (drop the version's document bloom
+//     filter — cached entry and on-disk file; deliberately after the metadata
+//     removal so no request can reach the version; skipped when not wired)
+//  7. WAL.WriteVersionDeleteComplete
 //
 // Idempotency: every storage step is a filter/prefix delete, the metadata
 // removal is idempotent, and the WAL writes are idempotent per version — so

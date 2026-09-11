@@ -295,6 +295,7 @@ func main() {
 		IndexManager:        indexMgr,
 		DocStore:            ds,
 		VersionDocList:      vd,
+		VersionBloom:        vBloomStore,
 	})
 
 	// --- WAL crash recovery ---

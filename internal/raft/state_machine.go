@@ -21,7 +21,12 @@ import (
 // newly assigned VersionID.
 type applyResult struct {
 	VersionID int64
-	Err       error
+	// DeletedVersionIDs is set by cmdMarkVersionDeleting: every version
+	// that command marked Deleting, so the caller can report the exact
+	// impact set (including sibling branches swept up by an ANCESTORS
+	// delete). Empty for every other command.
+	DeletedVersionIDs []int64
+	Err               error
 }
 
 // stateMachine holds the in-memory knowledge base and version metadata
@@ -144,14 +149,27 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 }
 
 // applyMarkVersionDeleting handles cmdMarkVersionDeleting: validates the
-// DeleteVersion constraints (version exists and belongs to kbID, is not the
-// active version, is not PENDING — for the whole recursive subtree), then
-// marks the version and every one of its descendants as Deleting.
+// DeleteVersion constraints for the exact version set selected by cmd.Mode,
+// applies the structural rewiring that mode implies, then marks that set as
+// Deleting.
+//
+// The three modes (types.VersionDeleteMode):
+//
+//   - SUBTREE: versionID plus every descendant — the original semantics.
+//   - SINGLE: versionID only; its direct children are re-parented onto
+//     versionID's parent (a linked-list splice), which is what keeps the
+//     branch structure below an arbitrary "middle" version intact.
+//   - ANCESTORS: every ancestor (前置版本) of versionID, plus any sibling
+//     branch hanging off those ancestors; versionID becomes the new base
+//     (root) of the knowledge base by having its ParentVersionID cleared.
 //
 // Constraints are evaluated against the state machine snapshot at apply
-// time, so the descendant set is deterministic across nodes regardless of
-// which node proposed the command. Idempotent: re-proposing for an
-// already-Deleting subtree passes validation and re-marks it (a no-op).
+// time, so the descendant/ancestor set is deterministic across nodes
+// regardless of which node proposed the command. The whole set is
+// validated before anything is mutated: a partial mark followed by a
+// rejection would leave the tree half-deleting. Idempotent: re-proposing
+// for an already-Deleting set passes validation and re-marks it (a no-op),
+// which is what lets the async cleanup flow resume safely after a crash.
 func (sm *stateMachine) applyMarkVersionDeleting(cmd command) applyResult {
 	if _, ok := sm.kbs[cmd.KBID]; !ok {
 		return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
@@ -164,11 +182,14 @@ func (sm *stateMachine) applyMarkVersionDeleting(cmd command) applyResult {
 		return applyResult{Err: fmt.Errorf("version %d belongs to a different knowledge base: %w", cmd.VersionID, stratumerrors.ErrVersionNotFound)}
 	}
 
-	subtree := sm.collectVersionSubtree(cmd.KBID, cmd.VersionID)
+	targets, err := sm.versionDeleteTargets(cmd.KBID, cmd.VersionID, cmd.Mode)
+	if err != nil {
+		return applyResult{Err: err}
+	}
 
-	// Validate the entire subtree before marking anything: a partial mark
+	// Validate the entire set before marking anything: a partial mark
 	// followed by a rejection would leave the tree half-deleting.
-	for _, versionID := range subtree {
+	for _, versionID := range targets {
 		v := sm.versions[versionID]
 		if sm.kbs[cmd.KBID].ActiveVersionID == versionID {
 			return applyResult{Err: fmt.Errorf("version %d is the active version of %s: %w", versionID, cmd.KBID, stratumerrors.ErrVersionIsActive)}
@@ -177,13 +198,176 @@ func (sm *stateMachine) applyMarkVersionDeleting(cmd command) applyResult {
 			return applyResult{Err: fmt.Errorf("version %d is PENDING: %w", versionID, stratumerrors.ErrVersionPending)}
 		}
 	}
+	if err := sm.validateSurvivorsNotPending(cmd.KBID, targets); err != nil {
+		return applyResult{Err: err}
+	}
 
-	for _, versionID := range subtree {
+	// Structural rewiring, only after validation succeeded. An ANCESTORS
+	// delete with the parent pointer already clear is the "already the
+	// base" no-op — the condition checks the pointer itself, not the
+	// target set, so a broken chain (parent metadata already gone) is
+	// healed into a proper root as well. Both cases report an empty
+	// DeletedVersionIDs; the broken-chain case still clears the stale
+	// pointer, which is the only side effect of an otherwise empty delete.
+	switch cmd.Mode {
+	case types.VersionDeleteSingle:
+		sm.reparentChildren(cmd.KBID, cmd.VersionID, sm.spliceParent(cmd.KBID, root.ParentVersionID))
+	case types.VersionDeleteAncestors:
+		if root.ParentVersionID != 0 {
+			root.ParentVersionID = 0
+			sm.versions[cmd.VersionID] = root
+		}
+	}
+
+	for _, versionID := range targets {
 		v := sm.versions[versionID]
 		v.Deleting = true
 		sm.versions[versionID] = v
 	}
-	return applyResult{}
+	return applyResult{DeletedVersionIDs: targets}
+}
+
+// validateSurvivorsNotPending rejects a delete that would strand a still
+// PENDING survivor: a version that stays alive but whose parent is in removed
+// still needs that parent's VersionDocList to finish its storage writes
+// (WriteCoordinatorImpl.writeVersionDocList reads the parent set) and to be
+// rebuilt after a crash (cmd/stratum's replay uses the recorded
+// ParentVersionID). Once the async cleanup drops that list, the survivor's
+// doc set silently loses every document it inherited.
+//
+// The SUBTREE rule "no PENDING version inside the removed set" covered this
+// before rewiring existed, because every descendant was removed too; SINGLE
+// and ANCESTORS deliberately keep descendants alive, so the survivors get
+// their own check.
+//
+// PENDING is a conservative proxy for "storage writes not finished": a
+// version reaches READY only when its index build callback fires, which is
+// strictly later than WriteCoordinator writing its full doc set. The guard
+// therefore rejects a superset of the truly unsafe window, never a subset of
+// it; FAILED versions are not a problem either, since their writes completed
+// before the build was even triggered. Under SUBTREE the check is a no-op —
+// that set is closed downwards, so no survivor's parent is in it.
+func (sm *stateMachine) validateSurvivorsNotPending(kbID string, removed []int64) error {
+	if len(removed) == 0 {
+		return nil
+	}
+	removedSet := make(map[int64]bool, len(removed))
+	for _, id := range removed {
+		removedSet[id] = true
+	}
+	for _, id := range sm.versionsByKB[kbID] {
+		if removedSet[id] {
+			continue
+		}
+		v := sm.versions[id]
+		if !removedSet[v.ParentVersionID] {
+			continue
+		}
+		if v.IndexStatus == types.IndexStatusPending {
+			return fmt.Errorf("version %d is PENDING and still depends on its to-be-deleted parent %d: %w", id, v.ParentVersionID, stratumerrors.ErrVersionPending)
+		}
+	}
+	return nil
+}
+
+// versionDeleteTargets computes, deterministically from the current state
+// machine contents, the exact set of versions cmd.Mode removes for
+// versionID.
+func (sm *stateMachine) versionDeleteTargets(kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error) {
+	switch mode {
+	case types.VersionDeleteSubtree:
+		return sm.collectVersionSubtree(kbID, versionID), nil
+
+	case types.VersionDeleteSingle:
+		return []int64{versionID}, nil
+
+	case types.VersionDeleteAncestors:
+		ancestors := sm.collectVersionAncestors(kbID, versionID)
+		if len(ancestors) == 0 {
+			return nil, nil // already the base: nothing ahead of it
+		}
+		// Keep versionID and its whole subtree. Anything reachable from an
+		// ancestor but outside that subtree — the ancestors themselves and
+		// any sibling branches — is removed with it.
+		keep := make(map[int64]bool)
+		for _, id := range sm.collectVersionSubtree(kbID, versionID) {
+			keep[id] = true
+		}
+		seen := make(map[int64]bool)
+		var out []int64
+		for _, ancestor := range ancestors {
+			for _, id := range sm.collectVersionSubtree(kbID, ancestor) {
+				if keep[id] || seen[id] {
+					continue
+				}
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+		return out, nil
+
+	default:
+		return nil, fmt.Errorf("unknown version delete mode %d: %w", mode, stratumerrors.ErrInvalidArgument)
+	}
+}
+
+// collectVersionAncestors returns every ancestor (前置版本) of versionID
+// within kbID, walking ParentVersionID edges upward. Deterministic given
+// the state machine contents.
+func (sm *stateMachine) collectVersionAncestors(kbID string, versionID int64) []int64 {
+	var out []int64
+	seen := map[int64]bool{versionID: true}
+	cur := versionID
+	for {
+		v, ok := sm.versions[cur]
+		if !ok {
+			return out
+		}
+		parentID := v.ParentVersionID
+		if parentID == 0 || seen[parentID] {
+			return out
+		}
+		parent, ok := sm.versions[parentID]
+		if !ok || parent.KBID != kbID {
+			return out
+		}
+		seen[parentID] = true
+		out = append(out, parentID)
+		cur = parentID
+	}
+}
+
+// reparentChildren rewires every direct child of fromVersionID within kbID
+// onto newParentVersionID (0 meaning "becomes a root"), keeping the branch
+// structure below the removed version intact.
+func (sm *stateMachine) reparentChildren(kbID string, fromVersionID, newParentVersionID int64) {
+	for _, id := range sm.versionsByKB[kbID] {
+		if id == fromVersionID {
+			continue
+		}
+		v, ok := sm.versions[id]
+		if !ok || v.ParentVersionID != fromVersionID {
+			continue
+		}
+		v.ParentVersionID = newParentVersionID
+		sm.versions[id] = v
+	}
+}
+
+// spliceParent returns the version a removed version's children should be
+// re-attached to: its parent, or 0 (becoming roots) when that parent is
+// missing or is itself being deleted — re-attaching onto a version whose
+// metadata is about to be removed would leave the children with a dangling
+// ParentVersionID.
+func (sm *stateMachine) spliceParent(kbID string, parentVersionID int64) int64 {
+	if parentVersionID == 0 {
+		return 0
+	}
+	parent, ok := sm.versions[parentVersionID]
+	if !ok || parent.KBID != kbID || parent.Deleting {
+		return 0
+	}
+	return parentVersionID
 }
 
 // applyRemoveVersionMeta handles cmdRemoveVersionMeta: removes a single

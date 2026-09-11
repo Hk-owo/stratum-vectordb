@@ -118,3 +118,59 @@ func TestVersionBloomStore_DeleteByKB(t *testing.T) {
 		t.Fatalf("DeleteByKB (missing): %v", err)
 	}
 }
+
+// TestVersionBloomStore_DeleteByVersion verifies that DeleteByVersion drops
+// the version's cached filter and its on-disk file, leaves other versions and
+// other KBs untouched, and tolerates a missing file (idempotent).
+func TestVersionBloomStore_DeleteByVersion(t *testing.T) {
+	vdl := &mockVdl{docs: map[int64][]string{
+		1: {"doc-a"},
+		2: {"doc-b"},
+	}}
+	root := t.TempDir()
+	s := NewVersionBloomStore(root, 1000, 0.01, vdl)
+
+	for _, tc := range []struct {
+		kbID      string
+		versionID int64
+		docID     string
+	}{
+		{"kb-1", 1, "doc-a"},
+		{"kb-1", 2, "doc-b"},
+		{"kb-2", 1, "doc-a"},
+	} {
+		if _, err := s.BuildAndPersist(tc.kbID, tc.versionID, []string{tc.docID}); err != nil {
+			t.Fatalf("BuildAndPersist %s/%d: %v", tc.kbID, tc.versionID, err)
+		}
+	}
+
+	if err := s.DeleteByVersion("kb-1", 1); err != nil {
+		t.Fatalf("DeleteByVersion: %v", err)
+	}
+
+	// The target's file and cache entry are gone.
+	if _, err := s.loadFromDisk("kb-1", 1); err == nil {
+		t.Error("kb-1/v1 bloom file should be gone after DeleteByVersion")
+	}
+	if _, ok := s.cache[versionKey{kbID: "kb-1", versionID: 1}]; ok {
+		t.Error("kb-1/v1 cache entry should be dropped")
+	}
+	// Sibling versions and other KBs survive, on disk and in cache.
+	if _, err := s.loadFromDisk("kb-1", 2); err != nil {
+		t.Errorf("kb-1/v2 bloom file should survive: %v", err)
+	}
+	if _, ok := s.cache[versionKey{kbID: "kb-1", versionID: 2}]; !ok {
+		t.Error("kb-1/v2 cache entry should survive")
+	}
+	if _, err := s.loadFromDisk("kb-2", 1); err != nil {
+		t.Errorf("kb-2/v1 bloom file should survive: %v", err)
+	}
+
+	// Idempotent: a missing file (and a missing KB directory) is not an error.
+	if err := s.DeleteByVersion("kb-1", 1); err != nil {
+		t.Fatalf("second DeleteByVersion: %v", err)
+	}
+	if err := s.DeleteByVersion("kb-missing", 7); err != nil {
+		t.Fatalf("DeleteByVersion on missing kb: %v", err)
+	}
+}

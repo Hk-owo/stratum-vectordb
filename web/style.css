@@ -665,6 +665,25 @@ body {
 }
 .modal-actions .btn { min-width: 84px; }
 
+/* 删除弹窗里的「删除范围」单选项 */
+#confirm-extra { margin: 0 0 20px; }
+.mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color 0.15s var(--ease), background 0.15s var(--ease);
+}
+.mode-option + .mode-option { margin-top: 8px; }
+.mode-option:hover { border-color: var(--border-strong); background: rgba(255, 255, 255, 0.02); }
+.mode-option:has(input:checked) { border-color: var(--border-strong); background: rgba(255, 255, 255, 0.04); }
+.mode-option input { margin: 3px 0 0; flex: none; accent-color: var(--primary); }
+.mode-text { display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.mode-text .muted { font-size: 12px; line-height: 1.55; }
+
 .hidden { display: none !important; }
 
 /* ---------- 滚动条 ---------- */

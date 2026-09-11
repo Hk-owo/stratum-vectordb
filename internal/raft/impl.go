@@ -477,12 +477,15 @@ func (impl *RaftNodeImpl) ProposeRollback(ctx context.Context, kbID string, targ
 }
 
 // ProposeMarkVersionDeleting implements RaftNode.
-func (impl *RaftNodeImpl) ProposeMarkVersionDeleting(ctx context.Context, kbID string, versionID int64) error {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdMarkVersionDeleting, KBID: kbID, VersionID: versionID})
+func (impl *RaftNodeImpl) ProposeMarkVersionDeleting(ctx context.Context, kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error) {
+	res, err := impl.proposeAndWait(ctx, command{Type: cmdMarkVersionDeleting, KBID: kbID, VersionID: versionID, Mode: mode})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return res.Err
+	if res.Err != nil {
+		return nil, res.Err
+	}
+	return res.DeletedVersionIDs, nil
 }
 
 // ProposeRemoveVersionMeta implements RaftNode.

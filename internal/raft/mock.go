@@ -128,6 +128,9 @@ func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, pa
 		if parent.IndexStatus == types.IndexStatusPending {
 			return 0, fmt.Errorf("parent version %d is PENDING: %w", parentVersionID, stratumerrors.ErrInvalidParentVersion)
 		}
+		if parent.Deleting {
+			return 0, fmt.Errorf("parent version %d is being deleted: %w", parentVersionID, stratumerrors.ErrInvalidParentVersion)
+		}
 	}
 
 	versionID := r.nextVersionID
@@ -205,38 +208,150 @@ func (r *MockRaftNode) ProposeRollback(_ context.Context, kbID string, targetVer
 }
 
 // ProposeMarkVersionDeleting implements RaftNode, mirroring the real state
-// machine's constraint checks: the version must exist and belong to kbID,
-// and the whole recursive subtree (version + descendants) must not contain
-// the active version or any PENDING version. Idempotent for an already
-// Deleting subtree.
-func (r *MockRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64) error {
+// machine's constraint checks and per-mode version-set selection: the
+// selected versions must exist and belong to kbID, and none of them may be
+// the active version or still PENDING. Idempotent for an already-Deleting
+// set. Returns the IDs actually marked.
+func (r *MockRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.kbs[kbID]; !ok {
-		return stratumerrors.ErrKnowledgeBaseNotFound
+		return nil, stratumerrors.ErrKnowledgeBaseNotFound
 	}
 	root, ok := r.versions[versionID]
 	if !ok {
-		return stratumerrors.ErrVersionNotFound
+		return nil, stratumerrors.ErrVersionNotFound
 	}
 	if root.KBID != kbID {
-		return stratumerrors.ErrVersionNotFound
+		return nil, stratumerrors.ErrVersionNotFound
 	}
-	subtree := r.mockVersionSubtree(kbID, versionID)
-	for _, id := range subtree {
+	targets, err := r.mockVersionDeleteTargets(kbID, versionID, mode)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range targets {
 		if r.kbs[kbID].ActiveVersionID == id {
-			return stratumerrors.ErrVersionIsActive
+			return nil, stratumerrors.ErrVersionIsActive
 		}
 		if r.versions[id].IndexStatus == types.IndexStatusPending {
-			return stratumerrors.ErrVersionPending
+			return nil, stratumerrors.ErrVersionPending
 		}
 	}
-	for _, id := range subtree {
+	// Mirror validateSurvivorsNotPending: a survivor whose parent is about
+	// to be removed must not still be PENDING, or its storage writes would
+	// rebuild an incomplete doc set from a dropped parent VersionDocList.
+	removedSet := make(map[int64]bool, len(targets))
+	for _, id := range targets {
+		removedSet[id] = true
+	}
+	for _, id := range r.versionsByKB[kbID] {
+		if removedSet[id] {
+			continue
+		}
+		v := r.versions[id]
+		if removedSet[v.ParentVersionID] && v.IndexStatus == types.IndexStatusPending {
+			return nil, stratumerrors.ErrVersionPending
+		}
+	}
+	switch mode {
+	case types.VersionDeleteSingle:
+		r.mockReparentChildren(kbID, versionID, r.mockSpliceParent(kbID, root.ParentVersionID))
+	case types.VersionDeleteAncestors:
+		if root.ParentVersionID != 0 {
+			root.ParentVersionID = 0
+			r.versions[versionID] = root
+		}
+	}
+	for _, id := range targets {
 		v := r.versions[id]
 		v.Deleting = true
 		r.versions[id] = v
 	}
-	return nil
+	return targets, nil
+}
+
+// mockVersionDeleteTargets mirrors the state machine's versionDeleteTargets.
+func (r *MockRaftNode) mockVersionDeleteTargets(kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error) {
+	switch mode {
+	case types.VersionDeleteSubtree:
+		return r.mockVersionSubtree(kbID, versionID), nil
+	case types.VersionDeleteSingle:
+		return []int64{versionID}, nil
+	case types.VersionDeleteAncestors:
+		ancestors := r.mockVersionAncestors(kbID, versionID)
+		if len(ancestors) == 0 {
+			return nil, nil
+		}
+		keep := make(map[int64]bool)
+		for _, id := range r.mockVersionSubtree(kbID, versionID) {
+			keep[id] = true
+		}
+		seen := make(map[int64]bool)
+		var out []int64
+		for _, ancestor := range ancestors {
+			for _, id := range r.mockVersionSubtree(kbID, ancestor) {
+				if keep[id] || seen[id] {
+					continue
+				}
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unknown version delete mode %d: %w", mode, stratumerrors.ErrInvalidArgument)
+	}
+}
+
+// mockVersionAncestors mirrors the state machine's collectVersionAncestors.
+func (r *MockRaftNode) mockVersionAncestors(kbID string, versionID int64) []int64 {
+	var out []int64
+	seen := map[int64]bool{versionID: true}
+	cur := versionID
+	for {
+		v, ok := r.versions[cur]
+		if !ok {
+			return out
+		}
+		parentID := v.ParentVersionID
+		if parentID == 0 || seen[parentID] {
+			return out
+		}
+		parent, ok := r.versions[parentID]
+		if !ok || parent.KBID != kbID {
+			return out
+		}
+		seen[parentID] = true
+		out = append(out, parentID)
+		cur = parentID
+	}
+}
+
+// mockReparentChildren mirrors the state machine's reparentChildren.
+func (r *MockRaftNode) mockReparentChildren(kbID string, fromVersionID, newParentVersionID int64) {
+	for _, id := range r.versionsByKB[kbID] {
+		if id == fromVersionID {
+			continue
+		}
+		v, ok := r.versions[id]
+		if !ok || v.ParentVersionID != fromVersionID {
+			continue
+		}
+		v.ParentVersionID = newParentVersionID
+		r.versions[id] = v
+	}
+}
+
+// mockSpliceParent mirrors the state machine's spliceParent.
+func (r *MockRaftNode) mockSpliceParent(kbID string, parentVersionID int64) int64 {
+	if parentVersionID == 0 {
+		return 0
+	}
+	parent, ok := r.versions[parentVersionID]
+	if !ok || parent.KBID != kbID || parent.Deleting {
+		return 0
+	}
+	return parentVersionID
 }
 
 // ProposeRemoveVersionMeta implements RaftNode: removes a single version's

@@ -157,12 +157,39 @@ message RollbackVersionResponse {
   bool success = 1;
 }
 
+// VersionDeleteMode selects which versions DeleteVersion removes relative
+// to the target version. It maps to internal/types.VersionDeleteMode.
+enum VersionDeleteMode {
+  // Remove the target version together with every descendant version
+  // (the original DeleteVersion semantics). Default, so clients that do
+  // not send a mode keep the historical behavior.
+  VERSION_DELETE_MODE_SUBTREE = 0;
+  // Remove only the target version itself: its direct child versions are
+  // re-parented onto the target's parent, preserving the branch structure
+  // below it (a linked-list splice). This is how an arbitrary "middle"
+  // version is removed without dragging its descendants along.
+  VERSION_DELETE_MODE_SINGLE = 1;
+  // Remove every ancestor (前置版本) of the target version, making the
+  // target the new base (root) of the knowledge base. Ancestors that
+  // carry sibling branches are removed together with those branches;
+  // the response lists every version actually marked for deletion.
+  VERSION_DELETE_MODE_ANCESTORS = 2;
+}
+
 message DeleteVersionRequest {
   string knowledge_base_id = 1;
   int64 version_id = 2;
+  // Which versions to remove relative to version_id; defaults to
+  // VERSION_DELETE_MODE_SUBTREE when unset.
+  VersionDeleteMode mode = 3;
 }
 message DeleteVersionResponse {
-  bool success = 1; // returned immediately after marking the version (and its descendants) for deletion; cleanup runs asynchronously
+  bool success = 1; // returned immediately after marking the version(s) for deletion; cleanup runs asynchronously
+  // Every version this call marked for deletion, in unspecified order.
+  // For VERSION_DELETE_MODE_ANCESTORS this also includes the sibling
+  // branches of the removed ancestors. Empty when the request was a
+  // no-op (e.g. ANCESTORS on a version that is already the base).
+  repeated int64 deleted_version_ids = 2;
 }
 
 message ListKnowledgeBasesRequest {}

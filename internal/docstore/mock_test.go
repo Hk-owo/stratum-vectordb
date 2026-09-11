@@ -114,3 +114,46 @@ func mustWrite(t *testing.T, s *MockDocStore, kbID, docID string, versionID int6
 		t.Fatalf("Write(%s,%s,%d): %v", kbID, docID, versionID, err)
 	}
 }
+
+// TestMockDocStore_DeleteByVersionExceptVisibleFrom keeps the in-memory mock
+// in lockstep with the Pebble implementation for the dependency-aware reclaim
+// the DeleteVersion cleanup uses (see
+// TestPebbleDocStore_DeleteByVersionExceptVisibleFrom).
+func TestMockDocStore_DeleteByVersionExceptVisibleFrom(t *testing.T) {
+	ctx := context.Background()
+	s := NewMockDocStore()
+
+	mustWrite(t, s, "kb1", "doc1", 1, "d1-v1")
+	mustWrite(t, s, "kb1", "doc1", 2, "d1-v2")
+	mustWrite(t, s, "kb1", "doc1", 3, "d1-v3")
+	mustWrite(t, s, "kb1", "doc2", 1, "d2-v1")
+	mustWrite(t, s, "kb1", "doc2", 2, "d2-v2")
+	// doc3 is deleted at v2 (tombstone); v3 must not resurrect it.
+	mustWrite(t, s, "kb1", "doc3", 1, "d3-v1")
+	if err := s.Write(ctx, "kb1", "doc3", 2, nil); err != nil {
+		t.Fatalf("Write doc3 tombstone: %v", err)
+	}
+
+	if err := s.DeleteByVersionExceptVisibleFrom(ctx, "kb1", 2, 3); err != nil {
+		t.Fatalf("DeleteByVersionExceptVisibleFrom(kb1, 2, anchor=3): %v", err)
+	}
+	if got, err := s.ReadAt(ctx, "kb1", "doc2", 3); err != nil || string(got) != "d2-v2" {
+		t.Errorf("doc2 at v3 after delete = (%q, %v), want (\"d2-v2\", nil)", got, err)
+	}
+	if _, err := s.ReadAt(ctx, "kb1", "doc3", 3); err == nil {
+		t.Error("doc3 at v3 after delete = nil error, want a not-found error (tombstone kept)")
+	}
+	if got, err := s.ReadAt(ctx, "kb1", "doc1", 2); err != nil || string(got) != "d1-v1" {
+		t.Errorf("doc1 at v2 after delete = (%q, %v), want (\"d1-v1\", nil)", got, err)
+	}
+	if got, err := s.ReadAt(ctx, "kb1", "doc1", 3); err != nil || string(got) != "d1-v3" {
+		t.Errorf("doc1 at v3 after delete = (%q, %v), want (\"d1-v3\", nil)", got, err)
+	}
+
+	if err := s.DeleteByVersionExceptVisibleFrom(ctx, "kb1", 2, 0); err != nil {
+		t.Fatalf("DeleteByVersionExceptVisibleFrom(kb1, 2, anchor=0): %v", err)
+	}
+	if got, err := s.ReadAt(ctx, "kb1", "doc2", 3); err != nil || string(got) != "d2-v1" {
+		t.Errorf("doc2 at v3 after anchor=0 delete = (%q, %v), want (\"d2-v1\", nil)", got, err)
+	}
+}

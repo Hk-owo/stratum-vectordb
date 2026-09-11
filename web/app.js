@@ -44,6 +44,7 @@ const SIMILARITY = {
 
 let currentKB = null;     // { id }
 let currentKBMeta = null; // KnowledgeBaseInfo
+let currentVersions = []; // 当前 KB 的版本列表（protojson：int64 字段是字符串）
 let pendingPollTimer = null;
 let warmupWatchVersion = null; // 预热后轮询完成的版本；离开 PENDING 时 toast 结果
 
@@ -81,6 +82,10 @@ let confirmCallback = null;
 function showConfirm(title, message, opts = {}) {
   $('confirm-title').textContent = title;
   $('confirm-message').textContent = message;
+  // 可选的内联附加内容（例如删除模式单选框）；不传时整体隐藏。
+  const extra = $('confirm-extra');
+  extra.innerHTML = opts.extraHTML || '';
+  extra.classList.toggle('hidden', !opts.extraHTML);
   const ok = $('confirm-ok');
   ok.textContent = opts.okText || '确认';
   // 危险操作用红色按钮，普通操作用主题色按钮
@@ -342,6 +347,7 @@ async function selectKB(id) {
 function clearKBDetail() {
   currentKB = null;
   currentKBMeta = null;
+  currentVersions = [];
   showKBDetail(false);
   $('kb-versions').innerHTML = '';
   $('parent-version-select').innerHTML = '';
@@ -366,6 +372,7 @@ async function loadVersions() {
   try {
     const resp = await api('/knowledge-bases/' + encodeURIComponent(currentKB.id) + '/versions');
     const versions = (resp.versions || []).slice().sort((a, b) => a.version_id - b.version_id);
+    currentVersions = versions;
     renderVersions(versions);
     renderParentSelect(versions);
     // 预热结果反馈：被预热的版本一旦离开 PENDING（READY/FAILED），toast 结果
@@ -404,15 +411,15 @@ function renderVersions(versions) {
   const byParent = {};
   const ids = new Set(versions.map(v => String(v.version_id)));
   for (const v of versions) {
-    const p = String(v.parent_version_id);
+    const p = String(v.parent_version_id ?? '0');
     (byParent[p] = byParent[p] || []).push(v);
   }
   for (const k of Object.keys(byParent)) byParent[k].sort((a, b) => Number(a.version_id) - Number(b.version_id));
   // 根节点：parent=0；孤儿节点（parent 不在本列表，历史被截断）也作为根。
   const roots = (byParent["0"] || []).concat(
     versions.filter(v => {
-      const p = String(v.parent_version_id);
-      return p !== "0" && !ids.has(p);
+      const p = String(v.parent_version_id ?? '0');
+      return p !== '0' && !ids.has(p);
     })
   );
 
@@ -432,11 +439,16 @@ function renderVersions(versions) {
         actions.push(`<button class="btn btn-ghost" data-act="rebuild" data-v="${v.version_id}">重建索引</button>`);
       }
       // 删除版本：活跃版本不可删除（后端也会拒绝），禁用并提示；其余版本
-      // 可删，会递归删除其全部子版本，需确认弹窗。
+      // 打开删除弹窗，可显式选择删除范围（子树 / 仅自身 / 前置版本）。
       if (v.version_id === active) {
         actions.push(`<button class="btn btn-ghost" disabled title="活跃版本不可删除，请先回滚到其他版本">删除</button>`);
       } else {
         actions.push(`<button class="btn btn-danger" data-act="delete" data-v="${v.version_id}">删除</button>`);
+      }
+      // 设为基底：删除该版本的全部前置版本，使其成为版本链新的根。
+      // 已是根的版本（parent_version_id = 0）没有前置可删，不出现该按钮。
+      if (String(v.parent_version_id ?? '0') !== '0') {
+        actions.push(`<button class="btn btn-ghost" data-act="setbase" data-v="${v.version_id}">设为基底</button>`);
       }
     }
     const activeTag = v.version_id === active ? '<span class="muted">（活跃）</span>' : '';
@@ -447,7 +459,7 @@ function renderVersions(versions) {
       ${deletingTag}
       <strong>v${v.version_id}</strong>
       <span class="local-no">本库 #${localNo[String(v.version_id)]}</span>
-      <span class="meta">父 v${v.parent_version_id} · ${fmtTime(v.created_at)} ${activeTag}</span>
+      <span class="meta">父 v${v.parent_version_id ?? '0'} · ${fmtTime(v.created_at)} ${activeTag}</span>
       <span class="actions">${actions.join('')}</span>
     </div>`);
     (byParent[String(v.version_id)] || []).forEach(c => walk(c, depth + 1));
@@ -464,6 +476,7 @@ function renderVersions(versions) {
       else if (act === 'rebuild') rebuild(vid);
       else if (act === 'warmup') warmup(vid);
       else if (act === 'delete') deleteVersion(vid);
+      else if (act === 'setbase') setBaseVersion(vid);
     });
   });
 }
@@ -507,21 +520,196 @@ async function warmup(versionId) {
   } catch (e) { toast('预热失败：' + e.message); }
 }
 
+// findVersion 在当前版本列表里按 version_id 查一个版本。protojson 把 int64
+// 序列化为字符串，统一用 String() 比较，避免 "3" !== 3 这类坑。
+function findVersion(versionId) {
+  return currentVersions.find(v => String(v.version_id) === String(versionId)) || null;
+}
+
+// ancestorDeleteImpact 计算「把 versionId 设为基底」会连带删除的版本集合：
+// 它的全部前置版本，以及这些前置版本上挂着的其它分支（旁支）。保留集是目标
+// 版本及其子树。算法与后端 ANCESTORS 模式（internal/raft/state_machine.go
+// 的 versionDeleteTargets）保持一致，仅用于删除前的确认提示。
+function ancestorDeleteImpact(versions, versionId) {
+  const byId = new Map(versions.map(v => [String(v.version_id), v]));
+  const childrenOf = new Map();
+  for (const v of versions) {
+    const p = String(v.parent_version_id ?? '0');
+    if (!childrenOf.has(p)) childrenOf.set(p, []);
+    childrenOf.get(p).push(String(v.version_id));
+  }
+  const target = byId.get(String(versionId));
+  if (!target) return [];
+
+  // 祖先链（遇到根或断链即止）
+  const ancestors = [];
+  const seenAncestor = new Set([String(versionId)]);
+  let cur = target;
+  for (;;) {
+    const p = String(cur.parent_version_id ?? '0');
+    if (p === '0' || !byId.has(p) || seenAncestor.has(p)) break;
+    seenAncestor.add(p);
+    ancestors.push(p);
+    cur = byId.get(p);
+  }
+  if (!ancestors.length) return [];
+
+  // 保留集：目标版本及其全部后代
+  const keep = new Set();
+  const stack = [String(versionId)];
+  while (stack.length) {
+    const id = stack.pop();
+    if (keep.has(id)) continue;
+    keep.add(id);
+    for (const c of (childrenOf.get(id) || [])) stack.push(c);
+  }
+
+  // 受影响：祖先子树中不属于保留集的版本
+  const affected = new Set();
+  const pending = ancestors.slice();
+  const visited = new Set();
+  while (pending.length) {
+    const id = pending.pop();
+    if (visited.has(id)) continue;
+    visited.add(id);
+    if (keep.has(id)) continue;
+    affected.add(id);
+    for (const c of (childrenOf.get(id) || [])) pending.push(c);
+  }
+  return [...affected].map(Number).sort((a, b) => a - b);
+}
+
+// subtreeIDs 返回 versionId 自身及其全部后代（含分叉），对应后端
+// collectVersionSubtree，用于 SUBTREE 模式的波及提示。
+function subtreeIDs(versions, versionId) {
+  const childrenOf = new Map();
+  for (const v of versions) {
+    const p = String(v.parent_version_id ?? '0');
+    if (!childrenOf.has(p)) childrenOf.set(p, []);
+    childrenOf.get(p).push(String(v.version_id));
+  }
+  const out = [];
+  const seen = new Set();
+  const stack = [String(versionId)];
+  while (stack.length) {
+    const id = stack.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(Number(id));
+    for (const c of (childrenOf.get(id) || [])) stack.push(c);
+  }
+  return out;
+}
+
+// activeVersionID 返回当前活跃版本的字符串 ID（protojson 的 int64 为字符串）；
+// 无活跃版本信息时返回 null。
+function activeVersionID() {
+  return currentKBMeta && currentKBMeta.active_version_id != null
+    ? String(currentKBMeta.active_version_id)
+    : null;
+}
+
+// formatVersionList 把版本 ID 列表格式化为易读文本，过长时只列前 8 个并给出
+// 总数，避免 toast / 弹窗被深层子树的长列表撑爆。
+function formatVersionList(ids) {
+  const shown = ids.slice(0, 8).map(id => 'v' + id).join('、');
+  return ids.length > 8 ? `${shown} 等共 ${ids.length} 个版本` : shown;
+}
+
 async function deleteVersion(versionId) {
-  // 删除不可撤销（递归删除该版本及其全部子版本），必须二次确认。
+  // 删除不可撤销，且现在有「删哪些版本」的语义选择，必须二次确认。
+  const v = findVersion(versionId);
+  const target = `v${versionId}`;
+  const parentId = v ? String(v.parent_version_id ?? '0') : '0';
+  const parentVersion = parentId === '0' ? null : findVersion(parentId);
+  // 父版本不可用（不存在或正在删除中）时子版本会成为新的根——与后端
+  // spliceParent 的判定保持一致。
+  const spliceHint = (parentVersion && !parentVersion.deleting)
+    ? `删除后 ${target} 的子版本会自动改挂到它的父版本 v${parentId} 上，分支结构保留。`
+    : `删除后 ${target} 的子版本会成为新的根版本。`;
+
+  const activeId = activeVersionID();
+  const impact = ancestorDeleteImpact(currentVersions, versionId);
+  const impactHasActive = activeId != null && impact.some(id => String(id) === activeId);
+  const baseHint = impact.length
+    ? `删除它的全部前置版本：${formatVersionList(impact)}（含这些版本上挂着的其它分支）${impactHasActive ? `；其中包含活跃版本 v${activeId}，后端会拒绝该操作` : ''}。`
+    : `${target} 已经是版本链的根，没有前置版本可删。`;
+
+  const subtree = subtreeIDs(currentVersions, versionId);
+  const subtreeHasActive = activeId != null && subtree.some(id => String(id) === activeId);
+  const subtreeHint = `整段截断：该版本之后派生出的版本一并删除${subtreeHasActive ? `；其中包含活跃版本 v${activeId}，后端会拒绝该操作` : ''}。`;
+
+  const modes = [
+    { value: 'VERSION_DELETE_MODE_SUBTREE', label: `删除 ${target} 及其所有子版本`, hint: subtreeHint },
+    { value: 'VERSION_DELETE_MODE_SINGLE', label: `仅删除 ${target}`, hint: spliceHint },
+    { value: 'VERSION_DELETE_MODE_ANCESTORS', label: `设为基底：删除 ${target} 的全部前置版本`, hint: baseHint },
+  ];
+  const extraHTML = modes.map((m, i) => `
+    <label class="mode-option">
+      <input type="radio" name="delete-mode" value="${m.value}" ${i === 0 ? 'checked' : ''}>
+      <span class="mode-text"><strong>${m.label}</strong><span class="muted">${m.hint}</span></span>
+    </label>`).join('');
+
+  showConfirm(`删除版本 ${target}？`, '删除不可撤销：被删版本将无法再被查询或回滚。请选择删除范围。', {
+    okText: '删除',
+    extraHTML,
+    onConfirm: async () => {
+      const picked = document.querySelector('input[name="delete-mode"]:checked');
+      const mode = picked ? picked.value : 'VERSION_DELETE_MODE_SUBTREE';
+      // 与「设为基底」按钮一致的提前拦截：活跃版本不可删，别让用户白提交一次。
+      if (mode === 'VERSION_DELETE_MODE_ANCESTORS' && impactHasActive) {
+        toast(`无法把 ${target} 设为基底：前置版本中包含活跃版本 v${activeId}，请先回滚到其它版本`);
+        return;
+      }
+      if (mode === 'VERSION_DELETE_MODE_SUBTREE' && subtreeHasActive) {
+        toast(`无法删除 ${target} 的整段子树：其中包含活跃版本 v${activeId}，请先回滚到其它版本`);
+        return;
+      }
+      try {
+        const resp = await api(`/knowledge-bases/${encodeURIComponent(currentKB.id)}/delete-version`, {
+          method: 'POST', body: { version_id: Number(versionId), mode },
+        });
+        const ids = (resp.deleted_version_ids || []).map(String);
+        toast(ids.length
+          ? `已标记删除：${formatVersionList(ids)}（异步清理，完成后将从列表消失）`
+          : '没有需要删除的版本（该版本已是基底）');
+        selectKB(currentKB.id);
+      } catch (e) { toast('删除失败：' + e.message); }
+    },
+  });
+}
+
+// setBaseVersion 把某个版本设为知识库基底：删除它的全部前置版本，使其成为
+// 版本链新的根（后端 ANCESTORS 模式）。
+async function setBaseVersion(versionId) {
+  const target = `v${versionId}`;
+  const impact = ancestorDeleteImpact(currentVersions, versionId);
+  if (!impact.length) {
+    toast(`${target} 已经是版本链的根，无需删除前置版本`);
+    return;
+  }
+  // 活跃版本不可删除：与其等后端拒绝，不如在这里提前拦截（后端仍会兜底）。
+  const activeId = activeVersionID();
+  if (activeId != null && impact.some(id => String(id) === activeId)) {
+    toast(`无法把 ${target} 设为基底：前置版本中包含活跃版本 v${activeId}，请先回滚到其它版本`);
+    return;
+  }
   showConfirm(
-    `删除版本 v${versionId}？`,
-    `将删除 v${versionId} 及其所有子版本，不可撤销；删除后无法再回滚到该版本。`,
+    `将 ${target} 设为知识库基底？`,
+    `将删除 ${target} 的全部前置版本：${formatVersionList(impact)}（含这些版本上挂着的其它分支），此操作不可撤销。`,
     {
-      okText: '删除',
+      okText: '设为基底',
       onConfirm: async () => {
         try {
-          await api(`/knowledge-bases/${encodeURIComponent(currentKB.id)}/delete-version`, {
-            method: 'POST', body: { version_id: Number(versionId) },
+          const resp = await api(`/knowledge-bases/${encodeURIComponent(currentKB.id)}/delete-version`, {
+            method: 'POST', body: { version_id: Number(versionId), mode: 'VERSION_DELETE_MODE_ANCESTORS' },
           });
-          toast(`已开始删除 v${versionId}（异步清理，完成后将从列表消失）`);
+          const ids = (resp.deleted_version_ids || []).map(String);
+          toast(ids.length
+            ? `已把 ${target} 设为基底，正在删除前置版本：${formatVersionList(ids)}`
+            : `${target} 已经是基底`);
           selectKB(currentKB.id);
-        } catch (e) { toast('删除失败：' + e.message); }
+        } catch (e) { toast('设为基底失败：' + e.message); }
       },
     }
   );

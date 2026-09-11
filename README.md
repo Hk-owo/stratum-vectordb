@@ -94,6 +94,7 @@ Go 层只负责编排与元数据,向量计算全部下沉到 C++ vecstore;两�
 ## 核心概念:版本化文档库
 
 - **版本链**:`CreateVersion` 一次调用应用任意数量的文档变更(ADD / DELETE / UPDATE),产出新版本并异步构建索引;父版本须已 READY,允许分叉。`RollbackVersion` 无停机切换活跃版本。
+- **版本删除三种模式**:`DeleteVersion` 由 `mode` 决定删除范围——`SUBTREE`(默认,删目标版本及其全部后代)、`SINGLE`(只删目标版本,其子版本自动改挂到它的父版本上,分支结构保留,因此任意"中间版本"都能单独删掉)、`ANCESTORS`(删目标版本的全部前置版本——含这些祖先上挂着的其它分支——使其成为版本链新的基底)。响应回传本次实际标记删除的版本清单;活跃版本与 PENDING 版本始终不可删。
 - **MVCC 零成本快照**:基于 PebbleDB 前缀编码,未变更文档在新版本中零拷贝;文档历史被压缩保存。
 - **布隆过滤器**:每个版本一份完整文档 ID 集合的布隆过滤器,成员检查开销极低;磁盘副本缺失时自动从 `VersionDocList` 重建。
 - **垃圾回收**:`ChunkGarbageCollector` 周期性(默认 5 分钟,`chunk_gc.sweep_interval_sec`)清扫不再被任何版本引用的 chunk。sweep 两遍:先无锁枚举孤儿候选,再持写锁按 Raft **当前**版本复查后删除,与并发写入互斥、不依赖过期快照(stale-snapshot race 免疫),锁粒度为一个 chunk,阻塞毫秒级。
@@ -169,7 +170,7 @@ Protobuf 定义在 `api/proto/`,含三个外部服务与两个内部服务(`Data
 | `ListVersions` | 返回知识库版本链 |
 | `RollbackVersion` | 切换活跃版本,无停机 |
 | `ListKnowledgeBases` / `GetKnowledgeBase` | 列出 / 查询知识库及其活跃版本 |
-| `DeleteVersion` | 标记版本(及后代)删除,清理异步执行 |
+| `DeleteVersion` | 按 `mode` 删除版本:`SUBTREE`(默认,含后代)/ `SINGLE`(仅该版本,子版本改挂其父)/ `ANCESTORS`(删前置版本,使其成为新基底);清理异步执行 |
 
 **QueryService**
 

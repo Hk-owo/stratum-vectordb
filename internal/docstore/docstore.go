@@ -46,6 +46,17 @@ type DocStore interface {
 	// knowledge base)); idempotent.
 	DeleteByVersion(ctx context.Context, kbID string, versionID int64) error
 
+	// DeleteByVersionExceptVisibleFrom removes (kbID, versionID) entries
+	// EXCEPT those still visible at anchorVersionID, i.e. the documents
+	// whose latest entry at or before anchorVersionID is the
+	// (kbID, versionID) one. Those entries are the MVCC read source for a
+	// surviving later version that never rewrote the document, so reclaiming
+	// them would silently make that version read an older value (or nothing
+	// at all) — see the DeleteVersion cleanup's delete_version_impl.go.
+	// anchorVersionID == 0 means "no surviving later version" and removes
+	// everything, exactly like DeleteByVersion. Idempotent.
+	DeleteByVersionExceptVisibleFrom(ctx context.Context, kbID string, versionID, anchorVersionID int64) error
+
 	// DiskUsage returns the approximate on-disk size in bytes of the store.
 	// Used by GetSystemStatus's resource-usage snapshot.
 	DiskUsage(ctx context.Context) (uint64, error)

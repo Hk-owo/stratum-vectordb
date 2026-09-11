@@ -76,6 +76,10 @@ func (s *testDocStore) DeleteByVersion(_ context.Context, kbID string, versionID
 	return nil
 }
 
+func (s *testDocStore) DeleteByVersionExceptVisibleFrom(_ context.Context, kbID string, versionID, anchorVersionID int64) error {
+	return nil
+}
+
 func (s *testDocStore) DiskUsage(_ context.Context) (uint64, error) { return 0, nil }
 
 func (s *testDocStore) count() int {
@@ -385,8 +389,8 @@ func (r *testRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error
 func (r *testRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
 	return nil
 }
-func (r *testRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64) error {
-	return nil
+func (r *testRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string, _ int64, _ types.VersionDeleteMode) ([]int64, error) {
+	return nil, nil
 }
 func (r *testRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
 	return nil

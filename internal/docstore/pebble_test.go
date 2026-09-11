@@ -294,3 +294,58 @@ func mustWritePebble(t *testing.T, s *PebbleDocStore, kbID, docID string, versio
 		t.Fatalf("Write(%s,%s,%d): %v", kbID, docID, versionID, err)
 	}
 }
+
+// TestPebbleDocStore_DeleteByVersionExceptVisibleFrom covers the
+// dependency-aware reclaim the DeleteVersion cleanup relies on: a record that
+// is still the read source at a surviving later version must be kept, while
+// records that version shadows can be reclaimed.
+func TestPebbleDocStore_DeleteByVersionExceptVisibleFrom(t *testing.T) {
+	ctx := context.Background()
+	s := newTestPebbleDocStore(t)
+
+	// doc1 is rewritten at v3; doc2 is last written at v2 (so v3 still reads
+	// v2's entry for it). Both also exist at v1.
+	mustWritePebble(t, s, "kb1", "doc1", 1, "d1-v1")
+	mustWritePebble(t, s, "kb1", "doc1", 2, "d1-v2")
+	mustWritePebble(t, s, "kb1", "doc1", 3, "d1-v3")
+	mustWritePebble(t, s, "kb1", "doc2", 1, "d2-v1")
+	mustWritePebble(t, s, "kb1", "doc2", 2, "d2-v2")
+	// doc3 is deleted at v2 (tombstone); v3 must not resurrect it.
+	mustWritePebble(t, s, "kb1", "doc3", 1, "d3-v1")
+	if err := s.Write(ctx, "kb1", "doc3", 2, nil); err != nil {
+		t.Fatalf("Write doc3 tombstone: %v", err)
+	}
+
+	// Remove v2 while v3 survives.
+	if err := s.DeleteByVersionExceptVisibleFrom(ctx, "kb1", 2, 3); err != nil {
+		t.Fatalf("DeleteByVersionExceptVisibleFrom(kb1, 2, anchor=3): %v", err)
+	}
+
+	// doc2@v2 is v3's read source and must survive: without it, v3 would
+	// silently fall back to the v1 content.
+	if got, err := s.ReadAt(ctx, "kb1", "doc2", 3); err != nil || string(got) != "d2-v2" {
+		t.Errorf("doc2 at v3 after delete = (%q, %v), want (\"d2-v2\", nil)", got, err)
+	}
+	// doc1@v2 is shadowed by v3's own entry, so it is reclaimed — and that
+	// fallback is harmless because v3 never reads it.
+	if got, err := s.ReadAt(ctx, "kb1", "doc1", 3); err != nil || string(got) != "d1-v3" {
+		t.Errorf("doc1 at v3 after delete = (%q, %v), want (\"d1-v3\", nil)", got, err)
+	}
+	if got, err := s.ReadAt(ctx, "kb1", "doc1", 2); err != nil || string(got) != "d1-v1" {
+		t.Errorf("doc1 at v2 after delete = (%q, %v), want (\"d1-v1\", nil)", got, err)
+	}
+	// The v2 tombstone for doc3 is v3's read source too, so it must survive:
+	// dropping it would resurrect a document v2 deleted.
+	if _, err := s.ReadAt(ctx, "kb1", "doc3", 3); !errors.Is(err, stratumerrors.ErrVersionNotFound) {
+		t.Errorf("doc3 at v3 after delete = %v, want ErrVersionNotFound (tombstone kept)", err)
+	}
+
+	// A zero anchor means nothing survives, so everything is reclaimable —
+	// exactly DeleteByVersion's behavior.
+	if err := s.DeleteByVersionExceptVisibleFrom(ctx, "kb1", 2, 0); err != nil {
+		t.Fatalf("DeleteByVersionExceptVisibleFrom(kb1, 2, anchor=0): %v", err)
+	}
+	if got, err := s.ReadAt(ctx, "kb1", "doc2", 3); err != nil || string(got) != "d2-v1" {
+		t.Errorf("doc2 at v3 after anchor=0 delete = (%q, %v), want (\"d2-v1\", nil)", got, err)
+	}
+}

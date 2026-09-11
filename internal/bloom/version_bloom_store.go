@@ -108,6 +108,36 @@ func (s *VersionBloomStore) BuildAndPersist(kbID string, versionID int64, docIDs
 	return f, nil
 }
 
+// DeleteByVersion removes (kbID, versionID)'s bloom filter: the cached
+// entry and its on-disk file. Used by the DeleteVersion cleanup — until now
+// only whole-KB deletion reclaimed these files, so one file per deleted
+// version lingered forever.
+//
+// A missing file is not an error, so re-running the version-delete flow
+// after a crash is safe. The filter is a pure accelerator (it is rebuilt
+// from the version's VersionDocList on demand), so dropping it can never
+// change query results.
+//
+// Note: a later Get on the same (kbID, versionID) would rebuild an empty
+// filter from the by-then-deleted VersionDocList and persist it again. That
+// is why the DeleteVersion cleanup runs this step only after the version's
+// metadata has been removed: with the version gone from the state machine no
+// request can reach it, and version IDs are never reused (the Raft counter is
+// monotonic).
+func (s *VersionBloomStore) DeleteByVersion(kbID string, versionID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.cache, versionKey{kbID: kbID, versionID: versionID})
+	if s.dir == "" {
+		return nil // persistence unconfigured: nothing on disk to remove
+	}
+	if err := os.Remove(s.filterPath(kbID, versionID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("bloom: VersionBloomStore.DeleteByVersion(%s,%d): %w", kbID, versionID, err)
+	}
+	return nil
+}
+
 // DeleteByKB removes kbID's on-disk version-bloom files entirely
 // (dir/bloom-version/<kbID>/) and drops its filters from the cache. A
 // missing directory is not an error, so re-running the knowledge-base
@@ -121,6 +151,9 @@ func (s *VersionBloomStore) DeleteByKB(kbID string) error {
 		if k.kbID == kbID {
 			delete(s.cache, k)
 		}
+	}
+	if s.dir == "" {
+		return nil // persistence unconfigured: nothing on disk to remove
 	}
 	if err := os.RemoveAll(filepath.Join(s.dir, "bloom-version", kbID)); err != nil {
 		return fmt.Errorf("bloom: VersionBloomStore.DeleteByKB(%s): %w", kbID, err)
@@ -145,8 +178,13 @@ func (s *VersionBloomStore) filterPath(kbID string, versionID int64) string {
 }
 
 // persist writes f's serialized form to disk (creating directories as
-// needed).
+// needed). No-op when persistence is unconfigured (dir == ""), so the store
+// stays a pure in-memory accelerator — matching DeleteByVersion/DeleteByKB,
+// which already guard on the same condition.
 func (s *VersionBloomStore) persist(kbID string, versionID int64, f BloomFilter) error {
+	if s.dir == "" {
+		return nil
+	}
 	data, err := f.Serialize()
 	if err != nil {
 		return fmt.Errorf("bloom: VersionBloomStore persist(%s,%d): serialize: %w", kbID, versionID, err)

@@ -232,6 +232,116 @@ func (s *PebbleDocStore) DeleteByVersion(_ context.Context, kbID string, version
 	return nil
 }
 
+// DeleteByVersionExceptVisibleFrom implements DocStore: it reclaims the
+// version's records except the ones a surviving later version still reads.
+//
+// A version's records are the MVCC source for every later version that did
+// not rewrite the same document (WriteCoordinator writes only the documents
+// a version actually changes, and ReadAt falls back to the newest entry at
+// or before the queried version). So when a DeleteVersion keeps any later
+// version alive — SINGLE re-parents the target's children, ANCESTORS keeps
+// the target's whole subtree — deleting those records would silently make
+// the survivor read an older value or nothing.
+//
+// The decision uses anchorVersionID, the smallest surviving version above
+// versionID: an entry must be kept iff it is the one ReadAt would return at
+// that anchor. A zero anchor means nothing survives, so every record is
+// reclaimable.
+func (s *PebbleDocStore) DeleteByVersionExceptVisibleFrom(ctx context.Context, kbID string, versionID, anchorVersionID int64) error {
+	if anchorVersionID <= 0 {
+		return s.DeleteByVersion(ctx, kbID, versionID)
+	}
+
+	kbPrefix := encodeKBPrefix(kbID)
+	upperBound := pebbleutil.PrefixSuccessor(kbPrefix)
+	if upperBound == nil {
+		return fmt.Errorf("docstore: DeleteByVersionExceptVisibleFrom(%s,%d): prefix has no successor (unexpected)", kbID, versionID)
+	}
+
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: kbPrefix, UpperBound: upperBound})
+	if err != nil {
+		return fmt.Errorf("docstore: DeleteByVersionExceptVisibleFrom(%s,%d): new iterator: %w", kbID, versionID, err)
+	}
+	defer iter.Close()
+
+	// Collect matching keys first, then delete in a single batch: mutating
+	// the keyspace while iterating is not safe in PebbleDB.
+	var keys [][]byte
+	for iter.First(); iter.Valid(); iter.Next() {
+		k := iter.Key()
+		// A docstore key is kbID || docID || versionID, and docID itself
+		// carries a 4-byte length prefix, so anything shorter cannot be a
+		// record we can attribute to a document.
+		if len(k) < len(kbPrefix)+4+8 {
+			continue
+		}
+		if binary.BigEndian.Uint64(k[len(k)-8:]) != uint64(versionID) {
+			continue
+		}
+		// Decode the docID segment by hand rather than via
+		// pebbleutil.DecodeString: that helper maps both "empty string" and
+		// "malformed encoding" to "", and an empty docID is a valid encoding
+		// we must not mistake for corruption.
+		docSeg := k[len(kbPrefix) : len(k)-8]
+		if len(docSeg) < 4 || int(binary.BigEndian.Uint32(docSeg[:4])) != len(docSeg)-4 {
+			return fmt.Errorf("docstore: DeleteByVersionExceptVisibleFrom(%s,%d): undecodable docID in key", kbID, versionID)
+		}
+		docID := string(docSeg[4:])
+		visible, ok, err := s.visibleVersionOf(kbID, docID, anchorVersionID)
+		if err != nil {
+			return fmt.Errorf("docstore: DeleteByVersionExceptVisibleFrom(%s,%d): %w", kbID, versionID, err)
+		}
+		if ok && visible == versionID {
+			continue // still the read source for a surviving later version
+		}
+		keys = append(keys, append([]byte(nil), k...))
+	}
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("docstore: DeleteByVersionExceptVisibleFrom(%s,%d): iterator error: %w", kbID, versionID, err)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	for _, k := range keys {
+		if err := batch.Delete(k, nil); err != nil {
+			return fmt.Errorf("docstore: DeleteByVersionExceptVisibleFrom(%s,%d): batch delete: %w", kbID, versionID, err)
+		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("docstore: DeleteByVersionExceptVisibleFrom(%s,%d): commit: %w", kbID, versionID, err)
+	}
+	return nil
+}
+
+// visibleVersionOf reports the key-visible version ID for (kbID, docID) at
+// maxVersionID — the largest versionID <= maxVersionID — and whether such an
+// entry exists. The entry may be a tombstone: this is deliberately ReadAt's
+// key-only counterpart, not its value semantics, because a surviving version
+// reads a tombstone too (and dropping it would resurrect a deleted document).
+func (s *PebbleDocStore) visibleVersionOf(kbID, docID string, maxVersionID int64) (int64, bool, error) {
+	prefix := encodeDocPrefix(kbID, docID)
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: boundedUpperBound(prefix, maxVersionID)})
+	if err != nil {
+		return 0, false, fmt.Errorf("visible entry for %s/%s@%d: new iterator: %w", kbID, docID, maxVersionID, err)
+	}
+	defer iter.Close()
+	if !iter.Last() {
+		// No entry at or before maxVersionID — distinct from an iteration
+		// error, which Last() also reports as false. The caller deletes the
+		// record when no entry is visible, so an error must not be mistaken
+		// for "nothing visible".
+		if err := iter.Error(); err != nil {
+			return 0, false, fmt.Errorf("visible entry for %s/%s@%d: iterator error: %w", kbID, docID, maxVersionID, err)
+		}
+		return 0, false, nil
+	}
+	k := iter.Key()
+	return int64(binary.BigEndian.Uint64(k[len(k)-8:])), true, nil
+}
+
 // DiskUsage implements DocStore: returns PebbleDB's estimated total disk
 // usage (live data + internal structures) in bytes.
 func (s *PebbleDocStore) DiskUsage(_ context.Context) (uint64, error) {

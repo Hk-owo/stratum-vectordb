@@ -451,3 +451,152 @@ func TestKnowledgeBaseService_DeleteVersion(t *testing.T) {
 		}
 	}
 }
+
+// kbSvcTestHarnessWithChain builds a harness plus a READY chain
+// v1 -> v2 -> v3 in a fresh knowledge base, returning the KB ID and the
+// three version IDs.
+func kbSvcTestHarnessWithChain(t *testing.T, h *kbSvcTestHarness) (string, int64, int64, int64) {
+	t.Helper()
+	ctx := context.Background()
+	createResp, err := h.svc.CreateKnowledgeBase(ctx, &pb.CreateKnowledgeBaseRequest{
+		Name:             "test-kb",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig:      &pb.EmbedConfig{ServiceAddr: "localhost:8080", ModelId: "test-model"},
+	})
+	if err != nil {
+		t.Fatalf("CreateKnowledgeBase: %v", err)
+	}
+	kbID, v1 := createResp.KnowledgeBaseId, createResp.InitialVersionId
+	v2, err := h.raftNode.ProposeCreateVersion(ctx, kbID, v1)
+	if err != nil {
+		t.Fatalf("create v2: %v", err)
+	}
+	for _, v := range []int64{v1, v2} {
+		if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v, types.IndexStatusReady); err != nil {
+			t.Fatalf("v%d READY: %v", v, err)
+		}
+	}
+	v3, err := h.raftNode.ProposeCreateVersion(ctx, kbID, v2)
+	if err != nil {
+		t.Fatalf("create v3: %v", err)
+	}
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady); err != nil {
+		t.Fatalf("v3 READY: %v", err)
+	}
+	return kbID, v1, v2, v3
+}
+
+// TestKnowledgeBaseService_DeleteVersion_SingleMode verifies that the SINGLE
+// mode is forwarded to Raft, that the response echoes the removed version
+// set, and that the removed middle version's child is spliced onto its
+// parent.
+func TestKnowledgeBaseService_DeleteVersion_SingleMode(t *testing.T) {
+	ctx := context.Background()
+	h := newKBSvcTestHarness()
+	kbID, v1, v2, v3 := kbSvcTestHarnessWithChain(t, h)
+	h.deleteVersionC.SetExecuteResult(nil)
+
+	resp, err := h.svc.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v2,
+		Mode:            pb.VersionDeleteMode_VERSION_DELETE_MODE_SINGLE,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVersion(SINGLE): %v", err)
+	}
+	if !resp.Success {
+		t.Error("expected success=true")
+	}
+	if len(resp.DeletedVersionIds) != 1 || resp.DeletedVersionIds[0] != v2 {
+		t.Errorf("deleted_version_ids = %v, want [%d]", resp.DeletedVersionIds, v2)
+	}
+	child, ok := h.raftNode.GetVersion(v3)
+	if !ok {
+		t.Fatal("v3 metadata missing")
+	}
+	if child.ParentVersionID != v1 {
+		t.Errorf("v3 parent = %d, want %d (spliced onto v1)", child.ParentVersionID, v1)
+	}
+	if child.Deleting {
+		t.Error("v3 must not be marked Deleting under SINGLE mode")
+	}
+}
+
+// TestKnowledgeBaseService_DeleteVersion_AncestorsMode verifies the "set a
+// version as the new base" flow end to end at the service boundary: the
+// preceding versions are reported as deleted and the target's parent pointer
+// is cleared.
+func TestKnowledgeBaseService_DeleteVersion_AncestorsMode(t *testing.T) {
+	ctx := context.Background()
+	h := newKBSvcTestHarness()
+	kbID, v1, v2, v3 := kbSvcTestHarnessWithChain(t, h)
+	// v3 becomes the active version so it is the survivor of the truncation.
+	if err := h.raftNode.ProposeRollback(ctx, kbID, v3); err != nil {
+		t.Fatalf("rollback to v3: %v", err)
+	}
+	h.deleteVersionC.SetExecuteResult(nil)
+
+	resp, err := h.svc.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v3,
+		Mode:            pb.VersionDeleteMode_VERSION_DELETE_MODE_ANCESTORS,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVersion(ANCESTORS): %v", err)
+	}
+	want := map[int64]bool{v1: true, v2: true}
+	if len(resp.DeletedVersionIds) != len(want) {
+		t.Errorf("deleted_version_ids = %v, want v%d and v%d", resp.DeletedVersionIds, v1, v2)
+	}
+	for _, id := range resp.DeletedVersionIds {
+		if !want[id] {
+			t.Errorf("unexpected deleted version v%d", id)
+		}
+		delete(want, id)
+	}
+	for id := range want {
+		t.Errorf("v%d missing from deleted_version_ids", id)
+	}
+	base, ok := h.raftNode.GetVersion(v3)
+	if !ok {
+		t.Fatal("v3 metadata missing")
+	}
+	if base.ParentVersionID != 0 {
+		t.Errorf("new base v3 parent = %d, want 0", base.ParentVersionID)
+	}
+	if base.Deleting {
+		t.Error("the new base v3 must not be marked Deleting")
+	}
+}
+
+// TestKnowledgeBaseService_DeleteVersion_RejectsUnknownMode pins the
+// fail-closed behavior: an unrecognized mode must error out rather than being
+// silently downgraded to the destructive SUBTREE default.
+func TestKnowledgeBaseService_DeleteVersion_RejectsUnknownMode(t *testing.T) {
+	ctx := context.Background()
+	h := newKBSvcTestHarness()
+	kbID, _, v2, _ := kbSvcTestHarnessWithChain(t, h)
+
+	_, err := h.svc.DeleteVersion(ctx, &pb.DeleteVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v2,
+		Mode:            pb.VersionDeleteMode(99),
+	})
+	if err == nil {
+		t.Fatal("expected an error for an unknown delete mode")
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("unknown-mode error code = %v, want InvalidArgument", status.Code(err))
+	}
+	meta, ok := h.raftNode.GetVersion(v2)
+	if !ok {
+		t.Fatal("v2 metadata missing")
+	}
+	if meta.Deleting {
+		t.Error("a rejected request must not mark the version Deleting")
+	}
+	if calls := h.deleteVersionC.Calls(); len(calls) != 0 {
+		t.Errorf("DeleteVersionCoordinator.Execute calls = %v, want none", calls)
+	}
+}

@@ -42,8 +42,8 @@ func (r *gcTestRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionI
 func (r *gcTestRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
 	return nil
 }
-func (r *gcTestRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64) error {
-	return nil
+func (r *gcTestRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string, _ int64, _ types.VersionDeleteMode) ([]int64, error) {
+	return nil, nil
 }
 func (r *gcTestRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
 	return nil
