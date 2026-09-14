@@ -387,12 +387,17 @@ func TestLocalDataPlane_ReconcileIndexes_DecisionTable(t *testing.T) {
 
 func TestLocalDataPlane_ReconcileIndexes_SkipsRetentionDropped(t *testing.T) {
 	meta := &stubMeta{
-		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-1"}},
+		// v3 is the active version, and that detail is now load-bearing: inside the
+		// window, "missing" alone no longer earns a rebuild — a lazy path exists, so
+		// an absent artifact costs only a slow first query. The one artifact
+		// reconcile rebuilds here is the one being SERVED. The full policy is pinned
+		// by TestReconcileIndexes_RebuildsOnlyPendingAndActive.
+		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-1", ActiveVersionID: 3}},
 		versions: map[string][]types.VersionMeta{
 			"kb-1": {
 				{VersionID: 1, KBID: "kb-1", IndexStatus: types.IndexStatusReady}, // outside the window, missing
 				{VersionID: 2, KBID: "kb-1", IndexStatus: types.IndexStatusReady}, // inside the window, on disk
-				{VersionID: 3, KBID: "kb-1", IndexStatus: types.IndexStatusReady}, // inside the window, missing
+				{VersionID: 3, KBID: "kb-1", IndexStatus: types.IndexStatusReady}, // inside the window, missing, ACTIVE
 			},
 		},
 	}

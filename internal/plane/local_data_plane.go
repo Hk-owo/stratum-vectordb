@@ -1385,10 +1385,17 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 				// versions): leave it absent and rebuild on demand.
 				d.logger.Info("plane: reconcile: skipping rebuild of retention-dropped index",
 					zap.String("kb_id", kb.KBID), zap.Int64("version_id", v.VersionID))
-			default:
-				// PENDING without an index, or READY whose index was lost:
-				// (re)build. TriggerBuild is idempotent, and the build
-				// re-persists and re-reports the status.
+			case v.IndexStatus == types.IndexStatusPending || v.VersionID == kb.ActiveVersionID:
+				// Worth a head start, and only these two:
+				//
+				//   PENDING — the writer is waiting for this very build; without it
+				//   the write stalls instead of merely being slower.
+				//
+				//   the active version — every query for this knowledge base lands on
+				//   it, so its build is needed immediately.
+				//
+				// TriggerBuild is idempotent, and the build re-persists and
+				// re-reports the status.
 				d.logger.Info("plane: reconcile: (re)building missing index",
 					zap.String("kb_id", kb.KBID), zap.Int64("version_id", v.VersionID),
 					zap.String("status", v.IndexStatus.String()))
@@ -1396,6 +1403,21 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 					d.logger.Warn("plane: reconcile: TriggerBuild failed",
 						zap.String("kb_id", kb.KBID), zap.Int64("version_id", v.VersionID), zap.Error(err))
 				}
+			default:
+				// READY, artifact missing, inside the window, and NOT the active
+				// version: leave it absent.
+				//
+				// The retention branch above gives the same answer for the same
+				// reason — EnsureIndex builds on demand, so an absent artifact costs a
+				// slow first query and nothing else. Rebuilding it here instead is how
+				// a restart over a populated volume turns into a rebuild storm: one
+				// eager build per historical version, every one of them competing with
+				// the writes that actually need the CPU, disk and vecstore. Measured: a
+				// fresh write waited 601s for READY while 41 historical artifacts were
+				// rebuilt ahead of it.
+				d.logger.Info("plane: reconcile: leaving a non-active missing index absent",
+					zap.String("kb_id", kb.KBID), zap.Int64("version_id", v.VersionID),
+					zap.String("status", v.IndexStatus.String()))
 			}
 		}
 	}

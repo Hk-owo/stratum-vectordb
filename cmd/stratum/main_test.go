@@ -419,13 +419,16 @@ func TestReconcileIndexStatus(t *testing.T) {
 	logger := zap.NewNop()
 
 	rn := &reconcileRaftNode{
-		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-1"}},
+		// v4 is the active version, which is what earns it a proactive rebuild now
+		// that reconcile no longer rebuilds every missing artifact it can see (an
+		// absent one is rebuilt on demand through EnsureIndex instead).
+		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-1", ActiveVersionID: 4}},
 		versions: map[string][]types.VersionMeta{
 			"kb-1": {
 				{VersionID: 1, KBID: "kb-1", IndexStatus: types.IndexStatusReady},   // exists: untouched
 				{VersionID: 2, KBID: "kb-1", IndexStatus: types.IndexStatusPending}, // exists: derive READY
 				{VersionID: 3, KBID: "kb-1", IndexStatus: types.IndexStatusPending}, // missing: build
-				{VersionID: 4, KBID: "kb-1", IndexStatus: types.IndexStatusReady},   // missing: rebuild
+				{VersionID: 4, KBID: "kb-1", IndexStatus: types.IndexStatusReady},   // missing + ACTIVE: rebuild
 				{VersionID: 5, KBID: "kb-1", IndexStatus: types.IndexStatusFailed},  // untouched
 			},
 		},
