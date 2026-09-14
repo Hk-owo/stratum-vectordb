@@ -710,7 +710,12 @@ func (d *LocalDataPlane) pickBackfillSource(ctx context.Context, kbID string, ne
 		if peer == fallback {
 			continue // already the default source
 		}
-		cursor, err := d.cursorQuerier.LocalVersionOf(ctx, peer, kbID)
+		// Bounded for the same reason as SafeDurableVersion's peer queries: this can
+		// run while a peer is not serving yet, and an unbounded wait would turn a
+		// backfill choice into a hang.
+		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
+		cancel()
 		if err != nil {
 			continue
 		}
@@ -995,6 +1000,23 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 	}
 	return nil
 }
+
+// peerCursorTimeout bounds ONE peer's cursor query.
+//
+// It exists because the callers run during STARTUP: ReconcileIndexes asks every peer
+// what it holds, and every storage node does that concurrently, reaching
+// grpcServer.Serve only after its own reconcile returns. With no bound here the
+// cluster deadlocks at boot — each node waits for the others while none of them is
+// serving. Measured on a node holding historical data: it never logged "Stratum gRPC
+// server listening", and the control layer got "connection refused" from every
+// storage address.
+//
+// Short on purpose. A peer that cannot answer within this window while starting is
+// not going to answer sooner if we wait longer, and the quorum check is what decides
+// whether the answers that DID arrive suffice. Like the other budget numbers this is
+// a placeholder: raise it if startup on slow disks shows peers being skipped that
+// would have answered.
+const peerCursorTimeout = 2 * time.Second
 
 // QuorumSize is the durable threshold for n replicas (Stratum_设计文档v13.md
 // §7.1): ⌈(n+1)/2⌉, a bare majority, so any two quorums intersect.
@@ -1302,7 +1324,20 @@ func (d *LocalDataPlane) SafeDurableVersion(ctx context.Context, kbID string) (i
 	// progress is part of the picture, not an absence of one.
 	reports := []int64{d.localVersionOf(kbID)}
 	for _, peer := range peers {
-		cursor, err := d.cursorQuerier.LocalVersionOf(ctx, peer, kbID)
+		// A SHORT deadline per peer, not the caller's. This runs during STARTUP, and
+		// the peers it asks may be inside this very call: every storage node reconciles
+		// concurrently, and none of them reaches grpcServer.Serve until its own
+		// reconcile has returned. Unbounded here, the cluster deadlocks at boot — each
+		// node waits for the others while none of them is serving. (Measured: a storage
+		// node holding historical data never logged "Stratum gRPC server listening",
+		// and the control layer got "connection refused" from every storage address.)
+		//
+		// An unreachable peer is not evidence of anything and is skipped either way, so
+		// the deadline only decides how long establishing "unreachable" takes — which
+		// during startup is the difference between a node that boots and one that hangs.
+		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
+		cancel()
 		if err != nil {
 			// An unreachable peer is not evidence of anything. It is skipped,
 			// and the quorum requirement below decides whether what is left
