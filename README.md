@@ -31,7 +31,7 @@ Stratum 是 RAG 管线的**存储与检索层**:不处理聊天历史、用户�
 # 构建
 go build ./cmd/stratum/
 
-# 运行全部测试(23 个测试包,共 28 个 Go 包)
+# 运行全部测试(23 个包含测试,共 29 个 Go 包)
 go test ./... -timeout 180s -count=1
 
 # 竞态检测(共识与索引核心)
@@ -178,6 +178,21 @@ storage:
 Web UI ⇄ gateway(:8081) ⇄ station(:7009) ⇄ 存储节点(读) / 控制节点(写)
 ```
 
+**为什么是两层,而不是一个入口**:两者解决的问题不同,合起来会让每一层都背着不属于自己的知识。
+
+| | `stratum-router`(服务站,`:7009`) | `stratum-gateway`(网关,`:8081`) |
+|---|---|---|
+| 协议 | **gRPC** | **HTTP/JSON** + 前端静态资源(同源) |
+| 面向 | 程序客户端 / SDK | 浏览器 / Web 控制台 |
+| 职责 | leader 发现、写转发、读均衡、副本选择与换候选、熔断、鉴权闸门 | HTTP→gRPC 转换(`protojson`)、静态资源托管、`/ops/` 运维台 |
+| 知道集群拓扑吗 | **知道**——要选副本、要把写转发给 leader | **不知道,也不关心**——只连服务站一个地址 |
+
+关键在最后一行:**leader 会换、副本会增减、某个副本会短暂不可用**,这些都该由服务站吸收,而不是泄漏到边缘。所以拓扑变化只动服务站;换前端、加 HTTP 鉴权、把网关放到 DMZ 多开几个实例,都不碰集群。鉴权闸门也只在服务站一处(`-tokens`),SDK 与浏览器过的是同一道闸。
+
+**只要程序接入(用 SDK 直连 `:7009`)就完全不需要网关**——它是可选的纯适配层,不装它集群照常工作,只是没有浏览器入口。
+
+> 浏览器打不开 `http://localhost:7009` 是**正常的**:那是 gRPC 端口,HTTP/1.1 请求会得到 `Received HTTP/0.9`,HTTP/2 请求得到 `415`(只接受 `application/grpc`)。要看界面请用网关的 `:8081`。
+
 ```bash
 scripts/gateway.sh [single|build|stop]   # 默认:构建后起 Docker 集群模式;single=连 127.0.0.1:7000
 scripts/router.sh status|stop            # 单独管理服务站(两层拓扑下会从 run/console.yaml 自动派生 -storage-nodes)
@@ -273,24 +288,23 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 
 ### 数据量实测(3 节点 Docker 集群,真实 Faiss HNSW + RocksDB,768 维)
 
-`TestT4_DataVolume` 在真实栈上采样(window=512 切分,mock embed 10 ms/chunk);每个节点运行独立的 vecstore(共享会引发并发 `Build = Reset + AddChunks` 竞态):
+`TestT4_DataVolume` 在真实栈上采样(window=512 切分,mock embed 10 ms/chunk);每个节点运行独立的 vecstore(共享会引发并发 `Build = Reset + AddChunks` 竞态)。规模用 `STRATUM_VOLUME_DOCS` 控制:
 
-| 指标 | 1,000 篇 | 10,000 篇 | 100,000 篇 |
-|---|---|---|---|
-| CreateVersion 写入 | 17.0 s | 3m25s | 42m14s |
-| 索引构建(累计) | 0.5 s | 5.1 s | 2m23s |
-| 3 节点存储合计 | — | 163.9 MiB | 877.1 MiB |
-| 总测试耗时 | 18.1 s | 3m30s | 44m37s(旧实现 30 分钟即卡死) |
+```bash
+STRATUM_VOLUME_DOCS=10000 go test ./integration/docker/ -tags=docker -count=1 -run TestT4_DataVolume -v
+```
 
-要点:写入须分批——单条 `CreateVersion` 受 4 MiB gRPC 消息上限约束(约 1,400 篇),每批成一版本且前一批 READY 后才链接;耗时随版本号递增(每版本重写完整 doc-ID 集并重建索引),这是"每版本独立索引"模型的固有开销。100k 轮还验证了 raft 快照(`max_log_length=150` 触发 2 次):日志即时 trim、写入与心跳不停摆——快照在 RLock 下深拷贝并异步持久化,apply 与心跳永不被阻塞(此前 leader 会冻结 14 分钟无心跳)。
+**这里刻意不再列具体数字。** 本仓库此前记录过一组 1k / 10k / 100k 篇的实测(写入耗时、索引构建累计、各节点存储合计、总耗时),但那是在**索引构建调度被改之前**跑的——随后为"重启后构建饥饿"引入的**有界构建池 + 两级优先级**(`index_manager.build_concurrency`)会直接改变构建吞吐。旧数字不再代表现在的行为,留着只会误导,故删除。**待用当前代码重跑后再补表**(100k 轮约 45 分钟,不适合进 CI)。
+
+要点(与数字无关,仍然成立):写入须分批——单条 `CreateVersion` 受 4 MiB gRPC 消息上限约束(约 1,400 篇),每批成一版本且前一批 READY 后才链接;耗时随版本号递增(每版本重写完整 doc-ID 集并重建索引),这是"每版本独立索引"模型的固有开销。100k 轮还验证了 raft 快照(`max_log_length=150` 触发 2 次):日志即时 trim、写入与心跳不停摆——快照在 RLock 下深拷贝并异步持久化,apply 与心跳永不被阻塞(此前 leader 会冻结 14 分钟无心跳)。
 
 ### 压力测试(3 节点 Docker 集群,真实 Faiss HNSW + RocksDB,768 维)
 
 压测填补的是设计文档阶段⑤ 要求、此前**没有任何实现**的两项——`TestT4_PerformanceBaseline` 与 `TestT4_StorageEfficiency` 都只是 `t.Skip` 占位。规模用环境变量控制(`STRATUM_STRESS_DOCS` / `_QUERIES` / `_VERSIONS` / `_TIMEOUT`),默认值小到能进 CI。
 
-| 用例 | 测什么 | 实测(300 篇 / 50 次查询) |
+| 用例 | 测什么 | 实测 |
 |---|---|---|
-| `TestT4_QueryLatency` | 单版本查询延迟,**冷热分开报** | cold **39.9 ms** · p50 **37.8 ms** · p95 **87.4 ms** · p99 **91.8 ms** |
+| `TestT4_QueryLatency` | 单版本查询延迟,**冷热分开报** | 1,000 篇 / 20 次查询:cold **336 ms** · p50 **222 ms** · p95 **282 ms** |
 | `TestT4_MultiVersionEviction` | 多版本分级换出的稳定性 | 4 版本 × 3 轮轮转,每个版本始终应答 |
 | `TestT4_GCPressure` | §8.6(d) 墓碑回收端到端 | ⚠️ 当前 SKIP,见下 |
 
