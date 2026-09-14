@@ -139,6 +139,27 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 	// driven from the control layer. A no-op when no threshold is configured.
 	indexMgr.StartColdPolicy()
 
+	// §8.6(d) phase 1: report — do not yet clean — active versions whose sealed
+	// artifact carries more dead weight than the current document set justifies.
+	// The scan covers ACTIVE versions only, so it needs to know which version
+	// each knowledge base is serving; that fact lives in the control layer's
+	// metadata, which a storage node reads over gRPC like any other metadata.
+	indexMgr.SetActiveVersionsProvider(func(ctx context.Context) (map[string]int64, error) {
+		kbs, err := rn.ListKnowledgeBases(ctx)
+		if err != nil {
+			return nil, err
+		}
+		active := make(map[string]int64, len(kbs))
+		for _, kb := range kbs {
+			if kb.ActiveVersionID == 0 {
+				continue
+			}
+			active[kb.KBID] = kb.ActiveVersionID
+		}
+		return active, nil
+	})
+	indexMgr.StartGCScanner()
+
 	// Build data sources: the IndexManager's async build reads the version's
 	// document IDs via ChunkDocMapper and pulls each chunk vector from the
 	// vecstore's ChunkStorageService (the same keys the write path used).

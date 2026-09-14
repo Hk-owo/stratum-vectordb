@@ -110,6 +110,20 @@ type IndexManagerConfig struct {
 	// which drops them. <= 0 means DefaultAppendMaxDeadRatio; 1.0 disables the
 	// check.
 	AppendMaxDeadRatio float64
+
+	// GCRatioThreshold is the dead-vector share above which an ACTIVE version
+	// becomes a §8.6(d) cleanup candidate. It is a separate knob from
+	// AppendMaxDeadRatio on purpose: that one decides whether a BUILD may start
+	// from an artifact, while this one decides whether a SEALED artifact is
+	// worth reopening — a different trade, because reopening takes the version
+	// out of service on this node for a moment. <= 0 means
+	// DefaultGCRatioThreshold.
+	GCRatioThreshold float64
+
+	// GCSweepInterval is how often the §8.6(d) scanner re-estimates the dead
+	// share of the active versions. Zero means DefaultGCSweepInterval;
+	// negative disables the scanner.
+	GCSweepInterval time.Duration
 }
 
 // DefaultColdSweepInterval is how often the §8.6a evaluator re-reads the
@@ -217,6 +231,18 @@ type IndexManagerImpl struct {
 	coldCancel context.CancelFunc
 	coldWG     sync.WaitGroup
 
+	// activeVersions reports, per knowledge base, the version it is currently
+	// serving. §8.6(d)'s scanner covers only those: a version WITH a successor
+	// is reclaimed by the append path's dead-ratio rebuild, and a historical
+	// version is queried too rarely to be worth the scan. Nil disables the
+	// scanner entirely.
+	activeVersions func(ctx context.Context) (map[string]int64, error)
+
+	// gcCancel/gcWG govern the §8.6(d) background scanner. gcCancel is nil
+	// while it is off.
+	gcCancel context.CancelFunc
+	gcWG     sync.WaitGroup
+
 	// deletedKBs / deletedVersions are tombstones set by knowledge-base
 	// deletion (DeleteFilesByKB) and version deletion (Discard). They
 	// close the "resurrection" race where a Search-triggered Load RPC
@@ -305,6 +331,7 @@ func (im *IndexManagerImpl) SetBuildDataSources(
 func (im *IndexManagerImpl) Close() error {
 	im.StopColdPolicy()
 	im.StopAbandonSweeper()
+	im.StopGCScanner()
 	if im.vecstoreConn != nil {
 		return im.vecstoreConn.Close()
 	}
