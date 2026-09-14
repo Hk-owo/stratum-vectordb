@@ -40,7 +40,7 @@ go test -race ./internal/kvraft/... ./internal/raft/... ./internal/index/...
 # 单节点服务
 go run ./cmd/stratum/
 
-# 一键拉起完整链路:vecstore(C++) → stratum(gRPC) → 路由层 → gateway(HTTP) + Web UI
+# 一键拉起完整链路:vecstore(C++) → stratum(gRPC) → 服务站 → gateway(HTTP) + Web UI
 ./start.sh            # 然后打开 http://localhost:8081
 ```
 
@@ -142,7 +142,8 @@ Go 层只负责编排与元数据,向量计算全部下沉到 C++ vecstore;两�
 
 - **单节点**:`cmd/stratum`(gRPC,默认 `127.0.0.1:7000`)+ 外部 C++ vecstore 进程。
 - **多节点集群**:多个 stratum 节点组成 Raft 集群,共享一套元数据。
-- **角色分离(进行中)**:`node.role` 选择进程承担哪一半——`all`(默认,控制面 + 存储面同进程,即原有形态)、`storage`(只跑存储层:文档 / chunk / 索引 / vecstore,不留 Raft 日志,元数据经 `RemoteRaftNode` 读取,也从不参与选举)、`control`(只跑控制面,**尚未实现**,当前会拒绝启动)。存储组由 `storage.nodes` 声明;省略即"每个 Raft 成员都持有数据",与拆分前的部署完全一致,老配置无需改动。
+- **角色分离**:`node.role` 选择进程承担哪一半——`all`(默认,控制面 + 存储面同进程,即原有形态)、`control`(**只跑控制面**:Raft 日志与元数据,不持有任何 data plane,连 vecstore 数据目录都不创建)、`storage`(只跑存储层:文档 / chunk / 索引 / vecstore,不留 Raft 日志,元数据经 `RemoteRaftNode` 读取,也从不参与选举)。存储组由 `storage.nodes` 声明;省略即"每个 Raft 成员都持有数据",与拆分前的部署完全一致,老配置无需改动。
+  - **两层拓扑的两条硬约束**:① 控制层 ID(`1..N`,即 Raft member ID)与存储层 ID(`11..1N`,同时是 `storage.nodes` 的键)**不得重叠**,否则控制节点会把存储节点的地址认成自己的;② 写入由控制层在 apply 时按副本拓扑**指派**给某个存储节点执行(`ExecuteVersionWrite`,那个节点作为该次写入的协调者再 fan-out),读由服务站路由到持有该版本的存储节点。
 
 ```yaml
 # 一个只跑存储层的节点:数据在这里,元数据在控制集群
@@ -163,18 +164,24 @@ storage:
       addr: "node4:7000"
 ```
 
-- **路由层 `cmd/stratum-router`**:集群前端。拨号所有节点、自动发现 Raft leader;**写操作转发给 leader**(故障转移时重新发现),**读操作 round-robin 负载均衡**到各节点。
+- **服务站 `cmd/stratum-router`**(早期文档里的"路由层"是同一个东西):集群**唯一**的对外入口。六项职责:① 路由表缓存(`KB + version → 可服务节点`,从控制层聚合**异步刷新**,不是自己逐节点探测);② **新鲜度凭证**(转发前附上"当前应看到的版本号",存储节点核对本地连续游标,不够就拒——把"悄悄返回过时结果"变成显式失败,服务站再换一个达标候选);③ 读负载均衡;④ 故障转移(同一客户端连接内换候选,客户端无感);⑤ 鉴权(token 表 → 租户/权限,数据面完全不必对外);⑥ 健康检查/熔断(closed / open / half-open 三态,状态是服务站**本地**态、实例间不同步,这是它能无状态水平扩展的前提)。另有 **超时预算传播**(按剩余候选数切分,避免一个慢节点吃掉整个预算)与背压。
+  - 节点侧还有一道闸门:`service/authgate.go` 要求三个**客户端可见**的 service 必须带服务站的信任标记(开关 `require_authenticated`);节点间协作(`DataSyncService` / `InternalService`)不受影响、也不得要求。信任标记刻意不携带身份——接收方只需知道"有权限提问的东西替这次调用背了书",安全性建立在"集群从外部不可达"之上。
 - **网关 `cmd/stratum-gateway`**:把三个外部 gRPC 服务暴露为 REST/JSON,并从同源提供 Web 控制台静态资源(`web/`),因此无需 CORS。内部服务(`DataSyncService`、`InternalService`)有意不对外。
 
 ```
-Web UI ⇄ gateway(:8081) ⇄ router(:7009) ⇄ node1 / node2 / node3
+Web UI ⇄ gateway(:8081) ⇄ station(:7009) ⇄ 存储节点(读) / 控制节点(写)
 ```
 
 ```bash
 scripts/gateway.sh [single|build|stop]   # 默认:构建后起 Docker 集群模式;single=连 127.0.0.1:7000
-scripts/router.sh status|stop            # 单独管理路由层
+scripts/router.sh status|stop            # 单独管理服务站(两层拓扑下会从 run/console.yaml 自动派生 -storage-nodes)
 
-# 手动等价:先起路由层,再起 gateway(始终指向路由层)
+# 两层集群(控制组 + 存储组)一键起停,细节见脚本头部
+scripts/docker-cluster-both.sh build     # 两个镜像;存储镜像自带 vecstore(scripts/build-storage-image.sh)
+scripts/docker-cluster-both.sh up        # 控制组 1..3(17000+) + 存储组 11..13(17100+) + mock-embed
+scripts/docker-cluster-both.sh status    # 每容器状态与控制组 leader
+
+# 手动等价:先起服务站,再起 gateway(始终指向服务站)
 ./run/bin/stratum-router  -listen 0.0.0.0:7009 -nodes 127.0.0.1:7000
 ./run/bin/stratum-gateway -grpc-addr 127.0.0.1:7009
 ```
