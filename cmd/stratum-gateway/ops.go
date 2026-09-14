@@ -64,9 +64,11 @@ func newOpsManager(cfgPath string, nodeID int) (*opsManager, error) {
 		cfgPath: cfgPath,
 		cfg:     &cfg,
 		sup:     NewSupervisor(&cfg),
-		docker:  &dockerCluster{script: cfg.Docker.Script},
-		opsMux:  http.NewServeMux(),
-		client:  &http.Client{Timeout: 3 * time.Second},
+		// 脚本路径不再缓存在这里：它按拓扑从配置解析（见 dockerCluster.scriptPath），
+		// 缓存一份就会在切换拓扑后继续驱动旧脚本。
+		docker: &dockerCluster{},
+		opsMux: http.NewServeMux(),
+		client: &http.Client{Timeout: 3 * time.Second},
 	}
 	m.registerRoutes(m.opsMux)
 	return m, nil
@@ -238,7 +240,6 @@ func (m *opsManager) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.sup.SetConfig(m.cfg)
-	m.docker.script = m.cfg.Docker.Script
 	writeOpsJSON(w, http.StatusOK, map[string]any{
 		"ok":   true,
 		"note": "参数已保存；正在运行的服务将在下次启动/重启时生效",
@@ -552,7 +553,6 @@ func (m *opsManager) handleDockerPutConfig(w http.ResponseWriter, r *http.Reques
 	// 布尔字段允许显式关闭：WithEmbed/Enabled 以 patch 中的值为准。
 	m.cfg.Docker.WithEmbed = patch.WithEmbed
 	m.cfg.Docker.Enabled = patch.Enabled
-	m.docker.script = m.cfg.Docker.Script
 	if err := saveOpsConfig(m.cfgPath, m.cfg); err != nil {
 		writeOpsError(w, http.StatusInternalServerError, "save config: "+err.Error())
 		return

@@ -31,14 +31,15 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	KnowledgeBaseService_CreateKnowledgeBase_FullMethodName = "/stratum.KnowledgeBaseService/CreateKnowledgeBase"
-	KnowledgeBaseService_DeleteKnowledgeBase_FullMethodName = "/stratum.KnowledgeBaseService/DeleteKnowledgeBase"
-	KnowledgeBaseService_CreateVersion_FullMethodName       = "/stratum.KnowledgeBaseService/CreateVersion"
-	KnowledgeBaseService_ListVersions_FullMethodName        = "/stratum.KnowledgeBaseService/ListVersions"
-	KnowledgeBaseService_RollbackVersion_FullMethodName     = "/stratum.KnowledgeBaseService/RollbackVersion"
-	KnowledgeBaseService_DeleteVersion_FullMethodName       = "/stratum.KnowledgeBaseService/DeleteVersion"
-	KnowledgeBaseService_ListKnowledgeBases_FullMethodName  = "/stratum.KnowledgeBaseService/ListKnowledgeBases"
-	KnowledgeBaseService_GetKnowledgeBase_FullMethodName    = "/stratum.KnowledgeBaseService/GetKnowledgeBase"
+	KnowledgeBaseService_CreateKnowledgeBase_FullMethodName   = "/stratum.KnowledgeBaseService/CreateKnowledgeBase"
+	KnowledgeBaseService_DeleteKnowledgeBase_FullMethodName   = "/stratum.KnowledgeBaseService/DeleteKnowledgeBase"
+	KnowledgeBaseService_CreateVersion_FullMethodName         = "/stratum.KnowledgeBaseService/CreateVersion"
+	KnowledgeBaseService_ListVersions_FullMethodName          = "/stratum.KnowledgeBaseService/ListVersions"
+	KnowledgeBaseService_RollbackVersion_FullMethodName       = "/stratum.KnowledgeBaseService/RollbackVersion"
+	KnowledgeBaseService_DeleteVersion_FullMethodName         = "/stratum.KnowledgeBaseService/DeleteVersion"
+	KnowledgeBaseService_ListKnowledgeBases_FullMethodName    = "/stratum.KnowledgeBaseService/ListKnowledgeBases"
+	KnowledgeBaseService_GetKnowledgeBase_FullMethodName      = "/stratum.KnowledgeBaseService/GetKnowledgeBase"
+	KnowledgeBaseService_GetDataVersionHolders_FullMethodName = "/stratum.KnowledgeBaseService/GetDataVersionHolders"
 )
 
 // KnowledgeBaseServiceClient is the client API for KnowledgeBaseService service.
@@ -53,6 +54,16 @@ type KnowledgeBaseServiceClient interface {
 	DeleteVersion(ctx context.Context, in *DeleteVersionRequest, opts ...grpc.CallOption) (*DeleteVersionResponse, error)
 	ListKnowledgeBases(ctx context.Context, in *ListKnowledgeBasesRequest, opts ...grpc.CallOption) (*ListKnowledgeBasesResponse, error)
 	GetKnowledgeBase(ctx context.Context, in *GetKnowledgeBaseRequest, opts ...grpc.CallOption) (*GetKnowledgeBaseResponse, error)
+	// GetDataVersionHolders answers "which nodes reported holding kbID at or past
+	// versionID" — the §3.1 question the service station's route table asks. It
+	// reads the control leader's in-memory §7.13.4 aggregate, which is SOFT state:
+	// an empty answer means "no node I have heard from", never "no node has it".
+	//
+	// It belongs on this control-layer service rather than on DataSyncService
+	// because of who asks and who answers: the station already holds a control
+	// connection (ListKnowledgeBases is how it learns the target version), while
+	// the reporters are the data nodes.
+	GetDataVersionHolders(ctx context.Context, in *GetDataVersionHoldersRequest, opts ...grpc.CallOption) (*GetDataVersionHoldersResponse, error)
 }
 
 type knowledgeBaseServiceClient struct {
@@ -143,6 +154,16 @@ func (c *knowledgeBaseServiceClient) GetKnowledgeBase(ctx context.Context, in *G
 	return out, nil
 }
 
+func (c *knowledgeBaseServiceClient) GetDataVersionHolders(ctx context.Context, in *GetDataVersionHoldersRequest, opts ...grpc.CallOption) (*GetDataVersionHoldersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetDataVersionHoldersResponse)
+	err := c.cc.Invoke(ctx, KnowledgeBaseService_GetDataVersionHolders_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KnowledgeBaseServiceServer is the server API for KnowledgeBaseService service.
 // All implementations must embed UnimplementedKnowledgeBaseServiceServer
 // for forward compatibility.
@@ -155,6 +176,16 @@ type KnowledgeBaseServiceServer interface {
 	DeleteVersion(context.Context, *DeleteVersionRequest) (*DeleteVersionResponse, error)
 	ListKnowledgeBases(context.Context, *ListKnowledgeBasesRequest) (*ListKnowledgeBasesResponse, error)
 	GetKnowledgeBase(context.Context, *GetKnowledgeBaseRequest) (*GetKnowledgeBaseResponse, error)
+	// GetDataVersionHolders answers "which nodes reported holding kbID at or past
+	// versionID" — the §3.1 question the service station's route table asks. It
+	// reads the control leader's in-memory §7.13.4 aggregate, which is SOFT state:
+	// an empty answer means "no node I have heard from", never "no node has it".
+	//
+	// It belongs on this control-layer service rather than on DataSyncService
+	// because of who asks and who answers: the station already holds a control
+	// connection (ListKnowledgeBases is how it learns the target version), while
+	// the reporters are the data nodes.
+	GetDataVersionHolders(context.Context, *GetDataVersionHoldersRequest) (*GetDataVersionHoldersResponse, error)
 	mustEmbedUnimplementedKnowledgeBaseServiceServer()
 }
 
@@ -188,6 +219,9 @@ func (UnimplementedKnowledgeBaseServiceServer) ListKnowledgeBases(context.Contex
 }
 func (UnimplementedKnowledgeBaseServiceServer) GetKnowledgeBase(context.Context, *GetKnowledgeBaseRequest) (*GetKnowledgeBaseResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetKnowledgeBase not implemented")
+}
+func (UnimplementedKnowledgeBaseServiceServer) GetDataVersionHolders(context.Context, *GetDataVersionHoldersRequest) (*GetDataVersionHoldersResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetDataVersionHolders not implemented")
 }
 func (UnimplementedKnowledgeBaseServiceServer) mustEmbedUnimplementedKnowledgeBaseServiceServer() {}
 func (UnimplementedKnowledgeBaseServiceServer) testEmbeddedByValue()                              {}
@@ -354,6 +388,24 @@ func _KnowledgeBaseService_GetKnowledgeBase_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KnowledgeBaseService_GetDataVersionHolders_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetDataVersionHoldersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KnowledgeBaseServiceServer).GetDataVersionHolders(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KnowledgeBaseService_GetDataVersionHolders_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KnowledgeBaseServiceServer).GetDataVersionHolders(ctx, req.(*GetDataVersionHoldersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KnowledgeBaseService_ServiceDesc is the grpc.ServiceDesc for KnowledgeBaseService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -392,6 +444,10 @@ var KnowledgeBaseService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetKnowledgeBase",
 			Handler:    _KnowledgeBaseService_GetKnowledgeBase_Handler,
+		},
+		{
+			MethodName: "GetDataVersionHolders",
+			Handler:    _KnowledgeBaseService_GetDataVersionHolders_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -24,7 +24,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	pb "stratum/api/proto/stratum"
-	vecstorepb "stratum/api/proto/vecstore"
 	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
@@ -96,12 +95,12 @@ func main() {
 		logger.Fatal("failed to create data directory", zap.String("path", dataDir), zap.Error(err))
 	}
 
-	// --- Storage paths ---
-	docStorePath := dataDir + "/docstore"
-	chunkDocPath := dataDir + "/chunkdoc"
-	versionDocPath := dataDir + "/versiondoc"
+	// --- WAL path ---
+	//
+	// The data layers' paths live in buildStorageStack now; this one stays here
+	// because Raft's log is not part of the storage layer — a control node has
+	// one too.
 	walPath := dataDir + "/wal"
-	vecstoreAddr := cfg.VecstoreGRPCAddr
 
 	// --- Initialize WAL ---
 	walImpl, err := wal.NewFileWAL(walPath)
@@ -121,145 +120,90 @@ func main() {
 			zap.Int("count", len(records)))
 	}
 
-	// --- PebbleDB stores ---
-	ds, err := docstore.NewPebbleDocStore(docStorePath)
-	if err != nil {
-		logger.Fatal("failed to open DocStore", zap.String("path", docStorePath), zap.Error(err))
-	}
-
-	cdm, err := chunkdoc.NewPebbleChunkDocMapper(chunkDocPath)
-	if err != nil {
-		logger.Fatal("failed to open ChunkDocMapper", zap.String("path", chunkDocPath), zap.Error(err))
-	}
-
-	vd, err := versiondoc.NewPebbleVersionDocList(versionDocPath)
-	if err != nil {
-		logger.Fatal("failed to open VersionDocList", zap.String("path", versionDocPath), zap.Error(err))
-	}
-
-	// --- vecstore gRPC client ---
-	chunkStore, err := chunkstore.NewVecstoreChunkStore(vecstoreAddr)
-	if err != nil {
-		logger.Fatal("failed to connect to vecstore", zap.String("addr", vecstoreAddr), zap.Error(err))
-	}
-	defer chunkStore.Close()
-
-	// --- Raft ---
-	raftImpl, err := raft.NewRaftNodeImpl(raft.Config{
-		NodeID:             cfg.NodeID,
-		DataDir:            dataDir,
-		RaftAddr:           cfg.RaftAddr,
-		Peers:              cfg.Peers,
-		WAL:                walImpl,
-		Logger:             logger.Named("raft"),
-		MaxLogLength:       cfg.MaxLogLength,
-		HeartbeatInterval:  cfg.HeartbeatInterval,
-		ElectionTimeoutMin: cfg.ElectionTimeoutMin,
-		ElectionTimeoutMax: cfg.ElectionTimeoutMax,
-	})
-	if err != nil {
-		logger.Fatal("failed to start RaftNode", zap.Error(err))
-	}
-	defer raftImpl.Stop()
-
-	// --- Embed client ---
-	embedClient := embed.NewHTTPEmbedClient(cfg.EmbedServiceAddr, 30*time.Second)
-
-	// --- Bloom filters ---
-	// Real bits-and-blooms-backed implementations (replacing the Phase 0
-	// mocks): the chunk-existence filter on the write path and the
-	// version-document filter on the read path. Sized from config
-	// (bloom_filter.expected_items / false_positive_rate).
-	chunkBloom := bloom.NewBitsAndBloomsFilter(cfg.BloomExpectedItems, cfg.BloomFalsePositiveRate)
-	vBloomStore := bloom.NewVersionBloomStore(dataDir, cfg.BloomExpectedItems, cfg.BloomFalsePositiveRate, vd)
-
-	// Rebuild the chunk-existence filter from the authoritative
-	// chunk-doc mapping (the design's "从 chunk store 重建" is served from
-	// the Go-side mapping since the vecstore has no enumeration RPC; a
-	// chunk whose mapping was already GC'd simply contributes a stale
-	// positive that the write path's Exists confirmation resolves).
-	// Best-effort: on a multi-node follower the Raft state machine may not
-	// yet hold the full KB list right after startup; KBs missed here only
-	// cost extra Exists round-trips on the write path, never correctness.
-	ctx := context.Background()
-	if kbs, err := raftImpl.ListKnowledgeBases(ctx); err == nil {
-		for _, kb := range kbs {
-			chunkIDs, err := cdm.ListChunkIDs(ctx, kb.KBID)
-			if err != nil {
-				logger.Warn("chunk bloom rebuild: ListChunkIDs failed", zap.String("kb_id", kb.KBID), zap.Error(err))
-				continue
-			}
-			for _, cid := range chunkIDs {
-				chunkBloom.Add(cid)
-			}
-		}
-		logger.Info("chunk bloom filter rebuilt", zap.Int("kbs", len(kbs)))
+	// --- Metadata channel ---
+	//
+	// rn is how this process reaches replicated metadata, whoever holds it: its
+	// own Raft node when it runs one, the remote proxy when it does not
+	// (Stratum_设计文档v13.md §11 阶段 ④「存储集群独立进程」).
+	//
+	// A storage node keeps no log, votes in no election and never leads, so it
+	// holds no RaftNodeImpl: raftNode stays nil and every control-layer callback
+	// below is skipped. The metadata it needs — a knowledge base's quantizer
+	// configuration, the version chain, who currently leads — is read over gRPC
+	// through RemoteRaftNode, and the facts it produces travel back the same way.
+	//
+	// Every consumer below therefore takes rn, never raftImpl: the two shapes
+	// differ in where the metadata lives, not in what it means.
+	var rn raft.RaftNode
+	var raftNode *raft.RaftNodeImpl
+	if cfg.Role == NodeRoleStorage {
+		rn = &raft.RemoteRaftNode{ControlAddrs: controlAddrsFromPeers(cfg.Peers)}
+		logger.Info("starting as a storage node: no Raft log, metadata read through the control cluster",
+			zap.String("role", string(cfg.Role)), zap.Int("control_nodes", len(cfg.Peers)))
 	} else {
-		logger.Warn("chunk bloom rebuild: ListKnowledgeBases failed; filter starts empty (write path degrades, stays correct)", zap.Error(err))
+		raftNode, err = raft.NewRaftNodeImpl(raft.Config{
+			NodeID:             cfg.NodeID,
+			DataDir:            dataDir,
+			RaftAddr:           cfg.RaftAddr,
+			Peers:              cfg.Peers,
+			WAL:                walImpl,
+			Logger:             logger.Named("raft"),
+			MaxLogLength:       cfg.MaxLogLength,
+			HeartbeatInterval:  cfg.HeartbeatInterval,
+			ElectionTimeoutMin: cfg.ElectionTimeoutMin,
+			ElectionTimeoutMax: cfg.ElectionTimeoutMax,
+		})
+		if err != nil {
+			logger.Fatal("failed to start RaftNode", zap.Error(err))
+		}
+		defer raftNode.Stop()
+		rn = raftNode
 	}
 
-	// --- ChunkSplitter ---
-	chunkSplitter := &splitter.SlidingWindowSplitter{}
+	// --- Storage layer (local) ---
+	//
+	// A control node keeps no data storage: it owns replicated metadata only
+	// (Stratum_设计文档v13.md §7.0), and every path that used to reach into a
+	// local store now goes through the storage contract instead. What it keeps
+	// is the WAL and data directory above — Raft's own log and snapshots, which
+	// are what make this node a member rather than a holder of data.
+	//
+	// The bindings below are nil on a control node. That is deliberate and not
+	// a latent panic: the code paths that would dereference them are the ones
+	// the role split removed.
+	storageLocal := cfg.Role != NodeRoleControl
+	// The data-plane helpers that actually touch stores. A control node builds
+	// none of them: what it keeps is the broadcast side of the contract plus the
+	// leader-side aggregate storage nodes report their cursors to (§7.13.4).
+	var syncLeader *stratumsync.LeaderHandler
+	var syncFollower *stratumsync.Follower
+	var syncPusher *stratumsync.Pusher
+	var ds *docstore.PebbleDocStore
+	var cdm *chunkdoc.PebbleChunkDocMapper
+	var vd *versiondoc.PebbleVersionDocList
+	var chunkStore *chunkstore.VecstoreChunkStore
+	var chunkBloom *bloom.BitsAndBloomsFilter
+	var vBloomStore *bloom.VersionBloomStore
+	var chunkSplitter *splitter.SlidingWindowSplitter
+	var indexMgr *index.IndexManagerImpl
+	var embedClient *embed.HTTPEmbedClient
 
-	// --- IndexManager ---
-	indexMgr := index.NewIndexManager(index.IndexManagerConfig{
-		LRUCapacity:         cfg.IndexLRUCapacity,
-		LoadWaitTimeout:     cfg.IndexLoadWaitTimeout,
-		CallbackMaxRetries:  cfg.IndexCallbackMaxRetries,
-		CallbackRetryBaseMS: cfg.IndexCallbackRetryBaseMS,
-		VecstoreAddr:        vecstoreAddr,
-		IndexDataDir:        dataDir,
-		IndexRetentionCount: cfg.IndexRetentionCount,
-		MemoryThresholdMB:   cfg.IndexMemoryThresholdMB,
-		ColdThreshold:       cfg.IndexColdThreshold,
-		ColdSweepInterval:   cfg.IndexColdSweepInterval,
-		AppendMaxDeadRatio:  cfg.IndexAppendMaxDeadRatio,
-	})
-	indexMgr.SetLogger(logger.Named("index"))
-	// §8.6a: the cold-version evaluator is a local, passive policy (it
-	// only reads this node's access table), so it is started here rather
-	// than driven from the control layer. A no-op when no threshold is
-	// configured. Close() stops it.
-	indexMgr.StartColdPolicy()
-	// Build data sources: the IndexManager's async build reads the
-	// version's document set from VersionDocList, reverse-looks-up chunk
-	// IDs via ChunkDocMapper, and pulls each chunk vector from the
-	// vecstore's ChunkStorageService (the same keys the write path used).
-	// Without this wiring the build goroutine would invoke nil callbacks
-	// and crash the process on the first CreateVersion.
-	indexMgr.SetBuildDataSources(
-		vd.ListDocIDs,
-		cdm.ListChunkIDsByDocs,
-		func(ctx context.Context, kbID, chunkID string) ([]float32, error) {
-			resp, err := chunkStore.VecstoreClient().Read(ctx, &vecstorepb.ReadChunkRequest{
-				Key: chunkstore.EncodeKey(kbID, chunkID),
-			})
-			if err != nil {
-				return nil, err
-			}
-			return resp.GetVector(), nil
-		},
-	)
-	// KB metadata source: async builds read the KB-level quantizer
-	// configuration from the Raft state machine and forward it to the
-	// vecstore with each Build RPC (Stratum_设计文档v12.md 2.4).
-	indexMgr.SetKBMetaGetter(raftImpl.GetKB)
-	// §8.6(c): a pure-append version may start its index from its parent
-	// version's artifact instead of rebuilding. The parent link lives in the
-	// replicated version metadata, which the storage layer already reads
-	// read-only (same source as the active-version check in onVersionCreated).
-	indexMgr.SetVersionParentGetter(func(ctx context.Context, kbID string, versionID int64) (int64, error) {
-		versions, err := raftImpl.ListVersions(ctx, kbID)
+	ctx := context.Background()
+	if storageLocal {
+		stack, err := buildStorageStack(cfg, dataDir, rn, logger)
 		if err != nil {
-			return 0, err
+			logger.Fatal("failed to initialize the storage layer", zap.Error(err))
 		}
-		for _, v := range versions {
-			if v.VersionID == versionID {
-				return v.ParentVersionID, nil
-			}
-		}
-		return 0, nil
-	})
+		defer stack.Close()
+		ds, cdm, vd, chunkStore = stack.DocStore, stack.ChunkDocMapper, stack.VersionDocList, stack.ChunkStore
+		chunkBloom, vBloomStore = stack.ChunkBloom, stack.VersionBloom
+		chunkSplitter, indexMgr, embedClient = stack.ChunkSplitter, stack.IndexManager, stack.EmbedClient
+		logger.Info("storage layer initialized", zap.String("role", string(cfg.Role)))
+	} else {
+		logger.Info("starting without local storage: metadata only (control role)",
+			zap.String("role", string(cfg.Role)))
+	}
+
 	// controlPlane is the storage layer's only channel to replicated state
 	// (control-data-separation-design.md §4.2); stage ① runs it in-process.
 	//
@@ -269,10 +213,10 @@ func main() {
 	// from reports its predecessor collected. Both are created here because the
 	// control plane is the view's first reader.
 	dataVersionRegistry := plane.NewDataVersionRegistry()
-	dataVersionGate := plane.NewLeaderGate(raftImpl.IsLeader, dataVersionRegistry.Reset)
+	dataVersionGate := plane.NewLeaderGate(rn.IsLeader, dataVersionRegistry.Reset)
 	// requiredReplicaIDs is assigned once peerAddrByID exists, further down.
 	var requiredReplicaIDs func() ([]int64, error)
-	controlPlane := plane.NewLocalControlPlane(raftImpl,
+	controlPlane := plane.NewLocalControlPlane(rn,
 		plane.WithDataVersionView(dataVersionRegistry, dataVersionGate),
 		// §7.5: the replica set a version must reach before the WAL changes behind
 		// it become reclaimable. It comes from the cluster topology — never from the
@@ -294,24 +238,26 @@ func main() {
 	// further down; until then a build stays local, which is exactly how the
 	// cluster behaved before distribution existed.
 	var distributeIndex func(kbID string, versionID int64)
-	indexMgr.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
-		// Apply the on-disk retention policy after every successful build:
-		// keep the newest cfg.IndexRetentionCount index files per KB, drop
-		// older ones (rebuilt on demand via RebuildIndex). The active
-		// version is shielded so a rolled-back active version's index is
-		// never dropped. Best-effort: a policy failure is logged upstream
-		// and does not fail the build.
-		if status == types.IndexStatusReady {
-			if kb, err := raftImpl.GetKB(context.Background(), kbID); err == nil {
-				_ = indexMgr.EnforceDiskRetention(context.Background(), kbID, []int64{kb.ActiveVersionID, versionID})
+	// A control node has no index manager, so no builds to observe.
+	if indexMgr != nil {
+		indexMgr.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
+			// Apply the on-disk retention policy after every successful build:
+			// keep the newest cfg.IndexRetentionCount index files per KB, drop
+			// older ones (rebuilt on demand via RebuildIndex). The active
+			// version is shielded so a rolled-back active version's index is
+			// never dropped. Best-effort: a policy failure is logged upstream
+			// and does not fail the build.
+			if status == types.IndexStatusReady {
+				if kb, err := rn.GetKB(context.Background(), kbID); err == nil {
+					_ = indexMgr.EnforceDiskRetention(context.Background(), kbID, []int64{kb.ActiveVersionID, versionID})
+				}
+				if distributeIndex != nil {
+					distributeIndex(kbID, versionID)
+				}
 			}
-			if distributeIndex != nil {
-				distributeIndex(kbID, versionID)
-			}
-		}
-		return reportIndexStatus(context.Background(), controlPlane, kbID, versionID, status)
-	})
-	defer indexMgr.Close()
+			return reportIndexStatus(context.Background(), controlPlane, kbID, versionID, status)
+		})
+	}
 
 	// --- Coordinators ---
 	// writeMu serializes CreateVersion write transactions (BEGIN through
@@ -332,7 +278,7 @@ func main() {
 		RetryBaseIntervalMS: cfg.WriteRetryBaseMS,
 		WriteMu:             &writeMu,
 		WAL:                 walImpl,
-		RaftNode:            raftImpl,
+		RaftNode:            rn,
 		Splitter:            chunkSplitter,
 		EmbedClient:         embedClient,
 		ChunkBloom:          chunkBloom,
@@ -355,28 +301,83 @@ func main() {
 		Logger: logger,
 	})
 
+	// A deleted knowledge base's data is reclaimed by whoever holds it: the local
+	// stores on an all-in-one node, and the storage group on a control node that
+	// keeps none. The data plane is assembled further down (it needs the
+	// coordinators), so the choice is resolved on first use rather than guessed
+	// here.
+	//
+	// dataPlane is declared here and assigned below for exactly that reason: a
+	// control node's dropper needs it, and the two constructions would otherwise
+	// have to be interleaved.
+	var dataPlane *plane.LocalDataPlane
+	kbDropper := coordinator.NewDeferredKBDropper(func() coordinator.KBStorageDropper {
+		// The reclaim has two halves and a split deployment needs both: the
+		// storage group holds the data, and this node may hold a copy of its
+		// own. Broadcasting is what makes the delete work at all when the data
+		// is not here — the local layer deletes alone would clear this node's
+		// (possibly empty) stores and leave the storage group's data readable.
+		//
+		// This mirrors the data plane's own DropVersionData, which broadcasts
+		// and drops locally rather than choosing one.
+		droppers := coordinator.KBStorageDroppers{
+			coordinator.BroadcastKBDropper{Metadata: rn, Dropper: dataPlane},
+		}
+		if cfg.Role != NodeRoleControl {
+			droppers = append(droppers, coordinator.LocalKBDropper{
+				IndexManager:   indexMgr,
+				DocStore:       ds,
+				ChunkStore:     chunkStore,
+				ChunkDocMapper: cdm,
+				VersionDocList: vd,
+				VersionBloom:   vBloomStore,
+			})
+		}
+		return droppers
+	})
 	deleteCoord := coordinator.NewDeleteCoordinatorImpl(coordinator.DeleteCoordinatorConfig{
 		MaxRetries:          cfg.DeleteMaxRetries,
 		RetryBaseIntervalMS: cfg.DeleteRetryBaseMS,
 		WAL:                 walImpl,
-		RaftNode:            raftImpl,
+		RaftNode:            rn,
 		IndexManager:        indexMgr,
 		DocStore:            ds,
 		ChunkStore:          chunkStore,
 		ChunkDocMapper:      cdm,
 		VersionDocList:      vd,
 		VersionBloom:        vBloomStore,
+		Dropper:             kbDropper,
 	})
 
+	// Same two halves as the whole-KB dropper above, for the same reason: the
+	// version's records live in the storage group under a split topology, and
+	// this node may hold a copy of its own. The receiving node applies the
+	// visibility anchor itself, since it is the one holding the records.
+	versionDropper := coordinator.NewDeferredVersionDropper(func() coordinator.VersionStorageDropper {
+		droppers := coordinator.VersionStorageDroppers{
+			coordinator.BroadcastVersionDropper{Dropper: dataPlane},
+		}
+		if cfg.Role != NodeRoleControl {
+			droppers = append(droppers, coordinator.LocalVersionDropper{
+				IndexManager:   indexMgr,
+				DocStore:       ds,
+				VersionDocList: vd,
+				VersionBloom:   vBloomStore,
+				Metadata:       rn,
+			})
+		}
+		return droppers
+	})
 	deleteVersionCoord := coordinator.NewDeleteVersionCoordinatorImpl(coordinator.DeleteVersionCoordinatorConfig{
 		MaxRetries:          cfg.DeleteMaxRetries,
 		RetryBaseIntervalMS: cfg.DeleteRetryBaseMS,
 		WAL:                 walImpl,
-		RaftNode:            raftImpl,
+		RaftNode:            rn,
 		IndexManager:        indexMgr,
 		DocStore:            ds,
 		VersionDocList:      vd,
 		VersionBloom:        vBloomStore,
+		Dropper:             versionDropper,
 	})
 
 	// --- WAL crash recovery ---
@@ -395,7 +396,19 @@ func main() {
 	// retries) is skipped and counted, never fatal: it stays in the WAL
 	// for the next restart and the node keeps starting up. See the policy
 	// comment above runCrashRecovery.
-	runCrashRecovery(ctx, logger, records, writeCoord, deleteCoord, deleteVersionCoord, walImpl)
+	// Replaying interrupted transactions is storage-layer work: every record it
+	// resumes (a version write, a delete) drives a storage coordinator. A control
+	// node has none, so running this there dereferences nil and — since it runs
+	// during startup — crash-loops the process. That is not a hypothetical: two
+	// control nodes were killed and restarted by the fault-injection tests, both
+	// came back into a restart loop, the cluster lost quorum, and every test
+	// after it timed out waiting for a leader.
+	//
+	// Its WAL is not idle on a control node: Raft's own records live there. What
+	// must not happen is treating those as storage transactions to resume.
+	if storageLocal {
+		runCrashRecovery(ctx, logger, records, writeCoord, deleteCoord, deleteVersionCoord, walImpl)
+	}
 
 	// --- Index status reconcile (derive state from disk facts) ---
 	// The authoritative fact for "this version's index is built and
@@ -419,25 +432,31 @@ func main() {
 	// from dropping).
 
 	// --- Orphan-chunk garbage collector ---
-	gcImpl := coordinator.NewChunkGarbageCollectorImpl(coordinator.ChunkGarbageCollectorConfig{
-		SweepIntervalSec: cfg.GCSweepIntervalSec,
-		WriteMu:          &writeMu, // same mutex as WriteCoordinatorConfig.WriteMu
-		RaftNode:         raftImpl,
-		ChunkDocMapper:   cdm,
-		DocStore:         ds,
-		ChunkStore:       chunkStore,
-	})
-	gcImpl.SetLogger(logger.Named("gc"))
-	go gcImpl.Run(ctx)
+	// The orphan-chunk sweep is a storage-layer task: it walks this node's
+	// chunk mappings and reclaims what no version references.
+	if storageLocal {
+		gcImpl := coordinator.NewChunkGarbageCollectorImpl(coordinator.ChunkGarbageCollectorConfig{
+			SweepIntervalSec: cfg.GCSweepIntervalSec,
+			WriteMu:          &writeMu, // same mutex as WriteCoordinatorConfig.WriteMu
+			RaftNode:         rn,
+			ChunkDocMapper:   cdm,
+			DocStore:         ds,
+			ChunkStore:       chunkStore,
+		})
+		gcImpl.SetLogger(logger.Named("gc"))
+		go gcImpl.Run(ctx)
+	}
 
 	// --- Data sync (leader→follower) ---
 	// Leader handler: serves storage-layer data to followers via gRPC.
-	syncLeader := stratumsync.NewLeaderHandler(
-		ds.DB(),
-		cdm.DB(),
-		vd.DB(),
-		chunkStore.VecstoreClient(),
-	)
+	if storageLocal {
+		syncLeader = stratumsync.NewLeaderHandler(
+			ds.DB(),
+			cdm.DB(),
+			vd.DB(),
+			chunkStore.VecstoreClient(),
+		)
+	}
 
 	// Build nodeID→ServiceAddr map for follower leader resolution.
 	peerAddrByID := make(map[int64]string, len(cfg.Peers))
@@ -447,12 +466,36 @@ func main() {
 		}
 	}
 
+	// localAddr is this node's own service address as its peers see it: the
+	// address the dispatcher falls back to for local coordination, and the one a
+	// writer announces so replicas can find the data it just wrote. A storage
+	// node appears in the storage group rather than the Raft member list.
+	localAddr := peerAddrByID[cfg.NodeID]
+	for _, node := range cfg.StorageNodes {
+		if node.ID == cfg.NodeID {
+			localAddr = node.Addr
+		}
+	}
+
 	// resolveReplicaAddrs is the replica topology the write dispatcher walks
 	// (§7.13.2) — the same list §8.4 distribution and the §8.5 confirmation use:
 	// every member holds the full dataset, so the candidates are the peers other
 	// than this node. Assigned here (once peerAddrByID exists) and consumed
 	// through closures, so the assembly order does not matter.
 	resolveReplicaAddrs = func(_ context.Context) ([]string, error) {
+		// The declared storage group when there is one, otherwise the Raft
+		// members: before the split every member also stored, and a deployment
+		// that declares no storage.nodes keeps exactly that shape.
+		if len(cfg.StorageNodes) > 0 {
+			addrs := make([]string, 0, len(cfg.StorageNodes))
+			for _, node := range cfg.StorageNodes {
+				if node.ID == cfg.NodeID {
+					continue // this node already holds its own copy
+				}
+				addrs = append(addrs, node.Addr)
+			}
+			return addrs, nil
+		}
 		addrs := make([]string, 0, len(peerAddrByID))
 		for id, addr := range peerAddrByID {
 			if id == cfg.NodeID {
@@ -468,22 +511,37 @@ func main() {
 	// appends on the leader, so the access layer carries those proposals
 	// there instead of the caller having to know who leads
 	// (Stratum_设计文档v13.md §7.3/§7.8).
-	raftImpl.SetNodeID(cfg.NodeID)
-	raftImpl.SetForwarder(&raft.GRPCProposeForwarder{
-		AddrByID: func(id int64) (string, bool) {
-			addr, ok := peerAddrByID[id]
-			return addr, ok
-		},
-	})
+	// Only a node that holds a log forwards a proposal to whoever leads; a
+	// storage node reports through the same commands, but they travel to a
+	// control node that appends them (RemoteRaftNode).
+	if raftNode != nil {
+		raftNode.SetNodeID(cfg.NodeID)
+		raftNode.SetForwarder(&raft.GRPCProposeForwarder{
+			AddrByID: func(id int64) (string, bool) {
+				addr, ok := peerAddrByID[id]
+				return addr, ok
+			},
+		})
+	}
 
 	// §7.5: which nodes must hold a version before its WAL changes become
 	// reclaimable. The static peer list (cfg.Peers) is the right source: "should
 	// hold it" is a deployment fact, not a runtime observation — deriving it from
 	// who has reported would let a silent node silently leave the requirement.
 	requiredReplicaIDs = func() ([]int64, error) {
-		ids := make([]int64, 0, len(peerAddrByID))
-		for id := range peerAddrByID {
-			ids = append(ids, id)
+		// Same source rule as resolveReplicaAddrs: the declared storage group
+		// when there is one, every Raft member otherwise.
+		var ids []int64
+		if len(cfg.StorageNodes) > 0 {
+			ids = make([]int64, 0, len(cfg.StorageNodes))
+			for _, node := range cfg.StorageNodes {
+				ids = append(ids, node.ID)
+			}
+		} else {
+			ids = make([]int64, 0, len(peerAddrByID))
+			for id := range peerAddrByID {
+				ids = append(ids, id)
+			}
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 		return ids, nil
@@ -491,7 +549,9 @@ func main() {
 
 	// Follower: pulls data when this node applies a version written by
 	// the leader. The sync module is wired via OnVersionCreated.
-	syncFollower := stratumsync.NewFollower(ds, cdm, vd, chunkStore, indexMgr)
+	if storageLocal {
+		syncFollower = stratumsync.NewFollower(ds, cdm, vd, chunkStore, indexMgr)
+	}
 
 	// DataPlane owns "does this node need the version's data, and where from"
 	// (stage ① of the control/data separation: replication moved inside the
@@ -499,10 +559,12 @@ func main() {
 	// Write-path replication: the coordinator exports the version's records to
 	// the other replicas and requires a quorum of acknowledgements before the
 	// storage layer reports it durable (Stratum_设计文档v13.md §7.1/§7.2).
-	syncPusher := stratumsync.NewPusher(stratumsync.PusherConfig{
-		Exporter: syncLeader,
-		NodeID:   cfg.NodeID,
-	})
+	if storageLocal {
+		syncPusher = stratumsync.NewPusher(stratumsync.PusherConfig{
+			Exporter: syncLeader,
+			NodeID:   cfg.NodeID,
+		})
+	}
 
 	// §8.5: data-source announcements. A writer tells its replicas where a
 	// version's data lives — the §7.3 confirmation carries its own address —
@@ -512,7 +574,7 @@ func main() {
 	// §8.5 unusable.
 	dataSources := plane.NewDataSourceRegistry()
 
-	dataPlane := plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
+	dataPlane = plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
 		IndexManager:  indexMgr,
 		Puller:        syncFollower,
 		WAL:           walImpl,
@@ -544,14 +606,14 @@ func main() {
 		// control plane is the side that knows.
 		VersionExistence: controlPlane,
 		Verify: func(ctx context.Context, kbID string, versionID int64) bool {
-			return verifyVersionPull(ctx, raftImpl, vd, kbID, versionID)
+			return verifyVersionPull(ctx, rn, vd, kbID, versionID)
 		},
 		// Resolve answers "who holds this version's data": the §8.5 table first
 		// (a writer announced itself), then the pre-§8.5 answer — the leader.
 		// Both halves are lookups; nothing here dials a peer, because this runs
 		// on the Raft apply path.
 		Resolve: plane.ResolverWithRegistry(dataSources, func(ctx context.Context, kbID string, versionID int64) (string, bool, error) {
-			status, err := raftImpl.GetClusterStatus(ctx)
+			status, err := rn.GetClusterStatus(ctx)
 			if err != nil {
 				return "", false, fmt.Errorf("GetClusterStatus: %w", err)
 			}
@@ -581,7 +643,7 @@ func main() {
 		// §8.5: announce this node as the holder of the versions it writes, so
 		// replicas learn where the data is. It is its own DataSyncService
 		// address — the same gRPC endpoint serves every service.
-		SelfDataSyncAddr: peerAddrByID[cfg.NodeID],
+		SelfDataSyncAddr: localAddr,
 		Logger:           logger,
 	})
 
@@ -589,19 +651,44 @@ func main() {
 	// through it, and the read/sync path resolves pulls through it.
 	writeCoord.SetDataPlane(dataPlane)
 
+	// The pull path is the third: it is what knows a version's records have
+	// landed here, and this plane is what owns the cursor §9.3(2) reads. Wired
+	// after the plane exists because the follower is built well before it.
+	if syncFollower != nil {
+		syncFollower.SetLocalVersionAdvancer(dataPlane)
+	}
+
 	// §7.13.2: the dispatcher picks a write's coordinator and hands it the work.
 	// It is built here because it needs the data plane (for the local fallback)
 	// and the replica topology, and it is published through the closure the
 	// coordinator captured above.
-	writeDispatcher := plane.NewCoordinatorDispatcher(plane.CoordinatorDispatcherConfig{
+	// §7.13.2/§2.2: the write goes to a candidate from the KB's replica topology,
+	// tried in order until one takes it.
+	//
+	// A control node dispatches too — it may be the leader at apply time, and it
+	// holds no data. What it must NOT be is one of its own candidates: it is not a
+	// replica. LocalWrite is precisely what puts this node into candidates() (that
+	// list only ever gains selfAddr when localhost != nil), and on a control node
+	// dataPlane is nil. A nil receiver's method value is legal to form, so nothing
+	// complains there; it panics only when called, deep inside the write
+	// transaction — which is how a nil pointer in a dispatcher surfaced as a
+	// stack trace through the storage layer.
+	//
+	// So: set LocalWrite only where there is a data plane. On a control node the
+	// candidates are the storage group and every dispatch is remote, which is what
+	// the topology asks for.
+	dispatcherCfg := plane.CoordinatorDispatcherConfig{
 		Replicas: resolveReplicaAddrs,
-		SelfAddr: peerAddrByID[cfg.NodeID],
+		SelfAddr: localAddr,
+		Logger:   logger,
+	}
+	if storageLocal {
 		// Coordinating locally is the last resort: it keeps a single-node cluster
 		// — or one whose peers are all unreachable — progressing without a second
 		// code path for the write.
-		LocalWrite: dataPlane.WriteVersionData,
-		Logger:     logger,
-	})
+		dispatcherCfg.LocalWrite = dataPlane.WriteVersionData
+	}
+	writeDispatcher := plane.NewCoordinatorDispatcher(dispatcherCfg)
 	dispatchVersionWrite = func(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error {
 		// The coordinator's contract reports only success or failure — which node
 		// took the write is the dispatcher's business. The apply hook below, which
@@ -628,41 +715,52 @@ func main() {
 	// promotes versions whose READY proposal was lost
 	// (control-data-separation-design.md §5.3/§7). Retention runs first so the
 	// reconcile sees post-retention disk facts.
-	if err := dataPlane.EnforceRetention(ctx, raftImpl); err != nil {
-		logger.Warn("index retention: ListKnowledgeBases failed", zap.Error(err))
+	// Both halves are about on-disk index facts this node is assumed to have.
+	if storageLocal {
+		if err := dataPlane.EnforceRetention(ctx, rn); err != nil {
+			logger.Warn("index retention: ListKnowledgeBases failed", zap.Error(err))
+		}
+		reconcileIndexStatus(ctx, logger, dataPlane, controlPlane, rn, cfg.IndexRetentionCount)
 	}
-	reconcileIndexStatus(ctx, logger, dataPlane, controlPlane, raftImpl, cfg.IndexRetentionCount)
 
 	// §10.6: a cleanup broadcast that failed is retried in the background, so
 	// orphaned data does not depend on someone noticing a log line.
 	dataPlane.StartCleanupRetries(ctx)
 
-	raftImpl.SetOnVersionCreated(func(kbID string, versionID int64) {
-		// §8.6b: only the active version is worth building eagerly — it is what
-		// ordinary queries hit. Every other version still gets its data (the
-		// data has to be here for the version to count as durable) but no
-		// index; a query that does reach one builds it lazily, by scanning if
-		// the version is small and by waiting for a build if it is not.
-		//
-		// "Which version is active" is read from the replicated metadata rather
-		// than pushed down: the storage layer already has a read-only view of
-		// it (§7.0's MetadataLister), so no new control-layer channel is needed.
-		active := false
-		if kb, err := raftImpl.GetKB(context.Background(), kbID); err == nil && kb.ActiveVersionID == versionID {
-			active = true
-		}
-		if active {
-			if err := dataPlane.EnsureIndex(context.Background(), kbID, versionID); err != nil {
-				logger.Error("sync: version data pull did not converge",
+	// This callback is the apply loop's, so only a node with an apply loop has
+	// it: a storage node is never told "a version was created", it is handed the
+	// version's data directly (ExecuteVersionWrite).
+	// Only a node that holds data answers this: it is the hook that pulls a
+	// version's records here and builds its index. A control node's versions
+	// live in the storage group, and it has no stores to pull them into.
+	if storageLocal && raftNode != nil {
+		raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
+			// §8.6b: only the active version is worth building eagerly — it is what
+			// ordinary queries hit. Every other version still gets its data (the
+			// data has to be here for the version to count as durable) but no
+			// index; a query that does reach one builds it lazily, by scanning if
+			// the version is small and by waiting for a build if it is not.
+			//
+			// "Which version is active" is read from the replicated metadata rather
+			// than pushed down: the storage layer already has a read-only view of
+			// it (§7.0's MetadataLister), so no new control-layer channel is needed.
+			active := false
+			if kb, err := rn.GetKB(context.Background(), kbID); err == nil && kb.ActiveVersionID == versionID {
+				active = true
+			}
+			if active {
+				if err := dataPlane.EnsureIndex(context.Background(), kbID, versionID); err != nil {
+					logger.Error("sync: version data pull did not converge",
+						zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+				}
+				return
+			}
+			if err := dataPlane.FetchVersionData(context.Background(), kbID, versionID); err != nil {
+				logger.Error("sync: version data fetch did not converge",
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
 			}
-			return
-		}
-		if err := dataPlane.FetchVersionData(context.Background(), kbID, versionID); err != nil {
-			logger.Error("sync: version data fetch did not converge",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-		}
-	})
+		})
+	}
 
 	// §7.13.2: only a node that leads AT APPLY TIME dispatches (see
 	// RaftNodeImpl.SetOnVersionCommittedAsLeader) — one dispatch per write, not
@@ -670,53 +768,83 @@ func main() {
 	// since the Raft command carries none (§7.7). TAKING it is what keeps the
 	// apply hook and Execute's own background dispatch from both acting: whichever
 	// arrives first wins, the other becomes a no-op.
-	raftImpl.SetOnVersionCommittedAsLeader(func(kbID string, versionID, parentVersionID int64, clientRequestID string) {
-		regParentID, changes, ok := writeCoord.TakePendingDispatch(kbID, clientRequestID)
-		if !ok {
-			// Nothing registered: this node never held the changes (it did not
-			// accept the write), or the dispatch already happened. Leaving it is
-			// correct — a retry by the writer is what fills the gap (§7.12).
-			logger.Warn("version committed here without a pending dispatch",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
-			return
-		}
-		if regParentID != 0 {
-			parentVersionID = regParentID
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		if _, err := writeDispatcher.Dispatch(ctx, kbID, versionID, parentVersionID, changes); err != nil {
-			logger.Warn("write dispatch failed; the client's retry or the retry budget takes over",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-		}
-	})
+	if raftNode != nil {
+		raftNode.SetOnVersionCommittedAsLeader(func(kbID string, versionID, parentVersionID int64, clientRequestID string) {
+			regParentID, changes, ok := writeCoord.TakePendingDispatch(kbID, clientRequestID)
+			if !ok {
+				// Nothing registered: this node never held the changes (it did not
+				// accept the write), or the dispatch already happened. Leaving it is
+				// correct — a retry by the writer is what fills the gap (§7.12).
+				logger.Warn("version committed here without a pending dispatch",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+				return
+			}
+			if regParentID != 0 {
+				parentVersionID = regParentID
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if _, err := writeDispatcher.Dispatch(ctx, kbID, versionID, parentVersionID, changes); err != nil {
+				logger.Warn("write dispatch failed; the client's retry or the retry budget takes over",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			}
+		})
+	}
 
 	// --- gRPC services ---
-	kbSvc := service.NewKnowledgeBaseService(raftImpl, writeCoord, deleteCoord, deleteVersionCoord)
-	querySvc := service.NewQueryService(raftImpl, indexMgr, cdm, vd, ds, vBloomStore)
+	//
+	// Which services a node answers follows from what it holds. The control
+	// services need a log to append a client write to; the storage services need
+	// the local stores. Registering the wrong half would either panic on a nil
+	// Raft node or accept writes a storage node could never commit.
+	//
+	// QueryService and AdminService are storage services in fact, even though
+	// clients reach them on the same port: their constructors take the index
+	// manager and the local stores directly, so only a node holding data can
+	// build them at all.
+	// §9.3(5): the authentication gate covers the client-facing surface only.
+	// Both interceptors are installed together so a streaming method added later
+	// cannot quietly bypass it.
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(service.UnaryAuthGate(cfg.RequireAuthenticated)),
+		grpc.ChainStreamInterceptor(service.StreamAuthGate(cfg.RequireAuthenticated)),
+	)
+
+	if raftNode != nil {
+		kbSvc := service.NewKnowledgeBaseService(rn, writeCoord, deleteCoord, deleteVersionCoord)
+		// §9.3(1)/§4.3(1): the station's route table reads "which nodes hold this
+		// version" from the leader's §7.13.4 aggregate instead of probing storage
+		// nodes itself. The adapter bridges plane's Holder to the service's own
+		// type so the service does not import plane.
+		kbSvc.SetVersionHolderSource(versionHolderSource{controlPlane})
+		pb.RegisterKnowledgeBaseServiceServer(grpcServer, kbSvc)
+	}
+
 	// Data-missing detection (Stratum_设计文档v13.md §7.12): the control layer
 	// asks every candidate replica whether it holds a version whose data may
 	// never have landed, and surfaces the ones nobody has.
-	presenceChecker := stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{})
-	adminSvc := service.NewAdminService(cfg.NodeID, raftImpl, indexMgr, ds, chunkStore, walImpl,
-		func() []string {
-			addrs := make([]string, 0, len(peerAddrByID))
-			for id, addr := range peerAddrByID {
-				if id == cfg.NodeID {
-					continue // this node's own view is not a replica answer
+	// These read the local stores by construction, so only a node holding data
+	// can build them. A control node answers neither.
+	if storageLocal {
+		presenceChecker := stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{})
+		querySvc := service.NewQueryService(rn, indexMgr, cdm, vd, ds, vBloomStore)
+		// §9.3(2): honouring a freshness credential requires being able to
+		// answer "how far does my history reach". Without this the node can only
+		// ignore credentials, which is not the same as refusing a stale answer.
+		querySvc.SetLocalVersionReporter(dataPlane)
+		adminSvc := service.NewAdminService(cfg.NodeID, rn, indexMgr, ds, chunkStore, walImpl,
+			func() []string {
+				addrs, err := resolveReplicaAddrs(context.Background())
+				if err != nil {
+					return nil
 				}
-				addrs = append(addrs, addr)
-			}
-			return addrs
-		},
-		presenceChecker,
-	)
-
-	// --- gRPC server ---
-	grpcServer := grpc.NewServer()
-	pb.RegisterKnowledgeBaseServiceServer(grpcServer, kbSvc)
-	pb.RegisterQueryServiceServer(grpcServer, querySvc)
-	pb.RegisterAdminServiceServer(grpcServer, adminSvc)
+				return addrs
+			},
+			presenceChecker,
+		)
+		pb.RegisterQueryServiceServer(grpcServer, querySvc)
+		pb.RegisterAdminServiceServer(grpcServer, adminSvc)
+	}
 
 	// One data-plane service per node: it both exports versions to peers (the
 	// pull path) and receives pushed ones, and answers presence/cursor
@@ -725,6 +853,10 @@ func main() {
 		syncLeader,
 		stratumsync.NewPushHandler(syncFollower, cfg.NodeID,
 			stratumsync.WithLocalVersion(dataPlane),
+			// §9.3(2): receiving a version's records is what makes this node
+			// hold it; without this the cursor stays 0 and the station's
+			// freshness check refuses a replica whose data is complete.
+			stratumsync.WithLocalVersionAdvancer(dataPlane),
 			stratumsync.WithVersionDataDropper(writeCoord),
 			stratumsync.WithVersionWriteWatcher(dataPlane),
 			stratumsync.WithIndexInstaller(indexMgr),
@@ -751,8 +883,12 @@ func main() {
 	)
 	pb.RegisterDataSyncServiceServer(grpcServer, nodeHandler)
 
-	// The internal service is how a peer forwards a proposal to this node.
-	pb.RegisterInternalServiceServer(grpcServer, raft.NewInternalServiceServer(raftImpl))
+	// The internal service is how a peer forwards a proposal to this node —
+	// which only a node holding a log can serve, so a storage node leaves it
+	// unregistered rather than being asked to append to a log it does not have.
+	if raftNode != nil {
+		pb.RegisterInternalServiceServer(grpcServer, raft.NewInternalServiceServer(raftNode))
+	}
 
 	lis, err := net.Listen("tcp", cfg.GRPCAddr)
 	if err != nil {
@@ -775,10 +911,14 @@ func main() {
 	// report is soft state, so a failed one is only logged and the next interval
 	// sends the whole view again.
 	go stratumsync.NewDataVersionReporter(stratumsync.DataVersionReporterConfig{
-		NodeID:       cfg.NodeID,
+		NodeID: cfg.NodeID,
+		// §3.1: the leader's aggregate hands this address to consumers (the
+		// station's route table), so a holder is something they can dial rather
+		// than an id each of them would have to map on its own.
+		SelfAddr:     localAddr,
 		DataVersions: dataPlane.DataVersionsSnapshot,
 		ResolveLeader: func(rctx context.Context) (string, bool, error) {
-			status, err := raftImpl.GetClusterStatus(rctx)
+			status, err := rn.GetClusterStatus(rctx)
 			if err != nil {
 				return "", false, fmt.Errorf("GetClusterStatus: %w", err)
 			}
@@ -837,6 +977,20 @@ const (
 // exponential backoff. On the first success it returns nil; if every
 // attempt fails it returns the last error (the caller then skips the
 // record — see runCrashRecovery).
+// controlAddrsFromPeers is the control cluster's address table as a storage node
+// needs it: every Raft peer by ID. The peers list is the control layer's own
+// membership, which is exactly who can answer a metadata read or accept a
+// forwarded proposal.
+func controlAddrsFromPeers(peers []raft.PeerConfig) map[int64]string {
+	addrs := make(map[int64]string, len(peers))
+	for _, peer := range peers {
+		if peer.ServiceAddr != "" {
+			addrs[peer.ID] = peer.ServiceAddr
+		}
+	}
+	return addrs
+}
+
 // replicaPusher adapts stratumsync.Pusher to plane.VersionPusher: the storage
 // layer only needs the acknowledging replica's node ID, not the whole
 // response.
@@ -1094,6 +1248,21 @@ type appConfig struct {
 	RaftAddr string
 	Peers    []raft.PeerConfig
 
+	// RequireAuthenticated makes this node accept client-facing calls
+	// (KnowledgeBaseService / QueryService / AdminService) only when they carry
+	// the service station's trust mark (Stratum_设计文档v13.md §9.3(5)).
+	//
+	// Off by default because a deployment without a station must keep working.
+	// It is the setting to turn ON wherever a station sits in front of the
+	// cluster: without it, anything that can reach a node's port steps around
+	// the station's authentication — and silently, since a station misconfigured
+	// to omit the mark looks perfectly normal.
+	//
+	// Internal collaboration (DataSyncService / InternalService) is never gated:
+	// those calls carry no end user's credential, and requiring one would break
+	// fan-out, catch-up and Raft forwarding outright.
+	RequireAuthenticated bool
+
 	// StorageNodes is the storage group (Stratum_设计文档v13.md §11 阶段 ④).
 	//
 	// On a control node it is the replica topology a committed write is
@@ -1137,6 +1306,17 @@ type appConfig struct {
 	// (index_manager.cold_threshold_ms, §8.6a); <= 0 disables the policy.
 	IndexColdThreshold time.Duration
 
+	// IndexBuildAbandonTimeout is how long a half-built index artifact may sit
+	// on disk before the sweeper reclaims it
+	// (index_manager.build_abandon_timeout_ms; §6 of
+	// coordinator-selection-and-node-liveness-design.md).
+	//
+	// Semantics deliberately invert those of the cold threshold: reclaiming an
+	// artifact that no one sealed is pure hygiene with no behavioural risk, so it
+	// is ON by default (<= 0 takes 30 minutes) and only a NEGATIVE value disables
+	// it.
+	IndexBuildAbandonTimeout time.Duration
+
 	// IndexColdSweepInterval is how often that evaluator re-reads the
 	// access table (index_manager.cold_sweep_interval_ms); <= 0 means the
 	// IndexManager's default.
@@ -1166,10 +1346,11 @@ type appConfig struct {
 // defaultConfig()'s values.
 type fileConfig struct {
 	Node struct {
-		NodeID   int64  `yaml:"node_id"`
-		Role     string `yaml:"role"`
-		GRPCAddr string `yaml:"grpc_addr"`
-		RaftAddr string `yaml:"raft_addr"`
+		NodeID               int64  `yaml:"node_id"`
+		Role                 string `yaml:"role"`
+		GRPCAddr             string `yaml:"grpc_addr"`
+		RaftAddr             string `yaml:"raft_addr"`
+		RequireAuthenticated bool   `yaml:"require_authenticated"`
 	} `yaml:"node"`
 
 	Raft struct {
@@ -1214,14 +1395,17 @@ type fileConfig struct {
 	} `yaml:"embed"`
 
 	IndexManager struct {
-		LRUCapacity         int     `yaml:"lru_capacity"`
-		MemoryThresholdMB   int     `yaml:"memory_threshold_mb"`
-		LoadWaitTimeoutMS   int     `yaml:"load_wait_timeout_ms"`
-		CallbackMaxRetries  int     `yaml:"callback_max_retries"`
-		CallbackRetryBaseMS int     `yaml:"callback_retry_base_interval_ms"`
-		ColdThresholdMS     int     `yaml:"cold_threshold_ms"`
-		ColdSweepIntervalMS int     `yaml:"cold_sweep_interval_ms"`
-		AppendMaxDeadRatio  float64 `yaml:"append_max_dead_ratio"`
+		LRUCapacity         int `yaml:"lru_capacity"`
+		MemoryThresholdMB   int `yaml:"memory_threshold_mb"`
+		LoadWaitTimeoutMS   int `yaml:"load_wait_timeout_ms"`
+		CallbackMaxRetries  int `yaml:"callback_max_retries"`
+		CallbackRetryBaseMS int `yaml:"callback_retry_base_interval_ms"`
+		ColdThresholdMS     int `yaml:"cold_threshold_ms"`
+		// BuildAbandonTimeoutMS is the §6 abandoned-artifact window. <= 0 takes
+		// the default (30 minutes); negative disables the sweeper.
+		BuildAbandonTimeoutMS int     `yaml:"build_abandon_timeout_ms"`
+		ColdSweepIntervalMS   int     `yaml:"cold_sweep_interval_ms"`
+		AppendMaxDeadRatio    float64 `yaml:"append_max_dead_ratio"`
 	} `yaml:"index_manager"`
 
 	WriteCoordinator struct {
@@ -1292,6 +1476,9 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.Raft.MaxLogLength > 0 {
 		cfg.MaxLogLength = uint64(fc.Raft.MaxLogLength)
 	}
+	if fc.Node.RequireAuthenticated {
+		cfg.RequireAuthenticated = true
+	}
 	if fc.Node.Role != "" {
 		role, err := parseNodeRole(fc.Node.Role)
 		if err != nil {
@@ -1332,6 +1519,14 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	if fc.IndexManager.ColdThresholdMS != 0 {
 		cfg.IndexColdThreshold = time.Duration(fc.IndexManager.ColdThresholdMS) * time.Millisecond
+	}
+	// The abandoned-artifact window is independent of the cold policy: a node
+	// that never reshapes a version still leaves remains behind when a build
+	// dies, and this sweeper is the only thing that reclaims them (§8.8).
+	// Parsing it inside the cold-threshold branch — where it used to live —
+	// meant that setting only build_abandon_timeout_ms silently did nothing.
+	if ms := fc.IndexManager.BuildAbandonTimeoutMS; ms != 0 {
+		cfg.IndexBuildAbandonTimeout = time.Duration(ms) * time.Millisecond
 	}
 	if fc.IndexManager.ColdSweepIntervalMS != 0 {
 		cfg.IndexColdSweepInterval = time.Duration(fc.IndexManager.ColdSweepIntervalMS) * time.Millisecond
@@ -1425,4 +1620,29 @@ func defaultConfig() appConfig {
 
 		GCSweepIntervalSec: 300,
 	}
+}
+
+// versionHolderSource adapts the control plane's data-version aggregate to what
+// the knowledge base service exposes to the station (§3.1).
+//
+// It exists to keep the dependency pointing one way: service does not import
+// plane, so the two Holder types (identical in content) are bridged here, where
+// both are already visible.
+type versionHolderSource struct {
+	cp *plane.LocalControlPlane
+}
+
+// DataVersionHolders reports which nodes hold kbID at or past versionID, and
+// whether this node is the control leader — a non-leader has folded no reports,
+// so its empty answer means "nobody I have heard from", never "nobody has it".
+func (s versionHolderSource) DataVersionHolders(kbID string, versionID int64) ([]service.VersionHolder, bool) {
+	holders, ok := s.cp.DataVersionHolders(kbID, versionID)
+	if !ok {
+		return nil, false
+	}
+	out := make([]service.VersionHolder, 0, len(holders))
+	for _, h := range holders {
+		out = append(out, service.VersionHolder{NodeID: h.NodeID, Address: h.Address})
+	}
+	return out, true
 }

@@ -35,7 +35,7 @@ func (s *recordingSink) SetLeaderWatermarks(watermarks map[string]int64) {
 	s.lastOne = watermarks
 }
 
-func (r *recordingRecorder) Record(nodeID int64, dataVersions map[string]int64) {
+func (r *recordingRecorder) Record(nodeID int64, address string, dataVersions map[string]int64) {
 	r.nodes = append(r.nodes, nodeID)
 	r.reports = append(r.reports, dataVersions)
 }

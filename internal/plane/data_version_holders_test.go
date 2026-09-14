@@ -10,8 +10,8 @@ import (
 // healthy node actually has (§10.6).
 func TestLocalControlPlane_DataVersionHoldersAnswersOnlyAsLeader(t *testing.T) {
 	reg := NewDataVersionRegistry()
-	reg.Record(2, map[string]int64{"kb-1": 7})
-	reg.Record(3, map[string]int64{"kb-1": 4})
+	reg.Record(2, "10.0.0.2:7000", map[string]int64{"kb-1": 7})
+	reg.Record(3, "10.0.0.3:7000", map[string]int64{"kb-1": 4})
 
 	var leader atomic.Bool
 	gate := NewLeaderGate(func() bool { return leader.Load() }, reg.Reset)
@@ -30,12 +30,12 @@ func TestLocalControlPlane_DataVersionHoldersAnswersOnlyAsLeader(t *testing.T) {
 		t.Fatalf("right after takeover: (%v, %v), want (empty, true)", holders, ok)
 	}
 
-	reg.Record(2, map[string]int64{"kb-1": 7})
+	reg.Record(2, "10.0.0.2:7000", map[string]int64{"kb-1": 7})
 	holders, ok := c.DataVersionHolders("kb-1", 4)
 	if !ok {
 		t.Fatal("a leader with a report must answer")
 	}
-	if len(holders) != 1 || holders[0] != 2 {
+	if len(holders) != 1 || holders[0].NodeID != 2 {
 		t.Errorf("holders = %v, want [2] — the takeover cleared every report, and only node 2 has re-reported since", holders)
 	}
 

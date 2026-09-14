@@ -63,11 +63,29 @@ func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versi
 
 // installFile atomically replaces path with data: write a temporary sibling,
 // fsync it, then rename over the target.
+//
+// The temporary name is unique per call rather than derived from the target
+// alone. The target is the same for every source pushing this (kb, version) —
+// and under §8.4 "build once, distribute N" every replica announces what it
+// holds, so several of them push the SAME artifact here at once. With one shared
+// ".installing" name those writers truncate and rename each other's temporary
+// file: the first rename consumes it and the rest fail with ENOENT, and an
+// interleaved pair can publish a half-written artifact. Unique names let each
+// writer publish its own complete copy and the last rename win — the payloads
+// are the same version's index, so either winner is correct.
 func installFile(path string, data []byte) error {
-	tmp := path + ".installing"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".installing.*")
 	if err != nil {
-		return fmt.Errorf("index: InstallIndex: create %s: %w", tmp, err)
+		return fmt.Errorf("index: InstallIndex: create temp beside %s: %w", path, err)
+	}
+	tmp := f.Name()
+	// 0666 for the same reason the target directory is 0777: the file has to be
+	// readable however the writer happens to be running.
+	if err := f.Chmod(0o666); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("index: InstallIndex: chmod %s: %w", tmp, err)
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()

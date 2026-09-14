@@ -36,6 +36,18 @@ type DeleteCoordinatorConfig struct {
 	// May be nil when the filter store is not wired; the cleanup then
 	// skips its on-disk file deletion.
 	VersionBloom *bloom.VersionBloomStore
+
+	// Dropper reclaims the knowledge base's physical data.
+	//
+	// When set, it is what the flow calls instead of reaching into the stores
+	// above: the reclaim then happens wherever the data actually is, which is
+	// what lets a control node with no storage of its own run this flow at all
+	// (Stratum_设计文档v13.md §7.0、§11 阶段 ④).
+	//
+	// nil falls back to a LocalKBDropper built from the fields above — the same
+	// layer-by-layer deletes, so the fallback is not a second code path but the
+	// same one reached without wiring.
+	Dropper KBStorageDropper
 }
 
 // DeleteCoordinatorImpl is the real DeleteCoordinator implementation,
@@ -85,56 +97,31 @@ func (c *DeleteCoordinatorImpl) Execute(ctx context.Context, kbID string) error 
 		return c.abort(ctx, kbID, fmt.Errorf("WAL.WriteDeleteMark: %w", err))
 	}
 
-	// Step 1: Evict indexes from memory.
-	if err := c.retry(ctx, func() error {
-		return c.cfg.IndexManager.EvictByKB(ctx, kbID)
-	}); err != nil {
-		return c.abort(ctx, kbID, fmt.Errorf("IndexManager.EvictByKB: %w", err))
-	}
-
-	// Step 2: delete on-disk index files and version-document bloom
-	// files (Stratum_设计文档v10.md "删除知识库" 第 4 步). Both deletions
-	// ignore missing files/directories, so re-running after a crash is
-	// safe. VersionBloom may be nil (not wired); skip then.
-	if err := c.retry(ctx, func() error {
-		return c.cfg.IndexManager.DeleteFilesByKB(ctx, kbID)
-	}); err != nil {
-		return c.abort(ctx, kbID, fmt.Errorf("IndexManager.DeleteFilesByKB: %w", err))
-	}
-	if c.cfg.VersionBloom != nil {
-		if err := c.retry(ctx, func() error {
-			return c.cfg.VersionBloom.DeleteByKB(kbID)
-		}); err != nil {
-			return c.abort(ctx, kbID, fmt.Errorf("VersionBloom.DeleteByKB: %w", err))
+	// Steps 1-6: reclaim the knowledge base's physical data — its in-memory
+	// indexes, on-disk index and bloom files, documents, chunk vectors,
+	// chunk→doc mappings and version→doc lists.
+	//
+	// Who performs these depends on where the data is, and the storage layer is
+	// what owns it (§7.0). So the flow asks for the reclaim rather than doing
+	// it: a node that holds the data reclaims locally, and a control node with
+	// no storage of its own hands each version to the nodes that do. A nil
+	// dropper keeps the historical behaviour by building the local one, so the
+	// all-in-one deployment is unchanged.
+	dropper := c.cfg.Dropper
+	if dropper == nil {
+		dropper = LocalKBDropper{
+			IndexManager:   c.cfg.IndexManager,
+			DocStore:       c.cfg.DocStore,
+			ChunkStore:     c.cfg.ChunkStore,
+			ChunkDocMapper: c.cfg.ChunkDocMapper,
+			VersionDocList: c.cfg.VersionDocList,
+			VersionBloom:   c.cfg.VersionBloom,
 		}
 	}
-
-	// Step 3: DocStore.DeleteByKB.
 	if err := c.retry(ctx, func() error {
-		return c.cfg.DocStore.DeleteByKB(ctx, kbID)
+		return dropper.DropKnowledgeBase(ctx, kbID)
 	}); err != nil {
-		return c.abort(ctx, kbID, fmt.Errorf("DocStore.DeleteByKB: %w", err))
-	}
-
-	// Step 4: ChunkStore.DeleteByKB.
-	if err := c.retry(ctx, func() error {
-		return c.cfg.ChunkStore.DeleteByKB(ctx, kbID)
-	}); err != nil {
-		return c.abort(ctx, kbID, fmt.Errorf("ChunkStore.DeleteByKB: %w", err))
-	}
-
-	// Step 5: ChunkDocMapper.DeleteByKB.
-	if err := c.retry(ctx, func() error {
-		return c.cfg.ChunkDocMapper.DeleteByKB(ctx, kbID)
-	}); err != nil {
-		return c.abort(ctx, kbID, fmt.Errorf("ChunkDocMapper.DeleteByKB: %w", err))
-	}
-
-	// Step 6: VersionDocList.DeleteByKB.
-	if err := c.retry(ctx, func() error {
-		return c.cfg.VersionDocList.DeleteByKB(ctx, kbID)
-	}); err != nil {
-		return c.abort(ctx, kbID, fmt.Errorf("VersionDocList.DeleteByKB: %w", err))
+		return c.abort(ctx, kbID, fmt.Errorf("DropKnowledgeBase: %w", err))
 	}
 
 	// Step 7: RaftNode.ProposeRemoveKBMeta.

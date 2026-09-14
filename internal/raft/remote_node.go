@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/authmeta"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/types"
 	"stratum/internal/wire"
@@ -246,7 +247,10 @@ func (r *RemoteRaftNode) proposeAt(ctx context.Context, id int64, addr string, d
 	}
 	defer func() { _ = conn.Close() }()
 
-	resp, err := pb.NewInternalServiceClient(conn).Propose(ctx, &pb.ProposeRequest{Command: data})
+	// Same reason as the reads: a proposal travels control-plane traffic, and
+	// the receiving control node treats a mark-less call as one that reached its
+	// port directly.
+	resp, err := pb.NewInternalServiceClient(conn).Propose(authmeta.WithVerifiedMark(ctx), &pb.ProposeRequest{Command: data})
 	if err != nil {
 		return ForwardedResult{}, 0, fmt.Errorf("raft: remote: propose at control node %d (%s): %w", id, addr, err)
 	}
@@ -370,7 +374,14 @@ func (r *RemoteRaftNode) readAtAnyControl(ctx context.Context, op func(ctx conte
 			lastErr = fmt.Errorf("raft: remote: dial control node %d (%s): %w", id, r.ControlAddrs[id], err)
 			continue
 		}
-		err = op(ctx, conn)
+		// The mark says "this came from inside the system". A storage node reads
+		// replicated metadata through the control layer's client-facing service,
+		// and a node configured with require_authenticated serves that service
+		// only to calls carrying the mark — which this one is in kind, just not
+		// in path. Without it a gated cluster's storage tier cannot read
+		// metadata at all: the reads come back Unauthenticated and every query
+		// fails. That is how this was found.
+		err = op(authmeta.WithVerifiedMark(ctx), conn)
 		_ = conn.Close()
 		if err == nil {
 			return nil

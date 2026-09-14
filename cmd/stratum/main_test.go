@@ -154,6 +154,35 @@ func TestLoadConfig_UnsetFieldsKeepDefaults(t *testing.T) {
 	}
 }
 
+// TestLoadConfig_BuildAbandonWindowIsIndependentOfTheColdPolicy pins the bug
+// this test was written with: the §8.8 abandoned-artifact window used to be
+// parsed inside the cold-threshold branch, so a config that set only
+// build_abandon_timeout_ms had it silently ignored — the sweeper kept its
+// default while the operator believed they had chosen a value. The two settings
+// are independent: a node that never reshapes a version still leaves remains
+// behind when a build dies.
+func TestLoadConfig_BuildAbandonWindowIsIndependentOfTheColdPolicy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "index_manager:\n  build_abandon_timeout_ms: 90000\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+
+	if cfg.IndexBuildAbandonTimeout != 90*time.Second {
+		t.Errorf("IndexBuildAbandonTimeout = %v, want 90s — the §8.8 window must not depend on cold_threshold_ms",
+			cfg.IndexBuildAbandonTimeout)
+	}
+	if cfg.IndexColdThreshold != 0 {
+		t.Errorf("IndexColdThreshold = %v, want 0 (unset)", cfg.IndexColdThreshold)
+	}
+}
+
 // TestRunCrashRecovery verifies the three-way dispatch of WAL
 // PendingRecords through the coordinator layer.
 func TestRunCrashRecovery(t *testing.T) {

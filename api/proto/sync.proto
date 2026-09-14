@@ -233,6 +233,11 @@ message ReportDataVersionsRequest {
   // the cursor is reported, not the data: the aggregate answers "who could serve
   // version V", which is exactly what a cursor comparison decides.
   map<string, int64> data_versions = 2;
+
+  // address is this node's storage-layer gRPC address. The leader records it
+  // alongside the cursors so GetDataVersionHolders can hand consumers something
+  // they can dial, instead of every consumer growing its own id→address map.
+  string address = 3;
 }
 
 message ReportDataVersionsResponse {

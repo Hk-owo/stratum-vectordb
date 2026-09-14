@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -345,4 +346,83 @@ func TestAggregate_Empty(t *testing.T) {
 	if got := aggregate(nil, pb.AggregationMethod_AGGREGATION_METHOD_MEDIAN); got != 0 {
 		t.Errorf("aggregate(empty) = %v, want 0", got)
 	}
+}
+
+// stubCursor stands in for a node's contiguous data cursor.
+type stubCursor int64
+
+func (s stubCursor) LocalVersionOf(string) int64 { return int64(s) }
+
+// TestQueryService_RefusesAStaleNodeForAFreshnessCredential pins §9.3(2): a node
+// whose contiguous history has not reached the version the caller should be
+// seeing must refuse the query. Its data is complete — merely older — and that
+// is exactly the silent staleness §9.1 risk 1 describes: the caller would get a
+// well-formed answer from the wrong point in time and no way to tell.
+func TestQueryService_RefusesAStaleNodeForAFreshnessCredential(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	h.svc.SetLocalVersionReporter(stubCursor(5)) // this node's history reaches version 5
+
+	required := int64(7)
+	_, err := h.svc.Query(context.Background(), &pb.QueryRequest{
+		KnowledgeBaseId: "kb-1",
+		Vector:          make([]float32, 768),
+		TopK:            5,
+		MinVersion:      &required,
+	})
+
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("err = %v, want FailedPrecondition", err)
+	}
+	// The message has to name both versions: an operator seeing this needs to
+	// know how far behind the node is.
+	if msg := err.Error(); !strings.Contains(msg, "5") || !strings.Contains(msg, "7") {
+		t.Errorf("error should name both the local and required version, got: %v", err)
+	}
+}
+
+// TestQueryService_NoCredentialIsNotARefusal: a query without min_version is
+// served as it was before §9 — the credential is an addition, not a
+// requirement, or a deployment that has not adopted a station would stop
+// working the moment this check landed.
+func TestQueryService_NoCredentialIsNotARefusal(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	h.svc.SetLocalVersionReporter(stubCursor(1))
+
+	_, err := h.svc.Query(context.Background(), &pb.QueryRequest{
+		KnowledgeBaseId: "kb-1",
+		Vector:          make([]float32, 768),
+		TopK:            5,
+	})
+
+	// It may fail for other reasons (the harness's KB state); what it must not
+	// fail on is the freshness check.
+	if status.Code(err) == codes.FailedPrecondition && strings.Contains(err.Error(), "below the required") {
+		t.Fatalf("a query with no credential must not be refused for freshness: %v", err)
+	}
+}
+
+// TestQueryService_WithoutAReporterIgnoresACredential keeps an unconfigured
+// node working: it cannot verify a credential, so it treats one as absent
+// rather than refusing everything.
+func TestQueryService_WithoutAReporterIgnoresACredential(t *testing.T) {
+	h := newQuerySvcHarness(t) // no reporter wired
+
+	required := int64(99)
+	_, err := h.svc.Query(context.Background(), &pb.QueryRequest{
+		KnowledgeBaseId: "kb-1",
+		Vector:          make([]float32, 768),
+		TopK:            5,
+		MinVersion:      &required,
+	})
+
+	if strings.Contains(errString(err), "below the required") {
+		t.Fatalf("a node with no cursor reporter must ignore the credential, not refuse: %v", err)
+	}
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

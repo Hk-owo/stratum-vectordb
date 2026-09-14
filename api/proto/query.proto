@@ -37,7 +37,31 @@ message QueryRequest {
   int32 top_k = 4;
   optional float threshold = 5; // optional similarity threshold
   AggregationMethod aggregation = 6; // optional; defaults to MEDIAN
+
+  // min_version is the freshness credential the service station attaches
+  // (Stratum_设计文档v13.md §9.3): "the version the caller should be seeing".
+  // A replica whose contiguous history has not reached it must refuse the
+  // query rather than answer from a state that is complete but stale — the
+  // failure mode §9.1 risk 1 describes, where a lagging node returns an
+  // old-version answer and the caller cannot tell.
+  //
+  // Unset (0) means "no credential": the caller came directly, or the station
+  // has no route table entry for this knowledge base yet. Serving is then the
+  // pre-§9 behaviour, which is what keeps a deployment that has not adopted a
+  // station working.
+  optional int64 min_version = 7;
 }
+
+// NOTE on authentication (Stratum_设计文档v13.md §9.3(5)): the service station
+// does not forward the caller's credential, and there is deliberately no
+// "authenticated" field here. The internal trust mark travels as gRPC metadata
+// (see internal/router/auth.go), because it is transport-level context rather
+// than part of what is being asked for: a field would have to be set at every
+// request construction site, while metadata is injected once on the way out and
+// read once on the way in.
+//
+// min_version above is different: it is part of the question ("the version the
+// caller should be seeing"), so it belongs in the request.
 message QueryResponse {
   repeated QueryResult results = 1;
   int64 version_id = 2; // the version actually queried

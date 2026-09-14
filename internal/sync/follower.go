@@ -26,6 +26,28 @@ type Follower struct {
 	versionDoc   versiondoc.VersionDocList
 	chunkStore   chunkstore.ChunkStore
 	indexManager IndexBuildTrigger
+
+	// advanceVersion records that this node now holds a version contiguously,
+	// once a pull has written its records. Optional, but without it a replica
+	// that pulled every record still reports version 0: the station's freshness
+	// check (§9.3(2)) then refuses a replica that is in fact current, and the
+	// read falls through to whichever node answers "0 < required".
+	advanceVersion LocalVersionAdvancer
+}
+
+// SetLocalVersionAdvancer wires the cursor update a completed pull performs.
+//
+// A setter rather than a constructor argument because the storage plane that
+// implements it is built after the follower in every assembly.
+func (f *Follower) SetLocalVersionAdvancer(a LocalVersionAdvancer) {
+	f.advanceVersion = a
+}
+
+// markVersionContiguous moves the cursor if an advancer is wired.
+func (f *Follower) markVersionContiguous(kbID string, versionID int64) {
+	if f.advanceVersion != nil {
+		f.advanceVersion.MarkVersionContiguous(kbID, versionID)
+	}
 }
 
 // DigestOf computes the document-set digest of (kbID, versionID) from this
@@ -124,6 +146,12 @@ func (f *Follower) PullVersionWith(ctx context.Context, leaderAddr string, kbID 
 			return fmt.Errorf("sync: apply %s entry: %w", entry.GetEntryType(), err)
 		}
 	}
+
+	// Every record is in the local stores, so this node holds the version —
+	// move the cursor now, before the build and before anything can ask about
+	// it. The cursor is what §9.3(2) reads, and a replica whose cursor never
+	// moves is refused as stale however complete its data is.
+	f.markVersionContiguous(kbID, versionID)
 
 	// All data written; trigger an independent HNSW build on this node.
 	if opts.SkipIndexBuild {

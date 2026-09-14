@@ -313,6 +313,14 @@ func (c *WriteCoordinatorImpl) ReplayVersionStorageWrites(ctx context.Context, k
 // FAILED_PERMANENT may still have landed on a replica whose acknowledgement was
 // lost, and nobody else would reclaim it.
 //
+// The reclaim is a plain prefix delete, as §10.6 specifies. It deliberately does
+// NOT apply the visibility-anchor rule the delete-version flow uses: that rule
+// protects a SURVIVING version's reads, and a permanently failed version has
+// none — visibility follows the control layer's state, not what is physically
+// present, so its records are unreachable by construction. Applying the anchor
+// here would also bolt a metadata lookup onto a cleanup path that has to work
+// precisely when the control layer is unreachable.
+//
 // Idempotent: both deletes are prefix scans, so a version that never arrived
 // here is a no-op rather than an error.
 func (c *WriteCoordinatorImpl) DropVersionStorage(ctx context.Context, kbID string, versionID int64) error {

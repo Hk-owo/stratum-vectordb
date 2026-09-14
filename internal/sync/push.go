@@ -102,6 +102,12 @@ type PushHandler struct {
 	// useless backfill source rather than a wrong one.
 	localVersion LocalVersionReporter
 
+	// advanceVersion moves that cursor once this node has received a version's
+	// records. Optional, but a node without it answers 0 forever: the records
+	// arrived, the data is complete, and the station's freshness check (§9.3(2))
+	// still refuses this replica with "local history reaches version 0".
+	advanceVersion LocalVersionAdvancer
+
 	// dropper reclaims a version's physical data on request (v13 §10.6).
 	dropper VersionDataDropper
 
@@ -155,7 +161,7 @@ type ReclaimWatermarkSource interface {
 // DataVersionRegistry implements it. Declared here, rather than importing plane,
 // because plane imports this package.
 type DataVersionRecorder interface {
-	Record(nodeID int64, dataVersions map[string]int64)
+	Record(nodeID int64, address string, dataVersions map[string]int64)
 }
 
 // VersionWriteExecutor runs the storage layer's write transaction for a version
@@ -277,6 +283,23 @@ func WithLocalVersion(r LocalVersionReporter) PushHandlerOption {
 	return func(h *PushHandler) { h.localVersion = r }
 }
 
+// LocalVersionAdvancer moves the cursor LocalVersionReporter answers from.
+//
+// Receiving a version's records — over the push or the pull path — is what
+// makes this node hold it, and the cursor is how it says so (§7.6/§9.3(2)).
+// The reporter alone is not enough, and its absence is silent in the worst
+// way: a replica with every record on disk answered "version 0", the station's
+// freshness check refused it as stale, and reads fell through to whichever
+// candidate happened to be as far behind.
+type LocalVersionAdvancer interface {
+	MarkVersionContiguous(kbID string, versionID int64)
+}
+
+// WithLocalVersionAdvancer wires the cursor update a received version performs.
+func WithLocalVersionAdvancer(a LocalVersionAdvancer) PushHandlerOption {
+	return func(h *PushHandler) { h.advanceVersion = a }
+}
+
 // NewPushHandler returns a PushHandler applying through follower.
 func NewPushHandler(follower *Follower, nodeID int64, opts ...PushHandlerOption) *PushHandler {
 	h := &PushHandler{follower: follower, nodeID: nodeID}
@@ -292,6 +315,12 @@ var _ pb.DataSyncServiceServer = (*PushHandler)(nil)
 
 // PushVersionData implements DataSyncService.PushVersionData.
 func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataServer) error {
+	// Applying a pushed version needs the local stores. A control node has none,
+	// and it still serves this service for the cursor reports it owns as leader
+	// — so the answer is "this node does not do that", not a nil dereference.
+	if h.follower == nil {
+		return status.Errorf(codes.Unimplemented, "sync: PushVersionData: this node holds no storage")
+	}
 	ctx := stream.Context()
 
 	var kbID string
@@ -316,8 +345,12 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 	}
 
 	if kbID != "" {
-		// Same post-apply step as the pull path: the data is in place, so
+		// Same post-apply step as the pull path: the records are in the local
+		// stores, so this node holds the version — move the cursor, then
 		// schedule this node's own index build.
+		if h.advanceVersion != nil {
+			h.advanceVersion.MarkVersionContiguous(kbID, versionID)
+		}
 		if err := h.follower.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
 			return fmt.Errorf("sync: push trigger build (%s v%d): %w", kbID, versionID, err)
 		}
@@ -430,7 +463,7 @@ func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 	if err := ctx.Err(); err != nil {
 		return nil, status.Errorf(codes.Canceled, "sync: ReportDataVersions: %v", err)
 	}
-	h.dataVersions.Record(req.GetNodeId(), req.GetDataVersions())
+	h.dataVersions.Record(req.GetNodeId(), req.GetAddress(), req.GetDataVersions())
 
 	resp := &pb.ReportDataVersionsResponse{Accepted: true, NodeId: h.nodeID}
 	// Carry back the watermarks for the knowledge bases this reporter just told us
@@ -497,6 +530,19 @@ func docChangesFromProto(in []*pb.DocChange) []types.DocChange {
 // never landed — as opposed to one that is merely waiting for its index build
 // (Stratum_设计文档v13.md §7.12 step ①).
 func (h *PushHandler) VersionPresence(ctx context.Context, req *pb.VersionPresenceRequest) (*pb.VersionPresenceResponse, error) {
+	// Presence is answered from the local document list, so a node without one
+	// cannot answer it at all. That has to be an error and not "present: false":
+	// the caller uses a negative answer to conclude a version's data never
+	// landed anywhere (§7.12 step ①), and "I hold no data" is not that claim.
+	//
+	// A control node is exactly such a node — it serves this service for the
+	// cursor reports it owns as leader, so a request here is possible rather
+	// than hypothetical, and without this it was a nil dereference that took
+	// the process down.
+	if h.follower == nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"sync: VersionPresence: this node holds no storage")
+	}
 	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
 	docIDs, err := h.follower.versionDoc.ListDocIDs(ctx, kbID, versionID)
 	if err != nil {
@@ -517,6 +563,11 @@ func (h *PushHandler) VersionPresence(ctx context.Context, req *pb.VersionPresen
 // one state worth paying memory to avoid. Indexes are tens of megabytes, not
 // gigabytes.
 func (h *PushHandler) PushIndexData(stream pb.DataSyncService_PushIndexDataServer) error {
+	// Same reason as PushVersionData: installing an index needs a local index
+	// directory, which a control node does not have.
+	if h.installer == nil {
+		return status.Errorf(codes.Unimplemented, "sync: PushIndexData: this node holds no storage")
+	}
 	var (
 		kbID       string
 		versionID  int64

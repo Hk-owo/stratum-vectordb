@@ -173,3 +173,38 @@ func TestCoordinatorDispatcher_AllCandidatesFailingIsAnError(t *testing.T) {
 		t.Fatal("a dispatch no replica accepted must return an error")
 	}
 }
+
+// TestCoordinatorDispatcher_BudgetScalesWithTheBatch pins the fix for
+// TestT4_DataVolume: a fixed per-candidate budget cannot tell "still writing a
+// large batch" from "gone", so it cut every candidate off mid-write, the version
+// stayed empty, and its index never reached READY.
+//
+// Both halves matter: large batches must get room, and the budget must stay
+// bounded so one candidate cannot hold a dispatch forever.
+func TestCoordinatorDispatcher_BudgetScalesWithTheBatch(t *testing.T) {
+	d := NewCoordinatorDispatcher(CoordinatorDispatcherConfig{})
+
+	empty := d.candidateBudget(0)
+	if empty != defaultCandidateTimeout {
+		t.Fatalf("a batch with no documents deserves only the floor: got %v, want %v", empty, defaultCandidateTimeout)
+	}
+
+	// The case that failed: 1000 documents in one version.
+	batch := d.candidateBudget(1000)
+	if batch <= defaultCandidateTimeout {
+		t.Fatalf("1000 docs must get more than the floor: got %v, want > %v", batch, defaultCandidateTimeout)
+	}
+	if want := defaultCandidateTimeout + 1000*candidateTimeoutPerDoc; batch != want {
+		t.Fatalf("1000 docs: got %v, want %v", batch, want)
+	}
+
+	// A batch boundary worth checking: the gRPC message limit caps a real batch
+	// near 1400 documents, and that must still land under the cap.
+	if near := d.candidateBudget(1400); near >= maxCandidateTimeout {
+		t.Fatalf("a realistic batch must not hit the cap: got %v, cap %v", near, maxCandidateTimeout)
+	}
+
+	if huge := d.candidateBudget(1 << 30); huge != maxCandidateTimeout {
+		t.Fatalf("a huge batch must be capped: got %v, want %v", huge, maxCandidateTimeout)
+	}
+}

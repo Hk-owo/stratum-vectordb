@@ -830,15 +830,18 @@ func isTransientQueryError(err error) bool {
 	}
 	msg := strings.ToLower(st.Message())
 
-	// Permanent first: a version that does not exist will not appear however long we
-	// wait, so that answer must not be retried.
-	if strings.Contains(msg, "not found") {
+	// Permanent FIRST, and narrowly: a version or knowledge base that does not exist
+	// will not appear however long we wait. Named precisely because a bare "not found"
+	// is NOT permanent here — the vector store answers "no index built or loaded" for a
+	// version whose index has not been built yet, which is exactly the wait-for-it case.
+	if strings.Contains(msg, "version not found") || strings.Contains(msg, "knowledge base not found") {
 		return false
 	}
 	for _, transient := range []string{
 		"version is pending",
 		"index not ready",
 		"index still building",
+		"no index built or loaded",
 		"index load timeout",
 	} {
 		if strings.Contains(msg, transient) {

@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -1849,4 +1853,179 @@ func TestIndexManager_BuildFallsBackWhenRemoveChunksFails(t *testing.T) {
 	if !im.IsLoaded("kb-1", 2) {
 		t.Fatal("v2 must be READY even though the removal failed")
 	}
+}
+
+// TestIndexManager_BuildReportsDocumentsWithoutChunks pins the diagnostic added
+// after an embed-less cluster was found to be half-succeeding at writes.
+//
+// An empty build batch has two origins, and conflating them hid a real outage:
+//
+//   - the version has no documents at all — normal, and the empty version
+//     deliberately never touches the vecstore;
+//   - the version HAS documents but nothing produced a chunk — splitting yielded
+//     nothing, or every embedding failed without failing its caller.
+//
+// The second one used to log the same Info line as the first. So with embed
+// unreachable, writes were half-successful — version committed, data never
+// landed, index stuck PENDING, queries refused with FailedPrecondition — and the
+// log showed one innocuous-looking "nothing to build". It has to be an Error.
+func TestIndexManager_BuildReportsDocumentsWithoutChunks(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	// 文档在,但一个 chunk 都没产出。
+	ds.addDoc(1, "doc-1", nil, nil)
+
+	core, logs := observer.New(zapcore.ErrorLevel)
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: 5 * time.Second, VecstoreAddr: "unused"})
+	im.logger = zap.New(core)
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	var cbCalled atomic.Int32
+	im.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
+		cbCalled.Add(1)
+		return nil
+	})
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild failed: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if cbCalled.Load() != 1 {
+		t.Fatalf("expected the build callback once, got %d", cbCalled.Load())
+	}
+
+	found := false
+	for _, e := range logs.All() {
+		if e.Level == zapcore.ErrorLevel && strings.Contains(e.Message, "produced no chunks") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("a version with documents but no chunks must be reported at Error — that is where a half-successful write becomes visible")
+	}
+}
+
+// TestIndexManager_BuildEmptyVersionStaysInfo is the other side of the same
+// branch: a genuinely empty version is routine and must not be alarming.
+func TestIndexManager_BuildEmptyVersionStaysInfo(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource() // 无文档
+
+	core, logs := observer.New(zapcore.ErrorLevel)
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: 5 * time.Second, VecstoreAddr: "unused"})
+	im.logger = zap.New(core)
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild failed: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if n := logs.Len(); n != 0 {
+		t.Errorf("an empty version is routine, want no Error logs, got %d: %v", n, logs.All())
+	}
+}
+
+// TestAbandonSweeper_RemovesOnlyUnsealedArtifacts pins §6.3's whole test: an
+// artifact with no .ids sidecar was never sealed by a Save, so nothing can serve
+// from it and nothing will ever come back for it.
+//
+// The gap it closes is the everyday one, not the rare one: a build that dies or
+// times out leaves these remains, the control layer quietly moves on to the next
+// candidate, that candidate succeeds, and the version never reaches
+// FAILED_PERMANENT — so §1.4's cleanup broadcast never fires either.
+func TestAbandonSweeper_RemovesOnlyUnsealedArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:         4,
+		LoadWaitTimeout:     time.Second,
+		IndexDataDir:        dir,
+		BuildAbandonTimeout: 30 * time.Minute,
+	})
+	im.logger = zap.NewNop()
+
+	kbDir := filepath.Join(dir, "index", "kb-1")
+	if err := os.MkdirAll(kbDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string, age time.Duration) string {
+		p := filepath.Join(kbDir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ts := time.Now().Add(-age)
+		if err := os.Chtimes(p, ts, ts); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	now := time.Now()
+	abandoned := write("7.index", 45*time.Minute) // unsealed + stale → reclaim
+	sealedOld := write("8.index", 45*time.Minute) // sealed: never touched
+	if err := os.WriteFile(filepath.Join(kbDir, "8.index.ids"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fresh := write("9.index", 2*time.Minute) // unsealed but recent → keep
+
+	// Save's own temporaries, the second kind of remains §8.8 named: it writes
+	// <v>.index.tmp and <v>.index.ids.tmp and renames them into place, so a
+	// stale one is a Save that died mid-write. Nothing else removes it — the
+	// next Save overwrites it in place, and EnforceDiskRetention does not count
+	// it — which is what makes it worth sweeping.
+	staleTmp := write("10.index.tmp", 45*time.Minute)
+	staleIDsTmp := write("10.index.ids.tmp", 45*time.Minute)
+	freshTmp := write("11.index.tmp", 2*time.Minute) // a Save may still be writing
+
+	im.sweepAbandonedArtifacts(now)
+
+	if fileExists(abandoned) {
+		t.Error("an unsealed artifact past the timeout must be reclaimed")
+	}
+	if !fileExists(sealedOld) {
+		t.Error("a SEALED artifact is a completed index — its age is EnforceDiskRetention's business, not the sweeper's")
+	}
+	if !fileExists(fresh) {
+		t.Error("an unsealed artifact younger than the timeout may be a build in progress and must be left alone")
+	}
+	if fileExists(staleTmp) {
+		t.Error("a stale Save temporary must be reclaimed — nothing else ever removes it")
+	}
+	if fileExists(staleIDsTmp) {
+		t.Error("the sidecar temporary must be reclaimed too")
+	}
+	if !fileExists(freshTmp) {
+		t.Error("a fresh temporary may belong to a Save that is still writing and must be left alone")
+	}
+}
+
+// TestAbandonSweeper_IsANoOpWithoutPersistenceOrWhenDisabled: with no
+// IndexDataDir there is no artifact to look at, and a negative timeout asks for
+// the sweeper to stay off.
+func TestAbandonSweeper_IsANoOpWithoutPersistenceOrWhenDisabled(t *testing.T) {
+	noDir := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: time.Second})
+	noDir.logger = zap.NewNop()
+	noDir.sweepAbandonedArtifacts(time.Now()) // must not panic on an empty data dir
+
+	disabled := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:         4,
+		LoadWaitTimeout:     time.Second,
+		IndexDataDir:        t.TempDir(),
+		BuildAbandonTimeout: -1,
+	})
+	disabled.logger = zap.NewNop()
+	disabled.StartAbandonSweeper()
+	disabled.mu.Lock()
+	running := disabled.abandonCancel != nil
+	disabled.mu.Unlock()
+	if running {
+		t.Error("a negative timeout must leave the sweeper off")
+	}
+	disabled.Close()
 }

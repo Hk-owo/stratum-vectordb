@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
@@ -40,7 +41,7 @@ func startWatermarkServer(t *testing.T, nodeID int64, control plane.ControlPlane
 // discardRecorder satisfies the aggregator; this case drives the reclaim side.
 type discardRecorder struct{}
 
-func (discardRecorder) Record(int64, map[string]int64) {}
+func (discardRecorder) Record(int64, string, map[string]int64) {}
 
 // TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack is the point of
 // the watermark round trip: the node whose WAL grows is the one that WROTE the data, and
@@ -125,7 +126,7 @@ func TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack(t *te
 	// Every replica reports a cursor that reaches v3 but not v4: so v3 and below are
 	// reclaimable, v4 is not.
 	for _, id := range requiredIDs {
-		leaderRegistry.Record(id, map[string]int64{kbID: v1 + 2})
+		leaderRegistry.Record(id, fmt.Sprintf("10.0.0.%d:7000", id), map[string]int64{kbID: v1 + 2})
 	}
 	watermark, ok := leaderControl.ReclaimableChangesThrough(kbID)
 	if !ok || watermark != v1+2 {

@@ -281,8 +281,18 @@
         <h2>集群参数 <span class="muted" style="text-transform:none;letter-spacing:0">（集群级统一配置，修改后需重建集群生效）</span></h2>
         <form id="dk-config-form" class="form">
           <div class="field-row">
-            <label>节点数<input id="dk-cfg-nodes" type="number" min="1"></label>
-            <label>基础端口（节点 1 的 gRPC）<input id="dk-cfg-baseport" type="number" min="1"></label>
+            <label>编排方式
+              <select id="dk-cfg-topology">
+                <option value="single">单层（所有节点同构）</option>
+                <option value="two-tier">两层（控制层 + 存储层）</option>
+              </select>
+            </label>
+            <label>节点数（两层时指控制层）<input id="dk-cfg-nodes" type="number" min="1"></label>
+            <label>基础端口（两层时指控制层）<input id="dk-cfg-baseport" type="number" min="1"></label>
+          </div>
+          <div class="field-row">
+            <label>存储节点数（仅两层）<input id="dk-cfg-storage-nodes" type="number" min="1"></label>
+            <label>存储层起始端口（仅两层）<input id="dk-cfg-storage-port" type="number" min="1"></label>
             <label>Docker 网络<input id="dk-cfg-network" placeholder="stratum-net"></label>
           </div>
           <div class="field-row">

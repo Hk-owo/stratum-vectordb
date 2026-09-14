@@ -27,7 +27,21 @@ type DataVersionRegistry struct {
 
 type nodeDataVersions struct {
 	cursors    map[string]int64
+	address    string
 	reportedAt time.Time
+}
+
+// Holder is one entry of the aggregate: a node that reported holding a version,
+// with the address it reported for itself.
+//
+// The address travels with the node id because the question this registry exists
+// to answer is "who should serve version V" — and whoever asks then has to talk
+// to the answer. Returning bare ids would push an id→address map onto every
+// consumer, which is the duplication §2.2 keeps out of this design. The registry
+// stores what the node said about itself and vouches for none of it beyond that.
+type Holder struct {
+	NodeID  int64
+	Address string
 }
 
 // NewDataVersionRegistry returns an empty registry.
@@ -39,30 +53,35 @@ func NewDataVersionRegistry() *DataVersionRegistry {
 // report is a complete statement of that node's cursors (the reporter sends every
 // KB it knows), so merging would keep resurrecting knowledge bases it has since
 // dropped.
-func (r *DataVersionRegistry) Record(nodeID int64, dataVersions map[string]int64) {
+//
+// address is the node's own storage-layer gRPC address. It is stored verbatim:
+// the registry has no registry of its own to check it against, and the alternative
+// — trusting nothing and making callers supply the mapping — is what Holder exists
+// to avoid.
+func (r *DataVersionRegistry) Record(nodeID int64, address string, dataVersions map[string]int64) {
 	cursors := make(map[string]int64, len(dataVersions))
 	for kbID, version := range dataVersions {
 		cursors[kbID] = version
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.byNode[nodeID] = &nodeDataVersions{cursors: cursors, reportedAt: time.Now()}
+	r.byNode[nodeID] = &nodeDataVersions{cursors: cursors, address: address, reportedAt: time.Now()}
 }
 
 // Holders returns, in ascending node order, the nodes whose recorded cursor
-// reaches versionID for kbID. A node that has never reported is simply absent —
-// which is why an empty result means "no one I have heard from", never "no one
-// has it".
-func (r *DataVersionRegistry) Holders(kbID string, versionID int64) []int64 {
+// reaches versionID for kbID, each with the address it reported. A node that has
+// never reported is simply absent — which is why an empty result means "no one I
+// have heard from", never "no one has it".
+func (r *DataVersionRegistry) Holders(kbID string, versionID int64) []Holder {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var holders []int64
+	var holders []Holder
 	for nodeID, data := range r.byNode {
 		if cursor, ok := data.cursors[kbID]; ok && cursor >= versionID {
-			holders = append(holders, nodeID)
+			holders = append(holders, Holder{NodeID: nodeID, Address: data.address})
 		}
 	}
-	sort.Slice(holders, func(i, j int) bool { return holders[i] < holders[j] })
+	sort.Slice(holders, func(i, j int) bool { return holders[i].NodeID < holders[j].NodeID })
 	return holders
 }
 

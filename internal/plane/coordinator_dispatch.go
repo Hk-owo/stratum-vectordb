@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -33,7 +34,42 @@ type CoordinatorDispatcher struct {
 	localhost func(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error
 	dial      func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 	logger    *zap.Logger
+
+	// candidateTimeout bounds one candidate's turn at the write.
+	candidateTimeout time.Duration
 }
+
+// defaultCandidateTimeout is how long one candidate may hold a dispatch.
+//
+// The candidate set is the knowledge base's replica topology, and a member of it
+// can be gone. The caller's context cannot bound this for us: the write path
+// dispatches from a background goroutine whose context is never cancelled, so
+// without a per-candidate deadline the first unreachable replica absorbs the
+// whole dispatch — and every replica that IS up goes unasked, leaving the
+// version PENDING indefinitely rather than merely delayed.
+const defaultCandidateTimeout = 15 * time.Second
+
+// candidateTimeoutPerDoc adds to a candidate's budget in proportion to the work
+// it was handed.
+//
+// That floor is only right for a candidate doing no work: it bounds dialling and
+// handshaking, and keeps a candidate that never answers from absorbing the whole
+// dispatch. A candidate that IS answering is writing documents — split, embed,
+// store, fan out — and that cost grows with the batch. Holding it to a constant
+// turns an ordinary large write into "candidate did not take the write":
+// TestT4_DataVolume (1000 docs per version) had every candidate cut off while
+// writing the version's doc list, so the version stayed empty, its index never
+// reached READY, and the test timed out at 603s.
+//
+// The budget therefore scales with the batch. The number is deliberately loose:
+// overshooting only delays the next candidate, while undershooting throws away a
+// write that was about to land.
+const candidateTimeoutPerDoc = 50 * time.Millisecond
+
+// maxCandidateTimeout caps a scaled budget so a very large batch cannot hold one
+// candidate indefinitely. Batches are bounded by the 4 MiB gRPC message limit
+// (~1400 docs each), so this cap sits far above what a real batch needs.
+const maxCandidateTimeout = 10 * time.Minute
 
 // CoordinatorDispatcherConfig wires a CoordinatorDispatcher.
 type CoordinatorDispatcherConfig struct {
@@ -60,11 +96,12 @@ type CoordinatorDispatcherConfig struct {
 func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispatcher {
 	dial := cfg.Dial
 	if dial == nil {
-		dial = func(ctx context.Context, addr string) (*grpc.ClientConn, error) {
-			return grpc.DialContext(ctx, addr,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithBlock(),
-			)
+		// grpc.NewClient, not DialContext with WithBlock: a candidate that is
+		// gone rather than slow must fail fast so the next one gets its turn.
+		// Blocking here blocks the whole dispatch (see candidateTimeout).
+		dial = func(_ context.Context, addr string) (*grpc.ClientConn, error) {
+			return grpc.NewClient(addr,
+				grpc.WithTransportCredentials(insecure.NewCredentials()))
 		}
 	}
 	logger := cfg.Logger
@@ -72,11 +109,12 @@ func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispa
 		logger = zap.NewNop()
 	}
 	return &CoordinatorDispatcher{
-		replicas:  cfg.Replicas,
-		selfAddr:  cfg.SelfAddr,
-		localhost: cfg.LocalWrite,
-		dial:      dial,
-		logger:    logger,
+		replicas:         cfg.Replicas,
+		selfAddr:         cfg.SelfAddr,
+		localhost:        cfg.LocalWrite,
+		dial:             dial,
+		logger:           logger,
+		candidateTimeout: defaultCandidateTimeout,
 	}
 }
 
@@ -84,17 +122,46 @@ func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispa
 // returning the address that did it. The error, when every candidate failed,
 // wraps the last failure — the caller treats it as transient and lets the retry
 // budget decide (§7.13.2: "try candidates in order until one succeeds").
+// candidateBudget is how long one candidate may hold this dispatch's write.
+//
+// It is the fixed floor plus a per-document allowance, capped — see
+// candidateTimeoutPerDoc for why a constant cannot be right.
+func (d *CoordinatorDispatcher) candidateBudget(docs int) time.Duration {
+	if docs < 0 {
+		docs = 0
+	}
+	budget := d.candidateTimeout + time.Duration(docs)*candidateTimeoutPerDoc
+	if budget > maxCandidateTimeout {
+		budget = maxCandidateTimeout
+	}
+	if budget <= 0 {
+		budget = defaultCandidateTimeout
+	}
+	return budget
+}
+
 func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) (string, error) {
 	candidates, err := d.candidates(ctx)
 	if err != nil {
 		return "", err
 	}
 
+	// One budget for every candidate in this dispatch: they are being handed
+	// the same work, so a candidate that needs longer than the others is not
+	// slow, it is gone.
+	budget := d.candidateBudget(len(changes))
+
 	var lastErr error
 	for _, addr := range candidates {
+		// Each candidate gets its own bounded turn: one that is unreachable must
+		// cost this dispatch a timeout, not the whole write.
+		attemptCtx, cancel := context.WithTimeout(ctx, budget)
+
 		if addr == d.selfAddr {
 			// Coordinating locally: no RPC, no serialization.
-			if err := d.localhost(ctx, kbID, versionID, parentVersionID, changes); err != nil {
+			err := d.localhost(attemptCtx, kbID, versionID, parentVersionID, changes)
+			cancel()
+			if err != nil {
 				lastErr = fmt.Errorf("coordinate %s v%d locally: %w", kbID, versionID, err)
 				d.logger.Warn("plane: dispatch: local coordination failed, trying the next candidate",
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
@@ -102,7 +169,10 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 			}
 			return addr, nil
 		}
-		if err := d.dispatchTo(ctx, addr, kbID, versionID, parentVersionID, changes); err != nil {
+
+		err := d.dispatchTo(attemptCtx, addr, kbID, versionID, parentVersionID, changes)
+		cancel()
+		if err != nil {
 			lastErr = err
 			d.logger.Warn("plane: dispatch: candidate did not take the write",
 				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),

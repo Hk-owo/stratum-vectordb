@@ -109,6 +109,17 @@ service KnowledgeBaseService {
   rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse);
   rpc ListKnowledgeBases(ListKnowledgeBasesRequest) returns (ListKnowledgeBasesResponse);
   rpc GetKnowledgeBase(GetKnowledgeBaseRequest) returns (GetKnowledgeBaseResponse);
+
+  // GetDataVersionHolders answers "which nodes reported holding kbID at or past
+  // versionID" — the §3.1 question the service station's route table asks. It
+  // reads the control leader's in-memory §7.13.4 aggregate, which is SOFT state:
+  // an empty answer means "no node I have heard from", never "no node has it".
+  //
+  // It belongs on this control-layer service rather than on DataSyncService
+  // because of who asks and who answers: the station already holds a control
+  // connection (ListKnowledgeBases is how it learns the target version), while
+  // the reporters are the data nodes.
+  rpc GetDataVersionHolders(GetDataVersionHoldersRequest) returns (GetDataVersionHoldersResponse);
 }
 
 message CreateKnowledgeBaseRequest {
@@ -172,15 +183,15 @@ enum VersionDeleteMode {
   // (the original DeleteVersion semantics). Default, so clients that do
   // not send a mode keep the historical behavior.
   VERSION_DELETE_MODE_SUBTREE = 0;
-  // Remove only the target version itself: its direct child versions are
-  // re-parented onto the target's parent, preserving the branch structure
-  // below it (a linked-list splice). This is how an arbitrary "middle"
-  // version is removed without dragging its descendants along.
+  // Remove only the target version itself: its child version (the chain is
+  // strictly linear, so there is at most one) is re-parented onto the
+  // target's parent — a linked-list splice. This is how an arbitrary
+  // "middle" version is removed without dragging its descendants along.
   VERSION_DELETE_MODE_SINGLE = 1;
   // Remove every ancestor (前置版本) of the target version, making the
-  // target the new base (root) of the knowledge base. Ancestors that
-  // carry sibling branches are removed together with those branches;
-  // the response lists every version actually marked for deletion.
+  // target the new base (root) of the knowledge base. The chain is strictly
+  // linear, so this is a prefix removal. The response lists every version
+  // actually marked for deletion.
   VERSION_DELETE_MODE_ANCESTORS = 2;
 }
 
@@ -194,9 +205,8 @@ message DeleteVersionRequest {
 message DeleteVersionResponse {
   bool success = 1; // returned immediately after marking the version(s) for deletion; cleanup runs asynchronously
   // Every version this call marked for deletion, in unspecified order.
-  // For VERSION_DELETE_MODE_ANCESTORS this also includes the sibling
-  // branches of the removed ancestors. Empty when the request was a
-  // no-op (e.g. ANCESTORS on a version that is already the base).
+  // Empty when the request was a no-op (e.g. ANCESTORS on a version that is
+  // already the base).
   repeated int64 deleted_version_ids = 2;
 }
 
@@ -210,4 +220,35 @@ message GetKnowledgeBaseRequest {
 }
 message GetKnowledgeBaseResponse {
   KnowledgeBaseInfo knowledge_base = 1;
+}
+
+// DataVersionHolder is one node the leader's aggregate believes holds a version.
+message DataVersionHolder {
+  int64 node_id = 1;
+
+  // address is the node's storage-layer gRPC address, as the node itself
+  // reported it. It is carried here so a consumer can act on the answer
+  // directly: the station has to forward to an address, and node ids alone would
+  // force a second id→address map onto every consumer.
+  string address = 2;
+}
+
+message GetDataVersionHoldersRequest {
+  string knowledge_base_id = 1;
+
+  // version_id is the version that must be servable. A node whose reported
+  // cursor reaches it is a holder; a node that has never reported is absent —
+  // which is why an empty answer is not "nobody has it".
+  int64 version_id = 2;
+}
+
+message GetDataVersionHoldersResponse {
+  // Ascending by node_id, so a caller's choice is reproducible rather than
+  // dependent on map iteration order.
+  repeated DataVersionHolder holders = 1;
+
+  // known is false when the answering node is not the control leader: its
+  // aggregate is empty only because it has never folded a report. The caller
+  // should re-resolve the leader rather than read the empty list as a fact.
+  bool known = 2;
 }

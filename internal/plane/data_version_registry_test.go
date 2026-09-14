@@ -9,26 +9,26 @@ import (
 // question cursors can actually answer.
 func TestDataVersionRegistry_HoldersComeFromReportedCursors(t *testing.T) {
 	reg := NewDataVersionRegistry()
-	reg.Record(1, map[string]int64{"kb-1": 5, "kb-2": 2})
-	reg.Record(2, map[string]int64{"kb-1": 3})
-	reg.Record(3, map[string]int64{"kb-1": 10})
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 5, "kb-2": 2})
+	reg.Record(2, "10.0.0.2:7000", map[string]int64{"kb-1": 3})
+	reg.Record(3, "10.0.0.3:7000", map[string]int64{"kb-1": 10})
 
 	// A node holds every version up to and including its cursor (the cursor means
 	// "contiguous up to here"), so v3 is held by 1, 2 and 3.
-	if got := reg.Holders("kb-1", 3); !reflect.DeepEqual(got, []int64{1, 2, 3}) {
+	if got := reg.Holders("kb-1", 3); !reflect.DeepEqual(got, []Holder{{NodeID: 1, Address: "10.0.0.1:7000"}, {NodeID: 2, Address: "10.0.0.2:7000"}, {NodeID: 3, Address: "10.0.0.3:7000"}}) {
 		t.Errorf("Holders(kb-1, 3) = %v, want [1 2 3]", got)
 	}
 	// v4 is past node 2's cursor.
-	if got := reg.Holders("kb-1", 4); !reflect.DeepEqual(got, []int64{1, 3}) {
+	if got := reg.Holders("kb-1", 4); !reflect.DeepEqual(got, []Holder{{NodeID: 1, Address: "10.0.0.1:7000"}, {NodeID: 3, Address: "10.0.0.3:7000"}}) {
 		t.Errorf("Holders(kb-1, 4) = %v, want [1 3]", got)
 	}
 	// v10 only reaches node 3's cursor.
-	if got := reg.Holders("kb-1", 10); !reflect.DeepEqual(got, []int64{3}) {
+	if got := reg.Holders("kb-1", 10); !reflect.DeepEqual(got, []Holder{{NodeID: 3, Address: "10.0.0.3:7000"}}) {
 		t.Errorf("Holders(kb-1, 10) = %v, want [3]", got)
 	}
 	// Node 2 never reported kb-2 at all, and that is not knowledge about kb-2's
 	// data — so only node 1 shows up.
-	if got := reg.Holders("kb-2", 1); !reflect.DeepEqual(got, []int64{1}) {
+	if got := reg.Holders("kb-2", 1); !reflect.DeepEqual(got, []Holder{{NodeID: 1, Address: "10.0.0.1:7000"}}) {
 		t.Errorf("Holders(kb-2, 1) = %v, want [1]", got)
 	}
 	// An unknown knowledge base has no holders.
@@ -42,8 +42,8 @@ func TestDataVersionRegistry_HoldersComeFromReportedCursors(t *testing.T) {
 // has since dropped.
 func TestDataVersionRegistry_RecordReplacesRatherThanMerges(t *testing.T) {
 	reg := NewDataVersionRegistry()
-	reg.Record(1, map[string]int64{"kb-1": 5, "kb-2": 7})
-	reg.Record(1, map[string]int64{"kb-1": 9})
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 5, "kb-2": 7})
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
 
 	if cursor, ok := reg.Cursor(1, "kb-1"); !ok || cursor != 9 {
 		t.Errorf("Cursor(1, kb-1) = (%d, %v), want (9, true)", cursor, ok)
@@ -61,7 +61,7 @@ func TestDataVersionRegistry_AbsentNodeIsNotAZeroCursor(t *testing.T) {
 	if cursor, ok := reg.Cursor(7, "kb-1"); ok {
 		t.Errorf("Cursor for a node that never reported = (%d, true), want false", cursor)
 	}
-	reg.Record(7, map[string]int64{"kb-1": 0})
+	reg.Record(7, "10.0.0.7:7000", map[string]int64{"kb-1": 0})
 	if cursor, ok := reg.Cursor(7, "kb-1"); !ok || cursor != 0 {
 		t.Errorf("Cursor(7, kb-1) = (%d, %v), want (0, true) — a reported zero is a fact", cursor, ok)
 	}
@@ -77,14 +77,14 @@ func TestDataVersionRegistry_AbsentNodeIsNotAZeroCursor(t *testing.T) {
 // discard the predecessor's soft state rather than inherit it.
 func TestDataVersionRegistry_ForgetAndResetDropTheView(t *testing.T) {
 	reg := NewDataVersionRegistry()
-	reg.Record(1, map[string]int64{"kb-1": 5})
-	reg.Record(2, map[string]int64{"kb-1": 5})
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 5})
+	reg.Record(2, "10.0.0.2:7000", map[string]int64{"kb-1": 5})
 	if got := reg.Nodes(); !reflect.DeepEqual(got, []int64{1, 2}) {
 		t.Errorf("Nodes() = %v, want [1 2]", got)
 	}
 
 	reg.Forget(1)
-	if got := reg.Holders("kb-1", 5); !reflect.DeepEqual(got, []int64{2}) {
+	if got := reg.Holders("kb-1", 5); !reflect.DeepEqual(got, []Holder{{NodeID: 2, Address: "10.0.0.2:7000"}}) {
 		t.Errorf("after Forget(1), Holders = %v, want [2]", got)
 	}
 
@@ -102,7 +102,7 @@ func TestDataVersionRegistry_ForgetAndResetDropTheView(t *testing.T) {
 func TestDataVersionRegistry_RecordCopiesTheMap(t *testing.T) {
 	reg := NewDataVersionRegistry()
 	cursors := map[string]int64{"kb-1": 5}
-	reg.Record(1, cursors)
+	reg.Record(1, "10.0.0.1:7000", cursors)
 	cursors["kb-1"] = 99
 
 	if cursor, _ := reg.Cursor(1, "kb-1"); cursor != 5 {

@@ -336,9 +336,10 @@ func (sm *stateMachine) versionDeleteTargets(kbID string, versionID int64, mode 
 		if len(ancestors) == 0 {
 			return nil, nil // already the base: nothing ahead of it
 		}
-		// Keep versionID and its whole subtree. Anything reachable from an
-		// ancestor but outside that subtree — the ancestors themselves and
-		// any sibling branches — is removed with it.
+		// Keep versionID and everything after it. Anything reachable from an
+		// ancestor but not from versionID — the ancestors themselves — is
+		// removed with it. The chain is strictly linear, so there are no
+		// sibling branches to consider.
 		keep := make(map[int64]bool)
 		for _, id := range sm.collectVersionSubtree(kbID, versionID) {
 			keep[id] = true
@@ -387,9 +388,10 @@ func (sm *stateMachine) collectVersionAncestors(kbID string, versionID int64) []
 	}
 }
 
-// reparentChildren rewires every direct child of fromVersionID within kbID
-// onto newParentVersionID (0 meaning "becomes a root"), keeping the branch
-// structure below the removed version intact.
+// reparentChildren rewires the child of fromVersionID within kbID onto
+// newParentVersionID (0 meaning "becomes a root"). The chain is strictly
+// linear, so there is at most one such child — this is a linked-list splice,
+// and everything below it moves with it.
 func (sm *stateMachine) reparentChildren(kbID string, fromVersionID, newParentVersionID int64) {
 	for _, id := range sm.versionsByKB[kbID] {
 		if id == fromVersionID {

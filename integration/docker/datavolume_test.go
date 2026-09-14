@@ -25,6 +25,13 @@ import (
 	pb "stratum/api/proto/stratum"
 )
 
+// storageDataDir is where storage node i keeps its data inside its container.
+// Storage nodes are numbered from 11 (see scripts/docker-cluster-both.sh), and
+// that number is what the directory is named after.
+func storageDataDir(i int) string {
+	return fmt.Sprintf("/var/lib/stratum/node%d", 10+i+1)
+}
+
 // dataVolumeDocs is the number of documents to write. Override with
 // STRATUM_VOLUME_DOCS (e.g. 10000) for a heavier run.
 func dataVolumeDocs() int {
@@ -238,20 +245,28 @@ func TestT4_DataVolume(t *testing.T) {
 		docCount, (len(changes)+batch-1)/batch, batch, writeDur, buildDur, writeTotal)
 
 	// --- Sample storage usage ---
+	//
+	// Sampled on the storage tier, because that is where documents, chunks and
+	// indexes live — under the split topology the control containers hold no
+	// data at all, so measuring them would report zero and mean nothing. The
+	// directory is keyed by node_id, which the container name no longer spells
+	// out. The vecstore's RocksDB sits in the same container, so its bytes are
+	// already inside these numbers.
 	var totalNodeBytes int64
-	for _, svc := range nodeServices {
-		n := duNodeBytes(t, svc, "/var/lib/stratum/"+strings.TrimPrefix(svc, "stratum-"))
+	for i, svc := range storageServices {
+		n := duNodeBytes(t, svc, storageDataDir(i))
 		t.Logf("storage %s: %d bytes (%.2f MiB)", svc, n, float64(n)/(1024*1024))
 		totalNodeBytes += n
 	}
-	t.Logf("storage total (3 nodes): %d bytes (%.2f MiB)", totalNodeBytes, float64(totalNodeBytes)/(1024*1024))
-	// Shared vecstore RocksDB lives on the host (host.docker.internal).
-	if vs, err := duBytes("/tmp/vecstore_data"); err == nil {
-		t.Logf("storage vecstore (host): %d bytes (%.2f MiB)", vs, float64(vs)/(1024*1024))
-	}
+	t.Logf("storage total (%d nodes): %d bytes (%.2f MiB)",
+		len(storageServices), totalNodeBytes, float64(totalNodeBytes)/(1024*1024))
 
 	// --- Query correctness: the index must return results ---
-	_, q, _, qconn, err := dialNode(leaderAddr)
+	// Reads are served by the storage tier: QueryService reads the index manager
+	// and the local stores directly, so a control node has nothing to answer
+	// with. Asking a storage node also checks the data actually got there — the
+	// version was committed by the control tier and dispatched here.
+	_, q, _, qconn, err := dialNode(storageAddrs[0])
 	if err != nil {
 		t.Fatalf("dial leader for query: %v", err)
 	}

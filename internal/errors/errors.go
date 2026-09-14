@@ -105,9 +105,19 @@ var grpcCodeMap = map[error]codes.Code{
 // ToGRPCStatus converts a business error into a gRPC status error. It walks
 // the error chain with errors.Is so wrapped errors (fmt.Errorf("...: %w",
 // err)) are correctly matched against the named sentinels. nil maps to nil.
-// Unrecognized errors map to codes.Internal — they should not normally
-// reach this function uncategorized; treat repeated Internal mappings for
-// the same error as a signal to add it to grpcCodeMap.
+//
+// An error that is ALREADY a gRPC status (one that came back from another service, or
+// from an internal boundary that returned one) keeps its own code instead of being
+// relabelled Internal. That relabelling was a real defect, not a hypothetical: the
+// vector store classifies a search on a still-building index as FAILED_PRECONDITION
+// (its C++ side maps absl's FailedPrecondition straight to the gRPC code), grpc-go
+// hands that classification to the caller intact, and this fallback then threw it away
+// — turning a correct classification into a wrong one. Preserving the incoming code is
+// what keeps a service's stated meaning intact across the hop.
+//
+// Only genuinely unrecognized errors map to codes.Internal — they should not normally
+// reach this function uncategorized; treat repeated Internal mappings for the same
+// error as a signal to add it to grpcCodeMap.
 //
 // Every gRPC method implementation calls ToGRPCStatus exactly once, at its
 // outermost layer, on whatever error it is about to return.
@@ -119,6 +129,14 @@ func ToGRPCStatus(err error) error {
 		if errors.Is(err, sentinel) {
 			return status.Error(code, err.Error())
 		}
+	}
+	// Checked with errors.As against the GRPCStatus interface rather than
+	// status.FromError: the latter reports success for ANY error (it yields
+	// codes.Unknown for those carrying no status at all), which would silently turn
+	// every unclassifiable error into Unknown.
+	var withStatus interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &withStatus) {
+		return status.Error(withStatus.GRPCStatus().Code(), err.Error())
 	}
 	return status.Error(codes.Internal, err.Error())
 }

@@ -1,0 +1,31 @@
+# Dockerfile.storage — the storage-layer image: the Stratum storage node plus
+# the C++ vecstore it owns.
+#
+# Where this differs from integration/docker/Dockerfile (the all-in-one image):
+# a storage node needs the vecstore in the same container as the Go storage
+# layer, because the index files the vecstore loads are the ones the storage
+# layer wrote into that node's data directory (Stratum_设计文档v13.md §11 阶段 ④).
+# Keeping the vecstore on the host worked only by bind-mounting the node's data
+# directory out to it, which is the coupling this image removes.
+#
+# Why the libraries are packaged instead of installed: this environment cannot
+# reach a registry to pull a C++ toolchain image, so vecstore_server is built on
+# the host (scripts/build-storage-image.sh) and travels here with every shared
+# library it links against. It is a dynamically linked ELF and the host's glibc
+# (2.42) is newer than any locally available base image's (22.04 ships 2.35), so
+# the host's loader and libc are packaged too and invoked explicitly by the
+# entrypoint. Copying only libgrpc/libprotobuf and letting the base image supply
+# libc fails on GLIBC_PRIVATE symbol mismatches between the two glibc builds.
+FROM ubuntu:22.04
+
+COPY run/docker/vecstore-libs/ /opt/stratum/lib/
+COPY run/bin/vecstore_server /opt/stratum/vecstore_server
+COPY integration/docker/stratum /usr/local/bin/stratum
+COPY integration/docker/entrypoint-storage.sh /usr/local/bin/entrypoint-storage.sh
+RUN chmod +x /usr/local/bin/entrypoint-storage.sh
+
+# Client-facing gRPC, Raft (unused on a storage node, kept for symmetry with the
+# all-in-one image) and metrics.
+EXPOSE 7000 8000 9000
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-storage.sh"]

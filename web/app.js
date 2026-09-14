@@ -933,16 +933,18 @@ function renderDkOverview(st) {
   const running = nodes.filter(n => n.status === 'running').length;
   const healthy = nodes.filter(n => n.health === 'healthy').length;
   const leader = nodes.find(n => n.leader);
+  // 两层拓扑的两个层规模不同、职责不同，概况里点明，免得把 6 个节点当成同一种。
+  const topology = st.topology === 'two-tier'
+    ? `两层（控制 ${st.control_count} + 存储 ${st.storage_count}）`
+    : '单层';
   $('dk-overview').innerHTML =
-    `网络 <b>${escapeHtml(st.network)}</b> · 节点 <b>${st.count}</b>（运行 ${running} / 健康 ${healthy}）` +
+    `网络 <b>${escapeHtml(st.network)}</b> · 编排 <b>${topology}</b>` +
+    ` · 节点 <b>${st.count}</b>（运行 ${running} / 健康 ${healthy}）` +
     ` · 基础端口 <b>${st.base_port}</b> · 镜像 <b>${escapeHtml(st.image)}</b>` +
     ` · leader <b>${leader ? escapeHtml(leader.name) : '—'}</b>`;
 }
-
-function renderDkNodes(st) {
-  const el = $('dk-nodes');
-  const nodes = st.nodes || [];
-  if (!nodes.length) { el.innerHTML = '<span class="muted">集群配置为空</span>'; return; }
+// dkNodeTable renders one group of nodes as a table.
+function dkNodeTable(nodes) {
   const rows = nodes.map(n => {
     const running = n.status === 'running';
     const act = running
@@ -958,9 +960,30 @@ function renderDkNodes(st) {
       <td>${act} <button class="btn btn-ghost" data-act="logs" data-id="${n.id}">日志</button></td>
     </tr>`;
   }).join('');
-  el.innerHTML = `<table class="dk-table">
+  return `<table class="dk-table">
     <thead><tr><th>节点</th><th>状态</th><th>健康</th><th>gRPC 端口</th><th>leader</th><th>操作</th></tr></thead>
     <tbody>${rows}</tbody></table>`;
+}
+
+function renderDkNodes(st) {
+  const el = $('dk-nodes');
+  const nodes = st.nodes || [];
+  if (!nodes.length) { el.innerHTML = '<span class="muted">集群配置为空</span>'; return; }
+
+  // 两层拓扑的节点分属两个层，且不可互换：控制节点不持数据、存储节点不持元数据。
+  // 所以分两组展示——把 6 个节点排成一张表，会让人以为读请求可以发给任意一个。
+  // 单层拓扑只有一个"节点"组，不加多余标题。
+  const groups = st.topology === 'two-tier'
+    ? [['control', '控制层（Raft 元数据，不存数据）'], ['storage', '存储层（文档 / 向量 / 索引）']]
+    : [[null, null]];
+
+  el.innerHTML = groups.map(([tier, title]) => {
+    const rows = tier === null ? nodes : nodes.filter(n => n.tier === tier);
+    if (!rows.length) return '';
+    const head = title ? `<h3 class="dk-group">${title}</h3>` : '';
+    return head + dkNodeTable(rows);
+  }).join('');
+
   el.querySelectorAll('button[data-act]').forEach(b => {
     b.addEventListener('click', () => {
       const id = Number(b.dataset.id);
@@ -972,73 +995,40 @@ function renderDkNodes(st) {
         dkNodeControl(id, b.dataset.act);
       }
     });
-  });
-}
-
-// ---------- 集群整体操作 ----------
-
-async function dkClusterAction(action, force, msg) {
-  if (DK.busy) { toast('上一步操作还在执行中'); return; }
-  DK.busy = true;
-  try {
-    toast('正在执行：' + msg + '（docker 操作可能耗时数十秒）');
-    await opsApi('/docker/' + action, { method: 'POST', body: force ? { force: true } : {} });
-    toast(msg + ' 完成');
-    setTimeout(dkPoll, 1500);
-  } catch (e) {
-    toast(msg + ' 失败：' + e.message);
-  } finally {
-    DK.busy = false;
-  }
-}
-
-$('dk-up').addEventListener('click', () => dkClusterAction('up', false, '启动集群'));
-$('dk-rebuild').addEventListener('click', () => dkClusterAction('up', true, '重建集群'));
-$('dk-down').addEventListener('click', () => dkClusterAction('down', false, '停止集群'));
-$('dk-clean').addEventListener('click', () => dkClusterAction('clean', false, '清理集群'));
-
-// ---------- 单节点操作 ----------
-
-async function dkNodeControl(id, action) {
-  if (DK.busy) { toast('上一步操作还在执行中'); return; }
-  DK.busy = true;
-  try {
-    await opsApi(`/docker/nodes/${id}/${action}`, { method: 'POST' });
-    toast(`node ${id} 已${action === 'start' ? '启动' : action === 'stop' ? '停止' : '重启'}`);
-    setTimeout(dkPoll, 1500);
-  } catch (e) {
-    toast(`node ${id} 操作失败：` + e.message);
-  } finally {
-    DK.busy = false;
-  }
-}
-
-// ---------- 集群参数（集群级统一配置） ----------
-
-async function dkConfigLoad() {
-  try {
-    DK.config = await opsApi('/docker/config');
-    dkConfigFill(DK.config);
-  } catch (e) {
-    toast('加载集群参数失败：' + e.message);
-  }
-}
-
+  });}
 function dkConfigFill(cfg) {
   const set = (id, v) => { const el = $(id); if (el) el.value = (v == null ? '' : v); };
+  set('dk-cfg-topology', cfg.topology || 'single');
   set('dk-cfg-nodes', cfg.nodes);
   set('dk-cfg-baseport', cfg.base_port);
+  set('dk-cfg-storage-nodes', cfg.storage_nodes);
+  set('dk-cfg-storage-port', cfg.storage_base_port);
   set('dk-cfg-network', cfg.network);
   set('dk-cfg-image', cfg.image);
   set('dk-cfg-prefix', cfg.container_prefix);
   $('dk-cfg-embed').checked = !!cfg.with_embed;
+  dkSyncTopologyFields();
+}
+
+// dkSyncTopologyFields 让存储层的两个字段只在两层拓扑下可编辑——它们对单层
+// 没有意义，留成可编辑会让人以为改了会生效。
+function dkSyncTopologyFields() {
+  const twoTier = $('dk-cfg-topology').value === 'two-tier';
+  for (const id of ['dk-cfg-storage-nodes', 'dk-cfg-storage-port']) {
+    const el = $(id);
+    if (el) el.disabled = !twoTier;
+  }
 }
 
 function dkConfigRead() {
   return {
     enabled: true,
+    topology: $('dk-cfg-topology').value || 'single',
     nodes: opsNum($('dk-cfg-nodes').value) || 3,
     base_port: opsNum($('dk-cfg-baseport').value) || 17000,
+    // 存储层参数在两种拓扑下都保存：切到单层再切回来时，之前的规模还在。
+    storage_nodes: opsNum($('dk-cfg-storage-nodes').value) || 3,
+    storage_base_port: opsNum($('dk-cfg-storage-port').value) || 17100,
     network: $('dk-cfg-network').value.trim(),
     image: $('dk-cfg-image').value.trim(),
     container_prefix: $('dk-cfg-prefix').value.trim(),
@@ -1071,6 +1061,7 @@ async function dkConfigSave(rebuild) {
   }
 }
 
+$('dk-cfg-topology').addEventListener('change', dkSyncTopologyFields);
 $('dk-config-form').addEventListener('submit', (e) => { e.preventDefault(); dkConfigSave(false); });
 $('dk-config-apply').addEventListener('click', () => dkConfigSave(true));
 $('dk-config-reset').addEventListener('click', () => { if (DK.config) dkConfigFill(DK.config); });

@@ -300,7 +300,7 @@ func (c *LocalControlPlane) ReportEpoch(ctx context.Context, _ uint64, dataVersi
 // is a routing hint: fetch from one of them rather than from a peer that never
 // reached V. It is never evidence for a destructive decision — that needs each
 // node's own confirmation.
-func (c *LocalControlPlane) DataVersionHolders(kbID string, versionID int64) ([]int64, bool) {
+func (c *LocalControlPlane) DataVersionHolders(kbID string, versionID int64) ([]Holder, bool) {
 	if c.dataVersions == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
 		return nil, false
 	}

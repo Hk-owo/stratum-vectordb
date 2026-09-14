@@ -11,6 +11,8 @@
 package router
 
 import (
+	"strings"
+
 	pb "stratum/api/proto/stratum"
 )
 
@@ -42,4 +44,23 @@ var writeMethods = map[string]bool{
 // write operation.
 func isWriteMethod(fullMethod string) bool {
 	return writeMethods[fullMethod]
+}
+
+// isStorageMethod reports whether fullMethod is served by the storage layer —
+// the nodes that hold data — rather than the control layer.
+//
+// QueryService and AdminService are both storage-side in fact: their
+// constructors take the index manager and the local stores, so a control node
+// cannot build them at all (§7.0's contract boundary). Routing them by layer
+// rather than by "write vs read" is what keeps a query off a node that has no
+// indices: reading the corpus is a read, but it is not a read of the control
+// layer's metadata.
+//
+// AdminService is included whole. Its per-operation leaders differ — RebuildIndex
+// acts on a version's storage, GetClusterStatus reports Raft connectivity — but
+// every one of them is answerable from a storage node, and none from a control
+// node.
+func isStorageMethod(fullMethod string) bool {
+	return strings.HasPrefix(fullMethod, "/stratum.QueryService/") ||
+		strings.HasPrefix(fullMethod, "/stratum.AdminService/")
 }

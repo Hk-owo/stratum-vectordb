@@ -29,9 +29,29 @@ type QueryServiceImpl struct {
 	versionDocList versiondoc.VersionDocList
 	docStore       docstore.DocStore
 	vBloomStore    *bloom.VersionBloomStore
+
+	// localVersion is where §9.3(2)'s freshness check reads this node's
+	// contiguous cursor. nil means "cannot verify a credential", which makes the
+	// check skip rather than fail — an unconfigured node behaves as it did
+	// before §9 rather than refusing everything.
+	localVersion LocalVersionReporter
 }
 
 // NewQueryService constructs a QueryServiceImpl.
+// LocalVersionReporter reports this node's contiguous data cursor for a
+// knowledge base — the highest version whose history it holds completely. It is
+// what §9.3(2)'s freshness check compares against.
+type LocalVersionReporter interface {
+	LocalVersionOf(kbID string) int64
+}
+
+// SetLocalVersionReporter wires the cursor the freshness check reads. Optional:
+// without it the node cannot verify a credential and therefore ignores one,
+// which is the pre-§9 behaviour rather than a broken one.
+func (s *QueryServiceImpl) SetLocalVersionReporter(r LocalVersionReporter) {
+	s.localVersion = r
+}
+
 func NewQueryService(
 	rn raft.RaftNode,
 	im index.IndexManager,
@@ -53,6 +73,22 @@ func NewQueryService(
 // Query implements QueryServiceServer.
 func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb.QueryResponse, error) {
 	kbID := req.KnowledgeBaseId
+
+	// §9.3(2): honour the service station's freshness credential.
+	//
+	// A node whose contiguous history has not reached the version the caller
+	// should be seeing can still answer — its data is complete, merely older —
+	// and that is precisely the silent staleness §9.1 risk 1 describes: the
+	// caller gets a well-formed result from the wrong point in time and has no
+	// way to tell. Refusing makes it visible, and lets the station move to a
+	// node that is current.
+	if want := req.GetMinVersion(); want > 0 && s.localVersion != nil {
+		if have := s.localVersion.LocalVersionOf(kbID); have < want {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"query: %s: local history reaches version %d, below the required %d",
+				kbID, have, want)
+		}
+	}
 
 	// Resolve version.
 	var versionID int64

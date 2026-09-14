@@ -232,3 +232,115 @@ func TestOpsDockerDisabled(t *testing.T) {
 		t.Errorf("disabled: code=%d body=%v, want 400", code, body)
 	}
 }
+
+// useTwoTier 把服务器切到两层拓扑：脚本按拓扑选择，所以两层用一个脚本路径
+// 就够了（生产里两个脚本各自有路径）。
+func useTwoTier(m *opsManager) {
+	m.cfg.Docker.Topology = TopologyTwoTier
+	m.cfg.Docker.ScriptTwoTier = m.cfg.Docker.Script
+	m.cfg.Docker.Nodes = 3
+	m.cfg.Docker.StorageNodes = 3
+	m.cfg.Docker.StorageBasePort = 17100
+}
+
+// TestOpsDockerTwoTierStatus pins how the console drives the two-tier
+// orchestrator: the options name the tier (--control-nodes/--storage-nodes,
+// --control-base-port/--storage-base-port) and, unlike the all-in-one script,
+// the node count is NOT a positional argument — passing one there would have
+// the script read a count it does not expect.
+func TestOpsDockerTwoTierStatus(t *testing.T) {
+	srv, m, callLog := testDockerOpsServer(t)
+	useTwoTier(m)
+
+	resp, err := http.Get(srv.URL + "/ops/docker/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status code = %d, want 200", resp.StatusCode)
+	}
+
+	logs := readCalls(t, callLog)
+	for _, want := range []string{
+		"status", "--json",
+		"--control-nodes 3",
+		"--storage-nodes 3",
+		"--control-base-port 17000",
+		"--storage-base-port 17100",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("expected %q in script calls, got: %s", want, logs)
+		}
+	}
+	if strings.Contains(logs, "status 3") {
+		t.Errorf("two-tier status must not pass the count positionally, got: %s", logs)
+	}
+}
+
+// TestOpsDockerTwoTierUp pins the launch argument assembly for the split
+// topology.
+func TestOpsDockerTwoTierUp(t *testing.T) {
+	srv, m, callLog := testDockerOpsServer(t)
+	useTwoTier(m)
+	m.cfg.Docker.WithEmbed = true
+
+	resp, err := http.Post(srv.URL+"/ops/docker/up", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status code = %d, want 200", resp.StatusCode)
+	}
+
+	logs := readCalls(t, callLog)
+	for _, want := range []string{"up", "--control-nodes 3", "--storage-nodes 3", "--with-embed"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("expected %q in script calls, got: %s", want, logs)
+		}
+	}
+	if strings.Contains(logs, "up 3") {
+		t.Errorf("two-tier up must not pass the count positionally, got: %s", logs)
+	}
+}
+
+// TestOpsDockerTwoTierRequiresItsScript pins the failure mode: a two-tier
+// deployment that has no two-tier script configured must fail loudly. Falling
+// back to the all-in-one script would drive it with commands it does not know,
+// and the operator would read "unknown command" instead of "not configured" —
+// a configuration mistake wearing a script bug's clothes.
+func TestOpsDockerTwoTierRequiresItsScript(t *testing.T) {
+	srv, m, _ := testDockerOpsServer(t)
+	m.cfg.Docker.Topology = TopologyTwoTier
+	m.cfg.Docker.ScriptTwoTier = ""
+
+	resp, err := http.Get(srv.URL + "/ops/docker/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Error("a two-tier topology without its script must fail, not answer 200")
+	}
+}
+
+// TestOpsDockerSingleTierUnchanged keeps the all-in-one contract pinned while
+// the two-tier path exists: same options, count positional.
+func TestOpsDockerSingleTierUnchanged(t *testing.T) {
+	srv, _, callLog := testDockerOpsServer(t)
+
+	resp, err := http.Get(srv.URL + "/ops/docker/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	logs := readCalls(t, callLog)
+	if !strings.Contains(logs, "status 3 --json") {
+		t.Errorf("expected 'status 3 --json' in script calls, got: %s", logs)
+	}
+	if strings.Contains(logs, "--control-nodes") {
+		t.Errorf("single-tier must not use tier options, got: %s", logs)
+	}
+}

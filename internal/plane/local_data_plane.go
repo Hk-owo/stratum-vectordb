@@ -461,6 +461,18 @@ func (d *LocalDataPlane) advanceLocalVersion(kbID string, versionID int64) {
 	}
 }
 
+// MarkVersionContiguous implements sync.LocalVersionAdvancer: a version whose
+// records this node has received — pushed by the coordinator or pulled from a
+// peer — is one it holds, and the cursor is how it says so.
+//
+// The two halves are wired separately on purpose: this plane owns the cursor,
+// while the sync handler is what knows the records landed. Without the wiring a
+// replica with every record on disk still answered "version 0" to the station's
+// freshness check (§9.3(2)) and was refused as stale.
+func (d *LocalDataPlane) MarkVersionContiguous(kbID string, versionID int64) {
+	d.advanceLocalVersion(kbID, versionID)
+}
+
 // LocalVersionOf reports the highest version this node holds contiguously for
 // kbID (0 = nothing known yet). It is the storage layer's answer to peers
 // looking for a backfill source (Stratum_设计文档v13.md §7.6).
@@ -880,6 +892,15 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 		return fmt.Errorf("plane: fan-out for version %d: resolve replicas: %w", versionID, err)
 	}
 	if len(targets) == 0 {
+		// 解析不出任何副本。这里从前静默返回成功,而"没有副本"在 quorum 判定上
+		// 与"副本就是我自己"是同一件事——于是这一版被当成已复制完成,控制层据此
+		// 推进,其余副本永远拿不到它。
+		//
+		// 单层集群里协调者就是受理者,它的副本列表非空,这条路径不会走到;派发
+		// 真正生效之后(§7.13.2)就会:写入落在一台远程节点上,而那台节点解析不出
+		// 副本列表时,它会把单副本当成 quorum。
+		d.logger.Warn("plane: fan-out found no replica targets; treating this node's own copy as the quorum",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
 		return nil
 	}
 

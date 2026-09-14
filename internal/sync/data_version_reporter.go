@@ -35,6 +35,13 @@ type DataVersionReporterConfig struct {
 	// value, so it must be the node's own ID, never one taken from elsewhere.
 	NodeID int64
 
+	// SelfAddr is this node's storage-layer gRPC address, reported alongside the
+	// cursors. The leader's aggregate hands it back to consumers (the station's
+	// route table) so they can dial the holder directly; without it every consumer
+	// would need its own node-id→address map. Optional: an empty value means
+	// "unknown", and holders are then reported without one.
+	SelfAddr string
+
 	// DataVersions supplies the cursors to report. Required.
 	DataVersions DataVersionSource
 
@@ -73,6 +80,7 @@ type LeaderWatermarkSink interface {
 // corrects everything.
 type DataVersionReporter struct {
 	nodeID        int64
+	selfAddr      string
 	dataVersions  DataVersionSource
 	resolveLeader LeaderAddrResolver
 	interval      time.Duration
@@ -93,6 +101,7 @@ func NewDataVersionReporter(cfg DataVersionReporterConfig) *DataVersionReporter 
 	}
 	return &DataVersionReporter{
 		nodeID:        cfg.NodeID,
+		selfAddr:      cfg.SelfAddr,
 		dataVersions:  cfg.DataVersions,
 		resolveLeader: cfg.ResolveLeader,
 		interval:      interval,
@@ -145,6 +154,7 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 
 	resp, err := pb.NewDataSyncServiceClient(conn).ReportDataVersions(ctx, &pb.ReportDataVersionsRequest{
 		NodeId:       r.nodeID,
+		Address:      r.selfAddr,
 		DataVersions: r.dataVersions(),
 	})
 	if err != nil {

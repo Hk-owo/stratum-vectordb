@@ -3,6 +3,8 @@ package sync
 import (
 	"context"
 	"net"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,5 +155,88 @@ func TestPusher_PushVersion_UnreachableTargetFails(t *testing.T) {
 
 	if _, err := pusher.PushVersion(ctx, deadAddr, "kb-push", 1); err == nil {
 		t.Fatal("pushing to an unreachable replica must return an error")
+	}
+}
+
+// recordingAdvancer records the versions a received push/pull declared this
+// node to hold.
+type recordingAdvancer struct {
+	mu     sync.Mutex
+	marked []string
+}
+
+func (a *recordingAdvancer) MarkVersionContiguous(kbID string, versionID int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.marked = append(a.marked, kbID+"/"+strconv.FormatInt(versionID, 10))
+}
+
+func (a *recordingAdvancer) got() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.marked...)
+}
+
+// TestPusher_PushVersion_AdvancesTheCursor pins the fix for the read path.
+//
+// Receiving a version's records is what makes a node hold it, and §9.3(2)'s
+// freshness check reads the cursor to decide whether the node may answer a
+// query. Without this the replica had every record on disk and still answered
+// "local history reaches version 0", so the station refused it as stale and the
+// read failed — the failure mode TestT4_DataVolume and
+// TestT4_MultiNode_Consistency both hit.
+func TestPusher_PushVersion_AdvancesTheCursor(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	leader, _, _ := startLeaderServer(t, newFakeVecstore())
+	kbID, versionID := "kb-cursor", int64(5)
+	if err := leader.docStore.Write(ctx, kbID, "doc-1", versionID, []byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.versionDoc.Write(ctx, kbID, versionID, "doc-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	adv := &recordingAdvancer{}
+	_, _, addr := startPushServer(t, 4, WithLocalVersionAdvancer(adv))
+
+	if _, err := NewPusher(PusherConfig{Exporter: leader.handler, NodeID: 1}).PushVersion(ctx, addr, kbID, versionID); err != nil {
+		t.Fatalf("PushVersion: %v", err)
+	}
+
+	got := adv.got()
+	if len(got) != 1 || got[0] != kbID+"/"+strconv.FormatInt(versionID, 10) {
+		t.Fatalf("cursor after push = %v, want exactly [%s/%d]", got, kbID, versionID)
+	}
+}
+
+// TestFollower_PullVersion_AdvancesTheCursor is the same fact over the pull
+// direction: a node that fetched a version's records holds it too, so the
+// cursor must move there as well.
+func TestFollower_PullVersion_AdvancesTheCursor(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	leader, _, leaderAddr := startLeaderServer(t, newFakeVecstore())
+	kbID, versionID := "kb-pull-cursor", int64(6)
+	if err := leader.docStore.Write(ctx, kbID, "doc-1", versionID, []byte("pulled content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.versionDoc.Write(ctx, kbID, versionID, "doc-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	adv := &recordingAdvancer{}
+	follower, _, _ := startPushServer(t, 5)
+	follower.SetLocalVersionAdvancer(adv)
+
+	if err := follower.PullVersion(ctx, leaderAddr, kbID, versionID); err != nil {
+		t.Fatalf("PullVersion: %v", err)
+	}
+
+	got := adv.got()
+	if len(got) != 1 || got[0] != kbID+"/"+strconv.FormatInt(versionID, 10) {
+		t.Fatalf("cursor after pull = %v, want exactly [%s/%d]", got, kbID, versionID)
 	}
 }

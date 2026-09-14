@@ -355,15 +355,15 @@ const (
 	// (the original DeleteVersion semantics). Default, so clients that do
 	// not send a mode keep the historical behavior.
 	VersionDeleteMode_VERSION_DELETE_MODE_SUBTREE VersionDeleteMode = 0
-	// Remove only the target version itself: its direct child versions are
-	// re-parented onto the target's parent, preserving the branch structure
-	// below it (a linked-list splice). This is how an arbitrary "middle"
-	// version is removed without dragging its descendants along.
+	// Remove only the target version itself: its child version (the chain is
+	// strictly linear, so there is at most one) is re-parented onto the
+	// target's parent — a linked-list splice. This is how an arbitrary
+	// "middle" version is removed without dragging its descendants along.
 	VersionDeleteMode_VERSION_DELETE_MODE_SINGLE VersionDeleteMode = 1
 	// Remove every ancestor (前置版本) of the target version, making the
-	// target the new base (root) of the knowledge base. Ancestors that
-	// carry sibling branches are removed together with those branches;
-	// the response lists every version actually marked for deletion.
+	// target the new base (root) of the knowledge base. The chain is strictly
+	// linear, so this is a prefix removal. The response lists every version
+	// actually marked for deletion.
 	VersionDeleteMode_VERSION_DELETE_MODE_ANCESTORS VersionDeleteMode = 2
 )
 
@@ -1394,9 +1394,8 @@ type DeleteVersionResponse struct {
 
 	Success bool `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"` // returned immediately after marking the version(s) for deletion; cleanup runs asynchronously
 	// Every version this call marked for deletion, in unspecified order.
-	// For VERSION_DELETE_MODE_ANCESTORS this also includes the sibling
-	// branches of the removed ancestors. Empty when the request was a
-	// no-op (e.g. ANCESTORS on a version that is already the base).
+	// Empty when the request was a no-op (e.g. ANCESTORS on a version that is
+	// already the base).
 	DeletedVersionIds []int64 `protobuf:"varint,2,rep,packed,name=deleted_version_ids,json=deletedVersionIds,proto3" json:"deleted_version_ids,omitempty"`
 }
 
@@ -1625,6 +1624,184 @@ func (x *GetKnowledgeBaseResponse) GetKnowledgeBase() *KnowledgeBaseInfo {
 	return nil
 }
 
+// DataVersionHolder is one node the leader's aggregate believes holds a version.
+type DataVersionHolder struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	NodeId int64 `protobuf:"varint,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// address is the node's storage-layer gRPC address, as the node itself
+	// reported it. It is carried here so a consumer can act on the answer
+	// directly: the station has to forward to an address, and node ids alone would
+	// force a second id→address map onto every consumer.
+	Address string `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+}
+
+func (x *DataVersionHolder) Reset() {
+	*x = DataVersionHolder{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_knowledgebase_proto_msgTypes[20]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *DataVersionHolder) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DataVersionHolder) ProtoMessage() {}
+
+func (x *DataVersionHolder) ProtoReflect() protoreflect.Message {
+	mi := &file_knowledgebase_proto_msgTypes[20]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DataVersionHolder.ProtoReflect.Descriptor instead.
+func (*DataVersionHolder) Descriptor() ([]byte, []int) {
+	return file_knowledgebase_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *DataVersionHolder) GetNodeId() int64 {
+	if x != nil {
+		return x.NodeId
+	}
+	return 0
+}
+
+func (x *DataVersionHolder) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+type GetDataVersionHoldersRequest struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	KnowledgeBaseId string `protobuf:"bytes,1,opt,name=knowledge_base_id,json=knowledgeBaseId,proto3" json:"knowledge_base_id,omitempty"`
+	// version_id is the version that must be servable. A node whose reported
+	// cursor reaches it is a holder; a node that has never reported is absent —
+	// which is why an empty answer is not "nobody has it".
+	VersionId int64 `protobuf:"varint,2,opt,name=version_id,json=versionId,proto3" json:"version_id,omitempty"`
+}
+
+func (x *GetDataVersionHoldersRequest) Reset() {
+	*x = GetDataVersionHoldersRequest{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_knowledgebase_proto_msgTypes[21]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *GetDataVersionHoldersRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetDataVersionHoldersRequest) ProtoMessage() {}
+
+func (x *GetDataVersionHoldersRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_knowledgebase_proto_msgTypes[21]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetDataVersionHoldersRequest.ProtoReflect.Descriptor instead.
+func (*GetDataVersionHoldersRequest) Descriptor() ([]byte, []int) {
+	return file_knowledgebase_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *GetDataVersionHoldersRequest) GetKnowledgeBaseId() string {
+	if x != nil {
+		return x.KnowledgeBaseId
+	}
+	return ""
+}
+
+func (x *GetDataVersionHoldersRequest) GetVersionId() int64 {
+	if x != nil {
+		return x.VersionId
+	}
+	return 0
+}
+
+type GetDataVersionHoldersResponse struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	// Ascending by node_id, so a caller's choice is reproducible rather than
+	// dependent on map iteration order.
+	Holders []*DataVersionHolder `protobuf:"bytes,1,rep,name=holders,proto3" json:"holders,omitempty"`
+	// known is false when the answering node is not the control leader: its
+	// aggregate is empty only because it has never folded a report. The caller
+	// should re-resolve the leader rather than read the empty list as a fact.
+	Known bool `protobuf:"varint,2,opt,name=known,proto3" json:"known,omitempty"`
+}
+
+func (x *GetDataVersionHoldersResponse) Reset() {
+	*x = GetDataVersionHoldersResponse{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_knowledgebase_proto_msgTypes[22]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *GetDataVersionHoldersResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetDataVersionHoldersResponse) ProtoMessage() {}
+
+func (x *GetDataVersionHoldersResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_knowledgebase_proto_msgTypes[22]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetDataVersionHoldersResponse.ProtoReflect.Descriptor instead.
+func (*GetDataVersionHoldersResponse) Descriptor() ([]byte, []int) {
+	return file_knowledgebase_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *GetDataVersionHoldersResponse) GetHolders() []*DataVersionHolder {
+	if x != nil {
+		return x.Holders
+	}
+	return nil
+}
+
+func (x *GetDataVersionHoldersResponse) GetKnown() bool {
+	if x != nil {
+		return x.Known
+	}
+	return false
+}
+
 var File_knowledgebase_proto protoreflect.FileDescriptor
 
 var file_knowledgebase_proto_rawDesc = []byte{
@@ -1796,7 +1973,25 @@ var file_knowledgebase_proto_rawDesc = []byte{
 	0x64, 0x67, 0x65, 0x5f, 0x62, 0x61, 0x73, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1a,
 	0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x4b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64,
 	0x67, 0x65, 0x42, 0x61, 0x73, 0x65, 0x49, 0x6e, 0x66, 0x6f, 0x52, 0x0d, 0x6b, 0x6e, 0x6f, 0x77,
-	0x6c, 0x65, 0x64, 0x67, 0x65, 0x42, 0x61, 0x73, 0x65, 0x2a, 0x7b, 0x0a, 0x0b, 0x49, 0x6e, 0x64,
+	0x6c, 0x65, 0x64, 0x67, 0x65, 0x42, 0x61, 0x73, 0x65, 0x22, 0x46, 0x0a, 0x11, 0x44, 0x61, 0x74,
+	0x61, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x48, 0x6f, 0x6c, 0x64, 0x65, 0x72, 0x12, 0x17,
+	0x0a, 0x07, 0x6e, 0x6f, 0x64, 0x65, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x03, 0x52,
+	0x06, 0x6e, 0x6f, 0x64, 0x65, 0x49, 0x64, 0x12, 0x18, 0x0a, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65,
+	0x73, 0x73, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73,
+	0x73, 0x22, 0x69, 0x0a, 0x1c, 0x47, 0x65, 0x74, 0x44, 0x61, 0x74, 0x61, 0x56, 0x65, 0x72, 0x73,
+	0x69, 0x6f, 0x6e, 0x48, 0x6f, 0x6c, 0x64, 0x65, 0x72, 0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73,
+	0x74, 0x12, 0x2a, 0x0a, 0x11, 0x6b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x5f, 0x62,
+	0x61, 0x73, 0x65, 0x5f, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0f, 0x6b, 0x6e,
+	0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x42, 0x61, 0x73, 0x65, 0x49, 0x64, 0x12, 0x1d, 0x0a,
+	0x0a, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x5f, 0x69, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28,
+	0x03, 0x52, 0x09, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x22, 0x6b, 0x0a, 0x1d,
+	0x47, 0x65, 0x74, 0x44, 0x61, 0x74, 0x61, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x48, 0x6f,
+	0x6c, 0x64, 0x65, 0x72, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x34, 0x0a,
+	0x07, 0x68, 0x6f, 0x6c, 0x64, 0x65, 0x72, 0x73, 0x18, 0x01, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x1a,
+	0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x44, 0x61, 0x74, 0x61, 0x56, 0x65, 0x72,
+	0x73, 0x69, 0x6f, 0x6e, 0x48, 0x6f, 0x6c, 0x64, 0x65, 0x72, 0x52, 0x07, 0x68, 0x6f, 0x6c, 0x64,
+	0x65, 0x72, 0x73, 0x12, 0x14, 0x0a, 0x05, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x18, 0x02, 0x20, 0x01,
+	0x28, 0x08, 0x52, 0x05, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x2a, 0x7b, 0x0a, 0x0b, 0x49, 0x6e, 0x64,
 	0x65, 0x78, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x12, 0x18, 0x0a, 0x14, 0x49, 0x4e, 0x44, 0x45,
 	0x58, 0x5f, 0x53, 0x54, 0x41, 0x54, 0x55, 0x53, 0x5f, 0x50, 0x45, 0x4e, 0x44, 0x49, 0x4e, 0x47,
 	0x10, 0x00, 0x12, 0x16, 0x0a, 0x12, 0x49, 0x4e, 0x44, 0x45, 0x58, 0x5f, 0x53, 0x54, 0x41, 0x54,
@@ -1840,7 +2035,7 @@ var file_knowledgebase_proto_rawDesc = []byte{
 	0x4d, 0x4f, 0x44, 0x45, 0x5f, 0x53, 0x49, 0x4e, 0x47, 0x4c, 0x45, 0x10, 0x01, 0x12, 0x21, 0x0a,
 	0x1d, 0x56, 0x45, 0x52, 0x53, 0x49, 0x4f, 0x4e, 0x5f, 0x44, 0x45, 0x4c, 0x45, 0x54, 0x45, 0x5f,
 	0x4d, 0x4f, 0x44, 0x45, 0x5f, 0x41, 0x4e, 0x43, 0x45, 0x53, 0x54, 0x4f, 0x52, 0x53, 0x10, 0x02,
-	0x32, 0xd5, 0x05, 0x0a, 0x14, 0x4b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x42, 0x61,
+	0x32, 0xbd, 0x06, 0x0a, 0x14, 0x4b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x42, 0x61,
 	0x73, 0x65, 0x53, 0x65, 0x72, 0x76, 0x69, 0x63, 0x65, 0x12, 0x60, 0x0a, 0x13, 0x43, 0x72, 0x65,
 	0x61, 0x74, 0x65, 0x4b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x42, 0x61, 0x73, 0x65,
 	0x12, 0x23, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x43, 0x72, 0x65, 0x61, 0x74,
@@ -1885,9 +2080,16 @@ var file_knowledgebase_proto_rawDesc = []byte{
 	0x74, 0x4b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x42, 0x61, 0x73, 0x65, 0x52, 0x65,
 	0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x21, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e,
 	0x47, 0x65, 0x74, 0x4b, 0x6e, 0x6f, 0x77, 0x6c, 0x65, 0x64, 0x67, 0x65, 0x42, 0x61, 0x73, 0x65,
-	0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x42, 0x1b, 0x5a, 0x19, 0x73, 0x74, 0x72, 0x61,
-	0x74, 0x75, 0x6d, 0x2f, 0x61, 0x70, 0x69, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x73, 0x74,
-	0x72, 0x61, 0x74, 0x75, 0x6d, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+	0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x12, 0x66, 0x0a, 0x15, 0x47, 0x65, 0x74, 0x44,
+	0x61, 0x74, 0x61, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x48, 0x6f, 0x6c, 0x64, 0x65, 0x72,
+	0x73, 0x12, 0x25, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2e, 0x47, 0x65, 0x74, 0x44,
+	0x61, 0x74, 0x61, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x48, 0x6f, 0x6c, 0x64, 0x65, 0x72,
+	0x73, 0x52, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x1a, 0x26, 0x2e, 0x73, 0x74, 0x72, 0x61, 0x74,
+	0x75, 0x6d, 0x2e, 0x47, 0x65, 0x74, 0x44, 0x61, 0x74, 0x61, 0x56, 0x65, 0x72, 0x73, 0x69, 0x6f,
+	0x6e, 0x48, 0x6f, 0x6c, 0x64, 0x65, 0x72, 0x73, 0x52, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65,
+	0x42, 0x1b, 0x5a, 0x19, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x2f, 0x61, 0x70, 0x69, 0x2f,
+	0x70, 0x72, 0x6f, 0x74, 0x6f, 0x2f, 0x73, 0x74, 0x72, 0x61, 0x74, 0x75, 0x6d, 0x62, 0x06, 0x70,
+	0x72, 0x6f, 0x74, 0x6f, 0x33,
 }
 
 var (
@@ -1903,35 +2105,38 @@ func file_knowledgebase_proto_rawDescGZIP() []byte {
 }
 
 var file_knowledgebase_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
-var file_knowledgebase_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_knowledgebase_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_knowledgebase_proto_goTypes = []any{
-	(IndexStatus)(0),                    // 0: stratum.IndexStatus
-	(IndexType)(0),                      // 1: stratum.IndexType
-	(Similarity)(0),                     // 2: stratum.Similarity
-	(QuantizerType)(0),                  // 3: stratum.QuantizerType
-	(KBStatus)(0),                       // 4: stratum.KBStatus
-	(ChangeOp)(0),                       // 5: stratum.ChangeOp
-	(VersionDeleteMode)(0),              // 6: stratum.VersionDeleteMode
-	(*EmbedConfig)(nil),                 // 7: stratum.EmbedConfig
-	(*DocChange)(nil),                   // 8: stratum.DocChange
-	(*VersionInfo)(nil),                 // 9: stratum.VersionInfo
-	(*KnowledgeBaseInfo)(nil),           // 10: stratum.KnowledgeBaseInfo
-	(*CreateKnowledgeBaseRequest)(nil),  // 11: stratum.CreateKnowledgeBaseRequest
-	(*CreateKnowledgeBaseResponse)(nil), // 12: stratum.CreateKnowledgeBaseResponse
-	(*DeleteKnowledgeBaseRequest)(nil),  // 13: stratum.DeleteKnowledgeBaseRequest
-	(*DeleteKnowledgeBaseResponse)(nil), // 14: stratum.DeleteKnowledgeBaseResponse
-	(*CreateVersionRequest)(nil),        // 15: stratum.CreateVersionRequest
-	(*CreateVersionResponse)(nil),       // 16: stratum.CreateVersionResponse
-	(*ListVersionsRequest)(nil),         // 17: stratum.ListVersionsRequest
-	(*ListVersionsResponse)(nil),        // 18: stratum.ListVersionsResponse
-	(*RollbackVersionRequest)(nil),      // 19: stratum.RollbackVersionRequest
-	(*RollbackVersionResponse)(nil),     // 20: stratum.RollbackVersionResponse
-	(*DeleteVersionRequest)(nil),        // 21: stratum.DeleteVersionRequest
-	(*DeleteVersionResponse)(nil),       // 22: stratum.DeleteVersionResponse
-	(*ListKnowledgeBasesRequest)(nil),   // 23: stratum.ListKnowledgeBasesRequest
-	(*ListKnowledgeBasesResponse)(nil),  // 24: stratum.ListKnowledgeBasesResponse
-	(*GetKnowledgeBaseRequest)(nil),     // 25: stratum.GetKnowledgeBaseRequest
-	(*GetKnowledgeBaseResponse)(nil),    // 26: stratum.GetKnowledgeBaseResponse
+	(IndexStatus)(0),                      // 0: stratum.IndexStatus
+	(IndexType)(0),                        // 1: stratum.IndexType
+	(Similarity)(0),                       // 2: stratum.Similarity
+	(QuantizerType)(0),                    // 3: stratum.QuantizerType
+	(KBStatus)(0),                         // 4: stratum.KBStatus
+	(ChangeOp)(0),                         // 5: stratum.ChangeOp
+	(VersionDeleteMode)(0),                // 6: stratum.VersionDeleteMode
+	(*EmbedConfig)(nil),                   // 7: stratum.EmbedConfig
+	(*DocChange)(nil),                     // 8: stratum.DocChange
+	(*VersionInfo)(nil),                   // 9: stratum.VersionInfo
+	(*KnowledgeBaseInfo)(nil),             // 10: stratum.KnowledgeBaseInfo
+	(*CreateKnowledgeBaseRequest)(nil),    // 11: stratum.CreateKnowledgeBaseRequest
+	(*CreateKnowledgeBaseResponse)(nil),   // 12: stratum.CreateKnowledgeBaseResponse
+	(*DeleteKnowledgeBaseRequest)(nil),    // 13: stratum.DeleteKnowledgeBaseRequest
+	(*DeleteKnowledgeBaseResponse)(nil),   // 14: stratum.DeleteKnowledgeBaseResponse
+	(*CreateVersionRequest)(nil),          // 15: stratum.CreateVersionRequest
+	(*CreateVersionResponse)(nil),         // 16: stratum.CreateVersionResponse
+	(*ListVersionsRequest)(nil),           // 17: stratum.ListVersionsRequest
+	(*ListVersionsResponse)(nil),          // 18: stratum.ListVersionsResponse
+	(*RollbackVersionRequest)(nil),        // 19: stratum.RollbackVersionRequest
+	(*RollbackVersionResponse)(nil),       // 20: stratum.RollbackVersionResponse
+	(*DeleteVersionRequest)(nil),          // 21: stratum.DeleteVersionRequest
+	(*DeleteVersionResponse)(nil),         // 22: stratum.DeleteVersionResponse
+	(*ListKnowledgeBasesRequest)(nil),     // 23: stratum.ListKnowledgeBasesRequest
+	(*ListKnowledgeBasesResponse)(nil),    // 24: stratum.ListKnowledgeBasesResponse
+	(*GetKnowledgeBaseRequest)(nil),       // 25: stratum.GetKnowledgeBaseRequest
+	(*GetKnowledgeBaseResponse)(nil),      // 26: stratum.GetKnowledgeBaseResponse
+	(*DataVersionHolder)(nil),             // 27: stratum.DataVersionHolder
+	(*GetDataVersionHoldersRequest)(nil),  // 28: stratum.GetDataVersionHoldersRequest
+	(*GetDataVersionHoldersResponse)(nil), // 29: stratum.GetDataVersionHoldersResponse
 }
 var file_knowledgebase_proto_depIdxs = []int32{
 	5,  // 0: stratum.DocChange.op:type_name -> stratum.ChangeOp
@@ -1950,27 +2155,30 @@ var file_knowledgebase_proto_depIdxs = []int32{
 	6,  // 13: stratum.DeleteVersionRequest.mode:type_name -> stratum.VersionDeleteMode
 	10, // 14: stratum.ListKnowledgeBasesResponse.knowledge_bases:type_name -> stratum.KnowledgeBaseInfo
 	10, // 15: stratum.GetKnowledgeBaseResponse.knowledge_base:type_name -> stratum.KnowledgeBaseInfo
-	11, // 16: stratum.KnowledgeBaseService.CreateKnowledgeBase:input_type -> stratum.CreateKnowledgeBaseRequest
-	13, // 17: stratum.KnowledgeBaseService.DeleteKnowledgeBase:input_type -> stratum.DeleteKnowledgeBaseRequest
-	15, // 18: stratum.KnowledgeBaseService.CreateVersion:input_type -> stratum.CreateVersionRequest
-	17, // 19: stratum.KnowledgeBaseService.ListVersions:input_type -> stratum.ListVersionsRequest
-	19, // 20: stratum.KnowledgeBaseService.RollbackVersion:input_type -> stratum.RollbackVersionRequest
-	21, // 21: stratum.KnowledgeBaseService.DeleteVersion:input_type -> stratum.DeleteVersionRequest
-	23, // 22: stratum.KnowledgeBaseService.ListKnowledgeBases:input_type -> stratum.ListKnowledgeBasesRequest
-	25, // 23: stratum.KnowledgeBaseService.GetKnowledgeBase:input_type -> stratum.GetKnowledgeBaseRequest
-	12, // 24: stratum.KnowledgeBaseService.CreateKnowledgeBase:output_type -> stratum.CreateKnowledgeBaseResponse
-	14, // 25: stratum.KnowledgeBaseService.DeleteKnowledgeBase:output_type -> stratum.DeleteKnowledgeBaseResponse
-	16, // 26: stratum.KnowledgeBaseService.CreateVersion:output_type -> stratum.CreateVersionResponse
-	18, // 27: stratum.KnowledgeBaseService.ListVersions:output_type -> stratum.ListVersionsResponse
-	20, // 28: stratum.KnowledgeBaseService.RollbackVersion:output_type -> stratum.RollbackVersionResponse
-	22, // 29: stratum.KnowledgeBaseService.DeleteVersion:output_type -> stratum.DeleteVersionResponse
-	24, // 30: stratum.KnowledgeBaseService.ListKnowledgeBases:output_type -> stratum.ListKnowledgeBasesResponse
-	26, // 31: stratum.KnowledgeBaseService.GetKnowledgeBase:output_type -> stratum.GetKnowledgeBaseResponse
-	24, // [24:32] is the sub-list for method output_type
-	16, // [16:24] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	27, // 16: stratum.GetDataVersionHoldersResponse.holders:type_name -> stratum.DataVersionHolder
+	11, // 17: stratum.KnowledgeBaseService.CreateKnowledgeBase:input_type -> stratum.CreateKnowledgeBaseRequest
+	13, // 18: stratum.KnowledgeBaseService.DeleteKnowledgeBase:input_type -> stratum.DeleteKnowledgeBaseRequest
+	15, // 19: stratum.KnowledgeBaseService.CreateVersion:input_type -> stratum.CreateVersionRequest
+	17, // 20: stratum.KnowledgeBaseService.ListVersions:input_type -> stratum.ListVersionsRequest
+	19, // 21: stratum.KnowledgeBaseService.RollbackVersion:input_type -> stratum.RollbackVersionRequest
+	21, // 22: stratum.KnowledgeBaseService.DeleteVersion:input_type -> stratum.DeleteVersionRequest
+	23, // 23: stratum.KnowledgeBaseService.ListKnowledgeBases:input_type -> stratum.ListKnowledgeBasesRequest
+	25, // 24: stratum.KnowledgeBaseService.GetKnowledgeBase:input_type -> stratum.GetKnowledgeBaseRequest
+	28, // 25: stratum.KnowledgeBaseService.GetDataVersionHolders:input_type -> stratum.GetDataVersionHoldersRequest
+	12, // 26: stratum.KnowledgeBaseService.CreateKnowledgeBase:output_type -> stratum.CreateKnowledgeBaseResponse
+	14, // 27: stratum.KnowledgeBaseService.DeleteKnowledgeBase:output_type -> stratum.DeleteKnowledgeBaseResponse
+	16, // 28: stratum.KnowledgeBaseService.CreateVersion:output_type -> stratum.CreateVersionResponse
+	18, // 29: stratum.KnowledgeBaseService.ListVersions:output_type -> stratum.ListVersionsResponse
+	20, // 30: stratum.KnowledgeBaseService.RollbackVersion:output_type -> stratum.RollbackVersionResponse
+	22, // 31: stratum.KnowledgeBaseService.DeleteVersion:output_type -> stratum.DeleteVersionResponse
+	24, // 32: stratum.KnowledgeBaseService.ListKnowledgeBases:output_type -> stratum.ListKnowledgeBasesResponse
+	26, // 33: stratum.KnowledgeBaseService.GetKnowledgeBase:output_type -> stratum.GetKnowledgeBaseResponse
+	29, // 34: stratum.KnowledgeBaseService.GetDataVersionHolders:output_type -> stratum.GetDataVersionHoldersResponse
+	26, // [26:35] is the sub-list for method output_type
+	17, // [17:26] is the sub-list for method input_type
+	17, // [17:17] is the sub-list for extension type_name
+	17, // [17:17] is the sub-list for extension extendee
+	0,  // [0:17] is the sub-list for field type_name
 }
 
 func init() { file_knowledgebase_proto_init() }
@@ -2219,6 +2427,42 @@ func file_knowledgebase_proto_init() {
 				return nil
 			}
 		}
+		file_knowledgebase_proto_msgTypes[20].Exporter = func(v any, i int) any {
+			switch v := v.(*DataVersionHolder); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_knowledgebase_proto_msgTypes[21].Exporter = func(v any, i int) any {
+			switch v := v.(*GetDataVersionHoldersRequest); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_knowledgebase_proto_msgTypes[22].Exporter = func(v any, i int) any {
+			switch v := v.(*GetDataVersionHoldersResponse); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -2226,7 +2470,7 @@ func file_knowledgebase_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_knowledgebase_proto_rawDesc,
 			NumEnums:      7,
-			NumMessages:   20,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

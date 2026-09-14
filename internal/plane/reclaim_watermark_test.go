@@ -29,9 +29,9 @@ func reclaimFixture(t *testing.T, required ...int64) (*LocalControlPlane, *DataV
 // peer that needs the delta has it.
 func TestLocalControlPlane_ReclaimWatermarkIsTheSlowestReplica(t *testing.T) {
 	c, reg := reclaimFixture(t, 1, 2, 3)
-	reg.Record(1, map[string]int64{"kb-1": 9})
-	reg.Record(2, map[string]int64{"kb-1": 4})
-	reg.Record(3, map[string]int64{"kb-1": 7})
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+	reg.Record(2, "10.0.0.2:7000", map[string]int64{"kb-1": 4})
+	reg.Record(3, "10.0.0.3:7000", map[string]int64{"kb-1": 7})
 
 	got, ok := c.ReclaimableChangesThrough("kb-1")
 	if !ok {
@@ -46,8 +46,8 @@ func TestLocalControlPlane_ReclaimWatermarkIsTheSlowestReplica(t *testing.T) {
 // silence is not evidence that it does not need the changes.
 func TestLocalControlPlane_ReclaimWatermarkUnknownWhenAReplicaIsSilent(t *testing.T) {
 	c, reg := reclaimFixture(t, 1, 2, 3)
-	reg.Record(1, map[string]int64{"kb-1": 9})
-	reg.Record(2, map[string]int64{"kb-1": 9})
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+	reg.Record(2, "10.0.0.2:7000", map[string]int64{"kb-1": 9})
 	// Node 3 never reported.
 
 	if got, ok := c.ReclaimableChangesThrough("kb-1"); ok {
@@ -59,8 +59,8 @@ func TestLocalControlPlane_ReclaimWatermarkUnknownWhenAReplicaIsSilent(t *testin
 // may hold other KBs, and its own cursor here was never stated.
 func TestLocalControlPlane_ReclaimWatermarkUnknownWhenAReplicaOmitsTheKB(t *testing.T) {
 	c, reg := reclaimFixture(t, 1, 2)
-	reg.Record(1, map[string]int64{"kb-1": 9})
-	reg.Record(2, map[string]int64{"kb-2": 9}) // reports, but not for kb-1
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+	reg.Record(2, "10.0.0.2:7000", map[string]int64{"kb-2": 9}) // reports, but not for kb-1
 
 	if _, ok := c.ReclaimableChangesThrough("kb-1"); ok {
 		t.Error("want unknown: node 2 never said anything about kb-1")
@@ -71,7 +71,7 @@ func TestLocalControlPlane_ReclaimWatermarkUnknownWhenAReplicaOmitsTheKB(t *test
 // of them resolves to "keep the data".
 func TestLocalControlPlane_ReclaimWatermarkUnavailableWithoutTheMeansToKnow(t *testing.T) {
 	reg := NewDataVersionRegistry()
-	reg.Record(1, map[string]int64{"kb-1": 9})
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
 	gate := NewLeaderGate(func() bool { return true }, nil)
 
 	t.Run("not the leader", func(t *testing.T) {
@@ -121,7 +121,7 @@ func TestLocalControlPlane_ReclaimWatermarkUnavailableWithoutTheMeansToKnow(t *t
 // same rule, just with nothing to take a minimum over.
 func TestLocalControlPlane_ReclaimWatermarkSingleReplica(t *testing.T) {
 	c, reg := reclaimFixture(t, 1)
-	reg.Record(1, map[string]int64{"kb-1": 6})
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 6})
 
 	got, ok := c.ReclaimableChangesThrough("kb-1")
 	if !ok || got != 6 {

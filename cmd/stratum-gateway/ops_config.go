@@ -40,15 +40,31 @@ type OpsConfig struct {
 // DockerClusterConfig 描述控制台管理的 docker 集群。所有参数都是集群级
 // 统一配置：修改后重建整个集群，而不是单独改某个节点。
 type DockerClusterConfig struct {
-	Enabled         bool   `yaml:"enabled" json:"enabled"`
-	Script          string `yaml:"script" json:"script"`                     // docker-cluster.sh 路径（相对工作目录）
-	Nodes           int    `yaml:"nodes" json:"nodes"`                       // 集群节点数
-	BasePort        int    `yaml:"base_port" json:"base_port"`               // 节点 1 的 gRPC 宿主端口（raft=+1000, metrics=+2000）
-	Network         string `yaml:"network" json:"network"`                   // Docker 网络名
-	Image           string `yaml:"image" json:"image"`                       // stratum 镜像名
-	ContainerPrefix string `yaml:"container_prefix" json:"container_prefix"` // 容器名前缀（stratum-nodeN）
-	WithEmbed       bool   `yaml:"with_embed" json:"with_embed"`             // 是否同时启动 mock-embed 依赖
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// Topology 选择控制台驱动的编排方式：""/"single" 为所有节点同构的单层集群
+	// （docker-cluster.sh），"two-tier" 为控制层只持元数据、存储层只持数据的两层
+	// 集群（docker-cluster-both.sh，Stratum_设计文档v13.md §11 阶段 ④）。
+	//
+	// 两者不可互换，控制台也不该假装可以：两层拓扑里一个节点要么是控制节点、
+	// 要么是存储节点，页面因此分两组展示——把节点列表当成同一个池子，就会把
+	// 读请求发给一个提供不了该服务的节点。
+	Topology string `yaml:"topology" json:"topology"`
+
+	Script          string `yaml:"script" json:"script"`                       // 单层编排脚本（docker-cluster.sh）
+	ScriptTwoTier   string `yaml:"script_two_tier" json:"script_two_tier"`     // 两层编排脚本（docker-cluster-both.sh）
+	Nodes           int    `yaml:"nodes" json:"nodes"`                         // 单层：集群节点数；两层：控制层节点数
+	StorageNodes    int    `yaml:"storage_nodes" json:"storage_nodes"`         // 两层：存储层节点数
+	BasePort        int    `yaml:"base_port" json:"base_port"`                 // 起始 gRPC 宿主端口（两层时指控制层）
+	StorageBasePort int    `yaml:"storage_base_port" json:"storage_base_port"` // 两层：存储层起始 gRPC 宿主端口
+	Network         string `yaml:"network" json:"network"`                     // Docker 网络名
+	Image           string `yaml:"image" json:"image"`                         // stratum 镜像名
+	ContainerPrefix string `yaml:"container_prefix" json:"container_prefix"`   // 容器名前缀（stratum-nodeN）
+	WithEmbed       bool   `yaml:"with_embed" json:"with_embed"`               // 是否同时启动 mock-embed 依赖
 }
+
+// TopologyTwoTier 是 DockerClusterConfig.Topology 的两层取值。
+const TopologyTwoTier = "two-tier"
 
 // ClusterNode identifies one console/gateway endpoint in the cluster.
 type ClusterNode struct {

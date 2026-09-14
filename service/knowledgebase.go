@@ -30,6 +30,61 @@ type KnowledgeBaseServiceImpl struct {
 	writeCoord         coordinator.WriteCoordinator
 	deleteCoord        coordinator.DeleteCoordinator
 	deleteVersionCoord coordinator.DeleteVersionCoordinator
+
+	// versionHolders is the control leader's data-version aggregate, exposed to
+	// the service station's route table (storage-coordination-and-service-station
+	// -design.md §3.1). Optional: without it the RPC answers known=false and the
+	// station keeps its previous behaviour.
+	versionHolders VersionHolderSource
+}
+
+// VersionHolder is one node that reported holding a version, with the address it
+// reported for itself. It mirrors plane's holder rather than importing it: this
+// is the control-layer service, and its caller is the station.
+type VersionHolder struct {
+	NodeID  int64
+	Address string
+}
+
+// VersionHolderSource answers "which nodes reported holding kbID at or past
+// versionID". ok=false means the answering node is not the control leader, so an
+// empty list is "I have heard from nobody", never "nobody has it" — the two
+// justify opposite actions, since the second would license deleting data (§10.6).
+//
+// *plane.LocalControlPlane implements it; declared narrow here so this package
+// does not depend on plane.
+type VersionHolderSource interface {
+	DataVersionHolders(kbID string, versionID int64) ([]VersionHolder, bool)
+}
+
+// SetVersionHolderSource wires the aggregate the holders RPC answers from.
+func (s *KnowledgeBaseServiceImpl) SetVersionHolderSource(src VersionHolderSource) {
+	s.versionHolders = src
+}
+
+// GetDataVersionHolders answers the station's route-table question: which nodes
+// reported a contiguous cursor reaching versionID for kbID.
+//
+// Deliberately not an error when this node is not the leader: it answers
+// known=false, which the station reads as "ask someone else" rather than as a
+// fact about where data lives. A station treating a follower's empty list as
+// "nobody has it" would route every query away from nodes that do hold it.
+func (s *KnowledgeBaseServiceImpl) GetDataVersionHolders(ctx context.Context, req *pb.GetDataVersionHoldersRequest) (*pb.GetDataVersionHoldersResponse, error) {
+	if s.versionHolders == nil {
+		return &pb.GetDataVersionHoldersResponse{}, nil
+	}
+	holders, ok := s.versionHolders.DataVersionHolders(req.GetKnowledgeBaseId(), req.GetVersionId())
+	if !ok {
+		return &pb.GetDataVersionHoldersResponse{}, nil
+	}
+	resp := &pb.GetDataVersionHoldersResponse{
+		Known:   true,
+		Holders: make([]*pb.DataVersionHolder, 0, len(holders)),
+	}
+	for _, h := range holders {
+		resp.Holders = append(resp.Holders, &pb.DataVersionHolder{NodeId: h.NodeID, Address: h.Address})
+	}
+	return resp, nil
 }
 
 // NewKnowledgeBaseService constructs a KnowledgeBaseServiceImpl.

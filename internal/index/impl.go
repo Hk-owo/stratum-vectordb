@@ -87,6 +87,19 @@ type IndexManagerConfig struct {
 	// table. Zero means DefaultColdSweepInterval.
 	ColdSweepInterval time.Duration
 
+	// BuildAbandonTimeout bounds how long a half-built index artifact may sit on
+	// disk before the sweeper deletes it
+	// (coordinator-selection-and-node-liveness-design.md §6, "索引构建失败产物的回收").
+	//
+	// The gap it closes: a build that dies or times out leaves an artifact that
+	// no one will ever look at again — the control layer simply moves on to the
+	// next candidate and that candidate succeeds, so the version never reaches
+	// FAILED_PERMANENT and §1.4's cleanup broadcast never fires. Without this, the
+	// remains sit there for good.
+	//
+	// <= 0 means DefaultBuildAbandonTimeout; negative disables the sweeper.
+	BuildAbandonTimeout time.Duration
+
 	// AppendMaxDeadRatio bounds how much dead weight a §8.6(c) pure-append
 	// reuse may carry: the share of the base artifact's vectors that this
 	// version no longer needs (documents deleted here, or by an ancestor and
@@ -104,6 +117,17 @@ type IndexManagerConfig struct {
 // in-memory map, so the cost is negligible; the delay it adds is the
 // worst-case lag between a version going cold and being reshaped.
 const DefaultColdSweepInterval = time.Minute
+
+// DefaultBuildAbandonTimeout is how long a half-built artifact may sit before
+// the sweeper reclaims it. The placeholder comes from §6.3: the known target is
+// "a 100k-chunk index builds within 5 minutes", and 6x headroom keeps the
+// sweeper away from a legitimately slow build (large batch, cold page cache).
+const DefaultBuildAbandonTimeout = 30 * time.Minute
+
+// DefaultBuildAbandonSweepInterval is how often the sweeper looks. It is
+// deliberately slower than the cold evaluator: the thing it reclaims has been
+// dead for half an hour, so finding it a minute later costs nothing.
+const DefaultBuildAbandonSweepInterval = 5 * time.Minute
 
 // DefaultAppendMaxDeadRatio is the dead-vector share above which §8.6(c)'s
 // pure-append reuse is abandoned for a full rebuild. At 20% a fifth of the
@@ -183,6 +207,11 @@ type IndexManagerImpl struct {
 	// re-triggering a rebuild on every sweep. Dropped with the version
 	// or KB, like the access record. Guarded by mu.
 	builtGraphFree map[indexKey]bool
+	// abandonCancel/abandonWG govern the background sweeper that reclaims
+	// half-built index artifacts (§6). abandonCancel is nil while it is off.
+	abandonCancel context.CancelFunc
+	abandonWG     sync.WaitGroup
+
 	// coldCancel/coldWG govern the background cold-version evaluator
 	// (§8.6a). coldCancel is nil while the policy is off or stopped.
 	coldCancel context.CancelFunc
@@ -275,6 +304,7 @@ func (im *IndexManagerImpl) SetBuildDataSources(
 // also stops the §8.6a cold-version evaluator.
 func (im *IndexManagerImpl) Close() error {
 	im.StopColdPolicy()
+	im.StopAbandonSweeper()
 	if im.vecstoreConn != nil {
 		return im.vecstoreConn.Close()
 	}
@@ -335,6 +365,30 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 		TopK:      int32(topK),
 	})
 	if err != nil {
+		// Translate the vector store's own classification rather than re-inventing it.
+		// The C++ side already answers a search on a still-building index with
+		// FAILED_PRECONDITION (hnsw_index.cpp → grpc_service.cpp maps absl's
+		// FailedPrecondition straight through), and grpc-go hands us that as a
+		// *status.Error — so the code is available here and is the right thing to read.
+		//
+		// Reading the code, not the message, is deliberate: the text ("index is still
+		// building") is a wording detail that may change, while the status code is the
+		// contract both sides already agreed on.
+		//
+		// Why this matters beyond tidiness: this error used to travel up wrapped in %w
+		// only, and ToGRPCStatus' fallback then re-labelled a correctly-classified
+		// error as Internal — the classification was not missing, it was overwritten.
+		// Attaching the local sentinel keeps the meaning, and ToGRPCStatus maps it back
+		// to FailedPrecondition.
+		// Two codes mean the same thing ON THIS PATH: FAILED_PRECONDITION ("still
+		// building") and NOT_FOUND ("no index built or loaded"). Both answer "the
+		// version's index is not usable on this node yet" — whether a version exists is
+		// the control layer's business, not the store's, so a NOT_FOUND here never means
+		// "this version does not exist".
+		switch status.Code(err) {
+		case codes.FailedPrecondition, codes.NotFound:
+			return nil, fmt.Errorf("index: vector search (%s/%d): %w", kbID, versionID, stratumerrors.ErrIndexNotReady)
+		}
 		return nil, fmt.Errorf("index: vector search (%s/%d): %w", kbID, versionID, err)
 	}
 
@@ -356,6 +410,164 @@ func (im *IndexManagerImpl) TriggerBuild(ctx context.Context, kbID string, versi
 // an acceptable price for a version nobody is asking about.
 func (im *IndexManagerImpl) TriggerBuildGraphFree(ctx context.Context, kbID string, versionID int64) error {
 	return im.triggerBuild(kbID, versionID, true)
+}
+
+// StartAbandonSweeper reclaims index artifacts whose build was abandoned
+// (coordinator-selection-and-node-liveness-design.md §6).
+//
+// The gap it closes: a build that dies or times out leaves a half-written
+// artifact behind, and nothing will ever come back for it. The control layer
+// moves on to the next candidate, that candidate succeeds, the version reaches
+// READY — so it never reaches FAILED_PERMANENT either, and §1.4's cleanup
+// broadcast never fires. The remains sit there for good. This is the everyday
+// case (an ordinary timeout or transient failure), far more frequent than a
+// version being condemned outright.
+//
+// Two deliberate properties:
+//
+//   - The verdict is read from the ARTIFACT's mtime, not from an in-process
+//     timer. A candidate may itself restart, and an in-memory timer would go
+//     with it, losing all knowledge of how long the remains have been there.
+//   - It waits for no external signal. §1.4's broadcast only covers the case
+//     where the version is condemned; here nobody will ever send "you were
+//     abandoned" — the control layer has already chosen someone else. Like the
+//     local health view (§5) and the leader's soft state (§4.3), the node
+//     cleans up on its own rather than depending on a message that may never
+//     arrive.
+//
+// A negative BuildAbandonTimeout disables it; <= 0 takes the default. It is
+// idempotent, and it does nothing when persistence is unconfigured (there is no
+// on-disk artifact to reclaim).
+func (im *IndexManagerImpl) StartAbandonSweeper() {
+	if im.cfg.BuildAbandonTimeout < 0 || im.cfg.IndexDataDir == "" {
+		return
+	}
+	im.mu.Lock()
+	if im.abandonCancel != nil {
+		im.mu.Unlock()
+		return // already running
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	im.abandonCancel = cancel
+	im.mu.Unlock()
+
+	im.abandonWG.Add(1)
+	go func() {
+		defer im.abandonWG.Done()
+		ticker := time.NewTicker(DefaultBuildAbandonSweepInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				im.sweepAbandonedArtifacts(now)
+			}
+		}
+	}()
+}
+
+// StopAbandonSweeper stops the sweeper and waits for the running sweep to
+// return. Safe to call when it was never started.
+func (im *IndexManagerImpl) StopAbandonSweeper() {
+	im.mu.Lock()
+	cancel := im.abandonCancel
+	im.abandonCancel = nil
+	im.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		im.abandonWG.Wait()
+	}
+}
+
+// sweepAbandonedArtifacts reclaims what a dead Save left behind.
+//
+// Two kinds of remains, and only two — v13 §8.8 named both:
+//
+//   - An <v>.index with no <v>.index.ids. Save renames the Faiss file into
+//     place FIRST and its .ids sidecar SECOND (§8.3's atomic-write ordering),
+//     so a process that dies between the two renames leaves exactly this: an
+//     index nothing can load (Load rejects an unpaired file) and nothing will
+//     ever rewrite.
+//   - <v>.index.tmp / <v>.index.ids.tmp, the temporaries Save writes before
+//     renaming. A stale one is a Save that died mid-write; the next Save
+//     overwrites it and EnforceDiskRetention ignores it, but until then it
+//     costs its full size.
+//
+// A SEALED pair is never touched here, however old — a READY version's artifact
+// staying on disk is EnforceDiskRetention's business, not this one's.
+//
+// The mtime test exists for the two-rename window, not for "a build in flight":
+// a build runs entirely in memory and touches no file (§8.8 finding 1 and 3), so
+// a stale mtime cannot mean "still building". What it means is that the remains
+// have been there for a while, and waiting one timeout keeps the sweeper away
+// from a Save that is merely slow to finish. Nothing is reported to the control
+// layer — the version's state there is authoritative, and this node's local
+// remains are not its concern.
+func (im *IndexManagerImpl) sweepAbandonedArtifacts(now time.Time) {
+	timeout := im.cfg.BuildAbandonTimeout
+	if timeout <= 0 {
+		timeout = DefaultBuildAbandonTimeout
+	}
+	root := filepath.Join(im.cfg.IndexDataDir, "index")
+	kbs, err := os.ReadDir(root)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			im.logger.Warn("index: abandoned-artifact sweep could not read the index directory", zap.Error(err))
+		}
+		return
+	}
+	for _, kb := range kbs {
+		if !kb.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, kb.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			switch {
+			case strings.HasSuffix(name, ".index.tmp"), strings.HasSuffix(name, ".index.ids.tmp"):
+				im.removeIfStale(dir, kb.Name(), e, now, timeout,
+					"an abandoned Save temporary")
+			case strings.HasSuffix(name, ".index"):
+				version := strings.TrimSuffix(name, ".index")
+				// Sealed by a Save: a completed artifact, not a remainder.
+				if fileExists(filepath.Join(dir, version+".index.ids")) {
+					continue
+				}
+				im.removeIfStale(dir, kb.Name(), e, now, timeout,
+					"an index artifact that no Save ever sealed")
+			}
+		}
+	}
+}
+
+// removeIfStale deletes one entry whose mtime is older than timeout, and says
+// so. A sweep is best-effort by design: a file that cannot be stat'ed or
+// removed is left for the next pass rather than failing the whole sweep.
+func (im *IndexManagerImpl) removeIfStale(dir, kbID string, e os.DirEntry, now time.Time, timeout time.Duration, what string) {
+	info, err := e.Info()
+	if err != nil {
+		return
+	}
+	age := now.Sub(info.ModTime())
+	if age < timeout {
+		return
+	}
+	if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !os.IsNotExist(err) {
+		im.logger.Warn("index: could not remove an abandoned artifact",
+			zap.String("kb_id", kbID), zap.String("file", e.Name()), zap.Error(err))
+		return
+	}
+	im.logger.Warn("index: removed "+what+" — nothing else would have reclaimed it",
+		zap.String("kb_id", kbID), zap.String("file", e.Name()),
+		zap.Duration("age", age), zap.Duration("timeout", timeout))
 }
 
 // StartColdPolicy starts the background evaluator that reshapes versions
@@ -758,6 +970,25 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 	// 回答空结果（chunk 数 0 远低于 BruteForceMaxChunks），不需要、也
 	// 无法在 vecstore 侧留下一个空索引文件。
 	if len(batches) == 0 {
+		// "没有 chunk" 有两种来源，而它们完全不同，不该共用一句话。
+		//
+		// 一种是版本本身没有文档：正常，上面的推理到此为止。
+		//
+		// 另一种是版本有文档、却一个 chunk 都没产出——切分没吐出内容，或者每
+		// 一次嵌入都失败了却没有让调用方失败。这一种从前也走这里，记一行 Info
+		// 就算完，于是集群少一个依赖（实测：mock-embed 没起来）时，写入是半成
+		// 功的：版本提交了、数据没落地、索引永远 PENDING，查询被 FailedPrecondition
+		// 一直拒，而日志里只有一行看起来无害的 "nothing to build"。把异常那一
+		// 种以 Error 记出来，让静默半成功至少不再静默。
+		if im.listDocIDs != nil {
+			if ids, err := im.listDocIDs(ctx, kbID, versionID); err == nil && len(ids) > 0 {
+				im.logger.Error("index: version has documents but produced no chunks; its data never landed",
+					zap.String("kb_id", kbID),
+					zap.Int64("version_id", versionID),
+					zap.Int("documents", len(ids)))
+				return 0, nil
+			}
+		}
 		im.logger.Info("index: version has no chunks; nothing to build",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
 		return 0, nil
