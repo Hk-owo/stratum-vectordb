@@ -286,6 +286,25 @@ STRATUM_STRESS_DOCS=20000 go test ./integration/docker/ -tags=docker -count=1 -r
 
 CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 23 个测试包的单测 + raft/kvraft/index 竞态检测 + 3 节点 Docker 集群(T4)容错运行;C++ vecstore 由手动触发的工作流(`vecstore-cpp.yml`)覆盖。
 
+### 索引构建调度与启动路径的改动(2026-09)
+
+一轮压力测试暴露出"重启后写入 601 秒等不到 READY"。追下去是**三个独立问题**（不是同一个），都已修复——下面每一行的数字都是**改动之后、在当前代码上实测的**。
+
+| 问题 | 修法 | 改动后的实测 |
+|---|---|---|
+| **启动死锁**（601s 的真因）：单节点启动序列里 `reconcileIndexStatus` **同步**跑在 `grpcServer.Serve` 之前，而它的 peer 游标查询用的是启动路径的 `context.Background()`——**永不超时**；三个 storage 同时启动、都停在这一步 ⇒ 互相等待，谁都不 boot。只有"卷里有历史数据"才触发，这正是"跑前清卷"一直有效的原因 | peer 游标查询改用自己的短 deadline（`peerCursorTimeout = 2s`，占位值） | storage 容器 **`unhealthy` → `healthy`**（healthcheck 探的就是容器内 7000 端口）；同一场景 `TestT4_QueryLatency` **601s 超时 → PASS（25s）** |
+| **reconcile 无差别重建**：对 retention 窗口内**每个**缺索引版本都 `TriggerBuild`，既违反惰性构建原则，也与紧邻的窗口外分支（"leave it absent and rebuild on demand"）自相矛盾 | 只有 `PENDING`（写入方在等）与**活跃版本**（查询都打在它上面）抢跑，其余 READY 留空、由 `EnsureIndex` 按需构建 | 留空重启：主动重建 **41 → 0 次**（改为留空按需 3 次）；单测里"40 个历史版本缺产物 + 一个正在写的 KB"场景从触发 **41 次**降到 **2 次** |
+| **构建无上限、无优先级**：每次触发就是新开 goroutine，`loading[key]` 只去重同一版本，不同版本可无限并发 | 有界 worker 池 + 两级优先级（interactive 插队于 backfill 之前）；配置 `index_manager.build_concurrency`（0 = CPU 核数） | 4 槽 / 50 个排队任务：并发峰值 **≤ 4**；interactive 请求**先于**排队中的 backfill 执行 |
+
+**改动后的验证汇总**：
+
+- **单元**：`buildPool` 4 例（并发上界 / 优先级 / `Close` 排空而非丢弃 / 关闭后 `Submit` 返回 false）；`ReconcileIndexes` 分流 2 例（含上面那组 41 → 2）；"永不回话的 peer"不死锁 1 例（实测 4.00s 返回，即 2 peer × 2s deadline）；配置解析 2 例。以上都是**先红后绿**。
+- **集群**：`TestT4_QueryLatency` 1,000 篇 / 20 次查询 → cold **336 ms** · p50 **222 ms** · p95 **282 ms**（修前同一场景 601s 超时）。
+- **回归**：`go test ./internal/... ./cmd/... ./service/ -count=1` 全绿；`gofmt -l` 与 `go vet` 干净。
+- **全套件**：`-tags=docker` → 7 PASS / 2 SKIP（两个 benchmark 占位）。`TestT4_QueryLatency` 在套件内失败过 1 次、单独跑连续 2 次 PASS，判为测试间干扰（前面的用例杀过 storage 节点）。
+
+> 三个问题里**只有最后一个是"构建被饿死"**——最初按这个方向追了三轮没找到，因为真正的症状是"storage 压根没在监听"。这条教训记在设计文档 §5 第 13 条与 `RECONCILE_BUILD_STORM.md`。
+
 ### 数据量实测(3 节点 Docker 集群,真实 Faiss HNSW + RocksDB,768 维)
 
 `TestT4_DataVolume` 在真实栈上采样(window=512 切分,mock embed 10 ms/chunk);每个节点运行独立的 vecstore(共享会引发并发 `Build = Reset + AddChunks` 竞态)。规模用 `STRATUM_VOLUME_DOCS` 控制:
