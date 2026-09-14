@@ -170,7 +170,7 @@ storage:
       addr: "node4:7000"
 ```
 
-- **服务站 `cmd/stratum-router`**(早期文档里的"路由层"是同一个东西):集群**唯一**的对外入口。六项职责:① 路由表缓存(`KB + version → 可服务节点`,从控制层聚合**异步刷新**,不是自己逐节点探测);② **新鲜度凭证**(转发前附上"当前应看到的版本号",存储节点核对本地连续游标,不够就拒——把"悄悄返回过时结果"变成显式失败,服务站再换一个达标候选);③ 读负载均衡;④ 故障转移(同一客户端连接内换候选,客户端无感);⑤ 鉴权(token 表 → 租户/权限,数据面完全不必对外);⑥ 健康检查/熔断(closed / open / half-open 三态,状态是服务站**本地**态、实例间不同步,这是它能无状态水平扩展的前提)。另有 **超时预算传播**(按剩余候选数切分,避免一个慢节点吃掉整个预算)与背压。
+- **服务站 `cmd/stratum-router`**:集群**唯一**的对外入口。六项职责:① 路由表缓存(`KB + version → 可服务节点`,从控制层聚合**异步刷新**,不是自己逐节点探测);② **新鲜度凭证**(转发前附上"当前应看到的版本号",存储节点核对本地连续游标,不够就拒——把"悄悄返回过时结果"变成显式失败,服务站再换一个达标候选);③ 读负载均衡;④ 故障转移(同一客户端连接内换候选,客户端无感);⑤ 鉴权(token 表 → 租户/权限,数据面完全不必对外);⑥ 健康检查/熔断(closed / open / half-open 三态,状态是服务站**本地**态、实例间不同步,这是它能无状态水平扩展的前提)。另有 **超时预算传播**(按剩余候选数切分,避免一个慢节点吃掉整个预算)与背压。
   - 节点侧还有一道闸门:`service/authgate.go` 要求三个**客户端可见**的 service 必须带服务站的信任标记(开关 `require_authenticated`);节点间协作(`DataSyncService` / `InternalService`)不受影响、也不得要求。信任标记刻意不携带身份——接收方只需知道"有权限提问的东西替这次调用背了书",安全性建立在"集群从外部不可达"之上。
 - **网关 `cmd/stratum-gateway`**:把三个外部 gRPC 服务暴露为 REST/JSON,并从同源提供 Web 控制台静态资源(`web/`),因此无需 CORS。内部服务(`DataSyncService`、`InternalService`)有意不对外。
 
@@ -207,9 +207,9 @@ scripts/docker-cluster-both.sh status    # 每容器状态与控制组 leader
 ./run/bin/stratum-gateway -grpc-addr 127.0.0.1:7009
 ```
 
-环境变量可覆盖默认:`STRATUM_HTTP_ADDR`(网关监听,默认 `0.0.0.0:8081`)、`STRATUM_ROUTER_ADDR`(默认 `127.0.0.1:7009`)、`STRATUM_GRPC_ADDR`(单机模式下路由层应连的节点,默认 `127.0.0.1:7000`)。
+环境变量可覆盖默认:`STRATUM_HTTP_ADDR`(网关监听,默认 `0.0.0.0:8081`)、`STRATUM_ROUTER_ADDR`(默认 `127.0.0.1:7009`)、`STRATUM_GRPC_ADDR`(单机模式下服务站应连的节点,默认 `127.0.0.1:7000`)。
 
-`start.sh` 一键构建并启动完整链路:路由层与控制台先行,数据库服务经控制台 `/ops/start` 端点拉起——Web UI(默认 `http://localhost:8081`,含「运维」页)在数据库未运行时也可用;Ctrl+C 干净停止,日志在 `run/log/`。仅需运维:直接运行 `./run/bin/stratum-gateway`,在「运维」页编辑 `run/console.yaml` 的启动参数并启停服务。
+`start.sh` 一键构建并启动完整链路:服务站与控制台先行,数据库服务经控制台 `/ops/start` 端点拉起——Web UI(默认 `http://localhost:8081`,含「运维」页)在数据库未运行时也可用;Ctrl+C 干净停止,日志在 `run/log/`。仅需运维:直接运行 `./run/bin/stratum-gateway`,在「运维」页编辑 `run/console.yaml` 的启动参数并启停服务。
 
 > Docker 集群模式下 vecstore 是宿主机上的外部依赖(`vecstore.grpc_addr: host.docker.internal:7100`),必须监听宿主机的**对外接口**(`--grpc_addr=0.0.0.0:7100`);只绑 `127.0.0.1` 时容器内无法访问,会导致索引构建失败、删除报错等连锁问题。
 
@@ -241,7 +241,7 @@ Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部�
 |---|---|
 | `HealthCheck` | 三态健康检查(HEALTHY / DEGRADED / UNHEALTHY) |
 | `GetSystemStatus` | 卡住版本、**数据缺失版本**(DATA_MISSING)、**永久失败版本**(FAILED_PERMANENT)、删除失败的知识库、WAL 告警、资源占用 |
-| `GetClusterStatus` | 节点 Raft 视图(node_id / leader_id / member_count),供路由层发现 leader |
+| `GetClusterStatus` | 节点 Raft 视图(node_id / leader_id / member_count),供服务站发现 leader |
 | `RebuildIndex` / `WarmupVersion` | 重试失败版本的索引构建 / 预热版本索引入内存(不切换活跃版本) |
 
 **InternalService**(节点间控制面流量,不对外)
@@ -265,8 +265,6 @@ Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部�
 | `PushIndexData` | 流式**推送已构建的索引**,副本直接加载而不再各自重建("建一次、分发 N 份") |
 
 ## 工程与测试
-
-共识层(`internal/kvraft`)改编自 [KVServer](https://github.com/Hk-owo/KVServer)(MIT 6.5840 教学实现),重写为 Stratum 代码风格并经 TDD 修复 6 个缺陷——多数派检查缺失导致单节点选不出 leader、心跳跳过日志一致性检查、InstallSnapshot 持锁发送(死锁风险)、RequestVote 未检查 `killed()`、选举后无 no-op 条目、leader 把自己加为 peer。
 
 | 批次 | 范围 | 状态 |
 |---|---|---|
@@ -357,7 +355,7 @@ internal/            # Go 核心
   splitter/ embed/ chunkstore/ kvstorage/ pebbleutil/ types/ errors/
 service/             # gRPC 服务实现(含测试)
 cmd/stratum/         # 节点入口(-config YAML / flags)
-cmd/stratum-router/  # 路由层:单地址接入 Raft 集群
+cmd/stratum-router/  # 服务站:单地址接入 Raft 集群,集群唯一对外入口
 cmd/stratum-gateway/ # HTTP/JSON 网关 + /ops 控制台控制面
 vecstore/            # C++ 向量存储:Faiss HNSW + RocksDB,支持量化两段式检索
 web/                 # Web 控制台前端(HTML/CSS/JS)
