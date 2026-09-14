@@ -34,6 +34,10 @@
 #   scripts/docker-cluster-both.sh status     per-container state and the leader
 #   scripts/docker-cluster-both.sh logs [name]
 #   scripts/docker-cluster-both.sh down       remove all containers (volumes kept)
+#   scripts/docker-cluster-both.sh station up|down|status|logs [lines]
+#                                             the §9 station (host process, not a
+#                                             container); `up` derives both address
+#                                             lists from this script's own ports
 #
 # Options (the same shape docker-cluster.sh uses, with the tier named):
 #   --control-nodes N        control-layer node count (default 3)
@@ -43,6 +47,7 @@
 #   --network N              Docker network (default stratum-net)
 #   --image IMG              image for every node (default stratum-storage:latest)
 #   --no-embed               do not start the mock-embed container (default: start it)
+#   --with-station           also start the station after `up`
 #   --force                  rebuild containers that already exist
 #   --json                   status as machine-readable JSON
 #
@@ -51,6 +56,9 @@
 #                            calls only when they carry a station's trust mark;
 #                            "false" is for a harness that talks to node ports
 #                            directly (see the note in the script)
+#   STRATUM_STATION_ADDR     station listen address (default 0.0.0.0:7009, same as
+#                            scripts/router.sh; the two are alternatives, not a pair —
+#                            this script derives the node address lists itself)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -74,6 +82,12 @@ FORCE=0
 # `down` removing it is what `up` has to undo. `--no-embed` is for a harness
 # that brings its own embed service.
 WITH_EMBED=1
+
+# Whether `up` also starts the station (§9). Off by default: the station is a
+# host process the operator may already run from scripts/router.sh, and starting
+# a second one would fight over the same port. `--with-station` is for the
+# deployment that wants a single command to bring the whole topology up.
+WITH_STATION=0
 
 # Whether nodes accept client-facing calls only from a service station (§9.3(5)).
 # On by default because that is the deployed shape: the station is the only
@@ -101,6 +115,22 @@ storage_id()   { echo $((STORAGE_ID_BASE + ${1})); }
 control_cfg()  { echo "$NODES_DIR/control${1}/config.yaml"; }
 storage_cfg()  { echo "$NODES_DIR/storage${1}/config.yaml"; }
 container_exists() { docker inspect "$1" >/dev/null 2>&1; }
+
+# ---------- station (§9 服务站) ----------
+#
+# The station is the only client-facing entry point in this topology: every node
+# runs with require_authenticated, so a caller that reaches a node port directly
+# gets nowhere (§9.3(5)). That makes starting it part of standing the deployment
+# up, not an afterthought — and it is why its start/stop lives HERE, deriving the
+# two address lists from this script's own ports, instead of asking the operator
+# to re-enter them in another script.
+#
+# The test suite does not depend on this: integration/docker's TestMain builds
+# and starts its own station (STRATUM_T4_STATION_ADDR can point it at this one).
+STATION_BIN="$ROOT/run/bin/stratum-router"
+STATION_ADDR="${STRATUM_STATION_ADDR:-0.0.0.0:7009}"
+STATION_PID_FILE="$RUN_DIR/station.pid"
+STATION_LOG="$LOG_DIR/station.log"
 
 # ---------- build ----------
 
@@ -326,6 +356,10 @@ cmd_up() {
   done
 
   if [[ "$WITH_EMBED" -eq 1 ]]; then embed_start; fi
+  # --with-station: bring the §9 entry point up too. Not the default (starting a
+  # host process is a deployment decision, not a side effect of `up`), but the
+  # two commands a two-tier deployment needs are one flag apart.
+  if [[ "$WITH_STATION" -eq 1 ]]; then cmd_station_up; fi
   cmd_status
 }
 
@@ -396,6 +430,121 @@ cmd_down() {
     log "没有需要删除的容器"
   fi
   docker rm -f stratum-embed >/dev/null 2>&1 && log "已删除 mock-embed" || true
+  # The station is a host process, not a container, so tearing the deployment
+  # down has to reach it explicitly — otherwise the next `up` leaves an orphan
+  # serving a cluster whose nodes have all been recreated under it.
+  cmd_station_down
+}
+
+# ---------- station commands ----------
+
+# station_pid echoes the running station's pid, or fails.
+station_pid() {
+  [[ -f "$STATION_PID_FILE" ]] || return 1
+  local pid
+  pid="$(cat "$STATION_PID_FILE" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+# station_listening reports whether something accepts connections on STATION_ADDR.
+station_listening() {
+  local host="${STATION_ADDR%:*}" port="${STATION_ADDR##*:}"
+  # 0.0.0.0 is a bind address, not a dial address.
+  [[ "$host" == "0.0.0.0" || "$host" == "*" ]] && host=127.0.0.1
+  (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null
+}
+
+# node_addr_list emits the host-side gRPC addresses of one tier.
+node_addr_list() {
+  local base=$1 count=$2 i out=""
+  for ((i = 1; i <= count; i++)); do
+    out+="localhost:$((base + i - 1)),"
+  done
+  echo "${out%,}"
+}
+
+cmd_station() {
+  local action="${1:-status}"
+  case "$action" in
+    up)          cmd_station_up ;;
+    down|stop)   cmd_station_down ;;
+    status)      cmd_station_status ;;
+    logs)        shift || true; cmd_station_logs "$@" ;;
+    *)           die "station 的动作只能是 up / down / status / logs（收到「$action」）" ;;
+  esac
+}
+
+cmd_station_up() {
+  local pid
+  if pid="$(station_pid)"; then
+    log "服务站已在运行（PID $pid，$STATION_ADDR）"
+    return 0
+  fi
+
+  # Listening, but not by a process this script started: almost always
+  # scripts/router.sh, which is a supported alternative rather than a mistake.
+  # Saying so beats a five-second wait followed by "did not start listening",
+  # which reads like a bug in this script.
+  if station_listening; then
+    die "$STATION_ADDR 已在监听，但不是本脚本起的服务站；若那是 scripts/router.sh 起的，直接用它（scripts/router.sh status），或换一个端口：STRATUM_STATION_ADDR=0.0.0.0:7010"
+  fi
+
+  # Build every time rather than reusing run/bin as-is: `go build` is
+  # incremental, and a binary older than -storage-nodes would start and then
+  # die on "flag provided but not defined" — the failure mode router.sh had.
+  log "构建 stratum-router …"
+  (cd "$ROOT" && GOCACHE="$ROOT/run/gocache" GOTMPDIR="$ROOT/run/gotmp" \
+     CGO_ENABLED=0 go build -o "$STATION_BIN" ./cmd/stratum-router/)
+
+  local nodes storage
+  nodes="$(node_addr_list "$CONTROL_BASE_PORT" "$CONTROL_COUNT")"
+  storage="$(node_addr_list "$STORAGE_BASE_PORT" "$STORAGE_COUNT")"
+  log "启动服务站（$STATION_ADDR｜控制组 $nodes｜存储组 $storage）…"
+  mkdir -p "$(dirname "$STATION_LOG")"
+  : > "$STATION_LOG"
+  nohup "$STATION_BIN" -listen "$STATION_ADDR" -nodes "$nodes" -storage-nodes "$storage" \
+    >>"$STATION_LOG" 2>&1 &
+  echo $! > "$STATION_PID_FILE"
+
+  local waited=0
+  while ! station_listening; do
+    if ! station_pid >/dev/null; then
+      warn "服务站启动失败，日志尾部："
+      tail -n 5 "$STATION_LOG" >&2 || true
+      rm -f "$STATION_PID_FILE"
+      die "服务站没能起来（见 $STATION_LOG）"
+    fi
+    ((waited++ >= 50)) && die "服务站 5 秒内未开始监听 $STATION_ADDR（见 $STATION_LOG）"
+    sleep 0.1
+  done
+  log "服务站已就绪：$STATION_ADDR（日志 $STATION_LOG）"
+}
+
+cmd_station_down() {
+  local pid
+  if pid="$(station_pid)"; then
+    kill "$pid" 2>/dev/null || true
+    log "已停止服务站（PID $pid）"
+  fi
+  rm -f "$STATION_PID_FILE"
+}
+
+cmd_station_status() {
+  local pid
+  if pid="$(station_pid)"; then
+    printf '服务站  running  pid=%s  addr=%s  control=%s  storage=%s\n' \
+      "$pid" "$STATION_ADDR" "$CONTROL_COUNT" "$STORAGE_COUNT"
+  else
+    printf '服务站  absent   addr=%s\n' "$STATION_ADDR"
+  fi
+}
+
+cmd_station_logs() {
+  local lines="${1:-40}"
+  [[ -f "$STATION_LOG" ]] || die "还没有服务站日志（$STATION_LOG）"
+  tail -n "$lines" "$STATION_LOG"
 }
 
 # container_status / container_health report one container's state as two
@@ -552,6 +701,7 @@ while [[ $# -gt 0 ]]; do
     --force)             FORCE=1; shift ;;
     --with-embed)        WITH_EMBED=1; shift ;;
     --no-embed)          WITH_EMBED=0; shift ;;
+    --with-station)      WITH_STATION=1; shift ;;
     --control-nodes)     CONTROL_COUNT="$2"; shift 2 ;;
     --storage-nodes)     STORAGE_COUNT="$2"; shift 2 ;;
     --control-base-port) CONTROL_BASE_PORT="$2"; shift 2 ;;
@@ -573,5 +723,6 @@ case "${1:-help}" in
   down)    cmd_down ;;
   status)  cmd_status ;;
   logs)    shift; cmd_logs "$@" ;;
+  station) shift; cmd_station "$@" ;;
   help|*)  cmd_help ;;
 esac
