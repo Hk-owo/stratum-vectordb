@@ -13,14 +13,20 @@
 #
 # 可选动作:
 #   --vecstore      额外(重新)构建 vecstore_server(C++,较慢,首次才需要)
-#   --docker [N]    额外更新 docker 集群:等价于 scripts/docker-cluster.sh update N
-#                   (重新编译 → 重建镜像 → --force 重建容器,数据卷保留)
+#   --docker [N]    额外更新**单层** docker 集群(等价于 scripts/docker-cluster.sh
+#                   update N:重新编译 → 重建镜像 → --force 重建容器,数据卷保留)
+#   --two-tier [N]  额外更新**两层** docker 集群(控制组 N + 存储组 N,走
+#                   scripts/docker-cluster-both.sh build + up --force:控制节点
+#                   role=control 零数据层,存储节点 role=storage 自带 vecstore)。
+#                   两层脚本没有 update 子命令,故等价于"重编 → 重建两个镜像 →
+#                   删旧容器重建",数据卷同样保留。与 --docker 互斥,同给以本项为准
 #   --no-restart    只构建,不重启 gateway / router(由你手动重启)
 #   --help / -h     显示本说明
 #
 # 用法:
 #   scripts/update-all.sh                  # 构建 Go 二进制 + 重启 gateway/router
-#   scripts/update-all.sh --docker 3       # 再更新 3 节点 docker 集群
+#   scripts/update-all.sh --docker 3       # 再更新 3 节点单层 docker 集群
+#   scripts/update-all.sh --two-tier 3     # 再更新两层集群(控制 3 + 存储 3)
 #   scripts/update-all.sh --vecstore --docker 1
 #   scripts/update-all.sh --no-restart     # 只构建不重启
 #
@@ -45,20 +51,26 @@ mkdir -p "$GOCACHE" "$GOTMPDIR"
 DO_VECSTORE=0
 DO_DOCKER=0
 DOCKER_NODES=3
+DO_TWO_TIER=0
+TWO_TIER_NODES=3
 DO_RESTART=1
 for arg in "$@"; do
   case "$arg" in
     --vecstore) DO_VECSTORE=1 ;;
     --docker)   DO_DOCKER=1 ;;
     --docker=*) DO_DOCKER=1; DOCKER_NODES="${arg#*=}" ;;
+    --two-tier)   DO_TWO_TIER=1 ;;
+    --two-tier=*) DO_TWO_TIER=1; TWO_TIER_NODES="${arg#*=}" ;;
     --no-restart) DO_RESTART=0 ;;
     --help|-h)
-      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
-      # 兼容 "update-all.sh --docker 3" 与 "update-all.sh --docker=3"
-      if [ "$DO_DOCKER" = "1" ] && [[ "$arg" =~ ^[0-9]+$ ]] && [ "$DOCKER_NODES" = "3" ]; then
+      # 兼容 "update-all.sh --docker 3" / "--two-tier 3" 与 "...=3" 两种写法
+      if [[ "$arg" =~ ^[0-9]+$ ]] && [ "$DO_TWO_TIER" = "1" ] && [ "$TWO_TIER_NODES" = "3" ]; then
+        TWO_TIER_NODES="$arg"
+      elif [[ "$arg" =~ ^[0-9]+$ ]] && [ "$DO_DOCKER" = "1" ] && [ "$DOCKER_NODES" = "3" ]; then
         DOCKER_NODES="$arg"
       else
         echo "未知参数: $arg(用 --help 查看用法)" >&2
@@ -67,6 +79,12 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# --docker 与 --two-tier 互斥:同时给出时只做两层(单层脚本对两层拓扑无从下手)。
+if [ "$DO_TWO_TIER" = "1" ] && [ "$DO_DOCKER" = "1" ]; then
+  echo "提示:--docker 与 --two-tier 同时给出,只做两层更新(--two-tier)" >&2
+  DO_DOCKER=0
+fi
 
 # ---------- 1. vecstore(C++,可选) ----------
 if [ "$DO_VECSTORE" = "1" ]; then
@@ -90,8 +108,19 @@ ls -la --time-style=+%Y-%m-%d_%H:%M:%S "$BIN"/stratum "$BIN"/stratum-gateway "$B
 
 # ---------- 3. docker 集群(可选) ----------
 if [ "$DO_DOCKER" = "1" ]; then
-  echo "==> [docker] 更新 ${DOCKER_NODES} 节点集群(docker-cluster.sh update)…"
+  echo "==> [docker] 更新 ${DOCKER_NODES} 节点单层集群(docker-cluster.sh update)…"
   "$ROOT/scripts/docker-cluster.sh" update "$DOCKER_NODES"
+fi
+
+# ---------- 3b. 两层 docker 集群(可选) ----------
+# 两层没有 update 子命令:更新 = build(重编 stratum + 重建两个镜像)+ up --force
+# (删旧容器重建,数据卷保留)。控制组先起、存储组后起,与 up 本身一致。
+if [ "$DO_TWO_TIER" = "1" ]; then
+  echo "==> [docker] 更新两层集群(控制组 ${TWO_TIER_NODES} + 存储组 ${TWO_TIER_NODES},docker-cluster-both.sh build + up --force)…"
+  "$ROOT/scripts/docker-cluster-both.sh" build
+  "$ROOT/scripts/docker-cluster-both.sh" \
+    --control-nodes "$TWO_TIER_NODES" --storage-nodes "$TWO_TIER_NODES" \
+    up --force
 fi
 
 # ---------- 4. 重启 gateway / router(默认) ----------
@@ -151,7 +180,8 @@ echo "=============================================="
 echo "  更新完成"
 echo "  二进制目录:$BIN/"
 echo "  日志目录:  $LOG/"
-[ "$DO_DOCKER" = "1" ] && echo "  docker 集群:已更新 ${DOCKER_NODES} 节点"
+[ "$DO_DOCKER" = "1" ] && echo "  docker 集群:已更新 ${DOCKER_NODES} 节点(单层)"
+[ "$DO_TWO_TIER" = "1" ] && echo "  两层集群:已更新(控制 ${TWO_TIER_NODES} + 存储 ${TWO_TIER_NODES})"
 [ "$DO_RESTART" = "1" ] && echo "  gateway/router:已按原参数重启"
 echo "  提示:浏览器访问控制台时请强制刷新(Ctrl+Shift+R)"
 echo "=============================================="

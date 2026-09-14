@@ -83,4 +83,4 @@ else
   done
 fi
 
-echo "完成。数据保留在 $ROOT/run/data/（删除前先停服，见 delete_test_db.py）"
+echo "完成。数据保留在 $ROOT/run/data/（彻底清空请先停服，再删除该目录下的 stratum/ 与 vecstore_rocksdb/）"

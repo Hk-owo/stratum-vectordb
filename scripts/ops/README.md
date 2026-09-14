@@ -136,8 +136,10 @@ scripts/ops/stop.sh        # 停止全部服务（优雅退出，--force 直接�
 scripts/ops/stop.sh --dry-run   # 只列出将停止的进程
 ```
 
-数据目录在 `run/data/`；**彻底清空数据**请先停服，再用
-`scripts/delete_test_db.py`（开发环境重置）。
+数据目录在 `run/data/`；**彻底清空数据**请先停服，再删掉 `run/data/` 下的
+`stratum/`（Go 侧 Pebble + WAL + Raft）与 `vecstore_rocksdb/`（C++ 侧 RocksDB +
+Faiss 索引）两个子目录（开发环境重置）。两层/容器形态下数据在容器数据卷里，
+请改用 `scripts/docker-cluster-both.sh down` 并删除对应数据卷。
 
 ## 三、给监控 / 自动化使用
 

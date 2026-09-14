@@ -97,15 +97,17 @@ else
   echo "==> [3/4] 控制台配置已存在，保留 $CONSOLE_YAML（如需重置请删除后重跑）"
 fi
 
-# ---------- 4. 启动路由层、控制台并拉起服务 ----------
-# 拓扑：gateway → stratum-router（路由层）→ 集群节点。router 负责 leader
-# 发现与写转发/读均衡，gateway 只连 router 一个地址。
-echo "==> [4/4] 启动路由层（stratum-router）与控制台（stratum-gateway）…"
+# ---------- 4. 启动服务站、控制台并拉起服务 ----------
+# 拓扑：gateway → 服务站 station（stratum-router）→ 集群节点。服务站负责
+# leader 发现与写转发/读均衡，gateway 只连它一个地址。
+# 这条链路是**单机/单层**形态：节点 role 默认 all（自带数据层），vecstore 在
+# 本机。要跑两层拓扑（控制组 + 存储组 + 服务站）请用 scripts/docker-cluster-both.sh。
+echo "==> [4/4] 启动服务站（stratum-router）与控制台（stratum-gateway）…"
 ROUTER_ADDR="${STRATUM_ROUTER_ADDR:-127.0.0.1:7009}"
 PIDS=()
 cleanup() {
   echo
-  echo "==> 停止服务（/ops/stop）并退出路由层与控制台…"
+  echo "==> 停止服务（/ops/stop）并退出服务站与控制台…"
   curl -sf -X POST "http://127.0.0.1:${HTTP_PORT}/ops/stop" -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
   sleep 1
   kill "${PIDS[@]:-}" 2>/dev/null || true

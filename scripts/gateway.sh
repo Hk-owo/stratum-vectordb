@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
-# gateway.sh — stratum-gateway 总启动脚本（路由层 + 控制台）。
+# gateway.sh — stratum-gateway 总启动脚本（服务站 + 控制台）。
 #
-# gateway 只连**路由层**（stratum-router）：leader 发现、写转发与读均衡
-# 全部由 router 承担，gateway 不再关心集群拓扑。路由层未在监听时本脚本
-# 会自动构建并后台拉起它（PID 记录在 run/.router.pid），Ctrl+C / stop 时
-# 一并清理自己拉起的路由层；外部已启动的路由层则复用、不干预。
+# gateway 只连**服务站**（stratum-router，早期文档里叫"路由层"，是同一个
+# 二进制）：leader 发现、写转发与读均衡全部由服务站承担，gateway 不再关心
+# 集群拓扑。服务站未在监听时本脚本会自动构建并后台拉起它（PID 记录在
+# run/.router.pid），Ctrl+C / stop 时一并清理自己拉起的服务站；外部已启动的
+# 服务站则复用、不干预。
 #
 # 模式：
 #   cluster（默认）  Docker 集群模式：从 run/console.yaml 的 docker 段
-#                    读取节点数/基础端口，启动路由层与 gateway。
-#   single           单机模式：路由层连 127.0.0.1:7000，启动 gateway。
+#                    读取节点数/基础端口，启动服务站与 gateway。
+#   single           单机模式：服务站连 127.0.0.1:7000，启动 gateway。
 #
 # 用法：
 #   scripts/gateway.sh              集群模式启动（零参数快捷启动）
 #   scripts/gateway.sh single       单机模式启动
 #   scripts/gateway.sh build        强制重新构建二进制后（默认模式）启动
-#   scripts/gateway.sh stop         停止 gateway 与本脚本拉起的路由层
+#   scripts/gateway.sh stop         停止 gateway 与本脚本拉起的服务站
 #
 # 环境变量：
 #   STRATUM_HTTP_ADDR    控制台监听地址（默认 0.0.0.0:8081）
-#   STRATUM_ROUTER_ADDR  路由层地址（默认 127.0.0.1:7009）
-#   STRATUM_GRPC_ADDR    单机模式下路由层应连接的节点地址（默认 127.0.0.1:7000）
+#   STRATUM_ROUTER_ADDR  服务站地址（默认 127.0.0.1:7009）
+#   STRATUM_GRPC_ADDR    单机模式下服务站应连接的节点地址（默认 127.0.0.1:7000）
 #
-# 单独管理路由层可用 scripts/router.sh（start / stop / status）。
+# 单独管理服务站可用 scripts/router.sh（start / stop / status）。
 
 set -euo pipefail
 
@@ -51,9 +52,9 @@ if [[ "${1:-}" == "stop" ]]; then
     rpid=$(cat "$ROUTER_PID_FILE")
     kill "$rpid" 2>/dev/null || true
     rm -f "$ROUTER_PID_FILE"
-    echo "已停止由 gateway.sh 拉起的路由层（PID: $rpid）"
+    echo "已停止由 gateway.sh 拉起的服务站（PID: $rpid）"
   else
-    echo "（路由层由外部启动，未干预；可用 scripts/router.sh stop 停止）"
+    echo "（服务站由外部启动，未干预；可用 scripts/router.sh stop 停止）"
   fi
   exit 0
 fi
@@ -97,12 +98,12 @@ EOF
     done
     CLUSTER_ADDRS="${CLUSTER_ADDRS%,}"
     GRPC_ARGS="-grpc-addr $ROUTER_ADDR"
-    echo "==> 集群模式：${NODES} 节点（$CLUSTER_ADDRS），gateway 经路由层 $ROUTER_ADDR"
+    echo "==> 集群模式：${NODES} 节点（$CLUSTER_ADDRS），gateway 经服务站 $ROUTER_ADDR"
     ;;
   single)
     GRPC_ARGS="-grpc-addr $ROUTER_ADDR"
     CLUSTER_ADDRS="${STRATUM_GRPC_ADDR:-127.0.0.1:7000}"
-    echo "==> 单机模式：gateway 经路由层 $ROUTER_ADDR（节点 $CLUSTER_ADDRS）"
+    echo "==> 单机模式：gateway 经服务站 $ROUTER_ADDR（节点 $CLUSTER_ADDRS）"
     ;;
   -h|--help)
     sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
@@ -114,8 +115,8 @@ EOF
     ;;
 esac
 
-# ---------- 路由层（自动拉起） ----------
-# gateway 只连路由层；未监听时自动构建并后台拉起（写转发/读均衡由 router
+# ---------- 服务站（自动拉起） ----------
+# gateway 只连服务站；未监听时自动构建并后台拉起（写转发/读均衡由服务站
 # 承担），PID 记录到 run/.router.pid，退出时一并清理。
 router_listening() {
   local host="${ROUTER_ADDR%:*}"
@@ -129,14 +130,14 @@ cleanup_router() {
     rpid=$(cat "$ROUTER_PID_FILE")
     kill "$rpid" 2>/dev/null || true
     rm -f "$ROUTER_PID_FILE"
-    echo "已停止由 gateway.sh 拉起的路由层（PID: $rpid）"
+    echo "已停止由 gateway.sh 拉起的服务站（PID: $rpid）"
   fi
 }
 trap cleanup_router EXIT INT TERM
 
 ensure_router() {
   if router_listening; then
-    echo "==> 路由层已在 $ROUTER_ADDR 运行（复用）"
+    echo "==> 服务站已在 $ROUTER_ADDR 运行（复用）"
     return
   fi
   if [[ ! -x "$ROUTER_BIN" ]]; then
@@ -145,7 +146,7 @@ ensure_router() {
     mkdir -p "$ROOT/run/bin" "$ROOT/run/gocache" "$ROOT/run/gotmp"
     go build -o "$ROUTER_BIN" ./cmd/stratum-router/
   fi
-  echo "==> 自动启动路由层（$ROUTER_ADDR，节点 $CLUSTER_ADDRS）…"
+  echo "==> 自动启动服务站（$ROUTER_ADDR，节点 $CLUSTER_ADDRS）…"
   mkdir -p "$ROOT/run/log"
   nohup "$ROUTER_BIN" -listen "$ROUTER_ADDR" -nodes "$CLUSTER_ADDRS" \
     >"$ROOT/run/log/router.log" 2>&1 &
@@ -157,7 +158,7 @@ ensure_router() {
     fi
     sleep 0.5
   done
-  echo "错误：路由层启动失败，请查看 $ROOT/run/log/router.log" >&2
+  echo "错误：服务站启动失败，请查看 $ROOT/run/log/router.log" >&2
   cleanup_router
   exit 1
 }
@@ -165,7 +166,7 @@ ensure_router() {
 # ---------- 启动 ----------
 ensure_router
 echo "==> 启动 stratum-gateway（控制台 http://localhost:${HTTP_ADDR##*:}）…"
-echo "    （Ctrl+C 停止 gateway；本脚本拉起的路由层会一并清理）"
+echo "    （Ctrl+C 停止 gateway；本脚本拉起的服务站会一并清理）"
 exec "$BIN" $GRPC_ARGS \
   -http-addr "$HTTP_ADDR" \
   -static "$STATIC" \

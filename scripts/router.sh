@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
-# router.sh — stratum-router 路由层启停脚本
+# router.sh — stratum-router 服务站启停脚本
 #
-# 路由层（stratum-router）是集群前端：外部客户端（含 gateway）只连它，
-# 由它负责 leader 发现、写转发与读负载均衡。
+# 服务站（stratum-router，早期文档里叫"路由层"，是同一个二进制）是集群前端：
+# 外部客户端（含 gateway）只连它，由它负责 leader 发现、写转发与读负载均衡，
+# 以及 §9 的鉴权闸门（-tokens）与健康熔断。
 #
 # 模式：
 #   cluster（默认）  Docker 集群模式：从 run/console.yaml 的 docker 段
-#                    读取节点数/基础端口，拼接节点地址并启动路由层。
+#                    读取节点数/基础端口，拼接节点地址并启动服务站。
 #   single           单机模式：连 127.0.0.1:7000（可用 STRATUM_GRPC_ADDR 覆盖）。
 #   build            强制重新构建二进制后（默认模式）启动。
-#   stop             停止正在运行的路由层。
-#   status           查看路由层是否在监听。
+#   stop             停止正在运行的服务站。
+#   status           查看服务站是否在监听。
 #
 # 用法：
 #   scripts/router.sh              集群模式启动（零参数快捷启动）
 #   scripts/router.sh single       单机模式启动
 #   scripts/router.sh build        强制重新构建后启动
-#   scripts/router.sh stop         停止路由层
+#   scripts/router.sh stop         停止服务站
 #   scripts/router.sh status       查看状态
 #
 # 环境变量：
-#   STRATUM_ROUTER_ADDR  路由层监听地址（默认 0.0.0.0:7009）
-#   STRATUM_GRPC_ADDR    单机模式下路由层要连接的节点地址（默认 127.0.0.1:7000）
+#   STRATUM_ROUTER_ADDR  服务站监听地址（默认 0.0.0.0:7009）
+#   STRATUM_GRPC_ADDR    单机模式下服务站要连接的节点地址（默认 127.0.0.1:7000）
 #   STRATUM_STORAGE_NODES 存储层节点地址（逗号分隔）。两层拓扑（控制组零存储）
 #                        下必须设置：路由表问的是"哪些存储节点持有该版本"，而
 #                        它要能把这些节点对上一个自己的连接。留空即全部节点同址
@@ -46,9 +47,9 @@ router_listening() {
 # ---------- 状态 ----------
 if [[ "${1:-}" == "status" ]]; then
   if router_listening; then
-    echo "路由层正在运行：$ROUTER_ADDR"
+    echo "服务站正在运行：$ROUTER_ADDR"
   else
-    echo "路由层未运行（$ROUTER_ADDR）"
+    echo "服务站未运行（$ROUTER_ADDR）"
   fi
   exit 0
 fi
@@ -57,10 +58,10 @@ fi
 if [[ "${1:-}" == "stop" ]]; then
   pids=$(pgrep -f "^$BIN " || true)
   if [[ -z "$pids" ]]; then
-    echo "路由层未在运行"
+    echo "服务站未在运行"
   else
     kill $pids
-    echo "已停止路由层（PID: $(echo "$pids" | tr '\n' ' ')）"
+    echo "已停止服务站（PID: $(echo "$pids" | tr '\n' ' ')）"
   fi
   exit 0
 fi
@@ -146,7 +147,7 @@ esac
 
 # ---------- 启动 ----------
 if router_listening; then
-  echo "路由层已在 $ROUTER_ADDR 运行，无需重复启动"
+  echo "服务站已在 $ROUTER_ADDR 运行，无需重复启动"
   exit 0
 fi
 
