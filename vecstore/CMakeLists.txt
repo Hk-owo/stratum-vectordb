@@ -15,6 +15,53 @@ find_package(Protobuf REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(absl REQUIRED)
 find_package(RocksDB REQUIRED)
+
+# ---------------------------------------------------------------------------
+# RocksDB transitive-dependency shim (Ubuntu packaging gap).
+# ---------------------------------------------------------------------------
+# Ubuntu's librocksdb-dev ships RocksDBTargets.cmake whose
+# INTERFACE_LINK_LIBRARIES name imported targets (gflags::gflags_shared,
+# Snappy::snappy, lz4::lz4, zstd::zstd) that the same package never defines
+# (no find_dependency() for them). CMake passes undefined `X::y` names to the
+# linker verbatim, so the link fails with "-lgflags::gflags_shared: No such
+# file or directory". Define them here over the system libraries; each block
+# is a no-op wherever the real target already exists (e.g. where gflags/Snappy
+# ship their own CMake config), so this stays harmless in CI.
+if(NOT TARGET gflags::gflags_shared)
+  find_library(GFLAGS_SHARED_LIBRARY NAMES gflags gflags_nothreads)
+  if(GFLAGS_SHARED_LIBRARY)
+    add_library(gflags::gflags_shared UNKNOWN IMPORTED)
+    set_target_properties(gflags::gflags_shared PROPERTIES
+      IMPORTED_LOCATION "${GFLAGS_SHARED_LIBRARY}")
+  endif()
+endif()
+
+if(NOT TARGET Snappy::snappy)
+  find_library(SNAPPY_LIBRARY NAMES snappy)
+  if(SNAPPY_LIBRARY)
+    add_library(Snappy::snappy UNKNOWN IMPORTED)
+    set_target_properties(Snappy::snappy PROPERTIES
+      IMPORTED_LOCATION "${SNAPPY_LIBRARY}")
+  endif()
+endif()
+
+if(NOT TARGET lz4::lz4)
+  find_library(LZ4_LIBRARY NAMES lz4)
+  if(LZ4_LIBRARY)
+    add_library(lz4::lz4 UNKNOWN IMPORTED)
+    set_target_properties(lz4::lz4 PROPERTIES
+      IMPORTED_LOCATION "${LZ4_LIBRARY}")
+  endif()
+endif()
+
+if(NOT TARGET zstd::zstd)
+  find_library(ZSTD_LIBRARY NAMES zstd)
+  if(ZSTD_LIBRARY)
+    add_library(zstd::zstd UNKNOWN IMPORTED)
+    set_target_properties(zstd::zstd PROPERTIES
+      IMPORTED_LOCATION "${ZSTD_LIBRARY}")
+  endif()
+endif()
 find_package(prometheus-cpp CONFIG REQUIRED)
 find_package(BLAS REQUIRED)
 find_package(LAPACK REQUIRED)

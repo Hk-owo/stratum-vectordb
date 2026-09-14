@@ -13,6 +13,8 @@ import (
 	"stratum/internal/coordinator"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
+	"stratum/internal/plane"
+	"stratum/internal/raft"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -337,6 +339,10 @@ func (r *reconcileRaftNode) ListKnowledgeBases(_ context.Context) ([]types.Knowl
 func (r *reconcileRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
 	return r.versions[kbID], nil
 }
+func (r *reconcileRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ string, _ int32) error {
+	return nil
+}
+
 func (r *reconcileRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
 	if r.proposed == nil {
 		r.proposed = make(map[int64]types.IndexStatus)
@@ -352,7 +358,9 @@ func (r *reconcileRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, kbID st
 	return nil
 }
 func (r *reconcileRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error { return nil }
-func (r *reconcileRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64) (int64, error) {
+func (r *reconcileRaftNode) IsLeader() bool                                           { return true }
+
+func (r *reconcileRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64, opts ...raft.ProposeOption) (int64, error) {
 	return 0, nil
 }
 func (r *reconcileRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {
@@ -399,7 +407,12 @@ func TestReconcileIndexStatus(t *testing.T) {
 		triggered: map[int64]bool{},
 	}
 
-	reconcileIndexStatus(ctx, logger, rn, im, 0)
+	// Stage ①: the reconcile runs through the contract — the storage layer
+	// reports the durable set (which owns the disk probing and the retention
+	// policy), the control layer reconciles its statuses against it.
+	dp := plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{IndexManager: im})
+	cp := plane.NewLocalControlPlane(rn)
+	reconcileIndexStatus(ctx, logger, dp, cp, rn, 0)
 
 	if got := rn.proposed[2]; got != types.IndexStatusReady {
 		t.Errorf("version 2 (PENDING+exists) proposed = %v, want READY", got)

@@ -19,6 +19,7 @@ enum IndexStatus {
   INDEX_STATUS_PENDING = 0; // metadata allocated, storage-layer write in progress; not queryable
   INDEX_STATUS_READY = 1;   // index build complete; queryable
   INDEX_STATUS_FAILED = 2;  // build failed; RebuildIndex can re-trigger
+  INDEX_STATUS_FAILED_PERMANENT = 3; // retry budget spent or unrecoverable; only an operator can retry or abandon it
 }
 
 // IndexType mirrors KnowledgeBaseMeta.IndexType. Only HNSW has a real
@@ -137,6 +138,13 @@ message CreateVersionRequest {
   string knowledge_base_id = 1;
   int64 parent_version_id = 2;
   repeated DocChange changes = 3;
+  // Optional client-generated idempotency key. A retry carrying the same key
+  // (for the same knowledge base) reuses the version the first attempt
+  // allocated instead of allocating another one — which is what lets a client
+  // re-send the changes for a version whose data never landed
+  // (Stratum_设计文档v13.md §7.12). Empty keeps the historical behaviour: every
+  // call allocates a new version.
+  string client_request_id = 4;
 }
 message CreateVersionResponse {
   int64 version_id = 1; // newly created version; PENDING, index building asynchronously

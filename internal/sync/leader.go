@@ -15,11 +15,29 @@ import (
 	"stratum/internal/pebbleutil"
 )
 
+// Naming note: "Leader" here is historical. What this type actually is, is the
+// node's *export* side — the half of DataSyncService that hands this node's
+// data to a peer — and it works the same whether or not this node leads. The
+// name survives because it appears in a lot of call sites; renaming it is a
+// pure cleanup, tracked in Stratum_设计文档v13.md §7.10.
+//
 // LeaderHandler implements the server side of DataSyncService. It is
 // registered on the leader's gRPC server so followers can pull
 // per-version storage-layer data. It reads directly from the local
 // PebbleDB instances (docstore, chunkdoc, versiondoc) and the local
 // vecstore gRPC client.
+// entrySink accepts one version's records as they stream out. Both the gRPC
+// pull stream (server side) and the push stream (client side) satisfy it,
+// which is what lets the pull and push paths share the export logic below.
+type entrySink interface {
+	Send(*pb.SyncEntry) error
+}
+
+// entrySinkFunc adapts a plain function to entrySink.
+type entrySinkFunc func(*pb.SyncEntry) error
+
+func (f entrySinkFunc) Send(entry *pb.SyncEntry) error { return f(entry) }
+
 type LeaderHandler struct {
 	pb.UnimplementedDataSyncServiceServer
 
@@ -52,9 +70,18 @@ func (h *LeaderHandler) PullVersionData(
 	req *pb.PullVersionDataRequest,
 	stream pb.DataSyncService_PullVersionDataServer,
 ) error {
-	kbID := req.GetKnowledgeBaseId()
-	versionID := req.GetVersionId()
+	return h.ExportVersion(stream.Context(), req.GetKnowledgeBaseId(), req.GetVersionId(), stream.Send)
+}
 
+// ExportVersion hands one version's records to send, in exactly the order and
+// shape PullVersionData produces. The push path drives it with a sink that
+// forwards to the target replica's PushVersionData stream, so both directions
+// export through identical logic.
+func (h *LeaderHandler) ExportVersion(ctx context.Context, kbID string, versionID int64, send func(*pb.SyncEntry) error) error {
+	return h.exportVersion(kbID, versionID, entrySinkFunc(send))
+}
+
+func (h *LeaderHandler) exportVersion(kbID string, versionID int64, stream entrySink) error {
 	// 1. VersionDocList: stream all (kbID, versionID, docID) entries.
 	docIDs, err := h.streamVersionDocList(kbID, versionID, stream)
 	if err != nil {
@@ -101,7 +128,7 @@ func (h *LeaderHandler) PullVersionData(
 // downstream steps.
 func (h *LeaderHandler) streamVersionDocList(
 	kbID string, versionID int64,
-	stream pb.DataSyncService_PullVersionDataServer,
+	stream entrySink,
 ) ([]string, error) {
 	prefix := append(
 		pebbleutil.EncodeString(kbID),
@@ -150,7 +177,7 @@ func (h *LeaderHandler) streamVersionDocList(
 // the visible entry at versionID (largest version ≤ versionID).
 func (h *LeaderHandler) streamDocStore(
 	kbID string, versionID int64, docIDs []string,
-	stream pb.DataSyncService_PullVersionDataServer,
+	stream entrySink,
 ) error {
 	kbPrefix := pebbleutil.EncodeString(kbID)
 
@@ -237,7 +264,7 @@ func (h *LeaderHandler) streamDocStore(
 // chunkIDs encountered.
 func (h *LeaderHandler) streamChunkDocReverse(
 	kbID string, docIDs []string,
-	stream pb.DataSyncService_PullVersionDataServer,
+	stream entrySink,
 ) (map[string]bool, error) {
 	chunkSet := make(map[string]bool)
 	kbPrefix := pebbleutil.EncodeString(kbID)
@@ -291,7 +318,7 @@ func (h *LeaderHandler) streamChunkDocReverse(
 // chunkID.
 func (h *LeaderHandler) streamChunkDocForward(
 	kbID string, chunkIDs []string,
-	stream pb.DataSyncService_PullVersionDataServer,
+	stream entrySink,
 ) error {
 	kbPrefix := pebbleutil.EncodeString(kbID)
 
@@ -341,7 +368,7 @@ func (h *LeaderHandler) streamChunkDocForward(
 // streams it.
 func (h *LeaderHandler) streamChunkVectors(
 	kbID string, chunkIDs []string,
-	stream pb.DataSyncService_PullVersionDataServer,
+	stream entrySink,
 ) error {
 	for _, chunkID := range chunkIDs {
 		resp, err := h.vecstore.Read(context.Background(), &vecstorepb.ReadChunkRequest{

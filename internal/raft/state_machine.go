@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,8 +24,8 @@ type applyResult struct {
 	VersionID int64
 	// DeletedVersionIDs is set by cmdMarkVersionDeleting: every version
 	// that command marked Deleting, so the caller can report the exact
-	// impact set (including sibling branches swept up by an ANCESTORS
-	// delete). Empty for every other command.
+	// impact set (for ANCESTORS that is every swept-up 前置版本).
+	// Empty for every other command.
 	DeletedVersionIDs []int64
 	Err               error
 }
@@ -41,14 +42,22 @@ type stateMachine struct {
 	versions      map[int64]types.VersionMeta
 	versionsByKB  map[string][]int64
 	nextVersionID int64
+	// versionsByRequest maps a client idempotency key (see requestKey) to the
+	// version ID the first apply of that request allocated. It is what lets a
+	// retried CreateVersion reuse its version instead of allocating another
+	// one, so a client can re-send the changes for a version whose data never
+	// landed (Stratum_设计文档v13.md §7.12). Entries live exactly as long as
+	// the version metadata they point at.
+	versionsByRequest map[string]int64
 }
 
 func newStateMachine() *stateMachine {
 	return &stateMachine{
-		kbs:           make(map[string]types.KnowledgeBaseMeta),
-		versions:      make(map[int64]types.VersionMeta),
-		versionsByKB:  make(map[string][]int64),
-		nextVersionID: 1,
+		kbs:               make(map[string]types.KnowledgeBaseMeta),
+		versions:          make(map[int64]types.VersionMeta),
+		versionsByKB:      make(map[string][]int64),
+		nextVersionID:     1,
+		versionsByRequest: make(map[string]int64),
 	}
 }
 
@@ -98,6 +107,7 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 			delete(sm.versions, versionID)
 		}
 		delete(sm.versionsByKB, cmd.KBID)
+		sm.dropRequestMappings(cmd.KBID, 0)
 		return applyResult{}
 
 	case cmdCreateVersion:
@@ -117,9 +127,21 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		if !ok {
 			return applyResult{Err: stratumerrors.ErrVersionNotFound}
 		}
+		// A late confirmation must not resurrect a settled version
+		// (Stratum_设计文档v13.md §10.6): the client may already have given up
+		// on this write and run its compensation path, so letting the data
+		// suddenly become queryable would be worse than the original failure.
+		// The check belongs here because the state machine knows the status
+		// deterministically, while a reporter only knows its own timing.
+		if v.IndexStatus == types.IndexStatusFailedPermanent || v.IndexStatus == types.IndexStatusReady {
+			return applyResult{}
+		}
 		v.DocIDSetHash = cmd.DocIDSetHash
 		sm.versions[cmd.VersionID] = v
 		return applyResult{}
+
+	case cmdMarkVersionFailedPermanent:
+		return sm.applyMarkVersionFailedPermanent(cmd)
 
 	case cmdRollback:
 		kb, ok := sm.kbs[cmd.KBID]
@@ -148,6 +170,30 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 	}
 }
 
+// applyMarkVersionFailedPermanent records the terminal state for a version:
+// the control layer has decided its Saga will not be retried automatically
+// (Stratum_设计文档v13.md §10.1). The storage layer only reports failures —
+// deciding when the budget is spent belongs to the control layer, and keeping
+// the verdict here (rather than in a node's memory) is what makes it
+// deterministic across replicas.
+//
+// Idempotent: re-applying overwrites the recorded reason and count, so a
+// replayed log entry converges instead of failing.
+func (sm *stateMachine) applyMarkVersionFailedPermanent(cmd command) applyResult {
+	v, ok := sm.versions[cmd.VersionID]
+	if !ok {
+		return applyResult{Err: stratumerrors.ErrVersionNotFound}
+	}
+	if v.KBID != cmd.KBID {
+		return applyResult{Err: fmt.Errorf("version %d belongs to a different knowledge base: %w", cmd.VersionID, stratumerrors.ErrVersionNotFound)}
+	}
+	v.IndexStatus = types.IndexStatusFailedPermanent
+	v.FailureReason = cmd.FailureReason
+	v.FailureCount = cmd.FailureCount
+	sm.versions[cmd.VersionID] = v
+	return applyResult{}
+}
+
 // applyMarkVersionDeleting handles cmdMarkVersionDeleting: validates the
 // DeleteVersion constraints for the exact version set selected by cmd.Mode,
 // applies the structural rewiring that mode implies, then marks that set as
@@ -155,13 +201,17 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 //
 // The three modes (types.VersionDeleteMode):
 //
-//   - SUBTREE: versionID plus every descendant — the original semantics.
-//   - SINGLE: versionID only; its direct children are re-parented onto
-//     versionID's parent (a linked-list splice), which is what keeps the
-//     branch structure below an arbitrary "middle" version intact.
-//   - ANCESTORS: every ancestor (前置版本) of versionID, plus any sibling
-//     branch hanging off those ancestors; versionID becomes the new base
-//     (root) of the knowledge base by having its ParentVersionID cleared.
+// The chain is strictly linear (a parent has at most one child, enforced by
+// applyCreateVersion), so these degrade to prefix/suffix trims:
+//
+//   - SUBTREE: versionID plus every descendant — i.e. the tail from
+//     versionID onwards.
+//   - SINGLE: versionID only; its single direct child is re-parented onto
+//     versionID's parent (a linked-list splice), which is what lets an
+//     arbitrary "middle" version be dropped without losing the chain below.
+//   - ANCESTORS: every ancestor (前置版本) of versionID — i.e. the prefix
+//     up to versionID; versionID becomes the new base (root) of the
+//     knowledge base by having its ParentVersionID cleared.
 //
 // Constraints are evaluated against the state machine snapshot at apply
 // time, so the descendant/ancestor set is deterministic across nodes
@@ -370,6 +420,30 @@ func (sm *stateMachine) spliceParent(kbID string, parentVersionID int64) int64 {
 	return parentVersionID
 }
 
+// requestKey is the idempotency-map key for a client request: the knowledge
+// base is part of it, so two KBs may reuse the same client-generated id.
+func requestKey(kbID, clientRequestID string) string {
+	return kbID + "\x00" + clientRequestID
+}
+
+// dropRequestMappings removes idempotency entries belonging to kbID (all of
+// them), or — when versionID > 0 — only the ones pointing at that version.
+// Called whenever the metadata they refer to goes away, so a reused key can
+// never resolve to a version that no longer exists.
+func (sm *stateMachine) dropRequestMappings(kbID string, versionID int64) {
+	for key, id := range sm.versionsByRequest {
+		if versionID > 0 {
+			if id == versionID {
+				delete(sm.versionsByRequest, key)
+			}
+			continue
+		}
+		if strings.HasPrefix(key, kbID+"\x00") {
+			delete(sm.versionsByRequest, key)
+		}
+	}
+}
+
 // applyRemoveVersionMeta handles cmdRemoveVersionMeta: removes a single
 // version's metadata from the state machine. Idempotent: deleting an
 // already-absent version succeeds, mirroring cmdRemoveKBMeta's
@@ -390,6 +464,7 @@ func (sm *stateMachine) applyRemoveVersionMeta(cmd command) applyResult {
 			break
 		}
 	}
+	sm.dropRequestMappings(cmd.KBID, cmd.VersionID)
 	return applyResult{}
 }
 
@@ -434,6 +509,16 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 		return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
 	}
 
+	// Idempotent retry: a request that already allocated a version returns
+	// that same version instead of allocating another one. Checked before the
+	// parent validation, because the parent's state may legitimately have
+	// moved on (e.g. it is READY now) since the first attempt.
+	if cmd.ClientRequestID != "" {
+		if id, ok := sm.versionsByRequest[requestKey(cmd.KBID, cmd.ClientRequestID)]; ok {
+			return applyResult{VersionID: id}
+		}
+	}
+
 	if cmd.ParentVersionID != 0 {
 		parent, ok := sm.versions[cmd.ParentVersionID]
 		if !ok {
@@ -447,6 +532,18 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 		}
 		if parent.Deleting {
 			return applyResult{Err: fmt.Errorf("parent version %d is being deleted: %w", cmd.ParentVersionID, stratumerrors.ErrInvalidParentVersion)}
+		}
+		// The version chain is strictly linear: a parent may have at most
+		// one child. docstore.ReadAt resolves a document by numeric
+		// "version <= maxVersionID", which is only equivalent to walking
+		// the ancestor chain when there are no forks — with two children, a
+		// query on one branch can read the sibling branch's write. Checked
+		// here (in apply, not at propose time) so every replica reaches the
+		// same verdict deterministically.
+		for _, id := range sm.versionsByKB[cmd.KBID] {
+			if v, ok := sm.versions[id]; ok && v.ParentVersionID == cmd.ParentVersionID {
+				return applyResult{Err: fmt.Errorf("parent version %d already has child version %d: %w", cmd.ParentVersionID, id, stratumerrors.ErrInvalidParentVersion)}
+			}
 		}
 	}
 
@@ -480,6 +577,9 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 		IndexStatus:     types.IndexStatusPending,
 	}
 	sm.versionsByKB[cmd.KBID] = append(sm.versionsByKB[cmd.KBID], versionID)
+	if cmd.ClientRequestID != "" {
+		sm.versionsByRequest[requestKey(cmd.KBID, cmd.ClientRequestID)] = versionID
+	}
 
 	return applyResult{VersionID: versionID}
 }
@@ -487,10 +587,11 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 // snapshotState is the gob-serializable form of the full state machine,
 // used by serialize/restore for Raft log compaction.
 type snapshotState struct {
-	KBs           map[string]types.KnowledgeBaseMeta
-	Versions      map[int64]types.VersionMeta
-	VersionsByKB  map[string][]int64
-	NextVersionID int64
+	KBs               map[string]types.KnowledgeBaseMeta
+	Versions          map[int64]types.VersionMeta
+	VersionsByKB      map[string][]int64
+	NextVersionID     int64
+	VersionsByRequest map[string]int64
 }
 
 // deepCopy returns a stable copy of the current state machine under RLock.
@@ -514,11 +615,16 @@ func (sm *stateMachine) deepCopy() snapshotState {
 	for k, v := range sm.versionsByKB {
 		versionsByKB[k] = append([]int64(nil), v...)
 	}
+	versionsByRequest := make(map[string]int64, len(sm.versionsByRequest))
+	for k, v := range sm.versionsByRequest {
+		versionsByRequest[k] = v
+	}
 	return snapshotState{
-		KBs:           kbs,
-		Versions:      versions,
-		VersionsByKB:  versionsByKB,
-		NextVersionID: sm.nextVersionID,
+		KBs:               kbs,
+		Versions:          versions,
+		VersionsByKB:      versionsByKB,
+		NextVersionID:     sm.nextVersionID,
+		VersionsByRequest: versionsByRequest,
 	}
 }
 
@@ -551,6 +657,7 @@ func (sm *stateMachine) restore(data []byte) error {
 	sm.versions = snap.Versions
 	sm.versionsByKB = snap.VersionsByKB
 	sm.nextVersionID = snap.NextVersionID
+	sm.versionsByRequest = snap.VersionsByRequest
 	if sm.kbs == nil {
 		sm.kbs = make(map[string]types.KnowledgeBaseMeta)
 	}
@@ -559,6 +666,10 @@ func (sm *stateMachine) restore(data []byte) error {
 	}
 	if sm.versionsByKB == nil {
 		sm.versionsByKB = make(map[string][]int64)
+	}
+	// A snapshot written before the idempotency map existed decodes to nil.
+	if sm.versionsByRequest == nil {
+		sm.versionsByRequest = make(map[string]int64)
 	}
 	return nil
 }

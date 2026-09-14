@@ -33,6 +33,59 @@ var (
 	ErrInvalidParentVersion  = errors.New("invalid parent version")
 )
 
+// sentinelNames gives every sentinel a stable wire name. A proposal forwarded
+// to the leader crosses a process boundary, so its outcome — error included —
+// has to travel as data and be rebuilt on the caller's side; carrying the name
+// is what keeps errors.Is working after the forward.
+//
+// A slice, not a map: Name must be deterministic when an error wraps more than
+// one sentinel.
+//
+// These names are part of the node-to-node protocol. Renaming one means a
+// mixed-version cluster stops agreeing on what an error means.
+var sentinelNames = []struct {
+	name     string
+	sentinel error
+}{
+	{"version_not_found", ErrVersionNotFound},
+	{"version_pending", ErrVersionPending},
+	{"version_failed", ErrVersionFailed},
+	{"version_deleting", ErrVersionDeleting},
+	{"version_is_active", ErrVersionIsActive},
+	{"knowledge_base_not_found", ErrKnowledgeBaseNotFound},
+	{"knowledge_base_deleted", ErrKnowledgeBaseDeleted},
+	{"index_not_ready", ErrIndexNotReady},
+	{"invalid_argument", ErrInvalidArgument},
+	{"index_load_timeout", ErrIndexLoadTimeout},
+	{"invalid_parent_version", ErrInvalidParentVersion},
+}
+
+// Name returns the stable wire name of the sentinel err wraps, or "" when err
+// is not one of them (an unknown error travels as its message alone).
+func Name(err error) string {
+	if err == nil {
+		return ""
+	}
+	for _, entry := range sentinelNames {
+		if errors.Is(err, entry.sentinel) {
+			return entry.name
+		}
+	}
+	return ""
+}
+
+// ByName rebuilds a sentinel from its wire name, or nil when the name is
+// unknown — a newer peer may know errors this build does not, and inventing one
+// would be worse than reporting the message alone.
+func ByName(name string) error {
+	for _, entry := range sentinelNames {
+		if entry.name == name {
+			return entry.sentinel
+		}
+	}
+	return nil
+}
+
 // grpcCodeMap is the single source of truth for business-error -> gRPC
 // status code translation. Errors not present here map to codes.Internal.
 var grpcCodeMap = map[error]codes.Code{

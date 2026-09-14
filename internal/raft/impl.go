@@ -99,19 +99,34 @@ type RaftNodeImpl struct {
 	pendingMu sync.Mutex
 	pending   map[uint64]*pendingProposal
 
+	// nodeID is this node's own ID, needed to tell "the leader is me" from
+	// "the leader is elsewhere" before forwarding.
+	nodeID int64
+	// forwarder carries proposals to the leader when this node is not it
+	// (SetForwarder). Optional: without it a non-leader proposal fails the
+	// way it always did.
+	forwarder ProposeForwarder
+
 	applyLoopDone chan struct{}
 	callbackWG    sync.WaitGroup
 
-	// onVersionCreated is an optional callback invoked after a
-	// cmdCreateVersion is applied on this node when this node is NOT
-	// the proposer (i.e. it is a follower receiving the entry via
-	// Raft replication). The leader (proposer) does its own
-	// storage-layer writes inline during the coordinator write flow
-	// and does not need this hook.
-	//
-	// Set by the startup wiring (main.go) to trigger data sync from
-	// the leader via internal/sync.FollowerSync.PullVersion.
+	// onVersionCreated is an optional callback invoked after a cmdCreateVersion
+	// is applied on this node — on EVERY applier, the proposer included. It is a
+	// data-plane notification ("this version now exists; make sure you hold it"),
+	// so each node has to react for itself, and the plane skips the pull when its
+	// own cursor already covers the version. Set by the startup wiring (main.go)
+	// to trigger data sync (internal/sync.FollowerSync.PullVersion).
 	onVersionCreated func(kbID string, versionID int64)
+
+	// onVersionCommittedAsLeader is an optional callback invoked after a
+	// cmdCreateVersion is applied on a node that, AT APPLY TIME, believes it is
+	// the leader. Unlike onVersionCreated it must fire on exactly one node: it
+	// triggers external side effects — choosing the write's coordinator and
+	// having that node run the write (§7.13.2) — which would otherwise be
+	// attempted once per replica. The leadership check happens in the apply loop
+	// rather than at propose time, because a forwarded proposal is applied by
+	// whoever leads then, and a since-deposed leader must not dispatch.
+	onVersionCommittedAsLeader func(kbID string, versionID, parentVersionID int64, clientRequestID string)
 }
 
 // NewRaftNodeImpl constructs and starts a RaftNodeImpl: it starts the
@@ -233,6 +248,21 @@ func (impl *RaftNodeImpl) SetOnVersionCreated(fn func(kbID string, versionID int
 	impl.onVersionCreated = fn
 }
 
+// SetOnVersionCommittedAsLeader registers the §7.13.2 dispatch hook: invoked
+// when a cmdCreateVersion is applied on a node that believes it leads at that
+// moment. Call before the first propose; not safe for concurrent use after the
+// apply loop has started.
+func (impl *RaftNodeImpl) SetOnVersionCommittedAsLeader(fn func(kbID string, versionID, parentVersionID int64, clientRequestID string)) {
+	impl.onVersionCommittedAsLeader = fn
+}
+
+// IsLeader reports whether this node currently believes it leads the cluster.
+// Read at apply time by the §7.13.2 dispatch hook: the answer that matters is
+// the one at the moment the entry is applied, not when it was proposed.
+func (impl *RaftNodeImpl) IsLeader() bool {
+	return impl.raft.IsLeader()
+}
+
 // runApplyLoop consumes committed entries (and snapshot requests) from
 // kvraft, applies them to the state machine, and delivers results to any
 // locally-waiting Propose* call. Exits when the underlying kvraft node's
@@ -282,22 +312,49 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	}
 	impl.pendingMu.Unlock()
 
+	// Notify the data-sync layer about every applied CreateVersion — including
+	// the node that proposed it (§8.5).
+	//
+	// This used to be inside the "!ok" branch below, i.e. it skipped the
+	// proposer, because the proposer was assumed to be the one that wrote the
+	// data. That assumption only holds while the coordinator is the leader. Once
+	// any node may coordinate (§8.5), the proposer and the data's holder come
+	// apart in two ways: a forwarded proposal has a waiter on *both* the
+	// originating node and the leader (so the leader — which holds no data —
+	// would be skipped), and a non-leader coordinator holds the data without
+	// anyone else knowing. Who needs to pull is a data-plane question, not a
+	// Raft one: the plane already skips the pull when its own cursor covers the
+	// version, so announcing every apply is both correct and cheap.
+	if err == nil && cmd.Type == cmdCreateVersion && impl.onVersionCreated != nil {
+		// Run asynchronously: pulling storage-layer data can block
+		// (dial + stream + retries), and a blocked apply loop would
+		// stall every subsequent committed entry — most visible when
+		// a follower replays its log after a restart.
+		impl.callbackWG.Add(1)
+		go func() {
+			defer impl.callbackWG.Done()
+			impl.onVersionCreated(cmd.KBID, result.VersionID)
+		}()
+	}
+
+	// The §7.13.2 dispatch hook, unlike the notification above, must fire on
+	// exactly one node: it triggers external side effects (picking the write's
+	// coordinator and having it run the write), which must not be attempted once
+	// per replica. "Am I the leader" is asked HERE, at apply time — not when the
+	// entry was proposed — because a forwarded proposal is applied by whoever
+	// leads then, and a since-deposed leader must not dispatch. The narrow window
+	// where two nodes both believe they lead is accepted: writes are
+	// content-addressed and idempotent (§1.4), and the dispatcher's take-once
+	// registration (§7.13.2) makes a repeated dispatch a no-op.
+	if err == nil && cmd.Type == cmdCreateVersion && impl.onVersionCommittedAsLeader != nil && impl.IsLeader() {
+		impl.callbackWG.Add(1)
+		go func() {
+			defer impl.callbackWG.Done()
+			impl.onVersionCommittedAsLeader(cmd.KBID, result.VersionID, cmd.ParentVersionID, cmd.ClientRequestID)
+		}()
+	}
+
 	if !ok {
-		// This node is not waiting on this index — it did not propose
-		// it. If the command was a CreateVersion, notify the data-sync
-		// layer so this follower pulls storage-layer data from the
-		// leader.
-		if err == nil && cmd.Type == cmdCreateVersion && impl.onVersionCreated != nil {
-			// Run asynchronously: pulling storage-layer data can block
-			// (dial + stream + retries), and a blocked apply loop would
-			// stall every subsequent committed entry — most visible when
-			// a follower replays its log after a restart.
-			impl.callbackWG.Add(1)
-			go func() {
-				defer impl.callbackWG.Done()
-				impl.onVersionCreated(cmd.KBID, result.VersionID)
-			}()
-		}
 		return // no local caller waiting (e.g. this is a follower)
 	}
 	if waiter.term != msg.Term {
@@ -389,6 +446,22 @@ func (impl *RaftNodeImpl) proposeAndWait(ctx context.Context, cmd command) (appl
 
 	index, term, err := impl.raft.Propose(ctx, data)
 	if err != nil {
+		// Raft appends on the leader only, but any node may have a fact worth
+		// reporting. The access layer carries it to whoever can append — the
+		// Raft core stays unaware of the network (Stratum_设计文档v13.md §7.3).
+		if errors.Is(err, kvraft.ErrNotLeader) && impl.forwarder != nil {
+			if leaderID, known := impl.raft.LeaderID(); known && leaderID != impl.nodeID {
+				forwarded, ferr := impl.forwarder.ForwardPropose(ctx, leaderID, data)
+				if ferr != nil {
+					return applyResult{}, ferr
+				}
+				return applyResult{
+					VersionID:         forwarded.VersionID,
+					DeletedVersionIDs: forwarded.DeletedVersionIDs,
+					Err:               forwarded.Err,
+				}, nil
+			}
+		}
 		return applyResult{}, err
 	}
 
@@ -409,7 +482,7 @@ func (impl *RaftNodeImpl) proposeAndWait(ctx context.Context, cmd command) (appl
 }
 
 func (impl *RaftNodeImpl) ProposeCreateKB(ctx context.Context, kb types.KnowledgeBaseMeta) error {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdCreateKB, KB: &kb})
+	res, err := impl.proposeAndWait(ctx, newCreateKBCommand(kb))
 	if err != nil {
 		return err
 	}
@@ -417,7 +490,7 @@ func (impl *RaftNodeImpl) ProposeCreateKB(ctx context.Context, kb types.Knowledg
 }
 
 func (impl *RaftNodeImpl) ProposeMarkKBDeleting(ctx context.Context, kbID string) error {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdMarkKBDeleting, KBID: kbID})
+	res, err := impl.proposeAndWait(ctx, newMarkKBDeletingCommand(kbID))
 	if err != nil {
 		return err
 	}
@@ -425,7 +498,7 @@ func (impl *RaftNodeImpl) ProposeMarkKBDeleting(ctx context.Context, kbID string
 }
 
 func (impl *RaftNodeImpl) ProposeMarkKBDeleteFailed(ctx context.Context, kbID string) error {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdMarkKBDeleteFailed, KBID: kbID})
+	res, err := impl.proposeAndWait(ctx, newMarkKBDeleteFailedCommand(kbID))
 	if err != nil {
 		return err
 	}
@@ -433,15 +506,15 @@ func (impl *RaftNodeImpl) ProposeMarkKBDeleteFailed(ctx context.Context, kbID st
 }
 
 func (impl *RaftNodeImpl) ProposeRemoveKBMeta(ctx context.Context, kbID string) error {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdRemoveKBMeta, KBID: kbID})
+	res, err := impl.proposeAndWait(ctx, newRemoveKBMetaCommand(kbID))
 	if err != nil {
 		return err
 	}
 	return res.Err
 }
 
-func (impl *RaftNodeImpl) ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64) (int64, error) {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdCreateVersion, KBID: kbID, ParentVersionID: parentVersionID})
+func (impl *RaftNodeImpl) ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64, opts ...ProposeOption) (int64, error) {
+	res, err := impl.proposeAndWait(ctx, newCreateVersionCommand(kbID, parentVersionID, resolveProposeOptions(opts).clientRequestID))
 	if err != nil {
 		return 0, err
 	}
@@ -451,8 +524,32 @@ func (impl *RaftNodeImpl) ProposeCreateVersion(ctx context.Context, kbID string,
 	return res.VersionID, nil
 }
 
+// SetNodeID records this node's own ID, needed to tell "the leader is me" from
+// "the leader is elsewhere" before forwarding a proposal.
+func (impl *RaftNodeImpl) SetNodeID(id int64) {
+	impl.nodeID = id
+}
+
+// SetForwarder wires the path that carries a proposal to the leader when this
+// node is not it (Stratum_设计文档v13.md §7.3). Without it, a non-leader
+// proposal fails exactly as before.
+func (impl *RaftNodeImpl) SetForwarder(f ProposeForwarder) {
+	impl.forwarder = f
+}
+
+// ProposeMarkVersionFailedPermanent implements RaftNode: the terminal verdict
+// for a version whose Saga has spent its retry budget
+// (Stratum_设计文档v13.md §10.1).
+func (impl *RaftNodeImpl) ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, reason string, count int32) error {
+	res, err := impl.proposeAndWait(ctx, newMarkVersionFailedPermanentCommand(kbID, versionID, reason, count))
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
 func (impl *RaftNodeImpl) ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus) error {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdUpdateVersionStatus, VersionID: versionID, Status: status})
+	res, err := impl.proposeAndWait(ctx, newUpdateVersionStatusCommand(versionID, status))
 	if err != nil {
 		return err
 	}
@@ -461,7 +558,7 @@ func (impl *RaftNodeImpl) ProposeUpdateVersionStatus(ctx context.Context, versio
 
 // ProposeUpdateVersionSummary implements RaftNode.
 func (impl *RaftNodeImpl) ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdUpdateVersionSummary, VersionID: versionID, DocIDSetHash: docIDSetHash})
+	res, err := impl.proposeAndWait(ctx, newUpdateVersionSummaryCommand(versionID, docIDSetHash))
 	if err != nil {
 		return err
 	}
@@ -469,7 +566,7 @@ func (impl *RaftNodeImpl) ProposeUpdateVersionSummary(ctx context.Context, versi
 }
 
 func (impl *RaftNodeImpl) ProposeRollback(ctx context.Context, kbID string, targetVersionID int64) error {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdRollback, KBID: kbID, TargetVersionID: targetVersionID})
+	res, err := impl.proposeAndWait(ctx, newRollbackCommand(kbID, targetVersionID))
 	if err != nil {
 		return err
 	}
@@ -478,7 +575,7 @@ func (impl *RaftNodeImpl) ProposeRollback(ctx context.Context, kbID string, targ
 
 // ProposeMarkVersionDeleting implements RaftNode.
 func (impl *RaftNodeImpl) ProposeMarkVersionDeleting(ctx context.Context, kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error) {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdMarkVersionDeleting, KBID: kbID, VersionID: versionID, Mode: mode})
+	res, err := impl.proposeAndWait(ctx, newMarkVersionDeletingCommand(kbID, versionID, mode))
 	if err != nil {
 		return nil, err
 	}
@@ -490,7 +587,7 @@ func (impl *RaftNodeImpl) ProposeMarkVersionDeleting(ctx context.Context, kbID s
 
 // ProposeRemoveVersionMeta implements RaftNode.
 func (impl *RaftNodeImpl) ProposeRemoveVersionMeta(ctx context.Context, kbID string, versionID int64) error {
-	res, err := impl.proposeAndWait(ctx, command{Type: cmdRemoveVersionMeta, KBID: kbID, VersionID: versionID})
+	res, err := impl.proposeAndWait(ctx, newRemoveVersionMetaCommand(kbID, versionID))
 	if err != nil {
 		return err
 	}

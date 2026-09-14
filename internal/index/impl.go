@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -29,6 +30,11 @@ import (
 type IndexManagerConfig struct {
 	// LRUCapacity is the maximum number of indexes to keep in memory.
 	LRUCapacity int
+
+	// BruteForceMaxChunks is the version size up to which a query for an
+	// unbuilt version is answered by scanning instead of building (§8.6b).
+	// Zero means DefaultBruteForceMaxChunks.
+	BruteForceMaxChunks int
 
 	// LoadWaitTimeout bounds how long a Search call blocks waiting for a
 	// concurrent load of the same version to finish.
@@ -66,7 +72,45 @@ type IndexManagerConfig struct {
 	// (Stratum_设计文档v10.md "内存换入换出"). <= 0 disables the byte
 	// threshold; LRUCapacity still applies.
 	MemoryThresholdMB int64
+
+	// ColdThreshold is how long a version may go without a Search before
+	// the background evaluator rebuilds it in the graph-free form
+	// (§8.6a). The HNSW graph dominates both build time and resident
+	// memory once vectors are quantized, and a version nobody queries
+	// does not need it; the answers stay equivalent because the
+	// graph-free variants keep the quantizer and its rerank semantics.
+	// The policy is off when <= 0 (the default), which keeps the
+	// historical "every version carries a full graph" behaviour.
+	ColdThreshold time.Duration
+
+	// ColdSweepInterval is how often the evaluator re-reads the access
+	// table. Zero means DefaultColdSweepInterval.
+	ColdSweepInterval time.Duration
+
+	// AppendMaxDeadRatio bounds how much dead weight a §8.6(c) pure-append
+	// reuse may carry: the share of the base artifact's vectors that this
+	// version no longer needs (documents deleted here, or by an ancestor and
+	// carried along by an earlier reuse). HNSW cannot remove vectors, so those
+	// dead ones stay resident and compete for candidate slots — the read path
+	// filters their results out, so they cost memory and recall, not
+	// correctness. Above the ratio the build falls back to a full rebuild,
+	// which drops them. <= 0 means DefaultAppendMaxDeadRatio; 1.0 disables the
+	// check.
+	AppendMaxDeadRatio float64
 }
+
+// DefaultColdSweepInterval is how often the §8.6a evaluator re-reads the
+// access table when ColdSweepInterval is unset. The sweep only reads an
+// in-memory map, so the cost is negligible; the delay it adds is the
+// worst-case lag between a version going cold and being reshaped.
+const DefaultColdSweepInterval = time.Minute
+
+// DefaultAppendMaxDeadRatio is the dead-vector share above which §8.6(c)'s
+// pure-append reuse is abandoned for a full rebuild. At 20% a fifth of the
+// resident vectors are pure overhead: they occupy memory and, worse, take
+// candidate slots in every search (the read path discards their results
+// afterwards, so they can only push real hits out of the top-K).
+const DefaultAppendMaxDeadRatio = 0.2
 
 // IndexManagerImpl is the real IndexManager implementation, backed by the
 // C++ vecstore's VectorIndexService gRPC. It manages per-version HNSW
@@ -96,7 +140,13 @@ type IndexManagerImpl struct {
 	// default (full precision / OFF) is used for every build.
 	kbMetaGetter func(ctx context.Context, kbID string) (types.KnowledgeBaseMeta, error)
 
-	// vecstore gRPC client for Build/Search/Save/Load/Reset.
+	// versionParent, when set, returns versionID's parent version (0 when it
+	// has none). §8.6(c)'s pure-append reuse needs it to find the artifact a
+	// build can start from. Nil disables the reuse entirely, which is the
+	// safe default: every build then proceeds from scratch.
+	versionParent func(ctx context.Context, kbID string, versionID int64) (int64, error)
+
+	// vecstore gRPC client for Build/Search/Save/LoadForAppend/Load/Reset.
 	vectorIndexClient vecstorepb.VectorIndexServiceClient
 	vecstoreConn      *grpc.ClientConn // owned; closed on shutdown
 
@@ -112,6 +162,31 @@ type IndexManagerImpl struct {
 	// set. Both are guarded by mu.
 	sizeByKey   map[indexKey]int64
 	loadedBytes int64
+
+	// lastSearch records, per version, when a Search request last asked
+	// for it (§8.6a). It is deliberately NOT the same thing as
+	// loadedIndex.lastAccess: that one is an LRU hint that is lost when
+	// the index is evicted from memory, while "is this version cold?" is
+	// a question about query traffic, so it must survive eviction and
+	// cover versions that were never loaded at all (a small version
+	// answered by brute force, or one whose index was dropped by the
+	// on-disk retention policy). A successful build seeds the entry with
+	// its own timestamp, so a version that is built but never queried
+	// still ages into cold; a version with no entry at all has been
+	// neither searched nor built by this process, so the evaluator does
+	// not know it exists. Guarded by mu.
+	lastSearch map[indexKey]time.Time
+
+	// builtGraphFree records, per version, whether the index currently
+	// built for it is the graph-free variant (§8.6a). The evaluator uses
+	// it to leave an already-cold-shaped version alone instead of
+	// re-triggering a rebuild on every sweep. Dropped with the version
+	// or KB, like the access record. Guarded by mu.
+	builtGraphFree map[indexKey]bool
+	// coldCancel/coldWG govern the background cold-version evaluator
+	// (§8.6a). coldCancel is nil while the policy is off or stopped.
+	coldCancel context.CancelFunc
+	coldWG     sync.WaitGroup
 
 	// deletedKBs / deletedVersions are tombstones set by knowledge-base
 	// deletion (DeleteFilesByKB) and version deletion (Discard). They
@@ -146,6 +221,8 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		loaded:          make(map[indexKey]*loadedIndex),
 		loading:         make(map[indexKey]bool),
 		sizeByKey:       make(map[indexKey]int64),
+		lastSearch:      make(map[indexKey]time.Time),
+		builtGraphFree:  make(map[indexKey]bool),
 		deletedKBs:      make(map[string]bool),
 		deletedVersions: make(map[indexKey]bool),
 		logger:          zap.NewNop(),
@@ -194,8 +271,10 @@ func (im *IndexManagerImpl) SetBuildDataSources(
 	im.readChunkVector = readChunkVector
 }
 
-// Close releases the vecstore gRPC connection, if one was created.
+// Close releases the vecstore gRPC connection, if one was created. It
+// also stops the §8.6a cold-version evaluator.
 func (im *IndexManagerImpl) Close() error {
+	im.StopColdPolicy()
 	if im.vecstoreConn != nil {
 		return im.vecstoreConn.Close()
 	}
@@ -211,6 +290,7 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 	}
 
 	key := indexKey{kbID, versionID}
+	im.recordSearch(key)
 
 	// Restore path: if the version's index is not already loaded (e.g.
 	// this Go process restarted, or the index was LRU-evicted and the
@@ -223,7 +303,23 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 	_, loading := im.loading[key]
 	im.mu.Unlock()
 	if !loaded && !loading {
-		_ = im.loadFromDisk(ctx, kbID, versionID)
+		if err := im.loadFromDisk(ctx, kbID, versionID); err != nil {
+			// §8.6b: indexes are built lazily now, so "no index on disk" is a
+			// normal state rather than a failure. A small version is answered
+			// by scanning; a large one falls through to the build below, which
+			// acquire() then waits for.
+			answered, results, terr := im.tryBruteForce(ctx, kbID, versionID, vector, topK)
+			if terr != nil {
+				return nil, terr
+			}
+			if answered {
+				return results, nil
+			}
+			if err := im.TriggerBuild(ctx, kbID, versionID); err != nil {
+				im.logger.Warn("index: could not schedule a lazy build",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			}
+		}
 	}
 
 	// Acquire the index: load if needed, increment ref count.
@@ -251,6 +347,124 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 
 // TriggerBuild implements IndexManager.
 func (im *IndexManagerImpl) TriggerBuild(ctx context.Context, kbID string, versionID int64) error {
+	return im.triggerBuild(kbID, versionID, false)
+}
+
+// TriggerBuildGraphFree builds the version without an HNSW graph (§8.6a), for a
+// cold version whose index is unlikely to be queried: the graph is what makes
+// it expensive to build and to keep resident, and a scan of quantized codes is
+// an acceptable price for a version nobody is asking about.
+func (im *IndexManagerImpl) TriggerBuildGraphFree(ctx context.Context, kbID string, versionID int64) error {
+	return im.triggerBuild(kbID, versionID, true)
+}
+
+// StartColdPolicy starts the background evaluator that reshapes versions
+// which have gone cold (§8.6a). It is a no-op when ColdThreshold <= 0, so
+// a deployment that does not configure a threshold keeps the historical
+// "every version carries a full graph" behaviour, and it is idempotent:
+// calling it twice leaves one evaluator running.
+//
+// The policy is intentionally local and passive, per the design's "自动、
+// 存储层自己判": it reads only this node's own access table, takes no
+// part in consensus, and never talks to other nodes. Two replicas may
+// therefore reshape at slightly different times; that is harmless, since
+// the graph-free variant answers the same queries (its quantizer and
+// rerank semantics are unchanged) and each node's build goes through the
+// same Save + §8.4 distribution path as any other build.
+func (im *IndexManagerImpl) StartColdPolicy() {
+	if im.cfg.ColdThreshold <= 0 {
+		return
+	}
+	im.mu.Lock()
+	if im.coldCancel != nil {
+		im.mu.Unlock()
+		return // already running
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	im.coldCancel = cancel
+	im.mu.Unlock()
+
+	interval := im.cfg.ColdSweepInterval
+	if interval <= 0 {
+		interval = DefaultColdSweepInterval
+	}
+	im.coldWG.Add(1)
+	go func() {
+		defer im.coldWG.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				im.sweepCold(ctx, now)
+			}
+		}
+	}()
+}
+
+// StopColdPolicy stops the evaluator and waits for the running sweep to
+// return. Safe to call when the policy was never started.
+func (im *IndexManagerImpl) StopColdPolicy() {
+	im.mu.Lock()
+	cancel := im.coldCancel
+	im.coldCancel = nil
+	im.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		im.coldWG.Wait()
+	}
+}
+
+// sweepCold reshapes every version that has gone cold. Scheduling is
+// asynchronous (triggerBuild spawns the build), so a sweep never blocks
+// on a vecstore build; a version already building is skipped by
+// triggerBuild itself.
+func (im *IndexManagerImpl) sweepCold(ctx context.Context, now time.Time) {
+	for _, key := range im.coldCandidates(now) {
+		if ctx.Err() != nil {
+			return
+		}
+		im.logger.Info("index: version is cold; reshaping graph-free (§8.6a)",
+			zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID))
+		if err := im.TriggerBuildGraphFree(ctx, key.kbID, key.versionID); err != nil {
+			im.logger.Warn("index: could not schedule the graph-free rebuild",
+				zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID), zap.Error(err))
+		}
+	}
+}
+
+// coldCandidates returns the versions whose last access is at least
+// ColdThreshold old and whose current index is not already graph-free,
+// in a deterministic (kbID, versionID) order. A version mid-build is
+// left out: the build in flight decides its own shape, and the next
+// sweep re-evaluates it if it stayed hot.
+func (im *IndexManagerImpl) coldCandidates(now time.Time) []indexKey {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	var out []indexKey
+	for k, last := range im.lastSearch {
+		if im.deletedKBs[k.kbID] || im.deletedVersions[k] {
+			continue
+		}
+		if im.builtGraphFree[k] || im.loading[k] {
+			continue
+		}
+		if now.Sub(last) >= im.cfg.ColdThreshold {
+			out = append(out, k)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].kbID != out[j].kbID {
+			return out[i].kbID < out[j].kbID
+		}
+		return out[i].versionID < out[j].versionID
+	})
+	return out
+}
+
+func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree bool) error {
 	key := indexKey{kbID, versionID}
 
 	im.mu.Lock()
@@ -261,11 +475,11 @@ func (im *IndexManagerImpl) TriggerBuild(ctx context.Context, kbID string, versi
 	im.loading[key] = true
 	im.mu.Unlock()
 
-	go im.doBuild(kbID, versionID)
+	go im.doBuild(kbID, versionID, graphFree)
 	return nil
 }
 
-func (im *IndexManagerImpl) doBuild(kbID string, versionID int64) {
+func (im *IndexManagerImpl) doBuild(kbID string, versionID int64, graphFree bool) {
 	key := indexKey{kbID, versionID}
 
 	status := types.IndexStatusReady
@@ -291,6 +505,15 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64) {
 			im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
 			im.sizeByKey[key] = sizeBytes
 			im.loadedBytes += sizeBytes
+			// Remember which shape is now on disk, so the cold
+			// evaluator does not rebuild an already graph-free version
+			// on every sweep (§8.6a).
+			im.builtGraphFree[key] = graphFree
+			// A version nobody has searched yet has no access record;
+			// seed one so the cold policy has a baseline to age from
+			// instead of having to guess when an unqueried version was
+			// last relevant.
+			im.seedAccessLocked(key)
 		}
 		callbacks := append([]BuildCompleteCallback(nil), im.callbacks...)
 		im.cond.Broadcast()
@@ -316,7 +539,7 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64) {
 	}()
 
 	var err error
-	sizeBytes, err = im.buildWithRetry(kbID, versionID)
+	sizeBytes, err = im.buildWithRetry(kbID, versionID, graphFree)
 	if err != nil {
 		im.logger.Error("index build failed",
 			zap.String("kb_id", kbID),
@@ -363,13 +586,13 @@ func isTransientBuildErr(err error) bool {
 	return false
 }
 
-func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64) (int64, error) {
+func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64, graphFree bool) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), buildRetryTimeout)
 	defer cancel()
 
 	var lastErr error
 	for {
-		sizeBytes, err := im.build(ctx, kbID, versionID)
+		sizeBytes, err := im.build(ctx, kbID, versionID, graphFree)
 		if err == nil {
 			return sizeBytes, nil
 		}
@@ -393,10 +616,19 @@ func (im *IndexManagerImpl) SetKBMetaGetter(
 	im.kbMetaGetter = getter
 }
 
+// SetVersionParentGetter wires a lookup from a version to its parent version
+// (0 when it has none, e.g. a knowledge base's first version). §8.6(c)'s
+// pure-append reuse reads it to find the artifact a build may start from;
+// without it every build rebuilds from scratch.
+func (im *IndexManagerImpl) SetVersionParentGetter(
+	getter func(ctx context.Context, kbID string, versionID int64) (int64, error)) {
+	im.versionParent = getter
+}
+
 // quantizerForKB maps a knowledge base's quantizer metadata to the
 // vecstore Build RPC fields. OFF (or an unknown value) maps to no
 // quantization, keeping the historical full-precision behavior.
-func quantizerForKB(kb types.KnowledgeBaseMeta) (vecstorepb.QuantizerTypeProto, int32, int32) {
+func quantizerForKB(kb types.KnowledgeBaseMeta, graphFree bool) (vecstorepb.QuantizerTypeProto, int32, int32) {
 	var q vecstorepb.QuantizerTypeProto
 	switch kb.QuantizerType {
 	case "SQ8":
@@ -408,27 +640,49 @@ func quantizerForKB(kb types.KnowledgeBaseMeta) (vecstorepb.QuantizerTypeProto, 
 	case "PQ":
 		q = vecstorepb.QuantizerTypeProto_QUANTIZER_PQ
 	default:
-		return vecstorepb.QuantizerTypeProto_QUANTIZER_OFF, 0, 0
+		q = vecstorepb.QuantizerTypeProto_QUANTIZER_OFF
 	}
 	pqM, pqNBits := int32(0), int32(0)
 	if kb.QuantizerType == "PQ" {
 		pqM = int32(kb.QuantizerPQM)
 		pqNBits = int32(kb.QuantizerPQNBits)
 	}
-	return q, pqM, pqNBits
+	return graphFreeVariant(q, graphFree), pqM, pqNBits
+}
+
+// graphFreeVariant maps a quantizer to its graph-free twin (§8.6a). The
+// quantizer itself is unchanged; only the HNSW graph is dropped.
+func graphFreeVariant(q vecstorepb.QuantizerTypeProto, graphFree bool) vecstorepb.QuantizerTypeProto {
+	if !graphFree {
+		return q
+	}
+	switch q {
+	case vecstorepb.QuantizerTypeProto_QUANTIZER_OFF:
+		return vecstorepb.QuantizerTypeProto_QUANTIZER_OFF_FLAT
+	case vecstorepb.QuantizerTypeProto_QUANTIZER_SQ8:
+		return vecstorepb.QuantizerTypeProto_QUANTIZER_SQ8_FLAT
+	case vecstorepb.QuantizerTypeProto_QUANTIZER_SQ_BF16:
+		return vecstorepb.QuantizerTypeProto_QUANTIZER_SQ_BF16_FLAT
+	case vecstorepb.QuantizerTypeProto_QUANTIZER_SQ_FP16:
+		return vecstorepb.QuantizerTypeProto_QUANTIZER_SQ_FP16_FLAT
+	case vecstorepb.QuantizerTypeProto_QUANTIZER_PQ:
+		return vecstorepb.QuantizerTypeProto_QUANTIZER_PQ_FLAT
+	default:
+		return q
+	}
 }
 
 // buildQuantizerFromKB returns the vecstore Build RPC quantizer fields
 // for kbID, consulting kbMetaGetter when set (default OFF otherwise).
-func (im *IndexManagerImpl) buildQuantizerFromKB(ctx context.Context, kbID string) (vecstorepb.QuantizerTypeProto, int32, int32) {
+func (im *IndexManagerImpl) buildQuantizerFromKB(ctx context.Context, kbID string, graphFree bool) (vecstorepb.QuantizerTypeProto, int32, int32) {
 	if im.kbMetaGetter == nil {
-		return vecstorepb.QuantizerTypeProto_QUANTIZER_OFF, 0, 0
+		return graphFreeVariant(vecstorepb.QuantizerTypeProto_QUANTIZER_OFF, graphFree), 0, 0
 	}
 	kb, err := im.kbMetaGetter(ctx, kbID)
 	if err != nil {
-		return vecstorepb.QuantizerTypeProto_QUANTIZER_OFF, 0, 0
+		return graphFreeVariant(vecstorepb.QuantizerTypeProto_QUANTIZER_OFF, graphFree), 0, 0
 	}
-	return quantizerForKB(kb)
+	return quantizerForKB(kb, graphFree)
 }
 
 // build executes the full build data flow and returns the estimated
@@ -436,10 +690,10 @@ func (im *IndexManagerImpl) buildQuantizerFromKB(ctx context.Context, kbID strin
 // 0 for an empty version). It reports success only if the index was also
 // persisted to disk (see saveToDisk), so a failed save surfaces as a
 // build failure.
-func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID int64) (int64, error) {
+func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID int64, graphFree bool) (int64, error) {
 	// Forward the KB-level quantizer config with every Build RPC; OFF
 	// (default) keeps the historical full-precision index type.
-	quantizerType, pqM, pqNBits := im.buildQuantizerFromKB(ctx, kbID)
+	quantizerType, pqM, pqNBits := im.buildQuantizerFromKB(ctx, kbID, graphFree)
 	// Last reported in-memory estimate from the vecstore (0 = unreported).
 	reportedMemBytes := int64(0)
 
@@ -453,6 +707,34 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 		return 0, fmt.Errorf("index: ListChunkIDsByDocs: %w", err)
 	}
 
+	// §8.6(c): a pure-append version can start from its parent's artifact and
+	// add only the new chunks, instead of rebuilding the whole graph. Purely
+	// an optimisation — a failure here falls back to the full build below,
+	// and nothing downstream (callback, distribution, retention) can tell
+	// which path produced the artifact.
+	if parentID, delta, dead, ok := im.appendBase(ctx, kbID, versionID, graphFree, chunkIDs); ok {
+		size, appendErr := im.buildFromBase(ctx, kbID, versionID, parentID, delta, dead, len(chunkIDs), graphFree)
+		if appendErr == nil {
+			im.logger.Info("index: built by appending to the parent version's artifact (§8.6c)",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Int64("parent_version_id", parentID),
+				zap.Int("total_chunks", len(chunkIDs)), zap.Int("delta_chunks", len(delta)),
+				zap.Int("deleted_chunks", len(dead)), zap.Bool("graph_free", graphFree))
+			return size, nil
+		}
+		if errors.Is(appendErr, errAppendTooManyTombstones) {
+			// Not a failure: the reuse was legal, but the base carried too much
+			// dead weight, so rebuilding (which drops it) is the better trade.
+			im.logger.Info("index: append reuse not worth it; rebuilding from scratch",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Int64("parent_version_id", parentID), zap.Error(appendErr))
+		} else {
+			im.logger.Warn("index: append reuse failed; rebuilding from scratch",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Int64("parent_version_id", parentID), zap.Error(appendErr))
+		}
+	}
+
 	// 分批读取并发送：单条 Build/AddChunks RPC 的载荷必须小于 gRPC 默认
 	// 4 MiB 上限。第一批用 Build 全量建索引，后续批用 AddChunks 增量追加。
 	batches, sizeBytes, err := im.collectChunkBatches(ctx, kbID, chunkIDs)
@@ -460,22 +742,25 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 		return 0, err
 	}
 
-	// 空版本（没有 chunk）也必须调一次 Build，在 vecstore 侧建立该
-	// (kb, version) 的索引条目：否则后续 Search 会因 "no index built or
-	// loaded" 而失败（与分批前 Build(empty) 的语义保持一致）。
+	// 空版本（没有 chunk）：vecstore 侧不建索引。
+	//
+	// 这里曾经调一次 Build(empty) 再 Save，期望在 vecstore 侧"建立该
+	// (kb,version) 的索引条目"。实测不成立：vecstore 的
+	// AddChunksLocked 对空 batch 直接返回 OkStatus，不创建 Faiss 索引，
+	// 于是紧随其后的 Save 永远报
+	// "Save: no index has been built or loaded"（FailedPrecondition）。
+	// 该错误被 isTransientBuildErr 判为可重试，构建便进入 5 分钟重试窗
+	// 口，loading[key] 一直为真 —— 期间对该版本的任何查询都以
+	// "index load timeout" 失败（integration 的 TwoNodeReplication /
+	// FaultTolerance 就是这么被拖垮的：KB 初始版本 v1 是空版本）。
+	//
+	// 空版本没有可检索内容，构建到此即完成：查询由 tryBruteForce 直接
+	// 回答空结果（chunk 数 0 远低于 BruteForceMaxChunks），不需要、也
+	// 无法在 vecstore 侧留下一个空索引文件。
 	if len(batches) == 0 {
-		_, err = im.vectorIndexClient.Build(ctx, &vecstorepb.BuildIndexRequest{
-			KbId:      kbID,
-			VersionId: versionID,
-			Metric:    vecstorepb.MetricTypeProto_COSINE,
-			Quantizer: quantizerType,
-			PqM:       pqM,
-			PqNbits:   pqNBits,
-		})
-		if err != nil {
-			return 0, fmt.Errorf("index: Build RPC: %w", err)
-		}
-		return 0, im.saveToDisk(ctx, kbID, versionID)
+		im.logger.Info("index: version has no chunks; nothing to build",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+		return 0, nil
 	}
 
 	for i, batch := range batches {
@@ -639,6 +924,211 @@ type chunkVec struct {
 	vec []float32
 }
 
+// appendBase reports whether versionID's index can be built by extending its
+// parent version's artifact rather than rebuilding from scratch (§8.6c "pure
+// append"), and if so returns the parent's id and the chunks that are new.
+//
+// The reuse needs all of:
+//   - a parent version (the version chain is linear, §6);
+//   - that parent's artifact still present on this node's disk;
+//   - this node knowing the parent's shape, and it being the shape this build
+//     wants — extending a graph-free artifact into a graphed index would have
+//     to rebuild anyway (and vice versa), and right after a restart nothing is
+//     known, so the conservative answer there is "no";
+//   - at least one chunk to append (with none, reuse is a copy, not a saving).
+//
+// Deletions do NOT disqualify the reuse: HNSW cannot remove vectors, so a
+// version that deletes documents leaves dead vectors in the base — but they
+// are filtered out of results by the read path (the chunk→doc mapping is
+// cleared for a deleted document, and the version's doc list confirms it), so
+// they cost memory and candidate slots rather than correctness. How much of
+// the base is dead is only known after the base is loaded (its `ntotal`),
+// which is why buildFromBase checks the ratio and may still fall back.
+func (im *IndexManagerImpl) appendBase(
+	ctx context.Context, kbID string, versionID int64, graphFree bool, chunkIDs []string,
+) (parentID int64, delta []string, dead []string, ok bool) {
+	if im.versionParent == nil || im.cfg.IndexDataDir == "" || len(chunkIDs) == 0 {
+		return 0, nil, nil, false
+	}
+	parent, err := im.versionParent(ctx, kbID, versionID)
+	if err != nil || parent <= 0 || parent == versionID {
+		return 0, nil, nil, false
+	}
+	// The artifact must be on this node. The files are the fact; the
+	// ExistsIndex RPC is not used as the criterion (some vecstore builds
+	// answer Unimplemented for it).
+	if !fileExists(im.indexPath(kbID, parent)) || !fileExists(im.sidecarPath(kbID, parent)) {
+		return 0, nil, nil, false
+	}
+	// The base's shape must be known here and match what this build wants.
+	im.mu.Lock()
+	parentGraphFree, known := im.builtGraphFree[indexKey{kbID, parent}]
+	im.mu.Unlock()
+	if !known || parentGraphFree != graphFree {
+		return 0, nil, nil, false
+	}
+
+	parentDocIDs, err := im.listDocIDs(ctx, kbID, parent)
+	if err != nil {
+		return 0, nil, nil, false
+	}
+	parentChunkIDs, err := im.listChunkIDsByDocs(ctx, kbID, parentDocIDs)
+	if err != nil || len(parentChunkIDs) == 0 {
+		return 0, nil, nil, false
+	}
+	present := make(map[string]bool, len(chunkIDs))
+	for _, id := range chunkIDs {
+		present[id] = true
+	}
+	parentSet := make(map[string]bool, len(parentChunkIDs))
+	for _, id := range parentChunkIDs {
+		parentSet[id] = true
+	}
+	delta = make([]string, 0, len(chunkIDs))
+	for _, id := range chunkIDs {
+		if !parentSet[id] {
+			delta = append(delta, id)
+		}
+	}
+	if len(delta) == 0 {
+		// Nothing new: the parent's artifact already describes this version's
+		// chunk set (or is a superset of it), so reusing it would be a copy at
+		// best — and if this version deleted anything, the dead vectors would
+		// come along for nothing. Rebuild from scratch.
+		return 0, nil, nil, false
+	}
+	// Chunks the parent holds and this version no longer does: the deletions of
+	// this step. A graph-free base can drop their vectors outright (§8.6c's
+	// RemoveChunks); a graphed one has to carry them as tombstones until the
+	// dead-vector ratio forces a rebuild.
+	dead = make([]string, 0)
+	for _, id := range parentChunkIDs {
+		if !present[id] {
+			dead = append(dead, id)
+		}
+	}
+	return parent, delta, dead, true
+}
+
+// buildFromBase extends the parent's artifact with delta and seals it for
+// (kbID, versionID) (§8.6c). The outcome is an ordinary artifact of this
+// version: Load restores the retrieval mode from the stored type, so the
+// base's shape carries over unchanged — which is exactly why appendBase only
+// reuses a base whose shape matches the build's target.
+func (im *IndexManagerImpl) buildFromBase(
+	ctx context.Context, kbID string, versionID, parentID int64, delta, dead []string,
+	totalChunks int, graphFree bool,
+) (int64, error) {
+	resp, err := im.vectorIndexClient.LoadForAppend(ctx, &vecstorepb.LoadIndexForAppendRequest{
+		KbId: kbID, VersionId: versionID, Path: im.indexPath(kbID, parentID),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("index: LoadForAppend RPC: %w", err)
+	}
+	baseNtotal := resp.GetBaseNtotal()
+
+	// §8.6(c) deletions, cheap path: a graph-free base can drop the vectors
+	// this version no longer needs, so they never become tombstones at all
+	// (faiss compacts IndexFlatCodes; a graphed index cannot remove). The
+	// build is still open here — Save is what seals it — which is exactly the
+	// window RemoveChunks requires.
+	if graphFree && len(dead) > 0 {
+		removed, removeErr := im.removeDeadChunks(ctx, kbID, versionID, dead)
+		if removeErr != nil {
+			return 0, fmt.Errorf("index: RemoveChunks RPC (append reuse): %w", removeErr)
+		}
+		baseNtotal -= removed
+	}
+
+	// How much of the base this version still no longer needs, now that the
+	// deletions we can identify are dropped. The base holds baseNtotal vectors
+	// and this version needs len(delta) of them to be new; everything else is
+	// either still in use or dead (a document deleted by an ancestor and
+	// carried along by an earlier reuse). |base ∩ thisVersion| <=
+	// totalChunks-len(delta), so this is an upper bound on the dead weight —
+	// erring towards rebuilding, the safe direction: a rebuild is slower, a
+	// bloated index is wrong for longer.
+	deadWeight := baseNtotal - int64(totalChunks-len(delta))
+	if deadWeight < 0 {
+		deadWeight = 0
+	}
+	if limit := im.appendMaxDeadRatio(); limit < 1.0 {
+		total := baseNtotal + int64(len(delta))
+		if total > 0 && float64(deadWeight)/float64(total) > limit {
+			return 0, fmt.Errorf("%w: %d of %d vectors are dead, ratio limit is %.2f",
+				errAppendTooManyTombstones, deadWeight, total, limit)
+		}
+	}
+
+	batches, deltaBytes, err := im.collectChunkBatches(ctx, kbID, delta)
+	if err != nil {
+		return 0, err
+	}
+	reportedMemBytes := int64(0)
+	for _, batch := range batches {
+		chunks := make([]*vecstorepb.ChunkVectorProto, 0, len(batch))
+		for _, cv := range batch {
+			chunks = append(chunks, &vecstorepb.ChunkVectorProto{ChunkId: cv.id, Vector: cv.vec})
+		}
+		addResp, addErr := im.vectorIndexClient.AddChunks(ctx, &vecstorepb.AddChunksRequest{
+			KbId: kbID, VersionId: versionID, Chunks: chunks,
+		})
+		if addErr != nil {
+			return 0, fmt.Errorf("index: AddChunks RPC (append reuse): %w", addErr)
+		}
+		reportedMemBytes = addResp.GetMemBytes()
+	}
+
+	if err := im.saveToDisk(ctx, kbID, versionID); err != nil {
+		return 0, err
+	}
+	// Memory accounting: prefer what the vecstore reports for the whole
+	// resident structure (base + delta); otherwise the parent's recorded
+	// footprint plus the delta payload.
+	if reportedMemBytes > 0 {
+		return reportedMemBytes, nil
+	}
+	return im.readSizeSidecar(kbID, parentID) + deltaBytes, nil
+}
+
+// errAppendTooManyTombstones reports that pure-append reuse is legal but not
+// worth it: too much of the base artifact is dead weight for the version being
+// built, so a full rebuild (which drops the dead vectors) is the better trade.
+var errAppendTooManyTombstones = errors.New("index: append reuse skipped, too many tombstoned vectors")
+
+// appendMaxDeadRatio is the dead-vector share above which appendBase's reuse is
+// abandoned in favour of a full rebuild. <= 0 means DefaultAppendMaxDeadRatio;
+// 1.0 disables the check (always reuse when the reuse is otherwise legal).
+func (im *IndexManagerImpl) appendMaxDeadRatio() float64 {
+	if im.cfg.AppendMaxDeadRatio <= 0 {
+		return DefaultAppendMaxDeadRatio
+	}
+	return im.cfg.AppendMaxDeadRatio
+}
+
+// removeDeadChunks asks the vecstore to drop these chunks' vectors and reports
+// how many it actually removed. Only a graph-free index supports it (faiss
+// compacts IndexFlatCodes but cannot repair an HNSW graph) and only while the
+// build is open — the vecstore answers FailedPrecondition otherwise, which the
+// caller turns into a fallback to a full rebuild.
+func (im *IndexManagerImpl) removeDeadChunks(
+	ctx context.Context, kbID string, versionID int64, dead []string,
+) (int64, error) {
+	resp, err := im.vectorIndexClient.RemoveChunks(ctx, &vecstorepb.RemoveChunksRequest{
+		KbId: kbID, VersionId: versionID, ChunkIds: dead,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return resp.GetRemoved(), nil
+}
+
+// fileExists reports whether path names an existing regular file.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
 // collectChunkBatches 逐个读取 chunk 向量，并按估算字节数切分成多个批次，
 // 使得每批序列化后都不会超过 maxBuildMessageBytes。同时返回所有 chunk 向量
 // 载荷的总字节数（4 × 维度 × chunk 数），作为该版本索引内存占用的估算。
@@ -738,6 +1228,58 @@ func (im *IndexManagerImpl) release(key indexKey) {
 		idx.refCount--
 		im.cond.Broadcast()
 	}
+}
+
+// recordSearch stamps key's most recent query time (§8.6a). Called at
+// the top of Search, before any load/build/brute-force decision, so a
+// version counts as "asked for" even when the request is answered by a
+// scan or fails afterwards. Keys deleted by Discard/DeleteFilesByKB are
+// revived only by a later search, which is the intended semantic.
+func (im *IndexManagerImpl) recordSearch(key indexKey) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.lastSearch[key] = time.Now()
+}
+
+// LastAccess reports when (kbID, versionID) was last searched (or, if it
+// was never searched here, when its index was last built), and whether
+// this process knows the version at all. It is the fact the cold-version
+// policy reads; false means "neither searched nor built here", in which
+// case the evaluator never sees the version and leaves it alone.
+func (im *IndexManagerImpl) LastAccess(kbID string, versionID int64) (time.Time, bool) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	t, ok := im.lastSearch[indexKey{kbID, versionID}]
+	return t, ok
+}
+
+// seedAccessLocked gives the cold policy a baseline for key when it has
+// none. A version this node just built or just received counts as "known
+// here from now on": without a record the version would be invisible to
+// the evaluator (§8.6a enumerates the access table, not the Raft state
+// machine), so a version nobody ever queries could never age into cold.
+// An existing record is left alone — a real query is better evidence than
+// a build, and re-seeding on every build would keep a version that is
+// being rebuilt for other reasons permanently hot. Must be called with
+// im.mu held.
+func (im *IndexManagerImpl) seedAccessLocked(key indexKey) {
+	if _, ok := im.lastSearch[key]; !ok {
+		im.lastSearch[key] = time.Now()
+	}
+}
+
+// forgetSearch drops key's access record. Must be called with im.mu held.
+func (im *IndexManagerImpl) forgetSearchLocked(key indexKey) {
+	delete(im.lastSearch, key)
+}
+
+// forgetVersionLocked drops everything the §8.6a policy remembers about
+// key: its access record and the shape of its index. Used when the
+// version itself goes away (Discard); eviction is not a reason to forget
+// either fact. Must be called with im.mu held.
+func (im *IndexManagerImpl) forgetVersionLocked(key indexKey) {
+	im.forgetSearchLocked(key)
+	delete(im.builtGraphFree, key)
 }
 
 // makeRoomLocked evicts least-recently-used, ref-count-zero indexes until
@@ -858,6 +1400,16 @@ func (im *IndexManagerImpl) DeleteFilesByKB(_ context.Context, kbID string) erro
 				im.loadedBytes -= size
 				delete(im.sizeByKey, k)
 			}
+		}
+	}
+	for k := range im.lastSearch {
+		if k.kbID == kbID {
+			im.forgetSearchLocked(k)
+		}
+	}
+	for k := range im.builtGraphFree {
+		if k.kbID == kbID {
+			delete(im.builtGraphFree, k)
 		}
 	}
 	im.mu.Unlock()
@@ -988,6 +1540,7 @@ func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID 
 		delete(im.sizeByKey, key)
 	}
 	im.deletedVersions[key] = true
+	im.forgetVersionLocked(key)
 	im.mu.Unlock()
 
 	if im.vectorIndexClient == nil {

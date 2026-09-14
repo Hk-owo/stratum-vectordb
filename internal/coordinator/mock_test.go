@@ -13,7 +13,7 @@ func TestMockWriteCoordinator_DefaultAndConfigured(t *testing.T) {
 	c := NewMockWriteCoordinator()
 
 	changes := []types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc1", Content: "hello"}}
-	versionID, err := c.Execute(ctx, "kb1", 0, changes)
+	versionID, err := c.Execute(ctx, "kb1", 0, changes, "")
 	if err != nil {
 		t.Fatalf("Execute (default): %v", err)
 	}
@@ -23,7 +23,7 @@ func TestMockWriteCoordinator_DefaultAndConfigured(t *testing.T) {
 
 	injected := errors.New("write failed")
 	c.SetExecuteResult(0, injected)
-	if _, err := c.Execute(ctx, "kb1", 1, changes); !errors.Is(err, injected) {
+	if _, err := c.Execute(ctx, "kb1", 1, changes, ""); !errors.Is(err, injected) {
 		t.Fatalf("err = %v, want injected", err)
 	}
 
@@ -44,7 +44,7 @@ func TestMockWriteCoordinator_CustomFunc(t *testing.T) {
 	c.SetExecuteFunc(func(_ context.Context, kbID string, parentVersionID int64, changes []types.DocChange) (int64, error) {
 		return parentVersionID + 100, nil
 	})
-	versionID, err := c.Execute(context.Background(), "kb1", 5, nil)
+	versionID, err := c.Execute(context.Background(), "kb1", 5, nil, "")
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -55,12 +55,12 @@ func TestMockWriteCoordinator_CustomFunc(t *testing.T) {
 
 func TestMockWriteCoordinator_Reset(t *testing.T) {
 	c := NewMockWriteCoordinator()
-	c.Execute(context.Background(), "kb1", 0, nil)
+	c.Execute(context.Background(), "kb1", 0, nil, "")
 	c.Reset()
 	if len(c.Calls()) != 0 {
 		t.Fatalf("calls not cleared after Reset")
 	}
-	versionID, err := c.Execute(context.Background(), "kb1", 0, nil)
+	versionID, err := c.Execute(context.Background(), "kb1", 0, nil, "")
 	if err != nil || versionID != 1 {
 		t.Fatalf("Execute after Reset = (%d, %v), want (1, nil)", versionID, err)
 	}

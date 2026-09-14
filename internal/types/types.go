@@ -17,6 +17,12 @@ const (
 	// IndexStatusFailed means the index build failed. RollbackVersion refuses
 	// to switch to a FAILED version; RebuildIndex can re-trigger the build.
 	IndexStatusFailed
+	// IndexStatusFailedPermanent is the control layer's verdict that a
+	// version has spent its retry budget (or hit an unrecoverable error) and
+	// will not be retried automatically again. Unlike FAILED, nothing
+	// re-triggers it: an operator must retry or abandon it
+	// (Stratum_设计文档v13.md §10.1).
+	IndexStatusFailedPermanent
 )
 
 // String returns a human-readable name for the status, primarily for logging.
@@ -28,6 +34,39 @@ func (s IndexStatus) String() string {
 		return "READY"
 	case IndexStatusFailed:
 		return "FAILED"
+	case IndexStatusFailedPermanent:
+		return "FAILED_PERMANENT"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// FailureClass is the storage layer's classification of a failed attempt to
+// make a version durable. It decides how the control layer treats the failure
+// (Stratum_设计文档v13.md §10.1): the storage layer names the kind, the control
+// layer owns the verdict.
+type FailureClass int
+
+const (
+	// FailureTransient is the default. A network blip, a restarted peer, a full
+	// disk: another attempt — possibly on another replica — may well succeed,
+	// so it counts against the version's retry budget.
+	FailureTransient FailureClass = iota
+	// FailureFatalGlobal means retrying cannot help: the knowledge base is
+	// gone, the input was rejected, the data is unavailable everywhere. It
+	// short-circuits the retry budget and goes straight to the terminal
+	// verdict, because spending retries only delays the inevitable and keeps
+	// the version PENDING in the meantime.
+	FailureFatalGlobal
+)
+
+// String returns a human-readable name, primarily for logging.
+func (c FailureClass) String() string {
+	switch c {
+	case FailureTransient:
+		return "TRANSIENT"
+	case FailureFatalGlobal:
+		return "FATAL_GLOBAL"
 	default:
 		return "UNKNOWN"
 	}
@@ -129,6 +168,16 @@ type VersionMeta struct {
 	// string means no digest has been committed yet (initial/empty version,
 	// or a missed propose) — followers then skip verification.
 	DocIDSetHash string
+
+	// FailureReason records why a version reached FAILED_PERMANENT: the
+	// storage layer's classification plus a detail string, so an operator can
+	// tell "the data is unavailable everywhere" from "every attempt timed
+	// out". Set together with IndexStatusFailedPermanent; empty otherwise.
+	FailureReason string
+
+	// FailureCount is how many attempts failed before that verdict, so the
+	// cause stays auditable after the fact.
+	FailureCount int32
 
 	// Deleting marks the version as being removed asynchronously (the
 	// DeleteVersion flow). Set by cmdMarkVersionDeleting; while true the

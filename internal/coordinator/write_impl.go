@@ -8,15 +8,18 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
 	"stratum/internal/embed"
 	"stratum/internal/index"
+	"stratum/internal/kvraft"
+	"stratum/internal/plane"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
-	stratinternalsync "stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 	"stratum/internal/wal"
@@ -50,6 +53,23 @@ type WriteCoordinatorConfig struct {
 	VersionDocList versiondoc.VersionDocList
 	IndexManager   index.IndexManager
 
+	// DataPlane runs the storage layer's write transaction (BEGIN → storage
+	// writes → COMMIT) and reports its outcome back up
+	// (control-data-separation-design.md §5.1; the split write path of
+	// Stratum_设计文档v13.md §7.12). When nil, the constructor assembles the
+	// in-process LocalDataPlane over the pieces above — which is what the
+	// tests and the single-node deployment use.
+	DataPlane plane.DataPlane
+
+	// Dispatch hands a committed version's write to the coordinator the control
+	// layer picks (§7.13.2), instead of running that write here. When nil, this
+	// node coordinates its own writes — the pre-§7.13.2 behaviour, kept so a node
+	// (or a test stack) that has not adopted the dispatch path keeps working.
+	Dispatch func(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error
+
+	// Logger receives background dispatch failures. Optional.
+	Logger *zap.Logger
+
 	// WriteMu is the lock serializing CreateVersion write transactions
 	// (BEGIN through COMMIT). It is shared with the orphan-chunk
 	// garbage collector so the GC's reclaim phase (current-version
@@ -76,6 +96,71 @@ type WriteCoordinatorImpl struct {
 	// It is the cfg.WriteMu instance (or a private fallback when nil), and
 	// is shared with ChunkGarbageCollectorImpl's reclaim phase.
 	txnMu *sync.Mutex
+
+	// pendingDispatch holds the changes of writes this node has proposed but not
+	// yet dispatched (§7.13.2). The dispatch runs on the apply of the entry, and
+	// the Raft command itself carries no changes — they deliberately stay out of
+	// the log (§7.7) — so they have to be handed over out of band. Keyed by
+	// (kbID, clientRequestID): that is what Execute knows before the version ID
+	// exists, and what the apply hook can read back from the command.
+	dispatchMu      sync.Mutex
+	pendingDispatch map[dispatchKey]pendingDispatchEntry
+
+	// dispatchWG tracks in-flight background dispatches, so a shutdown (or a
+	// test) can wait for the ones already handed off.
+	dispatchWG sync.WaitGroup
+}
+
+// dispatchKey identifies one in-flight write's pending dispatch.
+type dispatchKey struct {
+	kbID            string
+	clientRequestID string
+}
+
+// pendingDispatchEntry is what the dispatcher needs but the Raft command cannot
+// carry: the changes to apply.
+type pendingDispatchEntry struct {
+	parentVersionID int64
+	changes         []types.DocChange
+}
+
+// RegisterPendingDispatch remembers a write's changes so the apply-time
+// dispatcher (§7.13.2) can hand them to the coordinator it picks. Registered
+// before the proposal, because the apply may run before Execute has its version
+// ID back.
+func (c *WriteCoordinatorImpl) RegisterPendingDispatch(kbID, clientRequestID string, parentVersionID int64, changes []types.DocChange) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.pendingDispatch == nil {
+		c.pendingDispatch = make(map[dispatchKey]pendingDispatchEntry)
+	}
+	c.pendingDispatch[dispatchKey{kbID: kbID, clientRequestID: clientRequestID}] = pendingDispatchEntry{
+		parentVersionID: parentVersionID,
+		changes:         changes,
+	}
+}
+
+// TakePendingDispatch removes and returns the changes registered for
+// (kbID, clientRequestID). Taking rather than reading makes a repeated dispatch
+// attempt a no-op instead of a second write of the same version.
+func (c *WriteCoordinatorImpl) TakePendingDispatch(kbID, clientRequestID string) (int64, []types.DocChange, bool) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	key := dispatchKey{kbID: kbID, clientRequestID: clientRequestID}
+	entry, ok := c.pendingDispatch[key]
+	if !ok {
+		return 0, nil, false
+	}
+	delete(c.pendingDispatch, key)
+	return entry.parentVersionID, entry.changes, true
+}
+
+// ForgetPendingDispatch drops a registration whose proposal never landed, so it
+// cannot be dispatched later against a version that does not exist.
+func (c *WriteCoordinatorImpl) ForgetPendingDispatch(kbID, clientRequestID string) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	delete(c.pendingDispatch, dispatchKey{kbID: kbID, clientRequestID: clientRequestID})
 }
 
 // NewWriteCoordinatorImpl constructs a WriteCoordinatorImpl.
@@ -90,62 +175,123 @@ func NewWriteCoordinatorImpl(cfg WriteCoordinatorConfig) *WriteCoordinatorImpl {
 	if mu == nil {
 		mu = &sync.Mutex{}
 	}
-	return &WriteCoordinatorImpl{cfg: cfg, txnMu: mu}
+	c := &WriteCoordinatorImpl{cfg: cfg, txnMu: mu}
+	if c.cfg.DataPlane == nil {
+		c.cfg.DataPlane = plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
+			IndexManager: cfg.IndexManager,
+			WAL:          cfg.WAL,
+			Executor:     c,
+			Control:      plane.NewLocalControlPlane(cfg.RaftNode),
+		})
+	}
+	return c
+}
+
+// SetDataPlane replaces the write data plane. The node assembly needs it: the
+// DataPlane is built after the coordinator (it needs the coordinator as its
+// version-write executor), and then injected here so one instance serves both
+// the write path and the read/sync path.
+func (c *WriteCoordinatorImpl) SetDataPlane(dp plane.DataPlane) {
+	c.cfg.DataPlane = dp
+}
+
+// newDispatchID mints an idempotency key for a write that arrived without one.
+// Execute runs under txnMu, so the timestamp alone is unambiguous.
+func newDispatchID() string {
+	return fmt.Sprintf("auto-%d", time.Now().UnixNano())
 }
 
 // Execute implements WriteCoordinator.
-func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange) (int64, error) {
+func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange, clientRequestID string) (int64, error) {
 	// Serialize the whole transaction (BEGIN through COMMIT) so the WAL's
 	// BEGIN -> VERSION_ID binding per version stays unambiguous (see
 	// txnMu's doc comment).
 	c.txnMu.Lock()
 	defer c.txnMu.Unlock()
 
-	// Step 1: WAL.WriteBegin, persisting the transaction's replay input
-	// (kbID, parentVersionID, changes) so crash recovery can replay the
-	// storage writes if this process dies before COMMIT.
-	if err := c.cfg.WAL.WriteBegin(ctx, kbID, parentVersionID, changes); err != nil {
-		return 0, fmt.Errorf("coordinator: WAL.WriteBegin: %w", err)
+	// §7.13.2: only the leader accepts a write. It is the node that can put the
+	// entry in the log AND the node that holds the changes, so a client that
+	// reached a follower directly is answered with NotLeader and re-resolves the
+	// leader (the router does that for it) rather than being served through a
+	// second, client-side forwarding hop.
+	if !c.cfg.RaftNode.IsLeader() {
+		return 0, kvraft.ErrNotLeader
 	}
 
-	// Step 2: RaftNode.ProposeCreateVersion
-	// (Raft apply phase internally calls WAL.WriteVersionID before
-	// allocating the version in the state machine.)
-	versionID, err := c.cfg.RaftNode.ProposeCreateVersion(ctx, kbID, parentVersionID)
+	// Step 1-2: the control layer allocates the version ID (its apply phase
+	// writes the WAL's VERSION_ID record). Everything the version needs to
+	// exist is now in replicated metadata; the data itself is the storage
+	// layer's business.
+	//
+	// The changes never enter the log (§7.7), yet the §7.13.2 dispatch needs them
+	// at apply time. They are registered under a key the apply hook can read back
+	// out of the command, so a write that arrived without an idempotency key gets
+	// a generated one — without it there would be nothing to register against.
+	dispatchID := clientRequestID
+	if dispatchID == "" {
+		dispatchID = newDispatchID()
+	}
+	c.RegisterPendingDispatch(kbID, dispatchID, parentVersionID, changes)
+
+	opts := []raft.ProposeOption{raft.WithClientRequestID(dispatchID)}
+	versionID, err := c.cfg.RaftNode.ProposeCreateVersion(ctx, kbID, parentVersionID, opts...)
 	if err != nil {
+		// The entry never landed: drop the registration, or it would later be
+		// dispatched against a version that does not exist.
+		c.ForgetPendingDispatch(kbID, dispatchID)
 		return 0, fmt.Errorf("coordinator: Raft propose: %w", err)
 	}
 
-	// Get KB metadata for chunking and embed config.
-	kbMeta, err := c.cfg.RaftNode.GetKB(ctx, kbID)
-	if err != nil {
-		return 0, fmt.Errorf("coordinator: GetKB: %w", err)
+	// With no dispatcher wired, this node coordinates the write itself — the
+	// pre-§7.13.2 behaviour, kept so a node (or a test stack) that has not
+	// adopted the dispatch path keeps working.
+	if c.cfg.Dispatch == nil {
+		// Steps 3-7: the storage layer runs its own transaction (BEGIN → storage
+		// writes → COMMIT), reports the document-set digest up and schedules the
+		// index build (control-data-separation-design.md §5.1; the split write
+		// path of Stratum_设计文档v13.md §7.12).
+		if err := c.cfg.DataPlane.WriteVersionData(ctx, kbID, versionID, parentVersionID, changes); err != nil {
+			return 0, err
+		}
+		return versionID, nil
 	}
 
-	// Steps 3-6: storage-layer writes + WAL COMMIT.
-	docIDs, err := c.writeVersionStorage(ctx, kbID, parentVersionID, versionID, changes, kbMeta)
-	if err != nil {
-		return 0, err
-	}
-
-	// Step 6.5: commit the version's document-ID set hash so followers can
-	// verify their DataSync pulls are complete (see sync.VerifyDocIDSet and
-	// VersionMeta.DocIDSetHash). Non-fatal, like TriggerBuild below: a
-	// failed/missed propose leaves the version without a digest and
-	// followers fall back to best-effort pulls.
-	if err := c.cfg.RaftNode.ProposeUpdateVersionSummary(ctx, versionID, stratinternalsync.ComputeDocIDSetHash(docIDs)); err != nil {
-		_ = err // logged upstream; digest is an optimization for follower verification
-	}
-
-	// Step 7: IndexManager.TriggerBuild (asynchronous).
-	if err := c.cfg.IndexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
-		// TriggerBuild failure is not fatal — the version exists, storage
-		// is durably written, and the build can be retried later.
-		// Log and continue.
-		_ = err
-	}
-
+	// Dispatched (§2.5): the version exists as soon as it is committed, and the
+	// data lands right after, on whichever candidate takes the write.
+	//
+	// Dispatching here as well as from the apply hook is deliberate: the
+	// registration is TAKEN, not read, so exactly one of the two wins and the
+	// other is a no-op; and racing it here is what lets a client retry — same
+	// idempotency key, so no new apply happens — still get its write dispatched.
+	c.dispatchInBackground(kbID, versionID, dispatchID)
 	return versionID, nil
+}
+
+// dispatchInBackground hands a committed version's write to the coordinator the
+// control layer picks (§7.13.2). It runs off the request path: the caller's
+// version already exists, and the write's progress is visible through the
+// version's status and digest.
+func (c *WriteCoordinatorImpl) dispatchInBackground(kbID string, versionID int64, dispatchID string) {
+	parentVersionID, changes, ok := c.TakePendingDispatch(kbID, dispatchID)
+	if !ok {
+		return // the apply hook got there first
+	}
+	c.dispatchWG.Add(1)
+	go func() {
+		defer c.dispatchWG.Done()
+		if err := c.cfg.Dispatch(context.Background(), kbID, versionID, parentVersionID, changes); err != nil {
+			c.logger().Warn("coordinator: dispatch failed; the version stays unwritten until a retry or a client resend",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		}
+	}()
+}
+
+// logger returns the configured logger, or a no-op one.
+func (c *WriteCoordinatorImpl) logger() *zap.Logger {
+	if c.cfg.Logger != nil {
+		return c.cfg.Logger
+	}
+	return zap.NewNop()
 }
 
 // ReplayVersionStorageWrites implements WriteCoordinator: replays steps
@@ -155,27 +301,58 @@ func (c *WriteCoordinatorImpl) ReplayVersionStorageWrites(ctx context.Context, k
 	c.txnMu.Lock()
 	defer c.txnMu.Unlock()
 
-	kbMeta, err := c.cfg.RaftNode.GetKB(ctx, kbID)
-	if err != nil {
-		return fmt.Errorf("coordinator: replay GetKB: %w", err)
-	}
+	// The WAL already framed this transaction (its BEGIN record is what the
+	// recovery path read the replay input from), so the storage layer resumes
+	// it rather than starting a second one.
+	return c.cfg.DataPlane.ResumeVersionWrite(ctx, kbID, versionID, parentVersionID, changes)
+}
 
-	docIDs, err := c.writeVersionStorage(ctx, kbID, parentVersionID, versionID, changes, kbMeta)
-	if err != nil {
-		return fmt.Errorf("coordinator: replay version %d storage writes: %w", versionID, err)
+// DropVersionStorage removes one version's physical storage writes: its MVCC
+// records in the document store and its document-ID list. It is the cleanup of
+// Stratum_设计文档v13.md §10.6 — a version the control layer declared
+// FAILED_PERMANENT may still have landed on a replica whose acknowledgement was
+// lost, and nobody else would reclaim it.
+//
+// Idempotent: both deletes are prefix scans, so a version that never arrived
+// here is a no-op rather than an error.
+func (c *WriteCoordinatorImpl) DropVersionStorage(ctx context.Context, kbID string, versionID int64) error {
+	if err := c.cfg.DocStore.DeleteByVersion(ctx, kbID, versionID); err != nil {
+		return fmt.Errorf("coordinator: DropVersionStorage: docstore %s v%d: %w", kbID, versionID, err)
 	}
-
-	if err := c.cfg.RaftNode.ProposeUpdateVersionSummary(ctx, versionID, stratinternalsync.ComputeDocIDSetHash(docIDs)); err != nil {
-		_ = err
+	if err := c.cfg.VersionDocList.DeleteByVersion(ctx, kbID, versionID); err != nil {
+		return fmt.Errorf("coordinator: DropVersionStorage: versiondoc %s v%d: %w", kbID, versionID, err)
 	}
-	if err := c.cfg.IndexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
-		_ = err
+	// §10.6(4): reclaim the version's index artifacts too — the vecstore-side
+	// index object and its persisted files (.index, .ids, .index.mem). A version
+	// that reached FAILED_PERMANENT is never queryable and never rebuilt, so a
+	// surviving artifact would only linger and skew the disk retention window.
+	// Discard is idempotent, and server-side it is a no-op for an index that was
+	// never built — so a replica that never received this version can run the
+	// same cleanup harmlessly.
+	if c.cfg.IndexManager != nil {
+		if err := c.cfg.IndexManager.Discard(ctx, kbID, versionID); err != nil {
+			return fmt.Errorf("coordinator: DropVersionStorage: index %s v%d: %w", kbID, versionID, err)
+		}
 	}
 	return nil
 }
 
+// WriteVersionStorage is the storage layer's data-write step for one version
+// (steps 3-5): it resolves the KB metadata itself and performs the per-change
+// split/embed/writes plus the version document set and bloom filter. It does
+// NOT frame the WAL transaction (BEGIN/COMMIT) — the caller owns that framing,
+// which is what lets the storage layer's DataPlane run the transaction as its
+// own (Stratum_设计文档v13.md §7.12).
+func (c *WriteCoordinatorImpl) WriteVersionStorage(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) ([]string, error) {
+	kbMeta, err := c.cfg.RaftNode.GetKB(ctx, kbID)
+	if err != nil {
+		return nil, fmt.Errorf("coordinator: GetKB: %w", err)
+	}
+	return c.writeVersionStorage(ctx, kbID, parentVersionID, versionID, changes, kbMeta)
+}
+
 // writeVersionStorage executes the synchronous storage-layer steps of the
-// write path (3-6) for (kbID, versionID): per-change split/embed/write,
+// write path (3-5) for (kbID, versionID): per-change split/embed/write,
 // the version's full document-ID set, the version-document bloom filter,
 // and the WAL COMMIT. Shared by Execute and the crash-recovery replay;
 // every write is idempotent, so re-running it for an already-partially-
@@ -214,11 +391,6 @@ func (c *WriteCoordinatorImpl) writeVersionStorage(ctx context.Context, kbID str
 		if _, err := c.cfg.VersionBloom.BuildAndPersist(kbID, versionID, docIDs); err != nil {
 			_ = err // non-fatal; read path rebuilds lazily
 		}
-	}
-
-	// Step 6: WAL.WriteCommit
-	if err := c.cfg.WAL.WriteCommit(ctx, versionID); err != nil {
-		return nil, fmt.Errorf("coordinator: WAL.WriteCommit: %w", err)
 	}
 
 	return docIDs, nil

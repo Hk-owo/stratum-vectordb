@@ -28,6 +28,17 @@ service VectorIndexService {
   rpc Search(SearchIndexRequest) returns (SearchIndexResponse);
   rpc Save(SaveIndexRequest) returns (SaveIndexResponse);
   rpc Load(LoadIndexRequest) returns (LoadIndexResponse);
+  // LoadForAppend loads a persisted index as the *starting point* of a
+  // build rather than as a finished artifact: afterwards the index is in
+  // BUILDING state and accepts AddChunks, and a later Save seals it for
+  // (kb_id, version_id). This is what makes §8.6(c) incremental reuse
+  // possible without changing Faiss usage: HNSW supports appending to a
+  // graph that was written and read back, but our own Load deliberately
+  // seals the build (BUILDING -> READY), so appending through it is
+  // rejected. `path` names the *base* artifact (normally the parent
+  // version's index file); the object it is loaded into belongs to
+  // (kb_id, version_id), i.e. the version being built.
+  rpc LoadForAppend(LoadIndexForAppendRequest) returns (LoadIndexForAppendResponse);
   // ExistsIndex reports whether a persisted index exists at path for
   // (kb_id, version_id): both the Faiss index file and its .ids sidecar
   // must be present for Load to succeed. Stateless — it inspects the
@@ -36,6 +47,15 @@ service VectorIndexService {
   // startup reconcile to derive a version's READY status from disk facts
   // instead of trusting that a build-completion callback was delivered.
   rpc ExistsIndex(ExistsIndexRequest) returns (ExistsIndexResponse);
+  // RemoveChunks drops the named chunks' vectors from the index and compacts
+  // the storage. Only graph-free shapes can do this: faiss compacts
+  // IndexFlatCodes (the *_FLAT family) but cannot repair an HNSW graph, so a
+  // graphed index answers FAILED_PRECONDITION. The index must still be open —
+  // Save seals a build (BUILDING -> READY), so a sealed index has to be
+  // reopened with LoadForAppend before it can be modified. Used by §8.6(c)'s
+  // deletion path to drop the vectors a version no longer needs, instead of
+  // carrying them as tombstones until a rebuild.
+  rpc RemoveChunks(RemoveChunksRequest) returns (RemoveChunksResponse);
   rpc Reset(ResetIndexRequest) returns (ResetIndexResponse);
 }
 
@@ -83,6 +103,17 @@ enum QuantizerTypeProto {
   QUANTIZER_SQ_BF16 = 2;  // bfloat16 scalar quantization
   QUANTIZER_SQ_FP16 = 3;  // fp16 scalar quantization
   QUANTIZER_PQ = 4;       // product quantization
+
+  // Graph-free variants (Stratum_设计文档v13.md §8.6a). Same quantization, no
+  // HNSW graph: search degrades to a full scan of the quantized codes, which
+  // for a cold version is a good trade — the graph is what dominates both the
+  // memory footprint and the build time, and a cold version's index may never
+  // be queried at all. Hot versions keep the graph.
+  QUANTIZER_OFF_FLAT = 5;      // full precision, no graph
+  QUANTIZER_SQ8_FLAT = 6;      // 8-bit scalar quantization, no graph
+  QUANTIZER_SQ_BF16_FLAT = 7;  // bfloat16 scalar quantization, no graph
+  QUANTIZER_SQ_FP16_FLAT = 8;  // fp16 scalar quantization, no graph
+  QUANTIZER_PQ_FLAT = 9;       // product quantization, no graph
 }
 
 message BuildIndexRequest {
@@ -138,8 +169,39 @@ message SaveIndexResponse {}
 message LoadIndexRequest { string kb_id = 1; int64 version_id = 2; string path = 3; }
 message LoadIndexResponse {}
 
+// LoadIndexForAppendRequest names the base artifact to continue building
+// from. See VectorIndexService.LoadForAppend.
+message LoadIndexForAppendRequest { string kb_id = 1; int64 version_id = 2; string path = 3; }
+message LoadIndexForAppendResponse {
+  // base_ntotal is how many vectors the base artifact held, i.e. the number of
+  // chunk vectors now resident before any delta is appended. The Go
+  // IndexManager uses it to tell how many of those vectors this version no
+  // longer needs (§8.6(c)'s tombstones: pure-append reuse keeps the base's
+  // vectors, and a version that deletes documents leaves dead ones behind —
+  // they are filtered out of results, but they still cost memory and compete
+  // for the top-K candidate slots).
+  int64 base_ntotal = 1;
+}
+
 message ExistsIndexRequest { string kb_id = 1; int64 version_id = 2; string path = 3; }
 message ExistsIndexResponse { bool exists = 1; }
+
+// RemoveChunksRequest names the chunks to drop. See
+// VectorIndexService.RemoveChunks.
+message RemoveChunksRequest {
+  string kb_id = 1;
+  int64 version_id = 2;
+  repeated string chunk_ids = 3;
+}
+message RemoveChunksResponse {
+  // removed is how many *vectors* were dropped. A chunk id that appears more
+  // than once in the index (possible in artifacts written before the append
+  // path deduplicated ids) contributes more than one; an id that is not
+  // present contributes none. ntotal is how many vectors remain — the storage
+  // is compacted, so positions shift.
+  int64 removed = 1;
+  int64 ntotal = 2;
+}
 
 message ResetIndexRequest { string kb_id = 1; int64 version_id = 2; }
 message ResetIndexResponse {}

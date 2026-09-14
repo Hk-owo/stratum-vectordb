@@ -96,7 +96,8 @@ func TestMockRaftNode_ParentMustNotBePending(t *testing.T) {
 	}
 }
 
-func TestMockRaftNode_ForkingAllowed(t *testing.T) {
+// MockRaftNode must mirror the state machine's strictly linear version chain.
+func TestMockRaftNode_ForkRejected(t *testing.T) {
 	ctx := context.Background()
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
@@ -107,16 +108,17 @@ func TestMockRaftNode_ForkingAllowed(t *testing.T) {
 	}
 	mustUpdateStatus(t, r, v1, types.IndexStatusReady)
 
-	v2a, err := r.ProposeCreateVersion(ctx, "kb1", v1)
+	v2, err := r.ProposeCreateVersion(ctx, "kb1", v1)
 	if err != nil {
-		t.Fatalf("ProposeCreateVersion (fork A): %v", err)
+		t.Fatalf("ProposeCreateVersion (first child): %v", err)
 	}
-	v2b, err := r.ProposeCreateVersion(ctx, "kb1", v1)
-	if err != nil {
-		t.Fatalf("ProposeCreateVersion (fork B): %v", err)
+	mustUpdateStatus(t, r, v2, types.IndexStatusReady)
+
+	if _, err := r.ProposeCreateVersion(ctx, "kb1", v1); !errors.Is(err, stratumerrors.ErrInvalidParentVersion) {
+		t.Fatalf("second child of v%d = %v, want ErrInvalidParentVersion", v1, err)
 	}
-	if v2a == v2b {
-		t.Fatalf("two forks of the same parent got the same version ID: %d", v2a)
+	if _, err := r.ProposeCreateVersion(ctx, "kb1", v2); err != nil {
+		t.Fatalf("chained child of v%d failed: %v", v2, err)
 	}
 
 	versions, err := r.ListVersions(ctx, "kb1")
@@ -129,8 +131,8 @@ func TestMockRaftNode_ForkingAllowed(t *testing.T) {
 			parentCount++
 		}
 	}
-	if parentCount != 2 {
-		t.Fatalf("expected 2 children of v1, found %d", parentCount)
+	if parentCount != 1 {
+		t.Fatalf("expected 1 child of v1, found %d", parentCount)
 	}
 }
 

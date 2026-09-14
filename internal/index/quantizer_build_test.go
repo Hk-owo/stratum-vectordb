@@ -13,22 +13,14 @@ import (
 	"stratum/internal/types"
 )
 
+// testIndexManagerWithEmptyKB keeps its historical name for the call sites
+// below, but it now returns an IndexManager over a one-chunk version: an
+// empty version no longer reaches the vecstore at all (see
+// TestIndexManager_BuildEmptyVersionDoesNotCallVecstore), so asserting
+// quantizer forwarding needs a real chunk.
 func testIndexManagerWithEmptyKB(t *testing.T) *IndexManagerImpl {
 	t.Helper()
-	im := NewIndexManager(IndexManagerConfig{
-		LRUCapacity:     4,
-		LoadWaitTimeout: 5 * time.Second,
-		IndexDataDir:    t.TempDir(),
-	})
-	im.vectorIndexClient = newMockVectorIndexClient()
-	// Empty version: the build still issues one (empty) Build RPC, which
-	// carries the quantizer fields — enough to assert config forwarding.
-	im.SetBuildDataSources(
-		func(_ context.Context, _ string, _ int64) ([]string, error) { return nil, nil },
-		func(_ context.Context, _ string, _ []string) ([]string, error) { return nil, nil },
-		func(_ context.Context, _, _ string) ([]float32, error) { return nil, nil },
-	)
-	return im
+	return newIndexManagerWithData(t)
 }
 
 func TestBuildForwardsKBQuantizerConfig(t *testing.T) {
@@ -37,7 +29,7 @@ func TestBuildForwardsKBQuantizerConfig(t *testing.T) {
 		return types.KnowledgeBaseMeta{KBID: kbID, QuantizerType: "SQ8"}, nil
 	})
 
-	if _, err := im.buildWithRetry("kb-quant", 1); err != nil {
+	if _, err := im.buildWithRetry("kb-quant", 1, false); err != nil {
 		t.Fatalf("buildWithRetry: %v", err)
 	}
 	vc := im.vectorIndexClient.(*mockVectorIndexClient)
@@ -57,7 +49,7 @@ func TestBuildForwardsPQParams(t *testing.T) {
 		}, nil
 	})
 
-	if _, err := im.buildWithRetry("kb-pq", 1); err != nil {
+	if _, err := im.buildWithRetry("kb-pq", 1, false); err != nil {
 		t.Fatalf("buildWithRetry: %v", err)
 	}
 	vc := im.vectorIndexClient.(*mockVectorIndexClient)
@@ -72,7 +64,7 @@ func TestBuildForwardsPQParams(t *testing.T) {
 func TestBuildDefaultsToOffWithoutKBMeta(t *testing.T) {
 	im := testIndexManagerWithEmptyKB(t)
 	// No SetKBMetaGetter and no meta registered: OFF default.
-	if _, err := im.buildWithRetry("kb-plain", 1); err != nil {
+	if _, err := im.buildWithRetry("kb-plain", 1, false); err != nil {
 		t.Fatalf("buildWithRetry: %v", err)
 	}
 	vc := im.vectorIndexClient.(*mockVectorIndexClient)
@@ -111,7 +103,7 @@ func TestBuildAccountingPrefersReportedMemForQuantized(t *testing.T) {
 		return types.KnowledgeBaseMeta{KBID: kbID, QuantizerType: "SQ8"}, nil
 	})
 
-	size, err := im.buildWithRetry("kb-sq8", 1)
+	size, err := im.buildWithRetry("kb-sq8", 1, false)
 	if err != nil {
 		t.Fatalf("buildWithRetry: %v", err)
 	}
@@ -128,7 +120,7 @@ func TestBuildAccountingKeepsPayloadEstimateForOff(t *testing.T) {
 	vc := im.vectorIndexClient.(*mockVectorIndexClient)
 	vc.memToReport = 50000 // must be ignored for OFF KBs
 
-	size, err := im.buildWithRetry("kb-plain", 1)
+	size, err := im.buildWithRetry("kb-plain", 1, false)
 	if err != nil {
 		t.Fatalf("buildWithRetry: %v", err)
 	}

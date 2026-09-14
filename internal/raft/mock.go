@@ -34,6 +34,17 @@ type MockRaftNode struct {
 	versions      map[int64]types.VersionMeta
 	versionsByKB  map[string][]int64
 	nextVersionID int64
+	// versionsByRequest mirrors the real state machine's idempotency map so
+	// the two implementations agree on retry semantics
+	// (Stratum_设计文档v13.md §7.12). Tests are short-lived, so unlike the
+	// real state machine this map is not pruned on version/KB removal.
+	versionsByRequest map[string]int64
+
+	// leader mirrors the real node's view of itself. It defaults to true: every
+	// existing test drives a single-node stack, where the node is its own leader,
+	// so the §7.13.2 "only the leader accepts a write" rule must not change their
+	// behaviour. SetLeader(false) is how a test asserts the follower case.
+	leader bool
 }
 
 // NewMockRaftNode constructs an empty MockRaftNode. w is the WAL instance
@@ -43,12 +54,29 @@ type MockRaftNode struct {
 // RaftNodeImpl would be wired to the real WAL implementation.
 func NewMockRaftNode(w wal.WAL) *MockRaftNode {
 	return &MockRaftNode{
-		wal:           w,
-		kbs:           make(map[string]types.KnowledgeBaseMeta),
-		versions:      make(map[int64]types.VersionMeta),
-		versionsByKB:  make(map[string][]int64),
-		nextVersionID: 1,
+		wal:               w,
+		kbs:               make(map[string]types.KnowledgeBaseMeta),
+		versions:          make(map[int64]types.VersionMeta),
+		versionsByKB:      make(map[string][]int64),
+		nextVersionID:     1,
+		versionsByRequest: make(map[string]int64),
+		leader:            true,
 	}
+}
+
+// IsLeader implements RaftNode.
+func (r *MockRaftNode) IsLeader() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.leader
+}
+
+// SetLeader switches this node's view of itself, so a test can drive the
+// follower path (the write must be refused with ErrNotLeader).
+func (r *MockRaftNode) SetLeader(leader bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.leader = leader
 }
 
 func (r *MockRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBaseMeta) error {
@@ -106,12 +134,22 @@ func (r *MockRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error
 // phase ordering documented for RaftNodeImpl; (2) the parent version must
 // belong to the same knowledge base; (3) the parent version must not be
 // PENDING; (4) forking (multiple children of one parent) is allowed.
-func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64) (int64, error) {
+func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64, opts ...ProposeOption) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, ok := r.kbs[kbID]; !ok {
 		return 0, stratumerrors.ErrKnowledgeBaseNotFound
+	}
+
+	// Idempotent retry: the same client key returns the same version, checked
+	// before the parent constraints for the same reason the real state machine
+	// checks it there (the parent may legitimately have moved on).
+	clientRequestID := resolveProposeOptions(opts).clientRequestID
+	if clientRequestID != "" {
+		if id, ok := r.versionsByRequest[requestKey(kbID, clientRequestID)]; ok {
+			return id, nil
+		}
 	}
 
 	// parentVersionID == 0 is treated as "no parent" (initial version of a
@@ -130,6 +168,13 @@ func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, pa
 		}
 		if parent.Deleting {
 			return 0, fmt.Errorf("parent version %d is being deleted: %w", parentVersionID, stratumerrors.ErrInvalidParentVersion)
+		}
+		// Strictly linear version chain: at most one child per parent (see
+		// stateMachine.applyCreateVersion for the rationale).
+		for _, id := range r.versionsByKB[kbID] {
+			if v, ok := r.versions[id]; ok && v.ParentVersionID == parentVersionID {
+				return 0, fmt.Errorf("parent version %d already has child version %d: %w", parentVersionID, id, stratumerrors.ErrInvalidParentVersion)
+			}
 		}
 	}
 
@@ -154,8 +199,27 @@ func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, pa
 		IndexStatus:     types.IndexStatusPending,
 	}
 	r.versionsByKB[kbID] = append(r.versionsByKB[kbID], versionID)
+	if clientRequestID != "" {
+		r.versionsByRequest[requestKey(kbID, clientRequestID)] = versionID
+	}
 
 	return versionID, nil
+}
+
+// ProposeMarkVersionFailedPermanent mirrors the real state machine's terminal
+// verdict (Stratum_设计文档v13.md §10.1).
+func (r *MockRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, kbID string, versionID int64, reason string, count int32) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.versions[versionID]
+	if !ok || v.KBID != kbID {
+		return stratumerrors.ErrVersionNotFound
+	}
+	v.IndexStatus = types.IndexStatusFailedPermanent
+	v.FailureReason = reason
+	v.FailureCount = count
+	r.versions[versionID] = v
+	return nil
 }
 
 func (r *MockRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {

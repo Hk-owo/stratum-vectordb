@@ -50,6 +50,20 @@ index_manager:
   load_wait_timeout_ms: 5000
   callback_max_retries: 3
   callback_retry_base_interval_ms: 200
+  # §8.6a 冷版本免图分层。某个版本连续 cold_threshold_ms 没有被查询，后台
+  # 评估器就把它的索引重建为「免图」形态（量化码 + 暴力扫描，省掉 HNSW 图
+  # 边的构建耗时与常驻内存）；检索语义不变（量化方式与 rerank 一致）。评估
+  # 周期由 cold_sweep_interval_ms 控制，为 0 时用 IndexManager 默认值
+  # （1 分钟）。如上的 0 = 关闭该策略（默认），行为与历史一致：每个版本都
+  # 建完整 HNSW 图。形态变化后的产物走 §8.4 的副本分发，与新建索引同路。
+  cold_threshold_ms: 0
+  cold_sweep_interval_ms: 0
+  # §8.6(c) 纯追加复用的"死向量"上限。版本 N 若只是版本 N-1 的纯追加（父产物
+  # 还在本节点、形态一致），就以其产物为起点只追加新增 chunk；若本版本删了文档，
+  # 被删文档的向量会以「墓碑」形式留在产物里（查询路径会把它们的结果滤掉，代价
+  # 是内存与 top-K 候选名额）。墓碑占比超过该比例时改用全量重建（顺带清掉墓碑）。
+  # 0 = 用 IndexManager 默认值（0.2）；1.0 = 从不因墓碑而重建。
+  append_max_dead_ratio: 0
 
 bloom_filter:
   expected_items: 1000000

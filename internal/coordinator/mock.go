@@ -51,7 +51,7 @@ func NewMockWriteCoordinator() *MockWriteCoordinator {
 	return &MockWriteCoordinator{nextVersionID: 1}
 }
 
-func (c *MockWriteCoordinator) Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange) (int64, error) {
+func (c *MockWriteCoordinator) Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange, clientRequestID string) (int64, error) {
 	c.mu.Lock()
 	c.calls = append(c.calls, WriteCoordinatorCall{KBID: kbID, ParentVersionID: parentVersionID, Changes: changes})
 	fn := c.executeFunc

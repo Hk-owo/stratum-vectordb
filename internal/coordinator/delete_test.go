@@ -11,6 +11,7 @@ import (
 	"stratum/internal/bloom"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
+	"stratum/internal/raft"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -30,9 +31,15 @@ func newDeleteTestRaftNode() *deleteTestRaftNode {
 func (r *deleteTestRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBaseMeta) error {
 	return nil
 }
-func (r *deleteTestRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64) (int64, error) {
+func (r *deleteTestRaftNode) IsLeader() bool { return true }
+
+func (r *deleteTestRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64, opts ...raft.ProposeOption) (int64, error) {
 	return 0, nil
 }
+func (r *deleteTestRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ string, _ int32) error {
+	return nil
+}
+
 func (r *deleteTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
 	return nil
 }

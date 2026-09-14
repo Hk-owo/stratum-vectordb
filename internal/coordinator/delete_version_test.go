@@ -331,18 +331,19 @@ func TestDeleteVersionCoordinator_KeepsRecordsSurvivorReads(t *testing.T) {
 	}
 }
 
-// TestDeleteVersionCoordinator_KeepsRecordsForForkedDescendant pins the anchor
-// choice against a fork. The smallest surviving version above the deleted one
-// can be a SIBLING branch rather than a descendant:
+// TestDeleteVersionCoordinator_KeepsRecordsForLinearDeletion pins the anchor
+// choice on a strictly linear chain. After SINGLE removes v2, v2's only direct
+// child v3 is spliced onto v1 and becomes the smallest surviving version above
+// v2 — a true direct successor, not a sibling branch:
 //
-//	v1 ├─ v2 ├─ v4   (delete v2, keep v3 and v4)
-//	   └─ v3
+//	v1 -> v2 -> v3 -> v4   (delete v2, keep v3 and v4)
 //
-// with v2 < v3 < v4. Reads resolve purely by version number (ReadAt returns
-// the largest versionID <= the query, regardless of the parent chain), so the
-// sibling anchor v3 still sees v2's document and the dependency check keeps
-// the record for the descendant v4 as well.
-func TestDeleteVersionCoordinator_KeepsRecordsForForkedDescendant(t *testing.T) {
+// Reads resolve purely by version number (ReadAt returns the largest
+// versionID <= the query, regardless of the parent chain). On a linear chain
+// that numeric order is identical to the ancestor order, so the anchor v3 is
+// exactly the version whose view of v2's records must be preserved — and v4,
+// which inherited v2 through v3, keeps reading them too.
+func TestDeleteVersionCoordinator_KeepsRecordsForLinearDeletion(t *testing.T) {
 	ctx := context.Background()
 	w := wal.NewMockWAL()
 	rn := raft.NewMockRaftNode(w)
@@ -372,8 +373,8 @@ func TestDeleteVersionCoordinator_KeepsRecordsForForkedDescendant(t *testing.T) 
 	}
 	v1 := create(0)
 	v2 := create(v1)
-	v3 := create(v1) // sibling branch, created after v2
-	v4 := create(v2) // descendant of v2, created after v3
+	v3 := create(v2) // only child of v2
+	v4 := create(v3) // descendant of v2 through v3
 	if !(v2 < v3 && v3 < v4) {
 		t.Fatalf("fixture: want v2 < v3 < v4, got %d < %d < %d", v2, v3, v4)
 	}
@@ -394,10 +395,10 @@ func TestDeleteVersionCoordinator_KeepsRecordsForForkedDescendant(t *testing.T) 
 	}
 	writeDocIDs(v1, "doc-a")
 	writeDocIDs(v2, "doc-a", "doc-b")
-	writeDocIDs(v3, "doc-a")          // v3 inherits v1, which has no doc-b
-	writeDocIDs(v4, "doc-a", "doc-b") // v4 inherits v2
+	writeDocIDs(v3, "doc-a", "doc-b") // v3 inherits v2
+	writeDocIDs(v4, "doc-a", "doc-b") // v4 inherits v3
 
-	// SINGLE removes v2; the sibling v3 and the descendant v4 both survive.
+	// SINGLE removes v2; its only child v3 is spliced onto v1, and v4 survives.
 	if _, err := rn.ProposeMarkVersionDeleting(ctx, "kb-1", v2, types.VersionDeleteSingle); err != nil {
 		t.Fatalf("mark v2 deleting (SINGLE): %v", err)
 	}
@@ -421,7 +422,7 @@ func TestDeleteVersionCoordinator_KeepsRecordsForForkedDescendant(t *testing.T) 
 	// would silently serve v4 either nothing or an older value.
 	content, err := ds.ReadAt(ctx, "kb-1", "doc-b", v4)
 	if err != nil || string(content) != "b-v2" {
-		t.Errorf("doc-b at v4 = (%q, %v), want (\"b-v2\", nil): v2's record must survive for its forked descendant", content, err)
+		t.Errorf("doc-b at v4 = (%q, %v), want (\"b-v2\", nil): v2's record must survive for its descendant", content, err)
 	}
 	// The sibling anchor reads the same record, which is what makes the
 	// global-minimum anchor a sound choice.

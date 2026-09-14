@@ -57,12 +57,16 @@ import (
 // VERSION_ID to the correct transaction's replay input (see
 // internal/wal/file.go).
 type WriteCoordinator interface {
-	// Execute runs the full CreateVersion orchestration for kbID, with
-	// parentVersionID as the new version's parent and changes as the set
-	// of document mutations to apply. Returns the newly allocated version
-	// ID once synchronous steps (WAL COMMIT) have completed; index build
-	// continues asynchronously.
-	Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange) (int64, error)
+	// Execute runs the CreateVersion orchestration for kbID, with
+	// parentVersionID as the new version's parent and changes as the set of
+	// document mutations to apply. clientRequestID is an optional client
+	// idempotency key: a retry carrying the same key (for the same KB) reuses
+	// the version the first attempt allocated instead of allocating another
+	// one, which is what lets a client re-send the changes for a version whose
+	// data never landed (Stratum_设计文档v13.md §7.12). Returns the version ID
+	// once the synchronous steps have completed; index build continues
+	// asynchronously.
+	Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange, clientRequestID string) (int64, error)
 
 	// ReplayVersionStorageWrites replays the storage-layer writes (steps
 	// 3-6 of the write path) for an already-committed version after a

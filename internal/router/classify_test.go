@@ -10,6 +10,9 @@ func TestIsWriteMethod(t *testing.T) {
 	writes := []string{
 		pb.KnowledgeBaseService_CreateKnowledgeBase_FullMethodName,
 		pb.KnowledgeBaseService_DeleteKnowledgeBase_FullMethodName,
+		// CreateVersion is leader-bound again (§7.13.2): the control layer
+		// chooses the coordinator, so the entry must reach the leader rather
+		// than run on whichever node accepted it.
 		pb.KnowledgeBaseService_CreateVersion_FullMethodName,
 		pb.KnowledgeBaseService_RollbackVersion_FullMethodName,
 		pb.KnowledgeBaseService_DeleteVersion_FullMethodName,

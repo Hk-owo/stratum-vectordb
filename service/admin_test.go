@@ -31,7 +31,7 @@ func newAdminHarness() *adminHarness {
 		ListChunkIDsByDocs: func(ctx context.Context, kbID string, docIDs []string) ([]string, error) { return nil, nil },
 		ReadChunkVector:    func(ctx context.Context, kbID, chunkID string) ([]float32, error) { return nil, nil },
 	}, 16, 0)
-	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w)
+	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w, nil, nil)
 	return &adminHarness{svc: svc, raftNode: rn, indexMgr: im, wal: w}
 }
 
@@ -72,7 +72,7 @@ func TestAdmin_HealthCheck_DegradedNoLeader(t *testing.T) {
 	w := wal.NewMockWAL()
 	rn := &noLeaderRaft{MockRaftNode: raft.NewMockRaftNode(w)}
 	im := index.NewMockIndexManager(index.MockIndexManagerDeps{}, 16, 0)
-	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w)
+	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w, nil, nil)
 
 	resp, err := svc.HealthCheck(context.Background(), &pb.HealthCheckRequest{})
 	if err != nil {
@@ -123,7 +123,7 @@ func TestAdmin_GetClusterStatus_NoLeader(t *testing.T) {
 	w := wal.NewMockWAL()
 	rn := &noLeaderRaft{MockRaftNode: raft.NewMockRaftNode(w)}
 	im := index.NewMockIndexManager(index.MockIndexManagerDeps{}, 16, 0)
-	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w)
+	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w, nil, nil)
 
 	resp, err := svc.GetClusterStatus(context.Background(), &pb.GetClusterStatusRequest{})
 	if err != nil {
@@ -273,7 +273,7 @@ func TestAdmin_RebuildIndex_TriggerBuildError(t *testing.T) {
 	w := wal.NewMockWAL()
 	rn := raft.NewMockRaftNode(w)
 	im := &failingTriggerBuild{MockIndexManager: index.NewMockIndexManager(index.MockIndexManagerDeps{}, 16, 0)}
-	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w)
+	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w, nil, nil)
 
 	ctx := context.Background()
 	if err := rn.ProposeCreateKB(ctx, kbMeta("kb-1", types.KBStatusActive)); err != nil {
@@ -350,7 +350,7 @@ func TestAdmin_WarmupVersion_TriggerBuildError(t *testing.T) {
 	w := wal.NewMockWAL()
 	rn := raft.NewMockRaftNode(w)
 	im := &failingTriggerBuild{MockIndexManager: index.NewMockIndexManager(index.MockIndexManagerDeps{}, 16, 0)}
-	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w)
+	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w, nil, nil)
 
 	ctx := context.Background()
 	if err := rn.ProposeCreateKB(ctx, kbMeta("kb-1", types.KBStatusActive)); err != nil {

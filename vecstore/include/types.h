@@ -47,7 +47,51 @@ enum class QuantizerType {
   kSQBF16,    // bfloat16 scalar quantization (2 bytes/component)
   kSQFP16,    // fp16 scalar quantization (2 bytes/component)
   kPQ,        // product quantization (pq_m * pq_nbits / 8 bytes/vector)
+
+  // Graph-free variants (Stratum_设计文档v13.md §8.6a): the same quantizers
+  // without the HNSW graph. The graph dominates both the memory footprint and
+  // the build time, so a version that is unlikely to be queried — a cold,
+  // non-active one — is better served by scanning quantized codes, which costs
+  // O(n) per query but builds and stores far less. Hot versions keep the graph.
+  kOffFlat,   // full precision, linear scan
+  kSQ8Flat,   // 8-bit scalar quantization, linear scan
+  kSQBF16Flat,
+  kSQFP16Flat,
+  kPQFlat,
 };
+
+// isGraphFree reports whether t stores vectors without an HNSW graph.
+inline bool isGraphFree(QuantizerType t) {
+  switch (t) {
+    case QuantizerType::kOffFlat:
+    case QuantizerType::kSQ8Flat:
+    case QuantizerType::kSQBF16Flat:
+    case QuantizerType::kSQFP16Flat:
+    case QuantizerType::kPQFlat:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// isQuantized reports whether t stores approximate codes whose search results
+// need re-ranking against full-precision vectors. The graph-free variants use
+// the same quantizers, so their results are coarse in the same way.
+inline bool isQuantized(QuantizerType t) {
+  switch (t) {
+    case QuantizerType::kSQ8:
+    case QuantizerType::kSQBF16:
+    case QuantizerType::kSQFP16:
+    case QuantizerType::kPQ:
+    case QuantizerType::kSQ8Flat:
+    case QuantizerType::kSQBF16Flat:
+    case QuantizerType::kSQFP16Flat:
+    case QuantizerType::kPQFlat:
+      return true;
+    default:
+      return false;
+  }
+}
 
 // QuantizerConfig is the per-knowledge-base quantization setting. It is
 // fixed at knowledge-base creation time and never changes afterwards;

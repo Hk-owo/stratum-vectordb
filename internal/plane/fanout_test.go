@@ -1,0 +1,125 @@
+package plane
+
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+// stubPusher records pushes and fails for the targets listed in fail.
+type stubPusher struct {
+	fail  map[string]bool
+	calls []string
+}
+
+func (p *stubPusher) PushVersion(_ context.Context, targetAddr, _ string, _ int64) (int64, error) {
+	p.calls = append(p.calls, targetAddr)
+	if p.fail[targetAddr] {
+		return 0, errors.New("replica unreachable")
+	}
+	return 42, nil
+}
+
+var _ VersionPusher = (*stubPusher)(nil)
+
+// newFanOutPlane builds a plane whose local transaction succeeds and whose
+// replica set is targets.
+func newFanOutPlane(targets []string, pusher VersionPusher) *LocalDataPlane {
+	tr := &tracer{}
+	return NewLocalDataPlane(LocalDataPlaneConfig{
+		IndexManager: &stubIndexStore{},
+		WAL:          &stubWAL{t: tr},
+		Executor:     &stubExecutor{t: tr, docIDs: []string{"doc-1"}},
+		Pusher:       pusher,
+		ResolveReplicas: func(context.Context) ([]string, error) {
+			return targets, nil
+		},
+	})
+}
+
+func TestQuorumSize(t *testing.T) {
+	cases := map[int]int{0: 0, 1: 1, 2: 2, 3: 2, 4: 3, 5: 3, 6: 4, 7: 4}
+	for n, want := range cases {
+		if got := QuorumSize(n); got != want {
+			t.Errorf("QuorumSize(%d) = %d, want %d", n, got, want)
+		}
+	}
+}
+
+// With two targets the quorum is 2 of 3, so a single unreachable replica must
+// not fail the write (Stratum_设计文档v13.md §7.1).
+func TestLocalDataPlane_FanOutToleratesOneUnreachableReplica(t *testing.T) {
+	pusher := &stubPusher{fail: map[string]bool{"peer-b": true}}
+	dp := newFanOutPlane([]string{"peer-a", "peer-b"}, pusher)
+
+	if err := dp.WriteVersionData(context.Background(), "kb-1", 7, 3, nil); err != nil {
+		t.Fatalf("WriteVersionData with one reachable replica: %v", err)
+	}
+	if len(pusher.calls) != 2 {
+		t.Errorf("pushes = %v, want both targets attempted", pusher.calls)
+	}
+}
+
+// Losing both targets leaves 1 of 3 acknowledgements — below quorum — so the
+// write must fail rather than report the version durable.
+func TestLocalDataPlane_FanOutFailsBelowQuorum(t *testing.T) {
+	pusher := &stubPusher{fail: map[string]bool{"peer-a": true, "peer-b": true}}
+	dp := newFanOutPlane([]string{"peer-a", "peer-b"}, pusher)
+
+	if err := dp.WriteVersionData(context.Background(), "kb-1", 7, 3, nil); err == nil {
+		t.Fatal("WriteVersionData must fail when acknowledgements fall below quorum")
+	}
+}
+
+// A single-replica deployment (no resolver) has nothing to fan out to: the
+// local write is the whole quorum and no push is attempted, which is what
+// keeps the single-node and test defaults behaving exactly as before.
+func TestLocalDataPlane_FanOutWithoutReplicasIsLocalOnly(t *testing.T) {
+	pusher := &stubPusher{}
+	tr := &tracer{}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		IndexManager: &stubIndexStore{},
+		WAL:          &stubWAL{t: tr},
+		Executor:     &stubExecutor{t: tr, docIDs: []string{"doc-1"}},
+		Pusher:       pusher,
+	})
+
+	if err := dp.WriteVersionData(context.Background(), "kb-1", 7, 3, nil); err != nil {
+		t.Fatalf("WriteVersionData without a replica set: %v", err)
+	}
+	if len(pusher.calls) != 0 {
+		t.Errorf("pushes = %v, want none (no replica resolver configured)", pusher.calls)
+	}
+}
+
+// An empty target list behaves like no replication at all.
+func TestLocalDataPlane_FanOutWithEmptyTargetsIsLocalOnly(t *testing.T) {
+	pusher := &stubPusher{}
+	dp := newFanOutPlane(nil, pusher)
+
+	if err := dp.WriteVersionData(context.Background(), "kb-1", 7, 3, nil); err != nil {
+		t.Fatalf("WriteVersionData with an empty replica set: %v", err)
+	}
+	if len(pusher.calls) != 0 {
+		t.Errorf("pushes = %v, want none", pusher.calls)
+	}
+}
+
+// A resolver failure must surface: silently skipping replication would let the
+// write report the version durable with no replica holding it.
+func TestLocalDataPlane_FanOutResolverFailureSurfaces(t *testing.T) {
+	tr := &tracer{}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		IndexManager: &stubIndexStore{},
+		WAL:          &stubWAL{t: tr},
+		Executor:     &stubExecutor{t: tr, docIDs: []string{"doc-1"}},
+		Pusher:       &stubPusher{},
+		ResolveReplicas: func(context.Context) ([]string, error) {
+			return nil, errors.New("membership unavailable")
+		},
+	})
+
+	if err := dp.WriteVersionData(context.Background(), "kb-1", 7, 3, nil); err == nil {
+		t.Fatal("a replica-resolution failure must surface rather than degrade to no replication")
+	}
+}

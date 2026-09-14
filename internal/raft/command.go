@@ -22,6 +22,11 @@ const (
 	cmdRollback             commandType = "Rollback"
 	cmdMarkVersionDeleting  commandType = "MarkVersionDeleting"
 	cmdRemoveVersionMeta    commandType = "RemoveVersionMeta"
+
+	// cmdMarkVersionFailedPermanent records the control layer's verdict that a
+	// version has spent its retry budget and will not be retried again
+	// (Stratum_设计文档v13.md §10.1).
+	cmdMarkVersionFailedPermanent commandType = "MarkVersionFailedPermanent"
 )
 
 // command is the JSON-encoded payload carried inside each kvraft log
@@ -42,6 +47,11 @@ type command struct {
 
 	// cmdCreateVersion
 	ParentVersionID int64 `json:"parent_version_id,omitempty"`
+	// cmdCreateVersion: optional client idempotency key. Re-applying a command
+	// with the same (KBID, ClientRequestID) returns the version the first
+	// apply allocated instead of allocating another one
+	// (Stratum_设计文档v13.md §7.12).
+	ClientRequestID string `json:"client_request_id,omitempty"`
 
 	// cmdUpdateVersionStatus / cmdMarkVersionDeleting / cmdRemoveVersionMeta
 	VersionID int64             `json:"version_id,omitempty"`
@@ -54,6 +64,10 @@ type command struct {
 
 	// cmdUpdateVersionSummary
 	DocIDSetHash string `json:"doc_id_set_hash,omitempty"`
+
+	// cmdMarkVersionFailedPermanent: the cause chain an operator needs.
+	FailureReason string `json:"failure_reason,omitempty"`
+	FailureCount  int32  `json:"failure_count,omitempty"`
 
 	// cmdRollback
 	TargetVersionID int64 `json:"target_version_id,omitempty"`
@@ -73,4 +87,69 @@ func decodeCommand(data []byte) (command, error) {
 		return command{}, fmt.Errorf("raft: decode command: %w", err)
 	}
 	return c, nil
+}
+
+// Command constructors.
+//
+// Both the local RaftNodeImpl (which appends to this node's own Raft) and
+// RemoteRaftNode (which forwards the command to whichever control node leads)
+// build their proposals through these. Sharing them is what keeps the two
+// paths from drifting into encoding different commands for one logical
+// operation: such a drift would not fail a build, it would surface as a
+// storage node reporting something subtly different from what a same-process
+// node reports — and only under the split topology.
+
+func newCreateKBCommand(kb types.KnowledgeBaseMeta) command {
+	return command{Type: cmdCreateKB, KB: &kb}
+}
+
+func newMarkKBDeletingCommand(kbID string) command {
+	return command{Type: cmdMarkKBDeleting, KBID: kbID}
+}
+
+func newMarkKBDeleteFailedCommand(kbID string) command {
+	return command{Type: cmdMarkKBDeleteFailed, KBID: kbID}
+}
+
+func newRemoveKBMetaCommand(kbID string) command {
+	return command{Type: cmdRemoveKBMeta, KBID: kbID}
+}
+
+func newCreateVersionCommand(kbID string, parentVersionID int64, clientRequestID string) command {
+	return command{
+		Type:            cmdCreateVersion,
+		KBID:            kbID,
+		ParentVersionID: parentVersionID,
+		ClientRequestID: clientRequestID,
+	}
+}
+
+func newUpdateVersionStatusCommand(versionID int64, status types.IndexStatus) command {
+	return command{Type: cmdUpdateVersionStatus, VersionID: versionID, Status: status}
+}
+
+func newUpdateVersionSummaryCommand(versionID int64, docIDSetHash string) command {
+	return command{Type: cmdUpdateVersionSummary, VersionID: versionID, DocIDSetHash: docIDSetHash}
+}
+
+func newRollbackCommand(kbID string, targetVersionID int64) command {
+	return command{Type: cmdRollback, KBID: kbID, TargetVersionID: targetVersionID}
+}
+
+func newMarkVersionDeletingCommand(kbID string, versionID int64, mode types.VersionDeleteMode) command {
+	return command{Type: cmdMarkVersionDeleting, KBID: kbID, VersionID: versionID, Mode: mode}
+}
+
+func newRemoveVersionMetaCommand(kbID string, versionID int64) command {
+	return command{Type: cmdRemoveVersionMeta, KBID: kbID, VersionID: versionID}
+}
+
+func newMarkVersionFailedPermanentCommand(kbID string, versionID int64, reason string, count int32) command {
+	return command{
+		Type:          cmdMarkVersionFailedPermanent,
+		KBID:          kbID,
+		VersionID:     versionID,
+		FailureReason: reason,
+		FailureCount:  count,
+	}
 }

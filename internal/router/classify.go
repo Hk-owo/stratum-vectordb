@@ -19,6 +19,12 @@ import (
 // the service layer) or trigger index builds with side effects. Every
 // other method is read-only and safe on any node.
 //
+// CreateVersion belongs here again (§7.13.2): the coordinator is chosen by the
+// control layer, not by whichever node happens to accept the request — the
+// leader picks a candidate from the KB's replica topology and has that candidate
+// run the write. Until that dispatch path exists, the leader coordinates the
+// write itself, which is what this entry preserves.
+//
 // Keep this list in sync with the RPC sets in the service layer: if a
 // method starts calling RaftNode.Propose*, it becomes a write.
 var writeMethods = map[string]bool{

@@ -146,7 +146,10 @@ func TestRaftNodeImpl_ParentMustNotBePending(t *testing.T) {
 	}
 }
 
-func TestRaftNodeImpl_ForkingAllowed(t *testing.T) {
+// The version chain is strictly linear: a parent may have at most one child,
+// because docstore.ReadAt resolves a document by numeric version order, which
+// is only equivalent to the ancestor chain when there are no forks.
+func TestRaftNodeImpl_ForkRejected(t *testing.T) {
 	ctx := context.Background()
 	impl, _ := newTestRaftNodeImpl(t)
 	mustCreateKBImpl(t, impl, "kb1")
@@ -157,16 +160,19 @@ func TestRaftNodeImpl_ForkingAllowed(t *testing.T) {
 	}
 	mustUpdateStatusImpl(t, impl, v1, types.IndexStatusReady)
 
-	v2a, err := impl.ProposeCreateVersion(ctx, "kb1", v1)
+	v2, err := impl.ProposeCreateVersion(ctx, "kb1", v1)
 	if err != nil {
-		t.Fatalf("ProposeCreateVersion (fork A): %v", err)
+		t.Fatalf("ProposeCreateVersion (first child): %v", err)
 	}
-	v2b, err := impl.ProposeCreateVersion(ctx, "kb1", v1)
-	if err != nil {
-		t.Fatalf("ProposeCreateVersion (fork B): %v", err)
+	mustUpdateStatusImpl(t, impl, v2, types.IndexStatusReady)
+
+	if _, err := impl.ProposeCreateVersion(ctx, "kb1", v1); !errors.Is(err, stratumerrors.ErrInvalidParentVersion) {
+		t.Fatalf("second child of v%d = %v, want ErrInvalidParentVersion", v1, err)
 	}
-	if v2a == v2b {
-		t.Fatalf("two forks of the same parent got the same version ID: %d", v2a)
+
+	// The chain may continue from the only child.
+	if _, err := impl.ProposeCreateVersion(ctx, "kb1", v2); err != nil {
+		t.Fatalf("chained child of v%d failed: %v", v2, err)
 	}
 
 	versions, err := impl.ListVersions(ctx, "kb1")
@@ -179,8 +185,8 @@ func TestRaftNodeImpl_ForkingAllowed(t *testing.T) {
 			parentCount++
 		}
 	}
-	if parentCount != 2 {
-		t.Fatalf("expected 2 children of v1, found %d", parentCount)
+	if parentCount != 1 {
+		t.Fatalf("expected 1 child of v1, found %d", parentCount)
 	}
 }
 

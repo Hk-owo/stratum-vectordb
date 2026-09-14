@@ -79,9 +79,16 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   grpc::Status Load(grpc::ServerContext* context,
                      const ::vecstore::LoadIndexRequest* request,
                      ::vecstore::LoadIndexResponse* response) override;
+  grpc::Status LoadForAppend(
+      grpc::ServerContext* context,
+      const ::vecstore::LoadIndexForAppendRequest* request,
+      ::vecstore::LoadIndexForAppendResponse* response) override;
   grpc::Status ExistsIndex(grpc::ServerContext* context,
                             const ::vecstore::ExistsIndexRequest* request,
                             ::vecstore::ExistsIndexResponse* response) override;
+  grpc::Status RemoveChunks(grpc::ServerContext* context,
+                            const ::vecstore::RemoveChunksRequest* request,
+                            ::vecstore::RemoveChunksResponse* response) override;
   grpc::Status Reset(grpc::ServerContext* context,
                       const ::vecstore::ResetIndexRequest* request,
                       ::vecstore::ResetIndexResponse* response) override;
@@ -92,8 +99,23 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // GetOrCreateLocked returns the VectorIndex for key, constructing a new
   // HNSWVectorIndex (with config, which is only applied on creation) if
   // one does not already exist. Must be called with mu_ held.
+  //
+  // A caller that passes no config (AddChunks, Load) means "whatever is
+  // already there, or the default": it must never replace an existing
+  // index, or a batched build would drop the shape the preceding Build
+  // asked for. Callers that know which shape they want use
+  // GetOrCreateForShapeLocked instead.
   VectorIndex* GetOrCreateLocked(const IndexKey& key,
                                  const QuantizerConfig& config = {});
+
+  // GetOrCreateForShapeLocked is GetOrCreateLocked for a caller that
+  // requires a specific shape (Build). When the resident index was built
+  // with a different config, it is replaced: the quantizer/graph choice
+  // is fixed at construction, so reusing the object would silently keep
+  // the old shape — which is exactly what §8.6a's cold reshape must not
+  // do. Must be called with mu_ held.
+  VectorIndex* GetOrCreateForShapeLocked(const IndexKey& key,
+                                         const QuantizerConfig& config);
 
   // FileExists reports whether path exists and is a regular file. Used by
   // ExistsIndex's stateless on-disk existence check.

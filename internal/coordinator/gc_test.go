@@ -7,6 +7,7 @@ import (
 
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
+	"stratum/internal/raft"
 	"stratum/internal/types"
 )
 
@@ -30,9 +31,15 @@ func (r *gcTestRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBa
 func (r *gcTestRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) error     { return nil }
 func (r *gcTestRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, kbID string) error { return nil }
 func (r *gcTestRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error       { return nil }
-func (r *gcTestRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64) (int64, error) {
+func (r *gcTestRaftNode) IsLeader() bool                                                 { return true }
+
+func (r *gcTestRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64, opts ...raft.ProposeOption) (int64, error) {
 	return 0, nil
 }
+func (r *gcTestRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ string, _ int32) error {
+	return nil
+}
+
 func (r *gcTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
 	return nil
 }

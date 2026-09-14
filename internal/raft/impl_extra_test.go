@@ -130,10 +130,14 @@ func TestRaftNodeImpl_ProposeRemoveKBMeta_And_ListVersions(t *testing.T) {
 	}
 }
 
-// TestRaftNodeImpl_SetOnVersionCreated_NoopBeforeStart ensures the
-// callback can be registered and is not invoked for proposals made by
-// this node (the proposer does its own storage writes inline).
-func TestRaftNodeImpl_SetOnVersionCreated_NoopForProposer(t *testing.T) {
+// TestRaftNodeImpl_SetOnVersionCreated_FiresForProposerToo ensures the
+// callback fires on *every* node that applies a CreateVersion, the proposer
+// included (§8.5). Skipping the proposer encoded "the proposer wrote the data";
+// that holds only while the coordinator is the leader, and it is wrong twice
+// over once any node may coordinate — a forwarded proposal leaves a waiter on
+// the leader too (which holds no data), and a non-leader coordinator holds data
+// nobody else knows about. Deciding who pulls is the data plane's job.
+func TestRaftNodeImpl_SetOnVersionCreated_FiresForProposerToo(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
 	ctx := context.Background()
 
@@ -151,8 +155,8 @@ func TestRaftNodeImpl_SetOnVersionCreated_NoopForProposer(t *testing.T) {
 
 	select {
 	case <-called:
-		t.Fatal("onVersionCreated must not fire on the proposing node")
-	default:
+	case <-time.After(5 * time.Second):
+		t.Fatal("onVersionCreated must fire on the proposing node: the data plane, not Raft, decides whether a pull is needed")
 	}
 }
 

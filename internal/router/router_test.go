@@ -246,7 +246,7 @@ func TestForward_SwitchesByMethod(t *testing.T) {
 	ctx := context.Background()
 
 	writeIdx := -1
-	if _, err := Forward(r, ctx, pb.KnowledgeBaseService_CreateVersion_FullMethodName, func(idx int, ctx context.Context) (string, error) {
+	if _, err := Forward(r, ctx, pb.KnowledgeBaseService_RollbackVersion_FullMethodName, func(idx int, ctx context.Context) (string, error) {
 		writeIdx = idx
 		return "ok", nil
 	}); err != nil {
@@ -265,5 +265,19 @@ func TestForward_SwitchesByMethod(t *testing.T) {
 	}
 	if readIdx != 0 {
 		t.Errorf("read routed to idx %d, want 0 (round-robin start)", readIdx)
+	}
+
+	// CreateVersion is leader-bound again (§7.13.2): the control layer picks the
+	// coordinator from the KB's replica topology, so the entry is redirected to
+	// the leader rather than run on whichever node accepted it.
+	coordinatorIdx := -1
+	if _, err := Forward(r, ctx, pb.KnowledgeBaseService_CreateVersion_FullMethodName, func(idx int, ctx context.Context) (string, error) {
+		coordinatorIdx = idx
+		return "ok", nil
+	}); err != nil {
+		t.Fatalf("Forward(create-version): %v", err)
+	}
+	if coordinatorIdx != 2 {
+		t.Errorf("CreateVersion routed to idx %d, want 2 (the leader picks the coordinator)", coordinatorIdx)
 	}
 }

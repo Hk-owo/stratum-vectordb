@@ -104,6 +104,25 @@ type WAL interface {
 	// for versionID has finished. Idempotent per versionID.
 	WriteVersionDeleteComplete(ctx context.Context, kbID string, versionID int64) error
 
+	// ChangesFor returns the replay input recorded for (kbID, versionID): the
+	// changes its writer applied. It answers a lagging peer's backfill request
+	// (Stratum_设计文档v13.md §7.5) with the very same BEGIN record crash
+	// recovery replays — one record, two readers. ok is false when no BEGIN
+	// record is bound to that version: never written on this node (a follower
+	// that merely applied the leader's log writes none), already reclaimed, or
+	// predating the current format.
+	ChangesFor(ctx context.Context, kbID string, versionID int64) (changes []types.DocChange, ok bool, err error)
+
+	// ChangesInRange returns the recorded replay input for every version in
+	// (fromExclusive, toInclusive] that this node wrote, keyed by version ID,
+	// each entry carrying the parent it was applied to (a version's document set
+	// derives from its parent's, so the parent must be authoritative rather than
+	// inferred from the version chain). Versions with no bound BEGIN record are
+	// simply absent from the map — a lagging peer must SEE the gap (§7.5: an
+	// incomplete interval falls back to a full state transfer) rather than
+	// mistake it for a version that changed nothing.
+	ChangesInRange(ctx context.Context, kbID string, fromExclusive, toInclusive int64) (map[int64]VersionDelta, error)
+
 	// Recover scans the WAL at startup and returns every PendingRecord
 	// requiring crash-recovery handling. An empty slice means there is
 	// nothing to recover.

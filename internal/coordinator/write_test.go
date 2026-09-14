@@ -11,6 +11,7 @@ import (
 
 	"stratum/internal/bloom"
 	"stratum/internal/index"
+	"stratum/internal/raft"
 	stratumync "stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/wal"
@@ -351,7 +352,9 @@ func (r *testRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBase
 	return nil
 }
 
-func (r *testRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64) (int64, error) {
+func (r *testRaftNode) IsLeader() bool { return true }
+
+func (r *testRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64, opts ...raft.ProposeOption) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.kbs[kbID]; !ok {
@@ -367,6 +370,10 @@ func (r *testRaftNode) ProposeCreateVersion(_ context.Context, kbID string, pare
 		IndexStatus:     types.IndexStatusPending,
 	}
 	return v, nil
+}
+
+func (r *testRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ string, _ int32) error {
+	return nil
 }
 
 func (r *testRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
@@ -455,7 +462,7 @@ func TestWriteCoordinator_AddDocuments(t *testing.T) {
 		{Op: types.ChangeOpAdd, DocID: "doc-2", Content: "another document with different content"},
 	}
 
-	versionID, err := coord.Execute(context.Background(), "kb-1", 0, changes)
+	versionID, err := coord.Execute(context.Background(), "kb-1", 0, changes, "")
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -527,7 +534,7 @@ func TestWriteCoordinator_ChunkDedup(t *testing.T) {
 		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "duplicate content test"},
 	}
 
-	_, err := coord.Execute(context.Background(), "kb-1", 0, changes)
+	_, err := coord.Execute(context.Background(), "kb-1", 0, changes, "")
 	if err != nil {
 		t.Fatalf("first Execute failed: %v", err)
 	}
@@ -537,7 +544,7 @@ func TestWriteCoordinator_ChunkDedup(t *testing.T) {
 	changes = []types.DocChange{
 		{Op: types.ChangeOpAdd, DocID: "doc-2", Content: "duplicate content test"},
 	}
-	_, err = coord.Execute(context.Background(), "kb-1", 0, changes)
+	_, err = coord.Execute(context.Background(), "kb-1", 0, changes, "")
 	if err != nil {
 		t.Fatalf("second Execute failed: %v", err)
 	}
@@ -592,7 +599,7 @@ func TestWriteCoordinator_DeleteDocument(t *testing.T) {
 	// Add a document
 	_, err := coord.Execute(context.Background(), "kb-1", 0, []types.DocChange{
 		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "document content to delete"},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
@@ -600,7 +607,7 @@ func TestWriteCoordinator_DeleteDocument(t *testing.T) {
 	// Delete the document
 	_, err = coord.Execute(context.Background(), "kb-1", 1, []types.DocChange{
 		{Op: types.ChangeOpDelete, DocID: "doc-1"},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("delete failed: %v", err)
 	}
@@ -660,7 +667,7 @@ func TestWriteCoordinator_WALCommit(t *testing.T) {
 
 	_, err := coord.Execute(context.Background(), "kb-1", 0, []types.DocChange{
 		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "test content"},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -746,7 +753,7 @@ func TestWriteCoordinator_CrashAfterCommitBeforeBuild(t *testing.T) {
 	// Simulate a complete write (which includes TriggerBuild).
 	_, err := coord.Execute(context.Background(), "kb-1", 0, []types.DocChange{
 		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "test content"},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -802,7 +809,7 @@ func TestWriteCoordinator_UpdateDocument(t *testing.T) {
 	// Add a document
 	_, err := coord.Execute(context.Background(), "kb-1", 0, []types.DocChange{
 		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "original content"},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("add failed: %v", err)
 	}
@@ -810,7 +817,7 @@ func TestWriteCoordinator_UpdateDocument(t *testing.T) {
 	// Update the document
 	_, err = coord.Execute(context.Background(), "kb-1", 1, []types.DocChange{
 		{Op: types.ChangeOpUpdate, DocID: "doc-1", Content: "updated content"},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("update failed: %v", err)
 	}
@@ -901,7 +908,7 @@ func TestWriteCoordinator_ProposesVersionSummary(t *testing.T) {
 		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello world this is a test document"},
 		{Op: types.ChangeOpAdd, DocID: "doc-2", Content: "another document with different content"},
 	}
-	versionID, err := coord.Execute(ctx, "kb-1", 0, changes)
+	versionID, err := coord.Execute(ctx, "kb-1", 0, changes, "")
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
@@ -962,7 +969,7 @@ func TestWriteCoordinator_ReplayVersionStorageWrites(t *testing.T) {
 	// Parent version exists (fully committed).
 	if _, err := coord.Execute(ctx, "kb-1", 0, []types.DocChange{
 		{Op: types.ChangeOpAdd, DocID: "parent-doc", Content: "parent content"},
-	}); err != nil {
+	}, ""); err != nil {
 		t.Fatalf("parent Execute: %v", err)
 	}
 
@@ -1065,7 +1072,7 @@ func TestWriteCoordinator_VersionBloomPersisted(t *testing.T) {
 	versionID, err := coord.Execute(ctx, "kb-1", 0, []types.DocChange{
 		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello bloom"},
 		{Op: types.ChangeOpAdd, DocID: "doc-2", Content: "second doc"},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}

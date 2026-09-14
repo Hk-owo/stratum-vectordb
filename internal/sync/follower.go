@@ -28,6 +28,20 @@ type Follower struct {
 	indexManager IndexBuildTrigger
 }
 
+// DigestOf computes the document-set digest of (kbID, versionID) from this
+// node's own stores — the same value the coordinator reports as durable.
+//
+// The §7.3 takeover needs it: a replica announcing a version must announce a
+// digest that followers can verify their pulled data against, so it has to be
+// computed from the data rather than invented.
+func (f *Follower) DigestOf(ctx context.Context, kbID string, versionID int64) (string, error) {
+	docIDs, err := f.versionDoc.ListDocIDs(ctx, kbID, versionID)
+	if err != nil {
+		return "", fmt.Errorf("sync: digest of %s v%d: %w", kbID, versionID, err)
+	}
+	return ComputeDocIDSetHash(docIDs), nil
+}
+
 // IndexBuildTrigger is the subset of index.IndexManager that the sync
 // follower needs: triggering a build after data is in place.
 type IndexBuildTrigger interface {
@@ -52,7 +66,26 @@ func NewFollower(
 }
 
 // PullVersion implements FollowerSync.
+// PullVersionOptions controls what a pull does beyond fetching the data.
+type PullVersionOptions struct {
+	// SkipIndexBuild leaves the index unbuilt after the data lands. It is what
+	// a version that is not the active one wants (Stratum_设计文档v13.md §8.6b):
+	// the data has to be here, but its index is built lazily, on first query.
+	SkipIndexBuild bool
+}
+
 func (f *Follower) PullVersion(ctx context.Context, leaderAddr string, kbID string, versionID int64) error {
+	return f.PullVersionWith(ctx, leaderAddr, kbID, versionID, PullVersionOptions{})
+}
+
+// PullVersionData fetches the version's data and deliberately leaves its index
+// unbuilt, for a version whose index should be built lazily (§8.6b).
+func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID string, versionID int64) error {
+	return f.PullVersionWith(ctx, leaderAddr, kbID, versionID, PullVersionOptions{SkipIndexBuild: true})
+}
+
+// PullVersionWith is PullVersion with explicit control over the post-pull step.
+func (f *Follower) PullVersionWith(ctx context.Context, leaderAddr string, kbID string, versionID int64, opts PullVersionOptions) error {
 	// 兜底:不信任调用方 ctx 无超时(如 context.Background())。
 	// grpc.WithBlock() 在 leader 不可达(域名无法解析/拒绝连接)时会一直
 	// 等待连接建立;这里强制给整个拉取过程设上界,失败由调用方的 deadline
@@ -93,6 +126,9 @@ func (f *Follower) PullVersion(ctx context.Context, leaderAddr string, kbID stri
 	}
 
 	// All data written; trigger an independent HNSW build on this node.
+	if opts.SkipIndexBuild {
+		return nil
+	}
 	if err := f.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
 		return fmt.Errorf("sync: TriggerBuild(%s, %d): %w", kbID, versionID, err)
 	}

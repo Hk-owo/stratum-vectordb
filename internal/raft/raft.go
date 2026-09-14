@@ -41,6 +41,12 @@ import (
 // cleanup has finished; ProposeMarkKBDeleteFailed sets KBStatusDeleteFailed
 // once retries are exhausted, surfacing the failure to GetSystemStatus.
 type RaftNode interface {
+	// IsLeader reports whether this node currently believes it leads the
+	// cluster. The §7.13.2 dispatch hook reads it at APPLY time: that is when
+	// the answer matters, since a forwarded proposal is applied by whoever leads
+	// then, and a since-deposed leader must not dispatch.
+	IsLeader() bool
+
 	// ProposeCreateKB commits new knowledge base metadata.
 	ProposeCreateKB(ctx context.Context, kb types.KnowledgeBaseMeta) error
 
@@ -60,11 +66,17 @@ type RaftNode interface {
 	// with parentVersionID as its parent. Returns the newly allocated
 	// version ID. See the type-level doc comment for the WAL ordering and
 	// parent-version constraints enforced during apply.
-	ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64) (int64, error)
+	ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64, opts ...ProposeOption) (int64, error)
 
 	// ProposeUpdateVersionStatus updates a version's IndexStatus (e.g. to
 	// READY after a successful index build, or FAILED after a failed one).
 	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus) error
+
+	// ProposeMarkVersionFailedPermanent records the terminal verdict for a
+	// version (Stratum_设计文档v13.md §10.1): the control layer has decided
+	// its retry budget is spent and nothing will retry it automatically.
+	// reason and count form the auditable cause chain an operator needs.
+	ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, reason string, count int32) error
 
 	// ProposeUpdateVersionSummary records the version's full document-ID
 	// set hash (VersionMeta.DocIDSetHash). The leader calls this after its
@@ -110,4 +122,31 @@ type RaftNode interface {
 	// independent of any specific knowledge base. Used by HealthCheck's
 	// Raft connectivity probe.
 	GetClusterStatus(ctx context.Context) (types.ClusterStatus, error)
+}
+
+// ProposeOption tweaks a ProposeCreateVersion call without changing the
+// signature every caller uses.
+type ProposeOption func(*proposeOptions)
+
+type proposeOptions struct {
+	clientRequestID string
+}
+
+// WithClientRequestID attaches the client's idempotency key to the call: a
+// retry carrying the same key (for the same knowledge base) reuses the version
+// the first attempt allocated instead of allocating another one — what lets a
+// client re-send the changes for a version whose data never landed
+// (Stratum_设计文档v13.md §7.12). An empty key means "no idempotency".
+func WithClientRequestID(id string) ProposeOption {
+	return func(o *proposeOptions) { o.clientRequestID = id }
+}
+
+func resolveProposeOptions(opts []ProposeOption) proposeOptions {
+	var o proposeOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
 }

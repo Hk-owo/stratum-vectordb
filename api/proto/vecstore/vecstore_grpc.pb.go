@@ -318,13 +318,15 @@ var ChunkStorageService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	VectorIndexService_Build_FullMethodName       = "/vecstore.VectorIndexService/Build"
-	VectorIndexService_AddChunks_FullMethodName   = "/vecstore.VectorIndexService/AddChunks"
-	VectorIndexService_Search_FullMethodName      = "/vecstore.VectorIndexService/Search"
-	VectorIndexService_Save_FullMethodName        = "/vecstore.VectorIndexService/Save"
-	VectorIndexService_Load_FullMethodName        = "/vecstore.VectorIndexService/Load"
-	VectorIndexService_ExistsIndex_FullMethodName = "/vecstore.VectorIndexService/ExistsIndex"
-	VectorIndexService_Reset_FullMethodName       = "/vecstore.VectorIndexService/Reset"
+	VectorIndexService_Build_FullMethodName         = "/vecstore.VectorIndexService/Build"
+	VectorIndexService_AddChunks_FullMethodName     = "/vecstore.VectorIndexService/AddChunks"
+	VectorIndexService_Search_FullMethodName        = "/vecstore.VectorIndexService/Search"
+	VectorIndexService_Save_FullMethodName          = "/vecstore.VectorIndexService/Save"
+	VectorIndexService_Load_FullMethodName          = "/vecstore.VectorIndexService/Load"
+	VectorIndexService_LoadForAppend_FullMethodName = "/vecstore.VectorIndexService/LoadForAppend"
+	VectorIndexService_ExistsIndex_FullMethodName   = "/vecstore.VectorIndexService/ExistsIndex"
+	VectorIndexService_RemoveChunks_FullMethodName  = "/vecstore.VectorIndexService/RemoveChunks"
+	VectorIndexService_Reset_FullMethodName         = "/vecstore.VectorIndexService/Reset"
 )
 
 // VectorIndexServiceClient is the client API for VectorIndexService service.
@@ -340,6 +342,17 @@ type VectorIndexServiceClient interface {
 	Search(ctx context.Context, in *SearchIndexRequest, opts ...grpc.CallOption) (*SearchIndexResponse, error)
 	Save(ctx context.Context, in *SaveIndexRequest, opts ...grpc.CallOption) (*SaveIndexResponse, error)
 	Load(ctx context.Context, in *LoadIndexRequest, opts ...grpc.CallOption) (*LoadIndexResponse, error)
+	// LoadForAppend loads a persisted index as the *starting point* of a
+	// build rather than as a finished artifact: afterwards the index is in
+	// BUILDING state and accepts AddChunks, and a later Save seals it for
+	// (kb_id, version_id). This is what makes §8.6(c) incremental reuse
+	// possible without changing Faiss usage: HNSW supports appending to a
+	// graph that was written and read back, but our own Load deliberately
+	// seals the build (BUILDING -> READY), so appending through it is
+	// rejected. `path` names the *base* artifact (normally the parent
+	// version's index file); the object it is loaded into belongs to
+	// (kb_id, version_id), i.e. the version being built.
+	LoadForAppend(ctx context.Context, in *LoadIndexForAppendRequest, opts ...grpc.CallOption) (*LoadIndexForAppendResponse, error)
 	// ExistsIndex reports whether a persisted index exists at path for
 	// (kb_id, version_id): both the Faiss index file and its .ids sidecar
 	// must be present for Load to succeed. Stateless — it inspects the
@@ -348,6 +361,15 @@ type VectorIndexServiceClient interface {
 	// startup reconcile to derive a version's READY status from disk facts
 	// instead of trusting that a build-completion callback was delivered.
 	ExistsIndex(ctx context.Context, in *ExistsIndexRequest, opts ...grpc.CallOption) (*ExistsIndexResponse, error)
+	// RemoveChunks drops the named chunks' vectors from the index and compacts
+	// the storage. Only graph-free shapes can do this: faiss compacts
+	// IndexFlatCodes (the *_FLAT family) but cannot repair an HNSW graph, so a
+	// graphed index answers FAILED_PRECONDITION. The index must still be open —
+	// Save seals a build (BUILDING -> READY), so a sealed index has to be
+	// reopened with LoadForAppend before it can be modified. Used by §8.6(c)'s
+	// deletion path to drop the vectors a version no longer needs, instead of
+	// carrying them as tombstones until a rebuild.
+	RemoveChunks(ctx context.Context, in *RemoveChunksRequest, opts ...grpc.CallOption) (*RemoveChunksResponse, error)
 	Reset(ctx context.Context, in *ResetIndexRequest, opts ...grpc.CallOption) (*ResetIndexResponse, error)
 }
 
@@ -409,10 +431,30 @@ func (c *vectorIndexServiceClient) Load(ctx context.Context, in *LoadIndexReques
 	return out, nil
 }
 
+func (c *vectorIndexServiceClient) LoadForAppend(ctx context.Context, in *LoadIndexForAppendRequest, opts ...grpc.CallOption) (*LoadIndexForAppendResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LoadIndexForAppendResponse)
+	err := c.cc.Invoke(ctx, VectorIndexService_LoadForAppend_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *vectorIndexServiceClient) ExistsIndex(ctx context.Context, in *ExistsIndexRequest, opts ...grpc.CallOption) (*ExistsIndexResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ExistsIndexResponse)
 	err := c.cc.Invoke(ctx, VectorIndexService_ExistsIndex_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vectorIndexServiceClient) RemoveChunks(ctx context.Context, in *RemoveChunksRequest, opts ...grpc.CallOption) (*RemoveChunksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveChunksResponse)
+	err := c.cc.Invoke(ctx, VectorIndexService_RemoveChunks_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -442,6 +484,17 @@ type VectorIndexServiceServer interface {
 	Search(context.Context, *SearchIndexRequest) (*SearchIndexResponse, error)
 	Save(context.Context, *SaveIndexRequest) (*SaveIndexResponse, error)
 	Load(context.Context, *LoadIndexRequest) (*LoadIndexResponse, error)
+	// LoadForAppend loads a persisted index as the *starting point* of a
+	// build rather than as a finished artifact: afterwards the index is in
+	// BUILDING state and accepts AddChunks, and a later Save seals it for
+	// (kb_id, version_id). This is what makes §8.6(c) incremental reuse
+	// possible without changing Faiss usage: HNSW supports appending to a
+	// graph that was written and read back, but our own Load deliberately
+	// seals the build (BUILDING -> READY), so appending through it is
+	// rejected. `path` names the *base* artifact (normally the parent
+	// version's index file); the object it is loaded into belongs to
+	// (kb_id, version_id), i.e. the version being built.
+	LoadForAppend(context.Context, *LoadIndexForAppendRequest) (*LoadIndexForAppendResponse, error)
 	// ExistsIndex reports whether a persisted index exists at path for
 	// (kb_id, version_id): both the Faiss index file and its .ids sidecar
 	// must be present for Load to succeed. Stateless — it inspects the
@@ -450,6 +503,15 @@ type VectorIndexServiceServer interface {
 	// startup reconcile to derive a version's READY status from disk facts
 	// instead of trusting that a build-completion callback was delivered.
 	ExistsIndex(context.Context, *ExistsIndexRequest) (*ExistsIndexResponse, error)
+	// RemoveChunks drops the named chunks' vectors from the index and compacts
+	// the storage. Only graph-free shapes can do this: faiss compacts
+	// IndexFlatCodes (the *_FLAT family) but cannot repair an HNSW graph, so a
+	// graphed index answers FAILED_PRECONDITION. The index must still be open —
+	// Save seals a build (BUILDING -> READY), so a sealed index has to be
+	// reopened with LoadForAppend before it can be modified. Used by §8.6(c)'s
+	// deletion path to drop the vectors a version no longer needs, instead of
+	// carrying them as tombstones until a rebuild.
+	RemoveChunks(context.Context, *RemoveChunksRequest) (*RemoveChunksResponse, error)
 	Reset(context.Context, *ResetIndexRequest) (*ResetIndexResponse, error)
 	mustEmbedUnimplementedVectorIndexServiceServer()
 }
@@ -476,8 +538,14 @@ func (UnimplementedVectorIndexServiceServer) Save(context.Context, *SaveIndexReq
 func (UnimplementedVectorIndexServiceServer) Load(context.Context, *LoadIndexRequest) (*LoadIndexResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Load not implemented")
 }
+func (UnimplementedVectorIndexServiceServer) LoadForAppend(context.Context, *LoadIndexForAppendRequest) (*LoadIndexForAppendResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method LoadForAppend not implemented")
+}
 func (UnimplementedVectorIndexServiceServer) ExistsIndex(context.Context, *ExistsIndexRequest) (*ExistsIndexResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ExistsIndex not implemented")
+}
+func (UnimplementedVectorIndexServiceServer) RemoveChunks(context.Context, *RemoveChunksRequest) (*RemoveChunksResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RemoveChunks not implemented")
 }
 func (UnimplementedVectorIndexServiceServer) Reset(context.Context, *ResetIndexRequest) (*ResetIndexResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Reset not implemented")
@@ -593,6 +661,24 @@ func _VectorIndexService_Load_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VectorIndexService_LoadForAppend_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LoadIndexForAppendRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VectorIndexServiceServer).LoadForAppend(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VectorIndexService_LoadForAppend_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VectorIndexServiceServer).LoadForAppend(ctx, req.(*LoadIndexForAppendRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _VectorIndexService_ExistsIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ExistsIndexRequest)
 	if err := dec(in); err != nil {
@@ -607,6 +693,24 @@ func _VectorIndexService_ExistsIndex_Handler(srv interface{}, ctx context.Contex
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(VectorIndexServiceServer).ExistsIndex(ctx, req.(*ExistsIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VectorIndexService_RemoveChunks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveChunksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VectorIndexServiceServer).RemoveChunks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VectorIndexService_RemoveChunks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VectorIndexServiceServer).RemoveChunks(ctx, req.(*RemoveChunksRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -657,8 +761,16 @@ var VectorIndexService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _VectorIndexService_Load_Handler,
 		},
 		{
+			MethodName: "LoadForAppend",
+			Handler:    _VectorIndexService_LoadForAppend_Handler,
+		},
+		{
 			MethodName: "ExistsIndex",
 			Handler:    _VectorIndexService_ExistsIndex_Handler,
+		},
+		{
+			MethodName: "RemoveChunks",
+			Handler:    _VectorIndexService_RemoveChunks_Handler,
 		},
 		{
 			MethodName: "Reset",

@@ -68,6 +68,21 @@ QuantizerConfig FromProtoQuantizer(::vecstore::QuantizerTypeProto proto_quantize
     case ::vecstore::QUANTIZER_PQ:
       cfg.type = QuantizerType::kPQ;
       break;
+    case ::vecstore::QUANTIZER_OFF_FLAT:
+      cfg.type = QuantizerType::kOffFlat;
+      break;
+    case ::vecstore::QUANTIZER_SQ8_FLAT:
+      cfg.type = QuantizerType::kSQ8Flat;
+      break;
+    case ::vecstore::QUANTIZER_SQ_BF16_FLAT:
+      cfg.type = QuantizerType::kSQBF16Flat;
+      break;
+    case ::vecstore::QUANTIZER_SQ_FP16_FLAT:
+      cfg.type = QuantizerType::kSQFP16Flat;
+      break;
+    case ::vecstore::QUANTIZER_PQ_FLAT:
+      cfg.type = QuantizerType::kPQFlat;
+      break;
     case ::vecstore::QUANTIZER_OFF:
     default:
       cfg.type = QuantizerType::kOff;
@@ -169,6 +184,25 @@ VectorIndex* VectorIndexServiceImpl::GetOrCreateLocked(
   return inserted.first->second.get();
 }
 
+VectorIndex* VectorIndexServiceImpl::GetOrCreateForShapeLocked(
+    const IndexKey& key, const QuantizerConfig& config) {
+  auto it = indexes_.find(key);
+  if (it != indexes_.end()) {
+    if (it->second->MatchesConfig(config)) {
+      return it->second.get();
+    }
+    // The resident index has a different shape (a §8.6a cold reshape
+    // swapping graphed for graph-free, or a KB quantizer change). The
+    // shape is fixed when the object is constructed, so replace it
+    // rather than silently rebuilding the old shape.
+    it->second = std::make_unique<HNSWVectorIndex>(config);
+    return it->second.get();
+  }
+  auto inserted =
+      indexes_.emplace(key, std::make_unique<HNSWVectorIndex>(config));
+  return inserted.first->second.get();
+}
+
 grpc::Status VectorIndexServiceImpl::Build(grpc::ServerContext* /*context*/,
                                             const ::vecstore::BuildIndexRequest* request,
                                             ::vecstore::BuildIndexResponse* response) {
@@ -185,7 +219,9 @@ grpc::Status VectorIndexServiceImpl::Build(grpc::ServerContext* /*context*/,
   const QuantizerConfig config = FromProtoQuantizer(
       request->quantizer(), request->pq_m(), request->pq_nbits());
   std::lock_guard<std::mutex> lock(mu_);
-  VectorIndex* index = GetOrCreateLocked(key, config);
+  // Build names the shape it wants, so a reshape (§8.6a) replaces the
+  // resident index rather than rebuilding the shape it already had.
+  VectorIndex* index = GetOrCreateForShapeLocked(key, config);
   absl::Status status = index->Build(chunks, FromProtoMetric(request->metric()));
   if (!status.ok()) {
     return ToGrpcStatus(status);
@@ -279,6 +315,28 @@ grpc::Status VectorIndexServiceImpl::Load(grpc::ServerContext* /*context*/,
   return ToGrpcStatus(index->Load(request->path()));
 }
 
+grpc::Status VectorIndexServiceImpl::LoadForAppend(
+    grpc::ServerContext* /*context*/,
+    const ::vecstore::LoadIndexForAppendRequest* request,
+    ::vecstore::LoadIndexForAppendResponse* response) {
+  // The object belongs to (kb_id, version_id) — the version being built —
+  // while `path` names the base artifact it starts from (§8.6c). No config
+  // is passed: the base file is self-describing and Load restores the
+  // retrieval mode from the stored type, so reusing whatever object is
+  // resident is correct here. A shape change still goes through Build,
+  // which does replace the object (see GetOrCreateForShapeLocked).
+  IndexKey key{request->kb_id(), request->version_id()};
+  std::lock_guard<std::mutex> lock(mu_);
+  VectorIndex* index = GetOrCreateLocked(key);
+  const absl::Status status = index->LoadForAppend(request->path());
+  if (status.ok()) {
+    // How big the base artifact is: the caller compares it with the chunk set
+    // this version needs to see how many of those vectors became tombstones.
+    response->set_base_ntotal(index->TotalVectors());
+  }
+  return ToGrpcStatus(status);
+}
+
 grpc::Status VectorIndexServiceImpl::ExistsIndex(grpc::ServerContext* /*context*/,
                                                   const ::vecstore::ExistsIndexRequest* request,
                                                   ::vecstore::ExistsIndexResponse* response) {
@@ -297,6 +355,31 @@ grpc::Status VectorIndexServiceImpl::ExistsIndex(grpc::ServerContext* /*context*
 bool VectorIndexServiceImpl::FileExists(const std::string& path) {
   struct stat st {};
   return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+grpc::Status VectorIndexServiceImpl::RemoveChunks(
+    grpc::ServerContext* /*context*/,
+    const ::vecstore::RemoveChunksRequest* request,
+    ::vecstore::RemoveChunksResponse* response) {
+  IndexKey key{request->kb_id(), request->version_id()};
+  std::lock_guard<std::mutex> lock(mu_);
+  // Deliberately not GetOrCreateLocked: asking to remove vectors from an index
+  // that does not exist here is a caller error, not a reason to materialise an
+  // empty one.
+  auto it = indexes_.find(key);
+  if (it == indexes_.end()) {
+    return ToGrpcStatus(absl::FailedPreconditionError(
+        "vecstore: RemoveChunks: no index for this (kb_id, version_id)"));
+  }
+  const std::vector<std::string> chunk_ids(request->chunk_ids().begin(),
+                                           request->chunk_ids().end());
+  auto removed_or = it->second->RemoveChunks(chunk_ids);
+  if (!removed_or.ok()) {
+    return ToGrpcStatus(removed_or.status());
+  }
+  response->set_removed(static_cast<int64_t>(*removed_or));
+  response->set_ntotal(it->second->TotalVectors());
+  return grpc::Status::OK;
 }
 
 grpc::Status VectorIndexServiceImpl::Reset(grpc::ServerContext* /*context*/,

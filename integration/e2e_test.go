@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -44,6 +45,7 @@ import (
 	"stratum/internal/docstore"
 	"stratum/internal/embed"
 	"stratum/internal/index"
+	"stratum/internal/plane"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
 	"stratum/internal/sync"
@@ -201,6 +203,23 @@ type realNode struct {
 	versionDoc *versiondoc.PebbleVersionDocList
 	chunkStore *chunkstore.VecstoreChunkStore
 	indexMgr   *index.IndexManagerImpl
+	// indexDistributor is the §8.4 shipping path, exposed so a test can assert
+	// what a replica received rather than what it built.
+	indexDistributor *plane.LocalDataPlane
+
+	// dataSources is the §8.5 announcement table this node reads when it needs
+	// a version's data. In production the write path's plane fills it (a writer
+	// announces itself with its §7.3 confirmation); this stack's write path is
+	// the older "coordinator writes the stores directly" shape, so a test that
+	// wants a non-leader coordinator announces it explicitly.
+	dataSources *plane.DataSourceRegistry
+
+	// logger is where asynchronous work (§8.4 distribution, background index
+	// builds, sync pulls) reports problems. It must NOT be the test's *testing.T:
+	// that work can outlive the test — a build callback fires when its build
+	// finishes, which may be after t has completed — and logging through a
+	// finished *testing.T panics the whole run.
+	logger *zap.Logger
 
 	srv  *grpc.Server
 	conn *grpc.ClientConn
@@ -240,6 +259,13 @@ type realNodeConfig struct {
 	// fall behind the leader's log base and trigger the InstallSnapshot
 	// path on reconnect.
 	maxLogLength uint64
+
+	// coldThreshold / coldSweepInterval turn on the §8.6a cold-version
+	// evaluator for this node (index_manager.cold_threshold_ms in a real
+	// deployment). Zero keeps it off, which is the default everywhere else
+	// — a test that wants to watch a version go cold sets both.
+	coldThreshold     time.Duration
+	coldSweepInterval time.Duration
 }
 
 // newRealNodeWithAddrsAndDir is newRealNode with explicit addresses and a
@@ -261,6 +287,10 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		t.Fatalf("node %d: mkdir %s: %v", nodeID, baseDir, err)
 	}
+	// Asynchronous work (index distribution, background builds, sync pulls)
+	// reports through this logger rather than through t: it can outlive the
+	// test, and logging through a finished *testing.T panics the run.
+	nodeLogger := zap.NewNop()
 
 	w, err := wal.NewFileWAL(filepath.Join(baseDir, "wal"))
 	if err != nil {
@@ -309,6 +339,38 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		CallbackMaxRetries:  3,
 		CallbackRetryBaseMS: 10,
 		VecstoreAddr:        vecstoreAddr,
+		// IndexDataDir is where a built index is persisted. It is set so the
+		// stack behaves like a node (indexes on disk, ready to be distributed);
+		// without it every build stays in memory and §8.4 has nothing to ship.
+		IndexDataDir: filepath.Join(baseDir, "indexdata"),
+		// §8.6a: optional cold-version policy, off unless a test asks for it.
+		ColdThreshold:     cfg.coldThreshold,
+		ColdSweepInterval: cfg.coldSweepInterval,
+	})
+	im.SetLogger(nodeLogger)
+	// §8.6(c): wire the parent-version link, like the node assembly does, so
+	// this stack exercises the pure-append reuse end to end.
+	//
+	// One caveat worth knowing when reading integration timings: the reuse
+	// keeps a version's vecstore entry in BUILDING for longer than a plain
+	// Build does (the base artifact is read back from disk first), and these
+	// stacks build/install the same version from several places at once. A
+	// 10-run A/B against the pre-§8.6(c) timing showed FaultTolerance's
+	// `index load timeout` flakiness at 4/10 with the reuse and 3/10 without
+	// — inside the noise for that test, so the reuse is wired here; the
+	// mechanism (a longer BUILDING window) is real and is why the reuse is a
+	// pure optimisation with a full-rebuild fallback.
+	im.SetVersionParentGetter(func(ctx context.Context, kbID string, versionID int64) (int64, error) {
+		versions, err := rn.ListVersions(ctx, kbID)
+		if err != nil {
+			return 0, err
+		}
+		for _, v := range versions {
+			if v.VersionID == versionID {
+				return v.ParentVersionID, nil
+			}
+		}
+		return 0, nil
 	})
 	im.SetBuildDataSources(
 		vd.ListDocIDs,
@@ -321,9 +383,51 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 			return resp.GetVector(), nil
 		},
 	)
+	// §8.4: index distribution. The dispatcher is built explicitly so this
+	// stack exercises the same path a node uses — a replica receives a built
+	// index instead of building its own.
+	var distributeIndex func(kbID string, versionID int64)
+	dataSources := plane.NewDataSourceRegistry()
+	indexDistributor := plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
+		IndexManager: im,
+		IndexReader:  im,
+		IndexShipper: sync.NewIndexPusher(),
+		// §7.3/§8.5: the confirmation this path sends carries the writer's own
+		// address, so replicas can record where a version's data lives.
+		SelfDataSyncAddr: grpcAddr,
+		Confirmer:        sync.NewConfirmBroadcaster(sync.PresenceCheckerConfig{}),
+		ResolveReplicas: func(context.Context) ([]string, error) {
+			others := make([]string, 0, len(peers))
+			for _, p := range peers {
+				if p.ID != nodeID {
+					others = append(others, p.ServiceAddr)
+				}
+			}
+			return others, nil
+		},
+	})
 	im.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
+		if status == types.IndexStatusReady && distributeIndex != nil {
+			distributeIndex(kbID, versionID)
+		}
 		return rn.ProposeUpdateVersionStatus(context.Background(), versionID, status)
 	})
+	distributeIndex = func(kbID string, versionID int64) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := indexDistributor.PushIndexToReplicas(ctx, kbID, versionID); err != nil {
+			// Through the logger, not t: this callback fires when a build
+			// finishes, which can be after the test completed (§8.6a's cold
+			// evaluator makes late builds ordinary, not exotic).
+			nodeLogger.Warn("node index distribution failed",
+				zap.Int64("node_id", nodeID), zap.String("kb_id", kbID),
+				zap.Int64("version_id", versionID), zap.Error(err))
+		}
+	}
+	// §8.6a: start the cold-version evaluator only now, so a reshape's
+	// completion callback can ship the new artifact like any other build
+	// (distributeIndex is wired above). No-op when no threshold is set.
+	im.StartColdPolicy()
 
 	wc := coordinator.NewWriteCoordinatorImpl(coordinator.WriteCoordinatorConfig{
 		MaxRetries:          2,
@@ -361,13 +465,24 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		VersionDocList:      vd,
 	}))
 	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, vBloomStore)
-	adminSvc := service.NewAdminService(nodeID, rn, im, ds, cs, w)
+	adminSvc := service.NewAdminService(nodeID, rn, im, ds, cs, w, nil, nil)
 
 	srv := grpc.NewServer()
 	pb.RegisterKnowledgeBaseServiceServer(srv, kbSvc)
 	pb.RegisterQueryServiceServer(srv, querySvc)
 	pb.RegisterAdminServiceServer(srv, adminSvc)
-	pb.RegisterDataSyncServiceServer(srv, sync.NewLeaderHandler(ds.DB(), cdm.DB(), vd.DB(), cs.VecstoreClient()))
+	// One data-plane service per node, as in the node assembly: the export side
+	// plus the receive side, so this stack can exercise both directions.
+	syncFollower := sync.NewFollower(ds, cdm, vd, cs, im)
+	pb.RegisterDataSyncServiceServer(srv, sync.NewNodeHandler(
+		sync.NewLeaderHandler(ds.DB(), cdm.DB(), vd.DB(), cs.VecstoreClient()),
+		sync.NewPushHandler(syncFollower, nodeID,
+			sync.WithIndexInstaller(im),
+			// §8.5: record a writer's announcement (it rides the §7.3
+			// confirmation) so this node can find that version's data later.
+			sync.WithDataSourceRegistry(dataSources)),
+	))
+	pb.RegisterInternalServiceServer(srv, raft.NewInternalServiceServer(rn))
 
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
@@ -381,23 +496,26 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 	}
 
 	n := &realNode{
-		t:          t,
-		nodeID:     nodeID,
-		raftAddr:   raftAddr,
-		grpcAddr:   grpcAddr,
-		baseDir:    baseDir,
-		raftNode:   rn,
-		fileWAL:    w,
-		docStore:   ds,
-		chunkDoc:   cdm,
-		versionDoc: vd,
-		chunkStore: cs,
-		indexMgr:   im,
-		srv:        srv,
-		conn:       conn,
-		KB:         pb.NewKnowledgeBaseServiceClient(conn),
-		Query:      pb.NewQueryServiceClient(conn),
-		Admin:      pb.NewAdminServiceClient(conn),
+		t:                t,
+		nodeID:           nodeID,
+		logger:           nodeLogger,
+		raftAddr:         raftAddr,
+		grpcAddr:         grpcAddr,
+		baseDir:          baseDir,
+		raftNode:         rn,
+		fileWAL:          w,
+		docStore:         ds,
+		chunkDoc:         cdm,
+		versionDoc:       vd,
+		chunkStore:       cs,
+		indexMgr:         im,
+		indexDistributor: indexDistributor,
+		dataSources:      dataSources,
+		srv:              srv,
+		conn:             conn,
+		KB:               pb.NewKnowledgeBaseServiceClient(conn),
+		Query:            pb.NewQueryServiceClient(conn),
+		Admin:            pb.NewAdminServiceClient(conn),
 	}
 	t.Cleanup(n.Stop)
 	return n
@@ -445,13 +563,35 @@ func waitForLeader(t *testing.T, nodes ...*realNode) *realNode {
 // across leader changes. See sync.VerifyDocIDSet for the verification
 // contract. The initial version (v1, created by CreateKnowledgeBase) carries
 // no digest and no data — pull it once and move on.
+// wireProposeForwarding gives a node the same propose-forwarding path the
+// production assembly wires (cmd/stratum/main.go): Raft only appends on the
+// leader, so a node that is not the leader needs the access layer to carry its
+// proposal there (Stratum_设计文档v13.md §7.3/§7.8).
+func wireProposeForwarding(t *testing.T, n *realNode, addrByID map[int64]string) {
+	t.Helper()
+	n.raftNode.SetNodeID(n.nodeID)
+	n.raftNode.SetForwarder(&raft.GRPCProposeForwarder{
+		AddrByID: func(id int64) (string, bool) {
+			addr, ok := addrByID[id]
+			return addr, ok
+		},
+	})
+}
+
 func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 	t.Helper()
 	syncFollower := sync.NewFollower(n.docStore, n.chunkDoc, n.versionDoc, n.chunkStore, n.indexMgr)
 	n.raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
 		ctx := context.Background()
+		// The callback fires on every applier now, the writer included (§8.5),
+		// so a node that already holds the version has nothing to fetch. This
+		// is the test-stack equivalent of the data plane's cursor check, which
+		// keeps a writer from pulling back its own data in production.
+		if verifyFollowerPull(ctx, n, kbID, versionID) {
+			return
+		}
 		if versionID <= 1 {
-			if addr := leaderAddrOf(ctx, n, addrByID); addr != "" {
+			if addr := sourceAddrFor(ctx, n, kbID, versionID, addrByID); addr != "" {
 				_ = syncFollower.PullVersion(ctx, addr, kbID, versionID)
 			}
 			return
@@ -459,14 +599,19 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 		deadline := time.Now().Add(15 * time.Second)
 		backoff := 50 * time.Millisecond
 		for {
-			if addr := leaderAddrOf(ctx, n, addrByID); addr != "" {
+			// Resolved per attempt, not once: a non-leader coordinator's
+			// announcement (§8.5) arrives after this callback starts, so an
+			// early attempt legitimately falls back to the leader and fails.
+			if addr := sourceAddrFor(ctx, n, kbID, versionID, addrByID); addr != "" {
 				_ = syncFollower.PullVersion(ctx, addr, kbID, versionID)
 			}
 			if verifyFollowerPull(ctx, n, kbID, versionID) {
 				return
 			}
 			if time.Now().After(deadline) {
-				n.t.Logf("node %d: pull for %s v%d did not converge", n.nodeID, kbID, versionID)
+				n.logger.Warn("sync pull did not converge",
+					zap.Int64("node_id", n.nodeID), zap.String("kb_id", kbID),
+					zap.Int64("version_id", versionID))
 				return
 			}
 			time.Sleep(backoff)
@@ -475,6 +620,27 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 			}
 		}
 	})
+}
+
+// sourceAddrFor answers "where do I get this version's data": the §8.5
+// announcement table first — a writer announced itself, and it need not be the
+// leader — then the pre-§8.5 answer, the leader.
+//
+// A source that turns out to be this node itself yields "" (nothing to fetch),
+// which is the pre-existing production rule in main.go's Resolve ("I am the
+// leader → the data landed through my own write path"). It matters more now
+// that every applier is notified: the coordinator applies the entry before its
+// own storage writes finish, so a pull from itself would read the partial data
+// and build an index over it.
+func sourceAddrFor(ctx context.Context, n *realNode, kbID string, versionID int64, addrByID map[int64]string) string {
+	if addr, ok := n.dataSources.Lookup(kbID, versionID); ok && addr != n.grpcAddr {
+		return addr
+	}
+	addr := leaderAddrOf(ctx, n, addrByID)
+	if addr == n.grpcAddr {
+		return ""
+	}
+	return addr
 }
 
 // leaderAddrOf resolves the current cluster leader's gRPC address from this
@@ -643,19 +809,43 @@ func (n *realNode) queryTolerant(ctx context.Context, kbID string, versionID int
 	return resp.Results
 }
 
-// isTransientQueryError reports whether err is a transient, retryable query
-// error — the follower's index is still being built (index not ready) or
-// the version's storage-layer write is still in flight (version is
-// pending). Permanent errors (version not found, index build failed,
-// invalid argument, …) are not retryable and must fail immediately.
+// isTransientQueryError reports whether err is a transient, retryable query error —
+// the version's index is still being built, or its storage-layer write is still in
+// flight. Permanent errors (version not found, index build failed, invalid argument,
+// …) are not retryable and must fail immediately.
+//
+// The decision is made on the MESSAGE, not the gRPC code. The same condition arrives
+// with whichever code the outermost layer happened to wrap it in: a nested index error
+// reaches the client as `Internal desc = index: vector search (...): ... index is still
+// building`, a direct one as `FailedPrecondition desc = version is PENDING`, and a load
+// timeout as `DeadlineExceeded`. Crediting only some codes — and only one spelling, when
+// the state machine writes "PENDING" and the index manager "index not ready" — is what
+// made these runs flaky: the fast path (version already READY) never produces the error
+// at all, so only a slow build reached the unmatched branch, and the run failed exactly
+// when it should have kept waiting.
 func isTransientQueryError(err error) bool {
 	st, ok := status.FromError(err)
 	if !ok {
 		return false
 	}
-	return st.Code() == codes.FailedPrecondition &&
-		(strings.Contains(st.Message(), "index not ready") ||
-			strings.Contains(st.Message(), "version is pending"))
+	msg := strings.ToLower(st.Message())
+
+	// Permanent first: a version that does not exist will not appear however long we
+	// wait, so that answer must not be retried.
+	if strings.Contains(msg, "not found") {
+		return false
+	}
+	for _, transient := range []string{
+		"version is pending",
+		"index not ready",
+		"index still building",
+		"index load timeout",
+	} {
+		if strings.Contains(msg, transient) {
+			return true
+		}
+	}
+	return false
 }
 
 func findResult(results []*pb.QueryResult, docID string) *pb.QueryResult {

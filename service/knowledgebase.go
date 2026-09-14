@@ -153,7 +153,7 @@ func (s *KnowledgeBaseServiceImpl) CreateVersion(ctx context.Context, req *pb.Cr
 		}
 	}
 
-	versionID, err := s.writeCoord.Execute(ctx, req.KnowledgeBaseId, req.ParentVersionId, changes)
+	versionID, err := s.writeCoord.Execute(ctx, req.KnowledgeBaseId, req.ParentVersionId, changes, req.ClientRequestId)
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}

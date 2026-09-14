@@ -1,0 +1,42 @@
+// internal.proto — InternalService: node-to-node control-plane traffic that is
+// not part of any public API.
+//
+// Why it exists: Raft only lets the leader append to the log, but the facts a
+// node needs to report do not always originate there. A storage replica that
+// finished writing a version, or any node running its startup reconcile, has
+// something to say regardless of where it landed
+// (Stratum_设计文档v13.md §7.3/§7.8).
+//
+// Propose is the single funnel for that: the caller hands over the encoded
+// command, and the receiving node runs it through Raft (it is the leader).
+// The payload is metadata only — never document content.
+syntax = "proto3";
+package stratum;
+
+option go_package = "stratum/api/proto/stratum";
+
+service InternalService {
+  // Propose runs one command through Raft on the caller's behalf. The
+  // receiving node must be the leader; a node that is not answers with a
+  // redirect instead of forwarding again, so a forward never chains.
+  rpc Propose(ProposeRequest) returns (ProposeResponse);
+}
+
+message ProposeRequest {
+  // The Raft command, exactly as encodeCommand produced it.
+  bytes command = 1;
+}
+
+message ProposeResponse {
+  // The outcome of applying the command, in the same shape as applyResult.
+  int64 version_id = 1;
+  repeated int64 deleted_version_ids = 2;
+  // The sentinel's stable wire name (see internal/errors) rather than a
+  // message, so errors.Is still works on the caller's side after the forward.
+  // Empty means success; when the name is unknown the message stands alone.
+  string error_name = 3;
+  string error_message = 4;
+  // leader_id is set when the receiving node is not the leader, telling the
+  // caller who to ask instead of forwarding the proposal onwards.
+  int64 leader_id = 5;
+}

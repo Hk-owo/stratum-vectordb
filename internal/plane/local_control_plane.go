@@ -1,0 +1,411 @@
+package plane
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"sync"
+
+	"go.uber.org/zap"
+
+	"stratum/internal/types"
+)
+
+// LocalControlPlane is the in-process ControlPlane for stage ① of
+// control-data-separation-design.md §7: it translates storage-layer reports
+// into the metadata proposals the control layer already understands. It is
+// meant to be the only channel through which the storage layer reaches
+// replicated state — which is what keeps the boundary honest while both
+// layers still live in one process.
+// MetadataProposer is the slice of the control layer's metadata API the storage
+// layer reports through. Keeping it narrow means the ControlPlane — and its
+// tests — depend only on what they actually use; *raft.RaftNode satisfies it.
+type MetadataProposer interface {
+	MetadataLister
+	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus) error
+	ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error
+	ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, reason string, count int32) error
+}
+
+// DefaultFailureBudget is how many failed attempts a version tolerates before
+// the control layer declares it permanently failed
+// (Stratum_设计文档v13.md §10.1). Like the other §10.4 numbers it is a starting
+// point still to be calibrated against real workloads.
+const DefaultFailureBudget = 5
+
+type LocalControlPlane struct {
+	rn MetadataProposer
+
+	// logger is optional; a nil logger silently drops the advisory log lines.
+	logger *zap.Logger
+
+	// failures counts failed attempts per (kbID, versionID): the control
+	// layer is the arbiter of the terminal verdict, so it has to keep the
+	// count itself — the storage layer only reports that an attempt failed.
+	mu            sync.Mutex
+	failures      map[string]int32
+	failureBudget int32
+
+	// kbBudgets overrides the budget per knowledge base, set from that KB's
+	// DurabilityPolicy (SetFailureBudget). Absent means "use failureBudget".
+	kbBudgets map[string]int32
+
+	// dataVersions is the leader's §7.13.4 aggregate of the storage layer's
+	// cursor reports, and leaderGate answers whether this node is the one whose
+	// aggregate is authoritative. Both nil on a node that does not lead: the
+	// view is simply unavailable there, which callers must be able to tell apart
+	// from "nobody holds it".
+	dataVersions *DataVersionRegistry
+	leaderGate   *LeaderGate
+
+	// leaderWatermarks are the watermarks the control leader carried back on a
+	// report's response — the fallback for a node that writes data but does not lead
+	// (see ReclaimableChangesThrough). Guarded by mu.
+	leaderWatermarks map[string]int64
+
+	// requiredReplicas lists the node IDs that must hold a version before the WAL
+	// records behind it may be discarded (§7.5). It comes from the cluster
+	// topology, never from the aggregate: deriving "who should have it" from
+	// "who has reported" would let a node that is merely silent drop out of the
+	// requirement, and the reclaim verdict would then be derived from the very
+	// reports it is supposed to be checked against.
+	requiredReplicas func() ([]int64, error)
+}
+
+// ControlPlaneOption configures a LocalControlPlane.
+type ControlPlaneOption func(*LocalControlPlane)
+
+// WithDataVersionView wires the leader's §7.13.4 cursor aggregate, so the control
+// plane can answer "which nodes hold version V". The gate is consulted on every
+// query rather than at construction: leadership moves, and a node that has just
+// taken over has an empty aggregate (LeaderGate clears it on takeover) — answering
+// from it is correct, whereas answering from a predecessor's would not be.
+func WithDataVersionView(reg *DataVersionRegistry, gate *LeaderGate) ControlPlaneOption {
+	return func(c *LocalControlPlane) {
+		c.dataVersions = reg
+		c.leaderGate = gate
+	}
+}
+
+// WithRequiredReplicas wires the replica set a version must reach before the WAL
+// changes behind it become reclaimable (§7.5). Optional: without it the reclaimable
+// watermark stays unavailable, which is the conservative answer.
+func WithRequiredReplicas(fn func() ([]int64, error)) ControlPlaneOption {
+	return func(c *LocalControlPlane) {
+		c.requiredReplicas = fn
+	}
+}
+
+// WithFailureBudget overrides how many failures precede the terminal verdict.
+// Non-positive values keep DefaultFailureBudget.
+func WithFailureBudget(n int) ControlPlaneOption {
+	return func(c *LocalControlPlane) {
+		if n > 0 {
+			c.failureBudget = int32(n)
+		}
+	}
+}
+
+// WithControlLogger wires a logger for the control plane's advisory reports
+// (dropped late confirmations, for instance).
+func WithControlLogger(l *zap.Logger) ControlPlaneOption {
+	return func(c *LocalControlPlane) {
+		if l != nil {
+			c.logger = l
+		}
+	}
+}
+
+// NewLocalControlPlane returns a ControlPlane backed by rn.
+func NewLocalControlPlane(rn MetadataProposer, opts ...ControlPlaneOption) *LocalControlPlane {
+	c := &LocalControlPlane{
+		rn:            rn,
+		failures:      make(map[string]int32),
+		failureBudget: DefaultFailureBudget,
+		kbBudgets:     make(map[string]int32),
+		logger:        zap.NewNop(),
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
+	return c
+}
+
+// ReportVersionFailure records a failed attempt and, once the budget is spent —
+// or immediately, for a globally fatal failure — records the terminal verdict
+// (Stratum_设计文档v13.md §10.1).
+//
+// The count is per-process state on purpose: a restart forgets it and the
+// budget starts over. That errs toward retrying a version more often than the
+// budget allows rather than declaring it dead too early — retrying is the
+// recoverable direction, and the budget itself is still a §10.4 number to be
+// calibrated.
+func (c *LocalControlPlane) ReportVersionFailure(ctx context.Context, kbID string, versionID int64, class types.FailureClass, detail string) (bool, error) {
+	c.mu.Lock()
+	key := failureKey(kbID, versionID)
+	c.failures[key]++
+	count := c.failures[key]
+	budget := c.failureBudget
+	if perKB, ok := c.kbBudgets[kbID]; ok {
+		budget = perKB
+	}
+	c.mu.Unlock()
+
+	// A globally fatal failure does not wait for the budget: retrying cannot
+	// help, so spending the remaining retries would only delay the terminal
+	// verdict and keep the version PENDING meanwhile
+	// (Stratum_设计文档v13.md §10.1).
+	if class != types.FailureFatalGlobal && count < budget {
+		return false, nil // still inside the budget: the next attempt may succeed
+	}
+	if err := c.rn.ProposeMarkVersionFailedPermanent(ctx, kbID, versionID, detail, count); err != nil {
+		return false, fmt.Errorf("plane: ReportVersionFailure: mark version %d permanently failed: %w", versionID, err)
+	}
+	return true, nil
+}
+
+// SetFailureBudget records the retry budget declared for kbID. It is how a
+// KB's DurabilityPolicy reaches the layer that owns the terminal verdict
+// (Stratum_设计文档v13.md §10.1). A non-positive value clears any override,
+// falling back to the process default.
+func (c *LocalControlPlane) SetFailureBudget(_ context.Context, kbID string, maxFailures int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if maxFailures <= 0 {
+		delete(c.kbBudgets, kbID)
+		return nil
+	}
+	c.kbBudgets[kbID] = int32(maxFailures)
+	return nil
+}
+
+// failureKey namespaces the counter per knowledge base: version IDs are only
+// unique within one.
+func failureKey(kbID string, versionID int64) string {
+	return kbID + "\x00" + strconv.FormatInt(versionID, 10)
+}
+
+// clearFailures drops the counter once a version succeeds, so a later,
+// unrelated failure starts from a fresh budget.
+func (c *LocalControlPlane) clearFailures(kbID string, versionID int64) {
+	c.mu.Lock()
+	delete(c.failures, failureKey(kbID, versionID))
+	c.mu.Unlock()
+}
+
+var _ ControlPlane = (*LocalControlPlane)(nil)
+
+// ReportDataDurable records the version's document-set digest — the same
+// proposal followers already rely on to verify a completed data pull
+// (VersionMeta.DocIDSetHash).
+//
+// Whether a late confirmation still applies is decided by the state machine
+// rather than here: it holds the version's status deterministically, needs no
+// extra read on the write path, and is the same on every replica. A report for
+// an already settled version is dropped there (Stratum_设计文档v13.md §10.6).
+func (c *LocalControlPlane) ReportDataDurable(ctx context.Context, kbID string, versionID int64, digest string) error {
+	if err := c.rn.ProposeUpdateVersionSummary(ctx, versionID, digest); err != nil {
+		return err
+	}
+	c.clearFailures(kbID, versionID)
+	return nil
+}
+
+// ReportIndexReady marks the version's index built and serviceable.
+func (c *LocalControlPlane) ReportIndexReady(ctx context.Context, _ string, versionID int64) error {
+	return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady)
+}
+
+// ReportAvailability maps the abstract storage-layer availability onto the
+// version status the control layer keeps (v1 §4.3: AVAILABLE → READY,
+// UNAVAILABLE → FAILED).
+//
+// DEGRADED deliberately maps to no status change: it describes the read
+// service capacity distribution rather than the version's own state
+// (Stratum_设计文档v13.md §8.2), so the version stays READY and the
+// degradation is an alerting concern upstream.
+func (c *LocalControlPlane) ReportAvailability(ctx context.Context, _ string, versionID int64, state Availability) error {
+	switch state {
+	case AvailabilityDegraded:
+		return nil
+	case AvailabilityAvailable:
+		return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady)
+	case AvailabilityUnavailable:
+		return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusFailed)
+	default:
+		return fmt.Errorf("plane: ReportAvailability: unknown availability %d", int(state))
+	}
+}
+
+// ReportEpoch reconciles control-layer state with storage-layer facts after a
+// restart (v1 §5.3): the storage layer reports which versions it holds durably,
+// and every reported version whose metadata still says PENDING is promoted to
+// READY — the state the storage-layer facts justify.
+//
+// The other half of §5.3 (demoting versions the storage layer did *not*
+// report) is deliberately left to the storage layer: a version whose index is
+// missing inside the retention window is rebuilt rather than demoted, and
+// demoting on absence would fight that rebuild — the pre-contract reconcile
+// behaved the same way.
+func (c *LocalControlPlane) ReportEpoch(ctx context.Context, _ uint64, dataVersions map[string]int64, indexReadyVersions map[string][]int64) error {
+	// Stage ① runs in-process, so there is no stale-report window to close yet:
+	// the epoch itself becomes meaningful once the storage cluster keeps its own
+	// manifest (stage ④, v1 §5.3), and is accepted-and-ignored here.
+	//
+	// Only the index side promotes versions. IndexStatus.READY means "the index
+	// is queryable", and a data cursor alone does not establish that — which is
+	// exactly why §7.9 keeps the two sides separate. This startup snapshot only
+	// gets logged: the live cursor view is §7.13.4's periodic reports, read back
+	// through DataVersionHolders. Data-side state independent of index state is
+	// still §10.1's "each side owns its own terminal state" item, still to be done.
+	for kbID, cursor := range dataVersions {
+		c.logger.Info("plane: ReportEpoch: storage-layer data cursor",
+			zap.String("kb_id", kbID), zap.Int64("cursor", cursor))
+	}
+
+	for kbID, readyIDs := range indexReadyVersions {
+		if len(readyIDs) == 0 {
+			continue
+		}
+		ready := make(map[int64]bool, len(readyIDs))
+		for _, id := range readyIDs {
+			ready[id] = true
+		}
+		versions, err := c.rn.ListVersions(ctx, kbID)
+		if err != nil {
+			return fmt.Errorf("plane: ReportEpoch: list versions of %s: %w", kbID, err)
+		}
+		for _, v := range versions {
+			if !ready[v.VersionID] || v.IndexStatus != types.IndexStatusPending {
+				continue
+			}
+			if err := c.rn.ProposeUpdateVersionStatus(ctx, v.VersionID, types.IndexStatusReady); err != nil {
+				return fmt.Errorf("plane: ReportEpoch: promote version %d to READY: %w", v.VersionID, err)
+			}
+		}
+	}
+	return nil
+}
+
+// DataVersionHolders answers "which nodes hold version V of kbID", from the
+// leader's §7.13.4 aggregate of the storage layer's cursor reports. ok=false means
+// the answer is UNAVAILABLE — this node is not the leader, or no aggregate is
+// wired — and is emphatically not "nobody has it": the two lead to opposite
+// actions, since the second would justify deleting data (§10.6) that a healthy
+// node in fact holds.
+//
+// A non-empty result is still only "these nodes reported a cursor reaching V". It
+// is a routing hint: fetch from one of them rather than from a peer that never
+// reached V. It is never evidence for a destructive decision — that needs each
+// node's own confirmation.
+func (c *LocalControlPlane) DataVersionHolders(kbID string, versionID int64) ([]int64, bool) {
+	if c.dataVersions == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
+		return nil, false
+	}
+	return c.dataVersions.Holders(kbID, versionID), true
+}
+
+// ReclaimableChangesThrough reports the highest version V such that the WAL changes
+// for every version up to V may be discarded (§7.5): each required replica has
+// reported a contiguous cursor reaching V, so the delta has served every peer that
+// was supposed to need it.
+//
+// ok=false means the watermark is NOT KNOWN — this node is not the leader, no
+// aggregate or replica set is wired, the topology cannot be read, or at least one
+// required replica has not reported. Every one of those resolves to "do not
+// reclaim", which is why they share one answer: a CRASH is the failure mode, and
+// the only safe response to "I cannot prove it is safe" is to keep the data.
+//
+// Note that this is a policy input, not an instruction: reclaiming is irreversible
+// (a node that later needs the gap must fall back to a full state transfer), so the
+// caller decides, and the caller is expected to be conservative.
+func (c *LocalControlPlane) ReclaimableChangesThrough(kbID string) (int64, bool) {
+	if watermark, ok := c.localReclaimable(kbID); ok {
+		return watermark, true
+	}
+	// Not the leader (or the judgement cannot be made here), so fall back to what the
+	// leader carried back on the report's response. Handing the watermark to the node
+	// that WROTE the data is the whole point: that is the WAL that grows, and under
+	// §7.13.2 it need not be the leader's.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	watermark, ok := c.leaderWatermarks[kbID]
+	return watermark, ok
+}
+
+// localReclaimable computes the watermark from this node's own authoritative view.
+// It answers false whenever this node is not the leader or some replica's cursor is
+// unknown — every such answer means "keep the data".
+func (c *LocalControlPlane) localReclaimable(kbID string) (int64, bool) {
+	if c.dataVersions == nil || c.leaderGate == nil || c.requiredReplicas == nil || !c.leaderGate.IsLeader() {
+		return 0, false
+	}
+	required, err := c.requiredReplicas()
+	if err != nil {
+		return 0, false
+	}
+	if len(required) == 0 {
+		return 0, false
+	}
+
+	// The watermark is the *minimum* across replicas: the slowest replica decides,
+	// because a version is only safe to forget once every peer that needs the delta
+	// has it. A replica that has never reported makes the whole answer unknown
+	// rather than excepting it — its silence is not evidence that it does not need
+	// the changes.
+	watermark := int64(-1)
+	for _, nodeID := range required {
+		cursor, ok := c.dataVersions.Cursor(nodeID, kbID)
+		if !ok {
+			return 0, false
+		}
+		if watermark < 0 || cursor < watermark {
+			watermark = cursor
+		}
+	}
+	if watermark < 0 {
+		return 0, false
+	}
+	return watermark, true
+}
+
+// SetLeaderWatermarks records the watermarks the control leader carried back on a
+// report's response. It is only consulted when this node cannot judge locally (see
+// ReclaimableChangesThrough), i.e. on a node that writes data but does not lead.
+//
+// Staleness is safe in the only direction that matters here: a reported watermark was
+// true when the leader computed it, and cursors never move backwards, so a stale value
+// is never HIGHER than the current truth — it reclaims less than it could, never more.
+// (A leader change empties the new leader's aggregate, so the value can also go down;
+// discarding changes the previous leader had justified remains correct, and a replica
+// that later turns out to need one falls back to a full-state transfer by §6.4.)
+func (c *LocalControlPlane) SetLeaderWatermarks(watermarks map[string]int64) {
+	next := make(map[string]int64, len(watermarks))
+	for kbID, version := range watermarks {
+		next[kbID] = version
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.leaderWatermarks = next
+}
+
+// VersionExists reports whether a version is still present in the replicated
+// metadata. The backfill asks this before advancing its cursor over a version whose
+// pull returned no records: "empty" and "deleted" look identical at the storage
+// layer, and only the metadata can tell them apart (§7.5).
+//
+// It reads the local replica of the metadata, not a Raft round trip: the caller
+// runs on the apply path, where any blocking call would stall every later entry.
+func (c *LocalControlPlane) ExistingVersions(ctx context.Context, kbID string) (map[int64]bool, error) {
+	versions, err := c.rn.ListVersions(ctx, kbID)
+	if err != nil {
+		return nil, fmt.Errorf("plane: list versions of %s: %w", kbID, err)
+	}
+	existing := make(map[int64]bool, len(versions))
+	for _, v := range versions {
+		existing[v.VersionID] = true
+	}
+	return existing, nil
+}

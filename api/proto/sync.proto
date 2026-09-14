@@ -19,11 +19,157 @@ package stratum;
 
 option go_package = "stratum/api/proto/stratum";
 
-// DataSyncService is an internal-only gRPC service for leader→follower
-// data pull. Followers open a server-side streaming RPC per version and
-// apply each SyncEntry to their local storage layers.
+import "knowledgebase.proto";
+
+// DataSyncService is an internal-only gRPC service for inter-node data
+// replication. A node either pulls a version's records (server-side
+// streaming) or is handed them by the version's write coordinator
+// (client-side streaming) — the push direction is what lets a freshly
+// written version reach its target replicas without waiting for them to
+// notice it (Stratum_设计文档v13.md §7.2).
 service DataSyncService {
+  // ExecuteVersionWrite asks THIS node to run the storage-layer write
+  // transaction for a version the control layer has already committed
+  // (§7.13.2). The leader picks the coordinator from the knowledge base's
+  // replica topology and dispatches the work here, so the data-plane cost
+  // (split/embed/store locally, then fan out) lands on the coordinator rather
+  // than on the control leader. Idempotent per (kb, version).
+  rpc ExecuteVersionWrite(ExecuteVersionWriteRequest) returns (ExecuteVersionWriteResponse);
+
   rpc PullVersionData(PullVersionDataRequest) returns (stream SyncEntry);
+
+  // PullVersionChanges streams the recorded CHANGES for a range of versions, so a
+  // node that is behind can replay the delta instead of pulling each version's
+  // full record set (§7.5). The writer's WAL already holds them — the same BEGIN
+  // record crash recovery replays — so this reads one store for a second purpose.
+  //
+  // Gaps are visible, not silent: a version with no record is simply not sent, and
+  // the caller must fall back to a full state transfer rather than apply the range
+  // as if those versions changed nothing.
+  rpc PullVersionChanges(PullVersionChangesRequest) returns (stream VersionChanges);
+
+  // ReportDataVersions is the storage layer's periodic status report to the
+  // control leader (§7.13.4): "for each knowledge base, my contiguous data cursor
+  // has reached version N". The leader keeps the aggregate in memory and answers
+  // "which nodes hold version V" from it — an authoritative view of where data
+  // lives that is refreshed every interval, instead of a snapshot taken once and
+  // stale from that moment on.
+  //
+  // accepted=false tells the reporter it reached a non-leader: it re-resolves the
+  // leader and tries again next interval (§7.13.1's pattern), rather than the
+  // system growing a second forwarding path.
+  rpc ReportDataVersions(ReportDataVersionsRequest) returns (ReportDataVersionsResponse);
+
+  // PushVersionData hands one version's records to this node: the caller
+  // (the write's coordinator) streams the same SyncEntry records
+  // PullVersionData would have produced, and receives a single
+  // acknowledgement once they have all been applied. Idempotent, like the
+  // pull direction: records are keyed by (kb, version, doc/chunk).
+  rpc PushVersionData(stream SyncEntry) returns (PushVersionDataResponse);
+
+  // VersionPresence answers whether this node holds (kbID, versionID)'s data.
+  // The control layer asks every candidate replica so it can tell a version
+  // that is merely unbuilt from one whose data never landed anywhere
+  // (Stratum_设计文档v13.md §7.12 step ① — the block-report union).
+  rpc VersionPresence(VersionPresenceRequest) returns (VersionPresenceResponse);
+
+  // LocalVersion reports this node's contiguous data cursor for a knowledge
+  // base: the highest version whose history it holds completely. A node that
+  // is behind uses it to find a peer able to fill its gap instead of always
+  // asking the leader (Stratum_设计文档v13.md §7.6).
+  rpc LocalVersion(LocalVersionRequest) returns (LocalVersionResponse);
+
+  // DeleteVersionData reclaims a version's physical data on the receiving
+  // node. The control layer broadcasts it to *every* candidate replica when it
+  // declares a version FAILED_PERMANENT, because it does not know which
+  // replicas actually landed the data (Stratum_设计文档v13.md §10.6).
+  rpc DeleteVersionData(DeleteVersionDataRequest) returns (DeleteVersionDataResponse);
+
+  // ConfirmVersionWrite tells a replica that the version it received did reach
+  // quorum, so the §7.3 takeover timer it started can stand down.
+  rpc ConfirmVersionWrite(ConfirmVersionWriteRequest) returns (ConfirmVersionWriteResponse);
+
+  // PushIndexData streams one version's built index to a replica, so the
+  // replica loads the artifact instead of rebuilding it: "建一次、分发 N 份"
+  // (Stratum_设计文档v13.md §8.4). It replaces the "every replica builds its own
+  // HNSW" premise, which also removed the build-collision defect where
+  // several nodes ran Build (Reset + AddChunks) on the same version.
+  rpc PushIndexData(stream PushIndexChunk) returns (PushIndexDataResponse);
+}
+
+message PushIndexChunk {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+  // sidecar marks the .ids companion, which carries the checksum the index
+  // file is validated against. It is streamed first so an install never ends
+  // up with an index whose authenticating metadata is missing.
+  bool sidecar = 3;
+  bytes data = 4;
+  // last marks the final chunk of the whole transfer (both files).
+  bool last = 5;
+}
+
+message PushIndexDataResponse {
+  int64 node_id = 1;
+}
+
+message ConfirmVersionWriteRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+  // source_addr names where the writer's copy of this version's data lives —
+  // its DataSyncService address. The confirmation doubles as the §8.5
+  // announcement that turns "who holds this version" into a known fact on the
+  // receiving node, instead of something a puller has to discover by probing
+  // (probing on the Raft apply path is what made the first attempt at §8.5
+  // unusable: `integration` went from 26s to 462s and timed out). Empty when
+  // the sender does not announce itself; receivers then simply learn nothing.
+  string source_addr = 3;
+}
+
+message ConfirmVersionWriteResponse {
+  int64 node_id = 1;
+}
+
+message DeleteVersionDataRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+  // reason is advisory: it is logged, and the cleanup happens regardless.
+  string reason = 3;
+}
+
+message DeleteVersionDataResponse {
+  bool dropped = 1; // whether this node actually held data for the version
+  int64 node_id = 2;
+}
+
+message LocalVersionRequest {
+  string knowledge_base_id = 1;
+}
+
+message LocalVersionResponse {
+  int64 version = 1;
+  int64 node_id = 2;
+}
+
+message VersionPresenceRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+}
+
+message VersionPresenceResponse {
+  bool present = 1;
+  // node_id identifies the replica that answered, so the control layer can
+  // log which candidates were missing the version.
+  int64 node_id = 2;
+}
+
+message PushVersionDataResponse {
+  // Echoed so the coordinator can match the ack to the replica it pushed to.
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+  // acceptor_id is the Raft node ID of the replica that applied the stream;
+  // the coordinator counts distinct acceptors against the quorum threshold.
+  int64 acceptor_id = 3;
 }
 
 message PullVersionDataRequest {
@@ -40,6 +186,69 @@ message SyncEntry {
   string chunk_id = 4;
   int64 version_id = 5;
   bytes payload = 6; // DOC_STORE: docstore tag byte (0x01=content, 0x00=tombstone) + doc text; CHUNK_VECTOR: float32 vector bytes
+}
+
+// ExecuteVersionWriteRequest carries what the chosen coordinator needs to run
+// the write locally: the version the control layer committed, and the changes
+// to apply. The changes travel here rather than inside the Raft log — they
+// deliberately stay out of it (§7.7) — so the dispatcher hands them over.
+message ExecuteVersionWriteRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+  int64 parent_version_id = 3;
+  repeated DocChange changes = 4;
+  // client_request_id is the originating write's idempotency key, forwarded so
+  // a retried dispatch and a client retry describe the same transaction
+  // (§7.12).
+  string client_request_id = 5;
+}
+
+message ExecuteVersionWriteResponse {
+  int64 node_id = 1;
+  // completed means the local write transaction reached COMMIT: the data is in
+  // this node's stores and the version's digest has been reported upward.
+  bool completed = 2;
+}
+
+message PullVersionChangesRequest {
+  string knowledge_base_id = 1;
+  // The range is (from_exclusive, to_inclusive] — the versions a lagging node is
+  // missing, in the same half-open shape its cursor arithmetic uses (§7.5).
+  int64 from_exclusive = 2;
+  int64 to_inclusive = 3;
+}
+
+// VersionChanges is one version's recorded delta: what its writer changed, so a
+// peer can replay it to reach the same state without transferring that version's
+// full record set.
+message VersionChanges {
+  int64 version_id = 1;
+  int64 parent_version_id = 2;
+  repeated DocChange changes = 3;
+}
+
+message ReportDataVersionsRequest {
+  int64 node_id = 1;
+  // knowledge_base_id -> the highest version this node holds contiguously. Only
+  // the cursor is reported, not the data: the aggregate answers "who could serve
+  // version V", which is exactly what a cursor comparison decides.
+  map<string, int64> data_versions = 2;
+}
+
+message ReportDataVersionsResponse {
+  // accepted is false when the receiving node is not the control leader, so the
+  // reporter knows to re-resolve rather than assume the report landed.
+  bool accepted = 1;
+  // node_id identifies the responder.
+  int64 node_id = 2;
+  // reclaimable carries back, per knowledge base, the highest version whose recorded
+  // changes may be discarded (§7.5). It rides this response deliberately: the
+  // watermark needs the leader's global view, and the node that must act on it is the
+  // one that WROTE the data — which under §7.13.2 need not be the leader. Piggy-
+  // backing on the report every node already sends avoids inventing an RPC for it.
+  //
+  // A knowledge base absent from this map has no known watermark: keep everything.
+  map<string, int64> reclaimable = 3;
 }
 
 enum SyncEntryType {

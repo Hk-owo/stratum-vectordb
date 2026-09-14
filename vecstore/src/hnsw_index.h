@@ -27,6 +27,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -96,6 +97,7 @@ class HNSWVectorIndex : public VectorIndex {
       int candidate_n) override;
   absl::Status Save(const std::string& path) override;
   absl::Status Load(const std::string& path) override;
+  absl::Status LoadForAppend(const std::string& path) override;
   absl::Status Reset() override;
 
   // EstimatedMemoryBytes reports the index's in-memory footprint estimate
@@ -105,6 +107,20 @@ class HNSWVectorIndex : public VectorIndex {
   // payload otherwise). Approximate is fine; monotone in ntotal required.
   int64_t EstimatedMemoryBytes() const override;
 
+  // MatchesConfig reports whether this index was built with config; a
+  // different shape needs a different Faiss index type, so the owner
+  // replaces the object instead of reusing it (§8.6a cold reshape).
+  bool MatchesConfig(const QuantizerConfig& config) const override;
+
+  // TotalVectors reports how many vectors are currently resident (0 when
+  // nothing is built or loaded).
+  int64_t TotalVectors() const override;
+
+  // RemoveChunks drops the named chunks and compacts the storage (graph-free
+  // shapes only, while open).
+  absl::StatusOr<size_t> RemoveChunks(
+      const std::vector<std::string>& chunk_ids) override;
+
   // state returns the current lifecycle state. Diagnostic / test helper.
   LifecycleState state() const;
 
@@ -113,6 +129,18 @@ class HNSWVectorIndex : public VectorIndex {
   // (exclusive for *Locked; shared for SearchTopN / ExactScore).
   absl::Status ResetLocked();
   absl::Status AddChunksLocked(const std::vector<ChunkVector>& chunks);
+  // LoadLocked is the shared body of Load and LoadForAppend, leaving the
+  // index in final_state (READY / BUILDING). op names the caller for error
+  // messages.
+  absl::Status LoadLocked(const std::string& path, const char* op,
+                          LifecycleState final_state);
+
+  // ResetChunkIDTable / SetChunkIDTable are the only writers of
+  // id_to_chunk_id_ (besides AddChunksLocked's append). They keep the
+  // known_chunk_ids_ mirror in step, which is what makes the dedup in
+  // AddChunksLocked safe: a chunk that was removed must become addable again.
+  void ResetChunkIDTable();
+  void SetChunkIDTable(std::vector<std::string> chunk_ids);
 
   // SearchTopN is the shared coarse search: top_n candidates from the
   // in-memory Faiss index. Exact on a full-precision index, approximate
@@ -131,8 +159,18 @@ class HNSWVectorIndex : public VectorIndex {
   mutable std::shared_mutex state_mu_;
   LifecycleState state_ = LifecycleState::kEmpty;
 
-  std::unique_ptr<faiss::IndexHNSW> index_;
+  // faiss::Index, not faiss::IndexHNSW: graph-free variants (§8.6a) are not
+  // HNSW indexes at all. Every use below goes through the base-class interface
+  // (is_trained/train/add/search/ntotal); only the two HNSW tuning knobs need a
+  // cast, and they are guarded by isGraphFree.
+  std::unique_ptr<faiss::Index> index_;
   std::vector<std::string> id_to_chunk_id_;
+  // Mirrors id_to_chunk_id_ for O(1) "is this chunk already here?" checks,
+  // which AddChunks uses to skip content-addressed duplicates (§8.6c's delta
+  // can name a chunk the base artifact already holds). Every write to
+  // id_to_chunk_id_ must go through SetChunkIDTable / ResetChunkIDTable so
+  // the two never drift apart.
+  std::unordered_set<std::string> known_chunk_ids_;
   MetricType metric_ = MetricType::COSINE;
   int dim_ = 0;
   QuantizerConfig config_;

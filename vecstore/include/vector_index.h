@@ -107,9 +107,40 @@ class VectorIndex {
   // replacing any current in-memory state.
   virtual absl::Status Load(const std::string& path) = 0;
 
+  // LoadForAppend reads a file previously written by Save as the *starting
+  // point* of a build rather than as a sealed artifact: afterwards the index
+  // is in the BUILDING state and accepts AddChunks, and a later Save seals
+  // it. This is the entry point §8.6(c)'s pure-append reuse needs — HNSW can
+  // append to a graph that was written and read back, but Load deliberately
+  // ends in READY (Save seals the build), where appending is rejected.
+  virtual absl::Status LoadForAppend(const std::string& path) = 0;
+
   // Reset clears the index back to an empty, unbuilt state. After Reset,
   // Search must not be called until a subsequent Build or Load.
   virtual absl::Status Reset() = 0;
+
+  // MatchesConfig reports whether this index was constructed with config.
+  // The configuration is fixed at construction (it selects the concrete
+  // Faiss index type), so a caller that wants a different shape — §8.6a's
+  // cold reshape swapping a graphed index for its graph-free twin — cannot
+  // reuse this object and must construct a new one.
+  virtual bool MatchesConfig(const QuantizerConfig& config) const = 0;
+
+  // TotalVectors reports how many vectors the index currently holds (0 when
+  // nothing has been built or loaded). LoadForAppend reports it back so the
+  // caller can tell how many of the base artifact's vectors the version it is
+  // building no longer needs — those are §8.6(c)'s tombstones.
+  virtual int64_t TotalVectors() const = 0;
+
+  // RemoveChunks drops the named chunks' vectors and compacts the storage,
+  // returning how many were actually present. Only graph-free shapes can do
+  // this — faiss compacts IndexFlatCodes but cannot repair an HNSW graph — and
+  // only while the index is still open (BUILDING): Save seals a build, so a
+  // sealed index must be reopened with LoadForAppend first. This is what lets
+  // §8.6(c)'s deletion path reclaim a graph-free index's dead vectors instead
+  // of carrying them until a rebuild.
+  virtual absl::StatusOr<size_t> RemoveChunks(
+      const std::vector<std::string>& chunk_ids) = 0;
 };
 
 }  // namespace vecstore

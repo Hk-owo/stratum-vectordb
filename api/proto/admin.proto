@@ -34,6 +34,17 @@ message StuckVersion {
   int64 updated_at = 4;
 }
 
+// FailedVersion is a version the control layer declared FAILED_PERMANENT
+// (Stratum_设计文档v13.md §10.1): its Saga spent the retry budget, nothing retries
+// it automatically, and only an operator can retry or abandon it. The cause
+// chain is carried along so acting on it needs no further digging.
+message FailedVersion {
+  string kb_id = 1;
+  int64 version_id = 2;
+  string reason = 3;       // why the last attempt failed (the storage layer's report)
+  int32 failure_count = 4; // failed attempts before the verdict
+}
+
 message WALAlert {
   string description = 1; // human-readable summary of the stuck PendingRecord
   int32 retry_count = 2;
@@ -67,6 +78,15 @@ message GetSystemStatusResponse {
   repeated WALAlert wal_alerts = 4;
   ResourceUsage resource_usage = 5;
   repeated StuckVersion deleting_versions = 6; // versions whose DeleteVersion cleanup is in progress or unfinished
+  // data_missing_versions lists PENDING versions whose data no candidate
+  // replica holds: they cannot become READY on their own and are only
+  // recoverable by the writer re-sending its changes under the same
+  // client_request_id (Stratum_设计文档v13.md §7.12).
+  repeated StuckVersion data_missing_versions = 7;
+  // failed_permanent_versions lists versions that will never become READY on
+  // their own: the control layer has declared them dead and only an operator
+  // can retry or abandon them (Stratum_设计文档v13.md §10.1).
+  repeated FailedVersion failed_permanent_versions = 8;
 }
 
 // GetClusterStatusRequest is empty: the node reports its own view of the

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"time"
 
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/chunkstore"
@@ -23,7 +24,23 @@ type AdminServiceImpl struct {
 	docStore     docstore.DocStore
 	chunkStore   chunkstore.ChunkStore
 	wal          wal.WAL
+
+	// replicas lists the addresses of the nodes that may hold a version's
+	// data, and presence asks them whether they do. Both are optional: when
+	// either is nil the data-missing check is skipped (a single-node
+	// deployment has no other replica to ask).
+	replicas func() []string
+	presence PresenceChecker
 }
+
+// dataMissingMinAgeSec is how long a PENDING version may legitimately still be
+// mid-write before the control layer probes its replicas. Without it every
+// status call would probe versions that were allocated a moment ago.
+//
+// Placeholder: the value belongs with the other consistency-budget numbers
+// (Stratum_设计文档v13.md §10.4) once they are calibrated by measurement.
+// It is a var (not a const) only so tests can shorten it.
+var dataMissingMinAgeSec int64 = 120
 
 // NewAdminService constructs an AdminServiceImpl. nodeID identifies this
 // node in the Raft cluster; it is reported by GetClusterStatus so the
@@ -35,6 +52,8 @@ func NewAdminService(
 	ds docstore.DocStore,
 	cs chunkstore.ChunkStore,
 	w wal.WAL,
+	replicas func() []string,
+	presence PresenceChecker,
 ) *AdminServiceImpl {
 	return &AdminServiceImpl{
 		nodeID:       nodeID,
@@ -43,6 +62,8 @@ func NewAdminService(
 		docStore:     ds,
 		chunkStore:   cs,
 		wal:          w,
+		replicas:     replicas,
+		presence:     presence,
 	}
 }
 
@@ -84,6 +105,8 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 	// delete-failed KBs.
 	var stuckVersions []*pb.StuckVersion
 	var deletingVersions []*pb.StuckVersion
+	var pendingVersions []types.VersionMeta
+	var failedPermanent []*pb.FailedVersion
 	var deleteFailed []string
 	if kbs, err := s.raftNode.ListKnowledgeBases(ctx); err == nil {
 		for _, kb := range kbs {
@@ -115,6 +138,22 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 						// use the creation time as the best available proxy.
 						UpdatedAt: v.CreatedAt,
 					})
+					continue
+				}
+				if v.IndexStatus == types.IndexStatusPending {
+					pendingVersions = append(pendingVersions, v)
+				}
+				// FAILED_PERMANENT is the control layer's terminal verdict
+				// (Stratum_设计文档v13.md §10.1): it is reported separately from
+				// the retryable FAILED above, and carries the cause chain an
+				// operator needs.
+				if v.IndexStatus == types.IndexStatusFailedPermanent {
+					failedPermanent = append(failedPermanent, &pb.FailedVersion{
+						KbId:         v.KBID,
+						VersionId:    v.VersionID,
+						Reason:       v.FailureReason,
+						FailureCount: v.FailureCount,
+					})
 				}
 			}
 		}
@@ -144,14 +183,46 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 		resourceUsage.ChunkStoreBytes = int64(n)
 	}
 
+	// A PENDING version that no candidate replica holds cannot become READY on
+	// its own: its data never landed, so it is only recoverable by the writer
+	// re-sending its changes under the same client_request_id
+	// (Stratum_设计文档v13.md §7.12). Surface it instead of leaving it to look
+	// like an index build that is merely slow.
+	dataMissing := s.collectDataMissingVersions(ctx, pendingVersions)
+
 	return &pb.GetSystemStatusResponse{
-		Health:           health,
-		StuckVersions:    stuckVersions,
-		DeleteFailedKbs:  deleteFailed,
-		DeletingVersions: deletingVersions,
-		WalAlerts:        walAlerts,
-		ResourceUsage:    resourceUsage,
+		Health:                  health,
+		StuckVersions:           stuckVersions,
+		DeleteFailedKbs:         deleteFailed,
+		DeletingVersions:        deletingVersions,
+		WalAlerts:               walAlerts,
+		ResourceUsage:           resourceUsage,
+		DataMissingVersions:     dataMissing,
+		FailedPermanentVersions: failedPermanent,
 	}, nil
+}
+
+// collectDataMissingVersions probes the candidate replicas for every PENDING
+// version and reports the ones nobody holds. It is a no-op when the node has
+// no replica set or no presence checker.
+func (s *AdminServiceImpl) collectDataMissingVersions(ctx context.Context, versions []types.VersionMeta) []*pb.StuckVersion {
+	if s.presence == nil || s.replicas == nil || len(versions) == 0 {
+		return nil
+	}
+	missing := dataMissingVersions(ctx, versions, s.replicas(), s.presence, time.Now().Unix(), dataMissingMinAgeSec)
+	if len(missing) == 0 {
+		return nil
+	}
+	out := make([]*pb.StuckVersion, 0, len(missing))
+	for _, v := range missing {
+		out = append(out, &pb.StuckVersion{
+			KbId:        v.KBID,
+			VersionId:   v.VersionID,
+			IndexStatus: pb.IndexStatus(v.IndexStatus),
+			UpdatedAt:   v.CreatedAt,
+		})
+	}
+	return out
 }
 
 // GetClusterStatus implements AdminServiceServer.

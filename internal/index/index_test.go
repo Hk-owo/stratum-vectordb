@@ -30,6 +30,21 @@ type mockVectorIndexClient struct {
 	searchFn       func(kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) // per-call override
 	buildCalls     int                                                                                          // number of Build RPC invocations
 	addChunksCalls int                                                                                          // number of AddChunks RPC invocations
+	// §8.6(c) append reuse: how many times LoadForAppend was called, with
+	// which base path, an injectable failure, and how many vectors the base
+	// artifact should pretend to hold (the real vecstore reports the loaded
+	// artifact's ntotal).
+	loadForAppendCalls      int
+	lastLoadForAppendPath   string
+	loadForAppendErr        error
+	loadForAppendBaseNtotal int64
+	// chunk IDs passed to each AddChunks call, in order.
+	addedChunkIDs [][]string
+	// §8.6(c) deletion path: how many times RemoveChunks was called, with which
+	// chunk ids, and an injectable failure.
+	removeChunksCalls int
+	removedChunkIDs   []string
+	removeChunksErr   error
 	// last Build RPC's quantizer fields, for asserting config forwarding.
 	lastBuildQuantizer vecstorepb.QuantizerTypeProto
 	lastBuildPqM       int32
@@ -81,6 +96,11 @@ func (m *mockVectorIndexClient) AddChunks(_ context.Context, in *vecstorepb.AddC
 	}
 	m.built[key] = results
 	m.addChunksCalls++
+	ids := make([]string, 0, len(in.Chunks))
+	for _, c := range in.Chunks {
+		ids = append(ids, c.ChunkId)
+	}
+	m.addedChunkIDs = append(m.addedChunkIDs, ids)
 	if m.memToReport > 0 {
 		return &vecstorepb.AddChunksResponse{MemBytes: m.memToReport}, nil
 	}
@@ -137,6 +157,26 @@ func (m *mockVectorIndexClient) Load(_ context.Context, in *vecstorepb.LoadIndex
 	return &vecstorepb.LoadIndexResponse{}, nil
 }
 
+// LoadForAppend mirrors the real vecstore's §8.6(c) entry point: it reads a
+// persisted artifact as the starting point of a build, so the target key ends
+// up "built" (and therefore appendable) without a Build RPC. baseNtotal is
+// what a test wants the base artifact to pretend it holds.
+func (m *mockVectorIndexClient) LoadForAppend(_ context.Context, in *vecstorepb.LoadIndexForAppendRequest, _ ...grpc.CallOption) (*vecstorepb.LoadIndexForAppendResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Counted before the injectable failure: the counter means "attempts",
+	// which is what a test asserting a fallback wants to see.
+	m.loadForAppendCalls++
+	if m.loadForAppendErr != nil {
+		return nil, m.loadForAppendErr
+	}
+	m.lastLoadForAppendPath = in.Path
+	if _, ok := m.built[indexKey{kbID: in.KbId, versionID: in.VersionId}]; !ok {
+		m.built[indexKey{kbID: in.KbId, versionID: in.VersionId}] = nil
+	}
+	return &vecstorepb.LoadIndexForAppendResponse{BaseNtotal: m.loadForAppendBaseNtotal}, nil
+}
+
 func (m *mockVectorIndexClient) ExistsIndex(_ context.Context, in *vecstorepb.ExistsIndexRequest, _ ...grpc.CallOption) (*vecstorepb.ExistsIndexResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -146,6 +186,24 @@ func (m *mockVectorIndexClient) ExistsIndex(_ context.Context, in *vecstorepb.Ex
 
 func (m *mockVectorIndexClient) Reset(_ context.Context, _ *vecstorepb.ResetIndexRequest, _ ...grpc.CallOption) (*vecstorepb.ResetIndexResponse, error) {
 	return &vecstorepb.ResetIndexResponse{}, nil
+}
+
+// RemoveChunks mirrors the real vecstore's §8.6(c) deletion path: it reports
+// the requested ids as removed (a graph-free index can drop all of them) and
+// the resulting vector count.
+func (m *mockVectorIndexClient) RemoveChunks(_ context.Context, in *vecstorepb.RemoveChunksRequest, _ ...grpc.CallOption) (*vecstorepb.RemoveChunksResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.removeChunksCalls++
+	if m.removeChunksErr != nil {
+		return nil, m.removeChunksErr
+	}
+	m.removedChunkIDs = append(m.removedChunkIDs, in.ChunkIds...)
+	removed := int64(len(in.ChunkIds))
+	return &vecstorepb.RemoveChunksResponse{
+		Removed: removed,
+		Ntotal:  m.loadForAppendBaseNtotal - removed,
+	}, nil
 }
 
 // docSource is a test double providing VersionDocList + ChunkDocMapper + ChunkStore
@@ -359,10 +417,16 @@ func TestIndexManager_BuildBatchesChunks(t *testing.T) {
 	}
 }
 
-// TestIndexManager_BuildEmptyVersionStillCallsBuild 验证空版本（无 chunk）
-// 仍会调用一次 Build，在 vecstore 侧建立 (kb, version) 索引条目，避免后续
-// Search 因 "no index built or loaded" 失败。
-func TestIndexManager_BuildEmptyVersionStillCallsBuild(t *testing.T) {
+// TestIndexManager_BuildEmptyVersionDoesNotCallVecstore 固化空版本（无 chunk）
+// 的构建契约：**不**向 vecstore 发 Build、也不 Save。
+//
+// 历史：这里曾经要求"空版本仍调一次 Build 建立索引条目"，但 vecstore 的
+// AddChunksLocked 对空 batch 直接返回而不创建 Faiss 索引，于是随后的 Save
+// 必然报 "no index has been built or loaded"，被当成可重试错误后进入 5 分钟
+// 重试窗口，loading 标志长期占住，该版本上的查询全部以 index load timeout
+// 失败。空版本没有可检索内容，构建在 Go 侧即算完成，查询由 tryBruteForce
+// 直接回答空结果。
+func TestIndexManager_BuildEmptyVersionDoesNotCallVecstore(t *testing.T) {
 	vc := newMockVectorIndexClient()
 	ds := newDocSource() // 不添加任何 doc → ListDocIDs 返回空 → 无 chunk
 
@@ -394,18 +458,107 @@ func TestIndexManager_BuildEmptyVersionStillCallsBuild(t *testing.T) {
 	addCalls := vc.addChunksCalls
 	vc.mu.Unlock()
 
-	if buildCalls != 1 {
-		t.Errorf("Build calls = %d, want 1 (empty version must still Build once)", buildCalls)
+	if buildCalls != 0 {
+		t.Errorf("Build calls = %d, want 0 (an empty version must not touch the vecstore: its empty Build creates no index, so the following Save would fail forever)", buildCalls)
 	}
 	if addCalls != 0 {
 		t.Errorf("AddChunks calls = %d, want 0 (no chunks to append)", addCalls)
 	}
 }
 
-func TestIndexManager_SearchColdVersionTriggersLoad(t *testing.T) {
+// A version whose index has not been built is no longer an error: indexes are
+// built lazily (§8.6b), so a query that arrives first is answered by scanning
+// and a build is scheduled for the next one.
+func TestIndexManager_SearchUnbuiltVersionScansInsteadOfFailing(t *testing.T) {
 	vc := newMockVectorIndexClient()
 	ds := newDocSource()
 	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+	})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	results, err := im.Search(context.Background(), "kb-1", 1, []float32{0.5, 0.5}, 2)
+	if err != nil {
+		t.Fatalf("an unbuilt version must be answered, not rejected: %v", err)
+	}
+	if len(results) != 1 || results[0].ChunkID != "chunk-x" {
+		t.Fatalf("scan returned %+v, want the version's only chunk", results)
+	}
+	if results[0].Score <= 0 {
+		t.Errorf("score = %v, want a positive cosine similarity for identical directions", results[0].Score)
+	}
+	_ = vc
+}
+
+// A genuinely empty version keeps its old answer: there is nothing to scan and
+// nothing to build, so callers' existing "empty version" handling still applies.
+func TestIndexManager_SearchUnbuiltEmptyVersionStillReportsNotReady(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+	})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	_, err := im.Search(context.Background(), "kb-1", 1, []float32{0.1, 0.2}, 2)
+	if !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+		t.Fatalf("err = %v, want ErrIndexNotReady for an empty version", err)
+	}
+}
+
+// Above the size threshold, scanning costs about as much as building, so the
+// caller waits for the build instead of paying for a scan.
+func TestIndexManager_SearchLargeUnbuiltVersionDoesNotScan(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"c1", "c2"}, map[string][]float32{
+		"c1": {1, 0}, "c2": {0, 1},
+	})
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:         4,
+		LoadWaitTimeout:     50 * time.Millisecond,
+		BruteForceMaxChunks: 1, // two chunks: over the threshold
+	})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	// A scan answers immediately; waiting for a build does not. The build here
+	// never completes (the mock's Build is driven by the test), so the call
+	// reports not-ready after its wait — which is exactly what distinguishes
+	// "waited" from "scanned". Counting readChunkVector calls would not: the
+	// background build reads vectors too.
+	results, err := im.Search(context.Background(), "kb-1", 1, []float32{1, 0}, 2)
+	if len(results) != 0 {
+		t.Errorf("search returned %d results; an over-threshold version must be built, not scanned", len(results))
+	}
+	if err == nil {
+		t.Error("want an error when the build did not finish within the wait")
+	}
+}
+
+// §8.6a: deciding "is this version cold?" is a question about query
+// traffic, so the record must survive in-memory eviction and be dropped
+// only when the version/KB is really gone.
+func TestIndexManager_LastAccessTracking(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	for v := int64(1); v <= 2; v++ {
+		ds.addDoc(v, fmt.Sprintf("doc-%d", v), []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+	}
 
 	cfg := IndexManagerConfig{
 		LRUCapacity:     4,
@@ -417,14 +570,312 @@ func TestIndexManager_SearchColdVersionTriggersLoad(t *testing.T) {
 	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
 	im.readChunkVector = ds.ReadChunkVector
 
-	// Search against a version that hasn't been built
-	_, err := im.Search(context.Background(), "kb-1", 1, []float32{0.1, 0.2, 0.3}, 2)
-	if err == nil {
-		t.Fatal("expected error for unbuilt version")
+	for v := int64(1); v <= 2; v++ {
+		if err := im.TriggerBuild(context.Background(), "kb-1", v); err != nil {
+			t.Fatalf("TriggerBuild v=%d failed: %v", v, err)
+		}
 	}
-	if !errors.Is(err, stratumerrors.ErrIndexNotReady) {
-		t.Fatalf("expected ErrIndexNotReady, got %v", err)
+	time.Sleep(50 * time.Millisecond)
+
+	// A build seeds a baseline — the version is known here, but its
+	// recorded time is the build, not a query.
+	if _, ok := im.LastAccess("kb-1", 1); !ok {
+		t.Fatal("a build must give the cold policy a baseline for the version")
 	}
+	// A version this process has neither searched nor built is unknown to
+	// the policy (and therefore never reshaped).
+	if _, ok := im.LastAccess("kb-1", 99); ok {
+		t.Fatal("an unknown version must have no access record")
+	}
+
+	before := time.Now()
+	if _, err := im.Search(context.Background(), "kb-1", 1, []float32{0.5, 0.5}, 1); err != nil {
+		t.Fatalf("Search v=1 failed: %v", err)
+	}
+	after := time.Now()
+	ts, ok := im.LastAccess("kb-1", 1)
+	if !ok {
+		t.Fatal("Search must record an access for the searched version")
+	}
+	if ts.Before(before) || ts.After(after) {
+		t.Fatalf("recorded access %v outside [%v, %v]", ts, before, after)
+	}
+
+	// Eviction is an in-memory decision; the version itself is still
+	// reachable, so its access history must stay.
+	if err := im.Evict(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("Evict failed: %v", err)
+	}
+	if _, ok := im.LastAccess("kb-1", 1); !ok {
+		t.Fatal("Evict must not forget the access record")
+	}
+
+	if _, err := im.Search(context.Background(), "kb-1", 2, []float32{0.5, 0.5}, 1); err != nil {
+		t.Fatalf("Search v=2 failed: %v", err)
+	}
+
+	// Discard drops exactly one version's record.
+	if err := im.Discard(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("Discard failed: %v", err)
+	}
+	if _, ok := im.LastAccess("kb-1", 1); ok {
+		t.Fatal("Discard must forget the discarded version's access record")
+	}
+	if _, ok := im.LastAccess("kb-1", 2); !ok {
+		t.Fatal("Discard must not touch another version's access record")
+	}
+
+	// KB deletion drops every record of that KB.
+	if err := im.DeleteFilesByKB(context.Background(), "kb-1"); err != nil {
+		t.Fatalf("DeleteFilesByKB failed: %v", err)
+	}
+	if _, ok := im.LastAccess("kb-1", 2); ok {
+		t.Fatal("DeleteFilesByKB must forget the KB's access records")
+	}
+}
+
+// waitIndexLoaded blocks until (kbID, versionID)'s build has finished and
+// claimed its in-memory entry.
+func waitIndexLoaded(t *testing.T, im *IndexManagerImpl, kbID string, versionID int64) {
+	t.Helper()
+	if !waitForCondition(5*time.Second, func() bool { return im.IsLoaded(kbID, versionID) }) {
+		t.Fatalf("version %s/%d was never built", kbID, versionID)
+	}
+}
+
+// waitGraphFreeShape blocks until (kbID, versionID) is recorded as built
+// graph-free, failing the test on timeout.
+func waitGraphFreeShape(t *testing.T, im *IndexManagerImpl, kbID string, versionID int64) {
+	t.Helper()
+	key := indexKey{kbID, versionID}
+	if !waitForCondition(5*time.Second, func() bool {
+		im.mu.Lock()
+		defer im.mu.Unlock()
+		return im.builtGraphFree[key]
+	}) {
+		t.Fatalf("version %s/%d was never reshaped graph-free", kbID, versionID)
+	}
+}
+
+func waitForCondition(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}
+
+func newColdPolicyManager(t *testing.T, vc *mockVectorIndexClient, ds *docSource, cfg IndexManagerConfig) *IndexManagerImpl {
+	t.Helper()
+	im := NewIndexManager(cfg)
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+	return im
+}
+
+// §8.6a: the evaluator must pick exactly the versions that went cold,
+// leave a hot one alone, and not reshape an already graph-free version
+// again on the next sweep.
+func TestIndexManager_ColdPolicyPicksOnlyColdVersions(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	for v := int64(1); v <= 2; v++ {
+		ds.addDoc(v, fmt.Sprintf("doc-%d", v), []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+	}
+	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+		ColdThreshold:   time.Minute,
+	})
+
+	for v := int64(1); v <= 2; v++ {
+		if err := im.TriggerBuild(context.Background(), "kb-1", v); err != nil {
+			t.Fatalf("TriggerBuild v=%d failed: %v", v, err)
+		}
+	}
+	waitIndexLoaded(t, im, "kb-1", 1)
+	waitIndexLoaded(t, im, "kb-1", 2)
+
+	// Freshly built versions were never searched, but the build itself
+	// seeds their access record, so neither is cold yet.
+	if got := im.coldCandidates(time.Now()); len(got) != 0 {
+		t.Fatalf("freshly built versions must not be cold, got %v", got)
+	}
+
+	// Age version 1 by hand: it was last relevant an hour ago.
+	im.mu.Lock()
+	im.lastSearch[indexKey{"kb-1", 1}] = time.Now().Add(-time.Hour)
+	im.mu.Unlock()
+
+	got := im.coldCandidates(time.Now())
+	want := indexKey{"kb-1", 1}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("expected only %v to be cold, got %v", want, got)
+	}
+
+	im.sweepCold(context.Background(), time.Now())
+	waitGraphFreeShape(t, im, "kb-1", 1)
+
+	vc.mu.Lock()
+	quantizer := vc.lastBuildQuantizer
+	vc.mu.Unlock()
+	if quantizer != vecstorepb.QuantizerTypeProto_QUANTIZER_OFF_FLAT {
+		t.Fatalf("a cold rebuild must ask the vecstore for the graph-free variant, got %v", quantizer)
+	}
+
+	// The hot version keeps its graph.
+	im.mu.Lock()
+	hot := im.builtGraphFree[indexKey{"kb-1", 2}]
+	im.mu.Unlock()
+	if hot {
+		t.Fatal("the version that was not cold must keep its HNSW graph")
+	}
+
+	// Sweeping again must not rebuild what is already graph-free.
+	if got := im.coldCandidates(time.Now()); len(got) != 0 {
+		t.Fatalf("an already graph-free version must not be picked again, got %v", got)
+	}
+}
+
+// §8.6a: the policy is background and automatic — with a threshold
+// configured, nobody has to run the evaluator by hand.
+func TestIndexManager_ColdPolicyRunsInBackground(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
+		LRUCapacity:       4,
+		LoadWaitTimeout:   5 * time.Second,
+		ColdThreshold:     time.Nanosecond, // everything is cold immediately
+		ColdSweepInterval: 5 * time.Millisecond,
+	})
+
+	im.StartColdPolicy()
+	defer im.StopColdPolicy()
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild failed: %v", err)
+	}
+	waitGraphFreeShape(t, im, "kb-1", 1)
+}
+
+// §8.4's first real reuse point: a cold reshape is an ordinary build, so
+// it reports through the same BuildCompleteCallback that drives index
+// distribution — the replicas replace their copy of the artifact without
+// any new plumbing.
+func TestIndexManager_ColdRebuildReportsThroughBuildCallback(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+		ColdThreshold:   time.Minute,
+	})
+
+	reports := make(chan types.IndexStatus, 4)
+	im.RegisterBuildCallback(func(_ string, _ int64, status types.IndexStatus) error {
+		reports <- status
+		return nil
+	})
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild failed: %v", err)
+	}
+	waitIndexLoaded(t, im, "kb-1", 1)
+	select {
+	case <-reports: // the initial build
+	case <-time.After(5 * time.Second):
+		t.Fatal("the initial build never reported completion")
+	}
+
+	im.mu.Lock()
+	im.lastSearch[indexKey{"kb-1", 1}] = time.Now().Add(-time.Hour)
+	im.mu.Unlock()
+	im.sweepCold(context.Background(), time.Now())
+	waitGraphFreeShape(t, im, "kb-1", 1)
+
+	select {
+	case status := <-reports:
+		if status != types.IndexStatusReady {
+			t.Fatalf("a cold reshape must report READY so distribution refreshes the replicas, got %v", status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cold reshape never reported completion, so replicas would keep the hot artifact")
+	}
+}
+
+// §8.6a: a version that only ever arrived from another node must still be
+// visible to the cold policy — it is "received here", which is a baseline
+// just like "built here".
+func TestIndexManager_InstallIndexSeedsColdPolicyBaseline(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := newColdPolicyManager(t, vc, newDocSource(), IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+		IndexDataDir:    t.TempDir(),
+		ColdThreshold:   time.Minute,
+	})
+
+	// The mock vecstore, like the real one, refuses to Load an index it has
+	// never built.
+	vc.mu.Lock()
+	vc.built[indexKey{"kb-1", 7}] = nil
+	vc.mu.Unlock()
+
+	if err := im.InstallIndex(context.Background(), "kb-1", 7, []byte("index-bytes"), []byte("sidecar")); err != nil {
+		t.Fatalf("InstallIndex failed: %v", err)
+	}
+	if _, ok := im.LastAccess("kb-1", 7); !ok {
+		t.Fatal("receiving an artifact must give the cold policy a baseline for the version")
+	}
+
+	// Age it: the replica can now reshape what it received instead of
+	// keeping the shipped shape forever.
+	im.mu.Lock()
+	im.lastSearch[indexKey{"kb-1", 7}] = time.Now().Add(-time.Hour)
+	im.mu.Unlock()
+	got := im.coldCandidates(time.Now())
+	want := indexKey{"kb-1", 7}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("expected the received version to age into a cold candidate, got %v", got)
+	}
+}
+
+// The evaluator is off unless a threshold is configured, and starting or
+// stopping it is idempotent either way.
+func TestIndexManager_ColdPolicyLifecycle(t *testing.T) {
+	off := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: time.Second})
+	off.StartColdPolicy()
+	off.mu.Lock()
+	cancel := off.coldCancel
+	off.mu.Unlock()
+	if cancel != nil {
+		t.Fatal("no cold threshold configured: the evaluator must not start")
+	}
+	off.StopColdPolicy() // must be safe on a never-started policy
+
+	on := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:       4,
+		LoadWaitTimeout:   time.Second,
+		ColdThreshold:     time.Hour,
+		ColdSweepInterval: time.Hour,
+	})
+	on.StartColdPolicy()
+	on.StartColdPolicy() // idempotent: still exactly one evaluator
+	on.StopColdPolicy()
+	on.mu.Lock()
+	cancel = on.coldCancel
+	on.mu.Unlock()
+	if cancel != nil {
+		t.Fatal("StopColdPolicy must clear the evaluator handle")
+	}
+	on.StopColdPolicy() // idempotent
 }
 
 func TestIndexManager_ConcurrentSearchSameVersion(t *testing.T) {
@@ -993,5 +1444,409 @@ func TestIndexManager_DeletePreventsResurrection(t *testing.T) {
 	}
 	if im.IsLoaded("kb-2", 7) {
 		t.Error("index must not be resurrected after version deletion")
+	}
+}
+
+// --- §8.6(c) 纯追加复用 ---
+
+// writeFile writes content to path, creating parent directories. Used to put
+// a base artifact on disk by hand: the mock vecstore's Save does not touch
+// the filesystem, while appendBase treats the files as the fact.
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// appendTestCase wires an IndexManager with a parent link (v2 -> v1) and one
+// artifact directory, for the §8.6(c) tests below.
+func appendTestCase(t *testing.T, ds *docSource) (*mockVectorIndexClient, *IndexManagerImpl) {
+	t.Helper()
+	return appendTestCaseWith(t, ds, 0)
+}
+
+// appendTestCaseWith is appendTestCase with an explicit AppendMaxDeadRatio
+// (0 = the default).
+func appendTestCaseWith(t *testing.T, ds *docSource, maxDeadRatio float64) (*mockVectorIndexClient, *IndexManagerImpl) {
+	t.Helper()
+	vc := newMockVectorIndexClient()
+	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
+		LRUCapacity:        4,
+		LoadWaitTimeout:    5 * time.Second,
+		IndexDataDir:       t.TempDir(),
+		AppendMaxDeadRatio: maxDeadRatio,
+	})
+	im.SetVersionParentGetter(func(_ context.Context, _ string, versionID int64) (int64, error) {
+		if versionID == 2 {
+			return 1, nil
+		}
+		return 0, nil
+	})
+	return vc, im
+}
+
+// buildParentThenChild builds v1, puts its artifact on disk, then builds v2
+// (both graphed).
+func buildParentThenChild(t *testing.T, im *IndexManagerImpl) {
+	t.Helper()
+	buildParentThenChildWith(t, im, false)
+}
+
+// buildParentThenChildWith is buildParentThenChild with an explicit shape:
+// graphFree builds both versions through TriggerBuildGraphFree, which is what
+// puts §8.6(c)'s RemoveChunks path (graph-free shapes only) in play.
+func buildParentThenChildWith(t *testing.T, im *IndexManagerImpl, graphFree bool) {
+	t.Helper()
+	build := func(versionID int64) {
+		var err error
+		if graphFree {
+			err = im.TriggerBuildGraphFree(context.Background(), "kb-1", versionID)
+		} else {
+			err = im.TriggerBuild(context.Background(), "kb-1", versionID)
+		}
+		if err != nil {
+			t.Fatalf("TriggerBuild v%d (graph_free=%v): %v", versionID, graphFree, err)
+		}
+		waitIndexLoaded(t, im, "kb-1", versionID)
+	}
+	build(1)
+	writeFile(t, im.indexPath("kb-1", 1), "base-index")
+	writeFile(t, im.sidecarPath("kb-1", 1), "base-sidecar")
+	build(2)
+}
+
+// §8.6(c)：v2 = v1 + 新增 chunk，且 v1 的产物还在本节点 —— 这时 v2 应当以
+// v1 的产物为起点，只对 delta 追加，而不是整份重建。
+func TestIndexManager_BuildReusesParentArtifactOnPureAppend(t *testing.T) {
+	ds := newDocSource()
+	ds.addDoc(1, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-b", []string{"chunk-b"}, map[string][]float32{"chunk-b": {0.5, 0.5}})
+
+	vc, im := appendTestCase(t, ds)
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 1 // v1 holds chunk-a
+	vc.mu.Unlock()
+	buildParentThenChild(t, im)
+
+	vc.mu.Lock()
+	loadCalls := vc.loadForAppendCalls
+	basePath := vc.lastLoadForAppendPath
+	buildCalls := vc.buildCalls
+	payloads := vc.addedChunkIDs
+	vc.mu.Unlock()
+
+	if loadCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1", loadCalls)
+	}
+	if want := im.indexPath("kb-1", 1); basePath != want {
+		t.Fatalf("base path = %q, want the parent's artifact %q", basePath, want)
+	}
+	if buildCalls != 1 {
+		t.Fatalf("Build calls = %d, want 1 (v1 only): v2 must not rebuild from scratch", buildCalls)
+	}
+	if len(payloads) != 1 || len(payloads[0]) != 1 || payloads[0][0] != "chunk-b" {
+		t.Fatalf("AddChunks payloads = %v, want exactly the delta [chunk-b]", payloads)
+	}
+}
+
+// 本版本没有新增 chunk（只是父版本的子集）时不做复用：那顶多是一次拷贝，
+// 而若还删了东西，死向量会一起被继承下来。直接整份重建。
+func TestIndexManager_BuildRebuildsWhenThereIsNothingToAppend(t *testing.T) {
+	ds := newDocSource()
+	ds.addDoc(1, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(1, "doc-b", []string{"chunk-b"}, map[string][]float32{"chunk-b": {0.5, 0.5}})
+	ds.addDoc(2, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+
+	vc, im := appendTestCase(t, ds)
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 2
+	vc.mu.Unlock()
+	buildParentThenChild(t, im)
+
+	vc.mu.Lock()
+	loadCalls := vc.loadForAppendCalls
+	buildCalls := vc.buildCalls
+	vc.mu.Unlock()
+
+	if loadCalls != 0 {
+		t.Fatalf("LoadForAppend calls = %d, want 0: nothing to append, so no reuse", loadCalls)
+	}
+	if buildCalls != 2 {
+		t.Fatalf("Build calls = %d, want 2 (v1 and v2 both from scratch)", buildCalls)
+	}
+}
+
+// §8.6(c) 的删除场景（小量）：HNSW 删不掉向量，被删文档的向量会以"墓碑"形式
+// 留在产物里（查询路径会把它们的结果滤掉，代价是内存与候选名额）。删除不多时
+// 增量仍然划算 —— 这正是本轮放开的场景。
+func TestIndexManager_BuildReusesParentArtifactWhenDeletionsAreSmall(t *testing.T) {
+	ds := newDocSource()
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		ds.addDoc(1, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+	// v2 删掉 doc-e，新增 doc-f：delta = [chunk-f]，墓碑 1 个 / 共 6 个 ≈ 0.17。
+	for _, name := range []string{"a", "b", "c", "d", "f"} {
+		ds.addDoc(2, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+
+	vc, im := appendTestCase(t, ds)
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 5 // v1 holds chunk-a..e
+	vc.mu.Unlock()
+	buildParentThenChild(t, im)
+
+	vc.mu.Lock()
+	loadCalls := vc.loadForAppendCalls
+	buildCalls := vc.buildCalls
+	payloads := vc.addedChunkIDs
+	vc.mu.Unlock()
+
+	if loadCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1: a small deletion must not force a rebuild", loadCalls)
+	}
+	if buildCalls != 1 {
+		t.Fatalf("Build calls = %d, want 1 (v1 only)", buildCalls)
+	}
+	if len(payloads) != 1 || len(payloads[0]) != 1 || payloads[0][0] != "chunk-f" {
+		t.Fatalf("AddChunks payloads = %v, want exactly the delta [chunk-f]", payloads)
+	}
+}
+
+// 删除太多（墓碑占比超过阈值）时改用全量重建 —— 否则产物里大半是永远查不到
+// 的死向量，白占内存与 top-K 候选名额。
+func TestIndexManager_BuildRebuildsWhenTombstonesExceedRatio(t *testing.T) {
+	ds := newDocSource()
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		ds.addDoc(1, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+	// v2 只留 doc-a，新增 doc-f/g/h：delta 3 个，墓碑 4 个 / 共 8 个 = 0.5。
+	for _, name := range []string{"a", "f", "g", "h"} {
+		ds.addDoc(2, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+
+	vc, im := appendTestCase(t, ds)
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 5
+	vc.mu.Unlock()
+	buildParentThenChild(t, im)
+
+	vc.mu.Lock()
+	loadCalls := vc.loadForAppendCalls
+	buildCalls := vc.buildCalls
+	vc.mu.Unlock()
+
+	if loadCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1 (the base is loaded, then judged)", loadCalls)
+	}
+	if buildCalls != 2 {
+		t.Fatalf("Build calls = %d, want 2: too many tombstones must trigger a full rebuild", buildCalls)
+	}
+}
+
+// 阈值可关（1.0 = 不检查）：即使墓碑很多也照常增量。用于"重建代价远高于内存"
+// 的部署取舍。
+func TestIndexManager_BuildReusesDespiteTombstonesWhenRatioDisabled(t *testing.T) {
+	ds := newDocSource()
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		ds.addDoc(1, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+	for _, name := range []string{"a", "f", "g", "h"} {
+		ds.addDoc(2, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+
+	vc, im := appendTestCaseWith(t, ds, 1.0)
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 5
+	vc.mu.Unlock()
+	buildParentThenChild(t, im)
+
+	vc.mu.Lock()
+	buildCalls := vc.buildCalls
+	payloads := vc.addedChunkIDs
+	vc.mu.Unlock()
+
+	if buildCalls != 1 {
+		t.Fatalf("Build calls = %d, want 1 (v1 only): the ratio check is disabled", buildCalls)
+	}
+	want := map[string]bool{"chunk-f": true, "chunk-g": true, "chunk-h": true}
+	if len(payloads) != 1 || len(payloads[0]) != len(want) {
+		t.Fatalf("AddChunks payloads = %v, want one batch of the 3 delta chunks", payloads)
+	}
+	for _, id := range payloads[0] {
+		if !want[id] {
+			t.Fatalf("unexpected chunk %q in the append payload %v", id, payloads)
+		}
+	}
+}
+
+// 增量只是优化：起点加载失败时必须回退到全量构建，而不是让版本构建失败。
+func TestIndexManager_BuildFallsBackWhenAppendReuseFails(t *testing.T) {
+	ds := newDocSource()
+	ds.addDoc(1, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-b", []string{"chunk-b"}, map[string][]float32{"chunk-b": {0.5, 0.5}})
+
+	vc, im := appendTestCase(t, ds)
+	vc.mu.Lock()
+	vc.loadForAppendErr = status.Error(codes.Internal, "base artifact unreadable")
+	vc.mu.Unlock()
+
+	buildParentThenChild(t, im) // 必须仍然成功（回退到全量）
+
+	vc.mu.Lock()
+	loadCalls := vc.loadForAppendCalls
+	buildCalls := vc.buildCalls
+	vc.mu.Unlock()
+
+	if loadCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1 (one failed attempt)", loadCalls)
+	}
+	if buildCalls != 2 {
+		t.Fatalf("Build calls = %d, want 2: after the reuse failed, v2 rebuilds from scratch", buildCalls)
+	}
+	if !im.IsLoaded("kb-1", 2) {
+		t.Fatal("v2 must be READY even though the reuse failed")
+	}
+}
+
+// 重启后没有父版本的形态记录：不确定它是不是本次想要的形态，保守选择重建
+// （复用错形态会产出形态不符的产物）。
+func TestIndexManager_BuildSkipsReuseWhenParentShapeIsUnknown(t *testing.T) {
+	ds := newDocSource()
+	ds.addDoc(1, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-b", []string{"chunk-b"}, map[string][]float32{"chunk-b": {0.5, 0.5}})
+
+	vc, im := appendTestCase(t, ds)
+
+	// Put the parent's artifact on disk *without* building it here, which is
+	// what a restarted node sees.
+	writeFile(t, im.indexPath("kb-1", 1), "base-index")
+	writeFile(t, im.sidecarPath("kb-1", 1), "base-sidecar")
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 2); err != nil {
+		t.Fatalf("TriggerBuild v2: %v", err)
+	}
+	waitIndexLoaded(t, im, "kb-1", 2)
+
+	vc.mu.Lock()
+	loadCalls := vc.loadForAppendCalls
+	buildCalls := vc.buildCalls
+	vc.mu.Unlock()
+
+	if loadCalls != 0 {
+		t.Fatalf("LoadForAppend calls = %d, want 0: an unknown base shape must not be reused", loadCalls)
+	}
+	if buildCalls != 1 {
+		t.Fatalf("Build calls = %d, want 1 (v2 from scratch)", buildCalls)
+	}
+}
+
+// §8.6(c) 删除场景的快路径：**免图**形态可以真删（faiss 压缩 IndexFlatCodes），
+// 所以增量时把"本版本不再需要的 chunk"直接交给 vecstore 删掉，而不是留成墓碑
+// 等阈值触发重建。
+func TestIndexManager_BuildRemovesDeadChunksFromGraphFreeIndex(t *testing.T) {
+	ds := newDocSource()
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		ds.addDoc(1, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+	// v2 删掉 doc-e，新增 doc-f（两个版本都是免图形态）。
+	for _, name := range []string{"a", "b", "c", "d", "f"} {
+		ds.addDoc(2, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+
+	vc, im := appendTestCase(t, ds)
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 5 // v1 holds chunk-a..e
+	vc.mu.Unlock()
+	buildParentThenChildWith(t, im, true)
+
+	vc.mu.Lock()
+	removeCalls := vc.removeChunksCalls
+	removed := append([]string(nil), vc.removedChunkIDs...)
+	buildCalls := vc.buildCalls
+	payloads := vc.addedChunkIDs
+	vc.mu.Unlock()
+
+	if removeCalls != 1 {
+		t.Fatalf("RemoveChunks calls = %d, want 1 (a graph-free base can really delete)", removeCalls)
+	}
+	if len(removed) != 1 || removed[0] != "chunk-e" {
+		t.Fatalf("removed chunk ids = %v, want exactly [chunk-e] (the deletion of this step)", removed)
+	}
+	if buildCalls != 1 {
+		t.Fatalf("Build calls = %d, want 1 (v1 only): the reuse must still happen", buildCalls)
+	}
+	if len(payloads) != 1 || len(payloads[0]) != 1 || payloads[0][0] != "chunk-f" {
+		t.Fatalf("AddChunks payloads = %v, want exactly the delta [chunk-f]", payloads)
+	}
+}
+
+// 带图形态不能真删（faiss 对 HNSW 没有 remove_ids）：同样的删除场景下不调
+// RemoveChunks，墓碑留着，由阈值判定兜底。
+func TestIndexManager_BuildDoesNotRemoveChunksForGraphedIndex(t *testing.T) {
+	ds := newDocSource()
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		ds.addDoc(1, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+	for _, name := range []string{"a", "b", "c", "d", "f"} {
+		ds.addDoc(2, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+
+	vc, im := appendTestCase(t, ds)
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 5
+	vc.mu.Unlock()
+	buildParentThenChildWith(t, im, false) // graphed
+
+	vc.mu.Lock()
+	removeCalls := vc.removeChunksCalls
+	loadCalls := vc.loadForAppendCalls
+	buildCalls := vc.buildCalls
+	vc.mu.Unlock()
+
+	if removeCalls != 0 {
+		t.Fatalf("RemoveChunks calls = %d, want 0: HNSW cannot remove vectors", removeCalls)
+	}
+	if loadCalls != 1 || buildCalls != 1 {
+		t.Fatalf("LoadForAppend=%d Build=%d, want 1/1: the reuse still happens, tombstones stay", loadCalls, buildCalls)
+	}
+}
+
+// 真删失败也只是回退：删不掉（例如 vecstore 拒绝）时整份重建，版本构建照样成功。
+func TestIndexManager_BuildFallsBackWhenRemoveChunksFails(t *testing.T) {
+	ds := newDocSource()
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		ds.addDoc(1, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+	for _, name := range []string{"a", "b", "c", "d", "f"} {
+		ds.addDoc(2, "doc-"+name, []string{"chunk-" + name}, map[string][]float32{"chunk-" + name: {0.5, 0.5}})
+	}
+
+	vc, im := appendTestCase(t, ds)
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 5
+	vc.removeChunksErr = status.Error(codes.FailedPrecondition, "index is sealed")
+	vc.mu.Unlock()
+	buildParentThenChildWith(t, im, true)
+
+	vc.mu.Lock()
+	removeCalls := vc.removeChunksCalls
+	buildCalls := vc.buildCalls
+	vc.mu.Unlock()
+
+	if removeCalls != 1 {
+		t.Fatalf("RemoveChunks calls = %d, want 1 (one failed attempt)", removeCalls)
+	}
+	if buildCalls != 2 {
+		t.Fatalf("Build calls = %d, want 2: a failed removal falls back to a full rebuild", buildCalls)
+	}
+	if !im.IsLoaded("kb-1", 2) {
+		t.Fatal("v2 must be READY even though the removal failed")
 	}
 }

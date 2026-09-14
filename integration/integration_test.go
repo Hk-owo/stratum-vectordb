@@ -123,7 +123,7 @@ func newTestCluster(t testing.TB) *testCluster {
 		VersionDocList:      vd,
 	}))
 	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, vBloomStore)
-	adminSvc := service.NewAdminService(1, rn, im, ds, cs, w)
+	adminSvc := service.NewAdminService(1, rn, im, ds, cs, w, nil, nil)
 
 	srv := grpc.NewServer()
 	pb.RegisterKnowledgeBaseServiceServer(srv, kbSvc)
@@ -544,7 +544,9 @@ func TestIntegration_WarmupVersion(t *testing.T) {
 	}
 }
 
-func TestIntegration_ForkedVersions(t *testing.T) {
+// The version chain is strictly linear: a parent may have at most one child
+// (Stratum_设计文档v13.md §6).
+func TestIntegration_ForkRejected(t *testing.T) {
 	cluster := newTestCluster(t)
 	defer cluster.Close()
 	ctx := context.Background()
@@ -563,7 +565,7 @@ func TestIntegration_ForkedVersions(t *testing.T) {
 	}
 	kbID := createResp.KnowledgeBaseId
 
-	// Create two child versions from the same parent (forking).
+	// The first child of v1 is accepted.
 	verA, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
 		ParentVersionId: 1,
@@ -575,31 +577,27 @@ func TestIntegration_ForkedVersions(t *testing.T) {
 		t.Fatalf("CreateVersion branch A failed: %v", err)
 	}
 
-	verB, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
+	// A second child of the same parent must be rejected: the version chain
+	// is strictly linear (docstore.ReadAt's numeric lookup is only
+	// equivalent to the ancestor chain when there are no forks).
+	if _, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
 		ParentVersionId: 1,
 		Changes: []*pb.DocChange{
 			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-b", Content: "branch b"},
 		},
-	})
-	if err != nil {
-		t.Fatalf("CreateVersion branch B failed: %v", err)
+	}); err == nil {
+		t.Error("a second child of v1 must be rejected (strictly linear version chain)")
 	}
 
-	// Both forked versions should have distinct IDs.
-	if verA.VersionId == verB.VersionId {
-		t.Errorf("forked versions should have distinct IDs, both got %d", verA.VersionId)
-	}
-
-	// ListVersions should show the fork.
+	// Only v1 and its single child exist.
 	versions, err := cluster.KBClient.ListVersions(ctx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
 	if err != nil {
 		t.Fatalf("ListVersions failed: %v", err)
 	}
-	if len(versions.Versions) < 3 {
-		t.Errorf("expected at least 3 versions (v1 + 2 forks), got %d", len(versions.Versions))
+	if len(versions.Versions) != 2 {
+		t.Errorf("expected 2 versions (v1 + its single child v%d), got %d", verA.VersionId, len(versions.Versions))
 	}
-	t.Logf("fork: branch A = v%d, branch B = v%d", verA.VersionId, verB.VersionId)
 }
 
 func TestIntegration_ConcurrentCreateVersion(t *testing.T) {
@@ -624,7 +622,9 @@ func TestIntegration_ConcurrentCreateVersion(t *testing.T) {
 	// Set initial version to READY so it can be used as parent.
 	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady)
 
-	// Launch concurrent CreateVersion calls with the same parent (forking).
+	// Launch concurrent CreateVersion calls with the same parent. The chain
+	// is strictly linear, so exactly one may win; the other four must be
+	// rejected as a second child of the same parent.
 	var wg sync.WaitGroup
 	errs := make(chan error, 5)
 	versionIDs := make(chan int64, 5)
@@ -652,26 +652,20 @@ func TestIntegration_ConcurrentCreateVersion(t *testing.T) {
 	close(errs)
 	close(versionIDs)
 
-	for e := range errs {
-		t.Errorf("concurrent CreateVersion failed: %v", e)
-	}
-
 	ids := make([]int64, 0)
 	for id := range versionIDs {
 		ids = append(ids, id)
 	}
-
-	if len(ids) != 5 {
-		t.Errorf("expected 5 successful concurrent versions, got %d", len(ids))
+	rejected := 0
+	for range errs {
+		rejected++
 	}
 
-	// All version IDs should be distinct (forks from same parent).
-	seen := make(map[int64]bool)
-	for _, id := range ids {
-		if seen[id] {
-			t.Errorf("duplicate version ID: %d", id)
-		}
-		seen[id] = true
+	if len(ids) != 1 {
+		t.Errorf("expected exactly 1 successful concurrent version (strictly linear chain), got %d", len(ids))
+	}
+	if rejected != 4 {
+		t.Errorf("expected 4 rejected concurrent versions, got %d", rejected)
 	}
 }
 

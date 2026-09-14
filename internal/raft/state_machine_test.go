@@ -145,6 +145,28 @@ func TestStateMachine_Apply_CreateVersion_Constraints(t *testing.T) {
 	if !errors.Is(res.Err, stratumerrors.ErrInvalidParentVersion) {
 		t.Errorf("expected ErrInvalidParentVersion for PENDING parent, got %v", res.Err)
 	}
+
+	// The version chain is strictly linear: a parent that already has a
+	// child must reject a second one. docstore.ReadAt resolves documents
+	// by numeric version order, which only equals the ancestor chain when
+	// there are no forks (see Stratum_设计文档v13.md §6).
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-3"))}, w, zap.NewNop())
+	root := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3"}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: root.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+
+	first := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3", ParentVersionID: root.VersionID}, w, zap.NewNop())
+	if first.Err != nil {
+		t.Fatalf("first child of a READY root failed: %v", first.Err)
+	}
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: first.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+
+	second := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3", ParentVersionID: root.VersionID}, w, zap.NewNop())
+	if !errors.Is(second.Err, stratumerrors.ErrInvalidParentVersion) {
+		t.Errorf("expected ErrInvalidParentVersion for a second child, got %v", second.Err)
+	}
+	if second.VersionID != 0 {
+		t.Errorf("rejected create must not allocate a version ID, got %d", second.VersionID)
+	}
 }
 
 func TestStateMachine_Apply_CreateVersion_AllocatesAndWritesWAL(t *testing.T) {
@@ -156,11 +178,15 @@ func TestStateMachine_Apply_CreateVersion_AllocatesAndWritesWAL(t *testing.T) {
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
 
-	// Fork two children from v1: distinct monotonic IDs.
+	// Chained children get distinct monotonic IDs.
 	c1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	c2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	if c1.Err != nil || c2.Err != nil {
-		t.Fatalf("fork: %v, %v", c1.Err, c2.Err)
+	if c1.Err != nil {
+		t.Fatalf("first child: %v", c1.Err)
+	}
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: c1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	c2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: c1.VersionID}, w, zap.NewNop())
+	if c2.Err != nil {
+		t.Fatalf("second child: %v", c2.Err)
 	}
 	if c2.VersionID != c1.VersionID+1 {
 		t.Errorf("version IDs not monotonic: %d then %d", c1.VersionID, c2.VersionID)
@@ -452,15 +478,17 @@ func TestStateMachine_Apply_MarkVersionDeleting_Recursive(t *testing.T) {
 		t.Error("v1 must not be marked Deleting")
 	}
 
-	// New tree where the subtree contains the active version: rejected
-	// wholesale. v4 -> v5, v5 active.
-	v4 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+	// Subtree containing the active version: rejected wholesale. The chain
+	// is strictly linear, so the new branch starts at a fresh root in a new
+	// KB: v4 -> v5, v5 active.
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-2"))}, w, zap.NewNop())
+	v4 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v4.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
-	v5 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v4.VersionID}, w, zap.NewNop())
+	v5 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: v4.VersionID}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v5.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v5.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-2", TargetVersionID: v5.VersionID}, w, zap.NewNop())
 
-	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v4.VersionID}, w, zap.NewNop())
+	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-2", VersionID: v4.VersionID}, w, zap.NewNop())
 	if !errors.Is(res.Err, stratumerrors.ErrVersionIsActive) {
 		t.Errorf("expected ErrVersionIsActive for subtree containing active v%d, got %v", v5.VersionID, res.Err)
 	}
@@ -468,18 +496,21 @@ func TestStateMachine_Apply_MarkVersionDeleting_Recursive(t *testing.T) {
 		t.Error("rejected deletion must not mark any version")
 	}
 
-	// PENDING version anywhere in the subtree rejects the whole deletion.
-	// v6 -> v7 (v7 stays PENDING), v1 active again.
-	v6 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
+	// A PENDING version inside the removed set rejects the whole deletion.
+	// kb-3: v6 -> v7 -> v8 (v8 stays PENDING), v6 active.
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-3"))}, w, zap.NewNop())
+	v6 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v6.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
-	v7 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v6.VersionID}, w, zap.NewNop()) // stays PENDING
-	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
+	v7 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3", ParentVersionID: v6.VersionID}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v7.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	v8 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3", ParentVersionID: v7.VersionID}, w, zap.NewNop()) // stays PENDING
+	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-3", TargetVersionID: v6.VersionID}, w, zap.NewNop())
 
-	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v6.VersionID}, w, zap.NewNop())
+	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-3", VersionID: v7.VersionID}, w, zap.NewNop())
 	if !errors.Is(res.Err, stratumerrors.ErrVersionPending) {
-		t.Errorf("expected ErrVersionPending for subtree containing pending v%d, got %v", v7.VersionID, res.Err)
+		t.Errorf("expected ErrVersionPending for subtree containing pending v%d, got %v", v8.VersionID, res.Err)
 	}
-	if sm.versions[v6.VersionID].Deleting || sm.versions[v7.VersionID].Deleting {
+	if sm.versions[v7.VersionID].Deleting || sm.versions[v8.VersionID].Deleting {
 		t.Error("rejected deletion must not mark any version")
 	}
 }
@@ -611,7 +642,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_SingleSplicesChildren(t *testing
 	ctx := context.Background()
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
-	// v1 -> v2, then v2 forks into v3 and v4. v1 is active.
+	// v1 -> v2 -> v3 -> v4 (strictly linear). v1 is active.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
@@ -619,7 +650,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_SingleSplicesChildren(t *testing
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
 	v3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
-	v4 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
+	v4 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v3.VersionID}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v4.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
 
 	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID, Mode: types.VersionDeleteSingle}, w, zap.NewNop())
@@ -632,10 +663,15 @@ func TestStateMachine_Apply_MarkVersionDeleting_SingleSplicesChildren(t *testing
 	if !sm.versions[v2.VersionID].Deleting {
 		t.Error("v2 should be marked Deleting")
 	}
+	// Only the direct child is re-parented onto v1; the grandchild v4 keeps
+	// its own parent v3 (a linear chain has exactly one child per version).
+	if got := sm.versions[v3.VersionID].ParentVersionID; got != v1.VersionID {
+		t.Errorf("child v%d parent = %d, want %d (spliced onto v1)", v3.VersionID, got, v1.VersionID)
+	}
+	if got := sm.versions[v4.VersionID].ParentVersionID; got != v3.VersionID {
+		t.Errorf("grandchild v%d parent = %d, want %d", v4.VersionID, got, v3.VersionID)
+	}
 	for _, child := range []int64{v3.VersionID, v4.VersionID} {
-		if got := sm.versions[child].ParentVersionID; got != v1.VersionID {
-			t.Errorf("child v%d parent = %d, want %d (spliced onto v1)", child, got, v1.VersionID)
-		}
 		if sm.versions[child].Deleting {
 			t.Errorf("child v%d must not be marked Deleting", child)
 		}
@@ -661,24 +697,23 @@ func TestStateMachine_Apply_MarkVersionDeleting_Ancestors(t *testing.T) {
 	ctx := context.Background()
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
-	// v1 -> v2 -> v3, plus a sibling branch v1 -> v5. v3 is active.
+	// v1 -> v2 -> v3 (strictly linear, so no sibling branches exist).
+	// v3 is active.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
 	v3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
-	v5 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v5.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v3.VersionID}, w, zap.NewNop())
 
 	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v3.VersionID, Mode: types.VersionDeleteAncestors}, w, zap.NewNop())
 	if res.Err != nil {
 		t.Fatalf("ANCESTORS delete of v%d: %v", v3.VersionID, res.Err)
 	}
-	want := map[int64]bool{v1.VersionID: true, v2.VersionID: true, v5.VersionID: true}
+	want := map[int64]bool{v1.VersionID: true, v2.VersionID: true}
 	if len(res.DeletedVersionIDs) != len(want) {
-		t.Errorf("deleted set = %v, want the %d ancestors + siblings", res.DeletedVersionIDs, len(want))
+		t.Errorf("deleted set = %v, want the %d ancestors", res.DeletedVersionIDs, len(want))
 	}
 	for _, id := range res.DeletedVersionIDs {
 		if !want[id] {
@@ -788,23 +823,22 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorsReplayAndPending(t *tes
 		t.Error("replay must leave the new base untouched")
 	}
 
-	// A PENDING version on a swept-up sibling branch rejects the whole call.
-	// kb-2: o1 -> o2 -> o3, plus sibling o1 -> o4 (left PENDING); o3 active.
+	// A PENDING survivor whose parent is in the removed set rejects the
+	// whole call (with a linear chain the PENDING version is always the
+	// leaf, so it is the survivor, not a swept-up sibling branch).
+	// kb-2: o1 -> o2 -> o3, o3 left PENDING and active.
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-2"))}, w, zap.NewNop())
 	o1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: o1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
 	o2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: o1.VersionID}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: o2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
-	o3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: o2.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: o3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
-	o4 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: o1.VersionID}, w, zap.NewNop()) // stays PENDING
-	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-2", TargetVersionID: o3.VersionID}, w, zap.NewNop())
+	o3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: o2.VersionID}, w, zap.NewNop()) // stays PENDING
 
 	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-2", VersionID: o3.VersionID, Mode: types.VersionDeleteAncestors}, w, zap.NewNop())
 	if !errors.Is(res.Err, stratumerrors.ErrVersionPending) {
-		t.Errorf("ANCESTORS over a PENDING sibling v%d: expected ErrVersionPending, got %v", o4.VersionID, res.Err)
+		t.Errorf("ANCESTORS with a PENDING survivor v%d: expected ErrVersionPending, got %v", o3.VersionID, res.Err)
 	}
-	for _, vid := range []int64{o1.VersionID, o2.VersionID, o3.VersionID, o4.VersionID} {
+	for _, vid := range []int64{o1.VersionID, o2.VersionID, o3.VersionID} {
 		if sm.versions[vid].Deleting {
 			t.Errorf("rejected deletion must not mark v%d Deleting", vid)
 		}
@@ -910,10 +944,11 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorsHealsBrokenChain(t *tes
 func TestMockAndStateMachine_VersionDeleteModesAgree(t *testing.T) {
 	ctx := context.Background()
 
-	// build wires one identical fixture — v1 -> v2 -> v3 plus a sibling
-	// subtree v1 -> v4, all READY (unless pendingLeaf keeps v3 PENDING),
-	// v3 active — into a fresh state machine and a fresh MockRaftNode, and
-	// returns the version IDs by name.
+	// build wires one identical fixture — the strictly linear chain
+	// v1 -> v2 -> v3 -> v4, all READY (unless pendingLeaf keeps v3 PENDING,
+	// in which case the chain stops at v3 since a PENDING version cannot
+	// have children), v3 active — into a fresh state machine and a fresh
+	// MockRaftNode, and returns the version IDs by name.
 	build := func(t *testing.T, pendingLeaf bool) (*stateMachine, *wal.MockWAL, *MockRaftNode, map[string]int64) {
 		t.Helper()
 		sm, w := newTestSM(t)
@@ -953,7 +988,9 @@ func TestMockAndStateMachine_VersionDeleteModesAgree(t *testing.T) {
 		v1 := create("v1", 0, true)
 		v2 := create("v2", v1, true)
 		v3 := create("v3", v2, !pendingLeaf)
-		create("v4", v1, true)
+		if !pendingLeaf {
+			create("v4", v3, true)
+		}
 
 		sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v3}, w, zap.NewNop())
 		if err := mock.ProposeRollback(ctx, "kb-1", v3); err != nil {
@@ -988,14 +1025,15 @@ func TestMockAndStateMachine_VersionDeleteModesAgree(t *testing.T) {
 			sm, w, mock, ids := build(t, tc.pendingLeaf)
 			target := ids[tc.target]
 
-			// expectedParent is the fixture's version tree (v1 -> v2 -> v3
-			// plus sibling v1 -> v4), used to pin that a rejected command
+			// expectedParent is the fixture's version tree (the linear
+			// chain v1 -> v2 -> v3 -> v4; when pendingLeaf stops the chain
+			// at v3 there is no v4), used to pin that a rejected command
 			// did not rewire anything.
 			expectedParent := map[int64]int64{
 				ids["v1"]: 0,
 				ids["v2"]: ids["v1"],
 				ids["v3"]: ids["v2"],
-				ids["v4"]: ids["v1"],
+				ids["v4"]: ids["v3"],
 			}
 			// assertStatesAgree pins that MockRaftNode and the state machine
 			// ended up with identical metadata for every fixture version.

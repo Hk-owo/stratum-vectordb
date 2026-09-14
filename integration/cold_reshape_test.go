@@ -1,0 +1,206 @@
+package integration_test
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"stratum/internal/raft"
+	"stratum/internal/sync"
+
+	"go.uber.org/zap"
+
+	pb "stratum/api/proto/stratum"
+)
+
+// waitUntil polls cond every 50ms until it holds or the timeout passes.
+func waitUntil(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// wireSyncPullDataOnly is wireSyncPull with the §8.6b data-only pull: a node
+// fetches the version's documents and chunks but never builds an index of its
+// own, so its only route to an index is the leader's §8.4 distribution — which
+// is exactly the artifact the cold reshape later replaces.
+//
+// The distinction matters for the cold-reshape test for a second reason: a node
+// that builds on its own has its (kb, version) entry marked "loading" for as
+// long as that build keeps retrying, and the cold evaluator deliberately leaves
+// such a version alone (§8.6a: the build in flight decides its own shape). With
+// data-only pulls the reshaping node is never stuck behind its own build.
+func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) {
+	t.Helper()
+	syncFollower := sync.NewFollower(n.docStore, n.chunkDoc, n.versionDoc, n.chunkStore, n.indexMgr)
+	n.raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
+		ctx := context.Background()
+		deadline := time.Now().Add(20 * time.Second)
+		backoff := 50 * time.Millisecond
+		for {
+			if addr := leaderAddrOf(ctx, n, addrByID); addr != "" {
+				_ = syncFollower.PullVersionData(ctx, addr, kbID, versionID)
+			}
+			// v1 arrives with the KB itself, so it needs only one pull.
+			if versionID <= 1 || verifyFollowerPull(ctx, n, kbID, versionID) {
+				return
+			}
+			if time.Now().After(deadline) {
+				n.logger.Warn("data-only pull did not converge",
+					zap.Int64("node_id", n.nodeID), zap.String("kb_id", kbID),
+					zap.Int64("version_id", versionID))
+				return
+			}
+			time.Sleep(backoff)
+			if backoff < time.Second {
+				backoff *= 2
+			}
+		}
+	})
+}
+
+// TestRealStack_ColdRebuildRedistributesTheArtifact is the cluster-level proof
+// of the last piece of Stratum_设计文档v13.md §8.6(a): a version that has gone
+// cold is rebuilt in the graph-free shape, and the replicas end up serving that
+// rebuilt artifact — §8.4's callback chain reused, with no new channel.
+//
+// Only node 1 runs the cold evaluator; node 2 never reshapes anything by
+// itself. That is what makes the final byte-for-byte equality meaningful: node
+// 2's index can only have changed because node 1 shipped its reshaped artifact,
+// the same argument TestRealStack_IndexDistributionInstallsTheBuildersArtifact
+// makes for the first distribution.
+//
+// The threshold is set well above the time the first distribution needs, so the
+// phases are ordered: the version is graphed and distributed, then it ages
+// (nobody queries it, which is exactly what makes it cold), then the reshape is
+// distributed too.
+func TestRealStack_ColdRebuildRedistributesTheArtifact(t *testing.T) {
+	vecAddrs := [2]string{
+		startVecstoreServerForTest(t),
+		startVecstoreServerForTest(t),
+	}
+	// A few more dimensions than the other stacks use, so the graph the
+	// reshape removes is a meaningful part of the file.
+	embedURL := startMockEmbedForTest(t, 16)
+
+	var raftAddrs, grpcAddrs [2]string
+	for i := range raftAddrs {
+		raftAddrs[i] = freeLoopbackAddr(t)
+		grpcAddrs[i] = freeLoopbackAddr(t)
+	}
+	peers := []raft.PeerConfig{
+		{ID: 1, RaftAddr: raftAddrs[0], ServiceAddr: grpcAddrs[0]},
+		{ID: 2, RaftAddr: raftAddrs[1], ServiceAddr: grpcAddrs[1]},
+	}
+	addrByID := map[int64]string{1: grpcAddrs[0], 2: grpcAddrs[1]}
+
+	baseDirs := [2]string{t.TempDir(), t.TempDir()}
+	var nodes [2]*realNode
+	for i := 0; i < 2; i++ {
+		cfg := realNodeConfig{}
+		if i == 0 {
+			// Only node 1 reshapes; see the doc comment. The threshold is
+			// generous enough that the first distribution is long settled
+			// before anything is considered cold.
+			cfg.coldThreshold = 10 * time.Second
+			cfg.coldSweepInterval = 200 * time.Millisecond
+		}
+		nodes[i] = newRealNodeWithAddrsAndDirOpts(t, int64(i+1), peers, vecAddrs[i], embedURL,
+			raftAddrs[i], grpcAddrs[i], baseDirs[i], cfg)
+		wireSyncPullDataOnly(t, nodes[i], addrByID)
+	}
+
+	ctx := context.Background()
+	leader := waitForLeader(t, nodes[0], nodes[1])
+	t.Logf("leader = node %d", leader.nodeID)
+
+	kbID, v1 := leader.createTestKB(ctx, "cold-reshape-e2e")
+	changes := make([]*pb.DocChange, 0, 20)
+	for i := 0; i < 20; i++ {
+		changes = append(changes, &pb.DocChange{
+			Op:      pb.ChangeOp_CHANGE_OP_ADD,
+			DocId:   fmt.Sprintf("doc-%d", i),
+			Content: fmt.Sprintf("alpha beta gamma delta %d", i),
+		})
+	}
+	resp, err := leader.KB.CreateVersion(ctx, &pb.CreateVersionRequest{
+		KnowledgeBaseId: kbID,
+		ParentVersionId: v1,
+		Changes:         changes,
+	})
+	if err != nil {
+		t.Fatalf("CreateVersion: %v", err)
+	}
+	versionID := resp.GetVersionId()
+	t.Logf("created %s v%d", kbID, versionID)
+
+	// Node 1's artifact is where the cold policy starts counting: it was just
+	// built or received, so the threshold is still ahead of us.
+	if data, _ := waitForIndex(t, baseDirs[0], kbID, versionID, 60*time.Second); data == nil {
+		t.Fatal("node 1 never got an index for the version")
+	}
+
+	// Both nodes must agree on the first (graphed) artifact before we start
+	// watching for a change: otherwise a late independent build could be
+	// mistaken for the reshape.
+	if !waitUntil(30*time.Second, func() bool {
+		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
+		b, _ := indexFileOf(baseDirs[1], kbID, versionID)
+		return len(a) > 0 && bytes.Equal(a, b)
+	}) {
+		t.Fatal("the two nodes never converged on the first artifact")
+	}
+	graphed, _ := indexFileOf(baseDirs[0], kbID, versionID)
+	t.Logf("graphed index: %d bytes (both nodes)", len(graphed))
+
+	// The version goes cold on node 1 and is rebuilt graph-free. The artifact
+	// must differ from, and be smaller than, the graphed one: what the reshape
+	// drops is precisely the HNSW graph (edges + level arrays), which the
+	// graph-free form does not carry.
+	if !waitUntil(90*time.Second, func() bool {
+		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
+		return len(a) > 0 && !bytes.Equal(a, graphed) && len(a) < len(graphed)
+	}) {
+		now, _ := indexFileOf(baseDirs[0], kbID, versionID)
+		other, _ := indexFileOf(baseDirs[1], kbID, versionID)
+		t.Fatalf("node 1 never reshaped the cold version into a smaller artifact: n1=%d n2=%d graphed=%d",
+			len(now), len(other), len(graphed))
+	}
+	reshaped, _ := indexFileOf(baseDirs[0], kbID, versionID)
+	t.Logf("reshaped index: %d bytes (graphed was %d)", len(reshaped), len(graphed))
+
+	// Node 2 never reshapes on its own, so it can only hold these bytes if
+	// node 1 shipped them: §8.4 reused for the reshape.
+	if !waitUntil(60*time.Second, func() bool {
+		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
+		b, _ := indexFileOf(baseDirs[1], kbID, versionID)
+		return bytes.Equal(a, reshaped) && bytes.Equal(b, reshaped)
+	}) {
+		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
+		b, _ := indexFileOf(baseDirs[1], kbID, versionID)
+		t.Fatalf("the replica never installed the reshaped artifact: node 1 %d bytes, node 2 %d bytes, reshaped %d",
+			len(a), len(b), len(reshaped))
+	}
+
+	// The reshaped version must still answer queries on both nodes: the
+	// graph-free form changes the index type, not the answers' availability.
+	vec := make([]float32, 16)
+	vec[0] = 1
+	for _, n := range nodes {
+		results := n.queryTolerant(ctx, kbID, versionID, vec, 5)
+		if len(results) == 0 {
+			t.Errorf("node %d returned no results for the reshaped version", n.nodeID)
+		} else {
+			t.Logf("node %d answered %d results after the reshape (top doc %s)", n.nodeID, len(results), results[0].DocId)
+		}
+	}
+}

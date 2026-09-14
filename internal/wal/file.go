@@ -204,6 +204,10 @@ type FileWAL struct {
 	mu   sync.Mutex
 	file *os.File
 
+	// path is where the log lives. Compaction needs it: it writes a rewritten log
+	// beside the original and swaps it in with an atomic rename.
+	path string
+
 	// idempotency / pending-state tracking, rebuilt from the file on Open
 	// and kept up to date on every write thereafter.
 	versionIDsWritten   map[int64]bool
@@ -214,13 +218,18 @@ type FileWAL struct {
 	versionDeleteDone   map[int64]bool
 
 	// beginDataByVersion maps each versionID whose VERSION_ID record is in
-	// the log to the replay input of the BEGIN record that preceded it.
-	// Populated during rebuildIndex (sequential scan: the most recent
-	// unpaired BEGIN binds to the next VERSION_ID; correctness relies on
-	// the coordinator serializing each CreateVersion transaction end to
-	// end, so no other BEGIN can interleave) and consulted by Recover to
-	// fill PendingRecord.ParentVersionID / Changes.
+	// the log to the replay input of the BEGIN record that preceded it. The
+	// most recent unpaired BEGIN binds to the next VERSION_ID; correctness
+	// relies on the coordinator serializing each CreateVersion transaction end
+	// to end, so no other BEGIN can interleave. Rebuilt by rebuildIndex on
+	// Open and kept current by WriteBegin/WriteVersionID, so it also answers
+	// ChangesFor (a lagging peer's backfill request, §7.5) for versions
+	// written since this process started — not only for those on disk at Open.
 	beginDataByVersion map[int64]beginData
+
+	// pendingBegin is the BEGIN record still awaiting its VERSION_ID — the
+	// runtime counterpart of rebuildIndex's local pendingBegin.
+	pendingBegin *beginData
 
 	replayCounters map[replayKey]int
 }
@@ -236,6 +245,7 @@ func NewFileWAL(path string) (*FileWAL, error) {
 
 	w := &FileWAL{
 		file:                f,
+		path:                path,
 		versionIDsWritten:   make(map[int64]bool),
 		committedVersions:   make(map[int64]bool),
 		deleteMarked:        make(map[string]bool),
@@ -261,6 +271,27 @@ func (w *FileWAL) Close() error {
 	return w.file.Close()
 }
 
+// KnowledgeBases reports which knowledge bases this log holds recorded changes for.
+// Reclaiming works on the log's contents, not on what the node currently has data
+// for, so this — not the storage layer's cursor map — is the right scope for a
+// compaction pass: a knowledge base whose data was dropped still has log records to
+// drop, and one the node never wrote has none.
+func (w *FileWAL) KnowledgeBases() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	seen := make(map[string]bool, len(w.beginDataByVersion))
+	for _, begin := range w.beginDataByVersion {
+		if begin.kbID != "" {
+			seen[begin.kbID] = true
+		}
+	}
+	kbs := make([]string, 0, len(seen))
+	for kbID := range seen {
+		kbs = append(kbs, kbID)
+	}
+	return kbs
+}
+
 // rebuildIndex scans the file from the start, applying each valid record
 // to the in-memory idempotency maps, and leaves the file positioned at
 // the end of the last valid (complete, checksum-verified) record —
@@ -273,20 +304,37 @@ func (w *FileWAL) rebuildIndex() error {
 	}
 	r := bufio.NewReader(w.file)
 
+	// BEGIN and VERSION_ID are paired regardless of which of the two comes
+	// first in the file; both orders occur. The original write path wrote
+	// BEGIN first, so that an already-allocated version always had its replay
+	// input on disk. The split write path of the control/data separation
+	// (Stratum_设计文档v13.md §7.12) allocates the version ID first and writes
+	// BEGIN as part of the storage layer's own transaction. The write path
+	// serializes transactions, so at most one of the two is ever unpaired and
+	// the pairing stays unambiguous.
 	var validEnd int64
-	var lastBegin *beginData // most recent unpaired BEGIN, binds to the next VERSION_ID
+	var pendingBegin *beginData // BEGIN seen, waiting for its VERSION_ID
+	var pendingVersionID int64  // VERSION_ID seen, waiting for its BEGIN
 	for {
 		rec, recLen, err := readRecord(r)
 		if err != nil {
 			break // incomplete/corrupt trailing record, or clean EOF: stop here
 		}
-		if rec.kind == recordTypeBegin {
+		switch rec.kind {
+		case recordTypeBegin:
 			bd := rec.begin
-			lastBegin = &bd
-		} else if rec.kind == recordTypeVersionID {
-			if lastBegin != nil {
-				w.beginDataByVersion[rec.versionID] = *lastBegin
-				lastBegin = nil
+			if pendingVersionID != 0 {
+				w.beginDataByVersion[pendingVersionID] = bd
+				pendingVersionID = 0
+			} else {
+				pendingBegin = &bd
+			}
+		case recordTypeVersionID:
+			if pendingBegin != nil {
+				w.beginDataByVersion[rec.versionID] = *pendingBegin
+				pendingBegin = nil
+			} else {
+				pendingVersionID = rec.versionID
 			}
 		}
 		w.applyRecordLocked(rec)
@@ -439,6 +487,11 @@ func (w *FileWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int
 	if err := w.writeRecordLocked(recordTypeBegin, encodeBeginPayload(kbID, parentVersionID, changes)); err != nil {
 		return fmt.Errorf("wal: WriteBegin: %w", err)
 	}
+	// Remember it for the VERSION_ID that will bind to it (and, through
+	// beginDataByVersion, for a peer's later backfill request). Only after the
+	// record is durably written: an in-memory binding for a record that failed
+	// to land would be a lie.
+	w.pendingBegin = &beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}
 	return nil
 }
 
@@ -454,6 +507,14 @@ func (w *FileWAL) WriteVersionID(_ context.Context, versionID int64) error {
 		return fmt.Errorf("wal: WriteVersionID(%d): %w", versionID, err)
 	}
 	w.versionIDsWritten[versionID] = true
+	// Bind the BEGIN record this transaction started with — the same pairing
+	// rebuildIndex performs when it replays the pair from disk. Without this, a
+	// version written by this process could not answer a peer's backfill
+	// request until the next restart.
+	if w.pendingBegin != nil {
+		w.beginDataByVersion[versionID] = *w.pendingBegin
+		w.pendingBegin = nil
+	}
 	return nil
 }
 
@@ -536,6 +597,52 @@ func versionDeletePayload(versionID int64, kbID string) []byte {
 	binary.BigEndian.PutUint64(payload[:8], uint64(versionID))
 	copy(payload[8:], kbID)
 	return payload
+}
+
+// ChangesFor returns the replay input recorded for (kbID, versionID): the
+// changes its writer applied. It answers a lagging peer's backfill request
+// (Stratum_设计文档v13.md §7.5) with the same BEGIN record crash recovery
+// replays — one record, two readers. ok is false when no BEGIN record is bound
+// to that version: never written on this node (a follower that merely applied
+// the leader's log writes none), already reclaimed, or predating the format.
+func (w *FileWAL) ChangesFor(_ context.Context, kbID string, versionID int64) ([]types.DocChange, bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	bd, ok := w.beginDataByVersion[versionID]
+	if !ok || bd.kbID != kbID {
+		return nil, false, nil
+	}
+	return bd.changes, true, nil
+}
+
+// VersionDelta is one version's recorded replay input: the changes its writer
+// applied, plus the parent they were applied to. The parent is not decoration — a
+// version's document set is derived from its parent's set plus its own changes
+// (writeVersionDocList) — so a peer replaying the delta needs the authoritative
+// value rather than one inferred from the (currently linear) version chain.
+type VersionDelta struct {
+	VersionID       int64
+	ParentVersionID int64
+	Changes         []types.DocChange
+}
+
+// ChangesInRange returns the recorded replay input for every version in
+// (fromExclusive, toInclusive] this node wrote, keyed by version ID. A version
+// with no bound BEGIN record is absent rather than present-and-empty: a lagging
+// peer has to see the gap so it can fall back to a full state transfer (§7.5)
+// instead of applying a version as if nothing had changed.
+func (w *FileWAL) ChangesInRange(_ context.Context, kbID string, fromExclusive, toInclusive int64) (map[int64]VersionDelta, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	out := make(map[int64]VersionDelta)
+	for versionID, bd := range w.beginDataByVersion {
+		if versionID > fromExclusive && versionID <= toInclusive && bd.kbID == kbID {
+			out[versionID] = VersionDelta{VersionID: versionID, ParentVersionID: bd.parentVersionID, Changes: bd.changes}
+		}
+	}
+	return out, nil
 }
 
 // Recover returns every PendingRecord implied by the current in-memory
