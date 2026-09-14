@@ -94,7 +94,7 @@ type IndexReader interface {
 // replica records it, so a later reader knows where the data is instead of
 // having to ask the leader. *sync.ConfirmBroadcaster implements it.
 type WriteConfirmer interface {
-	ConfirmVersionWrite(ctx context.Context, peerAddr, kbID string, versionID int64, sourceAddr string) error
+	ConfirmVersionWrite(ctx context.Context, peerAddr, kbID string, versionID int64, sourceAddr string, empty bool) error
 }
 
 // VersionPresenceQuerier asks a peer whether it holds a version's data
@@ -360,9 +360,15 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 	}
 
 	if versionID <= 1 {
-		// Initial version: created together with the knowledge base and
-		// carrying no document changes, so no digest is ever committed for
-		// it. Pull once (a no-op stream) and done.
+		// Version 1: created together with the knowledge base and carrying no
+		// document changes, so no digest is ever committed for it. Pull once (a
+		// no-op stream) and done.
+		//
+		// This is only the FAST PATH for the case where the id really is 1.
+		// Version ids increase globally, so a knowledge base created later gets
+		// an initial version numbered far above 1 — that one is caught by the
+		// empty-version check inside the pull loop below, which is what makes
+		// "a new knowledge base's first query" work at all.
 		if err := d.puller.PullVersion(ctx, addr, kbID, versionID); err != nil {
 			return err
 		}
@@ -406,6 +412,20 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 		} else if d.verify(ctx, kbID, versionID) {
 			d.advanceLocalVersion(kbID, versionID)
 			return nil
+		} else if empty, emptyErr := d.versionHasNoDocuments(ctx, kbID, versionID); emptyErr == nil && empty {
+			// The pull succeeded and the version holds no documents — so the
+			// empty set IS its content. Waiting for a digest here means waiting
+			// forever: a writer never commits one for a version with no document
+			// set. The cursor would stay below a version this node in fact
+			// holds, which is what made a freshly created knowledge base answer
+			// "local history reaches version 0" to the station's freshness
+			// check (§9.3(2)) and refuse the query.
+			//
+			// Gated on the pull having SUCCEEDED just above: a pull that failed
+			// never reaches here, so a broken transfer can never be mistaken for
+			// an empty version.
+			d.advanceLocalVersion(kbID, versionID)
+			return nil
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf(
@@ -417,6 +437,33 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 			backoff *= 2
 		}
 	}
+}
+
+// versionHasNoDocuments reports whether this node holds no documents for the
+// version — so the empty set IS the version's content.
+//
+// Why it needs saying out loud: §7.5's pull loop waits for the writer's
+// document-set digest to match, and a version created with no changes never gets
+// one (there is no document set to hash). Left alone, the loop spins out its
+// whole timeout while the node's contiguous cursor stays below a version it in
+// fact holds. A freshly created knowledge base is exactly that state, and the
+// station's freshness check (§9.3(2)) reads the cursor — so its first query was
+// refused with "local history reaches version 0" depending on whether the route
+// table had refreshed yet.
+//
+// Conservative by construction: with no digest source it answers "no", so a gap
+// here degrades to the previous behaviour (wait, then fail) instead of advancing
+// the cursor on evidence it does not have. Callers must have a successful pull
+// behind them before trusting the answer.
+func (d *LocalDataPlane) versionHasNoDocuments(ctx context.Context, kbID string, versionID int64) (bool, error) {
+	if d.digest == nil {
+		return false, nil
+	}
+	got, err := d.digest.DigestOf(ctx, kbID, versionID)
+	if err != nil {
+		return false, err
+	}
+	return got == stratinternalsync.ComputeDocIDSetHash(nil), nil
 }
 
 // FetchVersionData brings the version's data here without building its index.
@@ -708,7 +755,12 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 		return err
 	}
 	d.reportAndSchedule(ctx, kbID, versionID, docIDs)
-	d.broadcastConfirmation(kbID, versionID)
+	// len(docIDs) == 0 is the whole reason the announcement carries a flag: a
+	// version with no documents is never fanned out (fanOut above sends
+	// nothing), so replicas that did NOT coordinate it have no other way to
+	// learn it exists — and their cursors would stay behind it, which the
+	// station reads as "stale" (§9.3(2)).
+	d.broadcastConfirmation(kbID, versionID, len(docIDs) == 0)
 	return nil
 }
 
@@ -754,7 +806,7 @@ func (d *LocalDataPlane) PushIndexToReplicas(ctx context.Context, kbID string, v
 // for the same reason the cleanup broadcast does (§10.6): the coordinator does
 // not track which push succeeded, and a stray confirmation to a replica that
 // never received the data is harmless.
-func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64) {
+func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64, empty bool) {
 	if d.confirmer == nil || d.resolveReplicas == nil {
 		return
 	}
@@ -770,7 +822,11 @@ func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64) {
 			// The confirmation doubles as the §8.5 announcement: it carries this
 			// node's own address so the peer records where the version's data
 			// is (see DataSourceRegistry). Empty means "announce nothing".
-			if err := d.confirmer.ConfirmVersionWrite(ctx, peer, kbID, versionID, d.selfDataSyncAddr); err != nil {
+			//
+			// empty tells the peer the version has no documents, so it can move
+			// its own cursor over it without fetching anything — the only cue
+			// such a version produces, since it is never fanned out.
+			if err := d.confirmer.ConfirmVersionWrite(ctx, peer, kbID, versionID, d.selfDataSyncAddr, empty); err != nil {
 				d.logger.Warn("plane: confirm version write",
 					zap.String("peer", peer), zap.String("kb_id", kbID),
 					zap.Int64("version_id", versionID), zap.Error(err))

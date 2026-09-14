@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	pb "stratum/api/proto/stratum"
 )
 
 // regKey identifies one (§8.5) announcement: a version of a knowledge base.
@@ -113,7 +115,7 @@ func TestConfirmVersionWrite_CarriesWriterAddressIntoTheAnnouncementTable(t *tes
 	)
 
 	broadcaster := NewConfirmBroadcaster(PresenceCheckerConfig{})
-	if err := broadcaster.ConfirmVersionWrite(ctx, addr, "kb-1", 42, "writer:7001"); err != nil {
+	if err := broadcaster.ConfirmVersionWrite(ctx, addr, "kb-1", 42, "writer:7001", false); err != nil {
 		t.Fatalf("ConfirmVersionWrite: %v", err)
 	}
 
@@ -141,7 +143,7 @@ func TestConfirmVersionWrite_EmptyWriterAddressIsNotRecorded(t *testing.T) {
 	_, _, addr := startPushServer(t, 7, WithDataSourceRegistry(reg))
 
 	broadcaster := NewConfirmBroadcaster(PresenceCheckerConfig{})
-	if err := broadcaster.ConfirmVersionWrite(ctx, addr, "kb-1", 42, ""); err != nil {
+	if err := broadcaster.ConfirmVersionWrite(ctx, addr, "kb-1", 42, "", false); err != nil {
 		t.Fatalf("ConfirmVersionWrite: %v", err)
 	}
 
@@ -165,7 +167,9 @@ func TestDeleteVersionData_WithdrawsTheAnnouncement(t *testing.T) {
 	)
 
 	broadcaster := NewConfirmBroadcaster(PresenceCheckerConfig{})
-	if err := broadcaster.ConfirmVersionWrite(ctx, addr, "kb-1", 42, "writer:7001"); err != nil {
+	// empty=false: this test is about the §8.5 announcement travelling through
+	// proto into the table, not about the empty-version flag.
+	if err := broadcaster.ConfirmVersionWrite(ctx, addr, "kb-1", 42, "writer:7001", false); err != nil {
 		t.Fatalf("ConfirmVersionWrite: %v", err)
 	}
 	if _, ok := reg.lookup("kb-1", 42); !ok {
@@ -182,5 +186,72 @@ func TestDeleteVersionData_WithdrawsTheAnnouncement(t *testing.T) {
 	}
 	if len(dropper.dropped) != 1 {
 		t.Errorf("dropper calls = %v, want exactly one (the data must actually be reclaimed)", dropper.dropped)
+	}
+}
+
+// TestPushHandler_ConfirmVersionWriteMovesTheCursorForAnEmptyVersion pins the
+// second half of the A4 fix: a version with no document changes is never fanned
+// out, so the §8.5 announcement is the only cue a non-coordinating replica gets
+// that it exists. The coordinator sends the fact (empty_version) instead of
+// leaving the replica to discover it — discovering it would mean fetching, and
+// there is nothing to fetch. Without this the replica answers "version 0" to the
+// station's freshness check (§9.3(2)) for a version it in fact holds.
+func TestPushHandler_ConfirmVersionWriteMovesTheCursorForAnEmptyVersion(t *testing.T) {
+	adv := &recordingAdvancer{}
+	h := NewPushHandler(nil, 7, WithLocalVersionAdvancer(adv))
+
+	if _, err := h.ConfirmVersionWrite(context.Background(), &pb.ConfirmVersionWriteRequest{
+		KnowledgeBaseId: "kb-1",
+		VersionId:       9,
+		SourceAddr:      "writer:7000",
+		EmptyVersion:    true,
+	}); err != nil {
+		t.Fatalf("ConfirmVersionWrite: %v", err)
+	}
+
+	got := adv.got()
+	if len(got) != 1 || got[0] != "kb-1/9" {
+		t.Fatalf("cursor marks = %v, want exactly kb-1/9", got)
+	}
+}
+
+// TestPushHandler_ConfirmVersionWriteLeavesTheCursorForAVersionWithData: the flag
+// is not a blanket "mark it held". A version WITH documents arrives through the
+// fan-out, and marking it here would claim a version whose records this node may
+// never have received — exactly the staleness lie the cursor exists to prevent.
+func TestPushHandler_ConfirmVersionWriteLeavesTheCursorForAVersionWithData(t *testing.T) {
+	adv := &recordingAdvancer{}
+	h := NewPushHandler(nil, 7, WithLocalVersionAdvancer(adv))
+
+	if _, err := h.ConfirmVersionWrite(context.Background(), &pb.ConfirmVersionWriteRequest{
+		KnowledgeBaseId: "kb-1",
+		VersionId:       9,
+		SourceAddr:      "writer:7000",
+		EmptyVersion:    false,
+	}); err != nil {
+		t.Fatalf("ConfirmVersionWrite: %v", err)
+	}
+
+	if got := adv.got(); len(got) != 0 {
+		t.Fatalf("cursor marks = %v, want none — a version with records is the fan-out's business", got)
+	}
+}
+
+// TestPushHandler_ConfirmVersionWriteWithoutAdvancerIsSilent: the hook is
+// optional, and a node that wired none must still answer the confirmation —
+// the coordinator is counting acknowledgements.
+func TestPushHandler_ConfirmVersionWriteWithoutAdvancerIsSilent(t *testing.T) {
+	h := NewPushHandler(nil, 7)
+
+	resp, err := h.ConfirmVersionWrite(context.Background(), &pb.ConfirmVersionWriteRequest{
+		KnowledgeBaseId: "kb-1",
+		VersionId:       9,
+		EmptyVersion:    true,
+	})
+	if err != nil {
+		t.Fatalf("ConfirmVersionWrite without an advancer: %v", err)
+	}
+	if resp.GetNodeId() != 7 {
+		t.Fatalf("response node = %d, want 7", resp.GetNodeId())
 	}
 }

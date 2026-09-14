@@ -124,6 +124,15 @@ message ConfirmVersionWriteRequest {
   // unusable: `integration` went from 26s to 462s and timed out). Empty when
   // the sender does not announce itself; receivers then simply learn nothing.
   string source_addr = 3;
+  // empty_version says this version carries no document changes. It is what
+  // lets a receiving replica know it holds the version without fetching
+  // anything: there is nothing to fetch, and no document-set digest is ever
+  // committed for it. Such a version is never fanned out (there are no records
+  // to send), so this announcement is the ONLY cue it produces — and without
+  // acting on it a replica's contiguous cursor stays behind a version it in
+  // fact holds, which the station's freshness check reads as "stale" (§9.3(2))
+  // and refuses the replica's queries for.
+  bool empty_version = 4;
 }
 
 message ConfirmVersionWriteResponse {

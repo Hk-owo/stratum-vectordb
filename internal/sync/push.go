@@ -375,12 +375,27 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 // data-source announcement — req.source_addr names the writer — so this node
 // records where the version's data lives; later readers resolve it from that
 // fact instead of asking the leader (see plane.DataSourceRegistry).
+//
+// It is ALSO this node's cue that the version exists, which matters most for the
+// version nobody sends: one with no document changes is never fanned out, so
+// without acting here a replica would never learn of it and its cursor would
+// stay behind a version it in fact holds.
 func (h *PushHandler) ConfirmVersionWrite(_ context.Context, req *pb.ConfirmVersionWriteRequest) (*pb.ConfirmVersionWriteResponse, error) {
+	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
 	if h.watcher != nil {
-		h.watcher.ConfirmVersionWrite(req.GetKnowledgeBaseId(), req.GetVersionId())
+		h.watcher.ConfirmVersionWrite(kbID, versionID)
 	}
 	if h.dataSources != nil && req.GetSourceAddr() != "" {
-		h.dataSources.Register(req.GetKnowledgeBaseId(), req.GetVersionId(), req.GetSourceAddr())
+		h.dataSources.Register(kbID, versionID, req.GetSourceAddr())
+	}
+	// empty_version: this version has no document changes, so it was never
+	// fanned out and there is nothing to fetch. Moving the cursor here is the
+	// whole job — and it costs no I/O, which is why the coordinator sends the
+	// fact rather than expecting the replica to discover it by pulling. Without
+	// it the replica answers "version 0" to the station's freshness check
+	// (§9.3(2)) for a version it holds, and its queries get refused.
+	if req.GetEmptyVersion() && h.advanceVersion != nil {
+		h.advanceVersion.MarkVersionContiguous(kbID, versionID)
 	}
 	return &pb.ConfirmVersionWriteResponse{NodeId: h.nodeID}, nil
 }
