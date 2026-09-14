@@ -382,3 +382,9 @@ func kbMeta(kbID string, status types.KBStatus) types.KnowledgeBaseMeta {
 		Status:           status,
 	}
 }
+
+// TriggerBuildBackfill satisfies index.IndexManager. Reconcile schedules through
+// this one; for this implementation it is the same build as TriggerBuild.
+func (m *failingTriggerBuild) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
+	return m.TriggerBuild(ctx, kbID, versionID)
+}

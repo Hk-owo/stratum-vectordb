@@ -532,3 +532,9 @@ func TestAvailabilityString(t *testing.T) {
 		}
 	}
 }
+
+// TriggerBuildBackfill satisfies index.IndexManager. Reconcile schedules through
+// this one; for this implementation it is the same build as TriggerBuild.
+func (s *stubIndexStore) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
+	return s.TriggerBuild(ctx, kbID, versionID)
+}

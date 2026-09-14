@@ -498,3 +498,9 @@ func (m *reconcileIndexMgr) EnforceDiskRetention(_ context.Context, _ string, _ 
 }
 func (m *reconcileIndexMgr) Ping(_ context.Context) error { return nil }
 func (m *reconcileIndexMgr) LoadedCount() int             { return 0 }
+
+// TriggerBuildBackfill satisfies index.IndexManager. Reconcile schedules through
+// this one; for this implementation it is the same build as TriggerBuild.
+func (m *reconcileIndexMgr) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
+	return m.TriggerBuild(ctx, kbID, versionID)
+}

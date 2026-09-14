@@ -62,7 +62,18 @@ type IndexManager interface {
 	// It returns once the build has been scheduled, not once it
 	// completes; completion is reported via the registered
 	// BuildCompleteCallback.
+	//
+	// It schedules at INTERACTIVE priority: somebody is waiting for this build.
 	TriggerBuild(ctx context.Context, kbID string, versionID int64) error
+
+	// TriggerBuildBackfill schedules the same build at BACKFILL priority — a
+	// head start for a version nobody is waiting for yet, typically a
+	// reconcile sweep restoring what it can after a restart.
+	//
+	// The distinction exists so that a large backlog of these can never
+	// outrank the build a live write is waiting on. Callers that are not
+	// serving anybody should use this one.
+	TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error
 
 	// RegisterBuildCallback registers cb to be invoked when an
 	// asynchronous build started by TriggerBuild completes (successfully

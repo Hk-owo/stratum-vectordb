@@ -168,6 +168,16 @@ type IndexManagerConfig struct {
 	// alone, because the next version will replace it and start clean. <= 0 means
 	// DefaultGCGraphRebuildRatio.
 	GCGraphRebuildRatio float64
+
+	// BuildConcurrency is how many index builds may run at once. <= 0 means
+	// defaultBuildConcurrency() (the CPU count).
+	//
+	// It exists because "one goroutine per request" had no ceiling: after a restart
+	// over a populated volume, every historical version's missing artifact used to be
+	// rebuilt at once, and a live write waited 601s for READY behind them. The bound
+	// caps the contention; the pool's interactive priority is what keeps a live write
+	// from queueing behind the sweep at all.
+	BuildConcurrency int
 }
 
 // DefaultIndexServingReplicaMin is the placeholder for IndexServingReplicaMin
@@ -299,6 +309,17 @@ type IndexManagerImpl struct {
 	// while it is off.
 	gcCancel context.CancelFunc
 	gcWG     sync.WaitGroup
+
+	// buildPool bounds how many index builds run at once and decides which one runs
+	// next (interactive before backfill). It replaces the previous
+	// "one goroutine per request, no ceiling" behaviour, which let a post-restart
+	// reconcile sweep of every historical version starve a fresh write of its build
+	// (measured: 601s without READY).
+	//
+	// Started lazily on the first Submit, so a manager that never builds anything —
+	// most unit tests — starts no workers and leaks none. buildPoolOnce guards it.
+	buildPool     *buildPool
+	buildPoolOnce sync.Once
 
 	// replicaCounter answers "how many OTHER replicas are serving this version"
 	// (§8.6(d) collection needs it before it may take this node out of service).
@@ -518,8 +539,22 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 }
 
 // TriggerBuild implements IndexManager.
+//
+// Interactive priority: this is what EnsureIndex calls when someone is waiting for
+// the index to answer a query or a confirmation. Reconcile used to call it too, which
+// is why a post-restart sweep could outrank live work; reconcile now uses
+// TriggerBuildBackfill below.
 func (im *IndexManagerImpl) TriggerBuild(ctx context.Context, kbID string, versionID int64) error {
-	return im.triggerBuild(kbID, versionID, false)
+	return im.triggerBuild(kbID, versionID, false, BuildPriorityInteractive)
+}
+
+// TriggerBuildBackfill schedules a build nobody is waiting for yet — a head start,
+// typically reconcile restoring what it can after a restart.
+//
+// It yields to every interactive build, so no backlog of these can starve a live
+// write of its build.
+func (im *IndexManagerImpl) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
+	return im.triggerBuild(kbID, versionID, false, BuildPriorityBackfill)
 }
 
 // TriggerBuildGraphFree builds the version without an HNSW graph (§8.6a), for a
@@ -527,7 +562,9 @@ func (im *IndexManagerImpl) TriggerBuild(ctx context.Context, kbID string, versi
 // it expensive to build and to keep resident, and a scan of quantized codes is
 // an acceptable price for a version nobody is asking about.
 func (im *IndexManagerImpl) TriggerBuildGraphFree(ctx context.Context, kbID string, versionID int64) error {
-	return im.triggerBuild(kbID, versionID, true)
+	// Backfill priority: §8.6a reshapes a COLD version — by definition one nobody is
+	// querying — so this is a head start, not something anyone is waiting for.
+	return im.triggerBuild(kbID, versionID, true, BuildPriorityBackfill)
 }
 
 // StartAbandonSweeper reclaims index artifacts whose build was abandoned
@@ -794,7 +831,7 @@ func (im *IndexManagerImpl) coldCandidates(now time.Time) []indexKey {
 	return out
 }
 
-func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree bool) error {
+func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree bool, priority BuildPriority) error {
 	key := indexKey{kbID, versionID}
 
 	im.mu.Lock()
@@ -805,8 +842,38 @@ func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree
 	im.loading[key] = true
 	im.mu.Unlock()
 
-	go im.doBuild(kbID, versionID, graphFree)
+	// Queued, not spawned. The pool bounds how many builds run at once, and lets a
+	// build somebody is waiting for jump ahead of a reconcile sweep's backfill.
+	if !im.submitBuild(buildRequest{
+		kbID:      kbID,
+		versionID: versionID,
+		graphFree: graphFree,
+		priority:  priority,
+	}) {
+		// The pool is shut down and will never run this. Clear the in-progress marker
+		// so the state stays truthful — a version that is NOT being built must not
+		// look like one that is, or EnsureIndex would wait for a build that will never
+		// arrive.
+		im.mu.Lock()
+		delete(im.loading, key)
+		im.mu.Unlock()
+		return errors.New("index: the build pool is closed")
+	}
 	return nil
+}
+
+// submitBuild hands a request to the pool, starting it on first use.
+//
+// Lazy on purpose: a manager that never builds anything — most unit tests — should
+// start no workers at all, and deferring the startup to the first request puts the
+// cost where the work is.
+func (im *IndexManagerImpl) submitBuild(req buildRequest) bool {
+	im.buildPoolOnce.Do(func() {
+		im.buildPool = newBuildPool(im.cfg.BuildConcurrency, func(r buildRequest) {
+			im.doBuild(r.kbID, r.versionID, r.graphFree)
+		}, im.logger)
+	})
+	return im.buildPool.Submit(req)
 }
 
 func (im *IndexManagerImpl) doBuild(kbID string, versionID int64, graphFree bool) {

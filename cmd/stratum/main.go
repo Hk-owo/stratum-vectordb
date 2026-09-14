@@ -1371,6 +1371,12 @@ type appConfig struct {
 	// scan, so disabling the scanner disables collection too.
 	IndexGCSweepInterval time.Duration
 
+	// IndexBuildConcurrency is how many index builds may run at once
+	// (index_manager.build_concurrency); <= 0 means the IndexManager's default (the
+	// CPU count). It bounds how much contention a rebuild sweep can cause; the
+	// manager's build pool separately keeps such a sweep from outranking a live write.
+	IndexBuildConcurrency int
+
 	WriteMaxRetries   int
 	WriteRetryBaseMS  int
 	DeleteMaxRetries  int
@@ -1465,6 +1471,14 @@ type fileConfig struct {
 		// default (10 minutes); negative disables the scanner (and with it
 		// collection — nothing would ever produce a candidate).
 		GCSweepIntervalMS int `yaml:"gc_sweep_interval_ms"`
+		// BuildConcurrency is how many index builds may run at once. <= 0 takes the
+		// IndexManager's default (the CPU count).
+		//
+		// Worth having as a knob rather than a constant: the right number trades
+		// build throughput against how much a build steals from live queries, and
+		// that trade depends on the deployment's disk and vecstore, not on anything
+		// this repository can know.
+		BuildConcurrency int `yaml:"build_concurrency"`
 	} `yaml:"index_manager"`
 
 	WriteCoordinator struct {
@@ -1608,6 +1622,9 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.IndexManager.GCSweepIntervalMS != 0 {
 		cfg.IndexGCSweepInterval = time.Duration(fc.IndexManager.GCSweepIntervalMS) * time.Millisecond
 	}
+	if fc.IndexManager.BuildConcurrency != 0 {
+		cfg.IndexBuildConcurrency = fc.IndexManager.BuildConcurrency
+	}
 	if fc.WriteCoordinator.MaxRetries != 0 {
 		cfg.WriteMaxRetries = fc.WriteCoordinator.MaxRetries
 	}
@@ -1690,6 +1707,7 @@ func defaultConfig() appConfig {
 		IndexServingReplicaMin:   0,
 		IndexGCGraphRebuildRatio: 0,
 		IndexGCSweepInterval:     0,
+		IndexBuildConcurrency:    0,
 
 		WriteMaxRetries:   3,
 		WriteRetryBaseMS:  100,

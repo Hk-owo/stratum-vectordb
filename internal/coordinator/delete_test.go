@@ -571,3 +571,9 @@ func TestDeleteCoordinator_RetryExhaustedMarksFailed(t *testing.T) {
 		t.Errorf("expected ProposeMarkKBDeleteFailed to be called, got %v", rn.deleteFailed)
 	}
 }
+
+// TriggerBuildBackfill satisfies index.IndexManager. Reconcile schedules through
+// this one; for this implementation it is the same build as TriggerBuild.
+func (im *deleteTestIndexManager) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
+	return im.TriggerBuild(ctx, kbID, versionID)
+}

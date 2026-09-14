@@ -424,3 +424,9 @@ func cosineSimilarity(a, b []float32) float32 {
 }
 
 var _ IndexManager = (*MockIndexManager)(nil)
+
+// TriggerBuildBackfill satisfies index.IndexManager. Reconcile schedules through
+// this one; for this implementation it is the same build as TriggerBuild.
+func (m *MockIndexManager) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
+	return m.TriggerBuild(ctx, kbID, versionID)
+}

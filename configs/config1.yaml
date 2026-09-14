@@ -79,6 +79,16 @@ index_manager:
   # 重建：从当前存活文档集现建一份新图（顺带清掉全部墓碑）。代价是整张图，所以
   # 阈值比 append_max_dead_ratio 高得多：0 = 用 IndexManager 默认值（0.5）。
   graph_rebuild_ratio: 0
+  # §8.6(d) 扫描周期。0 = 用 IndexManager 默认值（10 分钟）；负数 = 关闭扫描
+  # （连收集一起没了——候选只由扫描产生）。
+  gc_sweep_interval_ms: 0
+  # 同时进行的索引构建数上限。0 = 用 IndexManager 默认值（CPU 核数）。
+  #
+  # 它约束的是"一次构建风暴能造成多大争抢"：此前每次触发就是新开一个 goroutine，
+  # 没有任何上限，于是重启后对整段历史的重建会把一个新写入饿死（实测 601 秒等不到
+  # READY）。上限之外，IndexManager 的构建池还让实时写入的构建**插队**于 reconcile
+  # 的批量补建之前——即便积压几百个，也不会排在它们后面等。
+  build_concurrency: 0
   # §8.8 构建残留的自超时回收（后台，默认开）。构建在候选节点上失败或被放弃
   # （版本最终在别处 READY，从未进入 FAILED_PERMANENT）时，本机会留下两类没人
   # 回收的残留：① Save 在「先 rename .index、后 rename .index.ids」之间死掉 →

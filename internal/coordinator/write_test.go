@@ -1090,3 +1090,9 @@ func TestWriteCoordinator_VersionBloomPersisted(t *testing.T) {
 		t.Error("version bloom filter must not contain unrelated doc IDs")
 	}
 }
+
+// TriggerBuildBackfill satisfies index.IndexManager. Reconcile schedules through
+// this one; for this implementation it is the same build as TriggerBuild.
+func (im *testIndexManager) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
+	return im.TriggerBuild(ctx, kbID, versionID)
+}

@@ -490,3 +490,9 @@ func TestFollower_PullVersion_TriggerBuildFailure(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// TriggerBuildBackfill satisfies index.IndexManager. Reconcile schedules through
+// this one; for this implementation it is the same build as TriggerBuild.
+func (r *recordingTrigger) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
+	return r.TriggerBuild(ctx, kbID, versionID)
+}

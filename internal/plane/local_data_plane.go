@@ -149,6 +149,10 @@ type ReplicaResolver func(ctx context.Context) ([]string, error)
 type IndexStore interface {
 	Search(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error)
 	TriggerBuild(ctx context.Context, kbID string, versionID int64) error
+	// TriggerBuildBackfill is TriggerBuild at BACKFILL priority: a head start for a
+	// version nobody is waiting for. Reconcile uses this one so that a sweep over
+	// historical versions can never outrank the build a live write is waiting on.
+	TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error
 	IndexExists(ctx context.Context, kbID string, versionID int64) (bool, error)
 	EnforceDiskRetention(ctx context.Context, kbID string, protectedIDs []int64) error
 }
@@ -1399,8 +1403,8 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 				d.logger.Info("plane: reconcile: (re)building missing index",
 					zap.String("kb_id", kb.KBID), zap.Int64("version_id", v.VersionID),
 					zap.String("status", v.IndexStatus.String()))
-				if err := d.indexMgr.TriggerBuild(ctx, kb.KBID, v.VersionID); err != nil {
-					d.logger.Warn("plane: reconcile: TriggerBuild failed",
+				if err := d.indexMgr.TriggerBuildBackfill(ctx, kb.KBID, v.VersionID); err != nil {
+					d.logger.Warn("plane: reconcile: TriggerBuildBackfill failed",
 						zap.String("kb_id", kb.KBID), zap.Int64("version_id", v.VersionID), zap.Error(err))
 				}
 			default:

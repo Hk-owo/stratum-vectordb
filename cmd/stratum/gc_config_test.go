@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestLoadConfig_GCCollectionKnobs pins the §8.6(d) config surface. These fields
@@ -16,7 +17,9 @@ func TestLoadConfig_GCCollectionKnobs(t *testing.T) {
 	content := "index_manager:\n" +
 		"  gc_enabled: true\n" +
 		"  serving_replica_min: 3\n" +
-		"  graph_rebuild_ratio: 0.6\n"
+		"  graph_rebuild_ratio: 0.6\n" +
+		"  gc_sweep_interval_ms: 2500\n" +
+		"  build_concurrency: 3\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -34,6 +37,12 @@ func TestLoadConfig_GCCollectionKnobs(t *testing.T) {
 	}
 	if cfg.IndexGCGraphRebuildRatio != 0.6 {
 		t.Errorf("IndexGCGraphRebuildRatio = %v, want 0.6", cfg.IndexGCGraphRebuildRatio)
+	}
+	if cfg.IndexGCSweepInterval != 2500*time.Millisecond {
+		t.Errorf("IndexGCSweepInterval = %v, want 2.5s", cfg.IndexGCSweepInterval)
+	}
+	if cfg.IndexBuildConcurrency != 3 {
+		t.Errorf("IndexBuildConcurrency = %d, want 3", cfg.IndexBuildConcurrency)
 	}
 }
 
