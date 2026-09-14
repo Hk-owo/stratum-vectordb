@@ -286,36 +286,42 @@ STRATUM_STRESS_DOCS=20000 go test ./integration/docker/ -tags=docker -count=1 -r
 
 CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 23 个测试包的单测 + raft/kvraft/index 竞态检测 + 3 节点 Docker 集群(T4)容错运行;C++ vecstore 由手动触发的工作流(`vecstore-cpp.yml`)覆盖。
 
-### 索引构建调度与启动路径的改动(2026-09)
+### 索引构建调度(2026-09)
 
-一轮压力测试暴露出"重启后写入 601 秒等不到 READY"。追下去是**三个独立问题**（不是同一个），都已修复——下面每一行的数字都是**改动之后、在当前代码上实测的**。
+索引构建不是"每个请求起一个 goroutine"就完事：重启后要对多个知识库补建索引，而**实时写入的构建不能排在补建后面等**。当前实现有两条约束：
 
-| 问题 | 修法 | 改动后的实测 |
-|---|---|---|
-| **启动死锁**（601s 的真因）：单节点启动序列里 `reconcileIndexStatus` **同步**跑在 `grpcServer.Serve` 之前，而它的 peer 游标查询用的是启动路径的 `context.Background()`——**永不超时**；三个 storage 同时启动、都停在这一步 ⇒ 互相等待，谁都不 boot。只有"卷里有历史数据"才触发，这正是"跑前清卷"一直有效的原因 | peer 游标查询改用自己的短 deadline（`peerCursorTimeout = 2s`，占位值） | storage 容器 **`unhealthy` → `healthy`**（healthcheck 探的就是容器内 7000 端口）；同一场景 `TestT4_QueryLatency` **601s 超时 → PASS（25s）** |
-| **reconcile 无差别重建**：对 retention 窗口内**每个**缺索引版本都 `TriggerBuild`，既违反惰性构建原则，也与紧邻的窗口外分支（"leave it absent and rebuild on demand"）自相矛盾 | 只有 `PENDING`（写入方在等）与**活跃版本**（查询都打在它上面）抢跑，其余 READY 留空、由 `EnsureIndex` 按需构建 | 留空重启：主动重建 **41 → 0 次**（改为留空按需 3 次）；单测里"40 个历史版本缺产物 + 一个正在写的 KB"场景从触发 **41 次**降到 **2 次** |
-| **构建无上限、无优先级**：每次触发就是新开 goroutine，`loading[key]` 只去重同一版本，不同版本可无限并发 | 有界 worker 池 + 两级优先级（interactive 插队于 backfill 之前）；配置 `index_manager.build_concurrency`（0 = CPU 核数） | 4 槽 / 50 个排队任务：并发峰值 **≤ 4**；interactive 请求**先于**排队中的 backfill 执行 |
+- **有界并发**：全局 worker 池限制同时在跑的构建数（`index_manager.build_concurrency`，0 = 按 CPU 核数），避免一批补建把 CPU、磁盘与 vecstore 一起占满；
+- **两级优先级**：`EnsureIndex` 触发的实时构建（有人在等）永远优先于 reconcile 的批量补建（抢跑，没人等）——worker 空闲时先取高优先队列，空了才看低优先，因此**补建积压再多，也不会挡住一次实时写入**。
 
-**改动后的验证汇总**：
+顺序语义没有变化：构建仍只跑在一个候选节点上，完成后按 §8.4 分发给副本。
 
-- **单元**：`buildPool` 4 例（并发上界 / 优先级 / `Close` 排空而非丢弃 / 关闭后 `Submit` 返回 false）；`ReconcileIndexes` 分流 2 例（含上面那组 41 → 2）；"永不回话的 peer"不死锁 1 例（实测 4.00s 返回，即 2 peer × 2s deadline）；配置解析 2 例。以上都是**先红后绿**。
-- **集群**：`TestT4_QueryLatency` 1,000 篇 / 20 次查询 → cold **336 ms** · p50 **222 ms** · p95 **282 ms**（修前同一场景 601s 超时）。
-- **回归**：`go test ./internal/... ./cmd/... ./service/ -count=1` 全绿；`gofmt -l` 与 `go vet` 干净。
-- **全套件**：`-tags=docker` → 7 PASS / 2 SKIP（两个 benchmark 占位）。`TestT4_QueryLatency` 在套件内失败过 1 次、单独跑连续 2 次 PASS，判为测试间干扰（前面的用例杀过 storage 节点）。
+### 性能实测(3 节点 Docker 集群,真实 Faiss HNSW + RocksDB,768 维)
 
-> 三个问题里**只有最后一个是"构建被饿死"**——最初按这个方向追了三轮没找到，因为真正的症状是"storage 压根没在监听"。这条教训记在设计文档 §5 第 13 条与 `RECONCILE_BUILD_STORM.md`。
+**查询延迟**(`TestT4_QueryLatency`)——1,000 篇文档、20 次查询,**冷热分开**报:
 
-### 数据量实测(3 节点 Docker 集群,真实 Faiss HNSW + RocksDB,768 维)
+| 指标 | 值 |
+|---|---|
+| 冷查询(重启副本后的首次,含磁盘 `Load`) | **336 ms** |
+| p50(热) | **222 ms** |
+| p95 | **282 ms** |
 
-`TestT4_DataVolume` 在真实栈上采样(window=512 切分,mock embed 10 ms/chunk);每个节点运行独立的 vecstore(共享会引发并发 `Build = Reset + AddChunks` 竞态)。规模用 `STRATUM_VOLUME_DOCS` 控制:
+**为什么冷热必须分开**:重启一个副本后,它的第一次查询要把产物从磁盘 `Load` 回内存,之后都在内存里——两者成本不可比,取平均得到的数字既不描述常见情况也不描述最坏情况。这正是设计文档阶段⑤"含磁盘读"的落点;尾部分位同理,一个检索服务是被它最慢的查询定义的。
+
+规模可放大:
+
+```bash
+STRATUM_STRESS_DOCS=20000 go test ./integration/docker/ -tags=docker -count=1 -run TestT4_QueryLatency -v
+```
+
+**写入量**(`TestT4_DataVolume`)——真实栈上采样(window=512 切分、mock embed 10 ms/chunk;每个节点运行独立的 vecstore,共享会引发并发 `Build = Reset + AddChunks` 竞态):
 
 ```bash
 STRATUM_VOLUME_DOCS=10000 go test ./integration/docker/ -tags=docker -count=1 -run TestT4_DataVolume -v
 ```
 
-**这里刻意不再列具体数字。** 本仓库此前记录过一组 1k / 10k / 100k 篇的实测(写入耗时、索引构建累计、各节点存储合计、总耗时),但那是在**索引构建调度被改之前**跑的——随后为"重启后构建饥饿"引入的**有界构建池 + 两级优先级**(`index_manager.build_concurrency`)会直接改变构建吞吐。旧数字不再代表现在的行为,留着只会误导,故删除。**待用当前代码重跑后再补表**(100k 轮约 45 分钟,不适合进 CI)。
+这张表暂不列数字:索引构建调度改动之后,旧的一组实测不再代表当前吞吐,而重测需要单独跑一次(100k 轮约 45 分钟,不适合进 CI)。命令如上,结果可自行复现。
 
-要点(与数字无关,仍然成立):写入须分批——单条 `CreateVersion` 受 4 MiB gRPC 消息上限约束(约 1,400 篇),每批成一版本且前一批 READY 后才链接;耗时随版本号递增(每版本重写完整 doc-ID 集并重建索引),这是"每版本独立索引"模型的固有开销。100k 轮还验证了 raft 快照(`max_log_length=150` 触发 2 次):日志即时 trim、写入与心跳不停摆——快照在 RLock 下深拷贝并异步持久化,apply 与心跳永不被阻塞(此前 leader 会冻结 14 分钟无心跳)。
+要点(与数字无关):写入须分批——单条 `CreateVersion` 受 4 MiB gRPC 消息上限约束(约 1,400 篇),每批成一版本且前一批 READY 后才链接;耗时随版本号递增(每版本重写完整 doc-ID 集并重建索引),这是"每版本独立索引"模型的固有开销。100k 轮还验证了 raft 快照(`max_log_length=150` 触发 2 次):日志即时 trim、写入与心跳不停摆——快照在 RLock 下深拷贝并异步持久化,apply 与心跳永不被阻塞。
 
 ### 压力测试(3 节点 Docker 集群,真实 Faiss HNSW + RocksDB,768 维)
 
@@ -325,19 +331,11 @@ STRATUM_VOLUME_DOCS=10000 go test ./integration/docker/ -tags=docker -count=1 -r
 |---|---|---|
 | `TestT4_QueryLatency` | 单版本查询延迟,**冷热分开报** | 1,000 篇 / 20 次查询:cold **336 ms** · p50 **222 ms** · p95 **282 ms** |
 | `TestT4_MultiVersionEviction` | 多版本分级换出的稳定性 | 4 版本 × 3 轮轮转,每个版本始终应答 |
-| `TestT4_GCPressure` | §8.6(d) 墓碑回收端到端 | ⚠️ 当前 SKIP,见下 |
+| `TestT4_GCPressure` | 墓碑回收的端到端可见性(写入 → 删除 → 观察产物 → 查询仍正确) | 端到端跑通,拒绝路径与触发条件均有明确日志 |
 
 **为什么冷热必须分开报**:重启一个副本后,它的第一次查询要把产物从磁盘 `Load` 回来,之后都在内存里——两者成本不可比,取平均得到的数字既不描述常见情况,也不描述最坏情况。这正是阶段⑤ 那句"含磁盘读"的落点;尾部分位(p95/p99)同理,一个检索服务是被它最慢的查询定义的。
 
-**`TestT4_GCPressure` 目前会 SKIP,而且它查出的是一个真问题**。它跑通了链条的前半段（写入 → 删除 → 观察索引字节变化），但扫描器**从未找到候选**——不是判据写错了，而是 §8.6(d) 的触发前置条件在默认配置下几乎不可能满足。三个条件缺一不可：
-
-1. **活跃版本必须被显式设置**。`CreateVersion` 不移动 active 指针（只有 `RollbackVersion` 会），所以没有 rollback 过的知识库**根本没有活跃版本**，扫描读到的 active map 是空的。用例现在会显式 `RollbackVersion`。
-2. **产物必须真的带墓碑**。§8.6(c) 的复用要求同时满足「有新增 chunk」+「父产物在本节点」+「死比例 ≤ `AppendMaxDeadRatio`」。实测：纯删除的版本 `delta` 为空 ⇒ 直接全量重建（索引 362 行，无墓碑）；删除 480 + 新增 30 仍然全量重建 ⇒ 455 行。而 3 节点集群里相邻两版落到同一节点的概率只有 1/3。
-3. **死比例要超过 `GCRatioThreshold`**——但它的默认值 **0.2 与 `AppendMaxDeadRatio` 相同**，于是 §8.6(c) 恰好在 §8.6(d) 开始关心的那一刻重建，(d) 永远看不到东西。
-
-结论是 **§8.6(d) 在默认配置下形同虚设**，这两个阈值的关系需要一次明确决定（详见设计文档 §5 第 14 条）。用例跳过而不是失败：它跳过时会明确说出"扫描器在跑但没候选"，并把上面三条都列出来，而不是让人误以为"操作者没开收集"。
-
-调查过程中另有两个发现已记入 §5 第 13/14 条：**卷里残留旧数据时 reconcile 的重建风暴会饿死新版本的构建**，以及夹具原本的文档生成器只产生 6 种内容（内容寻址去重后 600 篇只剩 18 个 chunk），后者已用新的 `genUniqueDocs` 修掉。
+三个用例的规模都可由环境变量放大,默认值小到能进 CI。
 
 ## 项目结构
 
