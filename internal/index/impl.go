@@ -290,6 +290,14 @@ type IndexManagerImpl struct {
 	// whole point of the rolling scheme. Guarded by mu.
 	maintenance map[indexKey]bool
 
+	// gcBlocked holds the versions whose §8.6(d) collection is stuck behind the
+	// service-capacity check: the artifact carries too much dead weight, and too
+	// few other replicas are serving it for this node to step out. It exists to
+	// be REPORTED (BlockedCollections → GetSystemStatus) rather than acted on —
+	// the condition is a configuration problem, and §8.6(d) is explicit that it
+	// must not be endured in silence. Guarded by mu.
+	gcBlocked map[indexKey]*gcBlockedState
+
 	// deletedKBs / deletedVersions are tombstones set by knowledge-base
 	// deletion (DeleteFilesByKB) and version deletion (Discard). They
 	// close the "resurrection" race where a Search-triggered Load RPC
@@ -328,6 +336,7 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		deletedKBs:      make(map[string]bool),
 		deletedVersions: make(map[indexKey]bool),
 		maintenance:     make(map[indexKey]bool),
+		gcBlocked:       make(map[indexKey]*gcBlockedState),
 		logger:          zap.NewNop(),
 	}
 	im.cond = sync.NewCond(&im.mu)

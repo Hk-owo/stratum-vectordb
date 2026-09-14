@@ -856,6 +856,11 @@ func main() {
 			},
 			presenceChecker,
 		)
+		// §8.6(d): surface versions whose dead weight cannot be collected because
+		// too few replicas would remain serving. Nothing else clears that — the
+		// remedy is a larger replica count — so it goes out with the other
+		// needs-a-human signals rather than only into the node's log.
+		adminSvc.SetGCPressureReporter(indexMgr)
 		pb.RegisterQueryServiceServer(grpcServer, querySvc)
 		pb.RegisterAdminServiceServer(grpcServer, adminSvc)
 	}

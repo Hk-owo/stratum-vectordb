@@ -31,6 +31,26 @@ type AdminServiceImpl struct {
 	// deployment has no other replica to ask).
 	replicas func() []string
 	presence PresenceChecker
+
+	// gcPressure reports versions whose §8.6(d) dead-weight collection is blocked
+	// because too few replicas would remain serving. Optional: a control node
+	// keeps no index manager and has nothing to report.
+	gcPressure GCPressureReporter
+}
+
+// GCPressureReporter reports the versions whose §8.6(d) dead-weight collection is
+// blocked behind the service-capacity check.
+//
+// Declared here, by the consumer, for the same reason PresenceChecker is: the
+// service layer should depend on the one method it uses rather than on the whole
+// index manager. *index.IndexManagerImpl satisfies it.
+type GCPressureReporter interface {
+	BlockedCollections() []index.GCPressure
+}
+
+// SetGCPressureReporter wires the §8.6(d) blocked-collection report.
+func (s *AdminServiceImpl) SetGCPressureReporter(r GCPressureReporter) {
+	s.gcPressure = r
 }
 
 // dataMissingMinAgeSec is how long a PENDING version may legitimately still be
@@ -199,7 +219,40 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 		ResourceUsage:           resourceUsage,
 		DataMissingVersions:     dataMissing,
 		FailedPermanentVersions: failedPermanent,
+		// §8.6(d): an active version whose dead weight cannot be collected because
+		// too few replicas would remain serving. Nothing else will clear it — the
+		// remedy is a larger replica count — so it belongs next to the other
+		// "needs a human" signals rather than in a log nobody tails.
+		GcBlockedVersions: s.gcBlockedVersions(),
 	}, nil
+}
+
+// gcBlockedVersions maps the index manager's §8.6(d) blocked collections onto the
+// status payload.
+//
+// Absent reporter or nothing blocked are the same answer — an empty list — and
+// both are normal: a control node keeps no index manager, and a deployment with
+// slack never blocks.
+func (s *AdminServiceImpl) gcBlockedVersions() []*pb.GCBlockedVersion {
+	if s.gcPressure == nil {
+		return nil
+	}
+	blocked := s.gcPressure.BlockedCollections()
+	if len(blocked) == 0 {
+		return nil
+	}
+	out := make([]*pb.GCBlockedVersion, 0, len(blocked))
+	for _, b := range blocked {
+		out = append(out, &pb.GCBlockedVersion{
+			KbId:            b.KBID,
+			VersionId:       b.VersionID,
+			DeadShare:       b.DeadShare,
+			OthersServing:   int32(b.OthersServing),
+			MinimumRequired: int32(b.MinimumRequired),
+			BlockedSince:    b.Since.Unix(),
+		})
+	}
+	return out
 }
 
 // collectDataMissingVersions probes the candidate replicas for every PENDING

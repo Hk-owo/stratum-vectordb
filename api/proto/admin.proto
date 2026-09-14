@@ -87,6 +87,38 @@ message GetSystemStatusResponse {
   // their own: the control layer has declared them dead and only an operator
   // can retry or abandon them (Stratum_设计文档v13.md §10.1).
   repeated FailedVersion failed_permanent_versions = 8;
+  // gc_blocked_versions lists ACTIVE versions whose artifact carries more dead
+  // weight than the ratio allows, but which this node cannot collect because too
+  // few replicas would remain serving (§8.6(d)).
+  //
+  // It is an ALERTING signal, not a failure: the data is intact, the version is
+  // queryable, and nothing was modified. What is wrong is that
+  // IndexServingReplicaMin leaves no replica free to rotate — with a replica
+  // count equal to the minimum, collection can never start and the artifact
+  // keeps its dead weight forever. The remedy is configuration, which is exactly
+  // why it has to be visible rather than silently endured.
+  repeated GCBlockedVersion gc_blocked_versions = 9;
+}
+
+// GCBlockedVersion is one version whose dead-weight collection is stuck behind
+// the service-capacity check.
+message GCBlockedVersion {
+  string kb_id = 1;
+  int64 version_id = 2;
+  // dead_share is the estimated share of the artifact's vectors that the current
+  // document set no longer justifies (§8.6(d) phase 1's estimate).
+  double dead_share = 3;
+  // others_serving / minimum_required are the two numbers the decision is made
+  // from: how many OTHER replicas are serving the version, and how many must
+  // remain. others_serving < minimum_required is the whole reason this entry
+  // exists.
+  int32 others_serving = 4;
+  int32 minimum_required = 5;
+  // blocked_since is when this node first found the collection blocked, Unix
+  // seconds. Reported rather than thresholded here: how long is "too long" is a
+  // deployment's call, and an operator looking at the age of a stuck version
+  // knows better than a constant chosen in this repository.
+  int64 blocked_since = 6;
 }
 
 // GetClusterStatusRequest is empty: the node reports its own view of the

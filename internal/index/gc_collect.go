@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -107,6 +109,11 @@ func (im *IndexManagerImpl) collectCandidates(ctx context.Context, candidates []
 			im.logger.Info("index: gc: skipping collection — too few replicas would remain serving",
 				zap.String("kb_id", c.KBID), zap.Int64("version_id", c.VersionID),
 				zap.Int("others_serving", others), zap.Int("minimum_required", minimum))
+			// Recorded, not just logged (§8.6(d)): if every replica is needed, this
+			// condition never clears on its own, and "the dead weight is permanent
+			// because the deployment has no slack" is something an operator has to
+			// be able to see — see BlockedCollections → GetSystemStatus.
+			im.noteGCBlocked(indexKey{c.KBID, c.VersionID}, c.DeadShare, others, minimum)
 			continue
 		}
 
@@ -129,8 +136,101 @@ func (im *IndexManagerImpl) collectCandidates(ctx context.Context, candidates []
 		im.logger.Info("index: gc: collected dead vectors from a sealed artifact",
 			zap.String("kb_id", c.KBID), zap.Int64("version_id", c.VersionID),
 			zap.Int("dead_chunks", len(dead)), zap.Float64("was_dead_share", c.DeadShare))
+		// Collected, so whatever blocked this version before no longer describes
+		// it. Clearing here (and only here, on success) is what makes the report
+		// mean "stuck now" rather than "was stuck once".
+		im.clearGCBlocked(indexKey{c.KBID, c.VersionID})
 		im.notifyArtifactRewritten(c.KBID, c.VersionID)
 	}
+}
+
+// gcBlockedState is what this node remembers about a version whose collection is
+// stuck behind the service-capacity check.
+type gcBlockedState struct {
+	deadShare float64
+	others    int
+	minimum   int
+	since     time.Time
+}
+
+// GCPressure is one version whose §8.6(d) collection is blocked: its artifact
+// carries more dead weight than the ratio allows, and too few other replicas are
+// serving it for this node to step out and collect.
+//
+// Reported, never acted on. The condition is a configuration problem
+// (IndexServingReplicaMin leaves no slack), the data is intact, and the version is
+// queryable — the only thing wrong is that the dead weight cannot be reclaimed.
+type GCPressure struct {
+	KBID            string
+	VersionID       int64
+	DeadShare       float64
+	OthersServing   int
+	MinimumRequired int
+	// Since is when this node FIRST saw the version blocked. The age is the point:
+	// a version blocked for a minute is a moment, one blocked for a day is a
+	// deployment that needs its replica count raised.
+	Since time.Time
+}
+
+// noteGCBlocked records that a version's collection is blocked.
+//
+// The first sighting is kept as `since`: refreshing it on every pass would make a
+// long-standing problem look perpetually new, which is the opposite of what this
+// signal is for.
+func (im *IndexManagerImpl) noteGCBlocked(key indexKey, deadShare float64, others, minimum int) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	if existing, ok := im.gcBlocked[key]; ok {
+		existing.deadShare = deadShare
+		existing.others = others
+		existing.minimum = minimum
+		return
+	}
+	im.gcBlocked[key] = &gcBlockedState{
+		deadShare: deadShare,
+		others:    others,
+		minimum:   minimum,
+		since:     time.Now(),
+	}
+}
+
+// clearGCBlocked forgets a version's blocked state — called when a collection
+// actually succeeds, because the condition described by the record has ended.
+func (im *IndexManagerImpl) clearGCBlocked(key indexKey) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	delete(im.gcBlocked, key)
+}
+
+// BlockedCollections reports the versions whose §8.6(d) collection is stuck.
+//
+// Sorted by (kb, version) so repeated status calls produce the same order: an
+// alerting surface that reshuffles itself between calls is harder to read than one
+// that does not. Nil when nothing is blocked, which is the normal state.
+func (im *IndexManagerImpl) BlockedCollections() []GCPressure {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	if len(im.gcBlocked) == 0 {
+		return nil
+	}
+	out := make([]GCPressure, 0, len(im.gcBlocked))
+	for key, state := range im.gcBlocked {
+		out = append(out, GCPressure{
+			KBID:            key.kbID,
+			VersionID:       key.versionID,
+			DeadShare:       state.deadShare,
+			OthersServing:   state.others,
+			MinimumRequired: state.minimum,
+			Since:           state.since,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].KBID != out[j].KBID {
+			return out[i].KBID < out[j].KBID
+		}
+		return out[i].VersionID < out[j].VersionID
+	})
+	return out
 }
 
 // collectGraphFree reopens a sealed GRAPH-FREE artifact, drops the dead vectors
