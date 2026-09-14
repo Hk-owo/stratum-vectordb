@@ -17,6 +17,9 @@
 - **量化两段式检索(可选,默认全精度)** —— 开启后内存只驻留量化粗筛器(HNSW 图 + SQ/PQ 码),查询先粗筛出候选、再按候选读 L2 全精度向量做精确 rerank:精度由全精度 rerank 决定,量化只影响候选覆盖。量化后端为 Faiss 内建 `IndexHNSWSQ`/`IndexHNSWPQ`——评估 hnswlib(无量化)、DiskANN(C++ 分支已停止维护)、USearch(仅免训练标量降位、需整体换后端)后选定:零新依赖,且与现有 `write_index`/`read_index` 序列化格式完全兼容。
 - **索引对象生命周期状态机** —— 每个 vecstore 索引实例显式区分 `EMPTY`/`BUILDING`/`READY` 三态,读锁贯穿查询(含 rerank 磁盘 IO)、写锁保护构建/加载/重置,杜绝 Search 与并发 Reset/Load/AddChunks 之间的 use-after-free 与错位结果。
 - **Raft 强一致 + 崩溃一致性** —— 元数据写操作经 leader 并受 WAL 保护;查询可负载均衡到任意节点;快照不阻塞心跳与写入。
+- **控制面 / 存储面契约分离** —— `internal/plane` 定义两层之间的契约(`ControlPlane` / `DataPlane`),只传逻辑对象(知识库、版本、抽象可用性),**从不暴露副本数、纠删码、文件路径或节点身份**,因此两层可以拆成独立进程/集群而控制层无需知道数据放在哪。`node.role` 已支持 `all`(默认,两层同进程)与 `storage`(只跑存储层,不留 Raft 日志,元数据经 `RemoteRaftNode` 走 gRPC 读取),`storage.nodes` 声明存储组;纯控制面(`control`)角色尚未实现。
+- **任何节点都能发起写** —— Raft 只在 leader 追加日志,但"刚写完一个版本""启动 reconcile 有结论"这类事实可能发生在任何节点,所以非 leader 把提案经内部 `InternalService.Propose` 转给 leader(转发不成链);错误以稳定 wire name 跨进程传递,转发后 `errors.Is` 依然成立。
+- **写幂等 + 卡住的版本有明确归宿** —— `CreateVersion` 的 `client_request_id` 让重试复用首次分配的版本而非另分配一个;PENDING 不再等同于"永远在构建":**DATA_MISSING**(没有任何候选副本持有该版本的数据,只能由写入方按同一 key 重发救回)与 **FAILED_PERMANENT**(重试预算耗尽或不可恢复,只有运维能重试或放弃)都会在 `GetSystemStatus` 里显式列出。
 - **自动存储卫生** —— 周期 chunk GC、每版本布隆过滤器、启动时从磁盘事实推导版本 READY 状态(不依赖构建回调确实送达)。
 - **开箱可运维** —— 三态健康检查;HTTP 网关 + Web 控制台(同源提供、免 CORS);`start.sh` 一条命令拉起完整链路。
 
@@ -28,7 +31,7 @@ Stratum 是 RAG 管线的**存储与检索层**:不处理聊天历史、用户�
 # 构建
 go build ./cmd/stratum/
 
-# 运行全部测试(23 个包)
+# 运行全部测试(23 个测试包,共 28 个 Go 包)
 go test ./... -timeout 180s -count=1
 
 # 竞态检测(共识与索引核心)
@@ -61,7 +64,7 @@ scripts/docker-cluster.sh down
                     外部客户端:gRPC SDK · HTTP 网关 / Web 控制台
                                     │
 ┌───────────────────────────────────▼───────────────────────────────────┐
-│                      Go 编排层(stratum 节点)                           │
+│              Go 编排层(stratum 节点:控制面 + 存储面)                   │
 │                                                                        │
 │   KnowledgeBaseService · QueryService · AdminService                   │
 │        │                     │                       │                 │
@@ -91,6 +94,8 @@ scripts/docker-cluster.sh down
 
 Go 层只负责编排与元数据,向量计算全部下沉到 C++ vecstore;两段检索的并发语义(Search 持读锁贯穿,含 rerank 磁盘 IO)由索引对象的显式状态机 + 每实例锁保证,杜绝 use-after-free 与错位结果。
 
+上面这个框内部还有一条**控制面 / 存储面契约**(`internal/plane`):控制面只拥有 Raft 复制的元数据(知识库、版本链、活跃版本、抽象可用性),存储面拥有全部物理事实(文档、chunk、向量索引、复制、放置与修复),两者之间只传逻辑对象、不传放置细节。契约的同进程实现(`LocalControlPlane` / `LocalDataPlane`,连同写门、leader 门、数据版本注册表、回收水位、追链 backfill)现已落地,它也是把两层拆成独立进程的前提;`internal/wire` 负责 gRPC proto 与领域类型的**双向**映射,避免某个字段只在一侧被加上而另一侧静默丢弃。
+
 ## 核心概念:版本化文档库
 
 - **版本链**:`CreateVersion` 一次调用应用任意数量的文档变更(ADD / DELETE / UPDATE),产出新版本并异步构建索引;父版本须已 READY,且最多只能有一个子版本(版本链严格线性,不支持分叉)。`RollbackVersion` 无停机切换活跃版本。
@@ -98,6 +103,9 @@ Go 层只负责编排与元数据,向量计算全部下沉到 C++ vecstore;两�
 - **MVCC 零成本快照**:基于 PebbleDB 前缀编码,未变更文档在新版本中零拷贝;文档历史被压缩保存。
 - **布隆过滤器**:每个版本一份完整文档 ID 集合的布隆过滤器,成员检查开销极低;磁盘副本缺失时自动从 `VersionDocList` 重建。
 - **垃圾回收**:`ChunkGarbageCollector` 周期性(默认 5 分钟,`chunk_gc.sweep_interval_sec`)清扫不再被任何版本引用的 chunk。sweep 两遍:先无锁枚举孤儿候选,再持写锁按 Raft **当前**版本复查后删除,与并发写入互斥、不依赖过期快照(stale-snapshot race 免疫),锁粒度为一个 chunk,阻塞毫秒级。
+- **写幂等**:`CreateVersion.client_request_id` 是可选幂等键——同一知识库上重发同一 key 会复用首次分配的版本,而不是再分配一个。这是"数据没落地的版本"能被客户端救回的**唯一**途径(§7.12);省略则保持历史语义,每次调用分配新版本。
+- **任何节点都能写**:非 leader 节点把已编码的提案经内部 `InternalService.Propose` 交给 leader 执行;接收方不是 leader 时回传 `leader_id` 让调用方改问,转发不会成链。错误以稳定 wire name(`internal/errors.Name` / `ByName`)跨进程传递,认不出某个名字的一方只保留 message,不臆造 sentinel。
+- **卡住的版本有两种终点**:PENDING 的版本若没有任何候选副本持有其数据,即为 **DATA_MISSING**(写入方在分配版本后、数据落盘前死亡,或每次都推送失败),只能靠客户端按同一 `client_request_id` 重发恢复;失败尝试耗尽重试预算或撞上不可恢复错误时,控制面判定 **FAILED_PERMANENT**,不再自动重试,只有运维能重试或放弃——放弃会向**所有**候选副本广播物理回收,因为控制面并不知道数据实际落在哪几个副本上(§10.1 / §10.6)。
 - **启动 reconcile**:启动时从磁盘事实(Faiss 索引文件 + `.ids` 边车)推导版本 READY 状态,而不是信任崩溃前可能丢失的构建回调。
 
 ## 向量检索:全精度与量化两段式
@@ -125,7 +133,7 @@ Go 层只负责编排与元数据,向量计算全部下沉到 C++ vecstore;两�
 
 > 量化后 HNSW 图边成为内存主导项(实测 d=64、M=32 ≈ 272 B/节点);内存记账按 vecstore 报告的粗筛器口径(图边 + 码)。
 
-**实测**(2026-09,合成数据;方法见 `Stratum_设计文档v12.md` §2.5 与附录 D):
+**实测**(2026-09,合成数据;方法见 `Stratum_设计文档v13.md` §2.5 与附录 D):
 
 - 召回:SQ8 / SQ_BF16 / SQ_FP16 ≈ Flat HNSW;PQ 随候选 N 提升(0.56@32 → 0.75@256);
 - 端到端(top-10、候选 N=80、热 cache、单线程):OFF ≈ 0.27 ms,SQ8/FP16 ≈ 0.71 ms,PQ ≈ 1.0 ms——增量来自候选放大读盘 + rerank,可按需调小 `candidate_n`。
@@ -134,8 +142,29 @@ Go 层只负责编排与元数据,向量计算全部下沉到 C++ vecstore;两�
 
 - **单节点**:`cmd/stratum`(gRPC,默认 `127.0.0.1:7000`)+ 外部 C++ vecstore 进程。
 - **多节点集群**:多个 stratum 节点组成 Raft 集群,共享一套元数据。
+- **角色分离(进行中)**:`node.role` 选择进程承担哪一半——`all`(默认,控制面 + 存储面同进程,即原有形态)、`storage`(只跑存储层:文档 / chunk / 索引 / vecstore,不留 Raft 日志,元数据经 `RemoteRaftNode` 读取,也从不参与选举)、`control`(只跑控制面,**尚未实现**,当前会拒绝启动)。存储组由 `storage.nodes` 声明;省略即"每个 Raft 成员都持有数据",与拆分前的部署完全一致,老配置无需改动。
+
+```yaml
+# 一个只跑存储层的节点:数据在这里,元数据在控制集群
+node:
+  node_id: 4
+  role: storage            # all(默认) | storage | control(未实现)
+raft:
+  peers:                   # 控制集群成员:谁答元数据读取、谁接受转发的提案
+    - id: 1
+      addr: "node1:8000"
+      service_addr: "node1:7000"
+    - id: 2
+      addr: "node2:8000"
+      service_addr: "node2:7000"
+storage:
+  nodes:                   # 存储组:持有数据、构建索引的成员
+    - id: 4
+      addr: "node4:7000"
+```
+
 - **路由层 `cmd/stratum-router`**:集群前端。拨号所有节点、自动发现 Raft leader;**写操作转发给 leader**(故障转移时重新发现),**读操作 round-robin 负载均衡**到各节点。
-- **网关 `cmd/stratum-gateway`**:把三个外部 gRPC 服务暴露为 REST/JSON,并从同源提供 Web 控制台静态资源(`web/`),因此无需 CORS。内部 `DataSyncService`(leader→follower 数据同步)有意不对外。
+- **网关 `cmd/stratum-gateway`**:把三个外部 gRPC 服务暴露为 REST/JSON,并从同源提供 Web 控制台静态资源(`web/`),因此无需 CORS。内部服务(`DataSyncService`、`InternalService`)有意不对外。
 
 ```
 Web UI ⇄ gateway(:8081) ⇄ router(:7009) ⇄ node1 / node2 / node3
@@ -158,7 +187,7 @@ scripts/router.sh status|stop            # 单独管理路由层
 
 ## gRPC API
 
-Protobuf 定义在 `api/proto/`,含三个外部服务与两个内部服务(`DataSyncService`、vecstore 服务)。
+Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部服务(`DataSyncService`、`InternalService`、C++ 端的 vecstore 服务)。所谓内部,是指有意不向集群外暴露,只供节点之间使用。
 
 **KnowledgeBaseService**(知识库与版本生命周期)
 
@@ -166,7 +195,7 @@ Protobuf 定义在 `api/proto/`,含三个外部服务与两个内部服务(`Data
 |---|---|
 | `CreateKnowledgeBase` | 创建知识库(embed 配置、chunk 窗口、索引类型) |
 | `DeleteKnowledgeBase` | 标记删除,清理异步执行 |
-| `CreateVersion` | 应用文档变更(ADD / DELETE / UPDATE)并产出新版本 |
+| `CreateVersion` | 应用文档变更(ADD / DELETE / UPDATE)并产出新版本;可带 `client_request_id` 幂等键 |
 | `ListVersions` | 返回知识库版本链 |
 | `RollbackVersion` | 切换活跃版本,无停机 |
 | `ListKnowledgeBases` / `GetKnowledgeBase` | 列出 / 查询知识库及其活跃版本 |
@@ -183,9 +212,29 @@ Protobuf 定义在 `api/proto/`,含三个外部服务与两个内部服务(`Data
 | RPC | 说明 |
 |---|---|
 | `HealthCheck` | 三态健康检查(HEALTHY / DEGRADED / UNHEALTHY) |
-| `GetSystemStatus` | 卡住版本、删除失败的知识库、WAL 告警、资源占用 |
+| `GetSystemStatus` | 卡住版本、**数据缺失版本**(DATA_MISSING)、**永久失败版本**(FAILED_PERMANENT)、删除失败的知识库、WAL 告警、资源占用 |
 | `GetClusterStatus` | 节点 Raft 视图(node_id / leader_id / member_count),供路由层发现 leader |
 | `RebuildIndex` / `WarmupVersion` | 重试失败版本的索引构建 / 预热版本索引入内存(不切换活跃版本) |
+
+**InternalService**(节点间控制面流量,不对外)
+
+| RPC | 说明 |
+|---|---|
+| `Propose` | 把一条已编码的 Raft 命令交给本节点(须是 leader)执行;接收方不是 leader 时回传 `leader_id` 让调用方改问,因此转发不成链 |
+
+**DataSyncService**(存储面节点间流量,不对外)
+
+| RPC | 说明 |
+|---|---|
+| `ExecuteVersionWrite` | 请本节点执行某个**已提交**版本的存储层写事务(切分 / embed / 本地落盘 / 扇出),按 (kb, version) 幂等 |
+| `PushVersionData` / `PullVersionData` | 流式推送 / 拉取某版本的全部记录,按 (kb, version, doc/chunk) 幂等 |
+| `PullVersionChanges` | 流式拉取一段版本区间的**变更记录**,让落后节点重放增量而非逐版本拉全量;区间内缺记录是可见的缺口,调用方须退化为全量传输 |
+| `LocalVersion` | 本节点对某知识库的连续数据游标(完全持有的最高版本),供落后节点找 peer 补齐 |
+| `VersionPresence` | 本节点是否持有 (kb, version) 的数据——控制面据此把"数据从未落地"与"只是索引没建"区分开 |
+| `ReportDataVersions` | 存储层周期性向控制 leader 上报数据游标;"谁持有版本 V"由此是一份定期刷新的权威视图,而非一次性快照 |
+| `DeleteVersionData` | 回收本节点上某版本的物理数据(FAILED_PERMANENT 时向所有候选副本广播) |
+| `ConfirmVersionWrite` | 告知副本它收到的版本已达 quorum,stand down 其接管计时器 |
+| `PushIndexData` | 流式**推送已构建的索引**,副本直接加载而不再各自重建("建一次、分发 N 份") |
 
 ## 工程与测试
 
@@ -204,9 +253,9 @@ go test ./integration/... -run TestRealStack -v   # 全真实栈端到端(需 C+
 go test ./integration/... -run TestMultiNode -v   # 3 节点进程内集群:选主、复制 KB + 版本元数据
 ```
 
-全量单测(23 包)与 3 节点 Docker 集群(T4)命令见[快速开始](#快速开始)。
+全量单测(23 个测试包)与 3 节点 Docker 集群(T4)命令见[快速开始](#快速开始)。
 
-CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 23 包单测 + raft/kvraft/index 竞态检测 + 3 节点 Docker 集群(T4)容错运行;C++ vecstore 由手动触发的工作流(`vecstore-cpp.yml`)覆盖。
+CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 23 个测试包的单测 + raft/kvraft/index 竞态检测 + 3 节点 Docker 集群(T4)容错运行;C++ vecstore 由手动触发的工作流(`vecstore-cpp.yml`)覆盖。
 
 ### 数据量实测(3 节点 Docker 集群,真实 Faiss HNSW + RocksDB,768 维)
 
@@ -231,8 +280,10 @@ internal/            # Go 核心
   bloom/             #   chunk 存在性 + 每版本文档布隆过滤器
   index/             #   IndexManager(LRU + 引用计数 + 异步构建)
   kvraft/            #   Raft 共识(选主 / 日志复制 / 快照)
-  raft/              #   Stratum Raft 状态机(KB + 版本元数据)
-  wal/               #   崩溃一致性写前日志
+  raft/              #   Stratum Raft 状态机(KB + 版本元数据)+ 节点间转发
+  plane/             #   控制面 ↔ 存储面契约 + 同进程实现(写门 / 回收水位 / 追链)
+  wire/              #   gRPC proto ↔ 领域类型映射
+  wal/               #   崩溃一致性写前日志(含按水位重写日志)
   sync/              #   Leader→Follower 数据同步(DataSync)
   coordinator/       #   Write / Delete / DeleteVersion / chunk-GC 编排
   router/            #   写 → leader、读负载均衡的前端
@@ -250,9 +301,9 @@ configs/             # 示例配置文件
 
 ## 配套文档
 
-仓库内还维护一套随实现演进的中文设计文档(与代码同目录、不随本仓库发布,本地阅读用):
+与代码同目录维护一套随实现演进的中文设计文档——**不纳入版本控制**(`.gitignore` 忽略根目录除本 README 外的全部 Markdown),仅供本地阅读:
 
-- `Stratum_设计文档v13.md` —— 最新版设计总纲(存储层协调协议 / 读路径服务站 / 版本链线性化;含量化两段式 §2.5/§2.6、附录 D 实测方法、v1 基准 §7.0)
+- `Stratum_设计文档v13.md` —— 最新版设计总纲(控制面 / 存储面契约 §7.0、节点间转发 §7.3、数据缺失与幂等重发 §7.12、存储层状态上报 §7.13、索引分发 §8.4、FAILED_PERMANENT §10.1、存储集群独立进程 §11 阶段 ④;含量化两段式 §2.5/§2.6、附录 D 实测方法)
 - `Stratum_接口设计v9.md` —— gRPC/内部接口与语义
 - `Stratum_设计目标.md` —— 功能目标、性能指标与验收标准
 - `Stratum_测试顺序.md` / `Stratum_实现顺序.md` / `Stratum_代码风格.md`
