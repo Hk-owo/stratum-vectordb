@@ -37,6 +37,11 @@ type CoordinatorDispatcher struct {
 
 	// candidateTimeout bounds one candidate's turn at the write.
 	candidateTimeout time.Duration
+
+	// health is this node's own view of which peers it recently reached
+	// (§7.13.5). It only reorders candidates — it never removes one — and it is
+	// fed by the attempts below, so it needs no probe loop of its own.
+	health *LocalHealthView
 }
 
 // defaultCandidateTimeout is how long one candidate may hold a dispatch.
@@ -89,6 +94,12 @@ type CoordinatorDispatcherConfig struct {
 	// listener. Optional.
 	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 
+	// Health is this node's view of which peers it recently reached (§7.13.5).
+	// Optional — without it the dispatcher makes its own, so a node gets the
+	// §7.13.5 ordering by default. Injected by an assembly that wants to share
+	// one view across a node's outgoing traffic.
+	Health *LocalHealthView
+
 	Logger *zap.Logger
 }
 
@@ -108,6 +119,10 @@ func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispa
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	health := cfg.Health
+	if health == nil {
+		health = NewLocalHealthView(HealthViewConfig{})
+	}
 	return &CoordinatorDispatcher{
 		replicas:         cfg.Replicas,
 		selfAddr:         cfg.SelfAddr,
@@ -115,13 +130,10 @@ func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispa
 		dial:             dial,
 		logger:           logger,
 		candidateTimeout: defaultCandidateTimeout,
+		health:           health,
 	}
 }
 
-// Dispatch tries each candidate until one of them completes the write locally,
-// returning the address that did it. The error, when every candidate failed,
-// wraps the last failure — the caller treats it as transient and lets the retry
-// budget decide (§7.13.2: "try candidates in order until one succeeds").
 // candidateBudget is how long one candidate may hold this dispatch's write.
 //
 // It is the fixed floor plus a per-document allowance, capped — see
@@ -140,6 +152,10 @@ func (d *CoordinatorDispatcher) candidateBudget(docs int) time.Duration {
 	return budget
 }
 
+// Dispatch tries each candidate until one of them completes the write locally,
+// returning the address that did it. The error, when every candidate failed,
+// wraps the last failure — the caller treats it as transient and lets the retry
+// budget decide (§7.13.2: "try candidates in order until one succeeds").
 func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) (string, error) {
 	candidates, err := d.candidates(ctx)
 	if err != nil {
@@ -161,6 +177,9 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 			// Coordinating locally: no RPC, no serialization.
 			err := d.localhost(attemptCtx, kbID, versionID, parentVersionID, changes)
 			cancel()
+			// The local attempt is an observation too, but it is about this
+			// node rather than a peer: recording it would let a node demote
+			// itself, and §7.13.5's view exists to order PEERS.
 			if err != nil {
 				lastErr = fmt.Errorf("coordinate %s v%d locally: %w", kbID, versionID, err)
 				d.logger.Warn("plane: dispatch: local coordination failed, trying the next candidate",
@@ -172,6 +191,9 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 
 		err := d.dispatchTo(attemptCtx, addr, kbID, versionID, parentVersionID, changes)
 		cancel()
+		// §7.13.5: the attempt just made IS the observation — no probe loop,
+		// no extra RPC. It only ever reorders later dispatches.
+		d.health.Observe(addr, err == nil)
 		if err != nil {
 			lastErr = err
 			d.logger.Warn("plane: dispatch: candidate did not take the write",
@@ -201,6 +223,12 @@ func (d *CoordinatorDispatcher) candidates(ctx context.Context) ([]string, error
 		others = got
 	}
 	sort.Strings(others)
+	// §7.13.5: the sort above is what makes a failing sequence reproducible in
+	// logs; the local view then moves peers this node recently could not reach
+	// to the back, so a dispatch does not spend its first (expensive, scaled)
+	// attempt on a node that is gone. It REORDERS only — every candidate is
+	// still tried, which is what keeps a wrong verdict cheap.
+	others = d.health.Rank(others)
 
 	out := make([]string, 0, len(others)+1)
 	for _, addr := range others {
