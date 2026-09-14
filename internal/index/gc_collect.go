@@ -127,21 +127,94 @@ func (im *IndexManagerImpl) collectCandidates(ctx context.Context, candidates []
 			continue
 		}
 
-		if err := im.collectGraphFree(ctx, c.KBID, c.VersionID, dead); err != nil {
-			im.logger.Warn("index: gc: collection failed; the artifact is unchanged",
-				zap.String("kb_id", c.KBID), zap.Int64("version_id", c.VersionID),
-				zap.Int("dead_chunks", len(dead)), zap.Error(err))
+		// Which collection applies depends on the artifact's SHAPE, and the two
+		// are not interchangeable: a graph-free artifact is reopened and edited, a
+		// graphed one can only be rebuilt. The graphed path also needs a higher bar
+		// (see GCGraphRebuildRatio) — rebuilding a grid costs the whole graph, so it
+		// is only worth it for a version that is clearly not about to be replaced.
+		im.mu.Lock()
+		graphFree, shapeKnown := im.builtGraphFree[indexKey{c.KBID, c.VersionID}]
+		im.mu.Unlock()
+		if !shapeKnown {
+			// Neither path can be chosen safely. collectGraphFree would refuse and
+			// rebuildGraphed would too; saying so here makes the reason visible
+			// instead of leaving two identical refusals in the log.
+			im.logger.Info("index: gc: skipping — this node does not know the version's index shape",
+				zap.String("kb_id", c.KBID), zap.Int64("version_id", c.VersionID))
 			continue
 		}
-		im.logger.Info("index: gc: collected dead vectors from a sealed artifact",
+		if !graphFree && c.DeadShare < im.graphRebuildRatio() {
+			continue
+		}
+
+		if graphFree {
+			err = im.collectGraphFree(ctx, c.KBID, c.VersionID, dead)
+		} else {
+			err = im.rebuildGraphed(ctx, c.KBID, c.VersionID)
+		}
+		if err != nil {
+			im.logger.Warn("index: gc: collection failed; the artifact is unchanged",
+				zap.String("kb_id", c.KBID), zap.Int64("version_id", c.VersionID),
+				zap.Bool("graph_free", graphFree), zap.Int("dead_chunks", len(dead)), zap.Error(err))
+			continue
+		}
+		im.logger.Info("index: gc: collected dead vectors",
 			zap.String("kb_id", c.KBID), zap.Int64("version_id", c.VersionID),
-			zap.Int("dead_chunks", len(dead)), zap.Float64("was_dead_share", c.DeadShare))
+			zap.Bool("graph_free", graphFree), zap.Int("dead_chunks", len(dead)),
+			zap.Float64("was_dead_share", c.DeadShare))
 		// Collected, so whatever blocked this version before no longer describes
 		// it. Clearing here (and only here, on success) is what makes the report
 		// mean "stuck now" rather than "was stuck once".
 		im.clearGCBlocked(indexKey{c.KBID, c.VersionID})
 		im.notifyArtifactRewritten(c.KBID, c.VersionID)
 	}
+}
+
+// graphRebuildRatio is the dead-share bar for rebuilding a graphed artifact.
+func (im *IndexManagerImpl) graphRebuildRatio() float64 {
+	if im.cfg.GCGraphRebuildRatio > 0 {
+		return im.cfg.GCGraphRebuildRatio
+	}
+	return DefaultGCGraphRebuildRatio
+}
+
+// rebuildGraphed rebuilds a GRAPHED artifact from the current document set.
+//
+// A graphed artifact cannot be edited in place: faiss rejects remove_ids on HNSW
+// (§8.6c's verification table), so its tombstones are permanent unless the graph is
+// built again. The rebuild passes skipReuse=true — reusing the parent's artifact
+// would inherit exactly the tombstones this exists to discard.
+//
+// The rolling rule is the caller's (it already asked the control layer), and the
+// safety is the same as the graph-free path: build() writes through Save, which is
+// atomic, so a failure leaves the previous artifact untouched. The version is out
+// of service on this node for the duration — longer than the graph-free edit,
+// which is why the bar for starting is higher.
+func (im *IndexManagerImpl) rebuildGraphed(ctx context.Context, kbID string, versionID int64) error {
+	key := indexKey{kbID, versionID}
+
+	im.mu.Lock()
+	graphFree, known := im.builtGraphFree[key]
+	im.mu.Unlock()
+	if !known {
+		return fmt.Errorf("%w: version %d's index shape is unknown on this node",
+			stratumerrors.ErrInvalidArgument, versionID)
+	}
+	if graphFree {
+		return fmt.Errorf("%w: version %d is graph-free; that artifact is edited in place, not rebuilt",
+			stratumerrors.ErrInvalidArgument, versionID)
+	}
+	if im.vectorIndexClient == nil {
+		return errors.New("index: gc: no vecstore client is wired on this node")
+	}
+
+	im.setMaintenance(key, true)
+	defer im.setMaintenance(key, false)
+
+	if _, err := im.build(ctx, kbID, versionID, false /* graphFree */, true /* skipReuse */); err != nil {
+		return fmt.Errorf("index: gc: graphed rebuild: %w", err)
+	}
+	return nil
 }
 
 // gcBlockedState is what this node remembers about a version whose collection is

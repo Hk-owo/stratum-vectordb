@@ -1346,6 +1346,24 @@ type appConfig struct {
 	// IndexManager's default, 1.0 disables the check.
 	IndexAppendMaxDeadRatio float64
 
+	// IndexGCEnabled turns on §8.6(d) collection (index_manager.gc_enabled). Off
+	// by default: the scanner always runs and only reports, but collection
+	// rewrites an artifact that is currently SERVING queries, so turning it on is
+	// an operator's decision — the log line and the GetSystemStatus entry are the
+	// signals that it is worth making.
+	IndexGCEnabled bool
+
+	// IndexServingReplicaMin is how many OTHER replicas must be serving a version
+	// before this node takes itself out of service to collect it
+	// (index_manager.serving_replica_min); <= 0 means the IndexManager's default.
+	IndexServingReplicaMin int
+
+	// IndexGCGraphRebuildRatio is the dead-share bar for rebuilding a graphed
+	// artifact (index_manager.graph_rebuild_ratio); <= 0 means the IndexManager's
+	// default. Much higher than IndexAppendMaxDeadRatio on purpose: a rebuild
+	// costs the whole graph.
+	IndexGCGraphRebuildRatio float64
+
 	WriteMaxRetries   int
 	WriteRetryBaseMS  int
 	DeleteMaxRetries  int
@@ -1425,6 +1443,17 @@ type fileConfig struct {
 		BuildAbandonTimeoutMS int     `yaml:"build_abandon_timeout_ms"`
 		ColdSweepIntervalMS   int     `yaml:"cold_sweep_interval_ms"`
 		AppendMaxDeadRatio    float64 `yaml:"append_max_dead_ratio"`
+		// §8.6(d) collection. GCEnabled is the opt-in: the scanner always runs (it
+		// only reads), but rewriting a SERVING artifact happens only when an
+		// operator says so.
+		GCEnabled bool `yaml:"gc_enabled"`
+		// ServingReplicaMin is how many other replicas must be serving before this
+		// node steps out to collect (§8.6(d)). <= 0 takes the default (2).
+		ServingReplicaMin int `yaml:"serving_replica_min"`
+		// GraphRebuildRatio is the dead-share bar for rebuilding a graphed
+		// artifact, which costs the whole graph. <= 0 takes the default (0.5),
+		// deliberately far above append_max_dead_ratio.
+		GraphRebuildRatio float64 `yaml:"graph_rebuild_ratio"`
 	} `yaml:"index_manager"`
 
 	WriteCoordinator struct {
@@ -1553,6 +1582,16 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.IndexManager.AppendMaxDeadRatio != 0 {
 		cfg.IndexAppendMaxDeadRatio = fc.IndexManager.AppendMaxDeadRatio
 	}
+	// §8.6(d). gc_enabled is a plain bool: absent and false both mean "collect
+	// nothing", which is the only safe reading of a config file that predates the
+	// feature.
+	cfg.IndexGCEnabled = fc.IndexManager.GCEnabled
+	if fc.IndexManager.ServingReplicaMin != 0 {
+		cfg.IndexServingReplicaMin = fc.IndexManager.ServingReplicaMin
+	}
+	if fc.IndexManager.GraphRebuildRatio != 0 {
+		cfg.IndexGCGraphRebuildRatio = fc.IndexManager.GraphRebuildRatio
+	}
 	if fc.WriteCoordinator.MaxRetries != 0 {
 		cfg.WriteMaxRetries = fc.WriteCoordinator.MaxRetries
 	}
@@ -1626,6 +1665,14 @@ func defaultConfig() appConfig {
 		// ratio (20% dead vectors). Set append_max_dead_ratio to 1.0 to never
 		// let dead weight force a rebuild.
 		IndexAppendMaxDeadRatio: 0,
+
+		// §8.6(d) collection: 0/false means the IndexManager's own defaults, which
+		// are "do not collect" for gc_enabled and 2 for serving_replica_min. The
+		// scanner still runs and reports, so a node that has never been configured
+		// for collection will still say when collection would have been worth it.
+		IndexGCEnabled:           false,
+		IndexServingReplicaMin:   0,
+		IndexGCGraphRebuildRatio: 0,
 
 		WriteMaxRetries:   3,
 		WriteRetryBaseMS:  100,

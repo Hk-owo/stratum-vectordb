@@ -64,6 +64,21 @@ index_manager:
   # 是内存与 top-K 候选名额）。墓碑占比超过该比例时改用全量重建（顺带清掉墓碑）。
   # 0 = 用 IndexManager 默认值（0.2）；1.0 = 从不因墓碑而重建。
   append_max_dead_ratio: 0
+  # §8.6(d) 已封印索引的墓碑回收。扫面（gc_scan）默认就在跑：它只读本地产物与
+  # 当前文档集，把墓碑占比超阈值的「活跃且长期没有后继版本」的版本记进日志
+  # （以及 GetSystemStatus 的 gc_blocked_versions）。gc_enabled 控制的才是「收集」
+  # ——重写一个正在对外服务的产物，所以默认关闭，由运维显式打开。
+  gc_enabled: false
+  # 收集前先问控制层「除我之外还有几个副本在服务这个版本」，不足该数就放弃：
+  # 滚动回收的前提是「我暂时下线之后仍有人能服务」。0 = 用 IndexManager 默认
+  # 值（2）。它独立于 DurabilityPolicy.Replicas —— 那个保持久性，这个保读服务
+  # 能力。若总副本数恰好等于该值，收集永远无法启动，此时以 gc_blocked_versions
+  # 上报（不会静默卡死），处置办法是调大副本数。
+  serving_replica_min: 0
+  # 带图形态没有「原地删向量」这条路（faiss 的 HNSW 不支持 RemoveIds），只能整图
+  # 重建：从当前存活文档集现建一份新图（顺带清掉全部墓碑）。代价是整张图，所以
+  # 阈值比 append_max_dead_ratio 高得多：0 = 用 IndexManager 默认值（0.5）。
+  graph_rebuild_ratio: 0
   # §8.8 构建残留的自超时回收（后台，默认开）。构建在候选节点上失败或被放弃
   # （版本最终在别处 READY，从未进入 FAILED_PERMANENT）时，本机会留下两类没人
   # 回收的残留：① Save 在「先 rename .index、后 rename .index.ids」之间死掉 →

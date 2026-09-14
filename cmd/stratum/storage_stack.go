@@ -126,6 +126,13 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		ColdSweepInterval:   cfg.IndexColdSweepInterval,
 		AppendMaxDeadRatio:  cfg.IndexAppendMaxDeadRatio,
 		BuildAbandonTimeout: cfg.IndexBuildAbandonTimeout,
+		// §8.6(d) collection. NodeID is deliberately NOT set here: it arrives with
+		// SetGCReplicaCounter below, together with the control-plane client that
+		// answers "how many other replicas are serving" — and without that client
+		// a node ID would be a number nobody could act on.
+		GCEnabled:              cfg.IndexGCEnabled,
+		IndexServingReplicaMin: cfg.IndexServingReplicaMin,
+		GCGraphRebuildRatio:    cfg.IndexGCGraphRebuildRatio,
 	})
 	indexMgr.SetLogger(logger.Named("index"))
 	// §6: reclaim index artifacts whose build was abandoned. Like the cold

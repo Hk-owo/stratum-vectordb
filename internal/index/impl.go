@@ -152,6 +152,22 @@ type IndexManagerConfig struct {
 	// without knowing who "I" am, this node cannot tell whether stepping out
 	// would leave anyone behind.
 	NodeID int64
+
+	// GCGraphRebuildRatio is the dead-vector share at which a GRAPHED active
+	// version is worth a full rebuild (§8.6(d)).
+	//
+	// Higher than GCRatioThreshold on purpose, because the two operations are not
+	// comparable in cost: a graph-free artifact is reopened and edited, while a
+	// graphed one has to be built from scratch — faiss cannot remove from HNSW, so
+	// the entire graph is thrown away and rebuilt from the current document set.
+	//
+	// The threshold is also the only honest proxy available for §8.6(d)'s "how much
+	// longer will this version be served?". A version whose artifact is mostly dead
+	// weight has been edited (and served) for a while, and the dead share is
+	// unlikely to shrink; a version that just got a heavy deletion is better left
+	// alone, because the next version will replace it and start clean. <= 0 means
+	// DefaultGCGraphRebuildRatio.
+	GCGraphRebuildRatio float64
 }
 
 // DefaultIndexServingReplicaMin is the placeholder for IndexServingReplicaMin
@@ -159,6 +175,13 @@ type IndexManagerConfig struct {
 // replica free to rotate through maintenance. Like the other §10.4 numbers it is
 // a starting point for a deployment to adjust, not a derived value.
 const DefaultIndexServingReplicaMin = 2
+
+// DefaultGCGraphRebuildRatio is the placeholder for GCGraphRebuildRatio (§8.6(d)):
+// half the artifact's vectors are dead before it is worth rebuilding a graph from
+// scratch. Deliberately much higher than DefaultGCRatioThreshold — a rebuild costs
+// the whole graph, so it should only be spent on a version that is clearly not
+// about to be replaced.
+const DefaultGCGraphRebuildRatio = 0.5
 
 // DefaultColdSweepInterval is how often the §8.6a evaluator re-reads the
 // access table when ColdSweepInterval is unset. The sweep only reads an
@@ -899,7 +922,9 @@ func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64, graphFr
 
 	var lastErr error
 	for {
-		sizeBytes, err := im.build(ctx, kbID, versionID, graphFree)
+		// skipReuse false: a normal build, where starting from the parent's
+		// artifact is the cheaper path (§8.6(c)).
+		sizeBytes, err := im.build(ctx, kbID, versionID, graphFree, false)
 		if err == nil {
 			return sizeBytes, nil
 		}
@@ -997,7 +1022,7 @@ func (im *IndexManagerImpl) buildQuantizerFromKB(ctx context.Context, kbID strin
 // 0 for an empty version). It reports success only if the index was also
 // persisted to disk (see saveToDisk), so a failed save surfaces as a
 // build failure.
-func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID int64, graphFree bool) (int64, error) {
+func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID int64, graphFree bool, skipReuse bool) (int64, error) {
 	// Forward the KB-level quantizer config with every Build RPC; OFF
 	// (default) keeps the historical full-precision index type.
 	quantizerType, pqM, pqNBits := im.buildQuantizerFromKB(ctx, kbID, graphFree)
@@ -1019,26 +1044,34 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 	// an optimisation — a failure here falls back to the full build below,
 	// and nothing downstream (callback, distribution, retention) can tell
 	// which path produced the artifact.
-	if parentID, delta, dead, ok := im.appendBase(ctx, kbID, versionID, graphFree, chunkIDs); ok {
-		size, appendErr := im.buildFromBase(ctx, kbID, versionID, parentID, delta, dead, len(chunkIDs), graphFree)
-		if appendErr == nil {
-			im.logger.Info("index: built by appending to the parent version's artifact (§8.6c)",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
-				zap.Int64("parent_version_id", parentID),
-				zap.Int("total_chunks", len(chunkIDs)), zap.Int("delta_chunks", len(delta)),
-				zap.Int("deleted_chunks", len(dead)), zap.Bool("graph_free", graphFree))
-			return size, nil
-		}
-		if errors.Is(appendErr, errAppendTooManyTombstones) {
-			// Not a failure: the reuse was legal, but the base carried too much
-			// dead weight, so rebuilding (which drops it) is the better trade.
-			im.logger.Info("index: append reuse not worth it; rebuilding from scratch",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
-				zap.Int64("parent_version_id", parentID), zap.Error(appendErr))
-		} else {
-			im.logger.Warn("index: append reuse failed; rebuilding from scratch",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
-				zap.Int64("parent_version_id", parentID), zap.Error(appendErr))
+	//
+	// skipReuse turns it off, and exactly one caller needs that: §8.6(d)'s
+	// graphed collection. A graphed artifact cannot drop vectors (faiss), so its
+	// tombstones can only be removed by building a NEW graph from the current
+	// document set — and reusing the parent's artifact would inherit exactly the
+	// tombstones this rebuild exists to discard.
+	if !skipReuse {
+		if parentID, delta, dead, ok := im.appendBase(ctx, kbID, versionID, graphFree, chunkIDs); ok {
+			size, appendErr := im.buildFromBase(ctx, kbID, versionID, parentID, delta, dead, len(chunkIDs), graphFree)
+			if appendErr == nil {
+				im.logger.Info("index: built by appending to the parent version's artifact (§8.6c)",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+					zap.Int64("parent_version_id", parentID),
+					zap.Int("total_chunks", len(chunkIDs)), zap.Int("delta_chunks", len(delta)),
+					zap.Int("deleted_chunks", len(dead)), zap.Bool("graph_free", graphFree))
+				return size, nil
+			}
+			if errors.Is(appendErr, errAppendTooManyTombstones) {
+				// Not a failure: the reuse was legal, but the base carried too much
+				// dead weight, so rebuilding (which drops it) is the better trade.
+				im.logger.Info("index: append reuse not worth it; rebuilding from scratch",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+					zap.Int64("parent_version_id", parentID), zap.Error(appendErr))
+			} else {
+				im.logger.Warn("index: append reuse failed; rebuilding from scratch",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+					zap.Int64("parent_version_id", parentID), zap.Error(appendErr))
+			}
 		}
 	}
 
