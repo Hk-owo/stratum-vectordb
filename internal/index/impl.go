@@ -124,7 +124,41 @@ type IndexManagerConfig struct {
 	// share of the active versions. Zero means DefaultGCSweepInterval;
 	// negative disables the scanner.
 	GCSweepInterval time.Duration
+
+	// GCEnabled turns the §8.6(d) scanner from a REPORT into an ACTOR: the
+	// candidates it finds are then actually collected (reopen the sealed
+	// artifact, drop the dead vectors, reseal).
+	//
+	// Off by default, deliberately. The scan is free and its output is a log
+	// line; the collection rewrites a live artifact — atomically, and the
+	// version stays queryable elsewhere, but it is still a change to data an
+	// operator did not ask for. Everything that touches stored bytes should be
+	// opt-in, and the log line is what tells an operator they want to opt in.
+	GCEnabled bool
+
+	// IndexServingReplicaMin is how many OTHER replicas must be serving the
+	// version's index before this node may take itself out of service to collect
+	// (§8.6(d)). <= 0 means DefaultIndexServingReplicaMin.
+	//
+	// It is independent of DurabilityPolicy.Replicas on purpose (§8.2): that one
+	// protects durability — the data must survive — while this one protects READ
+	// SERVICE CAPACITY. A deployment can happily run 3 replicas for durability and
+	// require only 2 to be serving before rotating one out for maintenance.
+	IndexServingReplicaMin int
+
+	// NodeID is the node this manager runs on, used to exclude itself when
+	// asking how many other replicas are serving (see replicaCounter). Zero means
+	// unwired, and collection then refuses to run — the conservative direction:
+	// without knowing who "I" am, this node cannot tell whether stepping out
+	// would leave anyone behind.
+	NodeID int64
 }
+
+// DefaultIndexServingReplicaMin is the placeholder for IndexServingReplicaMin
+// (§8.6(d)): with the typical DurabilityPolicy.Replicas = 3 it leaves exactly one
+// replica free to rotate through maintenance. Like the other §10.4 numbers it is
+// a starting point for a deployment to adjust, not a derived value.
+const DefaultIndexServingReplicaMin = 2
 
 // DefaultColdSweepInterval is how often the §8.6a evaluator re-reads the
 // access table when ColdSweepInterval is unset. The sweep only reads an
@@ -243,6 +277,19 @@ type IndexManagerImpl struct {
 	gcCancel context.CancelFunc
 	gcWG     sync.WaitGroup
 
+	// replicaCounter answers "how many OTHER replicas are serving this version"
+	// (§8.6(d) collection needs it before it may take this node out of service).
+	// Nil, or a zero cfg.NodeID, disables collection: without both, this node
+	// cannot tell whether stepping out would leave anyone behind. Guarded by mu.
+	replicaCounter ReplicaCounter
+
+	// maintenance holds the versions this node has taken out of service for
+	// §8.6(d) collection. A search that asks for one gets
+	// stratumerrors.ErrIndexMaintenance instead of a stale answer or a hang: the
+	// station recognizes that sentinel and moves to another replica, which is the
+	// whole point of the rolling scheme. Guarded by mu.
+	maintenance map[indexKey]bool
+
 	// deletedKBs / deletedVersions are tombstones set by knowledge-base
 	// deletion (DeleteFilesByKB) and version deletion (Discard). They
 	// close the "resurrection" race where a Search-triggered Load RPC
@@ -280,6 +327,7 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		builtGraphFree:  make(map[indexKey]bool),
 		deletedKBs:      make(map[string]bool),
 		deletedVersions: make(map[indexKey]bool),
+		maintenance:     make(map[indexKey]bool),
 		logger:          zap.NewNop(),
 	}
 	im.cond = sync.NewCond(&im.mu)
@@ -347,6 +395,17 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 	}
 
 	key := indexKey{kbID, versionID}
+
+	// §8.6(d): while this node is collecting the version's artifact — it is
+	// reopened, so it is BUILDING, so the vecstore cannot answer from it — say so
+	// explicitly instead of letting the call fall through to a load that would
+	// fail for a reason the caller cannot act on. The named sentinel is what lets
+	// the station tell "this replica is briefly out" apart from "this version is
+	// gone", and retry elsewhere.
+	if im.inMaintenance(key) {
+		return nil, stratumerrors.ErrIndexMaintenance
+	}
+
 	im.recordSearch(key)
 
 	// Restore path: if the version's index is not already loaded (e.g.

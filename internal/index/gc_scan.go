@@ -100,7 +100,12 @@ func (im *IndexManagerImpl) StartGCScanner() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				im.scanGCCandidates(ctx)
+				// Scan first, collect second: the scan is what turns "this artifact
+				// carries more dead weight than we tolerate" into candidates, and
+				// the collection is what acts — only when it is enabled and only
+				// after the control layer says enough replicas would remain serving
+				// (§8.6(d)).
+				im.collectCandidates(ctx, im.scanGCCandidates(ctx))
 			}
 		}
 	}()
@@ -230,24 +235,72 @@ func (im *IndexManagerImpl) deadShare(ctx context.Context, kbID string, versionI
 // has been "SHA-256 in hex" throughout. Recognising it keeps this side from
 // breaking silently when the header grows a field.
 func (im *IndexManagerImpl) artifactChunkCount(kbID string, versionID int64) (int, error) {
+	chunkIDs, err := im.artifactChunkIDs(kbID, versionID)
+	return len(chunkIDs), err
+}
+
+// artifactChunkIDs reads the chunk ids recorded in a version's sealed sidecar
+// (.index.ids, written by vecstore's Save).
+//
+// The ids are recognised by SHAPE rather than by skipping a fixed number of
+// header lines: the header is the C++ writer's format (magic, dimension, metric,
+// checksum) and has changed once already, while a chunk id has been "SHA-256 in
+// hex" throughout. Recognising them keeps this side from breaking silently when
+// the header grows a field — and the caller needs the ids themselves, not just a
+// count, to know WHICH vectors to drop.
+func (im *IndexManagerImpl) artifactChunkIDs(kbID string, versionID int64) ([]string, error) {
 	f, err := os.Open(im.sidecarPath(kbID, versionID))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, chunkIDLength+2), 4096)
-	count := 0
+	var ids []string
 	for scanner.Scan() {
-		if looksLikeChunkID(scanner.Text()) {
-			count++
+		if line := scanner.Text(); looksLikeChunkID(line) {
+			ids = append(ids, line)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return 0, err
+		return nil, err
 	}
-	return count, nil
+	return ids, nil
+}
+
+// deadChunksOf returns the chunk ids the artifact holds that the version's
+// current document set no longer justifies — the vectors a §8.6(d) collection
+// would drop.
+//
+// The same set difference the estimate uses (artifact minus live), now materialised
+// as ids because that is what RemoveChunks takes.
+func (im *IndexManagerImpl) deadChunksOf(ctx context.Context, kbID string, versionID int64) ([]string, error) {
+	artifact, err := im.artifactChunkIDs(kbID, versionID)
+	if err != nil {
+		return nil, err
+	}
+	docIDs, err := im.listDocIDs(ctx, kbID, versionID)
+	if err != nil {
+		return nil, err
+	}
+	live := make(map[string]struct{}, len(docIDs))
+	if len(docIDs) > 0 {
+		chunkIDs, err := im.listChunkIDsByDocs(ctx, kbID, docIDs)
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range chunkIDs {
+			live[id] = struct{}{}
+		}
+	}
+	var dead []string
+	for _, id := range artifact {
+		if _, ok := live[id]; !ok {
+			dead = append(dead, id)
+		}
+	}
+	return dead, nil
 }
 
 // looksLikeChunkID reports whether a sidecar line is a chunk id: SHA-256 hex,

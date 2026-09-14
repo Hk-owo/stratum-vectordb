@@ -238,6 +238,15 @@ func main() {
 	// Build completion is reported through that contract rather than by
 	// proposing metadata directly: the storage layer no longer reaches into
 	// the Raft state machine itself.
+	//
+	// §8.6(d): the rolling collection asks the control layer how many OTHER
+	// replicas are serving a version before it takes this node out of service.
+	// Wired here because it needs both halves — the index manager (built with the
+	// storage stack above) and the control plane (built just now). A control node
+	// has no index manager, so there is nothing to wire there.
+	if indexMgr != nil {
+		indexMgr.SetGCReplicaCounter(controlPlane, cfg.NodeID)
+	}
 	// distributeIndex ships a freshly built index to the other replicas
 	// (Stratum_设计文档v13.md §8.4). It is assigned once the data plane exists,
 	// further down; until then a build stays local, which is exactly how the
