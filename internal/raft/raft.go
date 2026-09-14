@@ -70,7 +70,14 @@ type RaftNode interface {
 
 	// ProposeUpdateVersionStatus updates a version's IndexStatus (e.g. to
 	// READY after a successful index build, or FAILED after a failed one).
-	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus) error
+	//
+	// nodeID names the replica whose own index became serviceable, and is
+	// recorded so the control layer can answer "how many replicas are serving
+	// this version" (§8.6(d)'s rolling cleanup asks exactly that before taking
+	// one out of service). 0 means the control layer is setting the status
+	// itself — a reconcile promotion or an availability verdict — and no replica
+	// is recorded.
+	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error
 
 	// ProposeMarkVersionFailedPermanent records the terminal verdict for a
 	// version (Stratum_设计文档v13.md §10.1): the control layer has decided

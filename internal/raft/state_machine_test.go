@@ -977,7 +977,7 @@ func TestMockAndStateMachine_VersionDeleteModesAgree(t *testing.T) {
 			}
 			if ready {
 				sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: mockID, Status: types.IndexStatusReady}, w, zap.NewNop())
-				if err := mock.ProposeUpdateVersionStatus(ctx, mockID, types.IndexStatusReady); err != nil {
+				if err := mock.ProposeUpdateVersionStatus(ctx, mockID, types.IndexStatusReady, 0); err != nil {
 					t.Fatalf("mock %s READY: %v", name, err)
 				}
 			}

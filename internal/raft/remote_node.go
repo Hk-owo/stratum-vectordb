@@ -112,8 +112,8 @@ func (r *RemoteRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, 
 	return res.VersionID, nil
 }
 
-func (r *RemoteRaftNode) ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus) error {
-	res, err := r.propose(ctx, newUpdateVersionStatusCommand(versionID, status))
+func (r *RemoteRaftNode) ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
+	res, err := r.propose(ctx, newUpdateVersionStatusCommand(versionID, status, nodeID))
 	if err != nil {
 		return err
 	}

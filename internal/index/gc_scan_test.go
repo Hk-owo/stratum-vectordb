@@ -243,7 +243,7 @@ func TestLooksLikeChunkID(t *testing.T) {
 		{"stratum-index-ids-v1", false}, // header: magic
 		{"768", false},                  // header: dimension
 		{"3", false},                    // header: metric
-		{"0xdeadbeef", false}, // header: checksum
+		{"0xdeadbeef", false},           // header: checksum
 		// Uppercase hex must not count. Built from a value with LETTERS in it:
 		// "0000…0001" is all digits, so uppercasing it proves nothing.
 		{strings.ToUpper(gcChunkID(0xabc)), false},

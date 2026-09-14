@@ -158,7 +158,7 @@ func TestAdmin_GetSystemStatus_StuckAndFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, stuckV, types.IndexStatusFailed); err != nil {
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, stuckV, types.IndexStatusFailed, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -222,7 +222,7 @@ func TestAdmin_RebuildIndex_Success(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusFailed); err != nil {
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusFailed, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -299,7 +299,7 @@ func TestAdmin_WarmupVersion_Success(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady); err != nil {
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -360,7 +360,7 @@ func TestAdmin_WarmupVersion_TriggerBuildError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := rn.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady); err != nil {
+	if err := rn.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0); err != nil {
 		t.Fatal(err)
 	}
 

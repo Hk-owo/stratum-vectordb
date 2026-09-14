@@ -368,7 +368,7 @@ func mustCreateKBImpl(t *testing.T, impl *RaftNodeImpl, kbID string) {
 
 func mustUpdateStatusImpl(t *testing.T, impl *RaftNodeImpl, versionID int64, status types.IndexStatus) {
 	t.Helper()
-	if err := impl.ProposeUpdateVersionStatus(context.Background(), versionID, status); err != nil {
+	if err := impl.ProposeUpdateVersionStatus(context.Background(), versionID, status, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus(%d, %v): %v", versionID, status, err)
 	}
 }

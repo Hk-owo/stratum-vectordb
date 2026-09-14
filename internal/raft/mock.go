@@ -222,7 +222,7 @@ func (r *MockRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, kbID
 	return nil
 }
 
-func (r *MockRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
+func (r *MockRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	v, ok := r.versions[versionID]
@@ -230,6 +230,9 @@ func (r *MockRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID i
 		return stratumerrors.ErrVersionNotFound
 	}
 	v.IndexStatus = status
+	if nodeID != 0 && status == types.IndexStatusReady {
+		v.IndexReadyNodes = withIndexReadyNode(v.IndexReadyNodes, nodeID)
+	}
 	r.versions[versionID] = v
 	return nil
 }

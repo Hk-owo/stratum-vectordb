@@ -81,7 +81,7 @@ func newTestCluster(t testing.TB) *testCluster {
 	}, 16, 5*time.Second)
 
 	im.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
-		return rn.ProposeUpdateVersionStatus(context.Background(), versionID, status)
+		return rn.ProposeUpdateVersionStatus(context.Background(), versionID, status, 0)
 	})
 
 	splitterInstance := &splitter.SlidingWindowSplitter{}
@@ -192,7 +192,7 @@ func TestIntegration_CreateKB_CreateVersion_Query(t *testing.T) {
 	kbID := createResp.KnowledgeBaseId
 
 	// Step 2: Set initial version to READY so it can be used as parent.
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady)
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady, 0)
 
 	// Step 3: Create a version with documents.
 	// First, seed the mock chunk store with vectors for the chunks that
@@ -220,7 +220,7 @@ func TestIntegration_CreateKB_CreateVersion_Query(t *testing.T) {
 	// In the mock, TriggerBuild runs synchronously in a goroutine;
 	// wait for it to complete.
 	time.Sleep(100 * time.Millisecond)
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, createVerResp.VersionId, types.IndexStatusReady)
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, createVerResp.VersionId, types.IndexStatusReady, 0)
 
 	// Step 4: Query with explicit version ID.
 	queryVector := []float32{0.1, 0.2, 0.3, 0.4}
@@ -292,7 +292,7 @@ func TestIntegration_RollbackVersion(t *testing.T) {
 	kbID := createResp.KnowledgeBaseId
 
 	// Set initial version to READY so we can rollback to it.
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady)
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady, 0)
 
 	// Create a new version to rollback from.
 	cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
@@ -380,7 +380,7 @@ func TestIntegration_DeleteVersion(t *testing.T) {
 
 	// Build a chain v1 -> v2 -> v3, each READY (bypassing async index
 	// build by setting status directly, like the other integration tests).
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady)
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady, 0)
 
 	v2Resp, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
@@ -393,7 +393,7 @@ func TestIntegration_DeleteVersion(t *testing.T) {
 		t.Fatalf("CreateVersion(v2): %v", err)
 	}
 	v2 := v2Resp.VersionId
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady)
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady, 0)
 
 	v3Resp, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
@@ -406,7 +406,7 @@ func TestIntegration_DeleteVersion(t *testing.T) {
 		t.Fatalf("CreateVersion(v3): %v", err)
 	}
 	v3 := v3Resp.VersionId
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady)
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady, 0)
 
 	// Deleting the active version is rejected.
 	_, err = cluster.KBClient.DeleteVersion(ctx, &pb.DeleteVersionRequest{
@@ -620,7 +620,7 @@ func TestIntegration_ConcurrentCreateVersion(t *testing.T) {
 	kbID := createResp.KnowledgeBaseId
 
 	// Set initial version to READY so it can be used as parent.
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady)
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady, 0)
 
 	// Launch concurrent CreateVersion calls with the same parent. The chain
 	// is strictly linear, so exactly one may win; the other four must be
@@ -778,7 +778,7 @@ func TestIntegration_RebuildIndex(t *testing.T) {
 	}
 
 	// Mark initial version as FAILED.
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusFailed)
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusFailed, 0)
 
 	// Trigger rebuild.
 	resp, err := cluster.AdminClient.RebuildIndex(ctx, &pb.RebuildIndexRequest{

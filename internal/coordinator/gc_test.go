@@ -40,7 +40,7 @@ func (r *gcTestRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ 
 	return nil
 }
 
-func (r *gcTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
+func (r *gcTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, _ int64) error {
 	return nil
 }
 func (r *gcTestRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {

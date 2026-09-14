@@ -157,6 +157,19 @@ type VersionMeta struct {
 	// Not required to be strictly monotonic across nodes.
 	IndexStatus IndexStatus
 
+	// IndexReadyNodes records WHICH nodes have reported this version's index
+	// built and serviceable (ReportIndexReady), sorted and deduplicated.
+	//
+	// IndexStatus alone answers "is this version serviceable somewhere"; this
+	// field answers the different question §8.6(d)'s rolling cleanup has to ask
+	// before it takes one replica out of service to reclaim an artifact: "if I
+	// step out for a moment, how many are still serving?" — which needs the
+	// identities, not a count, because the asking node has to exclude itself.
+	//
+	// Replicas report it themselves; the control layer is the single authority
+	// that aggregates them (§1.2), so nothing here is a soft observation.
+	IndexReadyNodes []int64
+
 	// DocIDSetHash is the SHA-256 digest of this version's full document-ID
 	// set (sorted docIDs, '\n'-separated — see sync.ComputeDocIDSetHash).
 	// The leader computes and commits it (via ProposeUpdateVersionSummary)

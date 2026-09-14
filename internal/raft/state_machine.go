@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -119,6 +120,19 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 			return applyResult{Err: stratumerrors.ErrVersionNotFound}
 		}
 		v.IndexStatus = cmd.Status
+		// §8.6(d)/§1.2: a replica reporting its own index READY is recorded by
+		// IDENTITY. The status answers "is this serviceable somewhere"; the
+		// identities answer the question a node asks right before it takes itself
+		// out of service to reclaim an artifact — "how many are still serving?" —
+		// and it needs them because it has to exclude itself from the count.
+		//
+		// nodeID == 0 means the control layer is setting a status itself (a
+		// reconcile promotion, an availability verdict) rather than relaying a
+		// replica's fact, so nothing is recorded: inventing a node there would
+		// make the count lie in the direction that permits unsafe cleanup.
+		if cmd.NodeID != 0 && cmd.Status == types.IndexStatusReady {
+			v.IndexReadyNodes = withIndexReadyNode(v.IndexReadyNodes, cmd.NodeID)
+		}
 		sm.versions[cmd.VersionID] = v
 		return applyResult{}
 
@@ -696,4 +710,24 @@ func (sm *stateMachine) listAllVersions() []types.VersionMeta {
 		out = append(out, v)
 	}
 	return out
+}
+
+// withIndexReadyNode returns nodes with id present, kept sorted and free of
+// duplicates.
+//
+// The ordering is not decorative. Determinism is what makes the field safe to
+// put in a state machine: two nodes applying the same sequence of reports must
+// end up with byte-identical state, or a snapshot comparison between them would
+// differ for no reason. Sorted insertion also makes a repeat report (the same
+// replica reporting twice, which happens on retries and after a restart) a
+// no-op — the report is a set membership fact, not a counter.
+func withIndexReadyNode(nodes []int64, id int64) []int64 {
+	i := sort.Search(len(nodes), func(i int) bool { return nodes[i] >= id })
+	if i < len(nodes) && nodes[i] == id {
+		return nodes
+	}
+	nodes = append(nodes, 0)
+	copy(nodes[i+1:], nodes[i:])
+	nodes[i] = id
+	return nodes
 }

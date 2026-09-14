@@ -74,7 +74,7 @@ func (h *querySvcHarness) setupQueryableKB(t *testing.T, docChunks map[string][]
 		EmbedConfig: types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
 	})
 	vID, _ := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
-	h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady)
+	h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0)
 
 	// Write doc-chunk mappings and doc content.
 	for docID, chunkIDs := range docChunks {
@@ -105,7 +105,7 @@ func TestQueryService_VersionIsolation(t *testing.T) {
 
 	// Create a second version with a different document.
 	v2ID, _ := h.raftNode.ProposeCreateVersion(ctx, kbID, v1ID)
-	h.raftNode.ProposeUpdateVersionStatus(ctx, v2ID, types.IndexStatusReady)
+	h.raftNode.ProposeUpdateVersionStatus(ctx, v2ID, types.IndexStatusReady, 0)
 	h.chunkMapper.Write(ctx, kbID, "chunk-2", "doc-b")
 	h.versionDocs.Write(ctx, kbID, v2ID, "doc-b")
 	h.versionDocs.Write(ctx, kbID, v2ID, "doc-b")
@@ -274,7 +274,7 @@ func TestQueryService_FailedVersionRejected(t *testing.T) {
 		EmbedConfig: types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
 	})
 	vID, _ := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
-	h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusFailed)
+	h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusFailed, 0)
 
 	_, err := h.svc.Query(ctx, &pb.QueryRequest{
 		KnowledgeBaseId: kbID,

@@ -57,6 +57,13 @@ type command struct {
 	VersionID int64             `json:"version_id,omitempty"`
 	Status    types.IndexStatus `json:"status,omitempty"`
 
+	// cmdUpdateVersionStatus: which NODE is reporting, when the command carries a
+	// replica's own fact rather than the control layer's verdict. Zero means "no
+	// replica is being recorded" — the control layer setting a status itself
+	// (a reconcile promotion, an availability verdict). Recording a node for
+	// those would make the §8.6(d) service-capacity count lie.
+	NodeID int64 `json:"node_id,omitempty"`
+
 	// cmdMarkVersionDeleting: which versions to remove relative to
 	// VersionID (subtree / single-with-splice / ancestors). Zero value
 	// (VersionDeleteSubtree) keeps the historical behavior.
@@ -124,8 +131,11 @@ func newCreateVersionCommand(kbID string, parentVersionID int64, clientRequestID
 	}
 }
 
-func newUpdateVersionStatusCommand(versionID int64, status types.IndexStatus) command {
-	return command{Type: cmdUpdateVersionStatus, VersionID: versionID, Status: status}
+// newUpdateVersionStatusCommand builds the status update. nodeID is the replica
+// whose own index just became serviceable, or 0 when the control layer is setting
+// the status itself (see command.NodeID).
+func newUpdateVersionStatusCommand(versionID int64, status types.IndexStatus, nodeID int64) command {
+	return command{Type: cmdUpdateVersionStatus, VersionID: versionID, Status: status, NodeID: nodeID}
 }
 
 func newUpdateVersionSummaryCommand(versionID int64, docIDSetHash string) command {

@@ -40,6 +40,10 @@ type permanentCall struct {
 type statusCall struct {
 	versionID int64
 	status    types.IndexStatus
+	// nodeID is which replica made the report (0 = the control layer itself).
+	// Tests assert on it because §8.6(d)'s serving count is built out of these
+	// identities, not out of the status alone.
+	nodeID int64
 }
 
 type digestCall struct {
@@ -61,8 +65,8 @@ func (m *stubMeta) ListVersions(_ context.Context, kbID string) ([]types.Version
 	return m.versions[kbID], nil
 }
 
-func (m *stubMeta) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
-	m.statusCalls = append(m.statusCalls, statusCall{versionID: versionID, status: status})
+func (m *stubMeta) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
+	m.statusCalls = append(m.statusCalls, statusCall{versionID: versionID, status: status, nodeID: nodeID})
 	return nil
 }
 

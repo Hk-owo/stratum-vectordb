@@ -205,7 +205,7 @@ func TestKnowledgeBaseService_RollbackVersion(t *testing.T) {
 	})
 
 	// Initial version is PENDING by default; mark it as READY to allow rollback.
-	h.raftNode.ProposeUpdateVersionStatus(context.Background(), 1, types.IndexStatusReady)
+	h.raftNode.ProposeUpdateVersionStatus(context.Background(), 1, types.IndexStatusReady, 0)
 
 	_, err := h.svc.RollbackVersion(context.Background(), &pb.RollbackVersionRequest{
 		KnowledgeBaseId: createResp.KnowledgeBaseId,
@@ -405,7 +405,7 @@ func TestKnowledgeBaseService_DeleteVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create v2: %v", err)
 	}
-	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady); err != nil {
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v2 READY: %v", err)
 	}
 
@@ -473,7 +473,7 @@ func kbSvcTestHarnessWithChain(t *testing.T, h *kbSvcTestHarness) (string, int64
 		t.Fatalf("create v2: %v", err)
 	}
 	for _, v := range []int64{v1, v2} {
-		if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v, types.IndexStatusReady); err != nil {
+		if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v, types.IndexStatusReady, 0); err != nil {
 			t.Fatalf("v%d READY: %v", v, err)
 		}
 	}
@@ -481,7 +481,7 @@ func kbSvcTestHarnessWithChain(t *testing.T, h *kbSvcTestHarness) (string, int64
 	if err != nil {
 		t.Fatalf("create v3: %v", err)
 	}
-	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady); err != nil {
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v3 READY: %v", err)
 	}
 	return kbID, v1, v2, v3

@@ -209,7 +209,7 @@ func TestRealStack_ThreeNodeCluster_ForwardedErrorIsFaithful(t *testing.T) {
 	// answers with a sentinel, and the forward has to deliver that sentinel —
 	// not a generic transport error, and not "not leader".
 	err := proposeFromNonLeader(t, func(ctx context.Context) error {
-		return follower.raftNode.ProposeUpdateVersionStatus(ctx, 4242, types.IndexStatusReady)
+		return follower.raftNode.ProposeUpdateVersionStatus(ctx, 4242, types.IndexStatusReady, 0)
 	})
 	t.Logf("forwarded rejection (as the caller sees it): %v", err)
 	if !errors.Is(err, stratumerrors.ErrVersionNotFound) {

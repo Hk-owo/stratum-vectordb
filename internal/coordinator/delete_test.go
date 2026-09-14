@@ -40,7 +40,7 @@ func (r *deleteTestRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context
 	return nil
 }
 
-func (r *deleteTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
+func (r *deleteTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, _ int64) error {
 	return nil
 }
 func (r *deleteTestRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {

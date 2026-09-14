@@ -143,7 +143,7 @@ func (c *ConfirmBroadcaster) ConfirmVersionWrite(ctx context.Context, peerAddr, 
 		VersionId:       versionID,
 		// sourceAddr is the writer's own address: the confirmation is also the
 		// §8.5 announcement of where this version's data lives.
-		SourceAddr: sourceAddr,
+		SourceAddr:   sourceAddr,
 		EmptyVersion: empty,
 	}); err != nil {
 		return fmt.Errorf("sync: ConfirmVersionWrite(%s v%d) at %s: %w", kbID, versionID, peerAddr, err)

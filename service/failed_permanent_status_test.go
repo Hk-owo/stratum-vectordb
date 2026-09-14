@@ -71,7 +71,7 @@ func TestGetSystemStatus_RetryableFailureIsNotPermanent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProposeCreateVersion: %v", err)
 	}
-	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusFailed); err != nil {
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusFailed, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus: %v", err)
 	}
 

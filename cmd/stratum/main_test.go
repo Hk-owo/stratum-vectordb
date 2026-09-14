@@ -372,7 +372,7 @@ func (r *reconcileRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context,
 	return nil
 }
 
-func (r *reconcileRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
+func (r *reconcileRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, _ int64) error {
 	if r.proposed == nil {
 		r.proposed = make(map[int64]types.IndexStatus)
 	}

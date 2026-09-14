@@ -165,7 +165,7 @@ func TestRemoteRaftNode_ForwardsProposalsToTheControlNode(t *testing.T) {
 	node, cleanup := newRemoteNode(t, map[int64]*fakeControlNode{1: control})
 	defer cleanup()
 
-	if err := node.ProposeUpdateVersionStatus(context.Background(), 7, types.IndexStatusReady); err != nil {
+	if err := node.ProposeUpdateVersionStatus(context.Background(), 7, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus: %v", err)
 	}
 
@@ -173,7 +173,7 @@ func TestRemoteRaftNode_ForwardsProposalsToTheControlNode(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("control node received %d commands, want 1", len(got))
 	}
-	want := newUpdateVersionStatusCommand(7, types.IndexStatusReady)
+	want := newUpdateVersionStatusCommand(7, types.IndexStatusReady, 0)
 	if got[0] != want {
 		t.Errorf("forwarded command = %+v, want %+v", got[0], want)
 	}
@@ -242,7 +242,7 @@ func TestRemoteRaftNode_RebuildsSentinelErrors(t *testing.T) {
 // silent success that would look like "the metadata says nothing".
 func TestRemoteRaftNode_ReportsWhenNoControlNodeIsReachable(t *testing.T) {
 	node := &RemoteRaftNode{ControlAddrs: map[int64]string{1: "control-1"}}
-	if err := node.ProposeUpdateVersionStatus(context.Background(), 1, types.IndexStatusReady); err == nil {
+	if err := node.ProposeUpdateVersionStatus(context.Background(), 1, types.IndexStatusReady, 0); err == nil {
 		t.Fatal("expected an error when no control node is reachable")
 	}
 	if _, err := node.GetKB(context.Background(), "kb-1"); err == nil {

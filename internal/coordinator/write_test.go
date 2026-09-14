@@ -376,7 +376,7 @@ func (r *testRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ st
 	return nil
 }
 
-func (r *testRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus) error {
+func (r *testRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, _ int64) error {
 	return nil
 }
 func (r *testRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {

@@ -157,7 +157,7 @@ func TestMultiNode_RaftNodeImpl_3Node(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProposeCreateVersion: %v", err)
 	}
-	_ = leader.impl.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady)
+	_ = leader.impl.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0)
 
 	// Wait for replication.
 	time.Sleep(time.Second)

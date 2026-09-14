@@ -217,6 +217,11 @@ func main() {
 	// requiredReplicaIDs is assigned once peerAddrByID exists, further down.
 	var requiredReplicaIDs func() ([]int64, error)
 	controlPlane := plane.NewLocalControlPlane(rn,
+		// §8.6(d): index-readiness reports name the reporter, so the control
+		// layer can tell "how many replicas are serving this version" from
+		// "someone is" — the rolling cleanup asks that before taking one out of
+		// service.
+		plane.WithNodeID(cfg.NodeID),
 		plane.WithDataVersionView(dataVersionRegistry, dataVersionGate),
 		// §7.5: the replica set a version must reach before the WAL changes behind
 		// it become reclaimable. It comes from the cluster topology — never from the

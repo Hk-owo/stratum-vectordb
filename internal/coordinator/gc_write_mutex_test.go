@@ -126,7 +126,7 @@ func (r *gcWriteRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _
 	return nil
 }
 
-func (r *gcWriteRaftNode) ProposeUpdateVersionStatus(_ context.Context, _ int64, _ types.IndexStatus) error {
+func (r *gcWriteRaftNode) ProposeUpdateVersionStatus(_ context.Context, _ int64, _ types.IndexStatus, _ int64) error {
 	return nil
 }
 func (r *gcWriteRaftNode) ProposeUpdateVersionSummary(_ context.Context, _ int64, _ string) error {

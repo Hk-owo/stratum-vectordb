@@ -548,8 +548,8 @@ func (impl *RaftNodeImpl) ProposeMarkVersionFailedPermanent(ctx context.Context,
 	return res.Err
 }
 
-func (impl *RaftNodeImpl) ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus) error {
-	res, err := impl.proposeAndWait(ctx, newUpdateVersionStatusCommand(versionID, status))
+func (impl *RaftNodeImpl) ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
+	res, err := impl.proposeAndWait(ctx, newUpdateVersionStatusCommand(versionID, status, nodeID))
 	if err != nil {
 		return err
 	}

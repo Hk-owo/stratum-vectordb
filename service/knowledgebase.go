@@ -161,7 +161,8 @@ func (s *KnowledgeBaseServiceImpl) CreateKnowledgeBase(ctx context.Context, req 
 	}
 
 	// Mark the initial version as READY (there are no chunks to index).
-	_ = s.raftNode.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady)
+	// nodeID 0: settled by the control layer, not reported by a replica.
+	_ = s.raftNode.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, 0)
 
 	// Set the active version. Since the RaftNode interface has no explicit
 	// "set active version" RPC outside of Rollback, we use Rollback to set it.

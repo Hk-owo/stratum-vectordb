@@ -223,7 +223,7 @@ func mustCreateKB(t *testing.T, r *MockRaftNode, kbID string) {
 
 func mustUpdateStatus(t *testing.T, r *MockRaftNode, versionID int64, status types.IndexStatus) {
 	t.Helper()
-	if err := r.ProposeUpdateVersionStatus(context.Background(), versionID, status); err != nil {
+	if err := r.ProposeUpdateVersionStatus(context.Background(), versionID, status, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus(%d, %v): %v", versionID, status, err)
 	}
 }

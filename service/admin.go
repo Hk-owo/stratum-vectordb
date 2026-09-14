@@ -242,7 +242,9 @@ func (s *AdminServiceImpl) GetClusterStatus(ctx context.Context, req *pb.GetClus
 // RebuildIndex implements AdminServiceServer.
 func (s *AdminServiceImpl) RebuildIndex(ctx context.Context, req *pb.RebuildIndexRequest) (*pb.RebuildIndexResponse, error) {
 	// Set status to PENDING, then trigger build.
-	if err := s.raftNode.ProposeUpdateVersionStatus(ctx, req.VersionId, 0); err != nil { // 0 = IndexStatusPending
+	// nodeID 0: this is the control layer's verdict about the version, not a
+	// replica reporting that it serves it.
+	if err := s.raftNode.ProposeUpdateVersionStatus(ctx, req.VersionId, 0, 0); err != nil { // 0 = IndexStatusPending
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
@@ -260,7 +262,7 @@ func (s *AdminServiceImpl) WarmupVersion(ctx context.Context, req *pb.WarmupVers
 	// rollback/parenting while the async build runs, then trigger the build
 	// exactly like RebuildIndex. Completion is reported via the registered
 	// BuildCompleteCallback, which flips the status back to READY/FAILED.
-	if err := s.raftNode.ProposeUpdateVersionStatus(ctx, req.VersionId, types.IndexStatusPending); err != nil {
+	if err := s.raftNode.ProposeUpdateVersionStatus(ctx, req.VersionId, types.IndexStatusPending, 0); err != nil { // nodeID 0: see RebuildIndex
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 

@@ -8,6 +8,7 @@ import (
 
 	"go.uber.org/zap"
 
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/types"
 )
 
@@ -22,7 +23,7 @@ import (
 // tests — depend only on what they actually use; *raft.RaftNode satisfies it.
 type MetadataProposer interface {
 	MetadataLister
-	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus) error
+	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error
 	ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error
 	ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, reason string, count int32) error
 }
@@ -35,6 +36,12 @@ const DefaultFailureBudget = 5
 
 type LocalControlPlane struct {
 	rn MetadataProposer
+
+	// nodeID is the node this plane speaks for, set by WithNodeID. It is what
+	// makes an index-readiness report say WHO is ready rather than "someone is"
+	// (§8.6(d)). Zero means unwired: reports then record no replica, which
+	// under-states the serving count and is therefore the safe direction.
+	nodeID int64
 
 	// logger is optional; a nil logger silently drops the advisory log lines.
 	logger *zap.Logger
@@ -104,6 +111,17 @@ func WithFailureBudget(n int) ControlPlaneOption {
 			c.failureBudget = int32(n)
 		}
 	}
+}
+
+// WithNodeID tells the control plane which node it speaks for.
+//
+// It is needed because a replica's index-readiness report has to name the
+// REPORTER, not just assert that something is ready (§8.6(d)): the count of
+// serving replicas is what decides whether one of them may step out for
+// maintenance, and a node asking that question has to exclude itself. A report
+// that cannot say who it came from cannot be subtracted from.
+func WithNodeID(nodeID int64) ControlPlaneOption {
+	return func(c *LocalControlPlane) { c.nodeID = nodeID }
 }
 
 // WithControlLogger wires a logger for the control plane's advisory reports
@@ -213,9 +231,50 @@ func (c *LocalControlPlane) ReportDataDurable(ctx context.Context, kbID string, 
 	return nil
 }
 
-// ReportIndexReady marks the version's index built and serviceable.
+// ReportIndexReady marks the version's index built and serviceable — on THIS
+// node.
+//
+// The report carries the reporter's identity, because "serviceable" is a fact
+// about this replica rather than about the version in the abstract, and the
+// control layer aggregates the identities into the serving count §8.6(d)'s
+// rolling cleanup has to consult. An unwired nodeID (0) records nothing, which
+// under-states that count — the safe direction: it can only make cleanup more
+// cautious.
 func (c *LocalControlPlane) ReportIndexReady(ctx context.Context, _ string, versionID int64) error {
-	return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady)
+	return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, c.nodeID)
+}
+
+// IndexReadyReplicaCount reports how many nodes OTHER than `except` have reported
+// this version's index serviceable (§8.6(d)).
+//
+// It answers exactly one question, out of the control layer's own authoritative
+// state: may this node step out of service for a moment to reclaim its artifact?
+// The asker is excluded because it is about to stop serving — counting it would
+// let a node vouch for its own safety, which is the one thing the check exists to
+// prevent.
+//
+// A version that is not in the metadata at all is an ERROR rather than a count of
+// zero: "this version is gone" and "nobody is serving it" call for opposite
+// actions, and only the caller knows which it meant to ask about.
+func (c *LocalControlPlane) IndexReadyReplicaCount(ctx context.Context, kbID string, versionID int64, except int64) (int, error) {
+	versions, err := c.rn.ListVersions(ctx, kbID)
+	if err != nil {
+		return 0, fmt.Errorf("plane: IndexReadyReplicaCount: list versions of %s: %w", kbID, err)
+	}
+	for _, v := range versions {
+		if v.VersionID != versionID {
+			continue
+		}
+		count := 0
+		for _, node := range v.IndexReadyNodes {
+			if node != except {
+				count++
+			}
+		}
+		return count, nil
+	}
+	return 0, fmt.Errorf("plane: IndexReadyReplicaCount: version %d of %s not found: %w",
+		versionID, kbID, stratumerrors.ErrVersionNotFound)
 }
 
 // ReportAvailability maps the abstract storage-layer availability onto the
@@ -226,14 +285,18 @@ func (c *LocalControlPlane) ReportIndexReady(ctx context.Context, _ string, vers
 // service capacity distribution rather than the version's own state
 // (Stratum_设计文档v13.md §8.2), so the version stays READY and the
 // degradation is an alerting concern upstream.
+//
+// nodeID 0: these are verdicts ABOUT the version, not a replica claiming it is
+// serving (§8.6(d) counts the latter). Recording a node here would let one
+// replica's availability verdict stand in for another's readiness.
 func (c *LocalControlPlane) ReportAvailability(ctx context.Context, _ string, versionID int64, state Availability) error {
 	switch state {
 	case AvailabilityDegraded:
 		return nil
 	case AvailabilityAvailable:
-		return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady)
+		return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, 0)
 	case AvailabilityUnavailable:
-		return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusFailed)
+		return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusFailed, 0)
 	default:
 		return fmt.Errorf("plane: ReportAvailability: unknown availability %d", int(state))
 	}
@@ -281,7 +344,10 @@ func (c *LocalControlPlane) ReportEpoch(ctx context.Context, _ uint64, dataVersi
 			if !ready[v.VersionID] || v.IndexStatus != types.IndexStatusPending {
 				continue
 			}
-			if err := c.rn.ProposeUpdateVersionStatus(ctx, v.VersionID, types.IndexStatusReady); err != nil {
+			// nodeID 0: the version's readiness is established by the storage
+			// layer's own reconcile, not by a replica claiming it serves — §8.6(d)
+			// counts the latter, and this promotion must not add a phantom server.
+			if err := c.rn.ProposeUpdateVersionStatus(ctx, v.VersionID, types.IndexStatusReady, 0); err != nil {
 				return fmt.Errorf("plane: ReportEpoch: promote version %d to READY: %w", v.VersionID, err)
 			}
 		}

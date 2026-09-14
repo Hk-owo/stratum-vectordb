@@ -410,7 +410,7 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		if status == types.IndexStatusReady && distributeIndex != nil {
 			distributeIndex(kbID, versionID)
 		}
-		return rn.ProposeUpdateVersionStatus(context.Background(), versionID, status)
+		return rn.ProposeUpdateVersionStatus(context.Background(), versionID, status, 0)
 	})
 	distributeIndex = func(kbID string, versionID int64) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
