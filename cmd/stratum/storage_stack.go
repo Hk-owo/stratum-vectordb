@@ -133,6 +133,7 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		GCEnabled:              cfg.IndexGCEnabled,
 		IndexServingReplicaMin: cfg.IndexServingReplicaMin,
 		GCGraphRebuildRatio:    cfg.IndexGCGraphRebuildRatio,
+		GCSweepInterval:        cfg.IndexGCSweepInterval,
 	})
 	indexMgr.SetLogger(logger.Named("index"))
 	// §6: reclaim index artifacts whose build was abandoned. Like the cold

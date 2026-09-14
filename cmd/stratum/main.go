@@ -1364,6 +1364,13 @@ type appConfig struct {
 	// costs the whole graph.
 	IndexGCGraphRebuildRatio float64
 
+	// IndexGCSweepInterval is how often the §8.6(d) scanner re-estimates the dead
+	// share (index_manager.gc_sweep_interval_ms); <= 0 means the IndexManager's
+	// default, negative disables the scanner. Shortening it is cheap — a scan only
+	// reads local state — but collection candidates are only ever produced by a
+	// scan, so disabling the scanner disables collection too.
+	IndexGCSweepInterval time.Duration
+
 	WriteMaxRetries   int
 	WriteRetryBaseMS  int
 	DeleteMaxRetries  int
@@ -1454,6 +1461,10 @@ type fileConfig struct {
 		// artifact, which costs the whole graph. <= 0 takes the default (0.5),
 		// deliberately far above append_max_dead_ratio.
 		GraphRebuildRatio float64 `yaml:"graph_rebuild_ratio"`
+		// GCSweepIntervalMS is how often the scanner re-estimates. <= 0 takes the
+		// default (10 minutes); negative disables the scanner (and with it
+		// collection — nothing would ever produce a candidate).
+		GCSweepIntervalMS int `yaml:"gc_sweep_interval_ms"`
 	} `yaml:"index_manager"`
 
 	WriteCoordinator struct {
@@ -1592,6 +1603,11 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.IndexManager.GraphRebuildRatio != 0 {
 		cfg.IndexGCGraphRebuildRatio = fc.IndexManager.GraphRebuildRatio
 	}
+	// Negative is meaningful here (disable the scanner), so this one is applied
+	// whenever it is set rather than guarded by != 0.
+	if fc.IndexManager.GCSweepIntervalMS != 0 {
+		cfg.IndexGCSweepInterval = time.Duration(fc.IndexManager.GCSweepIntervalMS) * time.Millisecond
+	}
 	if fc.WriteCoordinator.MaxRetries != 0 {
 		cfg.WriteMaxRetries = fc.WriteCoordinator.MaxRetries
 	}
@@ -1673,6 +1689,7 @@ func defaultConfig() appConfig {
 		IndexGCEnabled:           false,
 		IndexServingReplicaMin:   0,
 		IndexGCGraphRebuildRatio: 0,
+		IndexGCSweepInterval:     0,
 
 		WriteMaxRetries:   3,
 		WriteRetryBaseMS:  100,

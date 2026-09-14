@@ -258,6 +258,22 @@ vecstore:
 embed:
   service_addr: "http://stratum-embed:8080"
 
+# §8.6(d) in the test fixture. The scanner is always on (it only reads), but this
+# cluster turns COLLECTION on too, with a short sweep interval: otherwise the
+# pressure case would have to wait out the 10-minute default before anything could
+# happen, and the whole chain (scan → decide → reopen/rebuild → save →
+# redistribute) would never run in CI.
+#
+# Leaving it on does not change what the other cases exercise: collection only
+# starts on an ARTIFACT THAT CARRIES TOMBSTONES over the ratio, and only after the
+# serving-capacity check, so a case that does not delete documents never produces a
+# candidate. serving_replica_min is spelled out so the fixture's own precondition
+# ("enough replicas left serving") is visible rather than implied by a default.
+index_manager:
+  gc_enabled: true
+  gc_sweep_interval_ms: 5000
+  serving_replica_min: 2
+
 logging:
   level: "info"
 EOF
