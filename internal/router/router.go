@@ -16,6 +16,7 @@ import (
 	pb "stratum/api/proto/stratum"
 
 	"stratum/internal/authmeta"
+	stratumerrors "stratum/internal/errors"
 )
 
 // Config configures a Router.
@@ -546,15 +547,30 @@ func tryAll[T any](r *Router, ctx context.Context, fn func(idx int, ctx context.
 	return zero, errors.New("router: no leader available")
 }
 
-// isRetryableErr reports whether a forwarded call should retry on another
-// node:
-//   - kvraft.ErrNotLeader (codes.Internal + "not leader"): this node is
-//     not the Raft leader, the router must re-discover and retry.
-//   - codes.Unavailable: node down / connection failed (leader failover
-//     or a stopped container).
+// isRetryableErr reports whether a forwarded call should retry on another node.
 //
-// Everything else (validation errors, index failures, ...) is terminal.
+// The decision is made on the error's IDENTITY first, and only then on its
+// status code. The code alone cannot answer the question: FailedPrecondition is
+// shared by failures that mean opposite things — "this replica has not built the
+// index / has taken it out of service, another one may be fine" versus "the
+// version is being deleted, do not retry anywhere". A code-only rule therefore
+// either retries the terminal ones or gives up on the recoverable ones, and a
+// message-matching rule (what the "not leader" special case below does) breaks
+// the moment anyone rewords an error. Named sentinels travel as a standard
+// ErrorInfo detail (errors.ReasonOf), which is what makes the distinction
+// available on this side of the wire at all.
+//
+// The code-based fallback covers errors that carry no reason:
+//   - codes.Unavailable: node down / connection failed (leader failover or a
+//     stopped container) — worth another candidate.
+//   - codes.Internal + "not leader": a forwarded kvraft error, which has no
+//     named sentinel of its own yet.
+//
+// Everything else (validation errors, terminal version states, ...) is terminal.
 func isRetryableErr(err error) bool {
+	if reason := stratumerrors.ReasonOf(err); reason != "" {
+		return retryableReasons[reason]
+	}
 	st, ok := status.FromError(err)
 	if !ok {
 		return false
@@ -563,4 +579,17 @@ func isRetryableErr(err error) bool {
 		return true
 	}
 	return st.Code() == codes.Internal && strings.Contains(st.Message(), "not leader")
+}
+
+// retryableReasons names the sentinels that mean "another candidate may
+// succeed". Keyed by the WIRE name (part of the node-to-node protocol), so a
+// reworded message cannot change the answer, and a sentinel that is not listed
+// here — e.g. version_deleting or knowledge_base_deleted, which share
+// FailedPrecondition but are terminal — is never retried by accident.
+var retryableReasons = map[string]bool{
+	// This replica has not built the version's index (yet); another one may have.
+	"index_not_ready": true,
+	// This replica took the version's index out of service on purpose, for the
+	// §8.6(d) rolling cleanup; another one is serving it.
+	"index_maintenance": true,
 }

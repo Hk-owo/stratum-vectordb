@@ -12,13 +12,15 @@ import (
 	"errors"
 	"fmt"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 // Named business errors. New error types are added here first; a single
 // line is then added to grpcCodeMap to route them to the correct gRPC
-// status code.
+// status code, and one to sentinelNames so the identity survives a process
+// boundary.
 var (
 	ErrVersionNotFound       = errors.New("version not found")
 	ErrVersionPending        = errors.New("version is pending")   // storage-layer write for the version still in progress; not queryable
@@ -28,9 +30,16 @@ var (
 	ErrKnowledgeBaseNotFound = errors.New("knowledge base not found")
 	ErrKnowledgeBaseDeleted  = errors.New("knowledge base is deleted")
 	ErrIndexNotReady         = errors.New("index not ready")
-	ErrInvalidArgument       = errors.New("invalid argument")
-	ErrIndexLoadTimeout      = errors.New("index load timeout")
-	ErrInvalidParentVersion  = errors.New("invalid parent version")
+	// ErrIndexMaintenance is this node deliberately taking a version's index out
+	// of service: §8.6(d)'s rolling cleanup reopens a sealed artifact, which
+	// leaves it in BUILDING until it is resealed. It is deliberately SEPARATE
+	// from ErrIndexNotReady — "we took it down on purpose" and "it has not been
+	// built yet" share a gRPC code (neither is fixable by retrying THIS node)
+	// but are different root causes, and whoever reads a log wants to know which.
+	ErrIndexMaintenance     = errors.New("index under maintenance")
+	ErrInvalidArgument      = errors.New("invalid argument")
+	ErrIndexLoadTimeout     = errors.New("index load timeout")
+	ErrInvalidParentVersion = errors.New("invalid parent version")
 )
 
 // sentinelNames gives every sentinel a stable wire name. A proposal forwarded
@@ -55,6 +64,7 @@ var sentinelNames = []struct {
 	{"knowledge_base_not_found", ErrKnowledgeBaseNotFound},
 	{"knowledge_base_deleted", ErrKnowledgeBaseDeleted},
 	{"index_not_ready", ErrIndexNotReady},
+	{"index_maintenance", ErrIndexMaintenance},
 	{"invalid_argument", ErrInvalidArgument},
 	{"index_load_timeout", ErrIndexLoadTimeout},
 	{"invalid_parent_version", ErrInvalidParentVersion},
@@ -97,6 +107,7 @@ var grpcCodeMap = map[error]codes.Code{
 	ErrKnowledgeBaseNotFound: codes.NotFound,
 	ErrKnowledgeBaseDeleted:  codes.FailedPrecondition,
 	ErrIndexNotReady:         codes.FailedPrecondition,
+	ErrIndexMaintenance:      codes.FailedPrecondition,
 	ErrInvalidArgument:       codes.InvalidArgument,
 	ErrIndexLoadTimeout:      codes.DeadlineExceeded,
 	ErrInvalidParentVersion:  codes.InvalidArgument,
@@ -106,14 +117,23 @@ var grpcCodeMap = map[error]codes.Code{
 // the error chain with errors.Is so wrapped errors (fmt.Errorf("...: %w",
 // err)) are correctly matched against the named sentinels. nil maps to nil.
 //
+// A NAMED sentinel carries its identity onto the wire, as a standard
+// google.rpc.ErrorInfo detail (see ReasonOf). The status code alone cannot
+// identify an error: FailedPrecondition covers both "retry elsewhere, another
+// replica may be ready" (index_not_ready, index_maintenance) and "stop, this is
+// terminal" (version_deleting, knowledge_base_deleted). Attaching the reason at
+// this single conversion point means every named error travels with its
+// identity — before this, only errors crossing the proposal-forwarding path
+// carried one, so a caller across the network had nothing to match on but the
+// message text.
+//
 // An error that is ALREADY a gRPC status (one that came back from another service, or
-// from an internal boundary that returned one) keeps its own code instead of being
-// relabelled Internal. That relabelling was a real defect, not a hypothetical: the
-// vector store classifies a search on a still-building index as FAILED_PRECONDITION
-// (its C++ side maps absl's FailedPrecondition straight to the gRPC code), grpc-go
-// hands that classification to the caller intact, and this fallback then threw it away
-// — turning a correct classification into a wrong one. Preserving the incoming code is
-// what keeps a service's stated meaning intact across the hop.
+// from an internal boundary that returned one) is returned AS IS — code, message and
+// details. That preservation was a real defect twice over: the vector store classifies
+// a search on a still-building index as FAILED_PRECONDITION (its C++ side maps absl's
+// FailedPrecondition straight to the gRPC code), and an earlier version of this function
+// relabelled it Internal; rebuilding the status from (code, message) still threw away
+// any details the producer attached.
 //
 // Only genuinely unrecognized errors map to codes.Internal — they should not normally
 // reach this function uncategorized; treat repeated Internal mappings for the same
@@ -125,10 +145,8 @@ func ToGRPCStatus(err error) error {
 	if err == nil {
 		return nil
 	}
-	for sentinel, code := range grpcCodeMap {
-		if errors.Is(err, sentinel) {
-			return status.Error(code, err.Error())
-		}
+	if reason := Name(err); reason != "" {
+		return statusWithReason(grpcCodeOf(err), err.Error(), reason)
 	}
 	// Checked with errors.As against the GRPCStatus interface rather than
 	// status.FromError: the latter reports success for ANY error (it yields
@@ -136,9 +154,57 @@ func ToGRPCStatus(err error) error {
 	// every unclassifiable error into Unknown.
 	var withStatus interface{ GRPCStatus() *status.Status }
 	if errors.As(err, &withStatus) {
-		return status.Error(withStatus.GRPCStatus().Code(), err.Error())
+		return withStatus.GRPCStatus().Err()
 	}
 	return status.Error(codes.Internal, err.Error())
+}
+
+// grpcCodeOf maps a business error to its status code, defaulting to Internal
+// for anything not in grpcCodeMap.
+func grpcCodeOf(err error) codes.Code {
+	for sentinel, code := range grpcCodeMap {
+		if errors.Is(err, sentinel) {
+			return code
+		}
+	}
+	return codes.Internal
+}
+
+// statusWithReason builds a status carrying a sentinel's wire name as a
+// google.rpc.ErrorInfo detail. A status that refuses the detail is still a valid
+// status, so failing to attach is not an error: the reason is an improvement,
+// not a requirement.
+func statusWithReason(code codes.Code, msg, reason string) error {
+	st := status.New(code, msg)
+	detailed, err := st.WithDetails(&errdetails.ErrorInfo{Reason: reason})
+	if err != nil {
+		return st.Err()
+	}
+	return detailed.Err()
+}
+
+// ReasonOf returns the sentinel name a gRPC status carries as ErrorInfo, or ""
+// when it carries none.
+//
+// This is how a caller across a process boundary tells two same-code failures
+// apart. Matching on the message text instead is what this replaces: the codebase
+// used to read codes.Internal plus strings.Contains(msg, "not leader"), which
+// breaks the moment anyone rewords an error and cannot promise it will not catch
+// something else.
+func ReasonOf(err error) string {
+	if err == nil {
+		return ""
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return ""
+	}
+	for _, detail := range st.Details() {
+		if info, ok := detail.(*errdetails.ErrorInfo); ok {
+			return info.GetReason()
+		}
+	}
+	return ""
 }
 
 // Wrap is a thin convenience wrapper around fmt.Errorf("...: %w", err) for
