@@ -264,15 +264,23 @@ embed:
 # happen, and the whole chain (scan → decide → reopen/rebuild → save →
 # redistribute) would never run in CI.
 #
-# Leaving it on does not change what the other cases exercise: collection only
-# starts on an ARTIFACT THAT CARRIES TOMBSTONES over the ratio, and only after the
-# serving-capacity check, so a case that does not delete documents never produces a
-# candidate. serving_replica_min is spelled out so the fixture's own precondition
-# ("enough replicas left serving") is visible rather than implied by a default.
+# append_max_dead_ratio is raised deliberately, and that is a FINDING rather than a
+# convenience. §8.6(c) reuses a parent artifact only while its dead share stays
+# under this ratio, and §8.6(d)'s collection threshold (GCRatioThreshold) defaults
+# to the SAME 0.2. With both at 0.2 the two cancel out: anything dead enough for (d)
+# to want is already dead enough for (c) to have rebuilt during the build, so the
+# tombstones never survive to be collected and (d) can never fire. Measured:
+# deleting 480 of 600 documents left a 362-line index (fully rebuilt, zero
+# tombstones) instead of the ~1800-line artifact with tombstones that (d) needs.
+#
+# Raising (c)'s bar here lets artifacts keep their tombstones, which is the only way
+# the (d) chain can be exercised at all. The production values for this pair need a
+# deliberate decision — see §5 #14 in the design document.
 index_manager:
   gc_enabled: true
   gc_sweep_interval_ms: 5000
   serving_replica_min: 2
+  append_max_dead_ratio: 0.95
 
 logging:
   level: "info"

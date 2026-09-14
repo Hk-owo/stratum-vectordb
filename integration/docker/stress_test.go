@@ -14,6 +14,8 @@ package docker_test
 
 import (
 	"context"
+	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"sort"
@@ -122,6 +124,26 @@ func writeChanges(t *testing.T, ctx context.Context, addr, kbID string, parent i
 	return resp.VersionId
 }
 
+// rollbackTo points the knowledge base's active version at versionID.
+//
+// The name is service-layer history: this is the "switch the active pointer
+// without downtime" operation (§7), and it accepts any READY version — it is not
+// restricted to ancestors. That matters here, because the version §8.6(d) should
+// collect is precisely the one that is both active and carrying tombstones.
+func rollbackTo(ctx context.Context, addr, kbID string, versionID int64) error {
+	kb, _, _, conn, err := dialNode(addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	_, err = kb.RollbackVersion(ctx, &pb.RollbackVersionRequest{
+		KnowledgeBaseId: kbID,
+		TargetVersionId: versionID,
+	})
+	return err
+}
+
 // writeVersion adds docs as a chain of CreateVersion batches and returns the last
 // version id, which is the one carrying all of them.
 //
@@ -151,6 +173,39 @@ func writeVersion(t *testing.T, ctx context.Context, addr, kbID string, docs []d
 		}
 	}
 	return parent
+}
+
+// genUniqueDocs generates n documents whose contents are all DISTINCT.
+//
+// datavolume_test.go's genDataVolumeDocs cycles a 6-sentence list seeded by the
+// document index, so its documents come in only 6 distinct flavours — fine for
+// measuring write volume, useless for the §8.6(d) case. Chunks are
+// content-addressed and stored once, so near-identical documents share their
+// chunks: deleting 480 of 600 such documents removed almost no chunk, and the
+// tombstones this case exists to provoke never appeared. (Measured: 600 documents
+// collapsed to 18 chunk ids, and the scan found no candidate at all.)
+//
+// This generator drives each document from its own PRNG seed over a character
+// pool, so every sliding-window chunk is its own. That is the precondition for
+// "deleting documents ⇒ dead vectors", which is all this case is about — not a
+// claim about realistic corpora.
+func genUniqueDocs(n, targetRunes int) []docUnit {
+	pool := []rune("向量检索分层缓存预写日志共识快照索引墓碑回收滚动重建活跃版本副本服务能力阈值占位标定" +
+		"召回粗筛量化重排分段切分窗口重叠去重幂等水位追链自愈广播鉴权闸门熔断降级限流背压")
+	docs := make([]docUnit, n)
+	for i := 0; i < n; i++ {
+		rng := rand.New(rand.NewSource(int64(i) * 7919))
+		var sb strings.Builder
+		sb.Grow(targetRunes * 3)
+		for len([]rune(sb.String())) < targetRunes {
+			sb.WriteRune(pool[rng.Intn(len(pool))])
+		}
+		docs[i] = docUnit{
+			id:      fmt.Sprintf("doc-%06d", i),
+			content: sb.String(),
+		}
+	}
+	return docs
 }
 
 // indexBytes sums the index directory across the whole storage group — the number
@@ -296,22 +351,38 @@ func TestT4_GCPressure(t *testing.T) {
 	leaderAddr := nodeAddrs[leaderIdx]
 	docCount := stressDocs()
 	deletePct := stressDeletePercent()
-	docs := genDataVolumeDocs(docCount, 1000)
+	docs := genUniqueDocs(docCount, 1000)
 
 	baseVersion := writeVersion(t, ctx, leaderAddr, kbID, docs)
 	waitVersionStatus(t, ctx, leaderAddr, kbID, baseVersion, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
 	before := indexBytes(t)
 	t.Logf("base version %d READY; index bytes across the storage group: %d", baseVersion, before)
 
-	// Delete most of it. The new version inherits the base's artifact by pure append
-	// (§8.6c), so the deleted documents' vectors remain as TOMBSTONES — precisely the
-	// dead weight §8.6(d) exists to reclaim.
+	// Delete most of it AND add a little, in the SAME version. The mixture is the
+	// precondition, not decoration: §8.6(c) reuses the parent artifact only when
+	// there is something to append — `appendBase` returns ok=false as soon as
+	// `len(delta) == 0`, because "copy the parent, dead vectors and all" is never
+	// worth it when nothing new comes along. A version that ONLY deletes is
+	// therefore rebuilt from scratch, and a rebuild drops every tombstone: measured
+	// at 362 index lines (clean) instead of ~1800 with tombstones.
+	//
+	// With the append actually happening, the deleted documents' vectors remain as
+	// TOMBSTONES in the sealed artifact — precisely the dead weight §8.6(d) exists to
+	// reclaim.
 	deleteCount := docCount * deletePct / 100
-	changes := make([]*pb.DocChange, 0, deleteCount)
+	added := genUniqueDocs(docCount/20+1, 1000)
+	changes := make([]*pb.DocChange, 0, deleteCount+len(added))
 	for i := 0; i < deleteCount; i++ {
 		changes = append(changes, &pb.DocChange{
 			Op:    pb.ChangeOp_CHANGE_OP_DELETE,
 			DocId: docs[i].id,
+		})
+	}
+	for i := range added {
+		changes = append(changes, &pb.DocChange{
+			Op:      pb.ChangeOp_CHANGE_OP_ADD,
+			DocId:   fmt.Sprintf("late-%06d", i),
+			Content: added[i].content,
 		})
 	}
 	trimmed := writeChanges(t, ctx, leaderAddr, kbID, baseVersion, changes)
@@ -325,6 +396,19 @@ func TestT4_GCPressure(t *testing.T) {
 			"the append may have rebuilt instead of reusing, which leaves no dead weight to collect",
 			before, afterDelete)
 	}
+
+	// Make the tombstoned version the ACTIVE one — §8.6(d) collects active versions
+	// only. The design's target is "long-lived, continuously queried, no successor
+	// in sight", and activeness is how the control layer expresses exactly that.
+	//
+	// CreateVersion does NOT move the active pointer (only the set-active command
+	// does), so without this step the knowledge base has no active version at all
+	// and the scanner has nothing to look at. This missing step — not a faulty
+	// candidate judgement — is why this case used to skip.
+	if err := rollbackTo(ctx, leaderAddr, kbID, trimmed); err != nil {
+		t.Fatalf("RollbackVersion(%d) failed: %v", trimmed, err)
+	}
+	t.Logf("version %d is now the active version", trimmed)
 
 	// --- Wait for the scanner to collect ---
 	deadline := time.Now().Add(stressCollectTimeout())
@@ -342,14 +426,28 @@ func TestT4_GCPressure(t *testing.T) {
 	}
 
 	if !collected {
-		if !anyStorageLogHas(t, "§8.6(d) cleanup candidate") {
-			t.Skip("no §8.6(d) scan in the storage logs: collection is off " +
-				"(index_manager.gc_enabled) or the scanner was never started")
+		switch {
+		case !anyStorageLogHas(t, "gc scan read the active versions"):
+			t.Skip("the §8.6(d) scanner is not running on any storage node — " +
+				"check index_manager.gc_sweep_interval_ms (negative disables it) and the data dir")
+		case !anyStorageLogHas(t, "cleanup candidate"):
+			t.Skipf("the scanner ran but found NO candidate. §8.6(d) has a narrow "+
+				"precondition and any one of these defeats it — (1) the sealed artifact "+
+				"carries no tombstones, because §8.6(c) rebuilt instead of reusing: a "+
+				"version that only deletes has an empty delta, and a build whose parent "+
+				"artifact sits on another node cannot reuse either (1 of %d nodes here); "+
+				"(2) the dead share is at or below GCRatioThreshold; (3) AppendMaxDeadRatio "+
+				"and GCRatioThreshold share the 0.2 default, so §8.6(c) rebuilds at exactly "+
+				"the share §8.6(d) starts caring about, and (d) never sees anything. "+
+				"Index bytes across the group: %d → %d.",
+				len(storageServices), before, afterDelete)
+		default:
+			t.Skipf("a candidate was found but nothing was collected within %v — check "+
+				"index_manager.serving_replica_min (with %d storage replicas, collection "+
+				"needs enough left serving) and whether collection is enabled "+
+				"(index_manager.gc_enabled)",
+				stressCollectTimeout(), len(storageServices))
 		}
-		t.Skipf("the scanner found candidates but never collected within %v — check "+
-			"index_manager.serving_replica_min (with %d storage replicas, collection needs "+
-			"enough replicas left serving) and index_manager.gc_sweep_interval_ms",
-			stressCollectTimeout(), len(storageServices))
 	}
 
 	t.Logf("COLLECTED: index bytes %d → %d (%.1f%% of the post-delete size reclaimed)",

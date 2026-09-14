@@ -160,6 +160,14 @@ func (im *IndexManagerImpl) scanGCCandidates(ctx context.Context) []gcCandidate 
 		im.logger.Warn("index: gc scan could not read the active versions", zap.Error(err))
 		return nil
 	}
+	// One line per scan, because the two ways this can find nothing — "the control
+	// layer reports no active version" and "the candidate judgement rejected them
+	// all" — look identical from the outside (nothing gets collected either way) and
+	// have entirely different causes. One line per scan is affordable: production
+	// scans every few minutes, and a test that shortens that to seconds is exactly
+	// when you want to see this.
+	im.logger.Info("index: gc scan read the active versions",
+		zap.Int("active_versions", len(active)), zap.Float64("threshold", threshold))
 	var candidates []gcCandidate
 	for kbID, versionID := range active {
 		// A SEALED artifact is the prerequisite: the unsealed remains of a dead
