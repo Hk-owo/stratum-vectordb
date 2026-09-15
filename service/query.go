@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -43,6 +44,12 @@ type QueryServiceImpl struct {
 	// check skip rather than fail — an unconfigured node behaves as it did
 	// before §9 rather than refusing everything.
 	localVersion LocalVersionReporter
+
+	// backfiller pulls this node's history up to a version on demand. It is what
+	// turns §9.3(2)'s freshness refusal from a dead end into a repair: without it
+	// a node that is behind refuses the query, never fetches what it is missing,
+	// and therefore stays behind forever. See the freshness check in Query.
+	backfiller Backfiller
 }
 
 // NewQueryService constructs a QueryServiceImpl.
@@ -58,6 +65,19 @@ type LocalVersionReporter interface {
 // which is the pre-§9 behaviour rather than a broken one.
 func (s *QueryServiceImpl) SetLocalVersionReporter(r LocalVersionReporter) {
 	s.localVersion = r
+}
+
+// Backfiller fetches a knowledge base's data on this node up to versionID — the
+// storage layer's §7.5 pull, which plane.DataPlane.EnsureIndex already is.
+type Backfiller interface {
+	EnsureIndex(ctx context.Context, kbID string, versionID int64) error
+}
+
+// SetBackfiller wires the pull the freshness check uses to repair itself.
+// Optional: without it the check refuses exactly as it did before and the node
+// simply never catches up on demand, which is the pre-existing behaviour.
+func (s *QueryServiceImpl) SetBackfiller(b Backfiller) {
+	s.backfiller = b
 }
 
 func NewQueryService(
@@ -130,11 +150,40 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// caller gets a well-formed result from the wrong point in time and has no
 	// way to tell. Refusing makes it visible, and lets the station move to a
 	// node that is current.
+	//
+	// Refusing is only half of it. A node that is behind has to be able to STOP
+	// being behind, and nothing else in this path fetches what it is missing: the
+	// write that would have pushed the data here reached quorum without it (§7.1),
+	// and the confirmation that would have told it to pull is best-effort. Left to
+	// refuse and nothing else, a replica stays behind forever while every query
+	// for a version it could serve is answered with an error it can never clear —
+	// measured on the 3+3 cluster, where one storage replica held none of a
+	// knowledge base's versions and answered every query with "local history
+	// reaches version 0".
+	//
+	// So the pull is asked for first, and the refusal is reserved for the case
+	// where it genuinely did not help. The refusal carries a retryable wire name,
+	// so a caller with another replica to ask (the station always has) moves on
+	// instead of treating it as terminal — see router.retryableReasons.
 	if want := req.GetMinVersion(); want > 0 && s.localVersion != nil {
 		if have := s.localVersion.LocalVersionOf(kbID); have < want {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"query: %s: local history reaches version %d, below the required %d",
-				kbID, have, want)
+			if s.backfiller != nil {
+				if err := s.backfiller.EnsureIndex(ctx, kbID, want); err != nil {
+					s.logger.Debug("query: could not pull this node's history up to the required version",
+						zap.String("kb_id", kbID), zap.Int64("want", want),
+						zap.Int64("have", have), zap.Error(err))
+				}
+			}
+			if have = s.localVersion.LocalVersionOf(kbID); have < want {
+				// Wrapped, not replaced: the wire name keeps it retryable for a
+				// caller with another replica to ask, while the message keeps the
+				// diagnosis — how far behind this node is and behind what. A bare
+				// sentinel throws away the only information that makes the refusal
+				// actionable (see TestQueryService_RefusesAStaleNodeForAFreshness…).
+				return nil, stratumerrors.ToGRPCStatus(fmt.Errorf(
+					"%w: %s: local history reaches version %d, below the required %d",
+					stratumerrors.ErrIndexNotReady, kbID, have, want))
+			}
 		}
 	}
 
@@ -203,7 +252,11 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		//
 		// Same gRPC code as before (FailedPrecondition), so callers see no change;
 		// what changes is that "another replica may have it" is now sayable.
-		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrIndexNotReady)
+		//
+		// ErrVersionPending rather than ErrIndexNotReady: both are retryable wire
+		// names, but this one names the actual state ("the version's write is still
+		// in progress"), which is what someone reading a log wants to know.
+		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionPending)
 	}
 	if targetVersion.IndexStatus == types.IndexStatusFailed {
 		return nil, status.Error(codes.FailedPrecondition, "version index is FAILED")

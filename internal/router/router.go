@@ -592,4 +592,9 @@ var retryableReasons = map[string]bool{
 	// This replica took the version's index out of service on purpose, for the
 	// §8.6(d) rolling cleanup; another one is serving it.
 	"index_maintenance": true,
+	// This replica's storage-layer write for the version is still in progress.
+	// The work is running (or about to be scheduled), so another replica may
+	// already be serving the version — and the query path now asks for the build
+	// instead of only refusing, which is what makes the retry worth making.
+	"version_pending": true,
 }

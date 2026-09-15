@@ -908,6 +908,11 @@ func main() {
 		// answer "how far does my history reach". Without this the node can only
 		// ignore credentials, which is not the same as refusing a stale answer.
 		querySvc.SetLocalVersionReporter(dataPlane)
+		// §9.3(2): the freshness check can also REPAIR a node that is behind —
+		// pulling the history it is missing — instead of only refusing. Without
+		// this a replica that missed a version's data can never fetch it, because
+		// the only path that triggers a pull is the query being refused.
+		querySvc.SetBackfiller(dataPlane)
 		// Per-stage query timings, at debug level. Without this the query path
 		// is opaque from the node's own log — localizing the O(candidates ×
 		// documents) defect needed an outside-in probe plus temporary C++
