@@ -261,6 +261,14 @@ func TestQueryService_PendingVersionRejected(t *testing.T) {
 	if st.Code() != codes.FailedPrecondition {
 		t.Errorf("expected FailedPrecondition, got %v", st.Code())
 	}
+
+	// Refusing is only half of it: the request must also ASK for the build.
+	// Otherwise PENDING is permanent — the query that would trigger the lazy
+	// build is the one being refused, so nothing ever gets built.
+	if got := h.indexMgr.TriggeredBuilds(); len(got) != 1 || got[0] != vID {
+		t.Errorf("TriggeredBuilds = %v, want [%d] — a PENDING version must ask for its lazy build",
+			got, vID)
+	}
 }
 
 func TestQueryService_FailedVersionRejected(t *testing.T) {

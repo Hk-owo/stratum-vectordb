@@ -63,7 +63,21 @@ type MockIndexManager struct {
 	loading   map[indexKey]bool // currently being built/loaded; concurrent Search calls wait on cond
 	callbacks []BuildCompleteCallback
 
+	// triggeredBuilds records every version TriggerBuild was asked for, in order.
+	// It exists so a test can assert that a request triggered a lazy build —
+	// which is what the query path must do for a PENDING version instead of only
+	// refusing it.
+	triggeredBuilds []int64
+
 	pingErr error // injectable for tests exercising HealthCheck DEGRADED/UNHEALTHY paths
+}
+
+// TriggeredBuilds returns the version IDs TriggerBuild has been called for, in
+// call order.
+func (m *MockIndexManager) TriggeredBuilds() []int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]int64(nil), m.triggeredBuilds...)
 }
 
 // MockIndexManagerDeps bundles the data-source callbacks MockIndexManager
@@ -109,6 +123,7 @@ func (m *MockIndexManager) TriggerBuild(ctx context.Context, kbID string, versio
 
 	m.mu.Lock()
 	m.loading[key] = true
+	m.triggeredBuilds = append(m.triggeredBuilds, versionID)
 	m.mu.Unlock()
 
 	go func() {

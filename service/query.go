@@ -176,6 +176,22 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionNotFound)
 	}
 	if targetVersion.IndexStatus == types.IndexStatusPending {
+		// A PENDING version is not a dead end: §8.6b builds its index lazily, and
+		// THIS request is the "somebody is waiting for it" signal that the lazy
+		// path exists for. Refusing without asking for the build is what made
+		// PENDING permanent — the very query that would have triggered the build
+		// was the one being refused, so a version whose eager build was slow,
+		// queued or dropped never got a second chance. Measured: TestTwoTier's
+		// `version is PENDING` never cleared inside its 180 s window, while the
+		// same version was READY and servable minutes later.
+		//
+		// Triggering rather than waiting is deliberate: the build runs off this
+		// request (the caller keeps its own deadline), and every retry the station
+		// or the client makes gets a finished index.
+		if err := s.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
+			s.logger.Debug("query: could not trigger a lazy build for a PENDING version",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		}
 		return nil, status.Error(codes.FailedPrecondition, "version is PENDING")
 	}
 	if targetVersion.IndexStatus == types.IndexStatusFailed {
