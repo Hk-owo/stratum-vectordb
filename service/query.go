@@ -168,11 +168,28 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	if want := req.GetMinVersion(); want > 0 && s.localVersion != nil {
 		if have := s.localVersion.LocalVersionOf(kbID); have < want {
 			if s.backfiller != nil {
-				if err := s.backfiller.EnsureIndex(ctx, kbID, want); err != nil {
-					s.logger.Debug("query: could not pull this node's history up to the required version",
-						zap.String("kb_id", kbID), zap.Int64("want", want),
-						zap.Int64("have", have), zap.Error(err))
-				}
+				// Asynchronous, and on its own context. The pull has to outlive this
+				// request: tied to the caller's ctx (as this was) it is cancelled by
+				// the very deadline that made the caller ask — measured as
+				// DeadlineExceeded on every single attempt, a fraction of the way in,
+				// so the node never caught up and never answered. Off the request,
+				// this caller is told to ask someone else (retryably, below) while
+				// the pull runs to completion behind it, and the next query is
+				// served from here.
+				//
+				// Re-triggering is harmless: EnsureIndex re-checks the cursor on every
+				// pass and returns immediately once it is satisfied (see its pull loop).
+				pullKB, pullWant := kbID, want
+				go func() {
+					// Comfortably longer than EnsureIndex's own 30 s pull loop, so
+					// what bounds a pull is the pull, not this wrapper.
+					pullCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					defer cancel()
+					if err := s.backfiller.EnsureIndex(pullCtx, pullKB, pullWant); err != nil {
+						s.logger.Debug("query: background pull did not complete",
+							zap.String("kb_id", pullKB), zap.Int64("want", pullWant), zap.Error(err))
+					}
+				}()
 			}
 			if have = s.localVersion.LocalVersionOf(kbID); have < want {
 				// Wrapped, not replaced: the wire name keeps it retryable for a
