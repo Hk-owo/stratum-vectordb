@@ -274,7 +274,7 @@ func TestT4_DataVolume(t *testing.T) {
 	queryResp, err := q.Query(ctx, &pb.QueryRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       &lastVersionID,
-		Vector:          make([]float32, 768),
+		Vector:          queryVector(768),
 		TopK:            10,
 	})
 	if err != nil {

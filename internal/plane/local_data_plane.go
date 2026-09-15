@@ -1358,6 +1358,152 @@ func (d *LocalDataPlane) SafeDurableVersion(ctx context.Context, kbID string) (i
 	return reports[quorum-1], true, nil
 }
 
+// emptyDocIDSetHash is the digest of a version whose document set is empty —
+// the version every knowledge base is created with. It is a value, not an
+// absence: see sync.ComputeDocIDSetHash.
+var emptyDocIDSetHash = stratinternalsync.ComputeDocIDSetHash(nil)
+
+// RecoverLocalCursors rebuilds this node's contiguous data cursor for every
+// knowledge base from LOCAL facts, once at startup.
+//
+// Why it is needed: the cursor lives in memory (§7.8), so a restarted node
+// starts at 0 for every knowledge base while its disk still holds the data. The
+// station's freshness check (§9.3(2)) reads that cursor, so this replica — data
+// complete, index present — is refused with "local history reaches version 0,
+// below the required N" until some later write happens to advance it. Measured
+// on the 3+3 cluster: after restarting one storage node, its sixth query failed
+// with exactly that error (TestT4_QueryLatency).
+//
+// The evidence is local, not the peers': what a node holds is a question about
+// its own disk. §7.8's quorum bound answers a different one ("what may I claim
+// durable?"), and it cannot answer this — a restarted node's own report is 0,
+// so the quorum minimum of {0, N, N} is 0 and the cursor would stay where it
+// was.
+//
+// Three facts say "this version is here": an artifact on this node (built here
+// or received via §8.4); a committed empty document set, because the empty set
+// IS that version's content; and a READY version whose digest was never
+// committed, which is how a version created with no changes looks. The third is
+// what keeps an EMPTY knowledge base servable after a restart — it has no
+// artifact anywhere, so the first two never fire, and the cursor would stay at 0
+// for good. holdsVersionLocally owns the order they are consulted in.
+//
+// Only a CONTIGUOUS prefix of the version chain is recovered: a node holding v3
+// and v5 but not v4 must not claim 5, because the cursor is what "my history is
+// unbroken to here" means.
+func (d *LocalDataPlane) RecoverLocalCursors(ctx context.Context, meta MetadataLister) error {
+	if meta == nil {
+		return nil
+	}
+	kbs, err := meta.ListKnowledgeBases(ctx)
+	if err != nil {
+		return fmt.Errorf("plane: RecoverLocalCursors: list knowledge bases: %w", err)
+	}
+
+	for _, kb := range kbs {
+		versions, err := meta.ListVersions(ctx, kb.KBID)
+		if err != nil {
+			d.logger.Warn("plane: cursor recovery: ListVersions failed",
+				zap.String("kb_id", kb.KBID), zap.Error(err))
+			continue
+		}
+		sort.Slice(versions, func(i, j int) bool { return versions[i].VersionID < versions[j].VersionID })
+
+		var recovered int64
+		for _, v := range versions {
+			reason, holds := d.holdsVersionLocally(ctx, kb.KBID, v)
+			if !holds {
+				d.logger.Info("plane: cursor recovery: stopped at a version this node does not hold",
+					zap.String("kb_id", kb.KBID),
+					zap.Int64("version_id", v.VersionID),
+					zap.String("reason", reason),
+					zap.String("doc_id_set_hash", v.DocIDSetHash),
+					zap.String("index_status", v.IndexStatus.String()),
+					zap.Int64("recovered_to", recovered))
+				break
+			}
+			recovered = v.VersionID
+		}
+		if recovered <= d.localVersionOf(kb.KBID) {
+			continue
+		}
+		d.advanceLocalVersion(kb.KBID, recovered)
+		d.logger.Info("plane: cursor recovery: recovered the local data cursor from disk",
+			zap.String("kb_id", kb.KBID),
+			zap.Int64("version_id", recovered),
+			zap.Int("versions_considered", len(versions)))
+	}
+	return nil
+}
+
+// holdsVersionLocally reports whether this node holds the version's data —
+// judged only by facts about this node and the version's own metadata — and
+// says why, so the startup log shows an operator which version broke the chain.
+//
+// The order matters, and the artifact is consulted first: of the three facts it
+// is the only one backed by a completed build, so no inference is involved. The
+// two document-set facts follow, because a version with no document set has no
+// artifact either — the index manager answers "version has no chunks; nothing to
+// build" for it — and a disk-only order would report a gap where there is none
+// and stop the recovery at the very first version of the knowledge base.
+//
+// An absent artifact is NOT evidence of absence for a version that HAS a
+// document set: §8.6(b) builds lazily, so such a version may legitimately have
+// no local artifact while its records sit in the stores. That case is reported
+// as "not held" — conservative on purpose, since claiming a version whose
+// records did not land would make this node serve an incomplete result instead
+// of refusing. The cost is a cursor that stays low (and a replica the station
+// keeps off) rather than a wrong answer.
+func (d *LocalDataPlane) holdsVersionLocally(ctx context.Context, kbID string, v types.VersionMeta) (string, bool) {
+	if d.hasLocalArtifact(ctx, kbID, v.VersionID) {
+		return "local artifact", true
+	}
+	if v.DocIDSetHash == emptyDocIDSetHash {
+		// A committed empty document set: the empty set IS this version's
+		// content, so there is nothing on disk to find.
+		return "empty document set", true
+	}
+	if v.DocIDSetHash == "" && v.IndexStatus == types.IndexStatusReady {
+		// READY with no committed digest is exactly how a version created with
+		// no changes looks — the leader commits no digest for a version with no
+		// document set — and READY says the write path (or the builder) was done
+		// with it.
+		//
+		// This case is what keeps an EMPTY knowledge base servable. Measured: a
+		// knowledge base holding only two empty versions (both READY, both with
+		// parent 0) had no artifact on any replica, so every restart left all
+		// three reporting cursor 0 while the station demanded 71: permanently
+		// refused, and nothing would ever build an index for a version with no
+		// chunks to trigger a later advance.
+		//
+		// The alternative reading — a version whose digest commit was missed
+		// while its records never reached this node — is narrower, and it fails
+		// in the direction of a too-high cursor by one version rather than a
+		// permanently refused replica.
+		//
+		// Anything not READY (PENDING, FAILED) keeps the conservative answer
+		// below: a version still being written may have records this node does
+		// not hold.
+		return "ready, no committed digest, no document set", true
+	}
+	return "no local artifact", false
+}
+
+// hasLocalArtifact reports whether this node holds the version's artifact on
+// disk. A missing index store means "no".
+func (d *LocalDataPlane) hasLocalArtifact(ctx context.Context, kbID string, versionID int64) bool {
+	if d.indexMgr == nil {
+		return false
+	}
+	exists, err := d.indexMgr.IndexExists(ctx, kbID, versionID)
+	if err != nil {
+		d.logger.Warn("plane: cursor recovery: IndexExists failed",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		return false
+	}
+	return exists
+}
+
 // ReconcileIndexes is the storage layer's half of the startup reconcile — the
 // "block report" of control-data-separation-design.md §5.3. It walks the
 // versions the control layer knows about, compares them against the indexes

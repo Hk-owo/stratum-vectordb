@@ -295,29 +295,69 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 
 ### 性能实测(3 节点 Docker 集群,真实 Faiss HNSW + RocksDB,768 维)
 
-**查询延迟**(`TestT4_QueryLatency`)——1,000 篇文档、20 次查询,**冷热分开**报:
+拓扑是 `scripts/docker-cluster-both.sh` 的两层形态:3 个控制节点 + 3 个存储节点,每个存储容器自带 vecstore(真实 Faiss HNSW + RocksDB);宿主 8 核 / 7.2 GB,容器与压测进程共享这台机器。
+
+**查询延迟**(`TestT4_QueryLatency`)——2,000 篇文档、200 次查询,**冷热分开**报:
 
 | 指标 | 值 |
 |---|---|
-| 冷查询(重启副本后的首次,含磁盘 `Load`) | **336 ms** |
-| p50(热) | **222 ms** |
-| p95 | **282 ms** |
+| 冷查询(重启副本后的首次,含磁盘 `Load`) | **18 ms** |
+| p50(热) | **15 ms** |
+| p95 | **27 ms** |
+| p99 | **34 ms** |
+
+**同一台机器、同一口径下的三轮对比**(2026-09,见下"查询路径的两处 O(n) 修复"):
+
+| | cold | p50 | p95 | p99 | 用例时长 |
+|---|---|---|---|---|---|
+| 最初 | 769 ms | 679 ms | 771 ms | 847 ms | 185 s |
+| 修掉 O(候选 × 文档) 后 | 65 ms | 42 ms | 56 ms | 66 ms | 55 s |
+| **再修掉"读完再截断"后** | **18 ms** | **15 ms** | 27 ms | 34 ms | 52 s |
+
+单次查询的成本合计降了 **约 44×**。**cold − warm ≈ 3 ms** 才是从磁盘 `Load` 产物本身的价格,其余是检索、结果组装与一次 gRPC 往返。
 
 **为什么冷热必须分开**:重启一个副本后,它的第一次查询要把产物从磁盘 `Load` 回内存,之后都在内存里——两者成本不可比,取平均得到的数字既不描述常见情况也不描述最坏情况。这正是设计文档阶段⑤"含磁盘读"的落点;尾部分位同理,一个检索服务是被它最慢的查询定义的。
 
-规模可放大:
+**查询向量的口径**:套件**现在发确定性非零向量**(`queryVector(768)`,固定种子),与真实调用方一致。曾经每个查询都发全零向量 —— 它与所有文档等距,HNSW 贪心遍历无从剪枝、退化为近似全图扫描;那是真实存在的放大效应,但只是**放大器**:修掉下面两处 O(n) 之后,`TestT4_QueryLatency` 里保留的零向量对照与随机向量已经**几乎无差别**(p50 15.4 ms vs 15.3 ms),因为检索本身只占总延迟的一小块了。
+
+**查询路径的两处 O(n) 修复(2026-09)**:两处都在 `service/query.go`,共同点是把"与命中规模成正比"的工作变成了"与需要的结果成正比"。
+
+1. **每个候选重扫一遍版本的完整 doc-ID 列表** —— 对每个候选 chunk(及其映射到的每个 docID)都做一次前缀扫描取回全部文档 ID、再线性查找成员 ⇒ 单次查询 O(候选数 × 文档数)。改成"每次查询取一次 + 集合查找"。定位时**先排除了 vecstore**:它内部 faiss HNSW 搜索只花 **16 µs**(临时探针 `VECPROBE search ntotal=18 took_us=16`)。
+2. **读完再截断** —— 对**每个**命中文档读一遍正文,再排序、截到 top-k,绝大部分正文直接丢掉。chunk 是内容寻址的,一个 chunk 可属于成千上万个文档(近似重复的语料塌缩成少量 chunk),实测该版本 `matched_docs: 1000`、`top_k=5`。改成先聚合打分、再排序、只为中选的 top-k 读正文。
+
+| | 修复前 p50 | 修复后 p50 |
+|---|---|---|
+| 2,000 篇,随机向量 | 207 ms | **23 ms** |
+| 8,000 篇,随机向量 | 2.73 s | **49 ms**(56×) |
+| 8,000 篇,全零向量 | 10.23 s | **90 ms**(114×) |
+
+同时"4× 数据 ⇒ 12–13× 延迟"的超线性也消失了(变成约 2×)。第二处的效果由**新的分段耗时日志**当场指出:打开 debug 后 `query: stage timings` 显示 `read_us: 8684` 占了 `total_us: 22909` 的 38%,而 `search_us` 只有 389。
+
+**服务端现在有分段耗时了**:`logging.level: debug` 即生效(此前这个配置项**没有任何代码读取**,节点永远是 info 级),`Query` 会打一行 `query: stage timings`(search / filter / read / total + 候选数与命中数)。这是定位上面两处问题时缺的那件工具 —— 当时只能靠外部探针加临时 C++ 插桩。定位过程见 HANDOFF「链上各部分耗时」。
+
+规模可放大,但**时间预算要一起放大**:`STRATUM_STRESS_TIMEOUT` 默认 10 分钟在 8,000 篇下不够(200 次 warm 只跑完 166 次就撞上 deadline)。
 
 ```bash
-STRATUM_STRESS_DOCS=20000 go test ./integration/docker/ -tags=docker -count=1 -run TestT4_QueryLatency -v
+STRATUM_STRESS_DOCS=8000 STRATUM_STRESS_TIMEOUT=35m \
+  go test ./integration/docker/ -tags=docker -count=1 -run TestT4_QueryLatency -v
 ```
 
-**写入量**(`TestT4_DataVolume`)——真实栈上采样(window=512 切分、mock embed 10 ms/chunk;每个节点运行独立的 vecstore,共享会引发并发 `Build = Reset + AddChunks` 竞态):
+
+**写入量**(`TestT4_DataVolume`)——真实栈上采样(window=512 切分、mock embed 10 ms/chunk;每个存储容器运行自己的 vecstore,共享会引发并发 `Build = Reset + AddChunks` 竞态)。本轮实测(两层 3+3,宿主 8 核 / 7.2 GB,`STRATUM_VOLUME_DOCS=10000`,每批 1,000 篇):
+
+| 指标 | 值 |
+|---|---|
+| 写入(`CreateVersion` × 10 批,仅 API 用时) | **2.55 s** |
+| 累计索引构建(10 批串行,每批等前一批 READY) | **4 m 2 s** |
+| 端到端 | **4 m 5 s** |
+| 存储占用(存储节点 1 / 2 / 3) | **306.8 / 157.4 / 155.1 MiB**,合计 **619 MiB** |
+| 查询 | top-k=10 返回 10 条结果 |
 
 ```bash
 STRATUM_VOLUME_DOCS=10000 go test ./integration/docker/ -tags=docker -count=1 -run TestT4_DataVolume -v
 ```
 
-这张表暂不列数字:索引构建调度改动之后,旧的一组实测不再代表当前吞吐,而重测需要单独跑一次(100k 轮约 45 分钟,不适合进 CI)。命令如上,结果可自行复现。
+**读法**:写入 API 只花 2.55 s,而 4 m 2 s 全在索引构建上——"每版本独立索引"模型下,吞吐由构建而非写路径决定。占用分布不均(第一个存储节点多出约一倍)是构建者与副本的差别,不是三份完整拷贝。
 
 要点(与数字无关):写入须分批——单条 `CreateVersion` 受 4 MiB gRPC 消息上限约束(约 1,400 篇),每批成一版本且前一批 READY 后才链接;耗时随版本号递增(每版本重写完整 doc-ID 集并重建索引),这是"每版本独立索引"模型的固有开销。100k 轮还验证了 raft 快照(`max_log_length=150` 触发 2 次):日志即时 trim、写入与心跳不停摆——快照在 RLock 下深拷贝并异步持久化,apply 与心跳永不被阻塞。
 
@@ -325,15 +365,21 @@ STRATUM_VOLUME_DOCS=10000 go test ./integration/docker/ -tags=docker -count=1 -r
 
 压测填补的是设计文档阶段⑤ 要求、此前**没有任何实现**的两项——`TestT4_PerformanceBaseline` 与 `TestT4_StorageEfficiency` 都只是 `t.Skip` 占位。规模用环境变量控制(`STRATUM_STRESS_DOCS` / `_QUERIES` / `_VERSIONS` / `_TIMEOUT`),默认值小到能进 CI。
 
+**定位:写入与读取分别称量。** 每个用例都是"写完并 READY 之后才开始读",两者从不并发——这不是漏测,而是刻意的:混跑会让写入侧的构建/IO/CPU 摊进查询的分位里,得到的数字既不是写入成本也不是读取成本。写入的账由 `TestT4_DataVolume` 给(写/构建/占用),读取的账由 `TestT4_QueryLatency` 给(冷热分位)。
+
+本轮(2026-09,两层 3+3 集群,宿主 8 核 / 7.2 GB)实测:
+
 | 用例 | 测什么 | 实测 |
 |---|---|---|
-| `TestT4_QueryLatency` | 单版本查询延迟,**冷热分开报** | 1,000 篇 / 20 次查询:cold **336 ms** · p50 **222 ms** · p95 **282 ms** |
-| `TestT4_MultiVersionEviction` | 多版本分级换出的稳定性 | 4 版本 × 3 轮轮转,每个版本始终应答 |
-| `TestT4_GCPressure` | 墓碑回收的端到端可见性(写入 → 删除 → 观察产物 → 查询仍正确) | 端到端跑通,拒绝路径与触发条件均有明确日志 |
+| `TestT4_QueryLatency` | 单版本查询延迟,**冷热分开报** | 2,000 篇 / 200 次查询:cold **18 ms** · p50 **15 ms** · p95 **27 ms** · p99 **34 ms**(确定性非零查询向量;同口径最初为 cold 769 ms / p50 679 ms) |
+| `TestT4_MultiVersionEviction` | 多版本分级换出的稳定性 | 6 版本 × 3 轮轮转(18 次查询),每个版本始终应答 |
+| `TestT4_GCPressure` | 墓碑回收的端到端可见性(写入 → 删除 → 观察产物 → 查询仍正确) | **SKIP**:扫描器在跑,但没有候选——默认 `GCRatioThreshold` 与 §8.6(c) 的 `AppendMaxDeadRatio` 都是 0.2,两者互抵;诊断信息会指明卡在哪条门 |
+
+**这轮压测顺手修掉的一个真缺陷**:重启一个存储副本后,它的内存游标(`localVersion`,§7.8)从 0 开始,磁盘数据完好却被 §9.3(2) 的新鲜度检查拒服务(`local history reaches version 0, below the required N`)。现在启动时从**本节点自己的事实**重建连续游标(`plane.RecoverLocalCursors`),同一场景由稳定失败转为通过——故障史与边界见 HANDOFF 与设计文档 §5 第 16 条。
 
 **为什么冷热必须分开报**:重启一个副本后,它的第一次查询要把产物从磁盘 `Load` 回来,之后都在内存里——两者成本不可比,取平均得到的数字既不描述常见情况,也不描述最坏情况。这正是阶段⑤ 那句"含磁盘读"的落点;尾部分位(p95/p99)同理,一个检索服务是被它最慢的查询定义的。
 
-三个用例的规模都可由环境变量放大,默认值小到能进 CI。
+三个用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`。
 
 ## 项目结构
 

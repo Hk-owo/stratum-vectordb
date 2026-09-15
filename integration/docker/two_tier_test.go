@@ -21,6 +21,7 @@ package docker_test
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"testing"
 	"time"
 
@@ -82,6 +83,30 @@ func writeDocumentThroughControl(t *testing.T, ctx context.Context, kbID, docID,
 
 // serveFrom asks one address to query a version, with no retry.
 func serveFrom(ctx context.Context, addr, kbID string, versionID int64) (*pb.QueryResponse, error) {
+	return serveVector(ctx, addr, kbID, versionID, queryVector(768), 5)
+}
+
+// queryVector returns the vector a test query sends.
+//
+// Deterministic, and deliberately NOT all-zero. An all-zero vector is
+// equidistant from every document, so the HNSW greedy walk has nothing to prune
+// with and every measurement is inflated: on the same version it cost ~3.4× the
+// random-vector latency, and before the O(candidates × documents) fix it was the
+// difference between 90 ms and 10 s at 8,000 documents. A real caller sends a
+// vector that came out of the embedder; tests should not measure a different
+// workload than the one that ships (v13 §5 #15).
+func queryVector(dim int) []float32 {
+	v := make([]float32, dim)
+	rng := rand.New(rand.NewSource(20240915))
+	for i := range v {
+		v[i] = rng.Float32()*2 - 1
+	}
+	return v
+}
+
+// serveVector asks addr to query a version with an explicit vector, with no
+// retry.
+func serveVector(ctx context.Context, addr, kbID string, versionID int64, vector []float32, topK int) (*pb.QueryResponse, error) {
 	_, q, _, conn, err := dialNode(addr)
 	if err != nil {
 		return nil, err
@@ -92,8 +117,8 @@ func serveFrom(ctx context.Context, addr, kbID string, versionID int64) (*pb.Que
 	return q.Query(ctx, &pb.QueryRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       &version,
-		Vector:          make([]float32, 768),
-		TopK:            5,
+		Vector:          vector,
+		TopK:            int32(topK),
 	})
 }
 

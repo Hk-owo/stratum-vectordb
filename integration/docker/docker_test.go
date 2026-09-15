@@ -283,7 +283,7 @@ func TestT4_MultiNode_Consistency(t *testing.T) {
 	queryResp, err := q.Query(ctx, &pb.QueryRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       &initialVersionID,
-		Vector:          make([]float32, 768),
+		Vector:          queryVector(768),
 		TopK:            5,
 	})
 	if err != nil {

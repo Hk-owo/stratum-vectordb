@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"time"
 
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -29,6 +31,12 @@ type QueryServiceImpl struct {
 	versionDocList versiondoc.VersionDocList
 	docStore       docstore.DocStore
 	vBloomStore    *bloom.VersionBloomStore
+
+	// logger carries the per-stage timings of a query. Debug level and silent by
+	// default: one line per query at info would be noise, while the point is that
+	// this path had no observability at all — localizing the O(candidates ×
+	// documents) bug took a temporary C++ probe (v13 §5 #18). See SetLogger.
+	logger *zap.Logger
 
 	// localVersion is where §9.3(2)'s freshness check reads this node's
 	// contiguous cursor. nil means "cannot verify a credential", which makes the
@@ -67,12 +75,47 @@ func NewQueryService(
 		versionDocList: vdl,
 		docStore:       ds,
 		vBloomStore:    vBloomStore,
+		logger:         zap.NewNop(),
+	}
+}
+
+// SetLogger wires the logger that carries the per-stage timings below. Optional:
+// without it those timings go nowhere, which is the pre-existing behaviour
+// (nothing about correctness depends on them).
+func (s *QueryServiceImpl) SetLogger(l *zap.Logger) {
+	if l != nil {
+		s.logger = l
 	}
 }
 
 // Query implements QueryServiceServer.
 func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb.QueryResponse, error) {
 	kbID := req.KnowledgeBaseId
+
+	// Per-stage timings, emitted at debug level by the deferred function below.
+	//
+	// Why it exists: this path had NO observability, so locating the
+	// O(candidates × documents) defect (v13 §5 #18) took an outside-in probe plus
+	// a temporary C++ instrumentation. A slow query must be answerable from the
+	// node's own log: search (vecstore), filter (chunk→doc mapping + version
+	// membership), read (per-document content), total.
+	//
+	// Deferred rather than printed on the success path so that a query failing
+	// *slowly* also reports where it spent the time.
+	qStart := time.Now()
+	var stageSearch, stageFilter, stageRead time.Duration
+	var candidateCount, matched int
+	defer func() {
+		s.logger.Debug("query: stage timings",
+			zap.String("kb_id", kbID),
+			zap.Int("top_k", int(req.GetTopK())),
+			zap.Int("candidates", candidateCount),
+			zap.Int("matched_docs", matched),
+			zap.Int64("search_us", stageSearch.Microseconds()),
+			zap.Int64("filter_us", stageFilter.Microseconds()),
+			zap.Int64("read_us", stageRead.Microseconds()),
+			zap.Int64("total_us", time.Since(qStart).Microseconds()))
+	}()
 
 	// §9.3(2): honour the service station's freshness credential.
 	//
@@ -135,7 +178,10 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		searchTopK = 1000
 	}
 
+	searchStart := time.Now()
 	searchResults, err := s.indexManager.Search(ctx, kbID, versionID, req.Vector, searchTopK)
+	stageSearch = time.Since(searchStart)
+	candidateCount = len(searchResults)
 	if err != nil {
 		// An empty version (no documents) has no index entry, so Search
 		// reports ErrIndexNotReady. Treat a genuinely empty version as an
@@ -167,6 +213,31 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// cost of extra work.
 	vBloom, vBloomErr := s.vBloomStore.Get(ctx, kbID, versionID)
 
+	// The version's document-ID set, materialized ONCE for the whole query.
+	//
+	// It used to be fetched INSIDE the loop below — once per candidate chunk,
+	// again per docID — and every fetch was a prefix scan returning the version's
+	// entire document list, which was then walked linearly to answer "is this
+	// docID in the version?". One query therefore cost O(candidates × documents).
+	// Measured on the 3+3 cluster: 2,000 documents → 207 ms, 8,000 → 2.73 s, while
+	// the HNSW search inside vecstore took 16 µs (probe: VECPROBE search
+	// ntotal=18 took_us=16). A single fetch plus a set makes membership O(1) and
+	// the whole query O(documents) once.
+	//
+	// A failed fetch leaves vDocs nil, and every membership test then fails —
+	// the same conservative "cannot confirm, so skip" the per-candidate fetch
+	// had when its own call errored.
+	var vDocs map[string]struct{}
+	if vBloomErr == nil {
+		if ids, err := s.versionDocList.ListDocIDs(ctx, kbID, versionID); err == nil {
+			vDocs = make(map[string]struct{}, len(ids))
+			for _, id := range ids {
+				vDocs[id] = struct{}{}
+			}
+		}
+	}
+
+	filterStart := time.Now()
 	for _, r := range searchResults {
 		if r.Score < threshold {
 			continue
@@ -185,18 +256,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 				if !vBloom.Test(docID) {
 					continue
 				}
-				vdocs, err := s.versionDocList.ListDocIDs(ctx, kbID, versionID)
-				if err != nil {
-					continue
-				}
-				foundVD := false
-				for _, vd := range vdocs {
-					if vd == docID {
-						foundVD = true
-						break
-					}
-				}
-				if !foundVD {
+				if _, ok := vDocs[docID]; !ok {
 					continue
 				}
 			}
@@ -207,6 +267,8 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 			}
 		}
 	}
+	stageFilter = time.Since(filterStart)
+	matched = len(docMap)
 
 	// Aggregate per-document scores.
 	agg := req.Aggregation
@@ -217,25 +279,41 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		score   float32
 		content string
 	}
-	var results []scoredDoc
 
+	// Aggregate, rank, THEN read — in that order.
+	//
+	// Reading content used to happen while building the candidate list, so one
+	// query read every matched document's text and threw almost all of it away
+	// when it truncated to top_k. That is not a rare case: chunks are
+	// content-addressed, so one chunk can belong to thousands of documents (a
+	// corpus of near-identical documents collapses to a handful of chunks), and
+	// the debug timings made it visible — `matched_docs: 1000`, `read_us: 8684`
+	// out of `total_us: 22909` on a 2,000-document version, against
+	// `search_us: 389`. Ranking first costs nothing (the scores are already in
+	// memory) and turns O(matched) document reads into O(top_k).
+	candidates := make([]scoredDoc, 0, len(docMap))
 	for docID, ds := range docMap {
-		score := aggregate(ds.scores, agg)
-		// Read document content.
-		content, err := s.docStore.ReadAt(ctx, kbID, docID, versionID)
+		candidates = append(candidates, scoredDoc{docID: docID, score: aggregate(ds.scores, agg)})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].score > candidates[j].score })
+
+	// Read content for the winners, stopping as soon as top_k readable documents
+	// are found. A candidate whose content cannot be read is skipped and the next
+	// one takes its place, which is what the previous "read everything, then
+	// truncate" ordering did as well.
+	readStart := time.Now()
+	results := make([]scoredDoc, 0, int(req.TopK))
+	for _, cand := range candidates {
+		if len(results) >= int(req.TopK) {
+			break
+		}
+		content, err := s.docStore.ReadAt(ctx, kbID, cand.docID, versionID)
 		if err != nil {
 			continue
 		}
-		results = append(results, scoredDoc{docID: docID, score: score, content: string(content)})
+		results = append(results, scoredDoc{docID: cand.docID, score: cand.score, content: string(content)})
 	}
-
-	// Sort by score descending.
-	sort.Slice(results, func(i, j int) bool { return results[i].score > results[j].score })
-
-	// Truncate to top_k.
-	if int(req.TopK) < len(results) {
-		results = results[:int(req.TopK)]
-	}
+	stageRead = time.Since(readStart)
 
 	out := make([]*pb.QueryResult, len(results))
 	for i, r := range results {

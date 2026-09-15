@@ -325,8 +325,30 @@ func TestT4_QueryLatency(t *testing.T) {
 	}
 	p50, p95, p99, mean := percentiles(warm)
 	t.Logf("WARM queries=%d mean=%v p50=%v p95=%v p99=%v", len(warm), mean, p50, p95, p99)
-	t.Logf("QUERY-LATENCY SUMMARY: docs=%d queries=%d cold=%v p50=%v p95=%v p99=%v mean=%v",
-		docCount, len(warm), cold, p50, p95, p99, mean)
+
+	// Zero-vector control: the same version on the same replica, queried with the
+	// all-zero vector this suite used to send everywhere. Reported in the same run
+	// so the two workloads can be compared directly rather than across commits —
+	// an all-zero vector is equidistant from every document, so the HNSW walk has
+	// nothing to prune with, and the difference is the price of measuring a
+	// workload no caller sends (v13 §5 #15).
+	control := make([]time.Duration, 0, 20)
+	for i := 0; i < 20; i++ {
+		start := time.Now()
+		resp, err := serveVector(ctx, storageAddrs[coldIdx], kbID, versionID, make([]float32, 768), 5)
+		if err != nil {
+			t.Fatalf("zero-vector control query %d/20 failed: %v", i+1, err)
+		}
+		if len(resp.Results) == 0 {
+			t.Fatalf("zero-vector control query %d/20 returned no results", i+1)
+		}
+		control = append(control, time.Since(start))
+	}
+	cp50, cp95, _, cmean := percentiles(control)
+	t.Logf("ZERO-VECTOR CONTROL queries=%d mean=%v p50=%v p95=%v", len(control), cmean, cp50, cp95)
+
+	t.Logf("QUERY-LATENCY SUMMARY: docs=%d queries=%d cold=%v p50=%v p95=%v p99=%v mean=%v zero_p50=%v",
+		docCount, len(warm), cold, p50, p95, p99, mean, cp50)
 }
 
 // --- T4-6: §8.6(d) collection under real dead weight ------------------------

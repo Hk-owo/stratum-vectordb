@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"gopkg.in/yaml.v3"
 
@@ -41,13 +42,46 @@ import (
 	"stratum/service"
 )
 
+// loggerAtLevel returns base rebuilt at the configured level (zap's names:
+// debug/info/warn/error).
+//
+// Empty means "keep base". An unknown level also keeps base and says so: a typo
+// in the config must not take the node down, and this field's whole purpose is
+// observability. Before this existed the setting was read by nobody — the node
+// built an info-level logger before the config file was even parsed — so
+// `logging.level: debug` silently had no effect and no debug line was reachable
+// (that is how the per-stage query timings stayed invisible, v13 §5 #18).
+func loggerAtLevel(base *zap.Logger, level string) *zap.Logger {
+	if level == "" {
+		return base
+	}
+	var lvl zapcore.Level
+	if err := lvl.UnmarshalText([]byte(level)); err != nil {
+		base.Warn("unknown logging level; keeping the current one",
+			zap.String("level", level), zap.Error(err))
+		return base
+	}
+	pc := zap.NewProductionConfig()
+	pc.Level = zap.NewAtomicLevelAt(lvl)
+	rebuilt, err := pc.Build()
+	if err != nil {
+		base.Warn("could not rebuild the logger at the configured level",
+			zap.String("level", level), zap.Error(err))
+		return base
+	}
+	return rebuilt
+}
+
 func main() {
 	logger, err := zap.NewProduction()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create logger: %v\n", err)
 		os.Exit(1)
 	}
-	defer logger.Sync()
+	// Bound to the VARIABLE, not to the bootstrap logger: logging.level rebuilds
+	// `logger` once the config file has been read (below), and that rebuilt one is
+	// the one whose buffers need flushing.
+	defer func() { _ = logger.Sync() }()
 
 	logger.Info("Stratum starting")
 
@@ -87,6 +121,13 @@ func main() {
 	if *embedAddrFlag != "" {
 		cfg.EmbedServiceAddr = *embedAddrFlag
 	}
+
+	// Now that the config file has been read (and the flags applied), honour
+	// logging.level. The bootstrap logger above is info, which is also the
+	// default; a deployment that asks for debug gets it from here on — including
+	// the query path's per-stage timings.
+	logger = loggerAtLevel(logger, cfg.LogLevel)
+
 	dataDir := cfg.DataDir
 	if dataDir == "" {
 		dataDir = "/var/lib/stratum/node1"
@@ -846,6 +887,11 @@ func main() {
 		// answer "how far does my history reach". Without this the node can only
 		// ignore credentials, which is not the same as refusing a stale answer.
 		querySvc.SetLocalVersionReporter(dataPlane)
+		// Per-stage query timings, at debug level. Without this the query path
+		// is opaque from the node's own log — localizing the O(candidates ×
+		// documents) defect needed an outside-in probe plus temporary C++
+		// instrumentation (v13 §5 #18).
+		querySvc.SetLogger(logger)
 		adminSvc := service.NewAdminService(cfg.NodeID, rn, indexMgr, ds, chunkStore, walImpl,
 			func() []string {
 				addrs, err := resolveReplicaAddrs(context.Background())
@@ -1132,6 +1178,16 @@ func runCrashRecovery(
 // control-data-separation-design.md §5.3/§7 and the decision table at the
 // call site.
 func reconcileIndexStatus(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPlane, cp plane.ControlPlane, meta plane.MetadataLister, retentionCount int) {
+	// §7.8: the contiguous cursor lives in memory, so a restarted node would
+	// answer "0" for every knowledge base — data complete, index on disk, and
+	// every query refused by the station's freshness check (§9.3(2)) until a
+	// later write happens to advance the cursor. Rebuild it from this node's own
+	// facts before anything reads it. (Measured: TestT4_QueryLatency failed with
+	// exactly that after restarting one storage replica.)
+	if err := dp.RecoverLocalCursors(ctx, meta); err != nil {
+		logger.Warn("index reconcile: cursor recovery failed", zap.Error(err))
+	}
+
 	durable, err := dp.ReconcileIndexes(ctx, meta, retentionCount)
 	if err != nil {
 		logger.Warn("index reconcile: storage-layer reconcile failed", zap.Error(err))
@@ -1307,6 +1363,13 @@ type appConfig struct {
 	VecstoreGRPCAddr string
 	EmbedServiceAddr string
 
+	// LogLevel is the process log level from the config file's logging.level
+	// (debug/info/warn/error, zap's names). Empty or unknown means info. It was
+	// ignored entirely before — the node built an info-level logger and never
+	// looked at the setting, so `logging.level: debug` silently did nothing and
+	// the per-stage query timings (and every other debug line) were unreachable.
+	LogLevel string
+
 	IndexLRUCapacity         int
 	IndexLoadWaitTimeout     time.Duration
 	IndexCallbackMaxRetries  int
@@ -1395,6 +1458,14 @@ type appConfig struct {
 // integration/docker/config{1,2,3}.yaml). Fields left unset fall back to
 // defaultConfig()'s values.
 type fileConfig struct {
+	// Logging.Level (debug/info/warn/error, zap's names) becomes
+	// appConfig.LogLevel. It used to be parsed by nobody at all: the node built an
+	// info-level logger before the config file was even read, so setting
+	// `logging.level: debug` did nothing.
+	Logging struct {
+		Level string `yaml:"level"`
+	} `yaml:"logging"`
+
 	Node struct {
 		NodeID               int64  `yaml:"node_id"`
 		Role                 string `yaml:"role"`
@@ -1575,6 +1646,9 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.Embed.ServiceAddr != "" {
 		cfg.EmbedServiceAddr = fc.Embed.ServiceAddr
 	}
+	if fc.Logging.Level != "" {
+		cfg.LogLevel = fc.Logging.Level
+	}
 	if fc.IndexManager.LRUCapacity != 0 {
 		cfg.IndexLRUCapacity = fc.IndexManager.LRUCapacity
 	}
@@ -1680,6 +1754,8 @@ func defaultConfig() appConfig {
 		IndexLoadWaitTimeout:     5 * time.Second,
 		IndexCallbackMaxRetries:  3,
 		IndexCallbackRetryBaseMS: 200,
+
+		LogLevel: "info",
 
 		// Disk retention and memory thresholds default to disabled (0).
 		// They activate only when the YAML config sets
