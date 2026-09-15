@@ -784,13 +784,34 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 	// the version durable (v13 §7.1/§7.2). The version is only "durable" once
 	// enough replicas hold it — the writer's own copy is one acknowledgement.
 	stepStart = time.Now()
-	if err := d.fanOut(ctx, kbID, versionID); err != nil {
-		tFanOut = time.Since(stepStart)
-		// A failed replication is transient by definition: peers come back.
-		d.reportFailure(ctx, kbID, versionID, types.FailureTransient, fmt.Sprintf("replication failed: %v", err))
-		return err
-	}
+	fanErr := d.fanOut(ctx, kbID, versionID, len(changes))
 	tFanOut = time.Since(stepStart)
+	if fanErr != nil {
+		// The local transaction above already committed: this node holds the
+		// version's documents, its document-ID set and its WAL commit record. What
+		// fan-out adds is durability on OTHER replicas — which §7.5 restores by
+		// backfill — not the version's existence, and not its ability to be served
+		// from here.
+		//
+		// So the build is scheduled on this path too. It used to be reachable only
+		// through reportAndSchedule on the success path below, which left a version
+		// whose replication fell short with no index and no report at all: the
+		// control layer kept it PENDING, every query answered "index not ready", and
+		// the documents sat on disk with nobody able to finish or serve them.
+		// Measured on a 1000-document batch: report_us = 0 on all three replicas,
+		// each of which had already spent 14.6 s committing that very version.
+		stepStart = time.Now()
+		d.scheduleIndexBuild(ctx, kbID, versionID)
+		tReport = time.Since(stepStart)
+
+		// Replication still failed, and it is still transient (peers come back), so
+		// it is reported and returned — the caller's Saga owns the retry decision
+		// (§10.1). Note what is deliberately NOT done: no durable report.
+		// Durability is precisely the claim quorum was supposed to establish, and
+		// making it without quorum would be a lie the control layer acts on.
+		d.reportFailure(ctx, kbID, versionID, types.FailureTransient, fmt.Sprintf("replication failed: %v", fanErr))
+		return fanErr
+	}
 
 	stepStart = time.Now()
 	d.reportAndSchedule(ctx, kbID, versionID, docIDs)
@@ -985,18 +1006,29 @@ func (d *LocalDataPlane) ApplyBackfillChanges(ctx context.Context, kbID string, 
 // replicaPushTimeout bounds ONE replica's push during fan-out.
 //
 // Why not the caller's budget: a push inherits the candidate's dispatch budget
-// (15 s, plane.CoordinatorDispatcher.candidateBudget) when nothing bounds it
-// here, and fan-out waits for every target — so ONE unreachable replica costs
-// the whole budget. Measured on the 3+3 cluster with one storage replica killed:
-// fanout_us = 15026509 (exactly the 15 s budget) inside a dispatch whose own
-// budget is the same 15 s, which made a write that HAD reached quorum look like
-// a candidate failure.
+// (plane.CoordinatorDispatcher.candidateBudget = 15 s + 50 ms per document,
+// capped at 10 min) when nothing bounds it here, and fan-out waits for every
+// target — so ONE unreachable replica costs the whole budget. Measured on the
+// 3+3 cluster with one storage replica killed: fanout_us = 15026509 (exactly the
+// 15 s budget) inside a dispatch whose own budget is the same 15 s, which made a
+// write that HAD reached quorum look like a candidate failure.
 //
-// The value is generous against the measured norm (4.3 ms for two replicas) and
-// far below the dispatch budget, so a dead replica costs this much and no more.
+// It is a floor, not the whole story: PushVersion sends the version's identity,
+// and the replica it reaches then pulls and writes the data itself (§7.5), so
+// the time a push legitimately needs scales with the batch. A 1000-document
+// batch measured pushBudget == the timeout exactly on all three replicas —
+// every push timed out while the peers were busy committing the very version
+// being pushed — which is what pushTimeoutPerDoc pays for.
 const replicaPushTimeout = 3 * time.Second
 
-func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int64) error {
+// pushTimeoutPerDoc is what one document's worth of remote work adds to a push's
+// budget: the peer pulls the documents and runs its own local transaction
+// (measured at ~14.6 ms/document for a 1000-document batch, split/embed/write).
+// Without it the budget is a constant while the work is not, and a large batch
+// times out on a replica that is doing exactly what it was asked to.
+const pushTimeoutPerDoc = 20 * time.Millisecond
+
+func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int64, docs int) error {
 	if d.pusher == nil || d.resolveReplicas == nil {
 		return nil // replication not configured: the local write is the quorum
 	}
@@ -1035,7 +1067,14 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 	// Bound every push by its own budget, and never by more than the caller has
 	// left: a push that inherits the dispatch budget would spend it in full on a
 	// replica that is simply gone.
-	pushBudget := replicaPushTimeout
+	//
+	// The budget scales with the batch because the peer's work does: PushVersion
+	// hands over the version's identity and the peer pulls and writes those
+	// documents itself (§7.5). A constant budget against scaling work times out on
+	// a peer doing exactly what it was asked to — measured on a 1000-document
+	// batch, where pushBudget was the timeout to the microsecond on all three
+	// replicas while each was busy committing the version being pushed.
+	pushBudget := replicaPushTimeout + time.Duration(docs)*pushTimeoutPerDoc
 	if deadline, ok := ctx.Deadline(); ok {
 		if left := time.Until(deadline); left < pushBudget {
 			pushBudget = left
@@ -1141,6 +1180,19 @@ func (d *LocalDataPlane) reportAndSchedule(ctx context.Context, kbID string, ver
 	if d.control != nil {
 		_ = d.control.ReportDataDurable(ctx, kbID, versionID, stratinternalsync.ComputeDocIDSetHash(docIDs))
 	}
+	d.scheduleIndexBuild(ctx, kbID, versionID)
+}
+
+// scheduleIndexBuild asks for this version's index to be built on this node.
+//
+// It is separate from reportAndSchedule because the two have different
+// preconditions. Reporting durable is a claim about *quorum*: only the caller
+// that got enough replica acknowledgements may make it (§7.1). Scheduling the
+// build is a claim about *this node*, and it is warranted as soon as the local
+// transaction has committed — the documents, the document-ID set and the WAL
+// commit record are all here, so the index can be built and a query answered
+// from this node whenever the version becomes servable.
+func (d *LocalDataPlane) scheduleIndexBuild(ctx context.Context, kbID string, versionID int64) {
 	if d.indexMgr != nil {
 		_ = d.indexMgr.TriggerBuild(ctx, kbID, versionID)
 	}
