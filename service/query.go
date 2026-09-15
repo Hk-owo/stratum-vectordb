@@ -181,13 +181,35 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 				// pass and returns immediately once it is satisfied (see its pull loop).
 				pullKB, pullWant := kbID, want
 				go func() {
-					// Comfortably longer than EnsureIndex's own 30 s pull loop, so
-					// what bounds a pull is the pull, not this wrapper.
-					pullCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-					defer cancel()
-					if err := s.backfiller.EnsureIndex(pullCtx, pullKB, pullWant); err != nil {
-						s.logger.Debug("query: background pull did not complete",
-							zap.String("kb_id", pullKB), zap.Int64("want", pullWant), zap.Error(err))
+					// Bounded retry with backoff, because this is the node's ONLY way
+					// back: the write that should have brought the data here reached
+					// quorum without it (§7.1) and the announcement that would have
+					// asked it to pull is best-effort, so if this attempt fails nothing
+					// else will come along. A single attempt is not enough — it can
+					// land in a window where the control tier is electing or a peer is
+					// restarting, measured on an otherwise healthy cluster as
+					// "resolve data source: GetClusterStatus: raft: remote: read at
+					// control node 3". One unlucky attempt must not decide between a
+					// node that catches up and one that stays behind for good.
+					for attempt, backoff := 0, time.Second; attempt < 4; attempt++ {
+						// Comfortably longer than EnsureIndex's own 30 s pull loop, so
+						// what bounds a pull is the pull, not this wrapper.
+						pullCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+						err := s.backfiller.EnsureIndex(pullCtx, pullKB, pullWant)
+						cancel()
+						if err == nil {
+							return
+						}
+						s.logger.Debug("query: background pull did not complete; will retry",
+							zap.String("kb_id", pullKB), zap.Int64("want", pullWant),
+							zap.Int("attempt", attempt+1), zap.Duration("backoff", backoff), zap.Error(err))
+						select {
+						case <-time.After(backoff):
+						case <-ctx.Done():
+							// The caller gave up, but that is not a reason for this node
+							// to stay behind: keep the retry schedule, drop the wait.
+						}
+						backoff *= 2
 					}
 				}()
 			}

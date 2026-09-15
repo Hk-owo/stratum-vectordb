@@ -2,8 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -12,6 +15,7 @@ import (
 	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/docstore"
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
 	"stratum/internal/raft"
 	"stratum/internal/types"
@@ -386,6 +390,72 @@ func TestQueryService_RefusesAStaleNodeForAFreshnessCredential(t *testing.T) {
 	if msg := err.Error(); !strings.Contains(msg, "5") || !strings.Contains(msg, "7") {
 		t.Errorf("error should name both the local and required version, got: %v", err)
 	}
+}
+
+// TestQueryService_AsksForAPullWhenItIsBehind: refusing a freshness credential
+// is not enough on its own — the node must also ask for the data it is missing,
+// and keep asking when the first attempt fails. Nothing else in this path
+// fetches (the write reached quorum without this node, §7.1, and the
+// announcement that would have told it to pull is best-effort), so a node that
+// only refuses never catches up, and every query for a version it could serve
+// returns an error it can never clear.
+func TestQueryService_AsksForAPullWhenItIsBehind(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	h.svc.SetLocalVersionReporter(stubCursor(5)) // this node's history reaches version 5
+
+	// Fails twice, then succeeds — an attempt that lands while the control tier
+	// is electing or a peer is restarting must not be the last word.
+	puller := &countingBackfiller{failures: 2}
+	h.svc.SetBackfiller(puller)
+
+	required := int64(7)
+	_, err := h.svc.Query(context.Background(), &pb.QueryRequest{
+		KnowledgeBaseId: "kb-1",
+		Vector:          make([]float32, 768),
+		TopK:            5,
+		MinVersion:      &required,
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("err = %v, want FailedPrecondition", err)
+	}
+	// Retryable, so a caller that has another replica to ask does so instead of
+	// treating the refusal as terminal.
+	if reason := stratumerrors.ReasonOf(err); reason != "index_not_ready" {
+		t.Errorf("wire name = %q, want index_not_ready (the station only retries named reasons)", reason)
+	}
+
+	// The pull is asynchronous and retried with backoff (1s, 2s, …), so wait for
+	// the retries rather than asserting on the first instant.
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) && puller.calls() < 3 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := puller.calls(); got < 3 {
+		t.Errorf("EnsureIndex called %d times, want >= 3 (one attempt plus retries)", got)
+	}
+}
+
+// countingBackfiller counts pull attempts and fails the first `failures` of them.
+type countingBackfiller struct {
+	mu       sync.Mutex
+	n        int
+	failures int
+}
+
+func (b *countingBackfiller) EnsureIndex(context.Context, string, int64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.n++
+	if b.n <= b.failures {
+		return errors.New("pull failed")
+	}
+	return nil
+}
+
+func (b *countingBackfiller) calls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.n
 }
 
 // TestQueryService_NoCredentialIsNotARefusal: a query without min_version is
