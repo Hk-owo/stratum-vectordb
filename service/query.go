@@ -192,7 +192,18 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 			s.logger.Debug("query: could not trigger a lazy build for a PENDING version",
 				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
 		}
-		return nil, status.Error(codes.FailedPrecondition, "version is PENDING")
+		// The refusal carries the index_not_ready sentinel, and that matters more
+		// than the wording: a bare status.Error here has no wire name, so the
+		// station's isRetryableErr reads it as terminal — it returns the error
+		// WITHOUT trying the replica whose index IS ready, and records the replica
+		// it just refused as failed. Measured: three rounds of that left every
+		// storage node circuit-broken ("router: every node for this layer is
+		// circuit-broken") and spent the test's whole 180 s window on it, while a
+		// sibling replica was serving the same version the whole time.
+		//
+		// Same gRPC code as before (FailedPrecondition), so callers see no change;
+		// what changes is that "another replica may have it" is now sayable.
+		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrIndexNotReady)
 	}
 	if targetVersion.IndexStatus == types.IndexStatusFailed {
 		return nil, status.Error(codes.FailedPrecondition, "version index is FAILED")
