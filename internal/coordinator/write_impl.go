@@ -476,20 +476,8 @@ func (c *WriteCoordinatorImpl) WriteVersionStorage(ctx context.Context, kbID str
 func (c *WriteCoordinatorImpl) writeVersionStorage(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange, kbMeta types.KnowledgeBaseMeta) ([]string, error) {
 	// Step 3: Per changed document: split -> embed -> per chunk: bloom
 	// test -> exists confirm -> write -> chunk-doc map -> doc store.
-	for _, change := range changes {
-		switch change.Op {
-		case types.ChangeOpAdd, types.ChangeOpUpdate:
-			if err := c.writeDocument(ctx, kbID, versionID, change, kbMeta); err != nil {
-				return nil, err
-			}
-		case types.ChangeOpDelete:
-			// Write a tombstone for the deleted document.
-			if err := c.retry(ctx, func() error {
-				return c.cfg.DocStore.Write(ctx, kbID, change.DocID, versionID, nil)
-			}); err != nil {
-				return nil, fmt.Errorf("coordinator: write tombstone for %s: %w", change.DocID, err)
-			}
-		}
+	if err := c.writeDocumentsConcurrently(ctx, kbID, versionID, changes, kbMeta); err != nil {
+		return nil, err
 	}
 
 	// Step 4: VersionDocList.Write — compute the full document set for
@@ -510,6 +498,93 @@ func (c *WriteCoordinatorImpl) writeVersionStorage(ctx context.Context, kbID str
 	}
 
 	return docIDs, nil
+}
+
+// maxConcurrentDocumentWrites bounds how many documents step 3 processes at once.
+//
+// The per-document work is independent and dominated by an embed round trip, so
+// the parallelism is real; the bound exists because the embedder is a shared
+// external service, and unbounded fan-out here would turn one large write into
+// everyone else's outage. Eight is deliberately modest: it already takes a
+// 1000-document batch from ~14.6 s of serialised embedding to a couple of
+// seconds, and the point is to stop queueing, not to saturate the embedder.
+const maxConcurrentDocumentWrites = 8
+
+// writeDocumentsConcurrently runs step 3 for every change with bounded
+// concurrency and returns the first failure.
+//
+// Why: each change touches only its own content, chunks, chunk-document mapping
+// and doc-store entry, and each one waits on an embed call — measured at ~14.6 ms
+// per document for a 1000-document batch, 10 ms of which was the embedder round
+// trip. Serially that is 14.6 s inside a single candidate's dispatch budget
+// (15 s floor + 50 ms/document), so a large batch was spending its budget
+// queueing rather than working.
+//
+// The ordering that matters is preserved: the version's document-ID set and
+// bloom filter are still written by the caller AFTER every change has settled,
+// so a partly-written version is never published as complete. Every individual
+// write is idempotent (see writeVersionStorage), so a failure that cancels the
+// rest leaves a version a later attempt can finish — not a corrupt one.
+func (c *WriteCoordinatorImpl) writeDocumentsConcurrently(ctx context.Context, kbID string, versionID int64, changes []types.DocChange, kbMeta types.KnowledgeBaseMeta) error {
+	if len(changes) <= 1 {
+		// Nothing to overlap. Keeping the single-document case free of the
+		// coordination below matters because it is the interactive-write common
+		// case, and it is what every existing order-sensitive test exercises.
+		for _, change := range changes {
+			if err := c.writeOneChange(ctx, kbID, versionID, change, kbMeta); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, maxConcurrentDocumentWrites)
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	for _, change := range changes {
+		if ctx.Err() != nil {
+			break // an earlier failure already stopped this write
+		}
+		sem <- struct{}{} // bounds how many embeddings are in flight
+		wg.Add(1)
+		go func(change types.DocChange) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := c.writeOneChange(ctx, kbID, versionID, change, kbMeta); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					cancel() // stop the rest: this version is not going to publish
+				}
+				mu.Unlock()
+			}
+		}(change)
+	}
+	wg.Wait()
+	return firstErr
+}
+
+// writeOneChange is step 3 for a single change: an add/update goes through the
+// split -> embed -> write path, a delete writes a tombstone.
+func (c *WriteCoordinatorImpl) writeOneChange(ctx context.Context, kbID string, versionID int64, change types.DocChange, kbMeta types.KnowledgeBaseMeta) error {
+	switch change.Op {
+	case types.ChangeOpAdd, types.ChangeOpUpdate:
+		return c.writeDocument(ctx, kbID, versionID, change, kbMeta)
+	case types.ChangeOpDelete:
+		// Write a tombstone for the deleted document.
+		if err := c.retry(ctx, func() error {
+			return c.cfg.DocStore.Write(ctx, kbID, change.DocID, versionID, nil)
+		}); err != nil {
+			return fmt.Errorf("coordinator: write tombstone for %s: %w", change.DocID, err)
+		}
+	}
+	return nil
 }
 
 // writeDocument handles a single ADD or UPDATE document change: split,
