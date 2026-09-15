@@ -354,6 +354,9 @@ func main() {
 			return dispatchVersionWrite(ctx, kbID, versionID, parentVersionID, changes)
 		},
 		Logger: logger,
+		// §10.1: a version whose data never landed has to reach the failure
+		// accounting instead of sitting PENDING forever — see AbandonDispatch.
+		ControlPlane: controlPlane,
 	})
 
 	// A deleted knowledge base's data is reclaimed by whoever holds it: the local
@@ -827,11 +830,29 @@ func main() {
 		raftNode.SetOnVersionCommittedAsLeader(func(kbID string, versionID, parentVersionID int64, clientRequestID string) {
 			regParentID, changes, ok := writeCoord.TakePendingDispatch(kbID, clientRequestID)
 			if !ok {
-				// Nothing registered: this node never held the changes (it did not
-				// accept the write), or the dispatch already happened. Leaving it is
-				// correct — a retry by the writer is what fills the gap (§7.12).
+				// Nothing registered on THIS node. Two very different cases hide
+				// behind that, and they used to be answered the same way (a log
+				// line and a return):
+				//
+				//   - the background dispatch already took it (Execute dispatches
+				//     the moment the version is committed; Take is once-only), so
+				//     the write is on its way and there is nothing to do;
+				//   - nobody holds the changes at all — the process that proposed
+				//     them is gone (a restarted or deposed leader), and the Raft
+				//     command deliberately carries no changes (§7.7). Then this
+				//     version will never be written by anyone, and leaving it
+				//     PENDING is what made Query answer "try again later" forever.
+				//
+				// The second case is the one that needs settling, and §10.1 owns
+				// the verdict (retry or FAILED_PERMANENT) — AbandonDispatch is how
+				// it gets asked. A false positive (case 1) is harmless: the retry
+				// budget records one transient failure for a version that is in
+				// fact being written.
+				writeCoord.AbandonDispatch(ctx, kbID, versionID, types.FailureTransient,
+					"no pending dispatch on this node: the changes were never registered here")
 				logger.Warn("version committed here without a pending dispatch",
-					zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+					zap.String("client_request_id", clientRequestID))
 				return
 			}
 			if regParentID != 0 {

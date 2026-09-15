@@ -3,21 +3,37 @@ package plane
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 )
 
 // stubPusher records pushes and fails for the targets listed in fail.
+//
+// The mutex is not decoration: fan-out pushes run concurrently, and since
+// quorum is what the caller waits for, a push past quorum settles AFTER fan-out
+// returns — so the test reads this while a goroutine may still be appending.
 type stubPusher struct {
+	mu    sync.Mutex
 	fail  map[string]bool
 	calls []string
 }
 
 func (p *stubPusher) PushVersion(_ context.Context, targetAddr, _ string, _ int64) (int64, error) {
+	p.mu.Lock()
 	p.calls = append(p.calls, targetAddr)
+	p.mu.Unlock()
 	if p.fail[targetAddr] {
 		return 0, errors.New("replica unreachable")
 	}
 	return 42, nil
+}
+
+// attempted returns the targets pushed so far, as a copy.
+func (p *stubPusher) attempted() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.calls...)
 }
 
 var _ VersionPusher = (*stubPusher)(nil)
@@ -55,8 +71,16 @@ func TestLocalDataPlane_FanOutToleratesOneUnreachableReplica(t *testing.T) {
 	if err := dp.WriteVersionData(context.Background(), "kb-1", 7, 3, nil); err != nil {
 		t.Fatalf("WriteVersionData with one reachable replica: %v", err)
 	}
-	if len(pusher.calls) != 2 {
-		t.Errorf("pushes = %v, want both targets attempted", pusher.calls)
+	// Both targets must eventually be attempted — but only quorum is waited for,
+	// so the push on the unreachable replica settles in the background (and, with
+	// the per-replica budget, at most replicaPushTimeout later). Poll instead of
+	// assuming it already happened.
+	deadline := time.Now().Add(2 * time.Second)
+	for len(pusher.attempted()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := pusher.attempted(); len(got) != 2 {
+		t.Errorf("pushes = %v, want both targets attempted", got)
 	}
 }
 

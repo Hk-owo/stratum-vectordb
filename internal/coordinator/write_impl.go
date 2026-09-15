@@ -25,6 +25,16 @@ import (
 	"stratum/internal/wal"
 )
 
+// DefaultDispatchTimeout bounds one background dispatch when the config does not
+// say otherwise.
+//
+// It must stay LARGER than plane's per-candidate budget (15 s floor +
+// 50 ms/document, capped at 10 min — see plane.CoordinatorDispatcher): this is
+// the OUTER bound, and two budgets of the same size would let the inner one
+// expire first, leaving the outer one nothing to report and the caller with a
+// write that looks dispatched but is not.
+const DefaultDispatchTimeout = 5 * time.Minute
+
 // WriteCoordinatorConfig bundles all dependencies and configuration for
 // WriteCoordinatorImpl, following the constructor-injection convention.
 type WriteCoordinatorConfig struct {
@@ -69,6 +79,28 @@ type WriteCoordinatorConfig struct {
 
 	// Logger receives background dispatch failures. Optional.
 	Logger *zap.Logger
+
+	// ControlPlane records a version's failure so §10.1's retry budget can decide
+	// its fate (transient → retried; budget spent → FAILED_PERMANENT). Optional:
+	// without it a give-up can only be logged, which is exactly the hole this
+	// field closes — a version whose dispatch failed stayed PENDING forever while
+	// Query answered "version is PENDING", i.e. "try again later", when nothing
+	// was ever going to try again.
+	ControlPlane plane.ControlPlane
+
+	// DispatchTimeout bounds ONE background dispatch, from the moment the version
+	// is committed to the moment its write has been handed to a coordinator.
+	// Zero means DefaultDispatchTimeout.
+	//
+	// Why it must exist: the background dispatch starts from a fresh context
+	// (the client's is long gone), and a context with no deadline hands every
+	// layer below an unbounded wait. The dispatcher does bound each candidate
+	// (see plane.CoordinatorDispatcher.candidateBudget), but that bound covers
+	// the candidate RPC only — candidate resolution, connection handling and the
+	// retry loop over candidates are not bounded by it, and a dispatch that never
+	// returns leaves no log line and no state: silence is the symptom. This is
+	// the outer bound, so it must be LARGER than the per-candidate budget.
+	DispatchTimeout time.Duration
 
 	// WriteMu is the lock serializing CreateVersion write transactions
 	// (BEGIN through COMMIT). It is shared with the orphan-chunk
@@ -279,11 +311,87 @@ func (c *WriteCoordinatorImpl) dispatchInBackground(kbID string, versionID int64
 	c.dispatchWG.Add(1)
 	go func() {
 		defer c.dispatchWG.Done()
-		if err := c.cfg.Dispatch(context.Background(), kbID, versionID, parentVersionID, changes); err != nil {
-			c.logger().Warn("coordinator: dispatch failed; the version stays unwritten until a retry or a client resend",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+
+		// Bounded, and it has to be: this context starts here (the client's is
+		// long gone), so without a deadline every layer below inherits an
+		// unbounded wait — and a stuck dispatch then produces neither a log line
+		// nor a state change. Silence is the symptom. The dispatcher bounds each
+		// candidate's RPC (plane.CoordinatorDispatcher.candidateBudget), but not
+		// candidate resolution, not the retry loop over candidates, and not this
+		// hand-off; this is the outer bound, so it is deliberately larger than
+		// the per-candidate budget.
+		ctx, cancel := context.WithTimeout(context.Background(), c.dispatchTimeout())
+		defer cancel()
+
+		if err := c.cfg.Dispatch(ctx, kbID, versionID, parentVersionID, changes); err != nil {
+			// Not just a log line: hand it to the same give-up path the apply
+			// hook uses, so §10.1's retry budget owns the verdict instead of the
+			// version sitting PENDING forever.
+			c.AbandonDispatch(ctx, kbID, versionID, types.FailureTransient,
+				fmt.Sprintf("dispatch failed: %v", err))
 		}
 	}()
+}
+
+// dispatchTimeout is the outer bound on one background dispatch.
+func (c *WriteCoordinatorImpl) dispatchTimeout() time.Duration {
+	if c.cfg.DispatchTimeout > 0 {
+		return c.cfg.DispatchTimeout
+	}
+	return DefaultDispatchTimeout
+}
+
+// AbandonDispatch is the single give-up path of the write path: the ONE place a
+// version whose data never landed is handed to §10.1's failure accounting.
+//
+// What it replaces: two independent code paths (the apply hook finding no
+// pending dispatch, and a background dispatch that failed or timed out) each
+// logged a warning and returned. Both left the version PENDING for good while
+// Query answered FailedPrecondition "version is PENDING" — a message that means
+// "try again shortly" about a version nothing was ever going to touch again.
+// Whether §10.1 retries it or declares FAILED_PERMANENT is that layer's
+// decision; all this does is make sure the decision gets made.
+//
+// Safe to call repeatedly: the control plane owns the budget.
+func (c *WriteCoordinatorImpl) AbandonDispatch(ctx context.Context, kbID string, versionID int64, class types.FailureClass, detail string) {
+	log := c.logger()
+	if versionID == 0 {
+		// Nothing to attribute the failure to: no version was ever allocated
+		// (the proposal did not land), so there is no version state to settle.
+		log.Warn("coordinator: abandoning a write that never allocated a version",
+			zap.String("kb_id", kbID), zap.String("detail", detail))
+		return
+	}
+	log.Warn("coordinator: abandoning a write's data path",
+		zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+		zap.String("class", class.String()), zap.String("detail", detail))
+
+	if c.cfg.ControlPlane == nil {
+		// No accounting wired (a test stack, or a node without a control plane):
+		// the warning above is all there is. Say so rather than pretending.
+		log.Warn("coordinator: no control plane wired; this failure is recorded only in the log",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+		return
+	}
+	terminal, err := c.cfg.ControlPlane.ReportVersionFailure(ctx, kbID, versionID, class, detail)
+	if err != nil {
+		log.Warn("coordinator: reporting a version's failure",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		return
+	}
+	if !terminal {
+		return // still inside the retry budget: §10.1 will try again
+	}
+	// The terminal verdict just landed: reclaim whatever physical data made it to
+	// disk, on every candidate replica — the control layer never knew which ones
+	// received it (§10.6).
+	if c.cfg.DataPlane == nil {
+		return
+	}
+	if err := c.cfg.DataPlane.DropVersionData(ctx, kbID, versionID); err != nil {
+		log.Warn("coordinator: cleanup after a permanent failure",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
 }
 
 // logger returns the configured logger, or a no-op one.

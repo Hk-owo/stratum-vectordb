@@ -739,16 +739,41 @@ func (d *LocalDataPlane) Search(ctx context.Context, kbID string, versionID int6
 // version ID; the transaction that makes the data durable is entirely the
 // storage layer's (Stratum_设计文档v13.md §7.12).
 func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error {
+	// Per-stage timings of one write transaction, at debug level.
+	//
+	// Why they are here: a dispatched write is bounded by the candidate budget
+	// (plane.CoordinatorDispatcher.candidateBudget, floor 15 s) and, before this,
+	// had no way to say where that budget went. The first measurement paid for
+	// itself — fan-out spent 15.0 s here, exactly the budget, because ONE replica
+	// was unreachable and every push inherited the whole budget (see
+	// replicaPushTimeout).
+	writeStart := time.Now()
+	var tAcquire, tLocal, tFanOut, tReport, tConfirm time.Duration
+	defer func() {
+		d.logger.Debug("write: stage timings",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("changes", len(changes)),
+			zap.Int64("acquire_us", tAcquire.Microseconds()),
+			zap.Int64("local_us", tLocal.Microseconds()),
+			zap.Int64("fanout_us", tFanOut.Microseconds()),
+			zap.Int64("report_us", tReport.Microseconds()),
+			zap.Int64("confirm_us", tConfirm.Microseconds()),
+			zap.Int64("total_us", time.Since(writeStart).Microseconds()))
+	}()
+
 	// One version is one Saga. Queue behind the writes already in flight for
 	// this KB instead of letting them pile up on the storage nodes
 	// (Stratum_设计文档v13.md §7.7). The wait honours ctx, so a caller that gives
 	// up stops waiting rather than holding a place it no longer wants.
+	stepStart := time.Now()
 	if err := d.limiter.Acquire(ctx, kbID); err != nil {
 		return err
 	}
+	tAcquire = time.Since(stepStart)
 	defer d.limiter.Release(kbID)
 
+	stepStart = time.Now()
 	docIDs, err := d.writeLocalTransaction(ctx, kbID, versionID, parentVersionID, changes)
+	tLocal = time.Since(stepStart)
 	if err != nil {
 		// The storage layer reports that an attempt failed; the control layer
 		// owns the terminal verdict (Stratum_设计文档v13.md §10.1).
@@ -758,18 +783,27 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 	// Replicate to the other replicas and require a quorum before reporting
 	// the version durable (v13 §7.1/§7.2). The version is only "durable" once
 	// enough replicas hold it — the writer's own copy is one acknowledgement.
+	stepStart = time.Now()
 	if err := d.fanOut(ctx, kbID, versionID); err != nil {
+		tFanOut = time.Since(stepStart)
 		// A failed replication is transient by definition: peers come back.
 		d.reportFailure(ctx, kbID, versionID, types.FailureTransient, fmt.Sprintf("replication failed: %v", err))
 		return err
 	}
+	tFanOut = time.Since(stepStart)
+
+	stepStart = time.Now()
 	d.reportAndSchedule(ctx, kbID, versionID, docIDs)
+	tReport = time.Since(stepStart)
+
 	// len(docIDs) == 0 is the whole reason the announcement carries a flag: a
 	// version with no documents is never fanned out (fanOut above sends
 	// nothing), so replicas that did NOT coordinate it have no other way to
 	// learn it exists — and their cursors would stay behind it, which the
 	// station reads as "stale" (§9.3(2)).
+	stepStart = time.Now()
 	d.broadcastConfirmation(kbID, versionID, len(docIDs) == 0)
+	tConfirm = time.Since(stepStart)
 	return nil
 }
 
@@ -948,6 +982,20 @@ func (d *LocalDataPlane) ApplyBackfillChanges(ctx context.Context, kbID string, 
 	return nil
 }
 
+// replicaPushTimeout bounds ONE replica's push during fan-out.
+//
+// Why not the caller's budget: a push inherits the candidate's dispatch budget
+// (15 s, plane.CoordinatorDispatcher.candidateBudget) when nothing bounds it
+// here, and fan-out waits for every target — so ONE unreachable replica costs
+// the whole budget. Measured on the 3+3 cluster with one storage replica killed:
+// fanout_us = 15026509 (exactly the 15 s budget) inside a dispatch whose own
+// budget is the same 15 s, which made a write that HAD reached quorum look like
+// a candidate failure.
+//
+// The value is generous against the measured norm (4.3 ms for two replicas) and
+// far below the dispatch budget, so a dead replica costs this much and no more.
+const replicaPushTimeout = 3 * time.Second
+
 func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int64) error {
 	if d.pusher == nil || d.resolveReplicas == nil {
 		return nil // replication not configured: the local write is the quorum
@@ -975,12 +1023,31 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 		acked  = 1 // this node's own local write
 		needed = QuorumSize(1 + len(targets))
 		total  = 1 + len(targets)
+
+		// reached fires the moment quorum is satisfied; allDone fires when every
+		// push has settled. Waiting only for the latter is what made a dead
+		// replica cost the entire budget: quorum is the contract, and the
+		// replicas beyond it are free to be slow.
+		reached = make(chan struct{})
+		once    sync.Once
+		allDone = make(chan struct{})
 	)
+	// Bound every push by its own budget, and never by more than the caller has
+	// left: a push that inherits the dispatch budget would spend it in full on a
+	// replica that is simply gone.
+	pushBudget := replicaPushTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if left := time.Until(deadline); left < pushBudget {
+			pushBudget = left
+		}
+	}
 	for _, target := range targets {
 		wg.Add(1)
 		go func(target string) {
 			defer wg.Done()
-			if _, err := d.pusher.PushVersion(ctx, target, kbID, versionID); err != nil {
+			pushCtx, cancel := context.WithTimeout(ctx, pushBudget)
+			defer cancel()
+			if _, err := d.pusher.PushVersion(pushCtx, target, kbID, versionID); err != nil {
 				d.logger.Warn("plane: replica push failed",
 					zap.String("replica", target), zap.String("kb_id", kbID),
 					zap.Int64("version_id", versionID), zap.Error(err))
@@ -988,15 +1055,34 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 			}
 			mu.Lock()
 			acked++
+			satisfied := acked >= needed
 			mu.Unlock()
+			if satisfied {
+				once.Do(func() { close(reached) })
+			}
 		}(target)
 	}
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(allDone)
+	}()
 
-	if acked < needed {
+	select {
+	case <-reached:
+		// Quorum is in hand; the remaining pushes keep running in the background
+		// with their own budget.
+	case <-allDone:
+	case <-ctx.Done():
+		// The caller's own bound expired: report what we have below.
+	}
+
+	mu.Lock()
+	final := acked
+	mu.Unlock()
+	if final < needed {
 		return fmt.Errorf(
 			"plane: version %d of %s reached %d/%d acknowledgements, below the quorum of %d",
-			versionID, kbID, acked, total, needed)
+			versionID, kbID, final, total, needed)
 	}
 	return nil
 }
