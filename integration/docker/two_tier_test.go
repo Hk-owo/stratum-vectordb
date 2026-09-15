@@ -95,11 +95,20 @@ func serveFrom(ctx context.Context, addr, kbID string, versionID int64) (*pb.Que
 // difference between 90 ms and 10 s at 8,000 documents. A real caller sends a
 // vector that came out of the embedder; tests should not measure a different
 // workload than the one that ships (v13 §5 #15).
+//
+// Non-negative components, like the embedder's: a real embedder output is
+// non-negative here (embed.deterministicVector divides hash bytes by 255 before
+// normalizing), so a query vector with negative components sits in a different
+// orthant and can score BELOW the query path's threshold of 0. That is correct
+// behaviour — an anti-correlated document is not a match — but it makes a
+// one-document fixture flaky in the worst way: the only candidate is pruned and
+// the query "succeeds" with zero results, which reads as a replication failure
+// rather than an unlucky vector.
 func queryVector(dim int) []float32 {
 	v := make([]float32, dim)
 	rng := rand.New(rand.NewSource(20240915))
 	for i := range v {
-		v[i] = rng.Float32()*2 - 1
+		v[i] = rng.Float32()
 	}
 	return v
 }
