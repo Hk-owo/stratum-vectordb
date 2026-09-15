@@ -104,13 +104,18 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// *slowly* also reports where it spent the time.
 	qStart := time.Now()
 	var stageSearch, stageFilter, stageRead time.Duration
-	var candidateCount, matched int
+	var stageMeta, stageBloom, stageChunkMap time.Duration
+	var candidateCount, matched, chunkMapCalls int
 	defer func() {
 		s.logger.Debug("query: stage timings",
 			zap.String("kb_id", kbID),
 			zap.Int("top_k", int(req.GetTopK())),
 			zap.Int("candidates", candidateCount),
 			zap.Int("matched_docs", matched),
+			zap.Int("chunkmap_calls", chunkMapCalls),
+			zap.Int64("meta_us", stageMeta.Microseconds()),
+			zap.Int64("bloom_us", stageBloom.Microseconds()),
+			zap.Int64("chunkmap_us", stageChunkMap.Microseconds()),
 			zap.Int64("search_us", stageSearch.Microseconds()),
 			zap.Int64("filter_us", stageFilter.Microseconds()),
 			zap.Int64("read_us", stageRead.Microseconds()),
@@ -146,7 +151,15 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	}
 
 	// Check version status.
+	//
+	// meta_us: on a storage node this is a CONTROL-PLANE read over gRPC
+	// (RemoteRaftNode → the control tier), and it runs on EVERY query. The
+	// per-stage timings showed search+filter+read summing to ~1.1 ms while
+	// total_us was ~10.9 ms, so the missing time is exactly this kind of
+	// per-query plumbing — measure it instead of assuming.
+	metaStart := time.Now()
 	versions, err := s.raftNode.ListVersions(ctx, kbID)
+	stageMeta = time.Since(metaStart)
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
@@ -211,6 +224,10 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// doc list is temporarily unavailable) degrades to no filtering: the
 	// authoritative confirmations below still keep results correct, at the
 	// cost of extra work.
+	//
+	// bloom_us covers the filter plus the version's doc-ID set (one prefix scan):
+	// both are local Pebble reads, so this is what "reading our own storage" costs.
+	bloomStart := time.Now()
 	vBloom, vBloomErr := s.vBloomStore.Get(ctx, kbID, versionID)
 
 	// The version's document-ID set, materialized ONCE for the whole query.
@@ -236,13 +253,17 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 			}
 		}
 	}
+	stageBloom = time.Since(bloomStart)
 
 	filterStart := time.Now()
 	for _, r := range searchResults {
 		if r.Score < threshold {
 			continue
 		}
+		chunkMapStart := time.Now()
 		docIDs, err := s.chunkDocMapper.ListDocIDs(ctx, kbID, r.ChunkID)
+		stageChunkMap += time.Since(chunkMapStart)
+		chunkMapCalls++
 		if err != nil {
 			continue
 		}

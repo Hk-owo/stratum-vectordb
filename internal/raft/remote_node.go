@@ -51,6 +51,19 @@ type RemoteRaftNode struct {
 
 	mu       sync.Mutex
 	leaderID int64 // 0 = not yet learned
+
+	// connMu guards conns: one long-lived connection per control address.
+	//
+	// Reads used to dial per call and close immediately after, so every query a
+	// storage node served paid a full TCP + HTTP/2 handshake to read metadata
+	// that the control node answers from an in-memory map. Measured on the 3+3
+	// cluster: the storage node's ListVersions took 7–22 ms and accounted for
+	// 72–95% of the query's total, while the real work (vecstore search,
+	// chunk→doc mapping, document reads) came to ~1–2.5 ms. Connections live for
+	// the process's lifetime; a control node that goes away is grpc-go's to
+	// reconnect, which is what a pooled connection is for.
+	connMu sync.Mutex
+	conns  map[string]*grpc.ClientConn
 }
 
 var _ RaftNode = (*RemoteRaftNode)(nil)
@@ -241,11 +254,10 @@ func (r *RemoteRaftNode) setLeader(id int64) {
 // node is not the leader and names the one it believes is; that is an answer,
 // not a failure, which is why it travels beside the result instead of inside it.
 func (r *RemoteRaftNode) proposeAt(ctx context.Context, id int64, addr string, data []byte) (ForwardedResult, int64, error) {
-	conn, err := r.dial(ctx, addr)
+	conn, err := r.connFor(ctx, addr)
 	if err != nil {
 		return ForwardedResult{}, 0, fmt.Errorf("raft: remote: dial control node %d (%s): %w", id, addr, err)
 	}
-	defer func() { _ = conn.Close() }()
 
 	// Same reason as the reads: a proposal travels control-plane traffic, and
 	// the receiving control node treats a mark-less call as one that reached its
@@ -369,7 +381,7 @@ func (r *RemoteRaftNode) readAtAnyControl(ctx context.Context, op func(ctx conte
 
 	var lastErr error
 	for _, id := range ids {
-		conn, err := r.dial(ctx, r.ControlAddrs[id])
+		conn, err := r.connFor(ctx, r.ControlAddrs[id])
 		if err != nil {
 			lastErr = fmt.Errorf("raft: remote: dial control node %d (%s): %w", id, r.ControlAddrs[id], err)
 			continue
@@ -382,7 +394,6 @@ func (r *RemoteRaftNode) readAtAnyControl(ctx context.Context, op func(ctx conte
 		// metadata at all: the reads come back Unauthenticated and every query
 		// fails. That is how this was found.
 		err = op(authmeta.WithVerifiedMark(ctx), conn)
-		_ = conn.Close()
 		if err == nil {
 			return nil
 		}
@@ -414,4 +425,31 @@ func (r *RemoteRaftNode) dial(ctx context.Context, addr string) (*grpc.ClientCon
 		return r.Dial(ctx, addr)
 	}
 	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+}
+
+// connFor returns a connection to a control address, dialing it once and
+// reusing it afterwards.
+//
+// Why it exists: readAtAnyControl and proposeAt used to call dial() and close
+// the connection immediately after, so every read a storage node served paid a
+// fresh TCP + HTTP/2 handshake — to fetch metadata the control node answers from
+// an in-memory map. Measured: ListVersions cost 7–22 ms per query and was 72–95%
+// of the query's total time, while the actual work (vecstore search, chunk→doc
+// mapping, document reads) came to ~1–2.5 ms. See the comment on the conns
+// field for the rest.
+func (r *RemoteRaftNode) connFor(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+	r.connMu.Lock()
+	defer r.connMu.Unlock()
+	if conn, ok := r.conns[addr]; ok {
+		return conn, nil
+	}
+	conn, err := r.dial(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	if r.conns == nil {
+		r.conns = make(map[string]*grpc.ClientConn)
+	}
+	r.conns[addr] = conn
+	return conn, nil
 }
