@@ -28,7 +28,14 @@
    - **回归测试**：`TestLocalDataPlane_RecoverLocalCursors_ShortFanOutIsNotAHold`（索引 READY + 数据 PENDING → 不声称持有）；`EmptyKnowledgeBaseIsServable` / `EmptyInitialVersionIsHeld` 已改用数据侧证据。
 2. **链尾没有到达 reporter。** 实测：leader 上 `ChainTail` 被调用 **0 次**，storage 侧的 sink 收到 **0 次信号**（`lag catch-up: signal carried no chain tails` 一次都没打）。组件本身有单测覆盖（含真 gRPC 往返），所以剩下的问题是**真集群里的接线**——单元测试把它 stub 掉了，看不出。**这一条仍未解决。**
 
-第 1 条已修并有回归测试；第 2 条仍开着——谁接手，用例与集群开关都已经是现成的。
+**修 ① 之后在真集群上复验，暴露了第三条（更根本）：`DataStatus` 从不变成 `Durable`。**
+
+- 修复后 `stopped at a version` 从 **0 次变成 49 次**（每个 KB 一次），reason 全是 `no local artifact`，且样本的 `doc_id_set_hash` 为空、`index_status` 为 READY —— 正是修复前会被误判成"持有"的那种版本，现在被正确判成"不持有"。
+- 但同一批日志里 `recovered the local data cursor` **一次都没有**：每个 KB 都停在 `recovered_to: 0`。也就是说**这套集群里没有版本的数据侧是 Durable**，于是修复后所有副本的游标都是 0。
+- 这解释了一路上那些 `only 1 of a required 2 cursors arrived`：fan-out 从未达成 quorum，或者 `DataStatus` 的推进路径（§10.1b）根本没跑。**在修好它之前，"游标虚高"实际上是在掩盖"数据侧终态从未推进"**——而掩盖的方向恰恰是错的：服务站会据此把查询路由给数据并不完整的副本，返回静默的不完整答案。
+- 所以这里保留判据修复（"宁可拒绝，不可交错答案"是设计明确选的方向），但**下一步应该查 `DataStatus` 为什么从不推进**；只修一头会把系统从"静默错答"推到"拒绝服务"，两个一起修才是正解。
+
+第 1 条已修并有回归测试；第 2 条与上面这条新暴露的问题都还开着——用例与集群开关都已经是现成的。
 
 ---
 
