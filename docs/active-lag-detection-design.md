@@ -19,16 +19,16 @@
 
 ### 集成验证暴露的两个前置（都在这条链路之外）
 
-1. **`RecoverLocalCursors` 会把落后节点看成不落后 —— 根因已定位。** 实测：一个离线了 55 个版本的存储节点，回来时上报的游标是 **405 / 405**（＝链尾）。
+1. **`RecoverLocalCursors` 会把落后节点看成不落后 —— 根因已定位，且已修。** 实测：一个离线了 55 个版本的存储节点，回来时上报的游标是 **405 / 405**（＝链尾）。
    - **直接证据**：`holdsVersionLocally` 的"停在哪"日志（`stopped at a version this node does not hold`）**一次都没有**——也就是每个 KB 的**所有**版本都被判成"本节点持有"，游标自然推到该 KB 的最大版本。
-   - **命中哪条判据**：不是"本地产物"（离线的节点没有），而是 `internal/plane/local_data_plane.go:1805` 那条 —— `v.DocIDSetHash == "" && IndexStatus == READY` 就当作"持有"。它不依赖任何本节点的事实，只依赖**复制来的元数据**。
-   - **它为什么会被普遍命中**：这套集群里大量版本的 `DocIDSetHash` 是空的（digest 从未提交）。digest 由 `reportAndSchedule`（`local_data_plane.go:1380`）在写事务后提交，而那里的注释写明它是**quorum 主张**——"only the caller that got enough replica acknowledgements may make it"。3 个存储节点、`serving_replica_min=2`、还杀掉一个的场景下，quorum 常常不足，于是 digest 缺失。
-   - **注释里的假设不成立**：那条判据的注释说这种读法"fails in the direction of a too-high cursor **by one version**"。实际不是——判据是**逐版本**的，每个没有 digest 的 READY 版本都会"持有"，于是游标**一路推到链尾**，而不是高出 1。
-   - **两个修法方向**：① 收窄这条判据——不要用"digest 为空"去推断"这是个空版本"，而应让控制层**显式**回答"这个版本有没有文档集"（§7.9 把数据侧与索引侧拆开就是这个路子）；② 先查 digest 为什么缺失——若正常 quorum 下它本该提交，那真正要修的是那条路径，而不是这条判据。
-   - **影响面比追赶大**：服务站的新鲜度检查（§9.3(2)）正是按这个游标判断副本够不够新。游标被虚高，意味着服务站会**误信**一个其实数据不全的副本——这比"落后检测不触发"严重。
-2. **链尾没有到达 reporter。** 实测：leader 上 `ChainTail` 被调用 **0 次**，storage 侧的 sink 收到 **0 次信号**（`lag catch-up: signal carried no chain tails` 一次都没打）。组件本身有单测覆盖（含真 gRPC 往返），所以剩下的问题是**真集群里的接线**——单元测试把它 stub 掉了，看不出。
+   - **根因是两个各自正确的决定相互作用**：判据里有一条是"`DocIDSetHash` 为空且 `IndexStatus == READY` 就当作持有"。而 **fan-out 未达成 quorum 时 digest 是刻意不提交的**——`WriteVersionData` 的注释写明"making it without quorum would be a lie the control layer acts on"；可是**索引照样在每台机器上建到 READY**（`scheduleIndexBuild` 在 fan-out 失败路径也走）。于是这条判据读的是**索引侧**的状态，却拿它推断**数据**在不在这台机器上。3 个存储节点 + `serving_replica_min=2` + 测试里再杀掉一个，fan-out 经常不足，于是它被普遍命中。
+   - **注释里的假设不成立**：那条判据的注释说这种读法"fails in the direction of a too-high cursor **by one version**"。实际不是——判据是**逐版本**的，每个没有 digest 的 READY 版本都会被当作持有，游标是**一路推到链尾**。
+   - **已修**：判据改为读**数据侧**——`DataStatus == Durable && DocIDSetHash == ""`（"数据已判持久、且没有文档集"才是空版本）。空知识库仍可服务（没有文档集的版本 fan-out 无事可做，必然成功、数据侧必然 Durable），而 fan-out 短了的版本不再被声称持有。
+   - **行为变化（要注意）**：修好之后，落后的副本会**如实报低游标**，于是服务站的新鲜度检查会拒绝给它路由，直到它被写入或追赶推进游标。这正是设计想要的失败方向（"宁可拒绝，不可交错答案"），也正是 lag catch-up 真正开始有用的前提——它本来就是推进游标的另一条路。
+   - **回归测试**：`TestLocalDataPlane_RecoverLocalCursors_ShortFanOutIsNotAHold`（索引 READY + 数据 PENDING → 不声称持有）；`EmptyKnowledgeBaseIsServable` / `EmptyInitialVersionIsHeld` 已改用数据侧证据。
+2. **链尾没有到达 reporter。** 实测：leader 上 `ChainTail` 被调用 **0 次**，storage 侧的 sink 收到 **0 次信号**（`lag catch-up: signal carried no chain tails` 一次都没打）。组件本身有单测覆盖（含真 gRPC 往返），所以剩下的问题是**真集群里的接线**——单元测试把它 stub 掉了，看不出。**这一条仍未解决。**
 
-两条都记在这里而不是留在对话里：谁接手任何一条，用例与集群开关都已经是现成的。
+第 1 条已修并有回归测试；第 2 条仍开着——谁接手，用例与集群开关都已经是现成的。
 
 ---
 

@@ -163,8 +163,8 @@ func TestLocalDataPlane_RecoverLocalCursors_EmptyInitialVersionIsHeld(t *testing
 	meta := &stubMetadata{
 		kbs: []types.KnowledgeBaseMeta{{KBID: kbID}},
 		versions: map[string][]types.VersionMeta{kbID: {
-			// created with no changes: no digest, no artifact, but READY
-			{KBID: kbID, VersionID: 60, DocIDSetHash: "", IndexStatus: types.IndexStatusReady},
+			// created with no changes: no digest, no artifact, but durably replicated
+			{KBID: kbID, VersionID: 60, DocIDSetHash: "", DataStatus: types.DataStatusDurable},
 			{KBID: kbID, VersionID: 61, DocIDSetHash: "h61"},
 			{KBID: kbID, VersionID: 62, DocIDSetHash: "h62"},
 		}},
@@ -180,8 +180,8 @@ func TestLocalDataPlane_RecoverLocalCursors_EmptyInitialVersionIsHeld(t *testing
 
 // TestLocalDataPlane_RecoverLocalCursors_EmptyKnowledgeBaseIsServable pins the
 // shape a 3+3 cluster actually produced (KB datavolume-178944190-11): a
-// knowledge base holding nothing but empty versions — both READY, both with
-// parent 0, no digest committed, and not one artifact on any replica.
+// knowledge base holding nothing but empty versions — both durably replicated,
+// both with parent 0, no digest committed, and not one artifact on any replica.
 //
 // Before, "no artifact" was read as "never received" whenever the knowledge base
 // had no footprint at all, so every replica reported cursor 0 while the station
@@ -198,8 +198,8 @@ func TestLocalDataPlane_RecoverLocalCursors_EmptyKnowledgeBaseIsServable(t *test
 	meta := &stubMetadata{
 		kbs: []types.KnowledgeBaseMeta{{KBID: kbID}},
 		versions: map[string][]types.VersionMeta{kbID: {
-			{KBID: kbID, VersionID: 71, DocIDSetHash: "", IndexStatus: types.IndexStatusReady},
-			{KBID: kbID, VersionID: 72, DocIDSetHash: "", IndexStatus: types.IndexStatusReady},
+			{KBID: kbID, VersionID: 71, DocIDSetHash: "", DataStatus: types.DataStatusDurable},
+			{KBID: kbID, VersionID: 72, DocIDSetHash: "", DataStatus: types.DataStatusDurable},
 		}},
 	}
 
@@ -208,6 +208,44 @@ func TestLocalDataPlane_RecoverLocalCursors_EmptyKnowledgeBaseIsServable(t *test
 	}
 	if got := dp.LocalVersionOf(kbID); got != 72 {
 		t.Fatalf("cursor = %d, want 72 — an empty knowledge base has no artifact anywhere and must still serve", got)
+	}
+}
+
+// TestLocalDataPlane_RecoverLocalCursors_ShortFanOutIsNotAHold is the regression
+// that replaced the index-READY test with a data-side one.
+//
+// A version whose fan-out fell short of quorum has NO committed digest — by
+// design, not by accident (WriteVersionData: "making it without quorum would be a
+// lie the control layer acts on") — while its INDEX still reaches READY on every
+// replica that builds it. Reading index-READY as "held here" therefore claims a
+// version whose records never arrived, and since the claim is made per version the
+// cursor does not come out one too high: it runs to the chain tail.
+//
+// Measured on a 3-node cluster before this: a replica offline for 55 versions came
+// back reporting the tail as its own cursor, so it never looked behind. The same
+// overclaim is what makes the station's freshness check trust a replica whose data
+// is incomplete.
+func TestLocalDataPlane_RecoverLocalCursors_ShortFanOutIsNotAHold(t *testing.T) {
+	const kbID = "kb-short-fanout"
+
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		IndexManager: &stubIndexStore{}, // no artifact anywhere
+	})
+	meta := &stubMetadata{
+		kbs: []types.KnowledgeBaseMeta{{KBID: kbID}},
+		versions: map[string][]types.VersionMeta{kbID: {
+			// Built here (index READY) but never durably replicated: no digest, and
+			// the data side never left PENDING (its zero value).
+			{KBID: kbID, VersionID: 80, DocIDSetHash: "", IndexStatus: types.IndexStatusReady},
+			{KBID: kbID, VersionID: 81, DocIDSetHash: "", IndexStatus: types.IndexStatusReady},
+		}},
+	}
+
+	if err := dp.RecoverLocalCursors(context.Background(), meta); err != nil {
+		t.Fatalf("RecoverLocalCursors: %v", err)
+	}
+	if got := dp.LocalVersionOf(kbID); got != 0 {
+		t.Fatalf("cursor = %d, want 0 — index-READY without durable data backs no claim", got)
 	}
 }
 

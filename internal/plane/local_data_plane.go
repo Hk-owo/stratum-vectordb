@@ -1802,28 +1802,34 @@ func (d *LocalDataPlane) holdsVersionLocally(ctx context.Context, kbID string, v
 		// content, so there is nothing on disk to find.
 		return "empty document set", true
 	}
-	if v.DocIDSetHash == "" && v.IndexStatus == types.IndexStatusReady {
-		// READY with no committed digest is exactly how a version created with
-		// no changes looks — the leader commits no digest for a version with no
-		// document set — and READY says the write path (or the builder) was done
-		// with it.
+	if v.DataStatus == types.DataStatusDurable && v.DocIDSetHash == "" {
+		// Durable DATA with no committed digest is how a version created with no
+		// changes looks: the leader commits no digest for a version with no document
+		// set, and the data side is durable once a quorum confirmed it — which a
+		// version with no documents reaches trivially, since there is nothing to fan
+		// out.
 		//
 		// This case is what keeps an EMPTY knowledge base servable. Measured: a
-		// knowledge base holding only two empty versions (both READY, both with
-		// parent 0) had no artifact on any replica, so every restart left all
-		// three reporting cursor 0 while the station demanded 71: permanently
-		// refused, and nothing would ever build an index for a version with no
-		// chunks to trigger a later advance.
+		// knowledge base holding only two empty versions (both with parent 0) had no
+		// artifact on any replica, so every restart left all three reporting cursor 0
+		// while the station demanded 71: permanently refused, and nothing would ever
+		// build an index for a version with no chunks to trigger a later advance.
 		//
-		// The alternative reading — a version whose digest commit was missed
-		// while its records never reached this node — is narrower, and it fails
-		// in the direction of a too-high cursor by one version rather than a
-		// permanently refused replica.
+		// The DATA side is the one consulted, NOT the index side, and the difference
+		// is not cosmetic. An index reaches READY on every replica that builds it —
+		// including a replica whose fan-out fell short of quorum, which is exactly
+		// when the digest is deliberately NOT committed (see WriteVersionData:
+		// "making it without quorum would be a lie the control layer acts on").
+		// Reading index-READY as "this node holds it" therefore claims versions
+		// whose records never arrived here; and because the test runs per version,
+		// the cursor does not end up one too high — it goes all the way to the chain
+		// tail. Measured on a 3-node cluster: a replica that had been offline for 55
+		// versions came back reporting the tail as its own cursor, and no knowledge
+		// base's recovery ever stopped anywhere (not one "stopped at a version" line).
 		//
-		// Anything not READY (PENDING, FAILED) keeps the conservative answer
-		// below: a version still being written may have records this node does
-		// not hold.
-		return "ready, no committed digest, no document set", true
+		// Anything not durable (PENDING, FAILED) keeps the conservative answer below:
+		// a version still being written may have records this node does not hold.
+		return "durable data, no committed digest, no document set", true
 	}
 	return "no local artifact", false
 }
