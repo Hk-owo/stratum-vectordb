@@ -13,9 +13,16 @@
 | 上报侧投递 | `internal/sync/data_version_reporter.go`（只在 `accepted` 时交给 sink） | ✅ |
 | 节点侧判定与调度 | `internal/plane/lag_catchup.go`（判据 / 每 KB 幂等 / jitter / 并发上限） | ✅ |
 | 配置 | `lag_catchup.*`（`configs/config1.yaml`），**默认关闭** | ✅ |
-| 单测 | `internal/sync` 3 例、`internal/plane` 6 例 | ✅ |
-| 集成（§8 的双节点自愈） | —— | ❌ 未做：集群配置由 `scripts/docker-cluster-both.sh` 生成，要跑这条得先让它支持 `lag_catchup.enabled` |
+| 单测 | `internal/sync` 3 例（含真 gRPC 往返）、`internal/plane` 7 例 | ✅ |
+| 集成（§8 的双节点自愈） | `integration/docker/lag_catchup_test.go` 的 `TestT4_ActiveLagCatchupCatchesUpWithoutAQuery`；集群开关由 `scripts/docker-cluster-both.sh` 的 `LAG_CATCHUP_ENABLED` / `LOG_LEVEL` 提供 | ⚠️ **用例在，但跳过**：真集群上跑不通，卡在两个**前置**（见下），不是卡在追赶本身 |
 | 压测标定（§9 的 `jitter_ms` / `max_concurrent_kbs`） | —— | ❌ 未做 |
+
+### 集成验证暴露的两个前置（都在这条链路之外）
+
+1. **`RecoverLocalCursors` 会把落后节点看成不落后。** 实测：一个离线了 55 个版本的存储节点，回来时上报的游标是 **405 / 405**（＝链尾）。`RecoverLocalCursors` 从"本节点自己的事实"重建游标，但其中一项（READY 且未提交 digest）读的是**复制来的元数据**——于是"控制层知道 v405"被当成了"我这台机器持有 v405"。后果是这个设计的前提（"节点落后于链尾"）在重启场景下**检测不到**：游标与链尾相等，判据直接跳过。**这条比追赶本身重要得多**，值得单独处理。
+2. **链尾没有到达 reporter。** 实测：leader 上 `ChainTail` 被调用 **0 次**，storage 侧的 sink 收到 **0 次信号**（`lag catch-up: signal carried no chain tails` 一次都没打）。组件本身有单测覆盖（含真 gRPC 往返），所以剩下的问题是**真集群里的接线**——单元测试把它 stub 掉了，看不出。
+
+两条都记在这里而不是留在对话里：谁接手任何一条，用例与集群开关都已经是现成的。
 
 ---
 

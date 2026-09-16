@@ -1064,6 +1064,14 @@ func main() {
 		Cursor:           dataPlane.DataVersionsSnapshot,
 		Logger:           logger,
 	})
+	// Say so at startup: whether this is on is otherwise invisible until it does
+	// something, and "nothing happened" is exactly what an operator needs to be able
+	// to tell apart from "it is not wired".
+	logger.Info("lag catch-up wired",
+		zap.Bool("enabled", cfg.LagCatchupEnabled),
+		zap.Int("min_lag_versions", cfg.LagCatchupMinLagVersions),
+		zap.Int("jitter_ms", cfg.LagCatchupJitterMS),
+		zap.Int("max_concurrent_kbs", cfg.LagCatchupMaxConcurrentKBs))
 
 	// §7.13.4: report this node's data cursors to the control leader every
 	// interval. The leader it resolves is looked up per interval, never cached:

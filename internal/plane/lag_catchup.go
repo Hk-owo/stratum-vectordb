@@ -3,6 +3,7 @@ package plane
 import (
 	"context"
 	"hash/fnv"
+	"sort"
 	"sync"
 	"time"
 
@@ -103,10 +104,20 @@ func NewLagCatchup(cfg LagCatchupConfig) *LagCatchup {
 //
 // A knowledge base is picked up when its own cursor is at least MinLagVersions behind
 // the tail, it is not already catching up, and there is room under the concurrency
-// bound. Anything skipped is simply reconsidered on the next report — the signal
+// bound. Anything not picked up is reconsidered on the next report — the signal
 // repeats every interval by construction, so nothing needs a queue of its own.
+//
+// When more knowledge bases are behind than the bound allows, the ones furthest back
+// go first. Iterating the map and stopping at the bound would be wrong twice over: Go
+// randomises map order, so which knowledge bases got through would change every
+// report, and a knowledge base could starve indefinitely behind a crowd of others that
+// are only marginally behind.
 func (l *LagCatchup) SetChainTails(tails map[string]int64) {
-	if !l.cfg.Enabled || l.cfg.Ensure == nil || l.cfg.Cursor == nil || len(tails) == 0 {
+	if !l.cfg.Enabled || l.cfg.Ensure == nil || l.cfg.Cursor == nil {
+		return
+	}
+	if len(tails) == 0 {
+		l.cfg.Logger.Debug("plane: lag catch-up: signal carried no chain tails")
 		return
 	}
 	cursor := l.cfg.Cursor()
@@ -115,23 +126,48 @@ func (l *LagCatchup) SetChainTails(tails map[string]int64) {
 		maxKBs = DefaultMaxConcurrentLagCatchups
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	type lag struct {
+		kbID  string
+		tail  int64
+		gapV  int64
+	}
+	var behind []lag
 	for kbID, tail := range tails {
-		if len(l.inflight) >= maxKBs {
-			// Out of room: the rest wait for the next report, which is a few
-			// seconds away by construction.
-			return
-		}
 		if l.inflight[kbID] || tail <= 0 {
 			continue
 		}
-		if cursor[kbID]+l.lagThreshold() > tail {
+		gapV := tail - cursor[kbID]
+		if gapV < l.lagThreshold() {
 			continue // not behind enough to act on
 		}
-		l.inflight[kbID] = true
-		go l.catchUp(kbID, tail)
+		behind = append(behind, lag{kbID: kbID, tail: tail, gapV: gapV})
 	}
+	if len(behind) == 0 {
+		l.cfg.Logger.Debug("plane: lag catch-up: nothing behind the chain tail",
+			zap.Int("tails_received", len(tails)))
+		return
+	}
+	sort.Slice(behind, func(i, j int) bool { return behind[i].gapV > behind[j].gapV })
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	room := maxKBs - len(l.inflight)
+	started := 0
+	for _, b := range behind {
+		if room <= 0 {
+			break
+		}
+		if l.inflight[b.kbID] {
+			continue
+		}
+		l.inflight[b.kbID] = true
+		room--
+		started++
+		go l.catchUp(b.kbID, b.tail)
+	}
+	l.cfg.Logger.Debug("plane: lag catch-up: scheduled",
+		zap.Int("tails_received", len(tails)), zap.Int("behind", len(behind)),
+		zap.Int("started", started), zap.Int("inflight", len(l.inflight)))
 }
 
 // lagThreshold is the smallest gap that counts as left behind. With the default of 1

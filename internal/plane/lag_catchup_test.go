@@ -226,3 +226,52 @@ func TestLagCatchup_JitterIsBoundedAndDelaysTheStart(t *testing.T) {
 		t.Fatalf("jitter = %v, want it inside [0, 500ms)", slept[0])
 	}
 }
+
+// With more knowledge bases behind than the bound allows, the ones furthest back go
+// first. Go randomises map order, so a scheduler that merely stopped at the bound
+// would let a badly lagging knowledge base starve behind a crowd of others that are
+// only marginally behind.
+//
+// This is not hypothetical: against a 3-node test cluster carrying dozens of stale
+// knowledge bases, exactly that happened — the knowledge base 400 versions behind
+// never got a slot.
+func TestLagCatchup_PrefersTheFurthestBehind(t *testing.T) {
+	started := make(chan string, 4)
+	release := make(chan struct{})
+
+	tails := map[string]int64{"kb-far": 1000}
+	cursor := map[string]int64{"kb-far": 0}
+	// Nineteen others, each exactly one version behind: inside the bar, but they would
+	// fill the single slot if order were left to chance.
+	for i := 0; i < 19; i++ {
+		id := "kb-near-" + string(rune('a'+i))
+		tails[id] = 2
+		cursor[id] = 1
+	}
+
+	l := NewLagCatchup(LagCatchupConfig{
+		Enabled:          true,
+		MaxConcurrentKBs: 1,
+		Ensure: func(_ context.Context, kbID string, _ int64) error {
+			started <- kbID
+			<-release
+			return nil
+		},
+		Cursor: func() map[string]int64 { return cursor },
+	})
+
+	l.SetChainTails(tails)
+	select {
+	case kbID := <-started:
+		if kbID != "kb-far" {
+			t.Fatalf("started %s: the knowledge base a thousand versions behind must go first", kbID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("nothing started")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(started); n != 0 {
+		t.Fatalf("%d further catch-ups started past the bound of 1", n)
+	}
+	close(release)
+}

@@ -480,10 +480,13 @@ func (c *LocalControlPlane) ReclaimableChangesThrough(kbID string) (int64, bool)
 // "nothing to catch up".
 func (c *LocalControlPlane) ChainTail(kbID string) (int64, bool) {
 	if c.rn == nil {
+		c.logger.Debug("plane: chain tail: no metadata source wired", zap.String("kb_id", kbID))
 		return 0, false
 	}
 	versions, err := c.rn.ListVersions(context.Background(), kbID)
 	if err != nil || len(versions) == 0 {
+		c.logger.Debug("plane: chain tail unavailable",
+			zap.String("kb_id", kbID), zap.Error(err), zap.Int("versions", len(versions)))
 		return 0, false
 	}
 	tail := int64(0)
@@ -492,6 +495,7 @@ func (c *LocalControlPlane) ChainTail(kbID string) (int64, bool) {
 			tail = v.VersionID
 		}
 	}
+	c.logger.Debug("plane: chain tail", zap.String("kb_id", kbID), zap.Int64("tail", tail))
 	return tail, tail > 0
 }
 

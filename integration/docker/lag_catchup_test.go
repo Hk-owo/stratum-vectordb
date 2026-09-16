@@ -214,9 +214,10 @@ func lagCatchupVersions() int {
 }
 
 // lagCatchupSettle is how long a returning replica is left alone before its
-// artifacts are counted. It is a settlement window, not a timeout: nothing is
-// expected to happen in it today (there is no active lag detection yet), which is
-// itself part of what the numbers show.
+// artifacts are counted, and how long the active-catch-up case waits for the node to
+// say it caught up. A settlement window, not a timeout: with lag_catchup off nothing
+// happens in it (which is what the window case measures), and with it on the node is
+// expected to report a catch-up well inside it.
 func lagCatchupSettle() time.Duration {
 	if v := os.Getenv("STRATUM_LAG_SETTLE"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
@@ -235,4 +236,108 @@ func lagCatchupTimeout() time.Duration {
 		}
 	}
 	return 40 * time.Minute
+}
+
+// TestT4_ActiveLagCatchupCatchesUpWithoutAQuery is the case
+// docs/active-lag-detection-design.md exists for: a node that fell behind catches up
+// on its own, with nothing asking it for data.
+//
+// It kills one storage node, advances versions while it is away, brings it back, and
+// then sends nothing at all — no query, no rebuild request. The assertion is the log
+// line the catch-up itself writes, because "an artifact appeared" alone would also be
+// explained by the startup reconcile giving the active version a head start.
+//
+// The cluster must be built with LAG_CATCHUP_ENABLED=true (scripts/docker-cluster-both.sh
+// reads it, and LOG_LEVEL=debug makes the scheduler's decisions visible).
+//
+// SKIPPED, not passing: run against a real 3-node cluster it fails, and the failure is
+// in two pieces of machinery this case sits on, not in the catch-up itself (the unit
+// tests cover that, including a real gRPC round trip):
+//
+//  1. `RecoverLocalCursors` hands a returning node a cursor equal to the CHAIN TAIL —
+//     measured: a node that was offline for 55 versions came back reporting cursor
+//     405 of 405. The recovery reads the replicated metadata, so "the control layer
+//     knows version 405" is taken as "this node holds 405". Until that is sorted out,
+//     a lagging node does not look lagging, and the trigger has nothing to fire on.
+//  2. The chain tails never reached the reporter: `ChainTail` was invoked zero times
+//     on the leader, and the scheduler logged zero signals. That is wiring in the real
+//     cluster, which the unit tests stub out.
+//
+// Both are recorded in the design doc's "实现进展" table. Keeping the case here (with
+// the cluster switches it needs) means whoever picks either one up has the harness
+// ready; a passing assertion would be a lie in the meantime.
+func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
+	t.Skip("blocked on two prerequisites, not on the catch-up itself — " +
+		"see the comment above and docs/active-lag-detection-design.md 实现进展")
+
+	ctx, cancel := context.WithTimeout(context.Background(), lagCatchupTimeout())
+	defer cancel()
+
+	waitForStorageGroupReady(t, 3*time.Minute)
+
+	enabled := dockerCmd(t, "exec", storageServices[0], "sh", "-c",
+		"grep -A1 '^lag_catchup:' /etc/stratum/config.yaml 2>/dev/null || true")
+	if !strings.Contains(enabled, "enabled: true") {
+		t.Skipf("cluster was built without lag_catchup enabled "+
+			"(rebuild with LAG_CATCHUP_ENABLED=true); config reads: %q", strings.TrimSpace(enabled))
+	}
+
+	leaderIdx, kbID := waitForLeader(t, ctx, "lag-active", 60*time.Second)
+	leaderAddr := nodeAddrs[leaderIdx]
+
+	behind := 0
+	for i := range storageServices {
+		if storageAddrs[i] != leaderAddr {
+			behind = i
+			break
+		}
+	}
+	behindSvc := storageServices[behind]
+
+	// One version everybody gets, so the knowledge base is real for this node before
+	// it goes away — and its artifact count has a baseline.
+	seed := genUniqueDocs(1, 600)
+	parent := writeChanges(t, ctx, leaderAddr, kbID, 0, lagAddChange(seed[0]))
+	waitVersionStatus(t, ctx, leaderAddr, kbID, parent, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
+	before := artifactCount(t, behind, kbID)
+
+	killNode(t, behindSvc)
+	defer startNode(t, behindSvc)
+
+	versions := lagCatchupVersions()
+	pool := genUniqueDocs(versions, 600)
+	for i := 0; i < versions; i++ {
+		parent = writeChanges(t, ctx, leaderAddr, kbID, parent, lagAddChange(pool[i]))
+		waitVersionStatus(t, ctx, leaderAddr, kbID, parent, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
+	}
+	t.Logf("%s was away for %d versions (chain tail v%d); artifacts before: %d",
+		behindSvc, versions, parent, before)
+
+	// From here on nothing touches the node: it is not queried, and nobody asks it to
+	// rebuild. Whatever it does, it does on its own.
+	startNode(t, behindSvc)
+
+	deadline := time.Now().Add(lagCatchupSettle())
+	caughtUp := false
+	for time.Now().Before(deadline) {
+		if strings.Contains(nodeLogsSince(t, behindSvc), "caught up with the chain tail") {
+			caughtUp = true
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+	after := artifactCount(t, behind, kbID)
+
+	t.Logf("LAG_CATCHUP_ENABLED=true, %d versions while offline", versions)
+	t.Logf("artifacts on the returning node: %d → %d", before, after)
+	t.Logf("caught up on its own (logged): %v", caughtUp)
+
+	if !caughtUp {
+		t.Errorf("%s never reported a chain-tail catch-up within %v: with nothing asking "+
+			"it for data, it stayed behind", behindSvc, lagCatchupSettle())
+	}
+	if after <= before {
+		t.Errorf("artifacts on %s did not grow (%d → %d), so the catch-up landed nothing",
+			behindSvc, before, after)
+	}
 }
