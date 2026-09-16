@@ -7,6 +7,26 @@ import (
 	"path/filepath"
 )
 
+// installShardCount is the size of the install-lock table (see
+// IndexManagerImpl.installShards). Fixed, so nothing ever has to be reclaimed:
+// two versions hashing to one shard merely serialise, which costs nothing.
+const installShardCount = 64
+
+// installShardOf maps a version to its install lock. FNV-1a over the knowledge
+// base id, mixed with both halves of the version id — cheap, and all it has to
+// do is spread versions.
+func installShardOf(key indexKey) int {
+	h := uint32(2166136261)
+	for i := 0; i < len(key.kbID); i++ {
+		h ^= uint32(key.kbID[i])
+		h *= 16777619
+	}
+	v := uint64(key.versionID)
+	h ^= uint32(v) ^ uint32(v>>32)
+	h *= 16777619
+	return int(h % installShardCount)
+}
+
 // InstallIndex writes an index built elsewhere into this node's index
 // directory and loads it, so a replica can serve a version it never built
 // (Stratum_设计文档v13.md §8.4: "建一次、分发 N 份").
@@ -19,7 +39,18 @@ import (
 // The sidecar is written first: it carries the checksum the index file is
 // validated against, so an index that lands without it is the one state we
 // must not reach.
+//
+// Installs of the SAME version are serialised. A version can be shipped more
+// than once (the build callback retries, and every attempt ships again), and two
+// installs interleaving their renames is precisely how a new index ends up
+// beside the previous version's sidecar — which the receiver then refuses to
+// Load with `checksum mismatch` (measured on a 3-node cluster). The lock spans
+// both renames, so "sidecar first, then index" is atomic to a reader.
 func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versionID int64, indexData, sidecarData []byte) error {
+	shard := &im.installShards[installShardOf(indexKey{kbID, versionID})]
+	shard.Lock()
+	defer shard.Unlock()
+
 	if im.cfg.IndexDataDir == "" {
 		return fmt.Errorf("index: InstallIndex: persistence not configured")
 	}
@@ -129,7 +160,16 @@ func (im *IndexManagerImpl) sidecarPath(kbID string, versionID int64) string {
 // ReadIndexFiles returns the raw bytes of (kbID, versionID)'s persisted index
 // and sidecar, for shipping them to a replica (§8.4). The caller decides who
 // receives them; this side only knows what is on its own disk.
+//
+// It takes the same shard lock the writers take (see installShards): the two
+// files are read one after the other, and a rebuild landing between those two
+// reads would hand the receiver a new index beside the previous sidecar — a pair
+// it cannot Load. Holding the lock keeps the pair consistent for the whole read.
 func (im *IndexManagerImpl) ReadIndexFiles(kbID string, versionID int64) (indexData, sidecarData []byte, err error) {
+	shard := &im.installShards[installShardOf(indexKey{kbID, versionID})]
+	shard.Lock()
+	defer shard.Unlock()
+
 	indexData, err = os.ReadFile(im.indexPath(kbID, versionID))
 	if err != nil {
 		return nil, nil, fmt.Errorf("index: read %s: %w", im.indexPath(kbID, versionID), err)

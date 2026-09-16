@@ -1869,19 +1869,15 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 			continue
 		}
 
-		// retentionCutoff is the smallest version ID inside the retention
-		// window; versions strictly below it are eligible to be dropped by
-		// the retention policy and are skipped for rebuild.
-		retentionCutoff := int64(-1)
-		if retentionCount > 0 && len(versions) > retentionCount {
-			ids := make([]int64, len(versions))
-			for i, v := range versions {
-				ids[i] = v.VersionID
-			}
-			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-			retentionCutoff = ids[len(ids)-retentionCount]
-		}
-
+		// Which versions actually have an artifact on disk? The retention window is
+		// defined over on-disk artifacts — EnforceDiskRetention counts files —
+		// while the control layer's version set also holds plenty that never
+		// produced one here (PENDING, FAILED, versions built elsewhere). Deriving
+		// the window from the version set instead would call versions
+		// "retention-dropped" that the policy never even saw.
+		present := make(map[int64]bool, len(versions))
+		unknown := make(map[int64]bool)
+		var onDisk []int64
 		for _, v := range versions {
 			// FAILED is retryable — RebuildIndex may trigger another attempt — but
 			// FAILED_PERMANENT is the control layer's terminal verdict (§10.1):
@@ -1900,10 +1896,32 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 			if err != nil {
 				d.logger.Warn("plane: reconcile: IndexExists failed",
 					zap.String("kb_id", kb.KBID), zap.Int64("version_id", v.VersionID), zap.Error(err))
+				unknown[v.VersionID] = true
+				continue
+			}
+			if exists {
+				present[v.VersionID] = true
+				onDisk = append(onDisk, v.VersionID)
+			}
+		}
+
+		// retentionCutoff is the smallest version ID the on-disk retention policy
+		// would keep. Below it, an absent artifact was dropped by the policy rather
+		// than lost — the very set EnforceDiskRetention works with.
+		retentionCutoff := retentionCutoffOf(onDisk, retentionCount)
+
+		for _, v := range versions {
+			if v.IndexStatus == types.IndexStatusFailed || v.IndexStatus == types.IndexStatusFailedPermanent ||
+				v.DataStatus == types.DataStatusFailedPermanent {
+				continue
+			}
+			if unknown[v.VersionID] {
+				// IndexExists failed for this version; anything said about it
+				// would be a guess.
 				continue
 			}
 			switch {
-			case exists:
+			case present[v.VersionID]:
 				// The index is on disk: the version is durable, and the
 				// control layer promotes a lost READY proposal from this
 				// report.
@@ -1951,4 +1969,22 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 		}
 	}
 	return durable, nil
+}
+
+// retentionCutoffOf returns the oldest version ID the on-disk retention policy
+// would keep, given the version IDs whose artifacts are actually on disk: the
+// smallest of the newest retentionCount. It returns -1 when the policy is off or
+// when nothing would be dropped, which reads as "no absence can be explained by
+// retention".
+//
+// It counts files, not versions, deliberately: EnforceDiskRetention works on the
+// `.index` files it finds, so a version that never produced one here is not part
+// of its window either.
+func retentionCutoffOf(onDisk []int64, retentionCount int) int64 {
+	if retentionCount <= 0 || len(onDisk) <= retentionCount {
+		return -1
+	}
+	ids := append([]int64(nil), onDisk...)
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids[len(ids)-retentionCount]
 }

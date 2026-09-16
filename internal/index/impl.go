@@ -289,6 +289,11 @@ type IndexManagerImpl struct {
 	loaded  map[indexKey]*loadedIndex
 	loading map[indexKey]bool // builds or loads currently in progress
 
+	// installShards serialise InstallIndex per version (see install.go). They
+	// exist because one version can be shipped more than once, and two installs
+	// interleaving their renames leaves an index file beside the wrong sidecar.
+	installShards [installShardCount]sync.Mutex
+
 	// sizeByKey tracks each loaded index's estimated in-memory footprint
 	// (vector payload bytes from the last build; 0 when unknown, e.g. a
 	// pre-policy index loaded without a size sidecar). loadedBytes is
@@ -1465,6 +1470,16 @@ func (im *IndexManagerImpl) saveToDisk(ctx context.Context, kbID string, version
 	if im.cfg.IndexDataDir == "" {
 		return nil // persistence not configured
 	}
+	// The same shard lock InstallIndex and ReadIndexFiles take (installShards).
+	// A build and an install of one version are two writers of the same pair of
+	// files, and letting them interleave is what leaves an index beside the wrong
+	// sidecar. Held across the vecstore Save and the sidecar write, so no reader
+	// can observe a half-updated pair. (Neither caller of this function holds
+	// im.mu, so the order shard → im.mu stays consistent with InstallIndex.)
+	shard := &im.installShards[installShardOf(indexKey{kbID, versionID})]
+	shard.Lock()
+	defer shard.Unlock()
+
 	path := im.indexPath(kbID, versionID)
 	// 0777: this node and the vecstore process share the filesystem but may
 	// run as different users (docker 集群形态：节点容器内 root、宿主机

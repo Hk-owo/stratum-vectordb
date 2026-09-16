@@ -772,8 +772,22 @@ func main() {
 	// queries and writes are waiting on stall. The 2-minute timeout and
 	// context.Background() below already described a call nobody waits for; this
 	// makes it one.
+	// One distribution per version at a time. The build callback is retried on
+	// failure (invokeCallback, up to 4 attempts) and every attempt calls this
+	// again; while distribution ran inline those attempts were strictly
+	// sequential, so a version was never shipped twice at once. Off the worker
+	// they can overlap — and overlapping ships of one version are exactly what
+	// lets a receiver's installs interleave (measured: an index/sidecar checksum
+	// mismatch on the receiving node). A ship already in flight is the same work,
+	// so skip it; once it finishes, a later attempt may try again.
+	distributing := sync.Map{}
 	distributeIndex = func(kbID string, versionID int64) {
+		key := fmt.Sprintf("%s\x00%d", kbID, versionID)
+		if _, inFlight := distributing.LoadOrStore(key, struct{}{}); inFlight {
+			return
+		}
 		go func() {
+			defer distributing.Delete(key)
 			// A panic here used to be caught by doBuild's recover, which marked
 			// the version FAILED. Off the worker goroutine there is nothing above
 			// to catch it, so it would take the process down.

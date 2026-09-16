@@ -323,6 +323,8 @@ go test ./internal/plane/ -run PushIndexToReplicas -race   # 并发闸门的用�
 
 ### 主动落后检测 / 激活：先定"谁来触发"
 
+> **设计稿已出**：`docs/active-lag-detection-design.md`——模型选型（结论：节点自发现）、响应侧 `chain_tails` 字段、节点侧动作与三种防护、验证方式都在那里；下面只保留与本计划交叉的部分。
+
 目标是不让"落后"长期只靠查询撞上才被修复——惰性恢复的问题是路由可能一直不选中落后节点，或者第一个撞上它的查询要付冷启动代价。
 
 **第一步是定触发模型，两种模型的防护手段不同：**
@@ -358,10 +360,50 @@ go test ./internal/plane/ -run PushIndexToReplicas -race   # 并发闸门的用�
 - **并发副本推送数**（把 `for peer` 循环也纳入闸门）与二级优先级：待出现"副本被选中要立刻服务查询但版本落后"这种急切分发需求时再评估。
 - **源节点 / 接收侧背压**：见 §6 风险第 6 条，pull 化之前必须单独立项。
 
-### retention 口径统一
+### retention 口径统一（✅ 已做）
 
-- `ReconcileIndexes` 的 `retentionCutoff` 与 `EnforceDiskRetention` 对"窗口内"的定义不同（前者只看 `versionID` 排序，后者含 active 与 `.used` 盾），见 §6 风险第 8 条。统一之后再谈"追赶有效窗口"的精确边界（§1）。
-- 既然 `IndexRetentionCount` 兼任"可分发追赶深度"，它的默认值需要与副本数、预期落后幅度一起标定，而不是只当磁盘配额看。
+- `ReconcileIndexes` 的"窗口"改为按**磁盘上实际有产物的版本集合**计算（新增纯函数 `retentionCutoffOf`），与 `EnforceDiskRetention`（数 `.index` 文件）同口径。此前它按控制层版本集合算，会把从未落盘的版本误判成"策略丢弃"——而 retention 分支排在 `PENDING`/active 分支**之前**，误判意味着**拒绝补建**（老 PENDING 写入、回滚后的 active 版本都会中招，而 `EnforceDiskRetention` 在磁盘上恰恰把 active 盾住）。
+- 测试：`TestReconcileIndexes_WindowFollowsArtifactsNotTheVersionSet`（带一条"前提守卫"，防止它退化成恒真测试）、`TestRetentionCutoffOf`。
+
+### `IndexRetentionCount` 默认值怎么标定
+
+它既是磁盘配额，也是**可被分发修复的追赶深度上限**（§1「追赶的有效窗口」）。标定要同时满足两头：
+
+- **下界**：不小于"一次批量版本推进的幅度"。否则刚构建出来的产物会在分发读盘之前被下一次 retention 收走——除非 `.used` 盾先兜住（Step 4 做的正是这个）。所以标定问的其实是"盾与窗口，谁先接住"。
+- **上界**：磁盘。上界 ≈ `IndexRetentionCount × (1 + RetentionProtectMax 的相对倍数)` × 单版本产物大小 × 每节点 KB 数。产物大小可参照已有实测的小样本（免图 1325 B / 带图 6866 B），生产量级要按文档集规模外推。
+
+**三个可观测信号**（都已在代码里，不需要新埋点）：
+
+| 信号 | 来源 | 期望 |
+|---|---|---|
+| `index distribution failed` 的 warn 计数 | `PushIndexToReplicas` 读盘失败 | 接了 Step 4 之后应 ≈ 0；不为 0 说明排队跨过了盾窗口 |
+| `skipping rebuild of retention-dropped index` 的 Info 计数 | `ReconcileIndexes`（口径已统一） | 应只对应真正被策略丢弃的版本 |
+| 副本侧自建次数 | `buildPool` 的 backfill 条目 | 越少越好——每次自建都是一次本该省下的构建 |
+
+**测法（已落地为 `integration/docker/lag_catchup_test.go`）**：
+
+1. 集群就绪——用例自己先等存储组 healthy 再写第一版，否则首次 `CreateVersion` 会因 dispatch 找不到候选被当作 TRANSIENT 放弃，之后的 READY 永远等不到（第一次跑就是这么超时的）；
+2. 在**同一个 KB** 上串行推进 M 个版本（每版等 READY，父版本不能是 PENDING）；
+3. `STRATUM_LAG_OFFLINE=1` 时先把一个 storage 节点杀掉再推进，随后拉起它，看它的产物数；
+4. 用例打印每个 storage 的产物数与该 KB 上的三类分发失败，而不是断言阈值——阈值取决于部署的写入速率。
+
+**首次实测（2026-09-16，3 控制 + 3 存储，默认配置 `gc.version_retention_count=50` / `push_concurrency=4`，M=55）**：
+
+| 读数 | 值 |
+|---|---|
+| 推进耗时 | 36 s（55 版，每版等到 READY） |
+| 产物数（三个 storage） | 批前 `[1 1 1]` → 批后 `[56 56 56]` |
+| `read local index`（读盘时产物已不在） | **1** |
+| `checksum mismatch`（收到的对在接收方校验失败） | **7** |
+| 副本不可达 | 2 |
+| `retention-dropped` | 0 |
+
+两条结论：
+
+1. **窗口 50 对这个写入速率够用**。56 个产物一个没被淘汰——`50 ≤ 56` 是靠 `.used` 盾兜住的（若没有 Step 4 的盾，retention 会把最老的 6 个删掉，而其中可能正有排队待发的）；55 次分发里只有 1 次撞上"产物已不在"。这印证了"下界 ≥ 一次批量推进的幅度"这条：**先把盾接上，窗口才有资格只当配额看**。
+2. **但暴露出一个独立的交错竞态**：`checksum mismatch` 7 次（前一次跑 8 次，稳定复现）。接收方 `Load` 时报 `<v>.index` 的 checksum 与 sidecar 记录的不符，说明它落盘的 `<v>.index` + `<v>.index.ids` **不是同一代**。**已修并复验**（同一用例、同一参数：`checksum` 回到 **0**）。根因是**同一版本那一对产物文件被并发读写**——本地构建 `saveToDisk`（经 vecstore 进程写盘）、`InstallIndex`（接收分发）、`ReadIndexFiles`（分发读盘）三者之间没有任何互斥，而 Step 1 的异步化把"同一次构建完成的多次分发"从串行变成了并发（`invokeCallback` 对回调带重试，最多 4 次，每次都会走 `distributeIndex`）。修法三件：① 一张按版本分片的锁（`IndexManagerImpl.installShards`，FNV-1a 取模 64，固定表无需回收）；② `InstallIndex`、`saveToDisk`、`ReadIndexFiles` 全部取该锁，让同一版本的写-写与读-写都串行（锁序统一为 shard → `im.mu`，三个入口的调用方都不持 `im.mu`）；③ `distributeIndex` 用 `sync.Map` 对同一 `(kbID, versionID)` 做 in-flight 去重。`read local index` 仍是 1——那一条与窗口有关，与本次修复无关。
+
+**用例位置与开关**：`integration/docker/lag_catchup_test.go`（`//go:build docker`）；`STRATUM_LAG_VERSIONS`、`STRATUM_LAG_OFFLINE`、`STRATUM_LAG_SETTLE`、`STRATUM_LAG_TIMEOUT` 可调。本仓库的集群由 `scripts/docker-cluster-both.sh`（控制组 + 存储组）管理，不是 `docker-cluster.sh`。
 
 ### 顺带清理：过时的注释（✅ 已做）
 
