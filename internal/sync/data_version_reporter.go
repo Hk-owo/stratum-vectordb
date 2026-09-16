@@ -71,6 +71,18 @@ type DataVersionReporterConfig struct {
 	// (docs/active-lag-detection-design.md). Optional: without it this node keeps the
 	// lazy recovery it has always had. *plane.LagCatchup implements it.
 	ChainTails ChainTailSink
+
+	// Holders receives the control leader's answer to "which nodes reported holding
+	// this version", per knowledge base (§7.13.4). It is the same aggregate the
+	// service station's route table reads; this node mirrors it so its data-source
+	// lookup can answer without dialling anyone — that lookup may run on the Raft
+	// apply path (see §8.5's history). Optional: without it the lookup keeps
+	// answering from its last layer. *plane.HoldersCache implements it.
+	//
+	// It rides this report because the response is already being sent every
+	// interval to the only node that has the aggregate. There is nothing to ask
+	// for: the answer comes back with everything else.
+	Holders HoldersSink
 }
 
 // LeaderWatermarkSink receives the watermarks a control leader published on a report's
@@ -88,6 +100,24 @@ type LeaderWatermarkSink interface {
 // LeaderWatermarkSink is: plane imports this package.
 type ChainTailSink interface {
 	SetChainTails(tails map[string]int64)
+}
+
+// HoldersSink receives the per-knowledge-base holder lists a control leader published
+// on a report's response (§7.13.4): which nodes reported holding that knowledge base,
+// and the address each of them reported for itself.
+//
+// through carries, per knowledge base, the version the answer is good for; on this
+// response it is the chain tail. A sink needs it because holder sets only narrow as
+// the version rises — a node whose cursor reached 20 holds everything below 20 too —
+// so an answer fetched with a higher version may serve lower asks, and never the other
+// way round.
+//
+// A knowledge base ABSENT from holders means "the leader said nothing about it" —
+// never "nobody holds it". The two lead to opposite actions, so a sink must not turn
+// an absence into a negative fact. Declared here for the same reason the sinks above
+// are: plane imports this package.
+type HoldersSink interface {
+	StoreHolders(holders map[string][]string, through map[string]int64)
 }
 
 // DataVersionReporter periodically tells the control leader which versions this
@@ -109,6 +139,10 @@ type DataVersionReporter struct {
 	// (docs/active-lag-detection-design.md). A sink decides for itself what to do
 	// with them — including nothing.
 	chainTails ChainTailSink
+
+	// holders mirrors the leader's §7.13.4 aggregate. It is filled from this loop's
+	// own response, which is why it needs no thread of its own.
+	holders HoldersSink
 }
 
 // NewDataVersionReporter returns a reporter that dials leaders directly.
@@ -122,15 +156,16 @@ func NewDataVersionReporter(cfg DataVersionReporterConfig) *DataVersionReporter 
 		interval = DefaultDataVersionReportInterval
 	}
 	return &DataVersionReporter{
-		nodeID:        cfg.NodeID,
-		selfAddr:      cfg.SelfAddr,
-		dataVersions:  cfg.DataVersions,
-		resolveLeader: cfg.ResolveLeader,
-		interval:      interval,
-		logger:        cfg.Logger,
-		dial:          dial,
-		watermarks:    cfg.Watermarks,
-		chainTails:    cfg.ChainTails,
+		nodeID:         cfg.NodeID,
+		selfAddr:       cfg.SelfAddr,
+		dataVersions:   cfg.DataVersions,
+		resolveLeader:  cfg.ResolveLeader,
+		interval:       interval,
+		logger:         cfg.Logger,
+		dial:           dial,
+		watermarks:     cfg.Watermarks,
+		chainTails:     cfg.ChainTails,
+		holders:        cfg.Holders,
 	}
 }
 
@@ -219,6 +254,21 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 				zap.Int("reclaimable", len(resp.GetReclaimable())))
 		}
 		r.chainTails.SetChainTails(resp.GetChainTails())
+	}
+	// The same response answers "who holds this version" for the data-source
+	// lookup, which mirrors it because that lookup may run on the Raft apply path
+	// and cannot dial anyone (see §8.5's history). Nothing is asked for here: the
+	// leader fills this for every knowledge base it knows, not only the ones named
+	// above, so a node that missed a whole chain still learns where that chain is.
+	if r.holders != nil {
+		byKB := make(map[string][]string, len(resp.GetHolders()))
+		for kbID, list := range resp.GetHolders() {
+			byKB[kbID] = list.GetAddresses()
+		}
+		// The tail is what these answers are good through: a node holding the tail
+		// holds every version below it, so the cache may reuse these holders for
+		// lower asks — and only for lower ones.
+		r.holders.StoreHolders(byKB, resp.GetChainTails())
 	}
 	return nil
 }

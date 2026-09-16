@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"errors"
+	"sort"
 	"testing"
 
 	pb "stratum/api/proto/stratum"
@@ -38,6 +39,24 @@ func (s *recordingSink) SetLeaderWatermarks(watermarks map[string]int64) {
 func (r *recordingRecorder) Record(nodeID int64, address string, dataVersions map[string]int64) {
 	r.nodes = append(r.nodes, nodeID)
 	r.reports = append(r.reports, dataVersions)
+}
+
+// KnowledgeBases is the union across reports, which is exactly what the leader
+// answers from — and the reason a node that named nothing still hears about its
+// chains.
+func (r *recordingRecorder) KnowledgeBases() []string {
+	seen := make(map[string]struct{})
+	for _, report := range r.reports {
+		for kbID := range report {
+			seen[kbID] = struct{}{}
+		}
+	}
+	kbs := make([]string, 0, len(seen))
+	for kbID := range seen {
+		kbs = append(kbs, kbID)
+	}
+	sort.Strings(kbs)
+	return kbs
 }
 
 // The leader folds the report into its aggregate, keyed by the reporting node.

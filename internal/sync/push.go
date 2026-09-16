@@ -155,6 +155,13 @@ type PushHandler struct {
 	// (docs/active-lag-detection-design.md §5). Same reason as watermarks for
 	// riding this response: the tail is the leader's global view.
 	chainTails ChainTailSource
+
+	// holders, when set, supplies the nodes that reported holding a version and the
+	// address each reported for itself (§7.13.4) — the same aggregate the service
+	// station's route table reads, now with a second consumer. The reportee mirrors
+	// it because its data-source lookup may run on the Raft apply path, where it
+	// cannot ask (docs/data-source-holders-fallback-plan.md).
+	holders HolderSource
 }
 
 // ReclaimWatermarkSource answers "how far can this knowledge base's recorded changes
@@ -178,6 +185,12 @@ type ChainTailSource interface {
 // because plane imports this package.
 type DataVersionRecorder interface {
 	Record(nodeID int64, address string, dataVersions map[string]int64)
+	// KnowledgeBases reports every knowledge base any node has reported a cursor
+	// for. The leader needs it to answer about chains the REPORTER never named: a
+	// node that missed a whole chain names it in no map at all, and the leader
+	// naming its chains is the only way that node learns there is something to be
+	// behind on (docs/active-lag-detection-design.md).
+	KnowledgeBases() []string
 }
 
 // VersionWriteExecutor runs the storage layer's write transaction for a version
@@ -237,6 +250,23 @@ func WithReclaimWatermarks(src ReclaimWatermarkSource) PushHandlerOption {
 // behind are you" — even though a leader normally passes itself for both.
 func WithChainTails(src ChainTailSource) PushHandlerOption {
 	return func(h *PushHandler) { h.chainTails = src }
+}
+
+// HolderSource answers "which nodes reported holding this version, and at which
+// address each can be reached" (§7.13.4). *plane.DataVersionRegistry implements it.
+// Declared here for the same reason the recorder is: plane imports this package.
+type HolderSource interface {
+	HolderAddresses(kbID string, versionID int64) []string
+}
+
+// WithHolders wires the source of the holder lists carried back on a report's
+// response. Separate from WithChainTails even though a leader normally passes
+// itself for both: the tail says "you are behind", the holders say "here is who can
+// give it to you" — and it is the second that the reportee's data-source lookup
+// mirrors, because that lookup may run where it cannot ask
+// (docs/data-source-holders-fallback-plan.md, §8.5's history).
+func WithHolders(src HolderSource) PushHandlerOption {
+	return func(h *PushHandler) { h.holders = src }
 }
 
 // DataSourceRegistry is the slice of plane.DataSourceRegistry that the receive
@@ -520,19 +550,44 @@ func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 			resp.Reclaimable = reclaimable
 		}
 	}
-	// And the chain tails, for the same set of knowledge bases: this reporter is the
-	// one whose cursor the tail will be compared against, and it already speaks to us
-	// every interval. An absent entry means "unknown" — no signal, never "nothing to
-	// catch up" (docs/active-lag-detection-design.md).
+	// And the chain tails and holder lists, for every knowledge base this leader
+	// knows about — NOT merely the ones this reporter named.
+	//
+	// That difference is the point. A node that missed a whole chain names it in no
+	// map at all, so answering the named set tells it nothing: it would hear back
+	// exactly the emptiness it already has, and never learn there is something to be
+	// behind on. (Measured on a replica that had been offline for 55 versions: its
+	// report carried reported_kbs=0, and every response came back with no tails
+	// because of that.) The union across nodes is what turns "I hold nothing" into
+	// "here is the chain, here is its tail, and here is who can serve it".
+	//
+	// An entry ABSENT from either map still means "unknown" — no signal, never
+	// "nothing to catch up" and never "nobody holds it"
+	// (docs/active-lag-detection-design.md, docs/data-source-holders-fallback-plan.md).
 	if h.chainTails != nil {
 		tails := make(map[string]int64)
-		for kbID := range req.GetDataVersions() {
-			if tail, ok := h.chainTails.ChainTail(kbID); ok {
-				tails[kbID] = tail
+		holders := make(map[string]*pb.HolderList)
+		for _, kbID := range h.dataVersions.KnowledgeBases() {
+			tail, ok := h.chainTails.ChainTail(kbID)
+			if !ok || tail <= 0 {
+				continue
+			}
+			tails[kbID] = tail
+			// The holder list is fetched AT the tail, which is the version this
+			// answer is good through: whoever holds the tail holds everything
+			// below it, so the reportee may reuse these addresses for any lower
+			// version it is missing — and only for lower ones.
+			if h.holders != nil {
+				if addrs := h.holders.HolderAddresses(kbID, tail); len(addrs) > 0 {
+					holders[kbID] = &pb.HolderList{Addresses: addrs}
+				}
 			}
 		}
 		if len(tails) > 0 {
 			resp.ChainTails = tails
+		}
+		if len(holders) > 0 {
+			resp.Holders = holders
 		}
 	}
 	return resp, nil

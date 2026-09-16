@@ -280,6 +280,35 @@ message ReportDataVersionsResponse {
   // A knowledge base absent from this map means "unknown" — no signal — not
   // "nothing to catch up".
   map<string, int64> chain_tails = 4;
+  // holders carries back, per knowledge base, which nodes reported holding it and
+  // the address each reported for itself (§7.13.4) — the same aggregate the service
+  // station's route table reads, now with a second consumer.
+  //
+  // It rides this response because the answer is "who can give me this data", and
+  // the askers are the data nodes — the ones this report already comes from. A
+  // node's data-source lookup may run on the Raft apply path, where dialling is not
+  // allowed (see §8.5), so it cannot ask for itself; it reads a mirror, and THIS is
+  // what fills that mirror.
+  //
+  // The map is keyed by knowledge base, and unlike reclaimable/chain_tails the
+  // leader fills it for every knowledge base it knows about, not only for the ones
+  // the reporter named. That is the whole point: a node that missed a whole chain
+  // names nothing (its own state is empty), and the leader naming its chains is how
+  // it learns there is something to be behind on.
+  //
+  // An absent knowledge base is "the leader said nothing", never "nobody holds it":
+  // the aggregate is soft state, scoped to a leadership term, refreshed every
+  // interval.
+  map<string, HolderList> holders = 5;
+}
+
+// HolderList is one knowledge base's holders, in ascending node-id order so a
+// caller's choice is reproducible.
+//
+// A message wrapper rather than a bare repeated field because proto does not allow
+// repeated inside a map value.
+message HolderList {
+  repeated string addresses = 1;
 }
 
 enum SyncEntryType {

@@ -632,6 +632,42 @@ func main() {
 	// §8.5 unusable.
 	dataSources := plane.NewDataSourceRegistry()
 
+	// §8.5's fourth layer (docs/data-source-holders-fallback-plan.md): the table
+	// above is filled only by a writer's confirmation, which is a bounded
+	// fire-and-forget broadcast. A replica that missed it has no source at all —
+	// the leader this lookup falls back to is the control leader, which in a
+	// two-tier deployment exports no data and refuses. This cache mirrors the
+	// control leader's §7.13.4 aggregate (built from the report every storage
+	// node already sends), so such a replica can still find one.
+	//
+	// The lookup stays a pure map read: it runs on the Raft apply path, where
+	// dialling anyone is what made the first attempt at §8.5 unusable. The
+	// misses it queues are serviced by the data-version report below, which
+	// already runs on an interval and already resolves the leader.
+	resolveControlLeader := func(rctx context.Context) (string, bool, error) {
+		status, err := rn.GetClusterStatus(rctx)
+		if err != nil {
+			return "", false, fmt.Errorf("GetClusterStatus: %w", err)
+		}
+		if !status.HasLeader {
+			return "", false, nil
+		}
+		addr, ok := peerAddrByID[status.LeaderID]
+		if !ok {
+			return "", false, fmt.Errorf("sync: leader address unknown for node ID %d", status.LeaderID)
+		}
+		return addr, true, nil
+	}
+	// The mirror of the control leader's §7.13.4 aggregate, read by the data-source
+	// lookup. It is filled FROM the report response (see the reporter wiring below),
+	// not by a refresh of its own: the lookup may run on the Raft apply path, so it
+	// can only read memory, and the heartbeat already talks to the leader every
+	// interval — carrying the answer back is one map in a response that is being
+	// sent anyway.
+	holdersCache := plane.NewHoldersCache(plane.HoldersCacheConfig{
+		Logger: logger,
+	})
+
 	dataPlane = plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
 		IndexManager:  indexMgr,
 		Puller:        syncFollower,
@@ -670,10 +706,11 @@ func main() {
 			return verifyVersionPull(ctx, rn, vd, kbID, versionID)
 		},
 		// Resolve answers "who holds this version's data": the §8.5 table first
-		// (a writer announced itself), then the pre-§8.5 answer — the leader.
-		// Both halves are lookups; nothing here dials a peer, because this runs
-		// on the Raft apply path.
-		Resolve: plane.ResolverWithRegistry(dataSources, func(ctx context.Context, kbID string, versionID int64) (string, bool, error) {
+		// (a writer announced itself), then the control leader's aggregate read
+		// from the local mirror, then the pre-§8.5 answer — the leader. All three
+		// are lookups; nothing here dials a peer, because this runs on the Raft
+		// apply path.
+		Resolve: plane.ResolverWithRegistry(dataSources, holdersCache, func(ctx context.Context, kbID string, versionID int64) (string, bool, error) {
 			status, err := rn.GetClusterStatus(ctx)
 			if err != nil {
 				return "", false, fmt.Errorf("GetClusterStatus: %w", err)
@@ -1043,7 +1080,11 @@ func main() {
 			// docs/active-lag-detection-design.md: and the chain tail, for the same
 			// reason — the leader is the only one that knows where the chain ends, and
 			// the reporter is the one that must decide whether it has fallen behind.
-			stratumsync.WithChainTails(controlPlane)),
+			stratumsync.WithChainTails(controlPlane),
+			// docs/data-source-holders-fallback-plan.md: and the holders, which the
+			// reporter mirrors so its data-source lookup can answer without dialling —
+			// that lookup may run on the Raft apply path, where it cannot ask.
+			stratumsync.WithHolders(dataVersionRegistry)),
 	)
 	pb.RegisterDataSyncServiceServer(grpcServer, nodeHandler)
 
@@ -1105,26 +1146,20 @@ func main() {
 		// than an id each of them would have to map on its own.
 		SelfAddr:     localAddr,
 		DataVersions: dataPlane.DataVersionsSnapshot,
-		ResolveLeader: func(rctx context.Context) (string, bool, error) {
-			status, err := rn.GetClusterStatus(rctx)
-			if err != nil {
-				return "", false, fmt.Errorf("GetClusterStatus: %w", err)
-			}
-			if !status.HasLeader {
-				return "", false, nil
-			}
-			addr, ok := peerAddrByID[status.LeaderID]
-			if !ok {
-				return "", false, fmt.Errorf("sync: leader address unknown for node ID %d", status.LeaderID)
-			}
-			return addr, true, nil
-		},
+		// Re-resolved every interval rather than cached, and shared with the
+		// source lookup's holders client: both want the same address, and for the
+		// same reason — §7.13.1's re-resolve instead of a cached forwarding path.
+		ResolveLeader: resolveControlLeader,
 		// §7.5: store the watermarks the leader carries back, so this node's WAL can
 		// be reclaimed even when this node is not the leader.
 		Watermarks: controlPlane,
 		// And the chain tails, which are what tell this node it has fallen behind.
 		ChainTails: lagCatchup,
-		Logger:     logger,
+		// And the control leader's answer to "who holds this version", which the
+		// data-source lookup mirrors. That lookup may run on the apply path, so it
+		// cannot ask for itself; this response is what fills the mirror.
+		Holders: holdersCache,
+		Logger:  logger,
 	}).Run(ctx)
 
 	// §7.5: reclaim the WAL's recorded changes once every replica holds the versions

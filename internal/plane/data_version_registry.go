@@ -85,6 +85,47 @@ func (r *DataVersionRegistry) Holders(kbID string, versionID int64) []Holder {
 	return holders
 }
 
+// KnowledgeBases returns every knowledge base any node has reported a cursor for.
+//
+// The union across nodes, not any one node's set: a node that missed a whole chain
+// names it in no map at all, so "which chains exist" cannot be answered from a
+// single report. That asymmetry is why this method exists — the leader is the only
+// party that can tell such a node what it is behind on
+// (docs/active-lag-detection-design.md).
+func (r *DataVersionRegistry) KnowledgeBases() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := make(map[string]struct{})
+	for _, data := range r.byNode {
+		for kbID := range data.cursors {
+			seen[kbID] = struct{}{}
+		}
+	}
+	kbs := make([]string, 0, len(seen))
+	for kbID := range seen {
+		kbs = append(kbs, kbID)
+	}
+	sort.Strings(kbs)
+	return kbs
+}
+
+// HolderAddresses is Holders flattened to just the addresses, in the same
+// ascending node-id order.
+//
+// It exists because both consumers of this fact — the wire form on a report's
+// response, and the reporter's sink on the other end — work in addresses, and
+// neither package can name plane.Holder.
+func (r *DataVersionRegistry) HolderAddresses(kbID string, versionID int64) []string {
+	holders := r.Holders(kbID, versionID)
+	addrs := make([]string, 0, len(holders))
+	for _, holder := range holders {
+		if holder.Address != "" {
+			addrs = append(addrs, holder.Address)
+		}
+	}
+	return addrs
+}
+
 // Cursor returns the highest version nodeID reported for kbID, and whether that
 // node has reported at all.
 func (r *DataVersionRegistry) Cursor(nodeID int64, kbID string) (int64, bool) {

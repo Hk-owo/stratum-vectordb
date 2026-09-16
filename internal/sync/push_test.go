@@ -240,3 +240,53 @@ func TestFollower_PullVersion_AdvancesTheCursor(t *testing.T) {
 		t.Fatalf("cursor after pull = %v, want exactly [%s/%d]", got, kbID, versionID)
 	}
 }
+
+// fixedHolders is a HolderSource with a fixed table.
+type fixedHolders struct {
+	holders map[string][]string
+}
+
+func (h *fixedHolders) HolderAddresses(kbID string, _ int64) []string {
+	return h.holders[kbID]
+}
+
+// The leader answers about EVERY knowledge base it knows, not only the ones the
+// reporter named.
+//
+// A node that missed a whole chain names nothing — its own cursor map is empty — so
+// an answer restricted to the named set hands it back exactly the emptiness it
+// already has, and it never learns there is something to be behind on. Measured: a
+// replica that had been offline for 55 versions reported reported_kbs=0, and every
+// response came back with no tails at all.
+func TestPushHandler_ReportDataVersions_AnswersAboutChainsTheReporterNeverNamed(t *testing.T) {
+	rec := &recordingRecorder{}
+	// A DIFFERENT node says it went through kb-1; the reporter below says nothing.
+	rec.Record(11, "other:7001", map[string]int64{"kb-1": 55})
+
+	h := NewPushHandler(nil, 7,
+		WithDataVersionAggregator(rec, func() bool { return true }),
+		WithChainTails(&fixedChainTails{tails: map[string]int64{"kb-1": 55}}),
+		WithHolders(&fixedHolders{holders: map[string][]string{"kb-1": {"other:7001"}}}),
+	)
+
+	resp, err := h.ReportDataVersions(context.Background(), &pb.ReportDataVersionsRequest{
+		NodeId:  3,
+		Address: "me:7003",
+		// This node holds nothing at all: it names no knowledge base.
+		DataVersions: map[string]int64{},
+	})
+	if err != nil {
+		t.Fatalf("ReportDataVersions: %v", err)
+	}
+	if !resp.GetAccepted() {
+		t.Fatal("the leader must accept the report")
+	}
+	if got := resp.GetChainTails()["kb-1"]; got != 55 {
+		t.Errorf("chain_tails = %v, want kb-1:55 even though the reporter named nothing",
+			resp.GetChainTails())
+	}
+	addrs := resp.GetHolders()["kb-1"].GetAddresses()
+	if len(addrs) != 1 || addrs[0] != "other:7001" {
+		t.Errorf("holders = %v, want kb-1:[other:7001]", resp.GetHolders())
+	}
+}
