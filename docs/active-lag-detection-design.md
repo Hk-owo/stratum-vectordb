@@ -37,9 +37,11 @@
   `SafeDurableVersion` 的注释其实承认了这个处境（"every storage node reconciles concurrently, and none of them reaches grpcServer.Serve until its own reconcile has returned"），并用短超时避免启动死锁——代价是**这条恢复协议在自己的时序里必然失败**。所以历史版本的数据侧永远停在 PENDING。
 - 顺带一提：新写入的版本本该由**实时路径**兜住（`reportAndSchedule` → `ReportDataDurable`），可这套集群里连它们也不是 Durable——那指向 fan-out 侧的另一个问题，和这条时序问题是两回事，需要分别查。
 - **修法方向**：把数据侧那半的上报挪到 gRPC serving 之后（或让它可重试），索引侧那半仍留在前面——索引侧不依赖 peers，数据侧的 quorum 判定则必须有 peers 可达。只把两半一起提前或一起推后都不对。
-- 所以这里保留判据修复（"宁可拒绝，不可交错答案"是设计选定的方向），但**下一步要么修这条时序，要么修 fan-out**；只修一头会把系统从"静默错答"推到"拒绝服务"。
+- **已修**：`reconcileIndexStatus` 现在只做本地那半（游标恢复 + `ReconcileIndexes`）并返回 durable 集合；payload 的发布拆成 `reportEpoch`，由 `reportEpochWhenPeersAreUp` 在 gRPC 开始 `Serve` 之后调用，并对"没有 quorum 的知识库"重试（3 秒一次、窗口 60 秒）——因为"本节点在服务"不等于"peers 在服务"，节点仍是并发启动的，最先到的那一个会看到 peers 还在各自 reconcile 里。**验证**：重建集群后 `no quorum for a durable claim` 从 **15 条降到 0 条**，且 `epoch payload stayed incomplete` 一次都没打，即每个知识库都拿到了 quorum，数据侧终态开始推进。
+- 顺带一提：新写入的版本本该由**实时路径**兜住（`reportAndSchedule` → `ReportDataDurable`），可这套集群里连它们也不是 Durable——那指向 fan-out 侧的另一个问题，和这条时序问题是两回事，需要分别查。**这一条仍开着。**
+- 所以这里保留判据修复（"宁可拒绝，不可交错答案"是设计选定的方向），而时序这条已经修掉；下一个该看的是 fan-out。
 
-第 1 条已修并有回归测试；第 2 条、第三条（时序）与 fan-out 那句都还开着——证据都在这里，用例与集群开关是现成的。
+第 1 条（判据）与第三条（时序）都已修并有验证；第 2 条（链尾没到 reporter）与 fan-out 那句仍开着——证据都在这里，用例与集群开关是现成的。
 
 ---
 
