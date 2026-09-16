@@ -1,7 +1,7 @@
 # resolve 的数据源第四层：控制层 holders 兜底 —— 实施计划
 
-> 状态：**方案待实施**（代码尚未落盘；撰写环境无 Go 工具链、无 protoc，本文代码未编译、未运行）
-> 范围：`internal/plane`（`resolve` 组装 + 缓存）、`internal/sync`（刷新客户端）、`cmd/stratum`（组装）、测试
+> 状态：**已实现**（2026-09；**最终采用 B2 响应捎带形态**，与 §5 主推的 B1′ 不同 —— 原因见 §11；单测与真集群验证均已通过）
+> 范围：`internal/plane`（`resolve` 组装 + holders 镜像）、`internal/sync`（响应捎带 + 上报侧镜像填充）、`cmd/stratum`（组装）、`api/proto`（响应字段）、测试
 > 关联：`Stratum_设计文档v13.md` §7.13.4（数据版本聚合）、§8.5（数据源注册表）、§7.5（游标与追链）、§9.3(2)（新鲜度检查）；`docs/index-distribution-backpressure-plan.md`、`docs/active-lag-detection-design.md`、`docs/index-push-probe-plan.md`
 
 > 约定：本文行号以撰写时的代码为准，落地后需重新校正。
@@ -43,12 +43,12 @@
 ### 目标
 
 1. 在 §8.5 表 miss 时，给 `resolve` 增加一层**基于控制层聚合**的数据源答案，让"错过 confirm 但已过一个上报周期"的副本能自己找到源。
-2. **不改 `.proto`、不重新生成 pb.go**（撰写环境无 protoc）。
+2. ~~**不改 `.proto`、不重新生成 pb.go**~~ —— **这条约束已被放弃**：最终采用 B2，改了 `.proto` 并重新生成了 `sync.pb.go`（本机有 protoc，且 `chain_tails` 已是先例）。见 §11。
 3. **绝不把 RPC 放进 Raft apply 路径**——这是 §8.5 当初的硬约束（首次在 apply 路径上探测 peers，把 `integration` 从 26 s 拖到 462 s）。
 
 ### 非目标（本轮不做，记录理由）
 
-- **改写 `ReportDataVersionsResponse` 捎带 holders / `chain_tails`**（即"B2"形态）：最干净，但需要改 `.proto` 并重新生成 `sync.pb.go`；与 `docs/active-lag-detection-design.md` §3 一起做更合适（见 §10）。
+- **改写 `ReportDataVersionsResponse` 捎带 holders / `chain_tails`**（即"B2"形态）：**最终采用了它**（见 §11）。原本列为非目标的理由——「需要改 `.proto` 并重新生成 `sync.pb.go`」——不成立：本机有 protoc，`chain_tails` 就是这么加进去的。更关键的是 §5 那条路的刷新由 miss 触发，而落后节点正是不会被问、也就不会 miss 的那个（§1.2 的环）。
 - **放宽 `backfillTo` 的选源条件**（即"A"形态）：它是实时的，但会在 `all` 角色下把 peer 轮询带进 apply 回路（每个版本的 apply 都探测一圈）——若做，必须配"表优先 + 探测回填 + 不在 apply 路径探测"三道护栏。
 - **修正 confirm 广播本身**（加有界重试）：它治的是根因的另一半，改动小、可独立做（见 `docs/index-push-probe-plan.md` 的姐妹项与 §10）。
 - 改变失败语义：拉不到仍然是失败/推迟，本方案只增加"能查到"的机会。
@@ -296,3 +296,61 @@ go test ./internal/... ./service/... ./cmd/stratum/...
 5. **把 holders 缓存接到 `pickBackfillSource`（本方案之后收益最大的一处）**：那是现在唯一还会"遍历 peers"的地方——串行地问 storage group 里每个 peer 的 `CursorQuerier.LocalVersionOf`（每 peer 带 `peerCursorTimeout`），只为挑一个能覆盖缺口的源。而 `P(need)` 缓存**就是那个答案**：命中时直接从 `addrs ∩ storageGroup` 里挑（升序第一个），整轮游标 RPC 归零——这同时把"缺口场景的探测风暴"风险一并消掉（见 §8 第 7 条与 `docs/index-push-probe-plan.md` 的讨论）。配套两点：**重试时轮换候选**（条目保存整个 `addrs` 列表，`EnsureIndex` 的 30 s 循环让第 n 次尝试用 `addrs[n mod len]`，避免反复撞同一个刚重启的节点）；以及**探测结果回填**（任何一次成功的实时探测都写回 §8.5 表 / holders 缓存，让一次探测被后续版本与后续节点复用）。
 6. **可选的收敛：把"选源"抽成一个组件**。现在它散在三处——`resolve`（`SourceResolver`）、`pickBackfillSource`（§7.6）、`transferFullState`（§6.4 传入的 source）。统一成 `SourcePicker(kbID, versionID, need)`，内部优先级固定为「§8.5 表 → holders 缓存 → 实时探测（有闸门 + 回填） → leader 兜底」，三处共用同一份缓存、同一道闸门、同一套观测——"什么时候允许探测"这条规则也就只有一个落点。
 7. **两条红线（不要顺手优化掉）**：① `SafeDurableVersion`（§7.8）**必须实时**逐个问 peers 的连续游标并取 quorum 最小值——它喂的是**正确性**的界（"我可以声称 durable 到哪"），而 holders 是控制 leader 的软状态、按 term、有滞后，用它替代直接违反它自己写下的硬边界（*never feeds a correctness decision*）；② **leader 兜底要保留**——它在分层部署下虽然无效，却是让拉取循环与 `backfillTo` 得以启动的入口（`ok=false` 会让 `EnsureIndex` 静默 `return nil`，比一个会失败的地址更糟）。
+
+---
+
+## 11. 落地记录（2026-09）
+
+**落地形态与本文 §5 不同：最终采用 B2（响应捎带），放弃了 §5 的 B1′（miss 排队刷新）。**
+理由是实现过程中才看清的，记在这里，因为它推翻了 §2 的一条非目标：
+
+- §2 把 B2 列为非目标，理由是「需要改 `.proto` 并重新生成 `sync.pb.go`」。这个约束不成立 —— 本机有 `protoc 3.21.12` + `protoc-gen-go v1.34.2`，而且 `ReportDataVersionsResponse` 的 `chain_tails` 正是照 `reclaimable` 的先例这么加进去的。先例在手。
+- 更要紧的是 B1′ 有一个**环**，而 §1.2 自己已经把它写下了：服务站只挑持有者，所以落后节点永远不会被路由选中；而 B1′ 的刷新由 **miss** 触发 —— 它不会被问，也就不会 miss，于是队列永远空、缓存永远空、`resolve` 永远走 leader 兜底。**刷新依赖「被问」，而落后节点恰恰是那个不会被问的节点。**
+
+B2 让 leader 主动回答，不依赖报方先发问。它也顺手补上了 `docs/active-lag-detection-design.md` 那边的一个缺口：链尾此前只为**报方点名过**的知识库回填，而一个整条链都错过的节点什么都不点名，于是收到的是空信号。现在回填遍历的是控制层知道的**所有**链。
+
+### 落地清单
+
+| 文件 | 改动 |
+|---|---|
+| `api/proto/sync.proto` + `api/proto/stratum/sync.pb.go` | `ReportDataVersionsResponse` 增加 `holders`（`map<string, HolderList>`；proto 不允许 map 的值是 repeated，所以包了一层 `HolderList` 消息） |
+| `internal/sync/push.go` | `DataVersionRecorder` 增加 `KnowledgeBases()`；新增 `HolderSource` 与 `WithHolders`；回填改为遍历 `h.dataVersions.KnowledgeBases()` 而非 `req.GetDataVersions()`，并对每个 KB 在**链尾**处取 `HolderAddresses` |
+| `internal/plane/data_version_registry.go` | 新增 `KnowledgeBases()`（跨节点的并集 —— 「有哪些链」无法从单份报告回答）与 `HolderAddresses()` |
+| `internal/sync/data_version_reporter.go` | 新增 `HoldersSink` 接口与 `DataVersionReporterConfig.Holders`；**accepted 之后**把 `resp.GetHolders()` 存进缓存，`through` 用同一条响应里的 `chain_tails` |
+| `internal/plane/holders_cache.go` | 保留 `Lookup` / `Store` / TTL / 上限，新增 `StoreHolders(holders, through)`；**删除** `ScheduleRefresh` / `FlushRefresh` / `takePending` / `refreshOne` / `pending` 队列 / `HoldersOfClient`，连同 `Client` / `Batch` / `RefreshTimeout` / `PendingLimit` 配置与相关计数器 |
+| `internal/plane/data_source_registry.go` | `ResolverWithRegistry(reg, holders, fallback)` 三层**全是纯 map 读**，不再有「miss 排队」这一步 |
+| `cmd/stratum/main.go` | 构造缓存不再需要客户端；reporter 接线改为 `Holders: holdersCache`；`NewPushHandler` 增加 `WithHolders(dataVersionRegistry)` |
+| `internal/plane/holders_cache_test.go` | TTL 过期、条目替换、上限淘汰、空答案不落盘、nil 惰性、并发、`Lookup` 返回副本；**新增**：`StoreHolders` 在缺版本或版本非正时不落盘、低版本可命中高版本条目、高版本不吃低版本条目 |
+| `internal/plane/data_source_registry_test.go` | 第四层用例改为「镜像命中优先于 fallback，且不拨号」「高于条目版本的查询回落到 leader」 |
+| `internal/sync/push_test.go` | **新增** `TestPushHandler_ReportDataVersions_AnswersAboutChainsTheReporterNeverNamed` —— 报方点名为空时仍收到 `chain_tails` 与 `holders`，这是 B2 相对原方案的全部意义 |
+
+**移除的文件**：`internal/sync/holders_client.go` 及其测试。`GetDataVersionHolders` 这个 RPC 不再被数据源路径使用（服务站路由表仍是它的消费者）。
+
+`through` 的语义是关键：holder 集合只随版本升高而**变窄**（游标是连续前缀），所以一条以链尾取得的答案可以服务任何更低的版本，而**绝不能**服务更高的版本。
+
+### 验证
+
+```bash
+go build ./...
+go vet ./internal/plane/ ./internal/sync/ ./cmd/stratum/
+go test ./internal/plane/ ./internal/sync/ ./cmd/stratum/ ./internal/raft/ ./service/ -count=1
+```
+
+以上均通过。
+
+§5 Step 4 的「可观测」现在落在 leader 侧：report 的路径带着 `reported_kbs` / `chain_tails` / `reclaimable` 三个计数。原方案那些「刷新从未生效 / 刷新生效但没人有」的区分随刷新路径一起消失了 —— 因为**没有刷新这回事**了。
+
+### §9 的手工确认点在真集群上通过了
+
+原 §9 要的手工点（「第四层命中」）现在的对应物是**整条主动追赶链路**。`integration/docker/lag_catchup_test.go` 的 `TestT4_ActiveLagCatchupCatchesUpWithoutAQuery` 此前因两个前置而跳过，两个前置都已修（见该文件注释），现已解开并通过：
+
+```text
+killing stratum-node-storage1
+stratum-node-storage1 was away for 55 versions (chain tail v191); artifacts before: 1
+starting stratum-node-storage1
+artifacts on the returning node: 1 → 2
+caught up on its own (logged): true
+--- PASS: TestT4_ActiveLagCatchupCatchesUpWithoutAQuery (40.23s)
+```
+
+一个落后 55 个版本的副本，在**没有任何查询打到它**的情况下自己发现落后并追上了。§8 风险 1（滞后窗口仍在）没有消失 —— 本方案把窗口缩到一个上报周期，而现在它真的填得上。
