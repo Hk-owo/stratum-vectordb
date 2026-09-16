@@ -654,6 +654,9 @@ func main() {
 		IndexReader:     indexMgr,
 		IndexShipper:    stratumsync.NewIndexPusher(),
 		ResolveReplicas: resolveReplicaAddrs,
+		// §8.4(a): bound how many distributions run at once; 0 takes the
+		// default (DefaultMaxConcurrentIndexPush).
+		MaxConcurrentIndexPush: cfg.IndexPushConcurrency,
 		// §7.5: a backfill can replay the changes a peer recorded instead of
 		// pulling each version in full. Same dialer config as the other
 		// peer-facing helpers.
@@ -759,13 +762,34 @@ func main() {
 	// the other replicas so they load it instead of building their own. Best
 	// effort — a replica that cannot be reached builds for itself, which is the
 	// behaviour the cluster had before distribution existed.
+	//
+	// Fire-and-forget, deliberately. This runs inside the build callback, which
+	// runs on a buildPool worker; shipping an index means reading the whole file
+	// into memory and streaming it to N replicas, and PushIndexToReplicas parks
+	// on a bounded semaphore while a distribution storm is in progress. Inline,
+	// that would hold a build worker for the whole push — and under enough
+	// storms every worker would queue behind distribution while the builds that
+	// queries and writes are waiting on stall. The 2-minute timeout and
+	// context.Background() below already described a call nobody waits for; this
+	// makes it one.
 	distributeIndex = func(kbID string, versionID int64) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		if err := dataPlane.PushIndexToReplicas(ctx, kbID, versionID); err != nil {
-			logger.Warn("index distribution failed",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-		}
+		go func() {
+			// A panic here used to be caught by doBuild's recover, which marked
+			// the version FAILED. Off the worker goroutine there is nothing above
+			// to catch it, so it would take the process down.
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("index distribution panicked",
+						zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Any("panic", r))
+				}
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if err := dataPlane.PushIndexToReplicas(ctx, kbID, versionID); err != nil {
+				logger.Warn("index distribution failed",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			}
+		}()
 	}
 
 	// Startup maintenance across the contract: the storage layer trims index
@@ -1501,6 +1525,13 @@ type appConfig struct {
 	// manager's build pool separately keeps such a sweep from outranking a live write.
 	IndexBuildConcurrency int
 
+	// IndexPushConcurrency is how many index distributions (§8.4) may be in
+	// flight at once (index_manager.push_concurrency); <= 0 means the data
+	// plane's default (DefaultMaxConcurrentIndexPush). One distribution reads a
+	// whole index file into memory and ships it to every replica, so this bounds
+	// the builder's memory peak and outbound bandwidth together.
+	IndexPushConcurrency int
+
 	WriteMaxRetries   int
 	WriteRetryBaseMS  int
 	DeleteMaxRetries  int
@@ -1617,6 +1648,14 @@ type fileConfig struct {
 		// that trade depends on the deployment's disk and vecstore, not on anything
 		// this repository can know.
 		BuildConcurrency int `yaml:"build_concurrency"`
+		// PushConcurrency is how many index distributions (§8.4) may be in flight
+		// at once. <= 0 takes the data plane's default (4).
+		//
+		// It bounds a distribution storm's cost in network, source-node disk IO and
+		// memory — one distribution reads the whole index file into memory before
+		// shipping it to N replicas. Distribution is already asynchronous (it no
+		// longer occupies a build worker), so this is its only gate.
+		PushConcurrency int `yaml:"push_concurrency"`
 	} `yaml:"index_manager"`
 
 	WriteCoordinator struct {
@@ -1773,6 +1812,9 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	if fc.IndexManager.BuildConcurrency != 0 {
 		cfg.IndexBuildConcurrency = fc.IndexManager.BuildConcurrency
+	}
+	if fc.IndexManager.PushConcurrency != 0 {
+		cfg.IndexPushConcurrency = fc.IndexManager.PushConcurrency
 	}
 	if fc.WriteCoordinator.MaxRetries != 0 {
 		cfg.WriteMaxRetries = fc.WriteCoordinator.MaxRetries

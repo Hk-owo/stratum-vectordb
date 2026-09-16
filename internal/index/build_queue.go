@@ -50,10 +50,13 @@ func defaultBuildConcurrency() int {
 // interactive queue before the backfill queue.
 //
 // Why bound it: triggerBuild used to spawn a goroutine per request with no ceiling.
-// A restart over a populated volume — where every historical version's artifact is
-// missing — could therefore put hundreds of builds on the CPU, disk and vecstore at
-// once, and a fresh write that arrived during that sweep waited 601s for READY
+// Back then a restart over a populated volume rebuilt every historical version's
+// missing artifact, which could put hundreds of builds on the CPU, disk and vecstore
+// at once — a fresh write arriving during such a sweep waited 601s for READY
 // because its build was competing with hundreds of others instead of running.
+// Reconcile no longer schedules those rebuilds at all (see ReconcileIndexes), but the
+// bound still earns its keep: a batch of version switches, a burst of cold rebuilds or
+// a catch-up sweep can each queue more builds than the machine should run at once.
 //
 // Why prioritise: bounding alone converts the storm into a long queue, and a queue is
 // only acceptable if the work someone is WAITING for goes first. A backfill item can

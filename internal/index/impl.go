@@ -1132,6 +1132,12 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64, graphFree bool
 		// the estimate to 0.
 		if status == types.IndexStatusReady {
 			im.persistSizeSidecar(kbID, versionID, sizeBytes)
+			// §8.4(a): put this version's retention shield on disk too, not
+			// only in seedAccessLocked's in-memory table. The callback below
+			// ships the artifact to the replicas, and the retention pass that
+			// could drop it runs on the *next* build — possibly one that fires
+			// while this distribution is still queued behind the push semaphore.
+			im.recordInterestNow(kbID, versionID)
 		}
 
 		// Invoke callbacks with retry. The on-disk retention policy is
@@ -1917,6 +1923,30 @@ func (im *IndexManagerImpl) recordAccess(key indexKey) {
 		// Outside the lock: it is a file write, and Search must not wait on it.
 		im.persistAccessTime(key.kbID, key.versionID, now)
 	}
+}
+
+// recordInterestNow records "this version is wanted here" and writes the on-disk
+// .used shield immediately, bypassing recordAccess's throttle.
+//
+// The build-complete and install paths use it. The artifact they just produced
+// or received is exactly the one a lagging replica is about to fetch (§8.4), and
+// the retention pass that would drop it runs on every later build — so the shield
+// has to be on disk before the next one, not up to a minute later. It maintains
+// only lastPersist (the throttle's own bookkeeping); lastSearch is the cold
+// evaluator's baseline and seedAccessLocked already set it, where a real query
+// outranks a build as evidence.
+func (im *IndexManagerImpl) recordInterestNow(kbID string, versionID int64) {
+	if im.retentionProtectWindow() <= 0 || im.cfg.IndexDataDir == "" {
+		return
+	}
+	now := time.Now()
+	key := indexKey{kbID, versionID}
+	im.mu.Lock()
+	im.lastPersist[key] = now
+	im.mu.Unlock()
+	// Outside the lock: it is a file write, and a build or install must not wait
+	// on it.
+	im.persistAccessTime(kbID, versionID, now)
 }
 
 // LastAccess reports when (kbID, versionID) was last searched (or, if it

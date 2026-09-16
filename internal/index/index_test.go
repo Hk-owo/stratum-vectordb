@@ -2467,3 +2467,65 @@ func TestIndexManager_RecordInterestShieldsFromRetention(t *testing.T) {
 		t.Errorf("expected 2 to be dropped, stat err: %v", err)
 	}
 }
+
+// §8.4(a): a completed build must leave the retention shield on disk, not only in
+// seedAccessLocked's in-memory table. The build callback ships this artifact to
+// the replicas, and the retention pass that could drop it runs on the *next*
+// build — possibly one that fires while the distribution is still queued behind
+// the push gate.
+func TestIndexManager_BuildCompleteShieldsArtifactOnDisk(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+	dir := t.TempDir()
+	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           dir,
+		RetentionProtectWindow: time.Hour,
+	})
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	waitIndexLoaded(t, im, "kb-1", 1)
+
+	if _, err := os.Stat(filepath.Join(dir, "index", "kb-1", "1.index.used")); err != nil {
+		t.Fatalf("a completed build must leave the .used shield on disk, got: %v", err)
+	}
+	at, ok := im.readAccessTime("kb-1", 1)
+	if !ok {
+		t.Fatal("build completion must persist an access time the retention shield can read after a restart")
+	}
+	if age := time.Since(at); age < 0 || age > time.Minute {
+		t.Fatalf("persisted shield time is %v old, want it recorded just now", age)
+	}
+}
+
+// §8.4(a): the same for an artifact received from another node. Without the
+// on-disk shield a replica would install a version outside the newest-N window
+// and then drop it on the next retention pass — installed, then deleted, for a
+// version the sender just spent bandwidth shipping.
+func TestIndexManager_InstallIndexShieldsArtifactOnDisk(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	dir := t.TempDir()
+	im := newColdPolicyManager(t, vc, newDocSource(), IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           dir,
+		RetentionProtectWindow: time.Hour,
+	})
+
+	// The mock vecstore, like the real one, refuses to Load an index it has
+	// never built.
+	vc.mu.Lock()
+	vc.built[indexKey{"kb-1", 7}] = nil
+	vc.mu.Unlock()
+
+	if err := im.InstallIndex(context.Background(), "kb-1", 7, []byte("index-bytes"), []byte("sidecar")); err != nil {
+		t.Fatalf("InstallIndex failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "index", "kb-1", "7.index.used")); err != nil {
+		t.Fatalf("installing an artifact must leave the .used shield on disk, got: %v", err)
+	}
+}

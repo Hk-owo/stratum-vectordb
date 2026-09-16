@@ -150,8 +150,11 @@ type IndexStore interface {
 	Search(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error)
 	TriggerBuild(ctx context.Context, kbID string, versionID int64) error
 	// TriggerBuildBackfill is TriggerBuild at BACKFILL priority: a head start for a
-	// version nobody is waiting for. Reconcile uses this one so that a sweep over
-	// historical versions can never outrank the build a live write is waiting on.
+	// version nobody is waiting for. Reconcile uses this one so a head start can
+	// never outrank the build a live write is waiting on. It currently schedules
+	// only PENDING versions and the active one (see ReconcileIndexes), but the
+	// priority is what keeps any future head start from getting in front of live
+	// work.
 	TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error
 	IndexExists(ctx context.Context, kbID string, versionID int64) (bool, error)
 	EnforceDiskRetention(ctx context.Context, kbID string, protectedIDs []int64) error
@@ -182,6 +185,12 @@ type LocalDataPlane struct {
 	confirmer       WriteConfirmer
 	indexReader     IndexReader
 	indexShipper    IndexShipper
+	// indexPushSem bounds how many PushIndexToReplicas runs may be in flight at
+	// once. One run reads a whole index file into memory and ships it to N
+	// replicas, so this is simultaneously the cap on distribution's memory peak
+	// and on the builder's outbound bandwidth (v13 §8.4(a)). A nil semaphore
+	// means "unconfigured, no limit" — the historical behaviour.
+	indexPushSem chan struct{}
 
 	// selfDataSyncAddr is what this node announces as the holder of the
 	// versions it writes (§8.5). See LocalDataPlaneConfig.SelfDataSyncAddr.
@@ -307,6 +316,12 @@ type LocalDataPlaneConfig struct {
 	IndexReader  IndexReader
 	IndexShipper IndexShipper
 
+	// MaxConcurrentIndexPush caps concurrent PushIndexToReplicas runs (v13
+	// §8.4(a)). Zero means DefaultMaxConcurrentIndexPush. One distribution reads
+	// a whole index file into memory and ships it to every replica, so the cap
+	// bounds the builder's memory peak and outbound bandwidth at once.
+	MaxConcurrentIndexPush int
+
 	// MaxInFlightWrites caps concurrent in-flight writes per knowledge base
 	// (§7.7). Zero means DefaultMaxInFlightWrites. Per-KB values arrive later
 	// through SetDurabilityPolicy.
@@ -342,6 +357,7 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		confirmer:        cfg.Confirmer,
 		indexReader:      cfg.IndexReader,
 		indexShipper:     cfg.IndexShipper,
+		indexPushSem:     newIndexPushSem(cfg.MaxConcurrentIndexPush),
 		selfDataSyncAddr: cfg.SelfDataSyncAddr,
 		limiter:          newWriteLimiter(cfg.MaxInFlightWrites),
 		logger:           logger,
@@ -980,9 +996,30 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 // be reached falls back to building for itself, which is exactly the behaviour
 // the cluster had before distribution existed: distribution is an optimisation
 // over that baseline, not a new way for a version to become unservable.
+//
+// §8.4(a): the call is bounded by indexPushSem. Distribution is the third of the
+// storage layer's resource-hungry paths — after replayed writes and local index
+// builds — and was the only one without a gate, so a batch of version switches
+// or a set of replicas catching up at once would have every build's callback open
+// a distribution at the same moment, each reading a whole index file into memory.
+// The gate counts calls, not replicas: one call already covers N replicas, and N
+// is small.
 func (d *LocalDataPlane) PushIndexToReplicas(ctx context.Context, kbID string, versionID int64) error {
 	if d.indexReader == nil || d.indexShipper == nil || d.resolveReplicas == nil {
 		return nil // distribution not wired; each replica builds its own
+	}
+	// Acquire before the read, not before the ship: the read is what makes the
+	// memory peak, so it has to be inside the gate. Honouring ctx matters as much
+	// as the bound — the callers are background goroutines (the build callback in
+	// cmd/stratum and reconcile), and one that cannot be cancelled would sit here
+	// for as long as the storm lasts.
+	if d.indexPushSem != nil {
+		select {
+		case d.indexPushSem <- struct{}{}:
+			defer func() { <-d.indexPushSem }()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	indexData, sidecarData, err := d.indexReader.ReadIndexFiles(kbID, versionID)
 	if err != nil {
@@ -1000,6 +1037,26 @@ func (d *LocalDataPlane) PushIndexToReplicas(ctx context.Context, kbID string, v
 		}
 	}
 	return nil
+}
+
+// DefaultMaxConcurrentIndexPush is how many PushIndexToReplicas runs may be in
+// flight at once when nothing is configured (v13 §8.4(a)).
+//
+// One distribution reads a whole index file into memory and streams it to every
+// replica, so this number bounds two resources at once: the builder's memory peak
+// and its outbound bandwidth. Four is deliberately modest — the point is to turn
+// a distribution storm (a batch of version switches, or replicas catching up at
+// once) into a queue instead of a spike, not to saturate the network. Like the
+// other budget numbers it is a §10.4 placeholder, to be revised once measured.
+const DefaultMaxConcurrentIndexPush = 4
+
+// newIndexPushSem builds the distribution semaphore. A non-positive limit takes
+// the default, following LocalDataPlaneConfig.MaxInFlightWrites' convention.
+func newIndexPushSem(limit int) chan struct{} {
+	if limit <= 0 {
+		limit = DefaultMaxConcurrentIndexPush
+	}
+	return make(chan struct{}, limit)
 }
 
 // broadcastConfirmation tells the candidate replicas that the version reached

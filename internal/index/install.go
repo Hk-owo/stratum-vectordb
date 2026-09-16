@@ -63,6 +63,12 @@ func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versi
 	// still graphed and rebuild it into the shape it already has.
 	delete(im.builtGraphFree, indexKey{kbID, versionID})
 	im.mu.Unlock()
+	// §8.4(a): the shield goes on disk too. seedAccessLocked writes only the
+	// in-memory table, so without this a received artifact — especially one
+	// outside the newest IndexRetentionCount — would be deleted by the next
+	// retention pass or the startup EnforceRetention: installed, then dropped,
+	// for a version the sender just spent bandwidth shipping.
+	im.recordInterestNow(kbID, versionID)
 	return nil
 }
 
