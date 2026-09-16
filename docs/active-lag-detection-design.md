@@ -38,10 +38,11 @@
 - 顺带一提：新写入的版本本该由**实时路径**兜住（`reportAndSchedule` → `ReportDataDurable`），可这套集群里连它们也不是 Durable——那指向 fan-out 侧的另一个问题，和这条时序问题是两回事，需要分别查。
 - **修法方向**：把数据侧那半的上报挪到 gRPC serving 之后（或让它可重试），索引侧那半仍留在前面——索引侧不依赖 peers，数据侧的 quorum 判定则必须有 peers 可达。只把两半一起提前或一起推后都不对。
 - **已修**：`reconcileIndexStatus` 现在只做本地那半（游标恢复 + `ReconcileIndexes`）并返回 durable 集合；payload 的发布拆成 `reportEpoch`，由 `reportEpochWhenPeersAreUp` 在 gRPC 开始 `Serve` 之后调用，并对"没有 quorum 的知识库"重试（3 秒一次、窗口 60 秒）——因为"本节点在服务"不等于"peers 在服务"，节点仍是并发启动的，最先到的那一个会看到 peers 还在各自 reconcile 里。**验证**：重建集群后 `no quorum for a durable claim` 从 **15 条降到 0 条**，且 `epoch payload stayed incomplete` 一次都没打，即每个知识库都拿到了 quorum，数据侧终态开始推进。
-- 顺带一提：新写入的版本本该由**实时路径**兜住（`reportAndSchedule` → `ReportDataDurable`），可这套集群里连它们也不是 Durable——那指向 fan-out 侧的另一个问题，和这条时序问题是两回事，需要分别查。**这一条仍开着。**
-- 所以这里保留判据修复（"宁可拒绝，不可交错答案"是设计选定的方向），而时序这条已经修掉；下一个该看的是 fan-out。
+- 顺带一提：新写入的版本本该由**实时路径**兜住（`reportAndSchedule` → `ReportDataDurable`），可这套集群里连它们也不是 Durable——那指向 fan-out 侧的另一个问题。**已查清**：fan-out 从未失败（`replica push failed` 0 条、`below the quorum` 0 条），digest 上报 2 次成功 0 次失败，问题在**状态机**：`cmdUpdateVersionSummary` 把 `IndexStatus == READY` 也当成"版本已 settled"，于是静默丢弃 digest。而 `IndexStatus` 是**版本级**的、住在 raft 状态机里——任何一台副本把索引建完都会推到 READY，小知识库上是毫秒级，而 fan-out 刚把文档交给它，协调者的 digest proposal 还在 Raft 里走。**这与该判据修复是同一个错误：拿索引侧的状态当数据侧的证据。**修法：状态机判"settled"只看数据侧终态（`DataStatusFailedPermanent`，索引侧的 `FailedPermanent` 保留），并有两条回归（digest 在索引 READY 之后到达仍提交 / 数据侧已判死时仍丢弃）。
+- **诊断能力的修复**（与行为修复同样重要）：`ReportDataDurable` 的错误原本被 `_ =` 吞掉、状态机丢弃 digest 时没有任何日志——所以这个 bug 只能靠"某个状态永远不出现"来推断。现在三处都可见：上报成功/失败各一条、丢弃记 debug、epoch payload 发布后记一条 info（含 `cursors` / `skipped_no_quorum` 计数）。
+- 所以这里保留判据修复（"宁可拒绝，不可交错答案"是设计选定的方向），时序这条也已修掉；fan-out 那句的真相是状态机，不再是独立问题。
 
-第 1 条（判据）与第三条（时序）都已修并有验证；第 2 条（链尾没到 reporter）与 fan-out 那句仍开着——证据都在这里，用例与集群开关是现成的。
+第 1 条（判据）、第三条（时序）与 fan-out 那句（状态机）都已修并验证：`epoch payload published` 现在带出 **15 个知识库的数据侧游标**（修复前 0 个 + 15 条 `no quorum`），且 `digest dropped` 为 0。第 2 条（链尾没到 reporter）仍开着——它是 lag catch-up 本身还差的最后一步。注意索引侧目前仍是空的（`knowledge_bases: 0`，磁盘上没有产物），所以 §7.9 的索引侧链路还没有被真实验证过。
 
 ---
 
