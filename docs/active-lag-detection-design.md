@@ -42,7 +42,8 @@
 - **诊断能力的修复**（与行为修复同样重要）：`ReportDataDurable` 的错误原本被 `_ =` 吞掉、状态机丢弃 digest 时没有任何日志——所以这个 bug 只能靠"某个状态永远不出现"来推断。现在三处都可见：上报成功/失败各一条、丢弃记 debug、epoch payload 发布后记一条 info（含 `cursors` / `skipped_no_quorum` 计数）。
 - 所以这里保留判据修复（"宁可拒绝，不可交错答案"是设计选定的方向），时序这条也已修掉；fan-out 那句的真相是状态机，不再是独立问题。
 
-第 1 条（判据）、第三条（时序）与 fan-out 那句（状态机）都已修并验证：`epoch payload published` 现在带出 **15 个知识库的数据侧游标**（修复前 0 个 + 15 条 `no quorum`），且 `digest dropped` 为 0。第 2 条（链尾没到 reporter）仍开着——它是 lag catch-up 本身还差的最后一步。注意索引侧目前仍是空的（`knowledge_bases: 0`，磁盘上没有产物），所以 §7.9 的索引侧链路还没有被真实验证过。
+第 1 条（判据）、第三条（时序）与 fan-out 那句（状态机）都已修并验证：`epoch payload published` 现在带出 **15 个知识库的数据侧游标**（修复前 0 个 + 15 条 `no quorum`），且 `digest dropped` 为 0。**再用字段值直接坐实**（经 station 读 `VersionInfo.data_status`）：修复后写入的版本是 `INDEX_STATUS_READY` + `DATA_STATUS_DURABLE`，同一批知识库里修复前写入的前一个版本则是 `INDEX_STATUS_READY` + `DATA_STATUS_PENDING`——"索引就绪"与"数据持久"是两个独立事实，这是它第一次真正显形；全库 **434 个版本 DURABLE**。历史版本仍停在 PENDING 是预期的：它们的 digest 已被丢弃，补不回来（`promoteDurableData` 用的游标是刻意保守的）。
+第 2 条（链尾没到 reporter）仍开着——它是 lag catch-up 本身还差的最后一步。另注意启动期 `ReconcileIndexes` 拿到的 durable 集合是空的（`knowledge_bases: 0`，那一刻磁盘上还没有产物），所以 §7.9 的**索引侧**链路还没有被真实验证过；运行中的索引链路是好的（所有版本都到过 READY）。
 
 ---
 
