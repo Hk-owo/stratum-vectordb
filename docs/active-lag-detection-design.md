@@ -1,8 +1,21 @@
 # 主动落后检测与激活 —— 设计稿
 
-> 状态：**设计待评审**（尚未实现）
+> 状态：**已实现**（2026-09，核心链路；集成与压测标定见下）
 > 范围：`api/proto/sync.proto`、`internal/sync`、`internal/plane`、`cmd/stratum`、`configs/config1.yaml`
 > 关联：`Stratum_设计文档v13.md` §7.5（游标与追链）、§7.8（恢复时的连续游标）、§7.9（epoch payload）、§8.4（建一次、分发 N 份）、§8.6(b)（惰性构建）；`docs/index-distribution-backpressure-plan.md` §7
+
+**实现进展**：
+
+| 组件 | 位置 | 状态 |
+|---|---|---|
+| 响应字段 `chain_tails` | `api/proto/sync.proto` 的 `ReportDataVersionsResponse` | ✅ |
+| leader 侧回填 | `internal/sync/push.go`（`WithChainTails`）+ `LocalControlPlane.ChainTail` | ✅ |
+| 上报侧投递 | `internal/sync/data_version_reporter.go`（只在 `accepted` 时交给 sink） | ✅ |
+| 节点侧判定与调度 | `internal/plane/lag_catchup.go`（判据 / 每 KB 幂等 / jitter / 并发上限） | ✅ |
+| 配置 | `lag_catchup.*`（`configs/config1.yaml`），**默认关闭** | ✅ |
+| 单测 | `internal/sync` 3 例、`internal/plane` 6 例 | ✅ |
+| 集成（§8 的双节点自愈） | —— | ❌ 未做：集群配置由 `scripts/docker-cluster-both.sh` 生成，要跑这条得先让它支持 `lag_catchup.enabled` |
+| 压测标定（§9 的 `jitter_ms` / `max_concurrent_kbs`） | —— | ❌ 未做 |
 
 ---
 

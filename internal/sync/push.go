@@ -147,6 +147,14 @@ type PushHandler struct {
 	// them, and under §7.13.2 it need not be the leader — so the leader sends them
 	// rather than waiting to be asked.
 	watermarks ReclaimWatermarkSource
+
+	// chainTails, when set, supplies the version at the TAIL of each knowledge
+	// base's replicated chain — the newest version the control layer has accepted.
+	// A reporter whose own cursor is behind it has fallen behind and may start
+	// catching up; whether and when it does is the reporter's own decision
+	// (docs/active-lag-detection-design.md §5). Same reason as watermarks for
+	// riding this response: the tail is the leader's global view.
+	chainTails ChainTailSource
 }
 
 // ReclaimWatermarkSource answers "how far can this knowledge base's recorded changes
@@ -154,6 +162,14 @@ type PushHandler struct {
 // rather than importing plane, because plane imports this package.
 type ReclaimWatermarkSource interface {
 	ReclaimableChangesThrough(kbID string) (int64, bool)
+}
+
+// ChainTailSource answers "what is the newest version the control layer has accepted
+// for this knowledge base?" — the tail a node compares its own cursor against.
+// *plane.LocalControlPlane implements it. Declared here for the same reason
+// ReclaimWatermarkSource is: plane imports this package.
+type ChainTailSource interface {
+	ChainTail(kbID string) (int64, bool)
 }
 
 // DataVersionRecorder is the control leader's §7.13.4 aggregate, reduced to the
@@ -213,6 +229,14 @@ func WithDataVersionAggregator(rec DataVersionRecorder, isLeader func() bool) Pu
 // for both.
 func WithReclaimWatermarks(src ReclaimWatermarkSource) PushHandlerOption {
 	return func(h *PushHandler) { h.watermarks = src }
+}
+
+// WithChainTails wires the source of the chain tails carried back on a report's
+// response (docs/active-lag-detection-design.md). Separate from WithReclaimWatermarks
+// because they answer different questions — "what may you discard" versus "how far
+// behind are you" — even though a leader normally passes itself for both.
+func WithChainTails(src ChainTailSource) PushHandlerOption {
+	return func(h *PushHandler) { h.chainTails = src }
 }
 
 // DataSourceRegistry is the slice of plane.DataSourceRegistry that the receive
@@ -494,6 +518,21 @@ func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 		}
 		if len(reclaimable) > 0 {
 			resp.Reclaimable = reclaimable
+		}
+	}
+	// And the chain tails, for the same set of knowledge bases: this reporter is the
+	// one whose cursor the tail will be compared against, and it already speaks to us
+	// every interval. An absent entry means "unknown" — no signal, never "nothing to
+	// catch up" (docs/active-lag-detection-design.md).
+	if h.chainTails != nil {
+		tails := make(map[string]int64)
+		for kbID := range req.GetDataVersions() {
+			if tail, ok := h.chainTails.ChainTail(kbID); ok {
+				tails[kbID] = tail
+			}
+		}
+		if len(tails) > 0 {
+			resp.ChainTails = tails
 		}
 	}
 	return resp, nil

@@ -1019,7 +1019,11 @@ func main() {
 			// §7.5: carry the reclaim watermark back on each accepted report, so the
 			// node that WROTE the data can discard its recorded changes even when it
 			// is not the leader (§7.13.2).
-			stratumsync.WithReclaimWatermarks(controlPlane)),
+			stratumsync.WithReclaimWatermarks(controlPlane),
+			// docs/active-lag-detection-design.md: and the chain tail, for the same
+			// reason — the leader is the only one that knows where the chain ends, and
+			// the reporter is the one that must decide whether it has fallen behind.
+			stratumsync.WithChainTails(controlPlane)),
 	)
 	pb.RegisterDataSyncServiceServer(grpcServer, nodeHandler)
 
@@ -1044,6 +1048,22 @@ func main() {
 		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
 		grpcServer.GracefulStop()
 	}()
+
+	// docs/active-lag-detection-design.md: turn the chain tail the leader sends back
+	// into a background catch-up. It is off by default, and when on it is deliberately
+	// damped — a random delay per signal and a bound on how many knowledge bases may
+	// catch up at once — because the alternative is a node returning from an outage
+	// starting every knowledge base together. It schedules nothing of its own:
+	// Ensure is the same call a query makes, so the existing gates still apply.
+	lagCatchup := plane.NewLagCatchup(plane.LagCatchupConfig{
+		Enabled:          cfg.LagCatchupEnabled,
+		MinLagVersions:   int64(cfg.LagCatchupMinLagVersions),
+		Jitter:           time.Duration(cfg.LagCatchupJitterMS) * time.Millisecond,
+		MaxConcurrentKBs: cfg.LagCatchupMaxConcurrentKBs,
+		Ensure:           dataPlane.EnsureIndex,
+		Cursor:           dataPlane.DataVersionsSnapshot,
+		Logger:           logger,
+	})
 
 	// §7.13.4: report this node's data cursors to the control leader every
 	// interval. The leader it resolves is looked up per interval, never cached:
@@ -1074,6 +1094,8 @@ func main() {
 		// §7.5: store the watermarks the leader carries back, so this node's WAL can
 		// be reclaimed even when this node is not the leader.
 		Watermarks: controlPlane,
+		// And the chain tails, which are what tell this node it has fallen behind.
+		ChainTails: lagCatchup,
 		Logger:     logger,
 	}).Run(ctx)
 
@@ -1526,6 +1548,21 @@ type appConfig struct {
 	// costs the whole graph.
 	IndexGCGraphRebuildRatio float64
 
+	// LagCatchup configures the background catch-up that turns the chain tail the
+	// control leader reports into an occasional recovery
+	// (lag_catchup.*, docs/active-lag-detection-design.md). Off by default: the lazy
+	// recovery it replaces is what the cluster has always run on, so turning it on is
+	// an operator's decision.
+	//
+	// LagCatchupJitterMS damps the trigger — each signal is followed by a random
+	// delay in [0, that) — and LagCatchupMaxConcurrentKBs bounds how many knowledge
+	// bases may catch up at once (<= 0 takes the default). LagCatchupMinLagVersions
+	// is how far behind the tail counts as left behind.
+	LagCatchupEnabled          bool
+	LagCatchupMinLagVersions   int
+	LagCatchupJitterMS         int
+	LagCatchupMaxConcurrentKBs int
+
 	// IndexGCSweepInterval is how often the §8.6(d) scanner re-estimates the dead
 	// share (index_manager.gc_sweep_interval_ms); <= 0 means the IndexManager's
 	// default, negative disables the scanner. Shortening it is cheap — a scan only
@@ -1691,6 +1728,16 @@ type fileConfig struct {
 		VersionRetentionCount int `yaml:"version_retention_count"`
 		SweepIntervalSec      int `yaml:"sweep_interval_s"`
 	} `yaml:"gc"`
+
+	// LagCatchup is the background catch-up described in
+	// docs/active-lag-detection-design.md: the node reads the chain tail the control
+	// leader carries back on its cursor report and catches up when it is behind.
+	LagCatchup struct {
+		Enabled          bool `yaml:"enabled"`
+		MinLagVersions   int  `yaml:"min_lag_versions"`
+		JitterMS         int  `yaml:"jitter_ms"`
+		MaxConcurrentKBs int  `yaml:"max_concurrent_kbs"`
+	} `yaml:"lag_catchup"`
 }
 
 // loadConfig reads a YAML config file and overlays it on the defaults.
@@ -1853,6 +1900,19 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	if fc.GC.SweepIntervalSec != 0 {
 		cfg.GCSweepIntervalSec = fc.GC.SweepIntervalSec
+	}
+
+	// lag_catchup.*. Enabled is the switch; the other three only matter when it is
+	// on, and each keeps its own "unset" meaning (<= 0 for the bounds, 1 for the lag).
+	cfg.LagCatchupEnabled = fc.LagCatchup.Enabled
+	if fc.LagCatchup.MinLagVersions != 0 {
+		cfg.LagCatchupMinLagVersions = fc.LagCatchup.MinLagVersions
+	}
+	if fc.LagCatchup.JitterMS != 0 {
+		cfg.LagCatchupJitterMS = fc.LagCatchup.JitterMS
+	}
+	if fc.LagCatchup.MaxConcurrentKBs != 0 {
+		cfg.LagCatchupMaxConcurrentKBs = fc.LagCatchup.MaxConcurrentKBs
 	}
 
 	return cfg, nil

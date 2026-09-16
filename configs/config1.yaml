@@ -133,5 +133,19 @@ gc:
   audit_log_retention_days: 30
   sweep_interval_s: 300
 
+# 主动落后追赶（docs/active-lag-detection-design.md）。节点每 5 秒向控制 leader 上报
+# 自己的游标，leader 在响应里捎带每 KB 的「链尾」（已提交的最新版本）；本节点若发现
+# 自己落后，就在后台追一次——复用查询路径（EnsureIndex），所以既有的闸门照旧生效，
+# 这里只决定「什么时候开始」。默认关闭：不开启时行为与历史一致，仍是「谁问谁建」。
+lag_catchup:
+  enabled: false
+  # 落后多少版本才算落后。1 = 差一个就追（正常写入竞态可能触发一次，代价只是白追一趟）。
+  min_lag_versions: 1
+  # 收到信号后随机延迟的上界（毫秒），把「同时发现」摊平成一个窗口。
+  # 单独靠它不构成上界——落后的 KB 数量可能远超预期，所以还有下面那个并发上限。
+  jitter_ms: 0
+  # 同时最多几个 KB 在追赶。0 = 用默认值（2）。
+  max_concurrent_kbs: 0
+
 logging:
   level: "info"

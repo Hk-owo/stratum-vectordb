@@ -64,6 +64,13 @@ type DataVersionReporterConfig struct {
 	// response. Optional: without it this node never learns them and simply keeps all
 	// its recorded changes. *plane.LocalControlPlane implements it.
 	Watermarks LeaderWatermarkSink
+
+	// ChainTails receives the chain tails the leader carries back on each response:
+	// per knowledge base, the newest version the control layer has accepted. It is
+	// the signal a node uses to notice it has fallen behind
+	// (docs/active-lag-detection-design.md). Optional: without it this node keeps the
+	// lazy recovery it has always had. *plane.LagCatchup implements it.
+	ChainTails ChainTailSink
 }
 
 // LeaderWatermarkSink receives the watermarks a control leader published on a report's
@@ -72,6 +79,15 @@ type DataVersionReporterConfig struct {
 // this package.
 type LeaderWatermarkSink interface {
 	SetLeaderWatermarks(watermarks map[string]int64)
+}
+
+// ChainTailSink receives the chain tails a control leader published on a report's
+// response: per knowledge base, the version at the tail of the replicated chain
+// (docs/active-lag-detection-design.md). What it does with them — and whether it does
+// anything at all — is its own decision. Declared here for the same reason
+// LeaderWatermarkSink is: plane imports this package.
+type ChainTailSink interface {
+	SetChainTails(tails map[string]int64)
 }
 
 // DataVersionReporter periodically tells the control leader which versions this
@@ -87,6 +103,12 @@ type DataVersionReporter struct {
 	logger        *zap.Logger
 	dial          func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 	watermarks    LeaderWatermarkSink
+
+	// chainTails receives the chain tails the leader carries back: per knowledge
+	// base, the newest version the control layer has accepted
+	// (docs/active-lag-detection-design.md). A sink decides for itself what to do
+	// with them — including nothing.
+	chainTails ChainTailSink
 }
 
 // NewDataVersionReporter returns a reporter that dials leaders directly.
@@ -108,6 +130,7 @@ func NewDataVersionReporter(cfg DataVersionReporterConfig) *DataVersionReporter 
 		logger:        cfg.Logger,
 		dial:          dial,
 		watermarks:    cfg.Watermarks,
+		chainTails:    cfg.ChainTails,
 	}
 }
 
@@ -173,6 +196,14 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 	// response updates them: a stale or refused answer must not move the watermarks.
 	if r.watermarks != nil {
 		r.watermarks.SetLeaderWatermarks(resp.GetReclaimable())
+	}
+	// The same accepted response carries the chain tails back. Like the watermarks,
+	// only an accepted answer may act on this node: a stale or refused response says
+	// nothing about where the chain is. What the sink does with them is its decision
+	// — an unwired or disabled sink simply does nothing
+	// (docs/active-lag-detection-design.md).
+	if r.chainTails != nil {
+		r.chainTails.SetChainTails(resp.GetChainTails())
 	}
 	return nil
 }

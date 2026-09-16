@@ -263,6 +263,23 @@ message ReportDataVersionsResponse {
   //
   // A knowledge base absent from this map has no known watermark: keep everything.
   map<string, int64> reclaimable = 3;
+  // chain_tails carries back, per knowledge base, the version at the TAIL of the
+  // replicated chain: the newest version the control layer has accepted. A node
+  // whose own contiguous cursor is behind it has fallen behind and MAY start
+  // catching up — whether, when and how fast are the node's own decisions
+  // (docs/active-lag-detection-design.md), which is what keeps this from becoming
+  // a broadcast storm. It rides this response for the same reason reclaimable
+  // does: the tail is the leader's global view, and the node that must act on it
+  // already talks to the leader every interval.
+  //
+  // Deliberately the chain tail, NOT the active version: a node is not "behind"
+  // merely because it has not switched to the newest version. Being on an older
+  // version is a routing choice; missing the chain is a missing data fact — the
+  // same distinction §7.9 draws for the epoch payload.
+  //
+  // A knowledge base absent from this map means "unknown" — no signal — not
+  // "nothing to catch up".
+  map<string, int64> chain_tails = 4;
 }
 
 enum SyncEntryType {

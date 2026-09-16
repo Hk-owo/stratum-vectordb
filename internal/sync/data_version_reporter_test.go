@@ -277,3 +277,122 @@ func TestDataVersionReporter_RefusedReportDoesNotMoveWatermarks(t *testing.T) {
 		t.Errorf("sink calls = %d, want 0: a refused answer must not move the watermarks", sink.calls)
 	}
 }
+
+// fixedChainTails is a ChainTailSource with a fixed table.
+type fixedChainTails struct {
+	tails map[string]int64
+}
+
+func (s *fixedChainTails) ChainTail(kbID string) (int64, bool) {
+	v, ok := s.tails[kbID]
+	return v, ok
+}
+
+// recordingChainTails captures what a leader carried back, so a reporter-side test
+// can assert on the delivery rather than on the wire.
+type recordingChainTails struct {
+	calls   int
+	lastOne map[string]int64
+}
+
+func (s *recordingChainTails) SetChainTails(tails map[string]int64) {
+	s.calls++
+	s.lastOne = tails
+}
+
+// The leader carries back a chain tail for each knowledge base the reporter mentioned,
+// so the reporter can compare it against its own cursor
+// (docs/active-lag-detection-design.md).
+func TestPushHandler_ReportDataVersions_CarriesChainTailsBack(t *testing.T) {
+	rec := &recordingRecorder{}
+	tails := &fixedChainTails{tails: map[string]int64{"kb-1": 42}}
+	_, _, addr := startPushServer(t, 7,
+		WithDataVersionAggregator(rec, func() bool { return true }),
+		WithChainTails(tails))
+
+	resp, err := dialSyncServer(t, addr).ReportDataVersions(context.Background(), &pb.ReportDataVersionsRequest{
+		NodeId:       3,
+		DataVersions: map[string]int64{"kb-1": 40, "kb-2": 4},
+	})
+	if err != nil {
+		t.Fatalf("ReportDataVersions: %v", err)
+	}
+	if got := resp.GetChainTails()["kb-1"]; got != 42 {
+		t.Errorf("chain_tails[kb-1] = %d, want 42", got)
+	}
+	// kb-2's tail is unknown, so it must be absent. The reporter reads absence as "no
+	// signal"; sending a zero would read as "the chain ends at 0", which would make
+	// every node holding anything believe it is ahead.
+	if _, present := resp.GetChainTails()["kb-2"]; present {
+		t.Error("kb-2 has no known tail and must not be sent")
+	}
+	// A leader with no tail source at all sends nothing, rather than an empty map.
+	rec2 := &recordingRecorder{}
+	_, _, addr2 := startPushServer(t, 8, WithDataVersionAggregator(rec2, func() bool { return true }))
+	resp2, err := dialSyncServer(t, addr2).ReportDataVersions(context.Background(), &pb.ReportDataVersionsRequest{
+		NodeId:       3,
+		DataVersions: map[string]int64{"kb-1": 40},
+	})
+	if err != nil {
+		t.Fatalf("ReportDataVersions (unwired): %v", err)
+	}
+	if len(resp2.GetChainTails()) != 0 {
+		t.Errorf("unwired leader sent tails: %v", resp2.GetChainTails())
+	}
+}
+
+// An accepted report hands the tails to the sink. What the sink does with them is its
+// decision — the reporter's job is only to deliver them, and only from an answer the
+// leader actually accepted.
+func TestDataVersionReporter_StoresChainTailsFromAnAcceptedReport(t *testing.T) {
+	rec := &recordingRecorder{}
+	_, _, addr := startPushServer(t, 7,
+		WithDataVersionAggregator(rec, func() bool { return true }),
+		WithChainTails(&fixedChainTails{tails: map[string]int64{"kb-1": 42}}))
+
+	sink := &recordingChainTails{}
+	r := NewDataVersionReporter(DataVersionReporterConfig{
+		NodeID:       3,
+		DataVersions: func() map[string]int64 { return map[string]int64{"kb-1": 40} },
+		ResolveLeader: func(context.Context) (string, bool, error) {
+			return addr, true, nil
+		},
+		ChainTails: sink,
+	})
+	if err := r.ReportOnce(context.Background()); err != nil {
+		t.Fatalf("ReportOnce: %v", err)
+	}
+	if sink.calls != 1 {
+		t.Fatalf("sink calls = %d, want 1", sink.calls)
+	}
+	if sink.lastOne["kb-1"] != 42 {
+		t.Errorf("delivered tails = %v, want kb-1:42", sink.lastOne)
+	}
+}
+
+// A refused report must not feed the sink either: a stale or wrong-node answer says
+// nothing about where the chain is, and acting on it would start catch-ups that are
+// not warranted.
+func TestDataVersionReporter_RefusedReportDoesNotFeedChainTails(t *testing.T) {
+	rec := &recordingRecorder{}
+	// A non-leader: it declines.
+	_, _, addr := startPushServer(t, 7,
+		WithDataVersionAggregator(rec, func() bool { return false }),
+		WithChainTails(&fixedChainTails{tails: map[string]int64{"kb-1": 42}}))
+
+	sink := &recordingChainTails{}
+	r := NewDataVersionReporter(DataVersionReporterConfig{
+		NodeID:       3,
+		DataVersions: func() map[string]int64 { return map[string]int64{"kb-1": 40} },
+		ResolveLeader: func(context.Context) (string, bool, error) {
+			return addr, true, nil
+		},
+		ChainTails: sink,
+	})
+	if err := r.ReportOnce(context.Background()); err == nil {
+		t.Fatal("a declined report must be reported as not landed")
+	}
+	if sink.calls != 0 {
+		t.Errorf("sink calls = %d, want 0: a refused answer must not feed the lag signal", sink.calls)
+	}
+}

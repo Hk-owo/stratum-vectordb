@@ -470,6 +470,31 @@ func (c *LocalControlPlane) ReclaimableChangesThrough(kbID string) (int64, bool)
 	return watermark, ok
 }
 
+// ChainTail answers "what is the newest version the control layer has accepted for
+// this knowledge base?" — the tail a node compares its own cursor against to decide
+// whether it has fallen behind (docs/active-lag-detection-design.md).
+//
+// It reads the replicated metadata directly, so this is the leader's answer and
+// nobody else's: a follower's metadata view can lag, and a lagging tail would tell a
+// node it is fine when it is not. Callers must treat false as "no signal", never as
+// "nothing to catch up".
+func (c *LocalControlPlane) ChainTail(kbID string) (int64, bool) {
+	if c.rn == nil {
+		return 0, false
+	}
+	versions, err := c.rn.ListVersions(context.Background(), kbID)
+	if err != nil || len(versions) == 0 {
+		return 0, false
+	}
+	tail := int64(0)
+	for _, v := range versions {
+		if v.VersionID > tail {
+			tail = v.VersionID
+		}
+	}
+	return tail, tail > 0
+}
+
 // localReclaimable computes the watermark from this node's own authoritative view.
 // It answers false whenever this node is not the leader or some replica's cursor is
 // unknown — every such answer means "keep the data".
