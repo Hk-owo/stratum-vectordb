@@ -162,6 +162,25 @@ func TestRealStack_ColdRebuildRedistributesTheArtifact(t *testing.T) {
 	graphed, _ := indexFileOf(baseDirs[0], kbID, versionID)
 	t.Logf("graphed index: %d bytes (both nodes)", len(graphed))
 
+	// §8.6a reshapes a version that is neither active nor the end of the chain —
+	// the end is what serves when the control layer has no active pointer, which
+	// is the normal state in this stack. So the reshaped version has to stop
+	// being the end first. Its tail is created here rather than up front because
+	// a version cannot parent another while it is still PENDING.
+	tail, err := leader.KB.CreateVersion(ctx, &pb.CreateVersionRequest{
+		KnowledgeBaseId: kbID,
+		ParentVersionId: versionID,
+		Changes: []*pb.DocChange{{
+			Op:      pb.ChangeOp_CHANGE_OP_ADD,
+			DocId:   "doc-tail",
+			Content: "tail version so the reshaped one is not the chain end",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateVersion (tail): %v", err)
+	}
+	t.Logf("created tail %s v%d", kbID, tail.GetVersionId())
+
 	// The version goes cold on node 1 and is rebuilt graph-free. The artifact
 	// must differ from, and be smaller than, the graphed one: what the reshape
 	// drops is precisely the HNSW graph (edges + level arrays), which the

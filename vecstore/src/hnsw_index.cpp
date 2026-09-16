@@ -55,6 +55,15 @@ constexpr int kM = 32;  // HNSW graph connectivity parameter
 // is what keeps pre-existing index files loadable.
 constexpr char kSidecarMagic[] = "stratum-index-1";
 
+// Sidecar shape line, introduced with §8.6a's cold-version reshaping. It
+// records whether the artifact next to this sidecar carries an HNSW graph.
+// The Go IndexManager reads it to answer "is this version already graph-free?"
+// — a fact it cannot derive from the index file (it does not parse Faiss) and
+// that does not survive a restart or a peer-to-peer artifact handoff if it
+// only lives in memory. Sidecars written before this line existed simply lack
+// it and are read as "shape unknown".
+constexpr char kShapePrefix[] = "graph_free ";
+
 // Crc32Table returns the standard CRC-32 (IEEE 802.3, reflected, polynomial
 // 0xEDB88320) lookup table, built once on first use.
 const std::array<uint32_t, 256>& Crc32Table() {
@@ -502,6 +511,13 @@ float HNSWVectorIndex::ExactScore(const std::vector<float>& query,
   return 0.0f;
 }
 
+bool HNSWVectorIndex::IsGraphFreeLocked() const {
+  // The Faiss type is the authority: HNSW means a graph, everything else in the
+  // supported set (IndexFlat / IndexScalarQuantizer / IndexPQ) is graph-free.
+  // Save only reaches here with index_ != nullptr.
+  return dynamic_cast<faiss::IndexHNSW*>(index_.get()) == nullptr;
+}
+
 absl::Status HNSWVectorIndex::Save(const std::string& path) {
   std::lock_guard<std::shared_mutex> write_lock(state_mu_);
   if (index_ == nullptr) {
@@ -547,6 +563,12 @@ absl::Status HNSWVectorIndex::Save(const std::string& path) {
     sidecar << dim_ << "\n";
     sidecar << static_cast<int>(metric_) << "\n";
     sidecar << *crc_or << "\n";
+    // §8.6a: record the shape this artifact holds, judged from index_'s real
+    // type rather than config_ (after a Load the config is the caller's
+    // request, not what the file contains). It goes BEFORE the chunk ids so a
+    // reader meets it in a fixed place; the reader below matches it by prefix,
+    // so a sidecar that lacks it (written before §8.6a) still reads correctly.
+    sidecar << (IsGraphFreeLocked() ? "graph_free 1" : "graph_free 0") << "\n";
     for (const auto& id : id_to_chunk_id_) {
       sidecar << id << "\n";
     }
@@ -651,12 +673,25 @@ absl::Status HNSWVectorIndex::LoadLocked(const std::string& path, const char* op
   }
   sidecar.ignore();  // consume the trailing newline before reading chunk_id lines
 
+  // §8.6a: the shape line sits between the header and the chunk ids. A sidecar
+  // written before it existed has a chunk id there instead (a 64-char hex
+  // string), so the line is recognized by its prefix and otherwise kept as an
+  // id. Only the checksummed format ever carries it.
+  bool has_shape = false;
+  bool sidecar_graph_free = false;
+
   std::vector<std::string> ids;
   std::string line;
   while (std::getline(sidecar, line)) {
-    if (!line.empty()) {
-      ids.push_back(line);
+    if (line.empty()) {
+      continue;
     }
+    if (checksummed && !has_shape && line.rfind(kShapePrefix, 0) == 0) {
+      has_shape = true;
+      sidecar_graph_free = (line == "graph_free 1");
+      continue;
+    }
+    ids.push_back(line);
   }
 
   // Verify the index file before handing it to Faiss. This is the only check
@@ -693,6 +728,21 @@ absl::Status HNSWVectorIndex::LoadLocked(const std::string& path, const char* op
     return absl::InternalError(
         pre + "sidecar lists " + std::to_string(listed) +
         " chunk ids but the index holds " + std::to_string(ntotal) + ": " + path);
+  }
+
+  // The sidecar and the index must agree on the shape as well as on the vector
+  // count: a pair that disagrees does not belong together — the same class of
+  // failure the checksum catches — and silently serving the other shape is
+  // worse than refusing to load. Sidecars that predate the line are skipped.
+  if (has_shape) {
+    const bool file_graph_free = dynamic_cast<faiss::IndexHNSW*>(raw) == nullptr;
+    if (file_graph_free != sidecar_graph_free) {
+      delete raw;
+      return absl::InternalError(
+          pre + "sidecar records graph_free=" +
+          std::to_string(sidecar_graph_free ? 1 : 0) +
+          " but the index file holds the other shape: " + path);
+    }
   }
 
   index_.reset(raw);

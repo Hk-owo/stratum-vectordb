@@ -142,6 +142,12 @@ class HNSWVectorIndex : public VectorIndex {
   void ResetChunkIDTable();
   void SetChunkIDTable(std::vector<std::string> chunk_ids);
 
+  // IsGraphFreeLocked reports whether index_ holds a graph-free variant
+  // (§8.6a). It reads the resident Faiss type, not config_: after a Load the
+  // config is the caller's request, not what the file actually holds. Callers
+  // must hold state_mu_.
+  bool IsGraphFreeLocked() const;
+
   // SearchTopN is the shared coarse search: top_n candidates from the
   // in-memory Faiss index. Exact on a full-precision index, approximate
   // on a quantized one (used by both Search and SearchWithRerank).

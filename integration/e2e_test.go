@@ -427,6 +427,30 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 	// §8.6a: start the cold-version evaluator only now, so a reshape's
 	// completion callback can ship the new artifact like any other build
 	// (distributeIndex is wired above). No-op when no threshold is set.
+	// §8.6a: the cold evaluator walks the AUTHORITATIVE version set, so this
+	// stack wires it the way a node does (cmd/stratum/storage_stack.go). Without
+	// it the evaluator has nothing to enumerate and stays off.
+	im.SetVersionsProvider(func(ctx context.Context) (map[string][]int64, error) {
+		kbs, err := rn.ListKnowledgeBases(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string][]int64, len(kbs))
+		for _, kb := range kbs {
+			versions, err := rn.ListVersions(ctx, kb.KBID)
+			if err != nil {
+				nodeLogger.Warn("cold policy: ListVersions failed",
+					zap.String("kb_id", kb.KBID), zap.Error(err))
+				continue
+			}
+			ids := make([]int64, 0, len(versions))
+			for _, v := range versions {
+				ids = append(ids, v.VersionID)
+			}
+			out[kb.KBID] = ids
+		}
+		return out, nil
+	})
 	im.StartColdPolicy()
 
 	wc := coordinator.NewWriteCoordinatorImpl(coordinator.WriteCoordinatorConfig{

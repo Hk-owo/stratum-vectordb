@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -126,5 +127,70 @@ func TestLeaderDiscoverer_NoCache(t *testing.T) {
 	}
 	if got := c.calls.Load(); got != 3 {
 		t.Errorf("GetClusterStatus calls = %d, want 3 (every call re-polls)", got)
+	}
+}
+
+// blockingStatusClient answers only when its own probe context ends: it is what
+// a black-holed node looks like from the station — the TCP connection is
+// accepted, but no reply ever comes.
+type blockingStatusClient struct{ calls atomic.Int32 }
+
+func (b *blockingStatusClient) GetClusterStatus(ctx context.Context, _ *pb.GetClusterStatusRequest, _ ...grpc.CallOption) (*pb.GetClusterStatusResponse, error) {
+	b.calls.Add(1)
+	<-ctx.Done()
+	return nil, status.Error(codes.DeadlineExceeded, "no answer")
+}
+
+// An unresponsive node must cost its own probe budget and no more: each probe
+// is bounded independently, so discovery still converges while the caller's
+// deadline is far from over.
+//
+// The failure this pins: with every probe sharing the caller's context, one
+// dead node held discovery until that deadline expired. Every leader-bound
+// write begins with LeaderNow, so a single dead node made the cluster look
+// unable to accept writes — which is how T4's minority-fault test failed
+// (kill a follower, then "timed out waiting for a leader to accept writes").
+func TestLeaderDiscoverer_UnresponsiveNodeDoesNotPinDiscovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	slow := &blockingStatusClient{}
+	// idx 1 and idx 2 both report node 2 as the leader, so the majority vote
+	// resolves to node 2 — which is admins[1].
+	d := NewLeaderDiscoverer([]statusClient{
+		slow,
+		&fakeStatusClient{resp: statusResp(2, 2, true)},
+		&fakeStatusClient{resp: statusResp(3, 2, true)},
+	})
+
+	start := time.Now()
+	idx, ok := d.LeaderNow(ctx)
+	elapsed := time.Since(start)
+
+	if !ok || idx != 1 {
+		t.Fatalf("LeaderNow() = (%d, %v), want (1, true)", idx, ok)
+	}
+	if slow.calls.Load() == 0 {
+		t.Fatal("the unresponsive node was never probed")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("LeaderNow took %v: an unresponsive node must not pin discovery", elapsed)
+	}
+}
+
+// A caller with less budget than one probe is never granted more than it has:
+// the probe bound is a ceiling, not a floor that outlives the caller.
+func TestLeaderDiscoverer_ProbeRespectsTighterCallerDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	d := NewLeaderDiscoverer([]statusClient{&blockingStatusClient{}})
+
+	start := time.Now()
+	if _, ok := d.LeaderNow(ctx); ok {
+		t.Fatal("no node reported a leader; ok must be false")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("LeaderNow took %v, want it bounded by the caller's 150ms deadline", elapsed)
 	}
 }

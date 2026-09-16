@@ -167,6 +167,31 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		}
 		return active, nil
 	})
+
+	// §8.6a: the cold evaluator walks the authoritative version set — every
+	// version the control layer knows about — instead of this node's access
+	// table, which is empty after a restart. Same metadata, same connection.
+	indexMgr.SetVersionsProvider(func(ctx context.Context) (map[string][]int64, error) {
+		kbs, err := rn.ListKnowledgeBases(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string][]int64, len(kbs))
+		for _, kb := range kbs {
+			versions, err := rn.ListVersions(ctx, kb.KBID)
+			if err != nil {
+				logger.Warn("index: cold policy: ListVersions failed",
+					zap.String("kb_id", kb.KBID), zap.Error(err))
+				continue
+			}
+			ids := make([]int64, 0, len(versions))
+			for _, v := range versions {
+				ids = append(ids, v.VersionID)
+			}
+			out[kb.KBID] = ids
+		}
+		return out, nil
+	})
 	indexMgr.StartGCScanner()
 
 	// Build data sources: the IndexManager's async build reads the version's

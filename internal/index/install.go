@@ -57,6 +57,11 @@ func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versi
 	// there.
 	im.mu.Lock()
 	im.seedAccessLocked(indexKey{kbID, versionID})
+	// Drop any remembered shape: the artifact that just landed decides it, and
+	// the sidecar beside it is now the authority (§8.6a). Keeping a stale entry
+	// here would make the evaluator treat a received graph-free artifact as
+	// still graphed and rebuild it into the shape it already has.
+	delete(im.builtGraphFree, indexKey{kbID, versionID})
 	im.mu.Unlock()
 	return nil
 }

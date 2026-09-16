@@ -81,6 +81,12 @@ type IndexManagerConfig struct {
 	// graph-free variants keep the quantizer and its rerank semantics.
 	// The policy is off when <= 0 (the default), which keeps the
 	// historical "every version carries a full graph" behaviour.
+	//
+	// The evaluator applies it only to versions this node holds that are
+	// neither active nor the end of the version chain, and it reshapes in both
+	// directions: a graph-free version queried again within half the threshold
+	// gets its graph back. The gap is hysteresis, so a version near the
+	// boundary is not rebuilt on every sweep.
 	ColdThreshold time.Duration
 
 	// ColdSweepInterval is how often the evaluator re-reads the access
@@ -288,6 +294,25 @@ type IndexManagerImpl struct {
 	// re-triggering a rebuild on every sweep. Dropped with the version
 	// or KB, like the access record. Guarded by mu.
 	builtGraphFree map[indexKey]bool
+
+	// startedAt is when this process constructed the manager. A version this
+	// process has neither queried nor built has no access record at all, so it
+	// is aged from here: after a restart every version is in that state, and
+	// stamping them "now" both avoids reshaping a whole knowledge base at boot
+	// and avoids the evaluator standing still forever. Guarded by mu.
+	startedAt time.Time
+
+	// coldVersions enumerates the authoritative version set (§8.6a): per
+	// knowledge base, which versions exist. The cold evaluator walks THIS, not
+	// the local access table — the table only answers "how long since this was
+	// queried here", and using it as the enumeration source makes the policy
+	// forget every version on each restart. Nil disables the evaluator.
+	coldVersions func(ctx context.Context) (map[string][]int64, error)
+
+	// coldFailedAt records, per version, when a build last failed. The
+	// evaluator consults it to back off: without it, a build that keeps failing
+	// is re-queued on every sweep. Guarded by mu.
+	coldFailedAt map[indexKey]time.Time
 	// abandonCancel/abandonWG govern the background sweeper that reclaims
 	// half-built index artifacts (§6). abandonCancel is nil while it is off.
 	abandonCancel context.CancelFunc
@@ -377,6 +402,8 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		sizeByKey:       make(map[indexKey]int64),
 		lastSearch:      make(map[indexKey]time.Time),
 		builtGraphFree:  make(map[indexKey]bool),
+		coldFailedAt:    make(map[indexKey]time.Time),
+		startedAt:       time.Now(),
 		deletedKBs:      make(map[string]bool),
 		deletedVersions: make(map[indexKey]bool),
 		maintenance:     make(map[indexKey]bool),
@@ -784,51 +811,198 @@ func (im *IndexManagerImpl) StopColdPolicy() {
 	}
 }
 
-// sweepCold reshapes every version that has gone cold. Scheduling is
-// asynchronous (triggerBuild spawns the build), so a sweep never blocks
-// on a vecstore build; a version already building is skipped by
-// triggerBuild itself.
+// sweepCold reshapes every version whose shape no longer matches its traffic:
+// a version that went cold is rebuilt graph-free, and one that came back is
+// rebuilt with its graph. Scheduling is asynchronous (triggerBuild spawns the
+// build), so a sweep never blocks on a vecstore build; a version already
+// building is skipped by triggerBuild itself.
 func (im *IndexManagerImpl) sweepCold(ctx context.Context, now time.Time) {
-	for _, key := range im.coldCandidates(now) {
+	for _, c := range im.coldCandidates(ctx, now) {
 		if ctx.Err() != nil {
 			return
 		}
-		im.logger.Info("index: version is cold; reshaping graph-free (§8.6a)",
-			zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID))
-		if err := im.TriggerBuildGraphFree(ctx, key.kbID, key.versionID); err != nil {
-			im.logger.Warn("index: could not schedule the graph-free rebuild",
+		key := c.key
+		var err error
+		if c.reheat {
+			im.logger.Info("index: version is queried again; restoring its graph (§8.6a)",
+				zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID))
+			err = im.TriggerBuildBackfill(ctx, key.kbID, key.versionID)
+		} else {
+			im.logger.Info("index: version is cold; reshaping graph-free (§8.6a)",
+				zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID))
+			err = im.TriggerBuildGraphFree(ctx, key.kbID, key.versionID)
+		}
+		if err != nil {
+			im.logger.Warn("index: could not schedule the reshape",
 				zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID), zap.Error(err))
 		}
 	}
 }
 
-// coldCandidates returns the versions whose last access is at least
-// ColdThreshold old and whose current index is not already graph-free,
-// in a deterministic (kbID, versionID) order. A version mid-build is
-// left out: the build in flight decides its own shape, and the next
-// sweep re-evaluates it if it stayed hot.
-func (im *IndexManagerImpl) coldCandidates(now time.Time) []indexKey {
+// coldCandidate is one version the §8.6a evaluator wants to reshape, with the
+// shape it wants.
+type coldCandidate struct {
+	key indexKey
+	// reheat is true when the version is being queried again and needs its HNSW
+	// graph back; false when it went cold and should be rebuilt graph-free.
+	reheat bool
+}
+
+// coldCandidates returns this sweep's reshapes, in a deterministic
+// (kbID, versionID) order.
+//
+// It walks the AUTHORITATIVE version set (coldVersions, from the control
+// layer's metadata), not the local access table: the table only supplies "how
+// long since this version was queried here", and using it as the enumeration
+// source makes the policy forget every version on each restart (§8.6a). Three
+// filters decide what is left:
+//
+//   - An ACTIVE version is never reshaped. The design says "a cold version —
+//     non-active and long unqueried", and dropping the first half turns the
+//     knowledge base's serving version into an O(n) scan. When the control
+//     layer has no active pointer (the common case: CreateVersion does not move
+//     it, only RollbackVersion does), the end of the version chain — the
+//     largest versionID — is what actually serves, so it is excluded too.
+//   - A version THIS NODE DOES NOT HOLD is never reshaped. A version that was
+//     merely queried once, whose index never landed here, must not be built by
+//     the evaluator out of nowhere: that bypasses §8.6b's build-on-demand and
+//     pairs with the disk retention policy into a build-then-delete loop.
+//   - A FAILED build backs off. Re-enumerating every sweep must not mean
+//     re-queuing a build that keeps failing.
+//
+// The shape is read from the artifact's sidecar (artifactGraphFree), not from
+// the in-memory record: the latter is lost on restart, which would make the
+// evaluator rebuild an already graph-free version on every sweep.
+func (im *IndexManagerImpl) coldCandidates(ctx context.Context, now time.Time) []coldCandidate {
+	threshold := im.cfg.ColdThreshold
+	im.mu.Lock()
+	versionsProvider := im.coldVersions
+	activeProvider := im.activeVersions
+	im.mu.Unlock()
+
+	if versionsProvider == nil {
+		return nil
+	}
+	authority, err := versionsProvider(ctx)
+	if err != nil {
+		im.logger.Warn("index: cold policy could not read the version set", zap.Error(err))
+		return nil
+	}
+
+	active := map[string]int64{}
+	if activeProvider != nil {
+		if a, err := activeProvider(ctx); err != nil {
+			im.logger.Warn("index: cold policy could not read the active versions", zap.Error(err))
+		} else {
+			active = a
+		}
+	}
+
 	im.mu.Lock()
 	defer im.mu.Unlock()
-	var out []indexKey
-	for k, last := range im.lastSearch {
-		if im.deletedKBs[k.kbID] || im.deletedVersions[k] {
+
+	var out []coldCandidate
+	for kbID, versionIDs := range authority {
+		if im.deletedKBs[kbID] {
 			continue
 		}
-		if im.builtGraphFree[k] || im.loading[k] {
-			continue
-		}
-		if now.Sub(last) >= im.cfg.ColdThreshold {
-			out = append(out, k)
+		newest := newestVersion(versionIDs)
+		for _, versionID := range versionIDs {
+			key := indexKey{kbID, versionID}
+			if im.deletedVersions[key] || im.loading[key] {
+				continue
+			}
+			// The version serving queries is never reshaped: the active one, and
+			// the end of the chain (what serves when the control layer has no
+			// active pointer). They can be different versions, so both are
+			// checked rather than one standing in for the other.
+			if act, ok := active[kbID]; ok && versionID == act {
+				continue
+			}
+			if versionID == newest {
+				continue
+			}
+			if !im.holdsArtifactLocked(key) {
+				continue
+			}
+			last, ok := im.lastSearch[key]
+			if !ok {
+				// Never seen by this process: age it from startup rather than
+				// treating it as permanently hot (the policy would stall) or as
+				// immediately cold (a restart would reshape the whole node).
+				last = im.startedAt
+			}
+			if failedAt, ok := im.coldFailedAt[key]; ok && !last.After(failedAt) {
+				continue // nothing queried it since the failure: back off
+			}
+			age := now.Sub(last)
+			graphFree, known := im.shapeGraphFreeLocked(key)
+			switch {
+			case !known || !graphFree:
+				if age >= threshold {
+					out = append(out, coldCandidate{key: key})
+				}
+			case age <= threshold/2:
+				// Queried again within half the cold window: restore the graph.
+				// The gap between the two thresholds is hysteresis — without it
+				// a version sitting near the boundary is rebuilt, and
+				// redistributed, on every sweep, in both directions.
+				out = append(out, coldCandidate{key: key, reheat: true})
+			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].kbID != out[j].kbID {
-			return out[i].kbID < out[j].kbID
+		if out[i].key.kbID != out[j].key.kbID {
+			return out[i].key.kbID < out[j].key.kbID
 		}
-		return out[i].versionID < out[j].versionID
+		return out[i].key.versionID < out[j].key.versionID
 	})
 	return out
+}
+
+// newestVersion returns the largest version id in ids (0 for an empty set).
+func newestVersion(ids []int64) int64 {
+	var newest int64
+	for _, id := range ids {
+		if id > newest {
+			newest = id
+		}
+	}
+	return newest
+}
+
+// holdsArtifactLocked reports whether this node holds the version's index
+// artifact — in memory, or as a file on disk. The question is "do we have it",
+// not "was it ever queried": a query puts a version in the access table without
+// implying this node has its index, and §8.6a reshapes only what is here.
+// The stat happens under the lock on purpose: the caller is a low-frequency
+// background sweep.
+func (im *IndexManagerImpl) holdsArtifactLocked(key indexKey) bool {
+	if _, ok := im.loaded[key]; ok {
+		return true
+	}
+	if _, ok := im.builtGraphFree[key]; ok {
+		return true
+	}
+	if im.cfg.IndexDataDir == "" {
+		return false
+	}
+	return fileExists(im.indexPath(key.kbID, key.versionID))
+}
+
+// shapeGraphFreeLocked reports the version's current index shape and whether it
+// is known. The in-memory record is consulted first (a version this process
+// just built needs no disk read); the sidecar is the fallback, and the only
+// source that survives a restart or describes an artifact this node merely
+// received from a peer.
+func (im *IndexManagerImpl) shapeGraphFreeLocked(key indexKey) (graphFree bool, known bool) {
+	if graphFree, ok := im.builtGraphFree[key]; ok {
+		return graphFree, true
+	}
+	if im.cfg.IndexDataDir == "" {
+		return false, false
+	}
+	return im.artifactGraphFree(key.kbID, key.versionID)
 }
 
 func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree bool, priority BuildPriority) error {
@@ -896,6 +1070,13 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64, graphFree bool
 		}
 		im.mu.Lock()
 		delete(im.loading, key)
+		if status != types.IndexStatusReady {
+			// Back off the cold evaluator: it re-enumerates on every sweep, so
+			// without a record of this failure a build that cannot succeed is
+			// re-queued forever (both the graph-free reshape and the reheat go
+			// through here).
+			im.coldFailedAt[key] = time.Now()
+		}
 		if status == types.IndexStatusReady {
 			// Make room before inserting the new index.
 			im.makeRoomLocked()
@@ -1332,6 +1513,11 @@ func (im *IndexManagerImpl) loadFromDisk(ctx context.Context, kbID string, versi
 	}
 	im.makeRoomLocked()
 	im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
+	// The file we just read decides the shape; the sidecar beside it is the
+	// authority (§8.6a). A remembered entry could be stale — the artifact may
+	// have been replaced since this process recorded one — so it is dropped and
+	// re-derived on demand.
+	delete(im.builtGraphFree, key)
 	size := im.readSizeSidecar(kbID, versionID)
 	im.sizeByKey[key] = size
 	im.loadedBytes += size

@@ -331,10 +331,18 @@ TEST_F(HNSWVectorIndexTest, LoadAcceptsLegacySidecarWithoutChecksum) {
   }
 
   // Rewrite the sidecar in the legacy layout: dim / metric / chunk ids.
+  // The checked layout is magic / dim / metric / crc / [shape] / ids, so the
+  // id block starts after the three header values — plus the §8.6a shape line
+  // when the writer recorded one.
   const auto checked = ReadLines(save_path_ + ".ids");
   ASSERT_GE(checked.size(), 4u);
+  size_t ids_begin = 4;
+  if (ids_begin < checked.size() &&
+      checked[ids_begin].rfind("graph_free ", 0) == 0) {
+    ++ids_begin;
+  }
   std::vector<std::string> legacy{checked[1], checked[2]};
-  legacy.insert(legacy.end(), checked.begin() + 4, checked.end());
+  legacy.insert(legacy.end(), checked.begin() + ids_begin, checked.end());
   WriteLines(save_path_ + ".ids", legacy);
 
   HNSWVectorIndex loaded;
@@ -586,6 +594,46 @@ TEST_F(HNSWVectorIndexTest, GraphFreeIndexBuildsSearchesAndRoundTripsThroughDisk
   auto results_or = loaded.Search(query, kTopK);
   ASSERT_TRUE(results_or.ok()) << results_or.status();
   EXPECT_EQ(results_or.value().size(), static_cast<size_t>(kTopK));
+}
+
+// §8.6a: the artifact sidecar records the shape, because that is a fact the Go
+// IndexManager cannot derive from the file (it does not parse Faiss) and must
+// not lose across a restart or a peer-to-peer handoff. A pair that disagrees
+// about the shape does not belong together, and is refused like a checksum
+// mismatch rather than served as the wrong shape.
+TEST_F(HNSWVectorIndexTest, SidecarRecordsShapeAndLoadRejectsAMismatchedOne) {
+  std::mt19937 rng(41);
+  auto chunks = MakeRandomChunks(20, rng);
+
+  {
+    HNSWVectorIndex index;
+    ASSERT_TRUE(index.Build(chunks, MetricType::COSINE).ok());
+    ASSERT_TRUE(index.Save(save_path_).ok());
+  }
+  // Layout: magic / dim / metric / crc / shape / ids.
+  auto lines = ReadLines(save_path_ + ".ids");
+  ASSERT_GE(lines.size(), 5u);
+  EXPECT_EQ(lines[4], "graph_free 0");
+
+  // A sidecar claiming the other shape must not be paired with this index.
+  lines[4] = "graph_free 1";
+  WriteLines(save_path_ + ".ids", lines);
+  HNSWVectorIndex mismatched;
+  EXPECT_FALSE(mismatched.Load(save_path_).ok())
+      << "a sidecar that disagrees about the shape must be refused";
+
+  {
+    QuantizerConfig cfg;
+    cfg.type = QuantizerType::kSQ8Flat;  // graph-free, training-free
+    HNSWVectorIndex index(cfg);
+    ASSERT_TRUE(index.Build(chunks, MetricType::COSINE).ok());
+    ASSERT_TRUE(index.Save(save_path_).ok());
+  }
+  auto free_lines = ReadLines(save_path_ + ".ids");
+  ASSERT_GE(free_lines.size(), 5u);
+  EXPECT_EQ(free_lines[4], "graph_free 1");
+  HNSWVectorIndex loaded;
+  EXPECT_TRUE(loaded.Load(save_path_).ok());
 }
 
 // The full-precision graph-free variant stores raw vectors and scans them: no

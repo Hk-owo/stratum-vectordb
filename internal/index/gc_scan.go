@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"os"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -60,6 +61,21 @@ func (im *IndexManagerImpl) SetActiveVersionsProvider(fn func(ctx context.Contex
 	im.mu.Lock()
 	defer im.mu.Unlock()
 	im.activeVersions = fn
+}
+
+// SetVersionsProvider wires the authoritative version set the §8.6a cold
+// evaluator enumerates: per knowledge base, which versions exist, from the
+// control layer's metadata.
+//
+// The evaluator needs this rather than the local access table because the table
+// is what this process happens to have seen — it is empty after a restart, and
+// an evaluator that walks it would therefore forget every version at exactly
+// the moment it has the most reshaping to do. The table keeps its own job:
+// supplying each version's last-query timestamp.
+func (im *IndexManagerImpl) SetVersionsProvider(fn func(ctx context.Context) (map[string][]int64, error)) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.coldVersions = fn
 }
 
 // StartGCScanner starts the background scan. Like the §8.6a evaluator and the
@@ -314,6 +330,39 @@ func (im *IndexManagerImpl) deadChunksOf(ctx context.Context, kbID string, versi
 // looksLikeChunkID reports whether a sidecar line is a chunk id: SHA-256 hex,
 // lowercase. The header's lines are a magic string and small decimal integers,
 // so no header line matches.
+// artifactGraphFree reports whether the sealed artifact for (kbID, versionID)
+// is the graph-free variant, by reading the shape line vecstore's Save writes
+// (§8.6a). known is false when the sidecar has no such line — written before it
+// existed — or cannot be read.
+//
+// Read from disk rather than from memory on purpose: the shape has to survive a
+// restart and describe an artifact received from a peer, and the in-memory
+// record does neither. The line is matched by prefix, like the chunk ids above,
+// so the header growing another field cannot shift the read onto the wrong one.
+func (im *IndexManagerImpl) artifactGraphFree(kbID string, versionID int64) (graphFree bool, known bool) {
+	f, err := os.Open(im.sidecarPath(kbID, versionID))
+	if err != nil {
+		return false, false
+	}
+	defer func() { _ = f.Close() }()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64), 4096)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, shapeLinePrefix) {
+			continue
+		}
+		return strings.TrimSpace(strings.TrimPrefix(line, shapeLinePrefix)) == "1", true
+	}
+	return false, false
+}
+
+// shapeLinePrefix is the sidecar line vecstore's Save writes to record whether
+// the artifact carries an HNSW graph (§8.6a). It must match hnsw_index.cpp's
+// kShapePrefix.
+const shapeLinePrefix = "graph_free "
+
 func looksLikeChunkID(line string) bool {
 	if len(line) != chunkIDLength {
 		return false
