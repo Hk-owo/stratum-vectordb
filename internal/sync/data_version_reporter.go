@@ -156,16 +156,16 @@ func NewDataVersionReporter(cfg DataVersionReporterConfig) *DataVersionReporter 
 		interval = DefaultDataVersionReportInterval
 	}
 	return &DataVersionReporter{
-		nodeID:         cfg.NodeID,
-		selfAddr:       cfg.SelfAddr,
-		dataVersions:   cfg.DataVersions,
-		resolveLeader:  cfg.ResolveLeader,
-		interval:       interval,
-		logger:         cfg.Logger,
-		dial:           dial,
-		watermarks:     cfg.Watermarks,
-		chainTails:     cfg.ChainTails,
-		holders:        cfg.Holders,
+		nodeID:        cfg.NodeID,
+		selfAddr:      cfg.SelfAddr,
+		dataVersions:  cfg.DataVersions,
+		resolveLeader: cfg.ResolveLeader,
+		interval:      interval,
+		logger:        cfg.Logger,
+		dial:          dial,
+		watermarks:    cfg.Watermarks,
+		chainTails:    cfg.ChainTails,
+		holders:       cfg.Holders,
 	}
 }
 

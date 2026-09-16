@@ -52,12 +52,6 @@ type HoldersCacheConfig struct {
 	Logger *zap.Logger
 }
 
-// holdersKey identifies one cached question.
-type holdersKey struct {
-	kbID      string
-	versionID int64
-}
-
 // holdersEntry is ONE successful answer for a knowledge base, plus the version
 // it was fetched with.
 //
