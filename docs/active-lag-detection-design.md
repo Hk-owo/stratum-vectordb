@@ -33,9 +33,13 @@
 - 修复后 `stopped at a version` 从 **0 次变成 49 次**（每个 KB 一次），reason 全是 `no local artifact`，且样本的 `doc_id_set_hash` 为空、`index_status` 为 READY —— 正是修复前会被误判成"持有"的那种版本，现在被正确判成"不持有"。
 - 但同一批日志里 `recovered the local data cursor` **一次都没有**：每个 KB 都停在 `recovered_to: 0`。也就是说**这套集群里没有版本的数据侧是 Durable**，于是修复后所有副本的游标都是 0。
 - 这解释了一路上那些 `only 1 of a required 2 cursors arrived`：fan-out 从未达成 quorum，或者 `DataStatus` 的推进路径（§10.1b）根本没跑。**在修好它之前，"游标虚高"实际上是在掩盖"数据侧终态从未推进"**——而掩盖的方向恰恰是错的：服务站会据此把查询路由给数据并不完整的副本，返回静默的不完整答案。
-- 所以这里保留判据修复（"宁可拒绝，不可交错答案"是设计明确选的方向），但**下一步应该查 `DataStatus` 为什么从不推进**；只修一头会把系统从"静默错答"推到"拒绝服务"，两个一起修才是正解。
+- **根因已定位，而且是时序上的自相矛盾**：数据侧终态唯一的推进路径是 `ReportEpoch` → `promoteDurableData`，而它要 `SafeDurableVersion` 先给出一个 quorum 最小值。可 `SafeDurableVersion` 在**启动期**跑，那时**本节点的 gRPC 还没 listening**——实测时间戳：最后一次 `no quorum for a durable claim` 在 `1789566767.997121`，而 `Stratum gRPC server listening` 在 `1789566767.9975135`，相差 **0.4 毫秒**；整段启动期（56 秒、15 条 `no quorum`）都在 serving 之前。于是每个节点问 peers 要游标时谁都不在服务，`reports` 里只有它自己（`only 1 of a required 2`），quorum 判定失败，该 KB 被整个跳过，`ReportEpoch` 也就不报数据侧游标。
+  `SafeDurableVersion` 的注释其实承认了这个处境（"every storage node reconciles concurrently, and none of them reaches grpcServer.Serve until its own reconcile has returned"），并用短超时避免启动死锁——代价是**这条恢复协议在自己的时序里必然失败**。所以历史版本的数据侧永远停在 PENDING。
+- 顺带一提：新写入的版本本该由**实时路径**兜住（`reportAndSchedule` → `ReportDataDurable`），可这套集群里连它们也不是 Durable——那指向 fan-out 侧的另一个问题，和这条时序问题是两回事，需要分别查。
+- **修法方向**：把数据侧那半的上报挪到 gRPC serving 之后（或让它可重试），索引侧那半仍留在前面——索引侧不依赖 peers，数据侧的 quorum 判定则必须有 peers 可达。只把两半一起提前或一起推后都不对。
+- 所以这里保留判据修复（"宁可拒绝，不可交错答案"是设计选定的方向），但**下一步要么修这条时序，要么修 fan-out**；只修一头会把系统从"静默错答"推到"拒绝服务"。
 
-第 1 条已修并有回归测试；第 2 条与上面这条新暴露的问题都还开着——用例与集群开关都已经是现成的。
+第 1 条已修并有回归测试；第 2 条、第三条（时序）与 fan-out 那句都还开着——证据都在这里，用例与集群开关是现成的。
 
 ---
 
