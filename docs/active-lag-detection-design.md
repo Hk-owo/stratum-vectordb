@@ -19,7 +19,13 @@
 
 ### 集成验证暴露的两个前置（都在这条链路之外）
 
-1. **`RecoverLocalCursors` 会把落后节点看成不落后。** 实测：一个离线了 55 个版本的存储节点，回来时上报的游标是 **405 / 405**（＝链尾）。`RecoverLocalCursors` 从"本节点自己的事实"重建游标，但其中一项（READY 且未提交 digest）读的是**复制来的元数据**——于是"控制层知道 v405"被当成了"我这台机器持有 v405"。后果是这个设计的前提（"节点落后于链尾"）在重启场景下**检测不到**：游标与链尾相等，判据直接跳过。**这条比追赶本身重要得多**，值得单独处理。
+1. **`RecoverLocalCursors` 会把落后节点看成不落后 —— 根因已定位。** 实测：一个离线了 55 个版本的存储节点，回来时上报的游标是 **405 / 405**（＝链尾）。
+   - **直接证据**：`holdsVersionLocally` 的"停在哪"日志（`stopped at a version this node does not hold`）**一次都没有**——也就是每个 KB 的**所有**版本都被判成"本节点持有"，游标自然推到该 KB 的最大版本。
+   - **命中哪条判据**：不是"本地产物"（离线的节点没有），而是 `internal/plane/local_data_plane.go:1805` 那条 —— `v.DocIDSetHash == "" && IndexStatus == READY` 就当作"持有"。它不依赖任何本节点的事实，只依赖**复制来的元数据**。
+   - **它为什么会被普遍命中**：这套集群里大量版本的 `DocIDSetHash` 是空的（digest 从未提交）。digest 由 `reportAndSchedule`（`local_data_plane.go:1380`）在写事务后提交，而那里的注释写明它是**quorum 主张**——"only the caller that got enough replica acknowledgements may make it"。3 个存储节点、`serving_replica_min=2`、还杀掉一个的场景下，quorum 常常不足，于是 digest 缺失。
+   - **注释里的假设不成立**：那条判据的注释说这种读法"fails in the direction of a too-high cursor **by one version**"。实际不是——判据是**逐版本**的，每个没有 digest 的 READY 版本都会"持有"，于是游标**一路推到链尾**，而不是高出 1。
+   - **两个修法方向**：① 收窄这条判据——不要用"digest 为空"去推断"这是个空版本"，而应让控制层**显式**回答"这个版本有没有文档集"（§7.9 把数据侧与索引侧拆开就是这个路子）；② 先查 digest 为什么缺失——若正常 quorum 下它本该提交，那真正要修的是那条路径，而不是这条判据。
+   - **影响面比追赶大**：服务站的新鲜度检查（§9.3(2)）正是按这个游标判断副本够不够新。游标被虚高，意味着服务站会**误信**一个其实数据不全的副本——这比"落后检测不触发"严重。
 2. **链尾没有到达 reporter。** 实测：leader 上 `ChainTail` 被调用 **0 次**，storage 侧的 sink 收到 **0 次信号**（`lag catch-up: signal carried no chain tails` 一次都没打）。组件本身有单测覆盖（含真 gRPC 往返），所以剩下的问题是**真集群里的接线**——单元测试把它 stub 掉了，看不出。
 
 两条都记在这里而不是留在对话里：谁接手任何一条，用例与集群开关都已经是现成的。
