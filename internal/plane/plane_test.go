@@ -25,6 +25,10 @@ type stubMeta struct {
 	statusCalls []statusCall
 	digestCalls []digestCall
 
+	// dataDurableCalls records the control layer's own data-side promotions
+	// (§10.1b) — the ones §7.9's cursor report drives at startup.
+	dataDurableCalls []int64
+
 	permanentCalls []permanentCall
 	permanentErr   error
 }
@@ -33,8 +37,12 @@ type stubMeta struct {
 type permanentCall struct {
 	kbID      string
 	versionID int64
-	reason    string
-	count     int32
+	// side is which half of the version the verdict settles (§10.1b). The data
+	// side and the index side are counted and recorded separately, so a test
+	// asserting "the data side died" has to say which side it means.
+	side   types.FailureSide
+	reason string
+	count  int32
 }
 
 type statusCall struct {
@@ -70,13 +78,18 @@ func (m *stubMeta) ProposeUpdateVersionStatus(_ context.Context, versionID int64
 	return nil
 }
 
-func (m *stubMeta) ProposeMarkVersionFailedPermanent(_ context.Context, kbID string, versionID int64, reason string, count int32) error {
+func (m *stubMeta) ProposeMarkVersionFailedPermanent(_ context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error {
 	if m.permanentErr != nil {
 		return m.permanentErr
 	}
 	m.permanentCalls = append(m.permanentCalls, permanentCall{
-		kbID: kbID, versionID: versionID, reason: reason, count: count,
+		kbID: kbID, versionID: versionID, side: side, reason: reason, count: count,
 	})
+	return nil
+}
+
+func (m *stubMeta) ProposeMarkVersionDataDurable(_ context.Context, versionID int64) error {
+	m.dataDurableCalls = append(m.dataDurableCalls, versionID)
 	return nil
 }
 

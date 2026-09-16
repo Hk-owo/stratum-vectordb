@@ -20,13 +20,13 @@ func TestLocalControlPlane_SetFailureBudgetOverridesPerKB(t *testing.T) {
 	}
 
 	// kb-1: the declared budget of 2 governs.
-	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "boom"); err != nil {
+	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "boom"); err != nil {
 		t.Fatal(err)
 	}
 	if len(meta.permanentCalls) != 0 {
 		t.Fatalf("declared after one failure: %+v", meta.permanentCalls)
 	}
-	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "boom"); err != nil {
+	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "boom"); err != nil {
 		t.Fatal(err)
 	}
 	if len(meta.permanentCalls) != 1 {
@@ -35,7 +35,7 @@ func TestLocalControlPlane_SetFailureBudgetOverridesPerKB(t *testing.T) {
 
 	// kb-2 has no override, so the process default of 5 still stands.
 	for i := 0; i < 4; i++ {
-		if _, err := cp.ReportVersionFailure(ctx, "kb-2", 7, types.FailureTransient, "boom"); err != nil {
+		if _, err := cp.ReportVersionFailure(ctx, "kb-2", 7, types.FailureSideData, types.FailureTransient, "boom"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -59,7 +59,7 @@ func TestLocalControlPlane_SetFailureBudgetClearsOverride(t *testing.T) {
 	}
 
 	for i := 0; i < 2; i++ {
-		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "boom"); err != nil {
+		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "boom"); err != nil {
 			t.Fatal(err)
 		}
 	}

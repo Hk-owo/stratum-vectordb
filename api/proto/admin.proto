@@ -43,6 +43,10 @@ message FailedVersion {
   int64 version_id = 2;
   string reason = 3;       // why the last attempt failed (the storage layer's report)
   int32 failure_count = 4; // failed attempts before the verdict
+  // side is WHICH half of the version died (§10.1b). It is not decoration: the
+  // two verdicts are independent, their remedies differ (retry the write vs
+  // rebuild the index), and without it an operator cannot tell which to reach for.
+  FailureSide side = 5;
 }
 
 message WALAlert {

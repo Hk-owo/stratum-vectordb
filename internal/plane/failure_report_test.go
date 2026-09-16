@@ -40,7 +40,7 @@ func (c *stubControl) ReportAvailability(context.Context, string, int64, Availab
 
 func (c *stubControl) SetFailureBudget(_ context.Context, _ string, _ int) error { return nil }
 
-func (c *stubControl) ReportVersionFailure(_ context.Context, kbID string, versionID int64, class types.FailureClass, detail string) (bool, error) {
+func (c *stubControl) ReportVersionFailure(_ context.Context, kbID string, versionID int64, side types.FailureSide, class types.FailureClass, detail string) (bool, error) {
 	c.failures = append(c.failures, failureReport{kbID: kbID, versionID: versionID, reason: detail, class: class})
 	return c.terminal, nil
 }

@@ -133,8 +133,8 @@ func (r *RemoteRaftNode) ProposeUpdateVersionStatus(ctx context.Context, version
 	return res.Err
 }
 
-func (r *RemoteRaftNode) ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, reason string, count int32) error {
-	res, err := r.propose(ctx, newMarkVersionFailedPermanentCommand(kbID, versionID, reason, count))
+func (r *RemoteRaftNode) ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error {
+	res, err := r.propose(ctx, newMarkVersionFailedPermanentCommand(kbID, versionID, side, reason, count))
 	if err != nil {
 		return err
 	}
@@ -143,6 +143,14 @@ func (r *RemoteRaftNode) ProposeMarkVersionFailedPermanent(ctx context.Context, 
 
 func (r *RemoteRaftNode) ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error {
 	res, err := r.propose(ctx, newUpdateVersionSummaryCommand(versionID, docIDSetHash))
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
+func (r *RemoteRaftNode) ProposeMarkVersionDataDurable(ctx context.Context, versionID int64) error {
+	res, err := r.propose(ctx, newMarkDataDurableCommand(versionID))
 	if err != nil {
 		return err
 	}

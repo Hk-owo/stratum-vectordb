@@ -197,8 +197,33 @@ type LocalDataPlane struct {
 	// version it holds contiguously. 0 means "unknown yet" (a node that has
 	// not applied anything for that KB). Guarded by versionMu; it only ever
 	// moves forward.
+	//
+	// "Contiguously" is load-bearing, and handledAbove/announcedAbove exist to
+	// keep it true. The cursor may only step over a version that either this
+	// node holds or that does not exist; a plain maximum would let one failed
+	// push followed by a successful later push claim an unbroken history the
+	// node does not have (§7.5's invariant, §9.3(2)'s freshness check).
 	versionMu    sync.RWMutex
 	localVersion map[string]int64
+
+	// handledAbove records versions ABOVE the cursor whose data this node has
+	// accounted for: written here, pulled from a peer, pushed by the
+	// coordinator, dropped as deleted, or covered by a full-state transfer.
+	//
+	// announcedAbove records versions above the cursor that the control layer
+	// says exist, announced at apply time. A version in announcedAbove but not
+	// in handledAbove is a KNOWN GAP: it exists and this node does not have it,
+	// so the cursor must stop below it rather than step over it.
+	//
+	// With nothing announced the two collapse into "the highest version seen",
+	// i.e. the pre-fix behaviour; every storage path announces, so in practice
+	// a gap is always known.
+	//
+	// Both are bounded by the versions of the KB above the cursor: that stays
+	// tiny while the chain is healthy (the cursor advances and the entries are
+	// dropped) and grows only while a gap is genuinely missing.
+	handledAbove   map[string]map[int64]struct{}
+	announcedAbove map[string]map[int64]struct{}
 
 	// takeoverMu guards pendingTakeovers: the §7.3 timers this node started
 	// for versions it received via fan-out, keyed like the failure counters.
@@ -321,6 +346,8 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		limiter:          newWriteLimiter(cfg.MaxInFlightWrites),
 		logger:           logger,
 		localVersion:     make(map[string]int64),
+		handledAbove:     make(map[string]map[int64]struct{}),
+		announcedAbove:   make(map[string]map[int64]struct{}),
 		pendingTakeovers: make(map[string]*takeoverWatch),
 	}
 }
@@ -501,15 +528,125 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 	return nil
 }
 
-// advanceLocalVersion records that this node now holds versionID contiguously.
-// The cursor only moves forward: re-applying an older version (idempotent
-// retries, backfill replay) must not move it back.
+// advanceLocalVersion records that this node has accounted for versionID: it
+// holds the version's data (written here, pulled, pushed, or covered by a
+// full-state transfer) or the version no longer exists (dropped as deleted).
+//
+// The cursor advances only over an UNBROKEN run of accounted versions. A version
+// known to exist but not yet accounted for stops the cursor below itself, which
+// is what keeps "the cursor is where my history is unbroken" true when a push to
+// this node is lost and a later version's push still lands (§7.5, §9.3(2)).
+//
+// The cursor never moves back: re-applying an older version (idempotent retries,
+// backfill replay) must not move it down, and a version announced only after the
+// cursor has already passed it does not pull the cursor back either. The fix is
+// for the future, not a retroactive correction.
 func (d *LocalDataPlane) advanceLocalVersion(kbID string, versionID int64) {
 	d.versionMu.Lock()
 	defer d.versionMu.Unlock()
-	if versionID > d.localVersion[kbID] {
-		d.localVersion[kbID] = versionID
+	if versionID <= d.localVersion[kbID] {
+		return
 	}
+	handled := d.handledAbove[kbID]
+	if handled == nil {
+		handled = make(map[int64]struct{})
+		d.handledAbove[kbID] = handled
+	}
+	handled[versionID] = struct{}{}
+	d.advanceCursorLocked(kbID)
+}
+
+// AnnounceVersion records that the control layer says versionID exists. It is the
+// "known gap" half of the §7.5 invariant: a version this node has been told about
+// but does not hold must block the cursor from stepping over it.
+//
+// Announcing is idempotent and cheap, and it deliberately does NOT move the
+// cursor: existence is not possession.
+func (d *LocalDataPlane) AnnounceVersion(kbID string, versionID int64) {
+	d.versionMu.Lock()
+	defer d.versionMu.Unlock()
+	if versionID <= d.localVersion[kbID] {
+		return
+	}
+	announced := d.announcedAbove[kbID]
+	if announced == nil {
+		announced = make(map[int64]struct{})
+		d.announcedAbove[kbID] = announced
+	}
+	announced[versionID] = struct{}{}
+}
+
+// advanceCursorLocked walks the cursor up over every accounted-for version,
+// stopping at the first KNOWN version that is not accounted for (or when nothing
+// above the cursor is known).
+//
+// The work is proportional to the number of versions above the cursor still being
+// tracked, which is one in the healthy case — an advance immediately consumes its
+// own entry — and grows only while a gap is genuinely missing.
+func (d *LocalDataPlane) advanceCursorLocked(kbID string) {
+	handled := d.handledAbove[kbID]
+	announced := d.announcedAbove[kbID]
+	for {
+		next, ok := d.lowestAboveLocked(kbID)
+		if !ok {
+			break
+		}
+		if _, done := handled[next]; !done {
+			// A version the control layer says exists and this node does not
+			// hold: the cursor stops below it rather than claiming a history
+			// with a hole in it.
+			break
+		}
+		delete(handled, next)
+		delete(announced, next)
+		d.localVersion[kbID] = next
+	}
+	if len(handled) == 0 {
+		delete(d.handledAbove, kbID)
+	}
+	if len(announced) == 0 {
+		delete(d.announcedAbove, kbID)
+	}
+}
+
+// lowestAboveLocked returns the smallest version above the cursor that this node
+// knows of — accounted for or merely announced. The second return value is false
+// when nothing above the cursor is known, i.e. there is nothing left to step over.
+func (d *LocalDataPlane) lowestAboveLocked(kbID string) (int64, bool) {
+	cursor := d.localVersion[kbID]
+	found := false
+	var lowest int64
+	for _, set := range []map[int64]struct{}{d.handledAbove[kbID], d.announcedAbove[kbID]} {
+		for v := range set {
+			if v <= cursor {
+				continue
+			}
+			if !found || v < lowest {
+				lowest, found = v, true
+			}
+		}
+	}
+	return lowest, found
+}
+
+// markVersionsHandled accounts for every version in [from, to] in one step. It is
+// for the paths that obtain a whole VERSION'S state at once — §6.4's full-state
+// transfer is the only one — where advancing version by version would re-scan the
+// pending sets once per version.
+func (d *LocalDataPlane) markVersionsHandled(kbID string, from, to int64) {
+	d.versionMu.Lock()
+	defer d.versionMu.Unlock()
+	handled := d.handledAbove[kbID]
+	if handled == nil {
+		handled = make(map[int64]struct{})
+		d.handledAbove[kbID] = handled
+	}
+	for v := from; v <= to; v++ {
+		if v > d.localVersion[kbID] {
+			handled[v] = struct{}{}
+		}
+	}
+	d.advanceCursorLocked(kbID)
 }
 
 // MarkVersionContiguous implements sync.LocalVersionAdvancer: a version whose
@@ -656,7 +793,14 @@ func (d *LocalDataPlane) transferFullState(ctx context.Context, sourceAddr, kbID
 		return fmt.Errorf("plane: backfill %s from %s: v%d was deleted (local cursor %d) and the full-state transfer of v%d failed: %w",
 			kbID, sourceAddr, deletedVersion, local, snapshot, err)
 	}
-	d.advanceLocalVersion(kbID, snapshot)
+	// §7.5: the snapshot IS this version's whole state, so the cursor may move up
+	// to it — but it has to move as a run of ACCOUNTED versions, not as a bare
+	// jump (which the cursor no longer performs for anyone). Every version the
+	// transfer skipped is accounted for by it: they are not individually held (the
+	// log line below says exactly which), but the gap they belonged to is
+	// precisely what the snapshot replaced. Registering them in ONE step keeps
+	// this O(versions skipped) instead of one cursor scan per version.
+	d.markVersionsHandled(kbID, local+1, snapshot)
 	d.logger.Warn("plane: backfilled via full-state transfer after a deleted version; the skipped versions are not readable locally",
 		zap.String("kb_id", kbID), zap.Int64("from_version", local),
 		zap.Int64("deleted_version", deletedVersion), zap.Int64("snapshot_version", snapshot))
@@ -927,7 +1071,7 @@ func (d *LocalDataPlane) reportFailure(ctx context.Context, kbID string, version
 	if d.control == nil {
 		return
 	}
-	terminal, err := d.control.ReportVersionFailure(ctx, kbID, versionID, class, detail)
+	terminal, err := d.control.ReportVersionFailure(ctx, kbID, versionID, types.FailureSideData, class, detail)
 	if err != nil {
 		d.logger.Warn("plane: report version failure",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
@@ -1687,7 +1831,12 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 			// nothing re-triggers it, and its data may already have been reclaimed
 			// (§10.6). Rebuilding here would contradict the recorded verdict and,
 			// with the data gone, fail on every sweep.
-			if v.IndexStatus == types.IndexStatusFailed || v.IndexStatus == types.IndexStatusFailedPermanent {
+			//
+			// The DATA side's verdict counts too: data that will never arrive
+			// cannot produce an index, so scheduling a build for it would fail on
+			// every sweep for the same reason (§10.1b).
+			if v.IndexStatus == types.IndexStatusFailed || v.IndexStatus == types.IndexStatusFailedPermanent ||
+				v.DataStatus == types.DataStatusFailedPermanent {
 				continue
 			}
 			exists, err := d.indexMgr.IndexExists(ctx, kb.KBID, v.VersionID)

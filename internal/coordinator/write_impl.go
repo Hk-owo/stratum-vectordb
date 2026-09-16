@@ -373,7 +373,7 @@ func (c *WriteCoordinatorImpl) AbandonDispatch(ctx context.Context, kbID string,
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
 		return
 	}
-	terminal, err := c.cfg.ControlPlane.ReportVersionFailure(ctx, kbID, versionID, class, detail)
+	terminal, err := c.cfg.ControlPlane.ReportVersionFailure(ctx, kbID, versionID, types.FailureSideData, class, detail)
 	if err != nil {
 		log.Warn("coordinator: reporting a version's failure",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))

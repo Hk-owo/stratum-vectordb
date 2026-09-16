@@ -79,11 +79,13 @@ type RaftNode interface {
 	// is recorded.
 	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error
 
-	// ProposeMarkVersionFailedPermanent records the terminal verdict for a
-	// version (Stratum_设计文档v13.md §10.1): the control layer has decided
-	// its retry budget is spent and nothing will retry it automatically.
-	// reason and count form the auditable cause chain an operator needs.
-	ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, reason string, count int32) error
+	// ProposeMarkVersionFailedPermanent records the terminal verdict for one
+	// side of a version (Stratum_设计文档v13.md §10.1, §10.1b): the control
+	// layer has decided that side's retry budget is spent and nothing will
+	// retry it automatically. side says which state the verdict lands in —
+	// DataStatusFailedPermanent or IndexStatusFailedPermanent — and reason and
+	// count form the auditable cause chain an operator needs.
+	ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error
 
 	// ProposeUpdateVersionSummary records the version's full document-ID
 	// set hash (VersionMeta.DocIDSetHash). The leader calls this after its
@@ -91,6 +93,14 @@ type RaftNode interface {
 	// the committed digest to verify DataSync pulls are complete. No-op
 	// when the version does not exist (returns ErrVersionNotFound).
 	ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error
+
+	// ProposeMarkVersionDataDurable records that versionID's DATA is durable,
+	// on the control layer's own authority rather than a writer's report
+	// (Stratum_设计文档v13.md §10.1b). It is how the startup reconcile turns the
+	// storage layer's reported cursor into replicated state (§7.9). Only a
+	// PENDING data side is promoted: an already settled one — durable, or a
+	// terminal verdict — is left exactly as it is.
+	ProposeMarkVersionDataDurable(ctx context.Context, versionID int64) error
 
 	// ProposeRollback switches kbID's active version to targetVersionID.
 	// Rejected (ErrVersionDeleting) if the target version is being deleted.

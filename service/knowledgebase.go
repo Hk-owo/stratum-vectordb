@@ -232,6 +232,10 @@ func (s *KnowledgeBaseServiceImpl) ListVersions(ctx context.Context, req *pb.Lis
 			CreatedAt:       v.CreatedAt,
 			IndexStatus:     pb.IndexStatus(v.IndexStatus),
 			Deleting:        v.Deleting,
+			// The data side travels alongside the index side (§10.1b): callers
+			// that only look at index_status cannot tell "the data never landed"
+			// from "everything is fine".
+			DataStatus: pb.DataStatus(v.DataStatus),
 		}
 	}
 	return &pb.ListVersionsResponse{Versions: out}, nil

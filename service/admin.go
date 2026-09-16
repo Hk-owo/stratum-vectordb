@@ -167,12 +167,23 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 				// (Stratum_设计文档v13.md §10.1): it is reported separately from
 				// the retryable FAILED above, and carries the cause chain an
 				// operator needs.
-				if v.IndexStatus == types.IndexStatusFailedPermanent {
+				//
+				// Either SIDE's verdict counts: a version whose data will never
+				// arrive is just as dead as one whose index never built, and
+				// leaving the data side out would hide exactly the failures the
+				// storage layer reports most often (§10.1b).
+				if v.IndexStatus == types.IndexStatusFailedPermanent ||
+					v.DataStatus == types.DataStatusFailedPermanent {
 					failedPermanent = append(failedPermanent, &pb.FailedVersion{
 						KbId:         v.KBID,
 						VersionId:    v.VersionID,
 						Reason:       v.FailureReason,
 						FailureCount: v.FailureCount,
+						// The side the verdict settled, recorded at apply time
+						// rather than inferred from the two statuses: a version
+						// can end up terminal on BOTH sides, and then only the
+						// stored side says which one the cause chain describes.
+						Side: pb.FailureSide(v.FailureSide),
 					})
 				}
 			}

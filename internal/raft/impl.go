@@ -538,10 +538,10 @@ func (impl *RaftNodeImpl) SetForwarder(f ProposeForwarder) {
 }
 
 // ProposeMarkVersionFailedPermanent implements RaftNode: the terminal verdict
-// for a version whose Saga has spent its retry budget
-// (Stratum_设计文档v13.md §10.1).
-func (impl *RaftNodeImpl) ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, reason string, count int32) error {
-	res, err := impl.proposeAndWait(ctx, newMarkVersionFailedPermanentCommand(kbID, versionID, reason, count))
+// for one side of a version whose Saga has spent its retry budget
+// (Stratum_设计文档v13.md §10.1, §10.1b).
+func (impl *RaftNodeImpl) ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error {
+	res, err := impl.proposeAndWait(ctx, newMarkVersionFailedPermanentCommand(kbID, versionID, side, reason, count))
 	if err != nil {
 		return err
 	}
@@ -559,6 +559,16 @@ func (impl *RaftNodeImpl) ProposeUpdateVersionStatus(ctx context.Context, versio
 // ProposeUpdateVersionSummary implements RaftNode.
 func (impl *RaftNodeImpl) ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error {
 	res, err := impl.proposeAndWait(ctx, newUpdateVersionSummaryCommand(versionID, docIDSetHash))
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
+// ProposeMarkVersionDataDurable implements RaftNode: the control layer's own
+// promotion of a version's data side (§10.1b).
+func (impl *RaftNodeImpl) ProposeMarkVersionDataDurable(ctx context.Context, versionID int64) error {
+	res, err := impl.proposeAndWait(ctx, newMarkDataDurableCommand(versionID))
 	if err != nil {
 		return err
 	}

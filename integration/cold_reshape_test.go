@@ -44,6 +44,11 @@ func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) 
 	syncFollower := sync.NewFollower(n.docStore, n.chunkDoc, n.versionDoc, n.chunkStore, n.indexMgr)
 	n.raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
 		ctx := context.Background()
+		// §7.5: the same announcement wireSyncPull makes. It matters more here:
+		// the data-only variant pulls records without building an index, so the
+		// cursor is the only thing that says this node holds the version.
+		n.indexDistributor.AnnounceVersion(kbID, versionID)
+
 		deadline := time.Now().Add(20 * time.Second)
 		backoff := 50 * time.Millisecond
 		for {

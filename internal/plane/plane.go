@@ -146,13 +146,20 @@ type ControlPlane interface {
 	ReportIndexReady(ctx context.Context, kbID string, versionID int64) error
 
 	// ReportVersionFailure records a failed attempt at making versionID
-	// durable. The control layer owns the terminal verdict (v13 §10.1): once
-	// its failure budget is spent it declares the version FAILED_PERMANENT
-	// with the recorded cause, and nothing retries it automatically again.
-	// Returning terminal=true means the control layer has just declared the
-	// version FAILED_PERMANENT: the caller should reclaim its physical data
-	// (Stratum_设计文档v13.md §10.6).
-	ReportVersionFailure(ctx context.Context, kbID string, versionID int64, class types.FailureClass, detail string) (terminal bool, err error)
+	// durable — where "durable" means whichever side the failure belongs to:
+	// its data (FailureSideData) or its index (FailureSideIndex). The control
+	// layer owns the terminal verdict (v13 §10.1): once that side's failure
+	// budget is spent it records the terminal state with the recorded cause —
+	// DataStatusFailedPermanent for the data side, IndexStatusFailedPermanent
+	// for the index side — and nothing retries it automatically again.
+	//
+	// The two sides count separately (v13 §10.1b): an index build that keeps
+	// failing must not spend the budget the data write needs.
+	//
+	// Returning terminal=true means the control layer has just recorded the
+	// terminal verdict for that side: when it is the DATA side, the caller
+	// should reclaim the version's physical data (Stratum_设计文档v13.md §10.6).
+	ReportVersionFailure(ctx context.Context, kbID string, versionID int64, side types.FailureSide, class types.FailureClass, detail string) (terminal bool, err error)
 
 	// SetFailureBudget declares how many failed attempts kbID tolerates before
 	// its versions are declared FAILED_PERMANENT. It comes from the KB's

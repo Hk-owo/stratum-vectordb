@@ -58,7 +58,7 @@ func TestIntegration_FailureBudgetDeclaresVersionFailedPermanent(t *testing.T) {
 
 	// Inside the budget nothing is declared: the version is still retryable.
 	for i := 0; i < 2; i++ {
-		terminal, err := control.ReportVersionFailure(ctx, kbID, verResp.VersionId, types.FailureTransient, cause)
+		terminal, err := control.ReportVersionFailure(ctx, kbID, verResp.VersionId, types.FailureSideData, types.FailureTransient, cause)
 		if err != nil {
 			t.Fatalf("report %d: %v", i+1, err)
 		}
@@ -71,7 +71,7 @@ func TestIntegration_FailureBudgetDeclaresVersionFailedPermanent(t *testing.T) {
 	}
 
 	// The budget is now spent.
-	terminal, err := control.ReportVersionFailure(ctx, kbID, verResp.VersionId, types.FailureTransient, cause)
+	terminal, err := control.ReportVersionFailure(ctx, kbID, verResp.VersionId, types.FailureSideData, types.FailureTransient, cause)
 	if err != nil {
 		t.Fatalf("report 3: %v", err)
 	}
@@ -91,8 +91,11 @@ func TestIntegration_FailureBudgetDeclaresVersionFailedPermanent(t *testing.T) {
 	}
 
 	// The verdict is replicated state, not this node's memory: the version
-	// itself must report FAILED_PERMANENT too, which is what makes every node
-	// agree on it.
+	// itself must carry the DATA side's terminal state, which is what makes
+	// every node agree on it. It lands there — and not in IndexStatus — because
+	// the report was a FailureSideData one: the two sides have separate states
+	// (Stratum_设计文档v13.md §10.1b), so a data-side verdict must not re-label an
+	// index that in fact built.
 	versions, err := cluster.RaftNode.ListVersions(ctx, kbID)
 	if err != nil {
 		t.Fatalf("ListVersions: %v", err)
@@ -101,8 +104,8 @@ func TestIntegration_FailureBudgetDeclaresVersionFailedPermanent(t *testing.T) {
 	for _, v := range versions {
 		if v.VersionID == verResp.VersionId {
 			found = true
-			if v.IndexStatus.String() != "FAILED_PERMANENT" {
-				t.Errorf("state-machine status = %s, want FAILED_PERMANENT", v.IndexStatus)
+			if v.DataStatus != types.DataStatusFailedPermanent {
+				t.Errorf("state-machine data status = %v, want DATA_FAILED_PERMANENT", v.DataStatus)
 			}
 		}
 	}

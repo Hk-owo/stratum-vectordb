@@ -207,17 +207,23 @@ func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, pa
 }
 
 // ProposeMarkVersionFailedPermanent mirrors the real state machine's terminal
-// verdict (Stratum_设计文档v13.md §10.1).
-func (r *MockRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, kbID string, versionID int64, reason string, count int32) error {
+// verdict, for the side the verdict names (Stratum_设计文档v13.md §10.1/§10.1b).
+func (r *MockRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	v, ok := r.versions[versionID]
 	if !ok || v.KBID != kbID {
 		return stratumerrors.ErrVersionNotFound
 	}
-	v.IndexStatus = types.IndexStatusFailedPermanent
+	switch side {
+	case types.FailureSideIndex:
+		v.IndexStatus = types.IndexStatusFailedPermanent
+	default:
+		v.DataStatus = types.DataStatusFailedPermanent
+	}
 	v.FailureReason = reason
 	v.FailureCount = count
+	v.FailureSide = side
 	r.versions[versionID] = v
 	return nil
 }
@@ -234,6 +240,23 @@ func (r *MockRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID i
 		v.IndexReadyNodes = withIndexReadyNode(v.IndexReadyNodes, nodeID)
 	}
 	r.versions[versionID] = v
+	return nil
+}
+
+// ProposeMarkVersionDataDurable mirrors the state machine's data-side promotion:
+// only a PENDING side moves, so a reconcile snapshot cannot undo a verdict
+// (Stratum_设计文档v13.md §10.1b).
+func (r *MockRaftNode) ProposeMarkVersionDataDurable(_ context.Context, versionID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.versions[versionID]
+	if !ok {
+		return stratumerrors.ErrVersionNotFound
+	}
+	if v.DataStatus == types.DataStatusPending {
+		v.DataStatus = types.DataStatusDurable
+		r.versions[versionID] = v
+	}
 	return nil
 }
 

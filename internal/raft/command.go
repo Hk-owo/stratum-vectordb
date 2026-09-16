@@ -27,6 +27,12 @@ const (
 	// version has spent its retry budget and will not be retried again
 	// (Stratum_设计文档v13.md §10.1).
 	cmdMarkVersionFailedPermanent commandType = "MarkVersionFailedPermanent"
+
+	// cmdMarkDataDurable records the DATA side as durable on the control layer's
+	// own authority rather than a writer's report: the startup reconcile knows a
+	// version's data sits on a quorum's worth of disks, and this is how that fact
+	// becomes replicated state (Stratum_设计文档v13.md §10.1b, §7.9).
+	cmdMarkDataDurable commandType = "MarkDataDurable"
 )
 
 // command is the JSON-encoded payload carried inside each kvraft log
@@ -75,6 +81,10 @@ type command struct {
 	// cmdMarkVersionFailedPermanent: the cause chain an operator needs.
 	FailureReason string `json:"failure_reason,omitempty"`
 	FailureCount  int32  `json:"failure_count,omitempty"`
+	// cmdMarkVersionFailedPermanent: which side the verdict lands on
+	// (Stratum_设计文档v13.md §10.1b). Omitted means the data side, which is
+	// what every command written before the two sides were separated meant.
+	FailureSide types.FailureSide `json:"failure_side,omitempty"`
 
 	// cmdRollback
 	TargetVersionID int64 `json:"target_version_id,omitempty"`
@@ -154,12 +164,20 @@ func newRemoveVersionMetaCommand(kbID string, versionID int64) command {
 	return command{Type: cmdRemoveVersionMeta, KBID: kbID, VersionID: versionID}
 }
 
-func newMarkVersionFailedPermanentCommand(kbID string, versionID int64, reason string, count int32) command {
+func newMarkVersionFailedPermanentCommand(kbID string, versionID int64, side types.FailureSide, reason string, count int32) command {
 	return command{
 		Type:          cmdMarkVersionFailedPermanent,
 		KBID:          kbID,
 		VersionID:     versionID,
+		FailureSide:   side,
 		FailureReason: reason,
 		FailureCount:  count,
 	}
+}
+
+// newMarkDataDurableCommand is the control layer's own data-side promotion
+// (Stratum_设计文档v13.md §10.1b): no KB ID, because the version ID is globally
+// unique and the state machine looks the version up by it.
+func newMarkDataDurableCommand(versionID int64) command {
+	return command{Type: cmdMarkDataDurable, VersionID: versionID}
 }

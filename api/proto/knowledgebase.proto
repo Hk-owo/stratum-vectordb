@@ -22,6 +22,24 @@ enum IndexStatus {
   INDEX_STATUS_FAILED_PERMANENT = 3; // retry budget spent or unrecoverable; only an operator can retry or abandon it
 }
 
+// DataStatus mirrors internal/types.DataStatus: a version's DATA-side state,
+// kept separate from IndexStatus because the two fail apart — a version whose
+// data is durable may still have no working index, and an index that never built
+// says nothing about whether the data landed (Stratum_设计文档v13.md §10.1b).
+enum DataStatus {
+  DATA_STATUS_PENDING = 0;          // metadata allocated, storage-layer write in flight
+  DATA_STATUS_DURABLE = 1;          // a quorum of replicas confirmed the data durable
+  DATA_STATUS_FAILED_PERMANENT = 2; // the data will never arrive; only an operator can retry or abandon it
+}
+
+// FailureSide mirrors internal/types.FailureSide: which half of a version a
+// failure verdict settles (§10.1b). It is what lets a report say "the data will
+// never arrive" without also claiming the index failed.
+enum FailureSide {
+  FAILURE_SIDE_DATA = 0;  // the default: the data side
+  FAILURE_SIDE_INDEX = 1; // the index side
+}
+
 // IndexType mirrors KnowledgeBaseMeta.IndexType. Only HNSW has a real
 // implementation today; IVF / FLAT are reserved for later iterations.
 enum IndexType {
@@ -81,6 +99,11 @@ message VersionInfo {
   int64 created_at = 3; // Unix timestamp, leader's local clock at apply time
   IndexStatus index_status = 4;
   bool deleting = 5; // true while an asynchronous DeleteVersion cleanup is in progress
+  // data_status is the same version's DATA-side state (§10.1b). It is reported
+  // alongside index_status rather than folded into it: a version can be
+  // queryable while its data is still being written, and it can have durable
+  // data with no index at all.
+  DataStatus data_status = 6;
 }
 
 // KnowledgeBaseInfo is the console-facing metadata of a knowledge base,

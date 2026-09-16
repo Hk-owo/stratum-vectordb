@@ -372,13 +372,17 @@ func (r *testRaftNode) ProposeCreateVersion(_ context.Context, kbID string, pare
 	return v, nil
 }
 
-func (r *testRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ string, _ int32) error {
+func (r *testRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ types.FailureSide, _ string, _ int32) error {
 	return nil
 }
 
 func (r *testRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, _ int64) error {
 	return nil
 }
+func (r *testRaftNode) ProposeMarkVersionDataDurable(_ context.Context, _ int64) error {
+	return nil
+}
+
 func (r *testRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -17,7 +17,7 @@ func TestLocalControlPlane_ReportVersionFailureDeclaresTerminalAfterBudget(t *te
 	ctx := context.Background()
 
 	for i := 1; i <= 2; i++ {
-		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "storage unreachable"); err != nil {
+		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "storage unreachable"); err != nil {
 			t.Fatalf("attempt %d: %v", i, err)
 		}
 	}
@@ -25,7 +25,7 @@ func TestLocalControlPlane_ReportVersionFailureDeclaresTerminalAfterBudget(t *te
 		t.Fatalf("declared the terminal verdict before the budget was spent: %+v", meta.permanentCalls)
 	}
 
-	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "storage unreachable"); err != nil {
+	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "storage unreachable"); err != nil {
 		t.Fatalf("attempt 3: %v", err)
 	}
 	if len(meta.permanentCalls) != 1 {
@@ -51,7 +51,7 @@ func TestLocalControlPlane_ReportDataDurableResetsTheBudget(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 2; i++ {
-		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "transient"); err != nil {
+		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "transient"); err != nil {
 			t.Fatalf("failure %d: %v", i, err)
 		}
 	}
@@ -60,7 +60,7 @@ func TestLocalControlPlane_ReportDataDurableResetsTheBudget(t *testing.T) {
 		t.Fatalf("ReportDataDurable: %v", err)
 	}
 	for i := 0; i < 2; i++ {
-		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "transient"); err != nil {
+		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "transient"); err != nil {
 			t.Fatalf("post-reset failure %d: %v", i, err)
 		}
 	}
@@ -76,11 +76,11 @@ func TestLocalControlPlane_FailureBudgetIsPerVersion(t *testing.T) {
 	cp := NewLocalControlPlane(meta, WithFailureBudget(2))
 	ctx := context.Background()
 
-	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "boom"); err != nil {
+	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "boom"); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 8, types.FailureTransient, "boom"); err != nil {
+		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 8, types.FailureSideData, types.FailureTransient, "boom"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -95,10 +95,10 @@ func TestLocalControlPlane_FailureBudgetIsPerKnowledgeBase(t *testing.T) {
 	cp := NewLocalControlPlane(meta, WithFailureBudget(2))
 	ctx := context.Background()
 
-	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "boom"); err != nil {
+	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "boom"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cp.ReportVersionFailure(ctx, "kb-2", 7, types.FailureTransient, "boom"); err != nil {
+	if _, err := cp.ReportVersionFailure(ctx, "kb-2", 7, types.FailureSideData, types.FailureTransient, "boom"); err != nil {
 		t.Fatal(err)
 	}
 	if len(meta.permanentCalls) != 0 {
@@ -114,8 +114,75 @@ func TestLocalControlPlane_ReportVersionFailurePropagatesProposalError(t *testin
 	cp := NewLocalControlPlane(meta, WithFailureBudget(1))
 	ctx := context.Background()
 
-	_, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureTransient, "boom")
+	_, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "boom")
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the proposal error", err)
+	}
+}
+
+// The two sides fail independently, so they must not share a counter: an index
+// build that keeps failing would otherwise spend the budget the data write needs
+// and declare the DATA dead — claiming the data will never arrive because an
+// index would not build (Stratum_设计文档v13.md §10.1b).
+func TestLocalControlPlane_FailureBudgetIsPerSide(t *testing.T) {
+	meta := &stubMeta{}
+	cp := NewLocalControlPlane(meta, WithFailureBudget(2))
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "data"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(meta.permanentCalls) != 1 || meta.permanentCalls[0].side != types.FailureSideData {
+		t.Fatalf("verdicts = %+v, want exactly one on the data side", meta.permanentCalls)
+	}
+
+	// One index-side failure is a fresh budget, not the data side's third.
+	terminal, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideIndex, types.FailureTransient, "index")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal {
+		t.Fatal("an index-side failure inherited the data side's spent budget")
+	}
+	if len(meta.permanentCalls) != 1 {
+		t.Fatalf("verdicts = %+v, want the data side's one and nothing more", meta.permanentCalls)
+	}
+
+	// And the index side's own budget is spent after its own two failures.
+	if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideIndex, types.FailureTransient, "index"); err != nil {
+		t.Fatal(err)
+	}
+	if len(meta.permanentCalls) != 2 || meta.permanentCalls[1].side != types.FailureSideIndex {
+		t.Fatalf("verdicts = %+v, want a second one on the index side", meta.permanentCalls)
+	}
+}
+
+// A successful report resets only ITS side's counter: the other side's history is
+// a different question with a different answer (§10.1b), and clearing both would
+// let an index build's success wipe the data side's recorded failures.
+func TestLocalControlPlane_SuccessResetsOnlyItsOwnSide(t *testing.T) {
+	meta := &stubMeta{}
+	cp := NewLocalControlPlane(meta, WithFailureBudget(2))
+	ctx := context.Background()
+
+	// One failure on each side, then the INDEX succeeds.
+	for _, side := range []types.FailureSide{types.FailureSideData, types.FailureSideIndex} {
+		if _, err := cp.ReportVersionFailure(ctx, "kb-1", 7, side, types.FailureTransient, side.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cp.ReportIndexReady(ctx, "kb-1", 7); err != nil {
+		t.Fatalf("ReportIndexReady: %v", err)
+	}
+
+	// The index side starts over: one more failure is not terminal.
+	if terminal, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideIndex, types.FailureTransient, "index"); err != nil || terminal {
+		t.Fatalf("index side = (%v, %v), want a fresh budget", terminal, err)
+	}
+	// The data side kept its one failure, so a second one spends its budget.
+	if terminal, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "data"); err != nil || !terminal {
+		t.Fatalf("data side = (%v, %v), want the terminal verdict", terminal, err)
 	}
 }

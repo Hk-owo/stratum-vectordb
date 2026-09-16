@@ -25,7 +25,8 @@ type MetadataProposer interface {
 	MetadataLister
 	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error
 	ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error
-	ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, reason string, count int32) error
+	ProposeMarkVersionDataDurable(ctx context.Context, versionID int64) error
+	ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error
 }
 
 // DefaultFailureBudget is how many failed attempts a version tolerates before
@@ -155,14 +156,19 @@ func NewLocalControlPlane(rn MetadataProposer, opts ...ControlPlaneOption) *Loca
 // or immediately, for a globally fatal failure — records the terminal verdict
 // (Stratum_设计文档v13.md §10.1).
 //
+// The counter is kept per (version, side): the data side and the index side
+// fail independently, so an index build that keeps failing must not spend the
+// budget the data write needs, and neither verdict may stand for the other
+// (§10.1b). The budget itself stays per KB.
+//
 // The count is per-process state on purpose: a restart forgets it and the
 // budget starts over. That errs toward retrying a version more often than the
 // budget allows rather than declaring it dead too early — retrying is the
 // recoverable direction, and the budget itself is still a §10.4 number to be
 // calibrated.
-func (c *LocalControlPlane) ReportVersionFailure(ctx context.Context, kbID string, versionID int64, class types.FailureClass, detail string) (bool, error) {
+func (c *LocalControlPlane) ReportVersionFailure(ctx context.Context, kbID string, versionID int64, side types.FailureSide, class types.FailureClass, detail string) (bool, error) {
 	c.mu.Lock()
-	key := failureKey(kbID, versionID)
+	key := sideFailureKey(kbID, versionID, side)
 	c.failures[key]++
 	count := c.failures[key]
 	budget := c.failureBudget
@@ -178,7 +184,7 @@ func (c *LocalControlPlane) ReportVersionFailure(ctx context.Context, kbID strin
 	if class != types.FailureFatalGlobal && count < budget {
 		return false, nil // still inside the budget: the next attempt may succeed
 	}
-	if err := c.rn.ProposeMarkVersionFailedPermanent(ctx, kbID, versionID, detail, count); err != nil {
+	if err := c.rn.ProposeMarkVersionFailedPermanent(ctx, kbID, versionID, side, detail, count); err != nil {
 		return false, fmt.Errorf("plane: ReportVersionFailure: mark version %d permanently failed: %w", versionID, err)
 	}
 	return true, nil
@@ -199,17 +205,29 @@ func (c *LocalControlPlane) SetFailureBudget(_ context.Context, kbID string, max
 	return nil
 }
 
-// failureKey namespaces the counter per knowledge base: version IDs are only
-// unique within one.
+// failureKey namespaces a (kbID, versionID) pair. Version IDs are only unique
+// within one knowledge base.
+//
+// It is shared by the failure counters, the §7.3 takeover timers, and the §10.6
+// cleanup queue — all three key off the same pair — which is why it takes no
+// side: the sides are a failure-counter concern only (see sideFailureKey).
 func failureKey(kbID string, versionID int64) string {
 	return kbID + "\x00" + strconv.FormatInt(versionID, 10)
 }
 
-// clearFailures drops the counter once a version succeeds, so a later,
-// unrelated failure starts from a fresh budget.
-func (c *LocalControlPlane) clearFailures(kbID string, versionID int64) {
+// sideFailureKey namespaces a FAILURE COUNTER per knowledge base, version, and
+// side. The data side and the index side fail independently, so their budgets
+// must not share a counter (Stratum_设计文档v13.md §10.1b).
+func sideFailureKey(kbID string, versionID int64, side types.FailureSide) string {
+	return failureKey(kbID, versionID) + "\x00" + side.String()
+}
+
+// clearFailures drops one side's counter once that side succeeds, so a later,
+// unrelated failure starts from a fresh budget. The other side's counter is left
+// alone: it is a different question with a different answer.
+func (c *LocalControlPlane) clearFailures(kbID string, versionID int64, side types.FailureSide) {
 	c.mu.Lock()
-	delete(c.failures, failureKey(kbID, versionID))
+	delete(c.failures, sideFailureKey(kbID, versionID, side))
 	c.mu.Unlock()
 }
 
@@ -227,7 +245,7 @@ func (c *LocalControlPlane) ReportDataDurable(ctx context.Context, kbID string, 
 	if err := c.rn.ProposeUpdateVersionSummary(ctx, versionID, digest); err != nil {
 		return err
 	}
-	c.clearFailures(kbID, versionID)
+	c.clearFailures(kbID, versionID, types.FailureSideData)
 	return nil
 }
 
@@ -240,8 +258,17 @@ func (c *LocalControlPlane) ReportDataDurable(ctx context.Context, kbID string, 
 // rolling cleanup has to consult. An unwired nodeID (0) records nothing, which
 // under-states that count — the safe direction: it can only make cleanup more
 // cautious.
-func (c *LocalControlPlane) ReportIndexReady(ctx context.Context, _ string, versionID int64) error {
-	return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, c.nodeID)
+//
+// A successful build also clears the INDEX side's failure counter: the side
+// that just succeeded is the one whose budget has been reset, and clearing only
+// that side is what keeps an index build's history from spending the data
+// side's retries (Stratum_设计文档v13.md §10.1b).
+func (c *LocalControlPlane) ReportIndexReady(ctx context.Context, kbID string, versionID int64) error {
+	if err := c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, c.nodeID); err != nil {
+		return err
+	}
+	c.clearFailures(kbID, versionID, types.FailureSideIndex)
+	return nil
 }
 
 // IndexReadyReplicaCount reports how many nodes OTHER than `except` have reported
@@ -317,15 +344,19 @@ func (c *LocalControlPlane) ReportEpoch(ctx context.Context, _ uint64, dataVersi
 	// the epoch itself becomes meaningful once the storage cluster keeps its own
 	// manifest (stage ④, v1 §5.3), and is accepted-and-ignored here.
 	//
-	// Only the index side promotes versions. IndexStatus.READY means "the index
-	// is queryable", and a data cursor alone does not establish that — which is
-	// exactly why §7.9 keeps the two sides separate. This startup snapshot only
-	// gets logged: the live cursor view is §7.13.4's periodic reports, read back
-	// through DataVersionHolders. Data-side state independent of index state is
-	// still §10.1's "each side owns its own terminal state" item, still to be done.
+	// Each half promotes its OWN side and nothing else (§7.9, §10.1b):
+	//
+	//   - the index half promotes an explicit version SET to READY, because
+	//     readiness is not monotonic in version order (§8.1) and a scalar could
+	//     not express it;
+	//   - the data half turns a reported cursor into DURABLE — see
+	//     promoteDurableData below. Keeping that in the data side is the point of
+	//     the split payload: a cursor alone must never make a version queryable,
+	//     so it may not touch IndexStatus.
 	for kbID, cursor := range dataVersions {
-		c.logger.Info("plane: ReportEpoch: storage-layer data cursor",
-			zap.String("kb_id", kbID), zap.Int64("cursor", cursor))
+		if err := c.promoteDurableData(ctx, kbID, cursor); err != nil {
+			return err
+		}
 	}
 
 	for kbID, readyIDs := range indexReadyVersions {
@@ -350,6 +381,44 @@ func (c *LocalControlPlane) ReportEpoch(ctx context.Context, _ uint64, dataVersi
 			if err := c.rn.ProposeUpdateVersionStatus(ctx, v.VersionID, types.IndexStatusReady, 0); err != nil {
 				return fmt.Errorf("plane: ReportEpoch: promote version %d to READY: %w", v.VersionID, err)
 			}
+		}
+	}
+	return nil
+}
+
+// promoteDurableData records the data side as durable for every version at or
+// below the reported cursor that the control layer still holds as PENDING
+// (Stratum_设计文档v13.md §10.1b; §7.9 owns the payload).
+//
+// The cursor is a scalar because the chain is linear: version numbering is dense
+// over the versions that still exist, so "at or below the cursor" is exactly
+// "durable" (§7.9). It is also conservative in the safe direction — the storage
+// layer reports the quorum MINIMUM of its replicas' cursors (§7.8), which can
+// only under-report, so the worst case is a version that stays PENDING until a
+// writer records it.
+//
+// Two filters carry real weight:
+//
+//   - the version must still EXIST: it comes from ListVersions, which is the
+//     authority on existence, while the cursor only answers "is the data here";
+//   - it must not be DELETING. A delete flow reclaims the data before it removes
+//     the metadata (§10.6), so inside that window a cursor can sit above a
+//     version whose bytes are already gone; calling that DURABLE would tell the
+//     cleanup path a version is alive when it is not.
+//
+// Only PENDING is promoted; the state machine enforces that too, so a replayed or
+// late report cannot undo a verdict.
+func (c *LocalControlPlane) promoteDurableData(ctx context.Context, kbID string, cursor int64) error {
+	versions, err := c.rn.ListVersions(ctx, kbID)
+	if err != nil {
+		return fmt.Errorf("plane: ReportEpoch: list versions of %s: %w", kbID, err)
+	}
+	for _, v := range versions {
+		if v.VersionID > cursor || v.Deleting || v.DataStatus != types.DataStatusPending {
+			continue
+		}
+		if err := c.rn.ProposeMarkVersionDataDurable(ctx, v.VersionID); err != nil {
+			return fmt.Errorf("plane: ReportEpoch: mark version %d data durable: %w", v.VersionID, err)
 		}
 	}
 	return nil

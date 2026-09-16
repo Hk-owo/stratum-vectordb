@@ -36,13 +36,17 @@ func (r *gcTestRaftNode) IsLeader() bool                                        
 func (r *gcTestRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64, opts ...raft.ProposeOption) (int64, error) {
 	return 0, nil
 }
-func (r *gcTestRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ string, _ int32) error {
+func (r *gcTestRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ types.FailureSide, _ string, _ int32) error {
 	return nil
 }
 
 func (r *gcTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, _ int64) error {
 	return nil
 }
+func (r *gcTestRaftNode) ProposeMarkVersionDataDurable(_ context.Context, _ int64) error {
+	return nil
+}
+
 func (r *gcTestRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {
 	return nil
 }

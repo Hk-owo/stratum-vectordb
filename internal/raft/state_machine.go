@@ -147,12 +147,27 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		// suddenly become queryable would be worse than the original failure.
 		// The check belongs here because the state machine knows the status
 		// deterministically, while a reporter only knows its own timing.
-		if v.IndexStatus == types.IndexStatusFailedPermanent || v.IndexStatus == types.IndexStatusReady {
+		//
+		// Both terminal sides settle the version: a DATA-side verdict means the
+		// data will never arrive, so a digest showing up afterwards is a stale
+		// replay or a bug, and neither should make the version queryable
+		// (Stratum_设计文档v13.md §10.1b).
+		if v.DataStatus == types.DataStatusFailedPermanent ||
+			v.IndexStatus == types.IndexStatusFailedPermanent ||
+			v.IndexStatus == types.IndexStatusReady {
 			return applyResult{}
 		}
 		v.DocIDSetHash = cmd.DocIDSetHash
+		// The writer commits this digest only after its own storage writes
+		// finished and a quorum confirmed them (ControlPlane.ReportDataDurable),
+		// so its arrival is exactly what makes the DATA side durable
+		// (Stratum_设计文档v13.md §10.1b).
+		v.DataStatus = types.DataStatusDurable
 		sm.versions[cmd.VersionID] = v
 		return applyResult{}
+
+	case cmdMarkDataDurable:
+		return sm.applyMarkDataDurable(cmd)
 
 	case cmdMarkVersionFailedPermanent:
 		return sm.applyMarkVersionFailedPermanent(cmd)
@@ -184,12 +199,41 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 	}
 }
 
-// applyMarkVersionFailedPermanent records the terminal state for a version:
-// the control layer has decided its Saga will not be retried automatically
-// (Stratum_设计文档v13.md §10.1). The storage layer only reports failures —
-// deciding when the budget is spent belongs to the control layer, and keeping
-// the verdict here (rather than in a node's memory) is what makes it
-// deterministic across replicas.
+// applyMarkDataDurable records the control layer's own promotion of a version's
+// DATA side to durable (Stratum_设计文档v13.md §10.1b).
+//
+// It is the startup reconcile's path: the storage layer reports a contiguous
+// cursor (§7.8's quorum minimum) and §7.9 turns it into replicated state. The
+// writer's own path is cmdUpdateVersionSummary, which commits the digest at the
+// same time; this one carries no digest because none was reported.
+//
+// Only a PENDING side moves. A version already DURABLE stays where it is, and a
+// version carrying a terminal data verdict is left alone — which is what keeps a
+// reconcile snapshot, by construction older than that verdict, from undoing it.
+func (sm *stateMachine) applyMarkDataDurable(cmd command) applyResult {
+	v, ok := sm.versions[cmd.VersionID]
+	if !ok {
+		return applyResult{Err: stratumerrors.ErrVersionNotFound}
+	}
+	if v.DataStatus != types.DataStatusPending {
+		return applyResult{}
+	}
+	v.DataStatus = types.DataStatusDurable
+	sm.versions[cmd.VersionID] = v
+	return applyResult{}
+}
+
+// applyMarkVersionFailedPermanent records the terminal state for ONE SIDE of a
+// version: the control layer has decided that side's Saga will not be retried
+// automatically (Stratum_设计文档v13.md §10.1, §10.1b). The storage layer only
+// reports failures — deciding when the budget is spent belongs to the control
+// layer, and keeping the verdict here (rather than in a node's memory) is what
+// makes it deterministic across replicas.
+//
+// The two sides have separate states and so separate verdicts: cmd.FailureSide
+// picks which one this command settles. Leaving the other side untouched is the
+// point — a version whose data never landed is not thereby a version whose
+// index failed, and an operator reading the metadata must be able to tell.
 //
 // Idempotent: re-applying overwrites the recorded reason and count, so a
 // replayed log entry converges instead of failing.
@@ -201,9 +245,18 @@ func (sm *stateMachine) applyMarkVersionFailedPermanent(cmd command) applyResult
 	if v.KBID != cmd.KBID {
 		return applyResult{Err: fmt.Errorf("version %d belongs to a different knowledge base: %w", cmd.VersionID, stratumerrors.ErrVersionNotFound)}
 	}
-	v.IndexStatus = types.IndexStatusFailedPermanent
+	switch cmd.FailureSide {
+	case types.FailureSideIndex:
+		v.IndexStatus = types.IndexStatusFailedPermanent
+	default:
+		v.DataStatus = types.DataStatusFailedPermanent
+	}
 	v.FailureReason = cmd.FailureReason
 	v.FailureCount = cmd.FailureCount
+	// Recorded, not inferred: a version can end up terminal on BOTH sides, and
+	// then only this field says which one the cause chain above describes
+	// (Stratum_设计文档v13.md §10.1b).
+	v.FailureSide = cmd.FailureSide
 	sm.versions[cmd.VersionID] = v
 	return applyResult{}
 }

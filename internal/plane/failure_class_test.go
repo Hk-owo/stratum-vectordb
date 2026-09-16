@@ -17,7 +17,7 @@ func TestLocalControlPlane_FatalFailureShortCircuitsTheBudget(t *testing.T) {
 	cp := NewLocalControlPlane(meta, WithFailureBudget(5))
 
 	terminal, err := cp.ReportVersionFailure(context.Background(), "kb-1", 7,
-		types.FailureFatalGlobal, "knowledge base is deleted")
+		types.FailureSideData, types.FailureFatalGlobal, "knowledge base is deleted")
 	if err != nil {
 		t.Fatalf("ReportVersionFailure: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestLocalControlPlane_TransientFailureStillCounts(t *testing.T) {
 
 	for i := 1; i <= 2; i++ {
 		terminal, err := cp.ReportVersionFailure(context.Background(), "kb-1", 7,
-			types.FailureTransient, "disk full")
+			types.FailureSideData, types.FailureTransient, "disk full")
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -793,6 +793,17 @@ func main() {
 	// live in the storage group, and it has no stores to pull them into.
 	if storageLocal && raftNode != nil {
 		raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
+			// §7.5: as of this apply the version EXISTS, whether or not this node
+			// ends up holding it. Telling the plane is what keeps its cursor
+			// honest — a version announced but not held blocks the cursor from
+			// stepping over it, so a lost push can no longer make this node claim
+			// an unbroken history it does not have.
+			//
+			// Announcing for EVERY applier (not only the ones that will fetch) is
+			// deliberate: the node that never receives the data is exactly the one
+			// that needs the gap recorded.
+			dataPlane.AnnounceVersion(kbID, versionID)
+
 			// §8.6b: only the active version is worth building eagerly — it is what
 			// ordinary queries hit. Every other version still gets its data (the
 			// data has to be here for the version to count as durable) but no
@@ -1098,14 +1109,27 @@ func (r replicaPusher) PushVersion(ctx context.Context, targetAddr, kbID string,
 }
 
 // reportIndexStatus maps an index build outcome onto the ControlPlane
-// contract: a finished build reports the index ready, a failed one reports the
-// version as unavailable (control-data-separation-design.md §4.2/§4.3).
+// contract: a finished build reports the index ready, a failed one reports a
+// failure on the INDEX side, which is where a build's retry budget and its
+// terminal verdict live (Stratum_设计文档v13.md §10.1, §10.1b).
+//
+// It deliberately no longer goes through ReportAvailability: that channel
+// describes the version's abstract availability, a different question from "did
+// this build fail". Routing build failures through it set a retryable FAILED
+// with no budget behind it — so nothing ever reached a verdict for the index
+// side, and a build that kept failing simply kept reporting.
 func reportIndexStatus(ctx context.Context, cp plane.ControlPlane, kbID string, versionID int64, status types.IndexStatus) error {
 	switch status {
 	case types.IndexStatusReady:
 		return cp.ReportIndexReady(ctx, kbID, versionID)
 	case types.IndexStatusFailed:
-		return cp.ReportAvailability(ctx, kbID, versionID, plane.AvailabilityUnavailable)
+		// The terminal flag is deliberately ignored: it means "the DATA side
+		// should reclaim its data". An index-side verdict reclaims nothing —
+		// the data may be perfectly durable, which is the whole reason the two
+		// sides are counted apart.
+		_, err := cp.ReportVersionFailure(ctx, kbID, versionID, types.FailureSideIndex,
+			types.FailureTransient, "index build failed")
+		return err
 	default:
 		return fmt.Errorf("index build reported unexpected status %v for version %d", status, versionID)
 	}

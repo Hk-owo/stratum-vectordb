@@ -607,6 +607,14 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 	syncFollower := sync.NewFollower(n.docStore, n.chunkDoc, n.versionDoc, n.chunkStore, n.indexMgr)
 	n.raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
 		ctx := context.Background()
+		// §7.5: the version EXISTS as of this apply, so the plane records that
+		// fact. A version this node ends up not holding then blocks its cursor
+		// instead of being stepped over — production wires the same call in
+		// cmd/stratum's apply hook, and without it this stack would keep
+		// exercising the old "highest version seen" behaviour rather than the
+		// real one.
+		n.indexDistributor.AnnounceVersion(kbID, versionID)
+
 		// The callback fires on every applier now, the writer included (§8.5),
 		// so a node that already holds the version has nothing to fetch. This
 		// is the test-stack equivalent of the data plane's cursor check, which

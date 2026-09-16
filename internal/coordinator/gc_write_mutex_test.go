@@ -122,13 +122,17 @@ func (r *gcWriteRaftNode) ListKnowledgeBases(_ context.Context) ([]types.Knowled
 	return out, nil
 }
 
-func (r *gcWriteRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ string, _ int32) error {
+func (r *gcWriteRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ types.FailureSide, _ string, _ int32) error {
 	return nil
 }
 
 func (r *gcWriteRaftNode) ProposeUpdateVersionStatus(_ context.Context, _ int64, _ types.IndexStatus, _ int64) error {
 	return nil
 }
+func (r *gcWriteRaftNode) ProposeMarkVersionDataDurable(_ context.Context, _ int64) error {
+	return nil
+}
+
 func (r *gcWriteRaftNode) ProposeUpdateVersionSummary(_ context.Context, _ int64, _ string) error {
 	return nil
 }

@@ -72,6 +72,79 @@ func (c FailureClass) String() string {
 	}
 }
 
+// FailureSide names which half of a version's Saga a failure belongs to.
+//
+// A version carries two independent states — its data (DataStatus) and its
+// index (IndexStatus) — so "this version failed" is not a complete statement.
+// The retry budget, the failure counter, and the terminal verdict all apply to
+// one side at a time: a version whose index build keeps failing must not spend
+// the budget its data write needs, and vice versa
+// (Stratum_设计文档v13.md §10.1, §10.1b).
+type FailureSide int
+
+const (
+	// FailureSideData is the default: the version's data never became durable.
+	//
+	// It is the zero value on purpose. Before the two sides were separated,
+	// every failure report came from the data write path, so a command written
+	// by an older build — which carries no side at all — replays as the data
+	// side, which is exactly what it was.
+	FailureSideData FailureSide = iota
+	// FailureSideIndex means the version's index never became serviceable.
+	FailureSideIndex
+)
+
+// String returns a human-readable name, primarily for logging.
+func (s FailureSide) String() string {
+	switch s {
+	case FailureSideData:
+		return "data"
+	case FailureSideIndex:
+		return "index"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// DataStatus is the storage-layer state of a version's DATA, kept independent
+// of its index state (Stratum_设计文档v13.md §10.1b).
+//
+// The two are tracked apart because they fail apart: a version whose data is
+// durable may still have no working index, and a failed index build says
+// nothing about whether the data landed. Before this existed the two shared
+// one field, and the data side's terminal verdict was recorded as an INDEX
+// state — the inverse of what that field means.
+type DataStatus int
+
+const (
+	// DataStatusPending means the version's metadata is allocated and the
+	// storage-layer write is still in flight. This is what "PENDING" always
+	// described; it was never the index's state.
+	DataStatusPending DataStatus = iota
+	// DataStatusDurable means a quorum of replicas has confirmed the version's
+	// data durable (ControlPlane.ReportDataDurable).
+	DataStatusDurable
+	// DataStatusFailedPermanent is the data side's terminal verdict: the retry
+	// budget is spent, or the failure was globally fatal, so the data will
+	// never be written. Like the index side's, nothing re-triggers it — only an
+	// operator can retry or abandon the version (Stratum_设计文档v13.md §10.1).
+	DataStatusFailedPermanent
+)
+
+// String returns a human-readable name for the status, primarily for logging.
+func (s DataStatus) String() string {
+	switch s {
+	case DataStatusPending:
+		return "DATA_PENDING"
+	case DataStatusDurable:
+		return "DATA_DURABLE"
+	case DataStatusFailedPermanent:
+		return "DATA_FAILED_PERMANENT"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // KBStatus represents the lifecycle status of a knowledge base.
 type KBStatus int
 
@@ -157,6 +230,14 @@ type VersionMeta struct {
 	// Not required to be strictly monotonic across nodes.
 	IndexStatus IndexStatus
 
+	// DataStatus is this version's DATA-side state, kept independent of
+	// IndexStatus (Stratum_设计文档v13.md §10.1b). The two are tracked apart
+	// because they fail apart: a version whose data is durable may still have
+	// no working index, and a failed index build says nothing about whether the
+	// data landed. Before this field existed, the data side's terminal verdict
+	// was recorded in IndexStatus.
+	DataStatus DataStatus
+
 	// IndexReadyNodes records WHICH nodes have reported this version's index
 	// built and serviceable (ReportIndexReady), sorted and deduplicated.
 	//
@@ -191,6 +272,13 @@ type VersionMeta struct {
 	// FailureCount is how many attempts failed before that verdict, so the
 	// cause stays auditable after the fact.
 	FailureCount int32
+
+	// FailureSide is WHICH half of the version that verdict settled
+	// (Stratum_设计文档v13.md §10.1b). The two sides carry independent states and
+	// therefore independent verdicts, so "the version failed" is not a complete
+	// statement without it — and the reason chain above belongs to whichever side
+	// this names.
+	FailureSide FailureSide
 
 	// Deleting marks the version as being removed asynchronously (the
 	// DeleteVersion flow). Set by cmdMarkVersionDeleting; while true the
