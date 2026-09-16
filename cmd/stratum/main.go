@@ -954,7 +954,13 @@ func main() {
 	// asks every candidate replica whether it holds a version whose data may
 	// never have landed, and surfaces the ones nobody has.
 	// These read the local stores by construction, so only a node holding data
-	// can build them. A control node answers neither.
+	// can build them. A control node answers neither — with one exception, below.
+	//
+	// AdminService is registered on both shapes now, because its surface is not
+	// uniform: the store-reading calls belong to a node that holds data, while
+	// GetClusterStatus reads the Raft view and belongs to the node that owns it.
+	// Registering it here alone left GetClusterStatus unreachable, which is what
+	// broke the storage layer's cursor reporter (see control_admin.go).
 	if storageLocal {
 		presenceChecker := stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{})
 		querySvc := service.NewQueryService(rn, indexMgr, cdm, vd, ds, vBloomStore)
@@ -989,6 +995,15 @@ func main() {
 		adminSvc.SetGCPressureReporter(indexMgr)
 		pb.RegisterQueryServiceServer(grpcServer, querySvc)
 		pb.RegisterAdminServiceServer(grpcServer, adminSvc)
+	} else {
+		// A node without stores answers Unimplemented for every admin call that
+		// reads them — but GetClusterStatus it answers in full, because the Raft
+		// view lives only here. Without this registration a storage node cannot
+		// resolve the control leader at all: every cursor report fails with
+		// "Unimplemented: unknown service stratum.AdminService", so §7.13.4's
+		// report never leaves the node, and the chain tails (lag catch-up), the
+		// holder view and the station's read routing go with it.
+		pb.RegisterAdminServiceServer(grpcServer, newControlAdminService(cfg.NodeID, rn))
 	}
 
 	// One data-plane service per node: it both exports versions to peers (the
