@@ -312,15 +312,18 @@ func (s *AdminServiceImpl) RebuildIndex(ctx context.Context, req *pb.RebuildInde
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
+	// Register the request with the retention policy BEFORE triggering the build.
+	// An explicit rebuild is "this version is wanted here, now", and the version
+	// is normally outside the newest-N window — that is why someone had to
+	// rebuild it. The order matters: builds are asynchronous, and a small one can
+	// finish — running the post-build retention pass — before the registration
+	// would have executed, leaving the artifact unprotected at the exact moment
+	// it is freshest.
+	s.indexManager.RecordInterest(req.KnowledgeBaseId, req.VersionId)
+
 	if err := s.indexManager.TriggerBuild(ctx, req.KnowledgeBaseId, req.VersionId); err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
-
-	// Register the request with the retention policy: an explicit rebuild is
-	// "this version is wanted here, now", and without it the artifact it builds
-	// is dropped by the next retention pass (the version is normally outside the
-	// newest-N window — that is why someone had to rebuild it).
-	s.indexManager.RecordInterest(req.KnowledgeBaseId, req.VersionId)
 
 	return &pb.RebuildIndexResponse{Success: true}, nil
 }
@@ -336,13 +339,15 @@ func (s *AdminServiceImpl) WarmupVersion(ctx context.Context, req *pb.WarmupVers
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
+	// Same as RebuildIndex — warming a version up is asking the node to keep it
+	// ready, so the retention policy must not drop the artifact afterwards — and
+	// for the same reason the registration goes first: the build it starts is
+	// asynchronous, so the shield has to be on disk before that build can finish.
+	s.indexManager.RecordInterest(req.KnowledgeBaseId, req.VersionId)
+
 	if err := s.indexManager.TriggerBuild(ctx, req.KnowledgeBaseId, req.VersionId); err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
-
-	// Same as RebuildIndex: warming a version up is asking the node to keep it
-	// ready, so the retention policy must not drop the artifact afterwards.
-	s.indexManager.RecordInterest(req.KnowledgeBaseId, req.VersionId)
 
 	return &pb.WarmupVersionResponse{Success: true}, nil
 }
