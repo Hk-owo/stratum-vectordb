@@ -812,11 +812,16 @@ func main() {
 	// (control-data-separation-design.md §5.3/§7). Retention runs first so the
 	// reconcile sees post-retention disk facts.
 	// Both halves are about on-disk index facts this node is assumed to have.
+	//
+	// epochDurable is the durable set the reconcile established here. The §7.9
+	// payload is published from it later — after the gRPC server is up, not here;
+	// see reportEpochWhenPeersAreUp.
+	var epochDurable []plane.VersionRef
 	if storageLocal {
 		if err := dataPlane.EnforceRetention(ctx, rn); err != nil {
 			logger.Warn("index retention: ListKnowledgeBases failed", zap.Error(err))
 		}
-		reconcileIndexStatus(ctx, logger, dataPlane, controlPlane, rn, cfg.IndexRetentionCount)
+		epochDurable = reconcileIndexStatus(ctx, logger, dataPlane, controlPlane, rn, cfg.IndexRetentionCount)
 	}
 
 	// §10.6: a cleanup broadcast that failed is retried in the background, so
@@ -1118,6 +1123,15 @@ func main() {
 	}).Run(ctx)
 
 	logger.Info("Stratum gRPC server listening", zap.String("addr", cfg.GRPCAddr))
+
+	// §7.9: publish the epoch payload now that this node is serving. It cannot be
+	// done during the reconcile above, because the payload's data side is a quorum
+	// claim and every storage node is still inside its own reconcile at that
+	// point — none of them serves until that returns, so each one sees only itself
+	// and the claim fails for every knowledge base at once. The helper retries,
+	// since "this node is serving" does not imply "its peers are".
+	go reportEpochWhenPeersAreUp(ctx, logger, dataPlane, controlPlane, epochDurable)
+
 	if err := grpcServer.Serve(lis); err != nil {
 		logger.Fatal("gRPC server failed", zap.Error(err))
 	}
@@ -1295,7 +1309,7 @@ func runCrashRecovery(
 // function walked local disks and proposed status itself — see
 // control-data-separation-design.md §5.3/§7 and the decision table at the
 // call site.
-func reconcileIndexStatus(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPlane, cp plane.ControlPlane, meta plane.MetadataLister, retentionCount int) {
+func reconcileIndexStatus(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPlane, cp plane.ControlPlane, meta plane.MetadataLister, retentionCount int) []plane.VersionRef {
 	// §7.8: the contiguous cursor lives in memory, so a restarted node would
 	// answer "0" for every knowledge base — data complete, index on disk, and
 	// every query refused by the station's freshness check (§9.3(2)) until a
@@ -1309,18 +1323,38 @@ func reconcileIndexStatus(ctx context.Context, logger *zap.Logger, dp *plane.Loc
 	durable, err := dp.ReconcileIndexes(ctx, meta, retentionCount)
 	if err != nil {
 		logger.Warn("index reconcile: storage-layer reconcile failed", zap.Error(err))
-		return
+		return nil
 	}
 
-	// §7.8: the contiguous cursor lives in memory, so a restarted node starts
-	// from nothing and cannot tell how far behind it is. What it may claim
-	// durable is therefore bounded by what a quorum of its peers still reports
-	// holding. Without a replica set the local view stands — there is nobody to
-	// disagree with.
-	//
-	// §7.9: the payload keeps the two sides separate — a scalar cursor per KB
-	// for the data side (linearization makes a scalar sufficient), an explicit
-	// version set for the index side (readiness cannot be collapsed).
+	// The §7.9 epoch payload is deliberately NOT published here. Its index side is
+	// local, but its data side is a quorum claim, and at this point in startup no
+	// storage node is serving yet — see reportEpoch. What this function can
+	// establish on its own is the durable set, and the caller hands it over once
+	// the node is up.
+	return durable
+}
+
+// reportEpoch publishes the §7.9 payload (one data cursor per knowledge base plus
+// the explicit index-ready set) and returns how many knowledge bases it had to
+// leave out because no quorum could be established.
+//
+// The two sides have different needs, which is why the payload goes out after the
+// node is serving rather than during reconcile:
+//
+//   - the INDEX side is local — the durable set ReconcileIndexes just produced.
+//   - the DATA side is a quorum claim (SafeDurableVersion). During startup every
+//     storage node is still inside its own reconcile, and none of them reaches
+//     grpcServer.Serve until that returns, so each one sees only itself, the claim
+//     fails for every knowledge base at once, and the whole data side is dropped.
+//     Measured before this change: 15 "no quorum for a durable claim" lines over
+//     56 seconds, with "Stratum gRPC server listening" landing 0.4 ms after the
+//     last one. Every version then sat at DATA_STATUS_PENDING, which in turn made
+//     cursor recovery overclaim a node's position — see
+//     docs/active-lag-detection-design.md.
+func reportEpoch(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPlane, cp plane.ControlPlane, durable []plane.VersionRef) int {
+	// §7.9: the payload keeps the two sides separate — a scalar cursor per KB for
+	// the data side (linearization makes a scalar sufficient), an explicit version
+	// set for the index side (readiness cannot be collapsed).
 	//
 	// One cursor query per knowledge base, not per version.
 	cursors := make(map[string]int64)
@@ -1333,10 +1367,10 @@ func reconcileIndexStatus(ctx context.Context, logger *zap.Logger, dp *plane.Loc
 			safe, ok, err := dp.SafeDurableVersion(ctx, ref.KBID)
 			switch {
 			case err != nil:
-				// No quorum means no safe claim. Reporting the local view
-				// anyway is precisely the "control layer runs ahead of the
-				// data" failure the epoch exists to prevent.
-				logger.Warn("index reconcile: no quorum for a durable claim; skipping this knowledge base",
+				// No quorum means no safe claim. Reporting the local view anyway is
+				// precisely the "control layer runs ahead of the data" failure the
+				// epoch exists to prevent.
+				logger.Warn("index reconcile: no quorum for a durable claim; leaving this knowledge base out of the payload",
 					zap.String("kb_id", ref.KBID), zap.Error(err))
 				skipKB[ref.KBID] = true
 			case ok:
@@ -1356,6 +1390,48 @@ func reconcileIndexStatus(ctx context.Context, logger *zap.Logger, dp *plane.Loc
 	// close yet (the storage cluster keeps its own manifest in stage ④).
 	if err := cp.ReportEpoch(ctx, 0, cursors, indexReady); err != nil {
 		logger.Warn("index reconcile: ReportEpoch failed", zap.Error(err))
+	}
+	return len(skipKB)
+}
+
+const (
+	// epochReportRetryInterval is how long to wait between attempts to publish a
+	// payload that quorum was not ready for yet.
+	epochReportRetryInterval = 3 * time.Second
+	// epochReportRetryWindow bounds the retrying. Peers come up within seconds of
+	// each other; a peer that is still not serving after this long is a different
+	// problem, and the log line below is the evidence for it.
+	epochReportRetryWindow = 60 * time.Second
+)
+
+// reportEpochWhenPeersAreUp publishes the payload once quorum can actually be
+// established, retrying the knowledge bases that had none.
+//
+// Retrying is the point: "this node is serving" does not imply "its peers are" —
+// the nodes still start concurrently, so the first one to get here can find every
+// peer inside its own reconcile. Giving up quietly would leave the data side
+// unpublished for the whole life of the process, which is exactly the failure this
+// replaces.
+func reportEpochWhenPeersAreUp(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPlane, cp plane.ControlPlane, durable []plane.VersionRef) {
+	deadline := time.Now().Add(epochReportRetryWindow)
+	for {
+		skipped := reportEpoch(ctx, logger, dp, cp, durable)
+		if skipped == 0 {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			logger.Warn("index reconcile: epoch payload stayed incomplete; the data side is unpublished for these knowledge bases",
+				zap.Int("knowledge_bases", skipped))
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(epochReportRetryInterval):
+		}
 	}
 }
 

@@ -448,7 +448,11 @@ func TestReconcileIndexStatus(t *testing.T) {
 	// policy), the control layer reconciles its statuses against it.
 	dp := plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{IndexManager: im})
 	cp := plane.NewLocalControlPlane(rn)
-	reconcileIndexStatus(ctx, logger, dp, cp, rn, 0)
+	// The §7.9 payload is published in two steps now: the reconcile above
+	// establishes the durable set, reportEpoch turns it into the payload. It is
+	// split because the payload's data side is a quorum claim — see main.go.
+	durable := reconcileIndexStatus(ctx, logger, dp, cp, rn, 0)
+	reportEpoch(ctx, logger, dp, cp, durable)
 
 	if got := rn.proposed[2]; got != types.IndexStatusReady {
 		t.Errorf("version 2 (PENDING+exists) proposed = %v, want READY", got)
