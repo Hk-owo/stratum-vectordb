@@ -2172,6 +2172,42 @@ func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string,
 		return fmt.Errorf("index: EnforceDiskRetention(%s): read dir: %w", kbID, err)
 	}
 
+	// Orphaned sidecars first: a `<v>.index.used` or `<v>.index.mem` whose
+	// `<v>.index` is gone. The drop loop below walks artifacts, so it can never
+	// reach them — a version whose artifact was lost (an interrupted install, a
+	// manual delete, a botched partial write) leaves its sidecars behind for
+	// good, and nothing else in the retention path ever looks at them.
+	//
+	// Only these two suffixes. saveToDisk and recordInterestNow write them AFTER
+	// the index is in place, whereas InstallIndex writes the `.ids` pair BEFORE
+	// the index — so a `.ids` without its index is a normal in-flight state, not
+	// garbage, and must be left alone. (That one is §8.8's business, not
+	// retention's.)
+	withIndex := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if name := e.Name(); strings.HasSuffix(name, ".index") {
+			withIndex[strings.TrimSuffix(name, ".index")] = true
+		}
+	}
+	for _, e := range entries {
+		name := e.Name()
+		var base string
+		switch {
+		case strings.HasSuffix(name, ".index.used"):
+			base = strings.TrimSuffix(name, ".index.used")
+		case strings.HasSuffix(name, ".index.mem"):
+			base = strings.TrimSuffix(name, ".index.mem")
+		default:
+			continue
+		}
+		if withIndex[base] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("index: EnforceDiskRetention(%s): remove orphan sidecar %s: %w", kbID, name, err)
+		}
+	}
+
 	protected := make(map[int64]bool, len(protectedIDs))
 	for _, id := range protectedIDs {
 		protected[id] = true

@@ -364,6 +364,8 @@ go test ./internal/plane/ -run PushIndexToReplicas -race   # 并发闸门的用�
 
 - `ReconcileIndexes` 的"窗口"改为按**磁盘上实际有产物的版本集合**计算（新增纯函数 `retentionCutoffOf`），与 `EnforceDiskRetention`（数 `.index` 文件）同口径。此前它按控制层版本集合算，会把从未落盘的版本误判成"策略丢弃"——而 retention 分支排在 `PENDING`/active 分支**之前**，误判意味着**拒绝补建**（老 PENDING 写入、回滚后的 active 版本都会中招，而 `EnforceDiskRetention` 在磁盘上恰恰把 active 盾住）。
 - 测试：`TestReconcileIndexes_WindowFollowsArtifactsNotTheVersionSet`（带一条"前提守卫"，防止它退化成恒真测试）、`TestRetentionCutoffOf`。
+- **孤儿 sidecar 也一并清了**：`EnforceDiskRetention` 的删除循环是**从 `.index` 出发**的，所以一个产物已丢失的版本，它的 `<v>.index.used` / `<v>.index.mem` 永远进不了那个循环——实测两轮 retention 都不动它。现在同一趟先扫一遍这两类孤儿（有 `.index` 就留，没有就删）。**只清这两种后缀**：`saveToDisk` 与 `recordInterestNow` 都在 `.index` 之后写它们，而 `InstallIndex` 是**先写 `.ids` 后写 `.index`**，所以"有 `.ids` 没 `.index`"是正常的安装中间态，不能当垃圾（那属于 §8.8）。测试：`TestIndexManager_RetentionClearsOrphanedSidecars`。
+- 注意一条**反直觉的结论**（核实过）：`retentionCutoffOf` 并不需要把 `.used` 盾算进去。盾保护的产物留在磁盘上 → 产物集合更大 → cutoff 更小 → 判定反而更宽松；盾的效果已经通过"数产物"间接进入了窗口。而孤儿 `.used` 也不占 shield 名额（`accessProtectedIDs` 只遍历磁盘上的候选）。
 
 ### `IndexRetentionCount` 默认值怎么标定
 

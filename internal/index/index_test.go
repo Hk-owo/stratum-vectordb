@@ -2529,3 +2529,53 @@ func TestIndexManager_InstallIndexShieldsArtifactOnDisk(t *testing.T) {
 		t.Fatalf("installing an artifact must leave the .used shield on disk, got: %v", err)
 	}
 }
+
+// A version whose artifact is gone can leave its sidecars behind. The drop loop
+// walks artifacts, so a `.index.used` (or `.index.mem`) with no `.index` beside it
+// is never reached by it — which is how a lost artifact turns into a sidecar that
+// outlives it forever. Retention clears those orphans in the same pass.
+//
+// The `.ids` file is a different animal and must survive: InstallIndex writes the
+// pair BEFORE the index, so an ids-without-index is a normal in-flight install,
+// not garbage.
+func TestIndexManager_RetentionClearsOrphanedSidecars(t *testing.T) {
+	dir := t.TempDir()
+	kbDir := seedIndexFiles(t, dir, "kb-1", 1, 2)
+
+	// Version 9's artifact is gone; its sidecars are not.
+	for _, suffix := range []string{".index.used", ".index.mem", ".index.ids"} {
+		if err := os.WriteFile(filepath.Join(kbDir, "9"+suffix), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write 9%s: %v", suffix, err)
+		}
+	}
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           dir,
+		IndexRetentionCount:    2, // as many artifacts as exist: nothing is dropped
+		RetentionProtectWindow: time.Hour,
+	})
+	im.vectorIndexClient = newMockVectorIndexClient()
+
+	if err := im.EnforceDiskRetention(context.Background(), "kb-1", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention: %v", err)
+	}
+
+	for _, suffix := range []string{".index.used", ".index.mem"} {
+		if _, err := os.Stat(filepath.Join(kbDir, "9"+suffix)); !os.IsNotExist(err) {
+			t.Errorf("orphaned 9%s must be cleared by retention, stat err: %v", suffix, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(kbDir, "9.index.ids")); err != nil {
+		t.Errorf("a .ids without its index is an in-flight install, not garbage: %v", err)
+	}
+	// Sidecars of versions that DO have artifacts stay untouched.
+	for _, base := range []string{"1", "2"} {
+		for _, suffix := range []string{".index", ".index.ids", ".index.mem"} {
+			if _, err := os.Stat(filepath.Join(kbDir, base+suffix)); err != nil {
+				t.Errorf("version %s%s must survive retention: %v", base, suffix, err)
+			}
+		}
+	}
+}
