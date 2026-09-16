@@ -203,6 +203,21 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 	// — an unwired or disabled sink simply does nothing
 	// (docs/active-lag-detection-design.md).
 	if r.chainTails != nil {
+		// What actually crossed the wire. "The report did not land" and "it landed
+		// carrying nothing" look identical from outside and mean opposite things: the
+		// first says the leader never heard us, the second says it did and had no tail
+		// to give. Both counts are needed to tell them apart, because a report naming
+		// zero knowledge bases cannot carry a tail at all — the leader only fills
+		// tails for the knowledge bases the reporter names.
+		//
+		// dataVersions is read again here rather than kept from the request: this is
+		// diagnostic, and a second read of the same node-local map is close enough.
+		if r.logger != nil {
+			r.logger.Debug("sync: data-version report landed",
+				zap.Int("reported_kbs", len(r.dataVersions())),
+				zap.Int("chain_tails", len(resp.GetChainTails())),
+				zap.Int("reclaimable", len(resp.GetReclaimable())))
+		}
 		r.chainTails.SetChainTails(resp.GetChainTails())
 	}
 	return nil

@@ -43,7 +43,11 @@
 - 所以这里保留判据修复（"宁可拒绝，不可交错答案"是设计选定的方向），时序这条也已修掉；fan-out 那句的真相是状态机，不再是独立问题。
 
 第 1 条（判据）、第三条（时序）与 fan-out 那句（状态机）都已修并验证：`epoch payload published` 现在带出 **15 个知识库的数据侧游标**（修复前 0 个 + 15 条 `no quorum`），且 `digest dropped` 为 0。**再用字段值直接坐实**（经 station 读 `VersionInfo.data_status`）：修复后写入的版本是 `INDEX_STATUS_READY` + `DATA_STATUS_DURABLE`，同一批知识库里修复前写入的前一个版本则是 `INDEX_STATUS_READY` + `DATA_STATUS_PENDING`——"索引就绪"与"数据持久"是两个独立事实，这是它第一次真正显形；全库 **434 个版本 DURABLE**。历史版本仍停在 PENDING 是预期的：它们的 digest 已被丢弃，补不回来（`promoteDurableData` 用的游标是刻意保守的）。
-第 2 条（链尾没到 reporter）仍开着——它是 lag catch-up 本身还差的最后一步。另注意启动期 `ReconcileIndexes` 拿到的 durable 集合是空的（`knowledge_bases: 0`，那一刻磁盘上还没有产物），所以 §7.9 的**索引侧**链路还没有被真实验证过；运行中的索引链路是好的（所有版本都到过 READY）。
+第 2 条（链尾没到 reporter）也修掉了，根因不在 lag catch-up 本身，而在它上游：**控制节点不注册 `AdminService`**（`main.go` 的注册在 `if storageLocal` 内），而 storage 侧 reporter 的 `ResolveLeader` 走的正是 `AdminService.GetClusterStatus`（storage 节点上 `rn` 是 `RemoteRaftNode`，要通过 gRPC 读控制组），于是每一次上报都以 `Unimplemented: unknown service stratum.AdminService` 失败——`SetChainTails` 从未被执行过。修法按最小改动：新增只实现 `GetClusterStatus` 的 `controlAdminService`（其余方法交给嵌入的 `UnimplementedAdminServiceServer`），注册改成 if/else。**验证**：`did not land` 与 `Unimplemented` 双双归零，而 `lag_catchup.go:120` 的 debug 从 **0 次变为持续出现**——那条只在 `SetChainTails` 真被执行时才可能打；写一个版本后 `data-version report landed` 报 **`reported_kbs:2, chain_tails:2, reclaimable:2`**，`lag_catchup.go:146` 报 **`tails_received:2` / `nothing behind the chain tail`**。即信号真的带着尾巴到达了 sink，并做出了"没有落后"的正确判断（刚写完数据）。这条上报同时喂着 `dataVersionRegistry` 和 station 的读路由（`SetVersionHolderSource`），所以它此前一直是三者共同的上游断点。
+
+另一条更早的错误结论值得记下：我曾据 `no chain tails` 判断"信号到达但为空"，那是对的，但随后又据一次写入后 `grep -c` 仍是 62 推断"写入也不管用"——那是我数了**全历史总数**而没有按时间分段，方法错了，不是代码的问题。分时间看（`tails_received`）才看清。
+
+注意启动期 `ReconcileIndexes` 拿到的 durable 集合仍是空的（`knowledge_bases: 0`，那一刻磁盘上还没有产物），所以 §7.9 的**索引侧**链路还没有被真实验证过；运行中的索引链路是好的（所有版本都到过 READY）。
 
 ---
 
