@@ -1379,7 +1379,24 @@ func (d *LocalDataPlane) ResumeVersionWrite(ctx context.Context, kbID string, ve
 // only costs followers a best-effort pull, and a failed build can be retried.
 func (d *LocalDataPlane) reportAndSchedule(ctx context.Context, kbID string, versionID int64, docIDs []string) {
 	if d.control != nil {
-		_ = d.control.ReportDataDurable(ctx, kbID, versionID, stratinternalsync.ComputeDocIDSetHash(docIDs))
+		digest := stratinternalsync.ComputeDocIDSetHash(docIDs)
+		if err := d.control.ReportDataDurable(ctx, kbID, versionID, digest); err != nil {
+			// This used to be discarded (`_ =`), and the silence is expensive: with no
+			// digest the version carries no evidence of having been durably
+			// replicated, so cursor recovery reads it as "not held here"
+			// (holdsVersionLocally) and the data side never leaves PENDING.
+			// Measured on a 3-node cluster: not one version reached DATA_DURABLE, while
+			// fan-out itself never failed — so whatever goes wrong, it goes wrong
+			// here.
+			d.logger.Warn("plane: reporting the version's digest failed; it keeps no durable digest",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		} else {
+			d.logger.Debug("plane: reported the version's digest",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("docs", len(docIDs)))
+		}
+	} else {
+		d.logger.Debug("plane: no control plane wired; the version's digest is not reported",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
 	}
 	d.scheduleIndexBuild(ctx, kbID, versionID)
 }

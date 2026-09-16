@@ -148,13 +148,26 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		// The check belongs here because the state machine knows the status
 		// deterministically, while a reporter only knows its own timing.
 		//
-		// Both terminal sides settle the version: a DATA-side verdict means the
-		// data will never arrive, so a digest showing up afterwards is a stale
-		// replay or a bug, and neither should make the version queryable
-		// (Stratum_设计文档v13.md §10.1b).
+		// "Settled" is judged on the DATA side only. IndexStatusReady must NOT be
+		// consulted here, for the same reason the two sides are separate states at
+		// all: an index reaches READY on every replica that builds it — with a small
+		// knowledge base that takes milliseconds, and fan-out has just handed the
+		// documents over — while the writer's digest proposal is still travelling
+		// through Raft. Reading "index is READY" as "this version is settled, drop
+		// the digest" therefore discards the very confirmation that would have made
+		// the data durable, on a version that is perfectly healthy. Measured on a
+		// 3-node cluster: fan-out never failed and every digest proposal was
+		// accepted, yet not one version reached DATA_DURABLE — the confirmation was
+		// dropped here every time.
+		//
+		// (IndexStatusFailedPermanent stays: that verdict retires the whole version,
+		// not merely its index.)
 		if v.DataStatus == types.DataStatusFailedPermanent ||
-			v.IndexStatus == types.IndexStatusFailedPermanent ||
-			v.IndexStatus == types.IndexStatusReady {
+			v.IndexStatus == types.IndexStatusFailedPermanent {
+			logger.Debug("raft: digest dropped, the version is retired",
+				zap.Int64("version_id", cmd.VersionID),
+				zap.String("data_status", v.DataStatus.String()),
+				zap.String("index_status", v.IndexStatus.String()))
 			return applyResult{}
 		}
 		v.DocIDSetHash = cmd.DocIDSetHash

@@ -110,3 +110,51 @@ func TestStateMachine_DataDurableSurvivesSnapshot(t *testing.T) {
 		t.Errorf("restored data status = %v, want DATA_DURABLE", got.DataStatus)
 	}
 }
+
+// A digest that arrives AFTER the version's index reached READY must still be
+// committed. Index readiness is not a data-side verdict, and it is not even about
+// this node: IndexStatus lives in the replicated metadata, so ANY replica
+// finishing its build flips it — for a small knowledge base milliseconds after
+// fan-out handed the documents over, while the writer's digest is still
+// travelling through Raft.
+//
+// Treating that as "settled, drop the digest" therefore threw away the one
+// confirmation that makes the data durable, on a perfectly healthy version.
+// Measured on a 3-node cluster: fan-out never failed and every proposal was
+// accepted, yet not one version reached DATA_DURABLE.
+func TestStateMachine_DigestArrivingAfterIndexReadyStillCommits(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := context.Background()
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
+	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
+	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+
+	sm.apply(ctx, command{Type: cmdUpdateVersionSummary, VersionID: v.VersionID, DocIDSetHash: "digest-after-ready"}, w, zap.NewNop())
+
+	got := sm.versions[v.VersionID]
+	if got.DocIDSetHash != "digest-after-ready" {
+		t.Errorf("digest = %q, want it committed even though the index is READY", got.DocIDSetHash)
+	}
+	if got.DataStatus != types.DataStatusDurable {
+		t.Errorf("data status = %v, want DATA_DURABLE — the digest is the data side's evidence", got.DataStatus)
+	}
+}
+
+// The DATA side's terminal verdict still settles the version: a digest arriving
+// after DATA_FAILED_PERMANENT must not quietly make it durable again.
+func TestStateMachine_DigestAfterDataFailedPermanentIsDropped(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := context.Background()
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
+	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
+	sm.apply(ctx, command{
+		Type: cmdMarkVersionFailedPermanent, KBID: "kb-1", VersionID: v.VersionID,
+		FailureSide: types.FailureSideData, FailureReason: "test",
+	}, w, zap.NewNop())
+
+	sm.apply(ctx, command{Type: cmdUpdateVersionSummary, VersionID: v.VersionID, DocIDSetHash: "late"}, w, zap.NewNop())
+
+	if got := sm.versions[v.VersionID]; got.DocIDSetHash != "" {
+		t.Errorf("digest = %q, want it dropped: the data side is already retired", got.DocIDSetHash)
+	}
+}

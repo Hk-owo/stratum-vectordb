@@ -1391,6 +1391,14 @@ func reportEpoch(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPla
 	if err := cp.ReportEpoch(ctx, 0, cursors, indexReady); err != nil {
 		logger.Warn("index reconcile: ReportEpoch failed", zap.Error(err))
 	}
+	// Report what went out. Without this line the only thing visible is the
+	// absence of a warning, which cannot be told apart from "never ran" — and the
+	// data side of this payload is what moves versions to DATA_DURABLE
+	// (promoteDurableData), so an empty cursor set is a silent outage.
+	logger.Info("index reconcile: epoch payload published",
+		zap.Int("knowledge_bases", len(indexReady)),
+		zap.Int("cursors", len(cursors)),
+		zap.Int("skipped_no_quorum", len(skipKB)))
 	return len(skipKB)
 }
 
