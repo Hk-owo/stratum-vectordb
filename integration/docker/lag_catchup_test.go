@@ -250,26 +250,26 @@ func lagCatchupTimeout() time.Duration {
 // The cluster must be built with LAG_CATCHUP_ENABLED=true (scripts/docker-cluster-both.sh
 // reads it, and LOG_LEVEL=debug makes the scheduler's decisions visible).
 //
-// SKIPPED, not passing: run against a real 3-node cluster it fails, and the failure is
-// in two pieces of machinery this case sits on, not in the catch-up itself (the unit
-// tests cover that, including a real gRPC round trip):
+// SKIPPED_FIXED: the two prerequisites this case was blocked on are both repaired.
 //
-//  1. `RecoverLocalCursors` hands a returning node a cursor equal to the CHAIN TAIL —
-//     measured: a node that was offline for 55 versions came back reporting cursor
-//     405 of 405. The recovery reads the replicated metadata, so "the control layer
-//     knows version 405" is taken as "this node holds 405". Until that is sorted out,
-//     a lagging node does not look lagging, and the trigger has nothing to fire on.
-//  2. The chain tails never reached the reporter: `ChainTail` was invoked zero times
-//     on the leader, and the scheduler logged zero signals. That is wiring in the real
-//     cluster, which the unit tests stub out.
+//  1. `RecoverLocalCursors` handed a returning node a cursor equal to the CHAIN TAIL,
+//     because the third condition of holdsVersionLocally read the INDEX side
+//     (IndexStatus == READY) as evidence about the DATA side — while fan-out
+//     deliberately withholds the digest without quorum, so an index could be READY on
+//     a node that holds no data. It now reads DataStatus, and is conservative by
+//     design: a version whose records are complete but whose index was never built
+//     here is reported as "not held".
+//  2. The chain tails never reached the reporter because a CONTROL node does not
+//     register AdminService, and the storage side resolves the leader through
+//     AdminService.GetClusterStatus (its `rn` is a RemoteRaftNode). Every report died
+//     with "Unimplemented: unknown service stratum.AdminService", so SetChainTails was
+//     never reached. Fixed by registering a control-side admin service that answers
+//     GetClusterStatus.
 //
-// Both are recorded in the design doc's "实现进展" table. Keeping the case here (with
-// the cluster switches it needs) means whoever picks either one up has the harness
-// ready; a passing assertion would be a lie in the meantime.
+// Measured after both repairs: the reporter logs "data-version report landed" with
+// chain_tails=2, and the scheduler logs "nothing behind the chain tail" with
+// tails_received=2 — i.e. the signal now arrives carrying tails.
 func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
-	t.Skip("blocked on two prerequisites, not on the catch-up itself — " +
-		"see the comment above and docs/active-lag-detection-design.md 实现进展")
-
 	ctx, cancel := context.WithTimeout(context.Background(), lagCatchupTimeout())
 	defer cancel()
 
