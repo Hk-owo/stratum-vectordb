@@ -1429,6 +1429,17 @@ type appConfig struct {
 	// knowledge base (gc.version_retention_count); <= 0 keeps everything.
 	IndexRetentionCount int
 
+	// IndexRetentionProtectWindow shields recently-queried versions from that
+	// policy (index_manager.retention_protect_window_ms): a version queried
+	// here within the window stays on disk even though it is older than the
+	// newest N. Zero takes the IndexManager default (24h); negative disables
+	// the protection, keeping the historical "newest N only" behaviour.
+	IndexRetentionProtectWindow time.Duration
+
+	// IndexRetentionProtectMax caps how many versions that window may shield
+	// (index_manager.retention_protect_max); <= 0 means the retention count.
+	IndexRetentionProtectMax int
+
 	// IndexMemoryThresholdMB bounds estimated in-memory footprint of all
 	// loaded indexes (index_manager.memory_threshold_mb); <= 0 disables.
 	IndexMemoryThresholdMB int64
@@ -1572,6 +1583,12 @@ type fileConfig struct {
 		CallbackMaxRetries  int `yaml:"callback_max_retries"`
 		CallbackRetryBaseMS int `yaml:"callback_retry_base_interval_ms"`
 		ColdThresholdMS     int `yaml:"cold_threshold_ms"`
+		// RetentionProtectWindowMS shields recently-queried versions from the
+		// disk retention policy. 0 takes the default (24h), negative disables.
+		RetentionProtectWindowMS int `yaml:"retention_protect_window_ms"`
+		// RetentionProtectMax caps how many versions that window may shield;
+		// <= 0 means version_retention_count.
+		RetentionProtectMax int `yaml:"retention_protect_max"`
 		// BuildAbandonTimeoutMS is the §6 abandoned-artifact window. <= 0 takes
 		// the default (30 minutes); negative disables the sweeper.
 		BuildAbandonTimeoutMS int     `yaml:"build_abandon_timeout_ms"`
@@ -1716,6 +1733,14 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	if fc.IndexManager.ColdThresholdMS != 0 {
 		cfg.IndexColdThreshold = time.Duration(fc.IndexManager.ColdThresholdMS) * time.Millisecond
+	}
+	// The retention shield is independent of the cold policy: it protects what
+	// is still being read, not what has stopped being read.
+	if fc.IndexManager.RetentionProtectWindowMS != 0 {
+		cfg.IndexRetentionProtectWindow = time.Duration(fc.IndexManager.RetentionProtectWindowMS) * time.Millisecond
+	}
+	if fc.IndexManager.RetentionProtectMax != 0 {
+		cfg.IndexRetentionProtectMax = fc.IndexManager.RetentionProtectMax
 	}
 	// The abandoned-artifact window is independent of the cold policy: a node
 	// that never reshapes a version still leaves remains behind when a build

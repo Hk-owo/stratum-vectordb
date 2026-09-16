@@ -65,6 +65,29 @@ type IndexManagerConfig struct {
 	// build and at startup. <= 0 disables the policy (keep everything).
 	IndexRetentionCount int
 
+	// RetentionProtectWindow shields recently-queried versions from the
+	// retention policy above: a version queried here within this window is not
+	// dropped even though it is older than the newest IndexRetentionCount. The
+	// version someone is still reading — comparing a historical one, or a
+	// client pinned to an older version — looks exactly like a dead one to a
+	// number-only policy, and dropping it means rebuilding it on the next
+	// query, for a version that was never cold.
+	//
+	// The evidence is the <versionID>.index.used sidecar, not the in-memory
+	// access table: the pass that drops the most runs at startup, when memory
+	// holds nothing. This protection is EXTRA retention, capped by
+	// RetentionProtectMax, so at most IndexRetentionCount+RetentionProtectMax
+	// index files are kept.
+	//
+	// Zero means DefaultRetentionProtectWindow; negative disables the
+	// protection entirely, which is the historical "newest N only" behaviour.
+	RetentionProtectWindow time.Duration
+
+	// RetentionProtectMax caps how many versions RetentionProtectWindow may
+	// shield at once, so a knowledge base whose versions are all read regularly
+	// cannot grow the on-disk set without bound. <= 0 means IndexRetentionCount.
+	RetentionProtectMax int
+
 	// MemoryThresholdMB bounds the estimated in-memory footprint of all
 	// loaded indexes (vector payload bytes, summed and tracked per loaded
 	// index). When the estimate exceeds the threshold, new loads/builds
@@ -313,6 +336,11 @@ type IndexManagerImpl struct {
 	// evaluator consults it to back off: without it, a build that keeps failing
 	// is re-queued on every sweep. Guarded by mu.
 	coldFailedAt map[indexKey]time.Time
+
+	// lastPersist records, per version, when its access time was last written
+	// to disk (the .index.used sidecar). It is only a throttle — the value that
+	// matters is on disk. Guarded by mu.
+	lastPersist map[indexKey]time.Time
 	// abandonCancel/abandonWG govern the background sweeper that reclaims
 	// half-built index artifacts (§6). abandonCancel is nil while it is off.
 	abandonCancel context.CancelFunc
@@ -403,6 +431,7 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		lastSearch:      make(map[indexKey]time.Time),
 		builtGraphFree:  make(map[indexKey]bool),
 		coldFailedAt:    make(map[indexKey]time.Time),
+		lastPersist:     make(map[indexKey]time.Time),
 		startedAt:       time.Now(),
 		deletedKBs:      make(map[string]bool),
 		deletedVersions: make(map[indexKey]bool),
@@ -1848,9 +1877,26 @@ func (im *IndexManagerImpl) release(key indexKey) {
 // scan or fails afterwards. Keys deleted by Discard/DeleteFilesByKB are
 // revived only by a later search, which is the intended semantic.
 func (im *IndexManagerImpl) recordSearch(key indexKey) {
+	now := time.Now()
 	im.mu.Lock()
-	defer im.mu.Unlock()
-	im.lastSearch[key] = time.Now()
+	im.lastSearch[key] = now
+	// Persist the access time, throttled. This on-disk record is what lets the
+	// retention policy shield a recently-queried version across a restart; a
+	// write on every query would put a small file write on the hot path, while
+	// the protection window is measured in hours, so a minute of granularity
+	// costs nothing.
+	persist := false
+	if im.retentionProtectWindow() > 0 && im.cfg.IndexDataDir != "" {
+		if last, ok := im.lastPersist[key]; !ok || now.Sub(last) >= accessPersistInterval {
+			im.lastPersist[key] = now
+			persist = true
+		}
+	}
+	im.mu.Unlock()
+	if persist {
+		// Outside the lock: it is a file write, and Search must not wait on it.
+		im.persistAccessTime(key.kbID, key.versionID, now)
+	}
 }
 
 // LastAccess reports when (kbID, versionID) was last searched (or, if it
@@ -1892,6 +1938,7 @@ func (im *IndexManagerImpl) forgetSearchLocked(key indexKey) {
 func (im *IndexManagerImpl) forgetVersionLocked(key indexKey) {
 	im.forgetSearchLocked(key)
 	delete(im.builtGraphFree, key)
+	delete(im.lastPersist, key)
 }
 
 // makeRoomLocked evicts least-recently-used, ref-count-zero indexes until
@@ -2086,14 +2133,39 @@ func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string,
 	if len(files) <= im.cfg.IndexRetentionCount {
 		return nil
 	}
+
+	// Shield the versions queried here recently, on top of the newest
+	// IndexRetentionCount. Read from the .used sidecars rather than from the
+	// in-memory access table, because this pass also runs at startup — when
+	// memory holds nothing and the drop is at its largest.
+	if window := im.retentionProtectWindow(); window > 0 {
+		candidates := make([]int64, len(files))
+		for i, f := range files {
+			candidates[i] = f.versionID
+		}
+		if keep := im.accessProtectedIDs(kbID, candidates, window, im.retentionProtectMax()); len(keep) > 0 {
+			rest := files[:0]
+			for _, f := range files {
+				if !keep[f.versionID] {
+					rest = append(rest, f)
+				}
+			}
+			files = rest
+			if len(files) <= im.cfg.IndexRetentionCount {
+				return nil
+			}
+		}
+	}
+
 	sort.Slice(files, func(i, j int) bool { return files[i].versionID < files[j].versionID })
 
 	// Drop the oldest (len(files) - retentionCount) versions' files.
 	// Sidecar names mirror the vecstore's Save layout: the Faiss file is
-	// <versionID>.index, its chunk-ID sidecar is <versionID>.index.ids,
-	// and the size sidecar is <versionID>.index.mem.
+	// <versionID>.index, its chunk-ID sidecar is <versionID>.index.ids, the
+	// size sidecar is <versionID>.index.mem, and the access-time sidecar (the
+	// retention shield above) is <versionID>.index.used.
 	for _, f := range files[:len(files)-im.cfg.IndexRetentionCount] {
-		for _, suffix := range []string{".index", ".index.ids", ".index.mem"} {
+		for _, suffix := range []string{".index", ".index.ids", ".index.mem", ".index.used"} {
 			path := filepath.Join(dir, f.base+suffix)
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("index: EnforceDiskRetention(%s): remove %s: %w", kbID, f.base+suffix, err)
@@ -2138,6 +2210,107 @@ func (im *IndexManagerImpl) sizeSidecarPath(kbID string, versionID int64) string
 	return filepath.Join(im.cfg.IndexDataDir, "index", kbID, fmt.Sprintf("%d.index.mem", versionID))
 }
 
+const (
+	// DefaultRetentionProtectWindow is the window the retention policy shields
+	// recently-queried versions for, used when RetentionProtectWindow is zero.
+	DefaultRetentionProtectWindow = 24 * time.Hour
+
+	// accessPersistInterval throttles how often a version's access time is
+	// written to its .used sidecar.
+	accessPersistInterval = time.Minute
+)
+
+// retentionProtectWindow resolves the configured shield window: negative
+// disables the protection, zero means the default.
+func (im *IndexManagerImpl) retentionProtectWindow() time.Duration {
+	if im.cfg.RetentionProtectWindow < 0 {
+		return 0
+	}
+	if im.cfg.RetentionProtectWindow > 0 {
+		return im.cfg.RetentionProtectWindow
+	}
+	return DefaultRetentionProtectWindow
+}
+
+// retentionProtectMax resolves the shield's size cap; zero or negative means
+// IndexRetentionCount (and at least one, so an enabled protection always
+// protects something).
+func (im *IndexManagerImpl) retentionProtectMax() int {
+	if im.cfg.RetentionProtectMax > 0 {
+		return im.cfg.RetentionProtectMax
+	}
+	if im.cfg.IndexRetentionCount > 0 {
+		return im.cfg.IndexRetentionCount
+	}
+	return 1
+}
+
+// accessProtectedIDs returns the version ids among candidates that were queried
+// here within window, keeping at most max of them — the most recently queried
+// win.
+//
+// The evidence is each version's <versionID>.index.used sidecar, which is what
+// makes the shield survive a restart. A version without one (never queried
+// here, or written before this policy existed) is simply not protected.
+func (im *IndexManagerImpl) accessProtectedIDs(kbID string, candidates []int64, window time.Duration, max int) map[int64]bool {
+	type entry struct {
+		id int64
+		at time.Time
+	}
+	cutoff := time.Now().Add(-window)
+	var recent []entry
+	for _, id := range candidates {
+		at, ok := im.readAccessTime(kbID, id)
+		if !ok || at.Before(cutoff) {
+			continue
+		}
+		recent = append(recent, entry{id: id, at: at})
+	}
+	if len(recent) > max {
+		sort.Slice(recent, func(i, j int) bool { return recent[i].at.After(recent[j].at) })
+		recent = recent[:max]
+	}
+	out := make(map[int64]bool, len(recent))
+	for _, e := range recent {
+		out[e.id] = true
+	}
+	return out
+}
+
+// persistAccessTime writes the version's last-query time next to its index, so
+// the retention policy can shield it after a restart. Best-effort, like the
+// size sidecar: a failed write only means the version loses its shield.
+func (im *IndexManagerImpl) persistAccessTime(kbID string, versionID int64, t time.Time) {
+	if im.cfg.IndexDataDir == "" {
+		return
+	}
+	path := im.usedPath(kbID, versionID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, []byte(strconv.FormatInt(t.UnixNano(), 10)), 0o644)
+}
+
+// readAccessTime loads the persisted last-query time for (kbID, versionID);
+// ok is false when the sidecar is absent or corrupt.
+func (im *IndexManagerImpl) readAccessTime(kbID string, versionID int64) (time.Time, bool) {
+	data, err := os.ReadFile(im.usedPath(kbID, versionID))
+	if err != nil {
+		return time.Time{}, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || n <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(0, n), true
+}
+
+// usedPath returns the on-disk path of (kbID, versionID)'s access-time
+// sidecar: <IndexDataDir>/index/<kbID>/<versionID>.index.used.
+func (im *IndexManagerImpl) usedPath(kbID string, versionID int64) string {
+	return filepath.Join(im.cfg.IndexDataDir, "index", kbID, fmt.Sprintf("%d.index.used", versionID))
+}
+
 // Discard implements IndexManager: evicts the in-memory entry, sets a
 // version tombstone (closing the Load-RPC resurrection race), resets the
 // vecstore-side index, and removes the version's on-disk index files.
@@ -2166,12 +2339,13 @@ func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID 
 	}
 
 	// Remove the version's on-disk index files (Faiss file + its .ids
-	// sidecar + the size sidecar; indexPath already ends in ".index").
+	// sidecar + the size sidecar + the access-time sidecar; indexPath already
+	// ends in ".index").
 	// Missing files are ignored; a no-op when persistence is unconfigured.
 	// Without this, a deleted version's files would linger and skew the
 	// disk retention window (see EnforceDiskRetention).
 	if im.cfg.IndexDataDir != "" {
-		for _, suffix := range []string{"", ".ids", ".mem"} {
+		for _, suffix := range []string{"", ".ids", ".mem", ".used"} {
 			path := im.indexPath(kbID, versionID) + suffix
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("index: Discard(%s,%d): remove %q: %w", kbID, versionID, filepath.Base(path), err)

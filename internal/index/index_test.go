@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2218,5 +2219,212 @@ func TestIndexManager_ColdPolicySkipsVersionsThisNodeDoesNotHold(t *testing.T) {
 
 	if got := im.coldCandidates(context.Background(), time.Now()); len(got) != 0 {
 		t.Fatalf("a version this node does not hold must not be reshaped, got %v", got)
+	}
+}
+
+// seedIndexFiles lays down a version's on-disk file set (the Faiss file plus
+// its sidecars), which is what the retention policy enumerates.
+func seedIndexFiles(t *testing.T, dir, kbID string, versionIDs ...int64) string {
+	t.Helper()
+	kbDir := filepath.Join(dir, "index", kbID)
+	if err := os.MkdirAll(kbDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, v := range versionIDs {
+		for _, suffix := range []string{".index", ".index.ids", ".index.mem"} {
+			name := fmt.Sprintf("%d%s", v, suffix)
+			if err := os.WriteFile(filepath.Join(kbDir, name), []byte("x"), 0o644); err != nil {
+				t.Fatalf("write %s: %v", name, err)
+			}
+		}
+	}
+	return kbDir
+}
+
+// recordAccessForTest writes a version's access-time sidecar directly, standing
+// in for a query this process never saw — which is exactly the state after a
+// restart, and the state the shield exists for.
+func recordAccessForTest(t *testing.T, kbDir string, versionID int64, at time.Time) {
+	t.Helper()
+	name := fmt.Sprintf("%d.index.used", versionID)
+	if err := os.WriteFile(filepath.Join(kbDir, name),
+		[]byte(strconv.FormatInt(at.UnixNano(), 10)), 0o644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+// A version queried here recently is shielded from retention even when it is
+// older than the newest IndexRetentionCount — and the shield comes from disk,
+// so it survives a restart. The manager doing the enforcing is deliberately a
+// FRESH one whose in-memory access table is empty: that is the case the shield
+// exists for, and reading memory instead would protect nothing.
+func TestIndexManager_RetentionShieldsRecentlyQueriedVersions(t *testing.T) {
+	dir := t.TempDir()
+	kbDir := seedIndexFiles(t, dir, "kb-1", 1, 2, 3)
+	recordAccessForTest(t, kbDir, 1, time.Now().Add(-time.Minute))
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           dir,
+		IndexRetentionCount:    1,         // newest only ...
+		RetentionProtectWindow: time.Hour, // ... plus what was just read
+	})
+	im.vectorIndexClient = newMockVectorIndexClient()
+
+	if err := im.EnforceDiskRetention(context.Background(), "kb-1", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention: %v", err)
+	}
+
+	// 3 is newest, 1 is shielded by its recent query; 2 is the one dropped.
+	for _, v := range []int64{1, 3} {
+		if _, err := os.Stat(filepath.Join(kbDir, fmt.Sprintf("%d.index", v))); err != nil {
+			t.Errorf("expected %d to survive retention, got: %v", v, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(kbDir, "2.index")); !os.IsNotExist(err) {
+		t.Errorf("expected 2 to be dropped by retention, stat err: %v", err)
+	}
+}
+
+// The shield is capped, and the cap is resolved by recency: the versions
+// queried most recently win. Without a cap a knowledge base whose versions are
+// all read regularly would grow its on-disk set without bound.
+func TestIndexManager_RetentionProtectionKeepsTheMostRecent(t *testing.T) {
+	dir := t.TempDir()
+	kbDir := seedIndexFiles(t, dir, "kb-1", 1, 2, 3)
+	// Both are inside the window; 2 was queried later, so only 2 survives the
+	// cap of one.
+	recordAccessForTest(t, kbDir, 1, time.Now().Add(-time.Hour))
+	recordAccessForTest(t, kbDir, 2, time.Now().Add(-time.Minute))
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           dir,
+		IndexRetentionCount:    1,
+		RetentionProtectWindow: time.Hour,
+		RetentionProtectMax:    1,
+	})
+	im.vectorIndexClient = newMockVectorIndexClient()
+
+	if err := im.EnforceDiskRetention(context.Background(), "kb-1", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention: %v", err)
+	}
+
+	for _, v := range []int64{2, 3} {
+		if _, err := os.Stat(filepath.Join(kbDir, fmt.Sprintf("%d.index", v))); err != nil {
+			t.Errorf("expected %d to survive retention, got: %v", v, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(kbDir, "1.index")); !os.IsNotExist(err) {
+		t.Errorf("expected 1 to lose the cap and be dropped, stat err: %v", err)
+	}
+}
+
+// A query older than the window does not shield anything: the protection is
+// about what is still being read, not about what was read once.
+func TestIndexManager_RetentionProtectionAgesOut(t *testing.T) {
+	dir := t.TempDir()
+	kbDir := seedIndexFiles(t, dir, "kb-1", 1, 2)
+	recordAccessForTest(t, kbDir, 1, time.Now().Add(-2*time.Hour))
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           dir,
+		IndexRetentionCount:    1,
+		RetentionProtectWindow: time.Hour, // the query is twice as old
+	})
+	im.vectorIndexClient = newMockVectorIndexClient()
+
+	if err := im.EnforceDiskRetention(context.Background(), "kb-1", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(kbDir, "2.index")); err != nil {
+		t.Errorf("expected the newest version to survive, got: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(kbDir, "1.index")); !os.IsNotExist(err) {
+		t.Errorf("an expired access record must not shield: stat err: %v", err)
+	}
+}
+
+// The shield is disabled by a negative window, which is the historical
+// behaviour: keep the newest N and nothing else.
+func TestIndexManager_RetentionProtectionDisabled(t *testing.T) {
+	dir := t.TempDir()
+	kbDir := seedIndexFiles(t, dir, "kb-1", 1, 2)
+	recordAccessForTest(t, kbDir, 1, time.Now())
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           dir,
+		IndexRetentionCount:    1,
+		RetentionProtectWindow: -1,
+	})
+	im.vectorIndexClient = newMockVectorIndexClient()
+
+	if err := im.EnforceDiskRetention(context.Background(), "kb-1", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(kbDir, "1.index")); !os.IsNotExist(err) {
+		t.Errorf("with the shield disabled, 1 must be dropped, stat err: %v", err)
+	}
+}
+
+// Dropping a version's files must take the access sidecar with them, or the
+// shield would outlive the version it shielded.
+func TestIndexManager_RetentionDropsAccessSidecarOfDroppedVersion(t *testing.T) {
+	dir := t.TempDir()
+	kbDir := seedIndexFiles(t, dir, "kb-1", 1, 2)
+	recordAccessForTest(t, kbDir, 1, time.Now().Add(-2*time.Hour)) // expired: 1 gets dropped
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           dir,
+		IndexRetentionCount:    1,
+		RetentionProtectWindow: time.Hour,
+	})
+	im.vectorIndexClient = newMockVectorIndexClient()
+
+	if err := im.EnforceDiskRetention(context.Background(), "kb-1", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention: %v", err)
+	}
+	for _, suffix := range []string{".index", ".index.ids", ".index.mem", ".index.used"} {
+		if _, err := os.Stat(filepath.Join(kbDir, "1"+suffix)); !os.IsNotExist(err) {
+			t.Errorf("1%s must be gone with the version, stat err: %v", suffix, err)
+		}
+	}
+}
+
+// Search is what records the access time on disk (throttled); that record is
+// what the retention shield reads after a restart.
+func TestIndexManager_SearchPersistsAccessTime(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
+	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           t.TempDir(),
+		RetentionProtectWindow: time.Hour,
+	})
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	waitIndexLoaded(t, im, "kb-1", 1)
+
+	if _, err := im.Search(context.Background(), "kb-1", 1, []float32{0.5, 0.5}, 1); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	at, ok := im.readAccessTime("kb-1", 1)
+	if !ok {
+		t.Fatal("Search must persist the version's access time for the retention shield")
+	}
+	if age := time.Since(at); age < 0 || age > time.Minute {
+		t.Fatalf("persisted access time is %v old, want it recorded just now", age)
 	}
 }

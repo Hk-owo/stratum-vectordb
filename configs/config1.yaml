@@ -58,6 +58,16 @@ index_manager:
   # 建完整 HNSW 图。形态变化后的产物走 §8.4 的副本分发，与新建索引同路。
   cold_threshold_ms: 0
   cold_sweep_interval_ms: 0
+  # 磁盘保留策略的「访问保护」。retention 默认只按版本号保新
+  # （gc.version_retention_count 个），于是一个还在被读的老版本（客户比对历史版本、
+  # 客户端钉在旧版本上）会被当成死版本删掉，下次查询再重建一次——它从来都不冷。
+  # 这里给「本节点最近查询过的版本」加一层保护：查询时间写在 <versionID>.index.used
+  # 旁车里，所以进程重启后（启动那一遍删得最狠）依然有效。保护是**额外**保留，数量
+  # 上限由 retention_protect_max 决定（默认取 version_retention_count），因此磁盘最多
+  # 保留 2×version_retention_count 份索引。
+  # 0 = 用默认（24h）；负数 = 关闭该保护（历史行为：只保新）。
+  retention_protect_window_ms: 0
+  retention_protect_max: 0
   # §8.6(c) 纯追加复用的"死向量"上限。版本 N 若只是版本 N-1 的纯追加（父产物
   # 还在本节点、形态一致），就以其产物为起点只追加新增 chunk；若本版本删了文档，
   # 被删文档的向量会以「墓碑」形式留在产物里（查询路径会把它们的结果滤掉，代价
