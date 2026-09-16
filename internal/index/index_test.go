@@ -2428,3 +2428,42 @@ func TestIndexManager_SearchPersistsAccessTime(t *testing.T) {
 		t.Fatalf("persisted access time is %v old, want it recorded just now", age)
 	}
 }
+
+// An explicit operator request (RebuildIndex / WarmupVersion) is "this version
+// is wanted here, now" — the same evidence a query leaves — so it must shield
+// the artifact from retention too.
+//
+// The version an operator rebuilds is, by construction, usually OUTSIDE the
+// newest-N window (otherwise there would be nothing to rebuild): without this
+// the artifact would survive only until the next retention pass.
+func TestIndexManager_RecordInterestShieldsFromRetention(t *testing.T) {
+	dir := t.TempDir()
+	kbDir := seedIndexFiles(t, dir, "kb-1", 1, 2, 3)
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:            4,
+		LoadWaitTimeout:        5 * time.Second,
+		IndexDataDir:           dir,
+		IndexRetentionCount:    1,         // newest only ...
+		RetentionProtectWindow: time.Hour, // ... plus what was explicitly asked for
+	})
+	im.vectorIndexClient = newMockVectorIndexClient()
+
+	// Version 1 is the oldest, and the operator asked for it by hand.
+	im.RecordInterest("kb-1", 1)
+	if _, err := os.Stat(filepath.Join(kbDir, "1.index.used")); err != nil {
+		t.Fatalf("RecordInterest must leave the access sidecar on disk, got: %v", err)
+	}
+
+	if err := im.EnforceDiskRetention(context.Background(), "kb-1", nil); err != nil {
+		t.Fatalf("EnforceDiskRetention: %v", err)
+	}
+	for _, v := range []int64{1, 3} {
+		if _, err := os.Stat(filepath.Join(kbDir, fmt.Sprintf("%d.index", v))); err != nil {
+			t.Errorf("expected %d to survive retention, got: %v", v, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(kbDir, "2.index")); !os.IsNotExist(err) {
+		t.Errorf("expected 2 to be dropped, stat err: %v", err)
+	}
+}

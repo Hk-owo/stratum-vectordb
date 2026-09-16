@@ -1877,6 +1877,26 @@ func (im *IndexManagerImpl) release(key indexKey) {
 // scan or fails afterwards. Keys deleted by Discard/DeleteFilesByKB are
 // revived only by a later search, which is the intended semantic.
 func (im *IndexManagerImpl) recordSearch(key indexKey) {
+	im.recordAccess(key)
+}
+
+// RecordInterest implements IndexManager. An operator asked for this version's
+// index explicitly (RebuildIndex / WarmupVersion), which is the same evidence a
+// query leaves — "this version is wanted here, now" — so it is recorded the
+// same way and the retention policy shields it for the same window.
+//
+// Without it, the artifact such a request builds is protected only for the
+// instant it completes: the post-build retention pass is handed the id being
+// built, but the next build, or the next restart, has no reason to keep it — and
+// an operator's explicit request then quietly expires.
+func (im *IndexManagerImpl) RecordInterest(kbID string, versionID int64) {
+	im.recordAccess(indexKey{kbID, versionID})
+}
+
+// recordAccess is where "something asked for this version" lands: the in-memory
+// access table the cold evaluator reads, and — throttled — the on-disk .used
+// sidecar the retention policy reads.
+func (im *IndexManagerImpl) recordAccess(key indexKey) {
 	now := time.Now()
 	im.mu.Lock()
 	im.lastSearch[key] = now

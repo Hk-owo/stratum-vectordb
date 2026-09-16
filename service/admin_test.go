@@ -388,3 +388,49 @@ func kbMeta(kbID string, status types.KBStatus) types.KnowledgeBaseMeta {
 func (m *failingTriggerBuild) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
 	return m.TriggerBuild(ctx, kbID, versionID)
 }
+
+// RebuildIndex and WarmupVersion must register the version with the retention
+// policy. Both ask for an artifact that is usually outside the newest-N window
+// — that is precisely why someone rebuilds it by hand — so without the
+// registration the next retention pass drops what they just built.
+func TestAdmin_RebuildAndWarmupRegisterRetentionInterest(t *testing.T) {
+	h := newAdminHarness()
+	ctx := context.Background()
+
+	// Two knowledge bases, one version each: a version cannot parent another
+	// while it is still PENDING, and what matters here is which versions got
+	// registered, not how they were created.
+	var rebuildID, warmupID int64
+	for i, kbID := range []string{"kb-rebuild", "kb-warmup"} {
+		if err := h.raftNode.ProposeCreateKB(ctx, kbMeta(kbID, types.KBStatusActive)); err != nil {
+			t.Fatal(err)
+		}
+		v, err := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			rebuildID = v
+		} else {
+			warmupID = v
+		}
+	}
+
+	if _, err := h.svc.RebuildIndex(ctx, &pb.RebuildIndexRequest{KnowledgeBaseId: "kb-rebuild", VersionId: rebuildID}); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+	if _, err := h.svc.WarmupVersion(ctx, &pb.WarmupVersionRequest{KnowledgeBaseId: "kb-warmup", VersionId: warmupID}); err != nil {
+		t.Fatalf("WarmupVersion: %v", err)
+	}
+
+	got := h.indexMgr.Interested()
+	want := []int64{rebuildID, warmupID}
+	if len(got) != len(want) {
+		t.Fatalf("RecordInterest called for %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("RecordInterest called for %v, want %v", got, want)
+		}
+	}
+}

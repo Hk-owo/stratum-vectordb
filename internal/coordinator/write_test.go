@@ -311,6 +311,7 @@ func (im *testIndexManager) Discard(_ context.Context, kbID string, versionID in
 	return nil
 }
 func (im *testIndexManager) EvictByKB(_ context.Context, kbID string) error { return nil }
+func (im *testIndexManager) RecordInterest(_ string, _ int64)               {}
 func (im *testIndexManager) DeleteFilesByKB(_ context.Context, _ string) error {
 	return nil
 }

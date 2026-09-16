@@ -243,6 +243,7 @@ func (im *deleteTestIndexManager) TriggerBuild(_ context.Context, kbID string, v
 	return nil
 }
 func (im *deleteTestIndexManager) RegisterBuildCallback(cb index.BuildCompleteCallback) {}
+func (im *deleteTestIndexManager) RecordInterest(_ string, _ int64)                     {}
 func (im *deleteTestIndexManager) Evict(_ context.Context, kbID string, versionID int64) error {
 	return nil
 }

@@ -487,6 +487,7 @@ func (m *reconcileIndexMgr) Search(_ context.Context, kbID string, versionID int
 	return nil, nil
 }
 func (m *reconcileIndexMgr) RegisterBuildCallback(cb index.BuildCompleteCallback) {}
+func (m *reconcileIndexMgr) RecordInterest(_ string, _ int64)                     {}
 func (m *reconcileIndexMgr) Evict(_ context.Context, kbID string, versionID int64) error {
 	return nil
 }

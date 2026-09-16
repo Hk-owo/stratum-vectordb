@@ -69,6 +69,11 @@ type MockIndexManager struct {
 	// refusing it.
 	triggeredBuilds []int64
 
+	// interested records every version RecordInterest was called for, in order,
+	// so a test can assert that an explicit operator request (RebuildIndex /
+	// WarmupVersion) registered the version for retention protection.
+	interested []int64
+
 	pingErr error // injectable for tests exercising HealthCheck DEGRADED/UNHEALTHY paths
 }
 
@@ -374,6 +379,21 @@ func (m *MockIndexManager) DeleteFilesByKB(_ context.Context, _ string) error {
 // index files, so the retention policy is a no-op.
 func (m *MockIndexManager) EnforceDiskRetention(_ context.Context, _ string, _ []int64) error {
 	return nil
+}
+
+// RecordInterest implements IndexManager. The mock keeps no on-disk sidecars, so
+// this only records the call for assertions (see Interested).
+func (m *MockIndexManager) RecordInterest(_ string, versionID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.interested = append(m.interested, versionID)
+}
+
+// Interested returns the version ids RecordInterest was called for, in order.
+func (m *MockIndexManager) Interested() []int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]int64(nil), m.interested...)
 }
 
 // Ping never loads an index or touches reference counts, per the

@@ -121,6 +121,14 @@ type IndexManager interface {
 	// files/directories are ignored; no-op when retention is unconfigured.
 	EnforceDiskRetention(ctx context.Context, kbID string, protectedIDs []int64) error
 
+	// RecordInterest marks (kbID, versionID) as explicitly needed by an operator
+	// request (RebuildIndex / WarmupVersion). That is the same evidence a query
+	// leaves — "this version is wanted here, now" — and is recorded the same way,
+	// so the on-disk retention policy shields its artifact for the same window.
+	// Without it, the artifact such a request builds survives only until the next
+	// retention pass.
+	RecordInterest(kbID string, versionID int64)
+
 	// Ping is a lightweight health probe: it reports whether IndexManager
 	// itself is operating normally, without loading any index or touching
 	// reference counts.
