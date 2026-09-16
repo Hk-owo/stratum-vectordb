@@ -57,3 +57,5 @@ __pycache__/
 # 根目录下唯一要发布的 Markdown 是 README.md。
 /*.md
 !/README.md
+# docs/ 整体同上：设计稿与开发日志只在本地维护,不随本仓库发布。
+/docs/
