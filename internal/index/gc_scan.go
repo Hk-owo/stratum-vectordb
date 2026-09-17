@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -362,6 +363,52 @@ func (im *IndexManagerImpl) artifactGraphFree(kbID string, versionID int64) (gra
 // the artifact carries an HNSW graph (§8.6a). It must match hnsw_index.cpp's
 // kShapePrefix.
 const shapeLinePrefix = "graph_free "
+
+// trainedLinePrefix is the sidecar line vecstore's Save writes to record the
+// codebook baseline (docs/codebook-refresh-plan.md §3): how many vectors the
+// quantizer was trained on, and how many append-reuses have happened since
+// ("trained <ntotal> <appends>"). It must match hnsw_index.cpp's kTrainedPrefix.
+//
+// The values ride along with the artifact, so the baseline survives a restart
+// and a §8.4 handoff without any Go-side state — the same reason the shape line
+// lives there (§8.6a).
+const trainedLinePrefix = "trained "
+
+// artifactTrainedBaseline reads the codebook baseline from a version's sealed
+// sidecar. known is false when the sidecar has no such line (written before this
+// mechanism existed) or cannot be read.
+//
+// The caller must treat unknown as fail-safe — rebuild once, which writes a
+// baseline — rather than as "trained just now": the latter would silently switch
+// the whole mechanism off, which is the failure mode §7 risk 1 calls the most
+// invisible one.
+func (im *IndexManagerImpl) artifactTrainedBaseline(kbID string, versionID int64) (trainedNtotal, appendsSinceTrain int64, known bool) {
+	f, err := os.Open(im.sidecarPath(kbID, versionID))
+	if err != nil {
+		return 0, 0, false
+	}
+	defer func() { _ = f.Close() }()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64), 4096)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, trainedLinePrefix) {
+			continue
+		}
+		fields := strings.Fields(strings.TrimPrefix(line, trainedLinePrefix))
+		if len(fields) != 2 {
+			return 0, 0, false
+		}
+		ntotal, nErr := strconv.ParseInt(fields[0], 10, 64)
+		appends, aErr := strconv.ParseInt(fields[1], 10, 64)
+		if nErr != nil || aErr != nil || ntotal < 0 || appends < 0 {
+			return 0, 0, false
+		}
+		return ntotal, appends, true
+	}
+	return 0, 0, false
+}
 
 func looksLikeChunkID(line string) bool {
 	if len(line) != chunkIDLength {

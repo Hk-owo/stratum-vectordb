@@ -2583,3 +2583,170 @@ func TestIndexManager_RetentionClearsOrphanedSidecars(t *testing.T) {
 		}
 	}
 }
+
+// --- §3 码本刷新（docs/codebook-refresh-plan.md）---
+//
+// 码本只在全量重建时训练，而"只 append、不删除"的库几乎不会全量重建 ⇒ 新向量一直
+// 用旧码本编码，粗筛的候选覆盖随分布漂移变差（排序仍由 rerank 决定，所以查询不报错、
+// 不超时，只是漏召回）。§3 给 build 加了第二个触发条件：累积新增向量比超阈值、或
+// 自训练以来的追加次数超阈值，就放弃追加复用、整份重建 —— 而全量重建正是重训码本
+// 的唯一途径。
+//
+// 基线读自**父产物**的 sidecar，随文件继承（跨版本、跨重启、跨 §8.4 分发都不用
+// Go 侧状态）。判定还按量化类型门控：只有 SQ8 / PQ 有可漂移的码本。
+
+// sidecarWithCodebookBaseline 造一个形态正确的 sidecar ——
+// magic / dim / metric / crc / shape / baseline / ids。这些用例只关心 baseline 行。
+func sidecarWithCodebookBaseline(trainedNtotal, appends int64) string {
+	return fmt.Sprintf("stratum-index-1\n2\n0\n1\ngraph_free 0\ntrained %d %d\n",
+		trainedNtotal, appends)
+}
+
+// fourChunkDocSource：v1 有 chunk-a；v2 有 chunk-a 加三个新 chunk ⇒ v2 共 4 个
+// 向量、其中 1 个继承自父版本。
+func fourChunkDocSource() *docSource {
+	ds := newDocSource()
+	ds.addDoc(1, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-b", []string{"chunk-b"}, map[string][]float32{"chunk-b": {0.5, 0.5}})
+	ds.addDoc(2, "doc-c", []string{"chunk-c"}, map[string][]float32{"chunk-c": {0.5, 0.5}})
+	ds.addDoc(2, "doc-d", []string{"chunk-d"}, map[string][]float32{"chunk-d": {0.5, 0.5}})
+	return ds
+}
+
+// installParentArtifact 把 v1 的产物与 sidecar 放到磁盘上（mock 的 Save 不碰盘），
+// 然后触发 v2 的构建。
+func installParentArtifact(t *testing.T, im *IndexManagerImpl, parentSidecar string) {
+	t.Helper()
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild v1: %v", err)
+	}
+	waitIndexLoaded(t, im, "kb-1", 1)
+	writeFile(t, im.indexPath("kb-1", 1), "base-index")
+	writeFile(t, im.sidecarPath("kb-1", 1), parentSidecar)
+	if err := im.TriggerBuild(context.Background(), "kb-1", 2); err != nil {
+		t.Fatalf("TriggerBuild v2: %v", err)
+	}
+	waitIndexLoaded(t, im, "kb-1", 2)
+}
+
+// codebookRefreshManager wires an IndexManager whose KB reports quantizer, with a
+// v2 -> v1 parent link.
+func codebookRefreshManager(
+	t *testing.T, ds *docSource, quantizer string, vc *mockVectorIndexClient,
+	maxDrift float64, maxAppends int64,
+) *IndexManagerImpl {
+	t.Helper()
+	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
+		LRUCapacity:           4,
+		LoadWaitTimeout:       5 * time.Second,
+		IndexDataDir:          t.TempDir(),
+		MaxCodebookDriftRatio: maxDrift,
+		MaxCodebookAppends:    maxAppends,
+	})
+	im.SetVersionParentGetter(func(_ context.Context, _ string, versionID int64) (int64, error) {
+		if versionID == 2 {
+			return 1, nil
+		}
+		return 0, nil
+	})
+	if quantizer != "" {
+		im.SetKBMetaGetter(func(_ context.Context, _ string) (types.KnowledgeBaseMeta, error) {
+			return types.KnowledgeBaseMeta{QuantizerType: quantizer}, nil
+		})
+	}
+	return im
+}
+
+// 累积新增向量比超阈值 ⇒ 不走追加复用（不调 LoadForAppend），整份重建。
+// 基线 1、现在 4 个向量：ratio = 3.0，远超默认 0.25。
+func TestIndexManager_BuildRefreshesCodebookWhenDriftRatioExceedsThreshold(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManager(t, fourChunkDocSource(), "SQ8", vc, 0, 0)
+	installParentArtifact(t, im, sidecarWithCodebookBaseline(1, 0))
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 0 {
+		t.Fatalf("LoadForAppend calls = %d, want 0: an over-threshold drift must rebuild from scratch", vc.loadForAppendCalls)
+	}
+	if vc.buildCalls != 2 {
+		t.Fatalf("Build calls = %d, want 2 (v1 and v2 both from scratch)", vc.buildCalls)
+	}
+}
+
+// 累积比未超阈值 ⇒ 追加复用照旧（默认路径不受影响）。基线 4、现在 4 个向量：ratio = 0。
+func TestIndexManager_BuildStillAppendsWhenCodebookIsFresh(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManager(t, fourChunkDocSource(), "SQ8", vc, 0, 0)
+	installParentArtifact(t, im, sidecarWithCodebookBaseline(4, 0))
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1 (a fresh codebook must not block reuse)", vc.loadForAppendCalls)
+	}
+	if vc.buildCalls != 1 {
+		t.Fatalf("Build calls = %d, want 1 (v1 only): v2 must append, not rebuild", vc.buildCalls)
+	}
+}
+
+// 兜底判据：向量增量很小（ratio = 0）但追加次数到顶 ⇒ 仍然重建。它覆盖"小版本高频
+// 写入"——每次只加几个向量，累积比迟迟到不了阈值，码本却一直在变旧。
+func TestIndexManager_BuildRefreshesCodebookOnAppendCountFallback(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManager(t, fourChunkDocSource(), "SQ8", vc, 0, 3)
+	installParentArtifact(t, im, sidecarWithCodebookBaseline(4, 3)) // 4 个向量 → ratio 0
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 0 {
+		t.Fatalf("LoadForAppend calls = %d, want 0: the append-count fallback must rebuild", vc.loadForAppendCalls)
+	}
+}
+
+// 基线未知（早于本机制的产物）⇒ fail-safe 重建一次，之后基线就补上了。刻意不把
+// "未知"当成"刚训过"——那会把整个机制静默关掉。
+func TestIndexManager_BuildRefreshesCodebookWhenBaselineIsUnknown(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManager(t, fourChunkDocSource(), "SQ8", vc, 0, 0)
+	// 老形态的 sidecar：没有 trained 行。
+	installParentArtifact(t, im, "stratum-index-1\n2\n0\n1\ngraph_free 0\n")
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 0 {
+		t.Fatalf("LoadForAppend calls = %d, want 0: an unknown baseline must fail safe into a rebuild", vc.loadForAppendCalls)
+	}
+	if vc.buildCalls != 2 {
+		t.Fatalf("Build calls = %d, want 2", vc.buildCalls)
+	}
+}
+
+// 免训练的量化类型（SQ_FP16）不参与判定：没有码本可漂移，重建是纯开销。这里刻意
+// 给一个"必然超阈值"的基线（1 → 4），断言仍然走追加复用。
+func TestIndexManager_BuildSkipsCodebookRefreshForTrainingFreeQuantizer(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManager(t, fourChunkDocSource(), "SQ_FP16", vc, 0, 0)
+	installParentArtifact(t, im, sidecarWithCodebookBaseline(1, 0))
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1: SQ_FP16 has no codebook to refresh", vc.loadForAppendCalls)
+	}
+}
+
+// OFF（默认量化类型，根本没有码本）同样不参与判定 —— 否则每个默认部署都会平白多出
+// 周期性的全量重建。
+func TestIndexManager_BuildSkipsCodebookRefreshWithoutQuantizer(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManager(t, fourChunkDocSource(), "", vc, 0, 0)
+	installParentArtifact(t, im, sidecarWithCodebookBaseline(1, 0))
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1: a full-precision KB has no codebook", vc.loadForAppendCalls)
+	}
+}

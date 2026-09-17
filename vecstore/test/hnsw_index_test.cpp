@@ -331,14 +331,17 @@ TEST_F(HNSWVectorIndexTest, LoadAcceptsLegacySidecarWithoutChecksum) {
   }
 
   // Rewrite the sidecar in the legacy layout: dim / metric / chunk ids.
-  // The checked layout is magic / dim / metric / crc / [shape] / ids, so the
-  // id block starts after the three header values — plus the §8.6a shape line
-  // when the writer recorded one.
+  // The checked layout is magic / dim / metric / crc / [shape] / [codebook
+  // baseline] / ids. Skip every header line the writer may have recorded rather
+  // than assuming a fixed offset: the header has already grown twice (the shape
+  // line in §8.6a, the §3 codebook baseline), and a stale offset silently turns
+  // a header line into a bogus chunk id.
   const auto checked = ReadLines(save_path_ + ".ids");
   ASSERT_GE(checked.size(), 4u);
   size_t ids_begin = 4;
-  if (ids_begin < checked.size() &&
-      checked[ids_begin].rfind("graph_free ", 0) == 0) {
+  while (ids_begin < checked.size() &&
+         (checked[ids_begin].rfind("graph_free ", 0) == 0 ||
+          checked[ids_begin].rfind("trained ", 0) == 0)) {
     ++ids_begin;
   }
   std::vector<std::string> legacy{checked[1], checked[2]};
@@ -914,6 +917,115 @@ TEST_F(HNSWVectorIndexTest, LoadForAppendContinuesABuildFromAnArtifact) {
   auto delta_hits = v2_loaded.Search(delta_chunks[0].vector, 5);
   ASSERT_TRUE(delta_hits.ok()) << delta_hits.status();
   EXPECT_TRUE(contains(*delta_hits, delta_chunks[0].chunk_id));
+}
+
+// ---------------------------------------------------------------------------
+// §3 码本基线（docs/codebook-refresh-plan.md）：sidecar 记录"码本是在多大的语料
+// 上训出来的、之后被追加了多少次"，两值都随产物继承 —— 追加复用改不了码本，所以
+// 基线原样带过去、只有追加计数 +1；全量构建才是新基线。Go 侧读它来决定要不要放弃
+// 追加复用、全量重建以重训码本。
+// ---------------------------------------------------------------------------
+
+// FindSidecarLine 返回第一条以 prefix 开头的行；没有就返回空串。
+std::string FindSidecarLine(const std::vector<std::string>& lines, const std::string& prefix) {
+  for (const auto& l : lines) {
+    if (l.rfind(prefix, 0) == 0) return l;
+  }
+  return "";
+}
+
+TEST_F(HNSWVectorIndexTest, SidecarRecordsCodebookBaselineAndInheritsItOnAppend) {
+  std::mt19937 rng(46);
+  const auto base_chunks = MakeRandomChunks(40, rng);
+  std::vector<ChunkVector> delta_chunks;
+  for (int i = 0; i < 10; ++i) {
+    delta_chunks.push_back(ChunkVector{"delta-" + std::to_string(i), RandomVector(rng)});
+  }
+
+  const std::string base_path = (test_dir_ / "baseline-a.bin").string();
+  const std::string next_path = (test_dir_ / "baseline-b.bin").string();
+  const std::string third_path = (test_dir_ / "baseline-c.bin").string();
+
+  // 全量构建 = 码本此刻训出来 ⇒ 基线 = 本批向量数，追加计数 = 0。
+  {
+    HNSWVectorIndex v1;
+    ASSERT_TRUE(v1.Build(base_chunks, MetricType::COSINE).ok());
+    ASSERT_TRUE(v1.Save(base_path).ok());
+    auto lines = ReadLines(base_path + ".ids");
+    EXPECT_EQ(FindSidecarLine(lines, "trained "),
+              "trained " + std::to_string(base_chunks.size()) + " 0");
+  }
+
+  // 追加复用改不了码本 ⇒ 基线继承、计数 +1。这正是 Go 侧判据读的那两个数。
+  {
+    HNSWVectorIndex v2;
+    ASSERT_TRUE(v2.LoadForAppend(base_path).ok());
+    ASSERT_TRUE(v2.AddChunks(delta_chunks).ok());
+    ASSERT_TRUE(v2.Save(next_path).ok());
+    auto lines = ReadLines(next_path + ".ids");
+    EXPECT_EQ(FindSidecarLine(lines, "trained "),
+              "trained " + std::to_string(base_chunks.size()) + " 1");
+  }
+
+  // 基线行绝不能被当成 chunk id 读掉：那会让 sidecar 的 id 数与索引的 ntotal 不符，
+  // Load 会直接拒绝。Load 成功 + TotalVectors 精确，就是这条的回归断言。
+  {
+    HNSWVectorIndex loaded;
+    ASSERT_TRUE(loaded.Load(next_path).ok())
+        << "the baseline line must not break the sidecar/index agreement";
+    EXPECT_EQ(loaded.TotalVectors(),
+              static_cast<int64_t>(base_chunks.size() + delta_chunks.size()));
+  }
+
+  // 再追加一次：计数继续走，基线仍然不动。
+  {
+    HNSWVectorIndex v3;
+    ASSERT_TRUE(v3.LoadForAppend(next_path).ok());
+    ASSERT_TRUE(v3.AddChunks({ChunkVector{"delta-extra", RandomVector(rng)}}).ok());
+    ASSERT_TRUE(v3.Save(third_path).ok());
+    auto lines = ReadLines(third_path + ".ids");
+    EXPECT_EQ(FindSidecarLine(lines, "trained "),
+              "trained " + std::to_string(base_chunks.size()) + " 2");
+  }
+
+  // 早于本机制的产物没有这一行：Load 必须照样成功（解析容忍缺行），而且再追加时
+  // 不能把"未知"回填成当期向量数 —— 那等于宣称"刚训过"，会让整个刷新机制静默失效。
+  {
+    auto lines = ReadLines(third_path + ".ids");
+    std::vector<std::string> pruned;
+    for (const auto& l : lines) {
+      if (l.rfind("trained ", 0) != 0) pruned.push_back(l);
+    }
+    ASSERT_EQ(pruned.size(), lines.size() - 1);
+    WriteLines(third_path + ".ids", pruned);
+
+    HNSWVectorIndex legacy_loaded;
+    EXPECT_TRUE(legacy_loaded.Load(third_path).ok()) << "a missing baseline line must read as unknown, not as an error";
+
+    HNSWVectorIndex legacy_append;
+    ASSERT_TRUE(legacy_append.LoadForAppend(third_path).ok());
+    ASSERT_TRUE(legacy_append.AddChunks({ChunkVector{"legacy-delta", RandomVector(rng)}}).ok());
+    const std::string legacy_out = (test_dir_ / "baseline-legacy.bin").string();
+    ASSERT_TRUE(legacy_append.Save(legacy_out).ok());
+    auto legacy_lines = ReadLines(legacy_out + ".ids");
+    EXPECT_EQ(FindSidecarLine(legacy_lines, "trained "), "trained 0 0")
+        << "an unknown baseline must stay unknown: back-filling it with the current "
+           "vector count would claim 'trained just now' and silently disable the "
+           "refresh mechanism (the failure mode §7 risk 1 warns about)";
+  }
+
+  // 从零全量构建（新的对象）⇒ 基线重置为当期向量数、计数归零。
+  {
+    std::vector<ChunkVector> all = base_chunks;
+    all.insert(all.end(), delta_chunks.begin(), delta_chunks.end());
+    HNSWVectorIndex rebuilt;
+    ASSERT_TRUE(rebuilt.Build(all, MetricType::COSINE).ok());
+    const std::string rebuilt_path = (test_dir_ / "baseline-rebuilt.bin").string();
+    ASSERT_TRUE(rebuilt.Save(rebuilt_path).ok());
+    auto lines = ReadLines(rebuilt_path + ".ids");
+    EXPECT_EQ(FindSidecarLine(lines, "trained "),
+              "trained " + std::to_string(all.size()) + " 0");
+  }
 }
 
 // ---------------------------------------------------------------------------

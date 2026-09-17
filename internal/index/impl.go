@@ -140,6 +140,30 @@ type IndexManagerConfig struct {
 	// check.
 	AppendMaxDeadRatio float64
 
+	// MaxCodebookDriftRatio and MaxCodebookAppends are the two triggers that
+	// retire a stale quantizer codebook (docs/codebook-refresh-plan.md §3):
+	// either one fires and the build abandons append reuse, rebuilding from
+	// scratch — which is the only path that trains a NEW codebook.
+	//
+	// 缺口：码本只在全量重建时训练一次，而"只 append、不删除"的库几乎不会全量
+	// 重建，于是新向量一直用旧码本编码 —— 量化误差随分布漂移上升，粗筛的候选覆盖
+	// 变差。排序仍由全精度 rerank 决定，所以查询不报错、不超时，只是"本该进候选的
+	// 近邻在 stage-1 就漏掉了"：功能与集成测试天然测不到这个维度。
+	//
+	// 收益不只在"防漂移"：基准里即便 delta 与 base 同分布，重训码本仍换来
+	// +8%~+16% 的候选覆盖 —— 因为新码本用上了增长后的语料（训练样本量）。语料越大
+	// 这份收益越大。
+	//
+	// 只对需要训练的量化类型生效（SQ8 学 per-dim range、PQ 学 k-means centroids）；
+	// SQ_FP16 / SQ_BF16 是纯位截断（免训练），OFF 根本没有码本 —— 见
+	// quantizerNeedsTraining，那三类实测的漂移代价恰为 0，对它们重建是纯开销。
+	//
+	// MaxCodebookDriftRatio <= 0 取 DefaultMaxCodebookDriftRatio；>= 1.0 实际上
+	// 不会触发（等价于关闭该判据）。MaxCodebookAppends <= 0 取
+	// DefaultMaxCodebookAppends。
+	MaxCodebookDriftRatio float64
+	MaxCodebookAppends    int64
+
 	// GCRatioThreshold is the dead-vector share above which an ACTIVE version
 	// becomes a §8.6(d) cleanup candidate. It is a separate knob from
 	// AppendMaxDeadRatio on purpose: that one decides whether a BUILD may start
@@ -245,6 +269,23 @@ const DefaultBuildAbandonSweepInterval = 5 * time.Minute
 // candidate slots in every search (the read path discards their results
 // afterwards, so they can only push real hits out of the top-K).
 const DefaultAppendMaxDeadRatio = 0.2
+
+// DefaultMaxCodebookDriftRatio is the cumulative-new-vector share at which a
+// version stops appending to its parent's artifact and rebuilds from scratch to
+// retrain the quantizer's codebook (docs/codebook-refresh-plan.md §3). The
+// share is (totalChunks - trainedNtotal) / trainedNtotal.
+//
+// 0.25 is a starting point, not a measured optimum: large enough that a KB whose
+// distribution is stable pays for a rebuild rarely, small enough that a
+// fast-moving one does not drift far. vecstore/test/recall_drift_bench_test.cpp
+// (§6) is the harness that would pin it down.
+const DefaultMaxCodebookDriftRatio = 0.25
+
+// DefaultMaxCodebookAppends is the fallback trigger: how many append-reuses may
+// pass before a rebuild retrains the codebook, however few vectors each one
+// added. It covers the KB that writes many small versions, where the cumulative
+// share climbs too slowly to trip the ratio.
+const DefaultMaxCodebookAppends = 50
 
 // IndexManagerImpl is the real IndexManager implementation, backed by the
 // C++ vecstore's VectorIndexService gRPC. It manages per-version HNSW
@@ -1335,17 +1376,34 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 		return 0, fmt.Errorf("index: ListChunkIDsByDocs: %w", err)
 	}
 
+	// 码本刷新判定（docs/codebook-refresh-plan.md §3）：只在"追加复用本来会发生"
+	// 时才需要 —— 判定成立就把它关掉，让下面走全量重建，而全量重建正是重训码本
+	// 的唯一途径。放在 appendBase 之前，是为了不先白付一次 LoadForAppend。
+	if !skipReuse {
+		if needed, reason, ratio := im.codebookRefreshNeeded(ctx, kbID, versionID, quantizerType, len(chunkIDs)); needed {
+			skipReuse = true
+			im.logger.Info("index: full rebuild to refresh the quantizer codebook (§3)",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.String("reason", reason),
+				zap.Float64("cumulative_drift_ratio", ratio),
+				zap.Int("total_chunks", len(chunkIDs)),
+				zap.String("quantizer", quantizerType.String()))
+		}
+	}
+
 	// §8.6(c): a pure-append version can start from its parent's artifact and
 	// add only the new chunks, instead of rebuilding the whole graph. Purely
 	// an optimisation — a failure here falls back to the full build below,
 	// and nothing downstream (callback, distribution, retention) can tell
 	// which path produced the artifact.
 	//
-	// skipReuse turns it off, and exactly one caller needs that: §8.6(d)'s
-	// graphed collection. A graphed artifact cannot drop vectors (faiss), so its
-	// tombstones can only be removed by building a NEW graph from the current
-	// document set — and reusing the parent's artifact would inherit exactly the
-	// tombstones this rebuild exists to discard.
+	// skipReuse turns it off, and two callers need that: §8.6(d)'s graphed
+	// collection, and §3's codebook refresh just above. The reasoning is the
+	// same shape for both — the rebuild exists to discard something the parent's
+	// artifact would otherwise carry in: tombstones in the first case, a stale
+	// codebook in the second (a quantized version's existing codes cannot be
+	// re-encoded under a new codebook in place, so a full rebuild is the only
+	// way to refresh it).
 	if !skipReuse {
 		if parentID, delta, dead, ok := im.appendBase(ctx, kbID, versionID, graphFree, chunkIDs); ok {
 			size, appendErr := im.buildFromBase(ctx, kbID, versionID, parentID, delta, dead, len(chunkIDs), graphFree)
@@ -1782,6 +1840,89 @@ func (im *IndexManagerImpl) appendMaxDeadRatio() float64 {
 		return DefaultAppendMaxDeadRatio
 	}
 	return im.cfg.AppendMaxDeadRatio
+}
+
+// maxCodebookDriftRatio / maxCodebookAppends resolve the two §3 triggers that
+// retire a stale codebook (docs/codebook-refresh-plan.md).
+func (im *IndexManagerImpl) maxCodebookDriftRatio() float64 {
+	if im.cfg.MaxCodebookDriftRatio <= 0 {
+		return DefaultMaxCodebookDriftRatio
+	}
+	return im.cfg.MaxCodebookDriftRatio
+}
+
+func (im *IndexManagerImpl) maxCodebookAppends() int64 {
+	if im.cfg.MaxCodebookAppends <= 0 {
+		return DefaultMaxCodebookAppends
+	}
+	return im.cfg.MaxCodebookAppends
+}
+
+// quantizerNeedsTraining reports whether this shape keeps a TRAINED codebook.
+// Only those can drift: SQ8 learns a per-dimension range and PQ learns k-means
+// centroids, while SQ_FP16 / SQ_BF16 are pure bit truncation (already trained at
+// construction) and OFF has no codebook at all.
+//
+// This gate is what keeps the mechanism off every default deployment: OFF is the
+// default quantizer, so an ungated trigger would buy a periodic full rebuild for
+// exactly zero benefit. The drift benchmark measures the untrained shapes'
+// codebook-drift cost as zero, which is why excluding them costs nothing.
+func quantizerNeedsTraining(q vecstorepb.QuantizerTypeProto) bool {
+	switch q {
+	case vecstorepb.QuantizerTypeProto_QUANTIZER_SQ8,
+		vecstorepb.QuantizerTypeProto_QUANTIZER_SQ8_FLAT,
+		vecstorepb.QuantizerTypeProto_QUANTIZER_PQ,
+		vecstorepb.QuantizerTypeProto_QUANTIZER_PQ_FLAT:
+		return true
+	}
+	return false
+}
+
+// codebookRefreshNeeded decides whether this build should give up append reuse
+// and rebuild from scratch — the only path that retrains the quantizer
+// (docs/codebook-refresh-plan.md §3).
+//
+// Two triggers, either suffices:
+//   - cumulative new-vector share: (totalChunks - trainedNtotal) / trainedNtotal
+//   - append-reuses since training: the fallback, which also covers a KB that
+//     adds a few vectors per version (the share never reaches the threshold but
+//     the codebook still ages)
+//
+// The baseline is read from the PARENT version's sealed sidecar, where it rides
+// along with the artifact — so it survives a restart and a §8.4 handoff with no
+// Go-side state. Three cases return true with an explicit reason, and all three
+// resolve after a single rebuild (which writes a baseline):
+//   - the parent's sidecar has no baseline line (artifact from before §3)
+//   - the parent's sidecar cannot be read
+//   - the baseline is zero, which is meaningless as a denominator
+//
+// cumulativeRatio is returned even when no refresh is needed, so the caller can
+// log how close a build is to the threshold.
+func (im *IndexManagerImpl) codebookRefreshNeeded(
+	ctx context.Context, kbID string, versionID int64,
+	quantizerType vecstorepb.QuantizerTypeProto, totalChunks int,
+) (needed bool, reason string, cumulativeRatio float64) {
+	if !quantizerNeedsTraining(quantizerType) || im.versionParent == nil {
+		return false, "", 0
+	}
+	parent, err := im.versionParent(ctx, kbID, versionID)
+	if err != nil || parent <= 0 || parent == versionID {
+		// No parent (or none can be looked up): this build trains a fresh
+		// codebook anyway, so there is nothing stale to refresh.
+		return false, "", 0
+	}
+	trainedNtotal, appends, known := im.artifactTrainedBaseline(kbID, parent)
+	if !known || trainedNtotal <= 0 {
+		return true, "baseline unknown", 0
+	}
+	if appends >= im.maxCodebookAppends() {
+		return true, "appends since training", 0
+	}
+	ratio := (float64(totalChunks) - float64(trainedNtotal)) / float64(trainedNtotal)
+	if ratio >= im.maxCodebookDriftRatio() {
+		return true, "cumulative drift ratio", ratio
+	}
+	return false, "", ratio
 }
 
 // removeDeadChunks asks the vecstore to drop these chunks' vectors and reports

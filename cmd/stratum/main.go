@@ -1701,6 +1701,18 @@ type appConfig struct {
 	// IndexManager's default, 1.0 disables the check.
 	IndexAppendMaxDeadRatio float64
 
+	// IndexMaxCodebookDriftRatio / IndexMaxCodebookAppends are §3's two triggers
+	// for retiring a stale quantizer codebook
+	// (index_manager.max_codebook_drift_ratio / max_codebook_appends): either one
+	// fires and the build rebuilds from scratch instead of appending, which is the
+	// only way to train a NEW codebook. <= 0 means the IndexManager's default.
+	//
+	// Both are inert unless the KB's quantizer actually learns a codebook (SQ8 or
+	// PQ): SQ_FP16 / SQ_BF16 are trained at construction and OFF has none, so
+	// those KBs never trigger a refresh however these knobs are set.
+	IndexMaxCodebookDriftRatio float64
+	IndexMaxCodebookAppends    int64
+
 	// IndexGCEnabled turns on §8.6(d) collection (index_manager.gc_enabled). Off
 	// by default: the scanner always runs and only reports, but collection
 	// rewrites an artifact that is currently SERVING queries, so turning it on is
@@ -1846,6 +1858,12 @@ type fileConfig struct {
 		BuildAbandonTimeoutMS int     `yaml:"build_abandon_timeout_ms"`
 		ColdSweepIntervalMS   int     `yaml:"cold_sweep_interval_ms"`
 		AppendMaxDeadRatio    float64 `yaml:"append_max_dead_ratio"`
+		// §3 codebook refresh. Either trigger fires and the build rebuilds from
+		// scratch instead of appending, which is the only way to retrain the
+		// quantizer. Both are inert for KBs whose quantizer does not learn a
+		// codebook (OFF / SQ_FP16 / SQ_BF16); <= 0 takes the default.
+		MaxCodebookDriftRatio float64 `yaml:"max_codebook_drift_ratio"`
+		MaxCodebookAppends    int64   `yaml:"max_codebook_appends"`
 		// §8.6(d) collection. GCEnabled is the opt-in: the scanner always runs (it
 		// only reads), but rewriting a SERVING artifact happens only when an
 		// operator says so.
@@ -2025,6 +2043,14 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.IndexManager.AppendMaxDeadRatio != 0 {
 		cfg.IndexAppendMaxDeadRatio = fc.IndexManager.AppendMaxDeadRatio
 	}
+	// §3 codebook refresh. 0 means "unset" for both (neither default is 0), so
+	// the != 0 guard reads correctly here too.
+	if fc.IndexManager.MaxCodebookDriftRatio != 0 {
+		cfg.IndexMaxCodebookDriftRatio = fc.IndexManager.MaxCodebookDriftRatio
+	}
+	if fc.IndexManager.MaxCodebookAppends != 0 {
+		cfg.IndexMaxCodebookAppends = fc.IndexManager.MaxCodebookAppends
+	}
 	// §8.6(d). gc_enabled is a plain bool: absent and false both mean "collect
 	// nothing", which is the only safe reading of a config file that predates the
 	// feature.
@@ -2133,6 +2159,12 @@ func defaultConfig() appConfig {
 		// ratio (20% dead vectors). Set append_max_dead_ratio to 1.0 to never
 		// let dead weight force a rebuild.
 		IndexAppendMaxDeadRatio: 0,
+
+		// §3 codebook refresh: 0 means the IndexManager's own defaults (drift
+		// ratio 0.25, 50 appends since training). Only a KB whose quantizer
+		// learns a codebook (SQ8 / PQ) can trigger it.
+		IndexMaxCodebookDriftRatio: 0,
+		IndexMaxCodebookAppends:    0,
 
 		// §8.6(d) collection: 0/false means the IndexManager's own defaults, which
 		// are "do not collect" for gc_enabled and 2 for serving_replica_min. The

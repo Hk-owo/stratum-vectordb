@@ -83,6 +83,21 @@ constexpr char kSidecarMagic[] = "stratum-index-1";
 // it and are read as "shape unknown".
 constexpr char kShapePrefix[] = "graph_free ";
 
+// Sidecar codebook-baseline line (docs/codebook-refresh-plan.md §3): how many
+// vectors the quantizer was trained on, and how many append-reuses have
+// happened since ("trained <ntotal> <appends>"). It rides along with the file,
+// so the baseline survives a restart and a §8.4 artifact handoff without any
+// Go-side state; the Go IndexManager reads it to decide whether to skip append
+// reuse and rebuild from scratch (which retrains the codebook).
+//
+// Two constraints matter and are load-bearing:
+//   1. The value must not look like a chunk id. A chunk id is 64 lowercase hex
+//      chars; "trained 12000 3" is neither, so Go's looksLikeChunkID rejects it
+//      and it cannot be miscounted as a vector.
+//   2. Readers must match it by prefix and `continue` (like the shape line),
+//      because anything unmatched in this loop is taken for a chunk id.
+constexpr char kTrainedPrefix[] = "trained ";
+
 // Crc32Table returns the standard CRC-32 (IEEE 802.3, reflected, polynomial
 // 0xEDB88320) lookup table, built once on first use.
 const std::array<uint32_t, 256>& Crc32Table() {
@@ -295,6 +310,8 @@ absl::Status HNSWVectorIndex::AddChunksLocked(
       hnsw->hnsw.efSearch = kEfSearch;
     }
     dim_ = dim;
+    // 新建索引 = 码本此刻（重新）训练出来 ⇒ 这是一条新的基线，Save 时写下去。
+    baseline_pending_ = true;
     // Quantized variants are approximate coarse retrievers whose search
     // results need re-ranking against full-precision vectors (see
     // SearchWithRerank); Flat stays exact and single-stage. The graph-free
@@ -618,6 +635,21 @@ absl::Status HNSWVectorIndex::Save(const std::string& path) {
     // reader meets it in a fixed place; the reader below matches it by prefix,
     // so a sidecar that lacks it (written before §8.6a) still reads correctly.
     sidecar << (IsGraphFreeLocked() ? "graph_free 1" : "graph_free 0") << "\n";
+    // §3: the codebook baseline. Same placement and matching rules as the shape
+    // line — before the chunk ids, read by prefix, absent in older sidecars.
+    int64_t out_ntotal = trained_ntotal_;
+    int64_t out_appends = appends_since_train_;
+    if (baseline_pending_) {
+      // 新建索引 ⇒ 码本就是拿这批内容（重新）训出来的：这是新基线。
+      out_ntotal = index_->ntotal;
+      out_appends = 0;
+    } else if (loaded_for_append_ && out_ntotal > 0) {
+      // 追加复用改不了码本 ⇒ 基线原样继承，只有复用计数往前走一格。
+      out_appends += 1;
+    }
+    // out_ntotal == 0（未知）时如实写成未知，**不**回填成 index_->ntotal：
+    // 回填等于宣称"刚训过"，会让整个机制静默失效。
+    sidecar << kTrainedPrefix << out_ntotal << " " << out_appends << "\n";
     for (const auto& id : id_to_chunk_id_) {
       sidecar << id << "\n";
     }
@@ -729,6 +761,12 @@ absl::Status HNSWVectorIndex::LoadLocked(const std::string& path, const char* op
   bool has_shape = false;
   bool sidecar_graph_free = false;
 
+  // §3 码本基线。早于本机制写下的产物没有这一行，has_trained 就保持 false ——
+  // Go 侧据此把基线当成"未知"并 fail-safe 重建一次，而不是去信一个没读到过的数。
+  bool has_trained = false;
+  int64_t sidecar_trained_ntotal = 0;
+  int64_t sidecar_trained_appends = 0;
+
   std::vector<std::string> ids;
   std::string line;
   while (std::getline(sidecar, line)) {
@@ -738,6 +776,23 @@ absl::Status HNSWVectorIndex::LoadLocked(const std::string& path, const char* op
     if (checksummed && !has_shape && line.rfind(kShapePrefix, 0) == 0) {
       has_shape = true;
       sidecar_graph_free = (line == "graph_free 1");
+      continue;
+    }
+    // 两个守卫都不是装饰：`checksummed` 把老 sidecar 的首行（裸 dimension）
+    // 挡在这个分支之外，而末尾的 `continue` 才是关键 —— 没有它，这一行会被
+    // 下面的 ids.push_back 当成 chunk id 吃掉，直接破坏 id 表。
+    if (checksummed && !has_trained && line.rfind(kTrainedPrefix, 0) == 0) {
+      const std::string rest = line.substr(sizeof(kTrainedPrefix) - 1);
+      long long ntotal = 0;
+      long long appends = 0;
+      if (std::sscanf(rest.c_str(), "%lld %lld", &ntotal, &appends) == 2 &&
+          ntotal >= 0 && appends >= 0) {
+        sidecar_trained_ntotal = static_cast<int64_t>(ntotal);
+        sidecar_trained_appends = static_cast<int64_t>(appends);
+        has_trained = true;
+      }
+      // 解析失败就保持"未知"：让 Go 侧多重建一次是可恢复的；猜一个值则会
+      // 静默把整个机制关掉。
       continue;
     }
     ids.push_back(line);
@@ -806,6 +861,13 @@ absl::Status HNSWVectorIndex::LoadLocked(const std::string& path, const char* op
                 dynamic_cast<faiss::IndexHNSWPQ*>(raw) != nullptr ||
                 dynamic_cast<faiss::IndexScalarQuantizer*>(raw) != nullptr ||
                 dynamic_cast<faiss::IndexPQ*>(raw) != nullptr);
+  // 码本基线随文件继承：读到什么就是什么；没有这一行（早于本机制的产物）就保持
+  // 0 = 未知，Go 侧读到未知会 fail-safe 全量重建一次，重建后基线自然补上。
+  trained_ntotal_ = has_trained ? sidecar_trained_ntotal : 0;
+  appends_since_train_ = has_trained ? sidecar_trained_appends : 0;
+  baseline_pending_ = false;
+  // LoadForAppend 之后还会继续追加：码本没变，但这次追加要让计数 +1。
+  loaded_for_append_ = (final_state == LifecycleState::kBuilding);
   state_ = final_state;
   return absl::OkStatus();
 }
@@ -822,6 +884,10 @@ absl::Status HNSWVectorIndex::ResetLocked() {
   ResetChunkIDTable();
   dim_ = 0;
   quantized_ = false;
+  trained_ntotal_ = 0;
+  appends_since_train_ = 0;
+  baseline_pending_ = false;
+  loaded_for_append_ = false;
   return absl::OkStatus();
 }
 

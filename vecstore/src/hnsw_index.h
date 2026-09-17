@@ -184,6 +184,23 @@ class HNSWVectorIndex : public VectorIndex {
   // quantized Build/AddChunks or a Load of a quantized file; Reset clears
   // it. Full-precision (Flat) indexes always have quantized_ == false.
   bool quantized_ = false;
+
+  // 码本基线（docs/codebook-refresh-plan.md §3）。它回答"当前码本是在多大的
+  // 语料上训出来的、之后被追加复用了多少次"，是 Go 侧判断"要不要放弃追加复用、
+  // 全量重建以重训码本"的依据。两者都随 sidecar 跨版本继承：追加复用改不了码本，
+  // 所以值是继承来的；全量重建（新建索引）才是新基线。故意放在 sidecar 而不是
+  // 内存里 —— 内存表重启即丢，基线一丢机制就静默失效（该文档 §7 风险 1）。
+  //
+  // trained_ntotal_ == 0 表示未知（sidecar 里没有这一行，早于本机制写下的产物）。
+  // 刻意不把"未知"折算成当期 ntotal：那等于宣告"刚训过"，会让机制就此失效。
+  int64_t trained_ntotal_ = 0;
+  int64_t appends_since_train_ = 0;
+  // baseline_pending_ 表示"本对象刚新建了索引 ⇒ 码本就是此刻训出来的"，
+  // Save 时据此把基线写成 (index_->ntotal, 0)。
+  bool baseline_pending_ = false;
+  // loaded_for_append_ 表示当前内容来自 LoadForAppend。Save 时它意味着
+  // "码本没变，只是这个版本又多追加了一批"，据此把追加计数 +1。
+  bool loaded_for_append_ = false;
 };
 
 }  // namespace vecstore
