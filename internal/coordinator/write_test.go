@@ -847,21 +847,36 @@ func TestWriteCoordinator_UpdateDocument(t *testing.T) {
 }
 
 // mockSplitter implements splitter.ChunkSplitter for tests.
+//
+// It only knows the window semantics. Since the zero ChunkMode now means
+// content-defined chunking (docs/content-defined-chunking-plan.md §3.6), a
+// knowledge base whose metadata leaves the mode unset hands it CDC parameters —
+// where WindowSize is 0. Letting that reach the loop below would make step 0 and
+// `i += step` would never terminate, so the mock falls back to the sizes it was
+// configured with. Tests that mean to exercise content-defined chunking inject
+// the real splitter instead (see chunk_reuse_test.go).
 type mockSplitter struct {
 	windowSize  int
 	overlapSize int
 }
 
-func (s *mockSplitter) Split(content string, windowSize int, overlapSize int, embedConfigID string) []types.Chunk {
+func (s *mockSplitter) Split(content string, params types.ChunkParams, embedConfigID string) []types.Chunk {
 	if len(content) == 0 {
 		return nil
 	}
-	chunks := []types.Chunk{}
-	runes := []rune(content)
+	windowSize, overlapSize := params.WindowSize, params.OverlapSize
+	if windowSize <= 0 {
+		windowSize, overlapSize = s.windowSize, s.overlapSize
+	}
 	step := windowSize - overlapSize
 	if step <= 0 {
 		step = windowSize
 	}
+	if step <= 0 {
+		step = 1 // never let the loop below stand still
+	}
+	chunks := []types.Chunk{}
+	runes := []rune(content)
 	for i := 0; i < len(runes); i += step {
 		end := i + windowSize
 		if end > len(runes) {

@@ -36,6 +36,13 @@ const KB_STATUS = {
   KB_STATUS_DELETE_FAILED: { label: 'DELETE_FAILED', cls: 'red' },
 };
 const INDEX_TYPE = { INDEX_TYPE_HNSW: 'HNSW', INDEX_TYPE_IVF: 'IVF', INDEX_TYPE_FLAT: 'FLAT' };
+const QUANTIZER = {
+  QUANTIZER_OFF: 'OFF',
+  QUANTIZER_SQ8: 'SQ8',
+  QUANTIZER_SQ_BF16: 'SQ_BF16',
+  QUANTIZER_SQ_FP16: 'SQ_FP16',
+  QUANTIZER_PQ: 'PQ',
+};
 const SIMILARITY = {
   SIMILARITY_COSINE: 'COSINE',
   SIMILARITY_EUCLIDEAN: 'EUCLIDEAN',
@@ -331,6 +338,7 @@ async function selectKB(id) {
   currentKB = { id };
   renderKBList();
   showKBDetail(true);
+  syncQueryKB(id);
   $('kb-detail-title').textContent = id;
   $('kb-detail-meta').textContent = '';
   try {
@@ -362,7 +370,8 @@ function renderKBDetail(kb) {
     badge(st.cls, st.label) +
     ' 活跃版本 v' + (kb.active_version_id ?? '—') +
     ' · ' + (INDEX_TYPE[kb.index_type] || kb.index_type) +
-    ' · ' + (SIMILARITY[kb.similarity] || kb.similarity);
+    ' · ' + (SIMILARITY[kb.similarity] || kb.similarity) +
+    ' · 量化 ' + (QUANTIZER[kb.quantizer] || 'OFF');
 }
 
 async function loadVersions() {
@@ -715,17 +724,53 @@ async function setBaseVersion(versionId) {
   );
 }
 
+// 新建知识库时高级设置的兜底默认值。地址与 start.sh / run/console.yaml 里
+// mock-embed 的默认（http://localhost:8080）保持一致，这样「只填名字」也能
+// 建出可用的库；高级设置里填了值就以填的为准。
+const DEFAULT_EMBED_ADDR = 'http://localhost:8080';
+const DEFAULT_EMBED_MODEL_ID = 'default';
+
+// PQ 的 m / nbits 只在选中 PQ 时可填：其余量化器不看这两个值，留着可编辑会
+// 让人以为填了也有效。切换时一并清空，避免带着上一次的值被提交。
+const createQuantizerSelect = document.querySelector('#create-kb-form select[name="quantizer"]');
+function syncPQFields() {
+  const isPQ = createQuantizerSelect.value === 'QUANTIZER_PQ';
+  document.querySelectorAll('#create-kb-form .pq-only input').forEach(el => {
+    el.disabled = !isPQ;
+    if (!isPQ) el.value = '';
+  });
+  document.querySelectorAll('#create-kb-form .pq-only').forEach(el => {
+    el.classList.toggle('muted', !isPQ);
+  });
+}
+createQuantizerSelect.addEventListener('change', syncPQFields);
+syncPQFields();
+
 $('create-kb-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = e.target;
   const body = {
-    name: f.name.value.trim(),
+    // 经 f.elements 取字段：form.name 在浏览器里是命名访问（返回控件），
+    // 但它同时又是 HTMLFormElement 自身的 name 属性，直接 f.name 依赖
+    // LegacyOverrideBuiltIns 这一条隐式规则；走 elements 没有歧义。
+    name: f.elements.name.value.trim(),
     chunk_window_size: Number(f.chunk_window_size.value) || 512,
     chunk_overlap_size: Number(f.chunk_overlap_size.value) || 64,
     index_type: f.index_type.value,
     similarity: f.similarity.value,
-    embed_config: { service_addr: f.service_addr.value.trim(), model_id: f.model_id.value.trim() },
+    quantizer: f.quantizer.value,
+    embed_config: {
+      service_addr: f.service_addr.value.trim() || DEFAULT_EMBED_ADDR,
+      model_id: f.model_id.value.trim() || DEFAULT_EMBED_MODEL_ID,
+    },
   };
+  // PQ 的两个参数只对 PQ 有意义：别的类型一律不送，免得把一个无效的 m/nbits
+  // 写进 KB 元数据（服务端只在「量化器 = PQ」时才读它们，但把口径留在前端更清楚）。
+  if (body.quantizer === 'QUANTIZER_PQ') {
+    const m = Number(f.pq_m.value), nbits = Number(f.pq_nbits.value);
+    if (m > 0) body.pq_m = m;
+    if (nbits > 0) body.pq_nbits = nbits;
+  }
   try {
     const resp = await api('/knowledge-bases', { method: 'POST', body });
     toast(`已创建 ${resp.knowledge_base_id}，初始版本 v${resp.initial_version_id}`);
@@ -758,31 +803,41 @@ function updateChangesEmpty() {
   $('changes-empty').classList.toggle('hidden', has);
 }
 
+// doc_id 自动编号：普通用户不必关心文档 ID，新增行默认给出 doc-1、doc-2…
+// （可手动改）。DELETE 不预填——删哪篇必须由人指明。
+let changeDocSeq = 0;
+
+function nextDocID() { return 'doc-' + (++changeDocSeq); }
+
 function addChangeRow(op = 'CHANGE_OP_ADD', docId = '', content = '') {
   const row = document.createElement('div');
   row.className = 'change-row';
+  const isDelete = op === 'CHANGE_OP_DELETE';
   row.innerHTML = `
     <select class="op">
       <option value="CHANGE_OP_ADD">ADD</option>
       <option value="CHANGE_OP_DELETE">DELETE</option>
       <option value="CHANGE_OP_UPDATE">UPDATE</option>
     </select>
-    <input class="doc-id" placeholder="doc_id" value="${docId}">
-    <textarea class="content" placeholder="content（ADD/UPDATE 必填，DELETE 无需）">${content}</textarea>
+    <input class="doc-id" placeholder="留空自动编号" value="${docId || (isDelete ? '' : nextDocID())}">
+    <textarea class="content" placeholder="贴入文档内容（DELETE 无需填写）">${content}</textarea>
     <button type="button" class="btn btn-ghost remove">移除</button>
   `;
   row.querySelector('select.op').value = op;
   row.querySelector('.remove').addEventListener('click', () => { row.remove(); updateChangesEmpty(); });
+  row.querySelector('.content').disabled = isDelete;
   row.querySelector('.op').addEventListener('change', function () {
-    const isDelete = this.value === 'CHANGE_OP_DELETE';
-    row.querySelector('.content').disabled = isDelete;
-    row.querySelector('.content').placeholder = isDelete
-      ? 'DELETE 无需内容'
-      : 'content（ADD/UPDATE 必填）';
+    const del = this.value === 'CHANGE_OP_DELETE';
+    row.querySelector('.content').disabled = del;
+    row.querySelector('.content').placeholder = del
+      ? '删除操作无需内容'
+      : '贴入文档内容';
   });
   $('changes-editor').appendChild(row);
   updateChangesEmpty();
-  row.querySelector('.doc-id').focus();
+  // 焦点给内容框：默认 ADD，用户的下一步就是贴文本。
+  const focusTarget = row.querySelector('.content');
+  (focusTarget.disabled ? row.querySelector('.doc-id') : focusTarget).focus();
 }
 
 $('add-change-btn').addEventListener('click', () => addChangeRow());
@@ -791,11 +846,13 @@ $('create-version-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   if (!currentKB) { toast('请先选择知识库'); return; }
   const changes = [];
+  let autoNo = 0;
   document.querySelectorAll('#changes-editor .change-row').forEach(row => {
     const op = row.querySelector('.op').value;
-    const docId = row.querySelector('.doc-id').value.trim();
-    if (!docId) return;
-    const change = { op, doc_id: docId };
+    const typed = row.querySelector('.doc-id').value.trim();
+    // 删除必须指明是哪篇文档：留空说明用户还没填，跳过而不是替它猜一个 ID。
+    if (!typed && op === 'CHANGE_OP_DELETE') return;
+    const change = { op, doc_id: typed || `doc-${++autoNo}` };
     if (op !== 'CHANGE_OP_DELETE') change.content = row.querySelector('.content').value;
     changes.push(change);
   });
@@ -825,6 +882,19 @@ function showQueryEmpty(visible) {
   $('query-results').classList.toggle('hidden', visible);
 }
 
+// 检索页的知识库跟随「知识库」页当前选中项自动填入，省掉复制 kb_id 这一步。
+// 用户一旦手动改过该输入框，就不再自动覆盖，避免抢掉他正在输入的值。
+let queryKBEdited = false;
+
+function syncQueryKB(id) {
+  const input = document.querySelector('#query-form input[name="knowledge_base_id"]');
+  if (!input || queryKBEdited) return;
+  input.value = id;
+}
+
+document.querySelector('#query-form input[name="knowledge_base_id"]')
+  .addEventListener('input', () => { queryKBEdited = true; });
+
 $('query-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const f = e.target;
@@ -832,7 +902,7 @@ $('query-form').addEventListener('submit', async (e) => {
   try {
     vector = JSON.parse(f.vector.value.trim());
     if (!Array.isArray(vector) || !vector.length || vector.some(x => typeof x !== 'number')) throw new Error('非法向量');
-  } catch (err) { toast('查询向量需为数字数组 JSON，如 [0.1, 0.2]'); return; }
+  } catch (err) { toast('请填入查询向量（JSON 数字数组），如 [0.1, 0.2]'); return; }
 
   const body = {
     knowledge_base_id: f.knowledge_base_id.value.trim(),
@@ -996,6 +1066,20 @@ function renderDkNodes(st) {
       }
     });
   });}
+
+// dkConfigLoad 拉取集群级统一参数并填进表单。它在脚本末尾被调用，但函数体力
+// 在某次改动中被连带删除、只留下调用点——顶层 ReferenceError 会中断脚本尾部，
+// 使随后的 dkPoll() 与 setInterval(dkPoll, 5000) 都不执行（运维页永远停在
+// 「加载中…」）。这里按 /ops/docker/config 的返回（config 对象本身）恢复实现。
+async function dkConfigLoad() {
+  try {
+    DK.config = await opsApi('/docker/config');
+    dkConfigFill(DK.config);
+  } catch (e) {
+    toast('加载集群参数失败：' + e.message);
+  }
+}
+
 function dkConfigFill(cfg) {
   const set = (id, v) => { const el = $(id); if (el) el.value = (v == null ? '' : v); };
   set('dk-cfg-topology', cfg.topology || 'single');

@@ -3,6 +3,8 @@ package splitter
 import (
 	"strings"
 	"testing"
+
+	"stratum/internal/types"
 )
 
 // TestSlidingWindowSplitter follows the T1-5 case table in
@@ -13,7 +15,7 @@ func TestSlidingWindowSplitter(t *testing.T) {
 	t.Run("normal split: chunk count and boundaries correct", func(t *testing.T) {
 		content := strings.Repeat("字", 1000)
 		windowSize, overlap := 200, 50
-		chunks := s.Split(content, windowSize, overlap, "cfg1")
+		chunks := s.Split(content, types.WindowChunkParams(windowSize, overlap), "cfg1")
 
 		step := windowSize - overlap // 150
 		wantCount := 0
@@ -46,7 +48,7 @@ func TestSlidingWindowSplitter(t *testing.T) {
 
 	t.Run("short document becomes a single whole chunk", func(t *testing.T) {
 		content := strings.Repeat("a", 50)
-		chunks := s.Split(content, 200, 50, "cfg1")
+		chunks := s.Split(content, types.WindowChunkParams(200, 50), "cfg1")
 		if len(chunks) != 1 {
 			t.Fatalf("chunk count = %d, want 1", len(chunks))
 		}
@@ -57,8 +59,8 @@ func TestSlidingWindowSplitter(t *testing.T) {
 
 	t.Run("chunk ID is consistent across repeated splits", func(t *testing.T) {
 		content := strings.Repeat("hello world ", 100)
-		c1 := s.Split(content, 200, 50, "cfg1")
-		c2 := s.Split(content, 200, 50, "cfg1")
+		c1 := s.Split(content, types.WindowChunkParams(200, 50), "cfg1")
+		c2 := s.Split(content, types.WindowChunkParams(200, 50), "cfg1")
 		if len(c1) != len(c2) {
 			t.Fatalf("chunk count differs across runs: %d vs %d", len(c1), len(c2))
 		}
@@ -71,8 +73,8 @@ func TestSlidingWindowSplitter(t *testing.T) {
 
 	t.Run("different embedConfigID yields different chunk IDs", func(t *testing.T) {
 		content := strings.Repeat("hello world ", 100)
-		c1 := s.Split(content, 200, 50, "cfg1")
-		c2 := s.Split(content, 200, 50, "cfg2")
+		c1 := s.Split(content, types.WindowChunkParams(200, 50), "cfg1")
+		c2 := s.Split(content, types.WindowChunkParams(200, 50), "cfg2")
 		if len(c1) != len(c2) {
 			t.Fatalf("chunk count differs: %d vs %d", len(c1), len(c2))
 		}
@@ -90,7 +92,7 @@ func TestSlidingWindowSplitter(t *testing.T) {
 	t.Run("overlap is correct: next chunk head contains previous chunk's tail", func(t *testing.T) {
 		content := strings.Repeat("0123456789", 30) // 300 runes
 		windowSize, overlap := 100, 20
-		chunks := s.Split(content, windowSize, overlap, "cfg1")
+		chunks := s.Split(content, types.WindowChunkParams(windowSize, overlap), "cfg1")
 		if len(chunks) < 2 {
 			t.Fatalf("expected at least 2 chunks, got %d", len(chunks))
 		}
@@ -106,7 +108,7 @@ func TestSlidingWindowSplitter(t *testing.T) {
 	})
 
 	t.Run("empty document does not panic and returns no/empty chunks", func(t *testing.T) {
-		chunks := s.Split("", 200, 50, "cfg1")
+		chunks := s.Split("", types.WindowChunkParams(200, 50), "cfg1")
 		if len(chunks) > 1 {
 			t.Fatalf("empty document produced %d chunks, want 0 or 1", len(chunks))
 		}
@@ -125,7 +127,7 @@ func TestSlidingWindowSplitter_DegenerateConfig(t *testing.T) {
 
 	t.Run("zero window size does not panic or loop forever", func(t *testing.T) {
 		content := strings.Repeat("a", 100)
-		chunks := s.Split(content, 0, 0, "cfg1")
+		chunks := s.Split(content, types.WindowChunkParams(0, 0), "cfg1")
 		if len(chunks) != 1 || chunks[0].Content != content {
 			t.Fatalf("zero windowSize should fall back to a single whole-document chunk, got %d chunks", len(chunks))
 		}
@@ -133,7 +135,7 @@ func TestSlidingWindowSplitter_DegenerateConfig(t *testing.T) {
 
 	t.Run("overlap >= windowSize does not loop forever", func(t *testing.T) {
 		content := strings.Repeat("a", 500)
-		chunks := s.Split(content, 100, 100, "cfg1") // overlap == windowSize
+		chunks := s.Split(content, types.WindowChunkParams(100, 100), "cfg1") // overlap == windowSize
 		if len(chunks) == 0 {
 			t.Fatalf("expected at least one chunk")
 		}
@@ -143,7 +145,7 @@ func TestSlidingWindowSplitter_DegenerateConfig(t *testing.T) {
 
 	t.Run("negative overlap treated as zero", func(t *testing.T) {
 		content := strings.Repeat("a", 300)
-		chunks := s.Split(content, 100, -10, "cfg1")
+		chunks := s.Split(content, types.WindowChunkParams(100, -10), "cfg1")
 		if len(chunks) == 0 {
 			t.Fatalf("expected at least one chunk")
 		}

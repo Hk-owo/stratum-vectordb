@@ -40,7 +40,7 @@ type storageStack struct {
 	ChunkStore     *chunkstore.VecstoreChunkStore
 	ChunkBloom     *bloom.BitsAndBloomsFilter
 	VersionBloom   *bloom.VersionBloomStore
-	ChunkSplitter  *splitter.SlidingWindowSplitter
+	ChunkSplitter  splitter.ChunkSplitter
 	IndexManager   *index.IndexManagerImpl
 	EmbedClient    *embed.HTTPEmbedClient
 }
@@ -111,7 +111,10 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		logger.Warn("chunk bloom rebuild: ListKnowledgeBases failed; filter starts empty (write path degrades, stays correct)", zap.Error(err))
 	}
 
-	stack.ChunkSplitter = &splitter.SlidingWindowSplitter{}
+	// One splitter serves every knowledge base on this node; which algorithm
+	// it applies comes from each KB's metadata, per write
+	// (docs/content-defined-chunking-plan.md §3.8).
+	stack.ChunkSplitter = splitter.NewDefault()
 
 	indexMgr := index.NewIndexManager(index.IndexManagerConfig{
 		LRUCapacity:         cfg.IndexLRUCapacity,

@@ -30,10 +30,12 @@ import (
 //  1. WAL.WriteBegin (persisting the transaction's replay input)
 //  2. RaftNode.ProposeCreateVersion (apply phase writes WAL.WriteVersionID
 //     first, then allocates the version into the state machine)
-//  3. For each changed document: ChunkSplitter.Split -> EmbedClient.Embed
-//     -> per chunk: BloomFilter.Test -> ChunkStore.Exists (false-positive
-//     confirmation) -> ChunkStore.Write + BloomFilter.Add ->
-//     ChunkDocMapper.Write -> DocStore.Write
+//  3. For each changed document: ChunkSplitter.Split (with the mode from the
+//     knowledge base metadata) -> per chunk: BloomFilter.Test ->
+//     ChunkStore.Exists, and only the chunks the KB does not already hold go
+//     to EmbedClient.Embed (docs/content-defined-chunking-plan.md §4) ->
+//     ChunkStore.Write + BloomFilter.Add -> ChunkDocMapper.Write (every
+//     chunk, the reused ones included) -> DocStore.Write
 //  4. VersionDocList.Write (parent version's full doc set + this version's
 //     changes)
 //  5. VersionBloomStore.BuildAndPersist (version-document filter

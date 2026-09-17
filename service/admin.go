@@ -149,6 +149,10 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 					})
 					continue
 				}
+				// 只认可重试的 FAILED（stuck = 卡在那儿等重试）。这里不能用
+				// IndexStatus.IsFailed()：本分支以 continue 结尾，把终态的
+				// FAILED_PERMANENT 一并收进来，就会让下面专门收集终态的
+				// failedPermanent 永远收不到东西。
 				if v.IndexStatus == types.IndexStatusFailed {
 					stuckVersions = append(stuckVersions, &pb.StuckVersion{
 						KbId:        v.KBID,

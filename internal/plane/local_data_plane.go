@@ -2250,7 +2250,7 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 			// The DATA side's verdict counts too: data that will never arrive
 			// cannot produce an index, so scheduling a build for it would fail on
 			// every sweep for the same reason (§10.1b).
-			if v.IndexStatus == types.IndexStatusFailed || v.IndexStatus == types.IndexStatusFailedPermanent ||
+			if v.IndexStatus.IsFailed() ||
 				v.DataStatus == types.DataStatusFailedPermanent {
 				continue
 			}
@@ -2273,7 +2273,7 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 		retentionCutoff := retentionCutoffOf(onDisk, retentionCount)
 
 		for _, v := range versions {
-			if v.IndexStatus == types.IndexStatusFailed || v.IndexStatus == types.IndexStatusFailedPermanent ||
+			if v.IndexStatus.IsFailed() ||
 				v.DataStatus == types.DataStatusFailedPermanent {
 				continue
 			}

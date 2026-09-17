@@ -605,11 +605,14 @@ func (c *WriteCoordinatorImpl) writeOneChange(ctx context.Context, kbID string, 
 	return nil
 }
 
-// writeDocument handles a single ADD or UPDATE document change: split,
-// embed, write chunks + mappings + doc content.
+// writeDocument handles a single ADD or UPDATE document change: split, embed
+// what is new, write chunks + mappings + doc content.
 func (c *WriteCoordinatorImpl) writeDocument(ctx context.Context, kbID string, versionID int64, change types.DocChange, kbMeta types.KnowledgeBaseMeta) error {
-	// Split
-	chunks := c.cfg.Splitter.Split(change.Content, kbMeta.ChunkWindowSize, kbMeta.ChunkOverlapSize, kbMeta.EmbedConfig.ModelID)
+	// Split, with the algorithm this knowledge base was created with: the
+	// splitter is shared by every KB on the node, so the mode travels with the
+	// call (docs/content-defined-chunking-plan.md §3.8).
+	params := kbMeta.Chunking()
+	chunks := c.cfg.Splitter.Split(change.Content, params, kbMeta.EmbedConfig.ModelID)
 
 	if len(chunks) == 0 {
 		// No chunks produced (e.g. empty content): just write the document
@@ -619,29 +622,67 @@ func (c *WriteCoordinatorImpl) writeDocument(ctx context.Context, kbID string, v
 		})
 	}
 
-	// Embed
-	var vectors map[string][]float32
-	err := c.retry(ctx, func() error {
-		var inner error
-		vectors, inner = c.cfg.EmbedClient.Embed(ctx, chunks)
-		return inner
-	})
-	if err != nil {
-		return fmt.Errorf("coordinator: embed chunks for doc %s: %w", change.DocID, err)
+	// Embed, but only the chunks this KB does not already hold.
+	//
+	// The chunk store is content-addressed, so a chunk the KB already has needs
+	// neither a fresh embedding nor a fresh vector — only its chunk-document
+	// mapping. Asking the embed service for it anyway is what used to make a
+	// higher reuse rate worth nothing in compute; filtering here is what turns
+	// the reuse into skipped embed calls (docs/content-defined-chunking-plan.md
+	// §4). The filter asks exactly the question writeChunk asks (chunkPresent),
+	// so the two cannot disagree.
+	//
+	// This is a per-node optimisation, not global dedup: the bloom filter that
+	// answers it is local, so a chunk another node stored is still embedded
+	// here (§4.3).
+	pending := make([]types.Chunk, 0, len(chunks))
+	alreadyPresent := 0
+	for _, chunk := range chunks {
+		present, err := c.chunkPresent(ctx, kbID, chunk.ChunkID)
+		if err != nil {
+			return err
+		}
+		if present {
+			alreadyPresent++
+			continue
+		}
+		pending = append(pending, chunk)
 	}
 
-	// Per chunk: bloom check -> exists confirm (if needed) -> write + bloom add -> chunk-doc map
-	for _, chunk := range chunks {
+	var vectors map[string][]float32
+	if len(pending) > 0 {
+		err := c.retry(ctx, func() error {
+			var inner error
+			vectors, inner = c.cfg.EmbedClient.Embed(ctx, pending)
+			return inner
+		})
+		if err != nil {
+			return fmt.Errorf("coordinator: embed chunks for doc %s: %w", change.DocID, err)
+		}
+	}
+
+	// Store the new vectors. writeChunk re-checks existence: a concurrent write
+	// of the same chunk (another document, another version) can store it
+	// between the filter above and here, and that check is what keeps the two
+	// paths from storing one chunk twice.
+	lateHits := 0
+	for _, chunk := range pending {
 		vector, ok := vectors[chunk.ChunkID]
 		if !ok {
 			return fmt.Errorf("coordinator: embed did not return vector for chunk %s", chunk.ChunkID)
 		}
-
-		if err := c.writeChunk(ctx, kbID, chunk, vector); err != nil {
+		existed, err := c.writeChunk(ctx, kbID, chunk, vector)
+		if err != nil {
 			return err
 		}
+		if existed {
+			lateHits++
+		}
+	}
 
-		// Write chunk-doc mapping (idempotent).
+	// Map every chunk — the reused ones included — to this document
+	// (idempotent).
+	for _, chunk := range chunks {
 		if err := c.retry(ctx, func() error {
 			return c.cfg.ChunkDocMapper.Write(ctx, kbID, chunk.ChunkID, change.DocID)
 		}); err != nil {
@@ -656,35 +697,60 @@ func (c *WriteCoordinatorImpl) writeDocument(ctx context.Context, kbID string, v
 		return fmt.Errorf("coordinator: doc store write: %w", err)
 	}
 
+	// Reuse observation (docs/content-defined-chunking-plan.md §5). The two
+	// counts differ exactly when a concurrent writer stored a chunk after the
+	// pre-embed filter: those were reused, but their embedding was paid for
+	// already.
+	c.logger().Info("write: document stored",
+		zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+		zap.String("doc_id", change.DocID),
+		zap.String("chunk_mode", params.Mode.String()),
+		zap.Int("chunks", len(chunks)),
+		zap.Int("chunks_already_present", alreadyPresent+lateHits),
+		zap.Int("embed_skipped", alreadyPresent))
+
 	return nil
 }
 
-// writeChunk handles a single chunk: bloom check -> authoritative exists
-// confirm -> write + bloom add (if truly new).
-func (c *WriteCoordinatorImpl) writeChunk(ctx context.Context, kbID string, chunk types.Chunk, vector []float32) error {
-	// Bloom filter test.
-	if c.cfg.ChunkBloom.Test(chunk.ChunkID) {
-		// Bloom says "maybe exists" — confirm against the authoritative store.
-		exists, err := c.cfg.ChunkStore.Exists(ctx, kbID, chunk.ChunkID)
-		if err != nil {
-			return fmt.Errorf("coordinator: ChunkStore.Exists for %s: %w", chunk.ChunkID, err)
-		}
-		if exists {
-			return nil // already stored; nothing to do
-		}
-		// False positive: write it now.
+// chunkPresent reports whether kbID's chunk store already holds chunkID.
+//
+// It is the write path's single answer to that question — whether the caller is
+// filtering before an embed call or confirming just before a write. The bloom
+// filter only hints: it can answer "maybe" for a chunk that is not there, and it
+// is per-node state that starts empty after a restart. So a hint is always
+// confirmed against the authoritative store.
+func (c *WriteCoordinatorImpl) chunkPresent(ctx context.Context, kbID, chunkID string) (bool, error) {
+	if !c.cfg.ChunkBloom.Test(chunkID) {
+		return false, nil
+	}
+	exists, err := c.cfg.ChunkStore.Exists(ctx, kbID, chunkID)
+	if err != nil {
+		return false, fmt.Errorf("coordinator: ChunkStore.Exists for %s: %w", chunkID, err)
+	}
+	return exists, nil
+}
+
+// writeChunk stores one chunk's vector unless the store already holds it, and
+// reports whether it was already there (writeDocument counts those).
+func (c *WriteCoordinatorImpl) writeChunk(ctx context.Context, kbID string, chunk types.Chunk, vector []float32) (bool, error) {
+	present, err := c.chunkPresent(ctx, kbID, chunk.ChunkID)
+	if err != nil {
+		return false, err
+	}
+	if present {
+		return true, nil // already stored; nothing to do
 	}
 
 	// Write chunk to vecstore.
 	if err := c.retry(ctx, func() error {
 		return c.cfg.ChunkStore.Write(ctx, kbID, chunk.ChunkID, vector)
 	}); err != nil {
-		return fmt.Errorf("coordinator: ChunkStore.Write for %s: %w", chunk.ChunkID, err)
+		return false, fmt.Errorf("coordinator: ChunkStore.Write for %s: %w", chunk.ChunkID, err)
 	}
 
 	// Add to bloom filter.
 	c.cfg.ChunkBloom.Add(chunk.ChunkID)
-	return nil
+	return false, nil
 }
 
 // writeVersionDocList computes the new version's full document ID set by

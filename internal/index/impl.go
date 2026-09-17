@@ -1164,6 +1164,14 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64, graphFree bool
 			zap.Int64("version_id", versionID),
 			zap.Error(err))
 		status = types.IndexStatusFailed
+		if !isTransientBuildErr(err) {
+			// 确定性失败（vecstore 拒绝了这批数据、参数不合法……）不会因为再试一次
+			// 而变好：buildWithRetry 已经在 isTransientBuildErr 上认出了这一点并提前
+			// 返回。上报时必须把同一判断带上——否则控制层收到的是「暂时失败」，把它
+			// 记进重试预算，版本就一直停在 PENDING 等一个永远不会来的成功
+			// （§10.1、cmd/stratum/main.go 的 reportIndexStatus）。
+			status = types.IndexStatusFailedPermanent
+		}
 	}
 }
 
@@ -1346,15 +1354,23 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
 					zap.Int64("parent_version_id", parentID),
 					zap.Int("total_chunks", len(chunkIDs)), zap.Int("delta_chunks", len(delta)),
+					zap.Float64("append_delta_ratio", float64(len(delta))/float64(max(len(chunkIDs), 1))),
 					zap.Int("deleted_chunks", len(dead)), zap.Bool("graph_free", graphFree))
 				return size, nil
 			}
 			if errors.Is(appendErr, errAppendTooManyTombstones) {
 				// Not a failure: the reuse was legal, but the base carried too much
 				// dead weight, so rebuilding (which drops it) is the better trade.
+				// The ratio is reported here too: this path still pays for a full
+				// rebuild, and without the number beside it there is no way to see
+				// which versions keep drifting past the limit
+				// (docs/content-defined-chunking-plan.md §5).
 				im.logger.Info("index: append reuse not worth it; rebuilding from scratch",
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
-					zap.Int64("parent_version_id", parentID), zap.Error(appendErr))
+					zap.Int64("parent_version_id", parentID),
+					zap.Int("total_chunks", len(chunkIDs)), zap.Int("delta_chunks", len(delta)),
+					zap.Float64("append_delta_ratio", float64(len(delta))/float64(max(len(chunkIDs), 1))),
+					zap.Error(appendErr))
 			} else {
 				im.logger.Warn("index: append reuse failed; rebuilding from scratch",
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),

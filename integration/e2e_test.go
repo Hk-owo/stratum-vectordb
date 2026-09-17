@@ -353,6 +353,15 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		ColdSweepInterval: cfg.coldSweepInterval,
 	})
 	im.SetLogger(nodeLogger)
+	// KB 级量化器的来源，与节点装配（cmd/stratum/storage_stack.go 的
+	// indexMgr.SetKBMetaGetter(rn.GetKB)）逐字一致：异步构建经它读到 KB 元数据
+	// 里的 QuantizerType，再随 Build RPC 转给 vecstore。
+	//
+	// 漏掉这一句的后果不是报错而是静默降级——buildQuantizerFromKB 在
+	// kbMetaGetter == nil 时一律返回 QUANTIZER_OFF，于是这个栈里每个 KB 的每次
+	// 构建都是全精度，量化器"开着"在这套集成/集群用例中从来不成立（integration/
+	// 里对 quantizer 零命中，就是这么来的）。
+	im.SetKBMetaGetter(rn.GetKB)
 	// §8.6(c): wire the parent-version link, like the node assembly does, so
 	// this stack exercises the pure-append reuse end to end.
 	//
@@ -1049,7 +1058,7 @@ func (n *realNode) createTestKB(ctx context.Context, name string) (string, int64
 func chunkIDFor(t *testing.T, content string) string {
 	t.Helper()
 	sp := splitter.NewSlidingWindowSplitter()
-	chunks := sp.Split(content, 512, 64, "m1")
+	chunks := sp.Split(content, types.WindowChunkParams(512, 64), "m1")
 	if len(chunks) == 0 {
 		t.Fatalf("no chunks for content %q", content)
 	}

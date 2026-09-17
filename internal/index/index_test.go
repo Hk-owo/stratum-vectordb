@@ -346,8 +346,12 @@ func TestIndexManager_TriggerBuildFailure(t *testing.T) {
 	var cbCalled atomic.Int32
 	im.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
 		cbCalled.Add(1)
-		if status != types.IndexStatusFailed {
-			t.Errorf("expected FAILED, got %v", status)
+		// 这个 mock 注入的是裸 error（不是 gRPC status），isTransientBuildErr 对
+		// 它返回 false——重试没有意义，所以上报的是终态的 FAILED_PERMANENT，而不是
+		// 会一直占着 PENDING 的 FAILED。断言 IsFailed() 保留用例本意（必须报告失败），
+		// 不把「失败报成哪种形态」写死在这里。
+		if !status.IsFailed() {
+			t.Errorf("expected a failed status (FAILED or FAILED_PERMANENT), got %v", status)
 		}
 		return nil
 	})

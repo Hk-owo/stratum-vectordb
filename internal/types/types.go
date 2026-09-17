@@ -41,6 +41,15 @@ func (s IndexStatus) String() string {
 	}
 }
 
+// IsFailed reports whether the index reached a failed verdict — transient
+// (IndexStatusFailed) or terminal (IndexStatusFailedPermanent). Both mean the
+// version has no usable index, so the read path and the operator-facing checks
+// must refuse it; the only difference is whether the control layer may still
+// retry.
+func (s IndexStatus) IsFailed() bool {
+	return s == IndexStatusFailed || s == IndexStatusFailedPermanent
+}
+
 // FailureClass is the storage layer's classification of a failed attempt to
 // make a version durable. It decides how the control layer treats the failure
 // (Stratum_设计文档v13.md §10.1): the storage layer names the kind, the control
@@ -184,6 +193,89 @@ type Chunk struct {
 	Content string // raw chunk text
 }
 
+// ChunkMode names the splitting algorithm a knowledge base uses to turn a
+// document into chunks (docs/content-defined-chunking-plan.md §3).
+type ChunkMode string
+
+const (
+	// ChunkModeCDC is content-defined chunking (splitter.CDCSplitter): the
+	// default, and what the zero value means. Boundaries come from a rolling
+	// Rabin fingerprint, so a mid-document edit disturbs only the chunks around
+	// it instead of every chunk after it. Measured against this repository's own
+	// documents, that moves the share of chunks past the edit point that keep
+	// their ChunkID from 0% to about 95%, and the text that has to be embedded
+	// again from 64% to 10% of the document
+	// (docs/content-defined-chunking-plan.md §1.2b).
+	//
+	// The zero value means this mode deliberately. Knowledge base metadata is
+	// stored as JSON/gob in the Raft state machine and read back through the
+	// control plane, so it arrives in three shapes: written by this code (the
+	// field is set), decoded from a snapshot that predates the field (""), or
+	// mapped field by field out of the control-plane proto, which has no field
+	// for the mode at all (""). Making the default here means all three resolve
+	// to the same algorithm — which is what removes the need for a proto field,
+	// and with it the failure mode of one node cutting a knowledge base
+	// differently from another (docs/content-defined-chunking-plan.md §3.6).
+	ChunkModeCDC ChunkMode = "cdc"
+
+	// ChunkModeWindow is the fixed-offset sliding window
+	// (splitter.SlidingWindowSplitter). Nothing in the API selects it: every
+	// knowledge base is chunked content-defined, and the window survives as the
+	// implementation the CDC tests are measured against
+	// (docs/content-defined-chunking-plan.md §8). Only code sets this.
+	ChunkModeWindow ChunkMode = "window"
+)
+
+// String returns the mode's name for logging. The empty mode reports "cdc",
+// because that is the behaviour it selects.
+func (m ChunkMode) String() string {
+	if m == "" {
+		return string(ChunkModeCDC)
+	}
+	return string(m)
+}
+
+// ChunkParams is one document's splitting input: which algorithm to use and
+// the sizes that algorithm reads.
+//
+// The two modes count in different units, and the field names keep them apart:
+// WindowSize/OverlapSize are RUNES (as they always were, so that multi-byte
+// text counts correctly), while MinSize/MaxSize are BYTES — the content-defined
+// chunker rolls a byte-wise fingerprint and reports byte offsets
+// (docs/content-defined-chunking-plan.md §3.2, §3.3). Each mode reads only its
+// own fields.
+type ChunkParams struct {
+	Mode        ChunkMode
+	WindowSize  int // window mode: window size, in runes.
+	OverlapSize int // window mode: overlap between neighbours, in runes.
+	MinSize     int // cdc mode: minimum chunk size, in bytes.
+	MaxSize     int // cdc mode: maximum chunk size, in bytes.
+	AvgBits     int // cdc mode: target average size, 2^AvgBits bytes.
+}
+
+// WindowChunkParams builds sliding-window parameters.
+func WindowChunkParams(windowSize, overlapSize int) ChunkParams {
+	return ChunkParams{Mode: ChunkModeWindow, WindowSize: windowSize, OverlapSize: overlapSize}
+}
+
+// CDCChunkParams builds content-defined chunking parameters.
+func CDCChunkParams(minSize, maxSize, avgBits int) ChunkParams {
+	return ChunkParams{Mode: ChunkModeCDC, MinSize: minSize, MaxSize: maxSize, AvgBits: avgBits}
+}
+
+// Defaults for the chunk sizes each mode falls back to when metadata leaves
+// them unset (docs/content-defined-chunking-plan.md §3.2). The window pair
+// matches knowledge_base_defaults in configs; the CDC triple is the measured
+// pick — it averages 738 bytes per chunk against the window's 766, so the
+// retrieval granularity is unchanged while the reuse rate is not.
+const (
+	DefaultChunkWindowSize  = 512
+	DefaultChunkOverlapSize = 64
+	DefaultChunkMinSize     = 256
+	DefaultChunkMaxSize     = 1536
+	DefaultChunkAvgBits     = 9
+)
+
 // SearchResult is a single vector-search hit at chunk granularity.
 type SearchResult struct {
 	ChunkID string
@@ -216,7 +308,19 @@ type KnowledgeBaseMeta struct {
 	Name             string
 	ChunkWindowSize  int
 	ChunkOverlapSize int
-	IndexType        string // HNSW / IVF / FLAT; immutable after creation.
+	// ChunkMode selects how documents are split into chunks. The zero value is
+	// ChunkModeCDC, so a knowledge base is chunked content-defined unless code
+	// says otherwise; nothing in the API sets this field, by design
+	// (docs/content-defined-chunking-plan.md §3.6). Each mode reads only its own
+	// sizes — the two window fields above, or the three CDC fields below.
+	// Immutable after creation: every version of a knowledge base has to be
+	// split the same way, or the same text yields different chunk IDs and
+	// nothing can be reused.
+	ChunkMode    ChunkMode
+	ChunkMinSize int    // cdc mode: minimum chunk size, in bytes.
+	ChunkMaxSize int    // cdc mode: maximum chunk size, in bytes.
+	ChunkAvgBits int    // cdc mode: target average size, 2^ChunkAvgBits bytes.
+	IndexType    string // HNSW / IVF / FLAT; immutable after creation.
 	// Only HNSW has a real implementation today.
 	Similarity string // COSINE / EUCLIDEAN / INNER_PRODUCT; immutable after
 	// creation; defaults to COSINE.
@@ -229,6 +333,40 @@ type KnowledgeBaseMeta struct {
 	EmbedConfig      EmbedConfig
 	ActiveVersionID  int64
 	Status           KBStatus
+}
+
+// Chunking returns the splitter input this knowledge base's versions must be
+// split with, with defaults filled in for anything the stored metadata left
+// unset. Everything except an explicit ChunkModeWindow is content-defined.
+//
+// The defaults are duplicated on purpose. service.KnowledgeBaseService fills the
+// window pair in when a knowledge base is created, but this function also has to
+// answer for metadata that never went through that path: a knowledge base decoded
+// from a snapshot predating these fields carries neither a mode nor CDC sizes, and
+// an unset size must not become a zero-size window.
+func (m KnowledgeBaseMeta) Chunking() ChunkParams {
+	if m.ChunkMode == ChunkModeWindow {
+		windowSize, overlapSize := m.ChunkWindowSize, m.ChunkOverlapSize
+		if windowSize <= 0 {
+			windowSize = DefaultChunkWindowSize
+		}
+		if overlapSize < 0 {
+			overlapSize = DefaultChunkOverlapSize
+		}
+		return WindowChunkParams(windowSize, overlapSize)
+	}
+
+	minSize, maxSize, avgBits := m.ChunkMinSize, m.ChunkMaxSize, m.ChunkAvgBits
+	if minSize <= 0 {
+		minSize = DefaultChunkMinSize
+	}
+	if maxSize <= 0 {
+		maxSize = DefaultChunkMaxSize
+	}
+	if avgBits <= 0 {
+		avgBits = DefaultChunkAvgBits
+	}
+	return CDCChunkParams(minSize, maxSize, avgBits)
 }
 
 // VersionMeta is version metadata stored in the Raft state machine.

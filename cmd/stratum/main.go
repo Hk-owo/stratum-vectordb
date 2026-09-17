@@ -225,7 +225,7 @@ func main() {
 	var chunkStore *chunkstore.VecstoreChunkStore
 	var chunkBloom *bloom.BitsAndBloomsFilter
 	var vBloomStore *bloom.VersionBloomStore
-	var chunkSplitter *splitter.SlidingWindowSplitter
+	var chunkSplitter splitter.ChunkSplitter
 	var indexMgr *index.IndexManagerImpl
 	var embedClient *embed.HTTPEmbedClient
 
@@ -1282,6 +1282,14 @@ func reportIndexStatus(ctx context.Context, cp plane.ControlPlane, kbID string, 
 		// sides are counted apart.
 		_, err := cp.ReportVersionFailure(ctx, kbID, versionID, types.FailureSideIndex,
 			types.FailureTransient, "index build failed")
+		return err
+	case types.IndexStatusFailedPermanent:
+		// 确定性失败：再试一次还是同一批数据、同一个参数，所以声明 FailureFatalGlobal
+		// ——它短路重试预算，直接把版本推到终态（internal/plane/local_control_plane.go
+		// 的 ReportVersionFailure）。少了这一条，这类失败会以「暂时失败」的名义留在
+		// PENDING 上，直到预算被耗光，而预算根本不该花在它身上。
+		_, err := cp.ReportVersionFailure(ctx, kbID, versionID, types.FailureSideIndex,
+			types.FailureFatalGlobal, "index build failed (non-retryable)")
 		return err
 	default:
 		return fmt.Errorf("index build reported unexpected status %v for version %d", status, versionID)

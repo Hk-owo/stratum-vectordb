@@ -508,6 +508,40 @@ TEST_F(HNSWVectorIndexTest, QuantizedPQSearchWithRerankMechanism) {
                                 save_path_, /*num_queries=*/4);
 }
 
+// A PQ codebook needs 2^pq_nbits centroids, and faiss refuses to train below
+// that by throwing. The throw has to reach the caller as a status that *names*
+// the floor: across gRPC an exception decays into "Unknown: Unexpected error in
+// RPC handling", and a version failing with that tells an operator nothing about
+// what to change (see FaissRejected in src/hnsw_index.cpp).
+TEST_F(HNSWVectorIndexTest, PQTrainingShortfallIsReportedNotThrown) {
+  std::mt19937 rng(4244);
+  QuantizerConfig cfg;
+  cfg.type = QuantizerType::kPQ;
+  cfg.pq_m = 8;      // divides kDim=32
+  cfg.pq_nbits = 8;  // 256 centroids — far more than the batch below can seed
+
+  HNSWVectorIndex index(cfg);
+  auto chunks = MakeRandomChunks(40, rng);  // 40 < 2^8
+
+  auto status = index.Build(chunks, MetricType::COSINE);
+  ASSERT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument)
+      << "a rejected batch must not surface as an opaque gRPC Unknown: " << status;
+  const std::string msg = std::string(status.message());
+  EXPECT_NE(msg.find("2^pq_nbits = 256"), std::string::npos) << msg;
+  EXPECT_NE(msg.find("this version has 40"), std::string::npos) << msg;
+
+  // The graph-free twin must answer identically (§8.6a): the floor comes from
+  // the quantizer, not from the graph.
+  QuantizerConfig flat_cfg = cfg;
+  flat_cfg.type = QuantizerType::kPQFlat;
+  HNSWVectorIndex flat_index(flat_cfg);
+  auto flat_status = flat_index.Build(chunks, MetricType::COSINE);
+  ASSERT_FALSE(flat_status.ok());
+  EXPECT_EQ(flat_status.code(), absl::StatusCode::kInvalidArgument)
+      << flat_status;
+}
+
 TEST_F(HNSWVectorIndexTest, QuantizedSaveLoadRestoresRerankBehavior) {
   std::mt19937 rng(7);
   constexpr int kNumChunks = 200;

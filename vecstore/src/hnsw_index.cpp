@@ -38,6 +38,25 @@ namespace vecstore {
 
 namespace {
 
+// FaissRejected turns a faiss exception into a status that carries its reason.
+//
+// Faiss reports a rejected batch by *throwing*, and an exception crossing the
+// gRPC boundary loses everything but "Unknown: Unexpected error in RPC
+// handling": an operator watching a version fail learns nothing about what
+// faiss objected to. Every faiss call that can throw is therefore wrapped below
+// and converted here.
+//
+// InvalidArgument (rather than FailedPrecondition) is deliberate: the Go build
+// retry loop only retries Unavailable / DeadlineExceeded / FailedPrecondition /
+// Internal (internal/index/impl.go isTransientBuildErr), because a batch faiss
+// refuses is deterministic — retrying it just burns the window and leaves the
+// version PENDING while the real answer ("make the batch bigger or the quantizer
+// simpler") sits unread.
+absl::Status FaissRejected(const char* op, const std::exception& e) {
+  return absl::InvalidArgumentError(std::string("hnsw_index: ") + op +
+                                    ": faiss rejected the batch: " + e.what());
+}
+
 // efConstruction / efSearch control the HNSW build/search quality-speed
 // tradeoff. These generous defaults favor recall over latency/build time,
 // appropriate for Stratum's per-version full-rebuild model (see
@@ -172,7 +191,11 @@ absl::Status HNSWVectorIndex::Build(const std::vector<ChunkVector>& chunks,
   metric_ = metric;
   ResetLocked();
   state_ = LifecycleState::kBuilding;
-  return AddChunksLocked(chunks);
+  try {
+    return AddChunksLocked(chunks);
+  } catch (const std::exception& e) {
+    return FaissRejected("Build", e);
+  }
 }
 
 absl::Status HNSWVectorIndex::AddChunks(const std::vector<ChunkVector>& chunks) {
@@ -187,7 +210,11 @@ absl::Status HNSWVectorIndex::AddChunks(const std::vector<ChunkVector>& chunks) 
     // the BUILDING phase is implied.
     state_ = LifecycleState::kBuilding;
   }
-  return AddChunksLocked(chunks);
+  try {
+    return AddChunksLocked(chunks);
+  } catch (const std::exception& e) {
+    return FaissRejected("AddChunks", e);
+  }
 }
 
 absl::Status HNSWVectorIndex::AddChunksLocked(
@@ -314,6 +341,28 @@ absl::Status HNSWVectorIndex::AddChunksLocked(
     // once on this batch (Faiss samples internally when appropriate);
     // every later AddChunks batch only encodes against the trained
     // quantizer. Full-precision (Flat) indexes are always is_trained.
+    //
+    // PQ is the one quantizer whose codebook (2^pq_nbits centroids) puts a hard
+    // floor under the training batch: faiss throws below it, so without this
+    // pre-check every small PQ version would fail through the generic
+    // exception path with nothing said about the floor. Checking it here names
+    // the numbers the caller has to change, and leaves the tolerant
+    // catch-all in FaissRejected for whatever faiss objects to next.
+    if (config_.type == QuantizerType::kPQ ||
+        config_.type == QuantizerType::kPQFlat) {
+      const int nbits = config_.pq_nbits;
+      if (nbits > 0 && nbits < 31) {  // out-of-range nbits: faiss gets to speak
+        const int64_t ksub = int64_t{1} << nbits;
+        if (static_cast<int64_t>(n) < ksub) {
+          return absl::InvalidArgumentError(
+              "hnsw_index: AddChunks: PQ training needs at least 2^pq_nbits = " +
+              std::to_string(ksub) + " vectors, but this version has " +
+              std::to_string(static_cast<int64_t>(n)) +
+              "; lower pq_nbits or pq_m, or use an untrained quantizer "
+              "(SQ_BF16/SQ_FP16)");
+        }
+      }
+    }
     index_->train(n, flat.data());
   }
   index_->add(n, flat.data());

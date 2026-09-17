@@ -310,7 +310,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		// in progress"), which is what someone reading a log wants to know.
 		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionPending)
 	}
-	if targetVersion.IndexStatus == types.IndexStatusFailed {
+	if targetVersion.IndexStatus.IsFailed() {
 		return nil, status.Error(codes.FailedPrecondition, "version index is FAILED")
 	}
 

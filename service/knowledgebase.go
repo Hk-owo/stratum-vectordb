@@ -260,7 +260,7 @@ func (s *KnowledgeBaseServiceImpl) RollbackVersion(ctx context.Context, req *pb.
 			if v.IndexStatus == types.IndexStatusPending {
 				return nil, status.Error(codes.FailedPrecondition, "target version is PENDING")
 			}
-			if v.IndexStatus == types.IndexStatusFailed {
+			if v.IndexStatus.IsFailed() {
 				return nil, status.Error(codes.FailedPrecondition, "target version index is FAILED")
 			}
 			break

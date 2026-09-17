@@ -111,37 +111,60 @@
                 <h2>新建知识库</h2>
                 <form id="create-kb-form" class="form">
                   <label>名称<input name="name" required placeholder="例如：产品文档库"></label>
-                  <fieldset>
-                    <legend>切割参数</legend>
-                    <div class="field-row">
-                      <label>窗口大小<input name="chunk_window_size" type="number" value="512"></label>
-                      <label>重叠大小<input name="chunk_overlap_size" type="number" value="64"></label>
+                  <p class="form-hint">填个名字就能创建，其余参数留空即用默认值。</p>
+                  <details class="advanced">
+                    <summary>高级设置（切分 / 索引 / 量化 / embed）</summary>
+                    <div class="advanced-body">
+                      <fieldset>
+                        <legend>切割参数</legend>
+                        <div class="field-row">
+                          <label>窗口大小<input name="chunk_window_size" type="number" value="512"></label>
+                          <label>重叠大小<input name="chunk_overlap_size" type="number" value="64"></label>
+                        </div>
+                      </fieldset>
+                      <fieldset>
+                        <legend>索引与相似度</legend>
+                        <div class="field-row">
+                          <label>索引类型
+                            <select name="index_type">
+                              <option value="INDEX_TYPE_HNSW">HNSW</option>
+                              <option value="INDEX_TYPE_IVF" disabled>IVF（预留）</option>
+                              <option value="INDEX_TYPE_FLAT" disabled>FLAT（预留）</option>
+                            </select>
+                          </label>
+                          <label>相似度
+                            <select name="similarity">
+                              <option value="SIMILARITY_COSINE">COSINE</option>
+                              <option value="SIMILARITY_EUCLIDEAN">EUCLIDEAN</option>
+                              <option value="SIMILARITY_INNER_PRODUCT">INNER_PRODUCT</option>
+                            </select>
+                          </label>
+                        </div>
+                      </fieldset>
+                      <fieldset>
+                        <legend>量化器（创建后不可改）</legend>
+                        <p class="form-hint">OFF 是全精度 HNSW：最准、内存最大。其余类型走「量化粗筛 + 全精度重排」两段式，召回近似、内存显著下降。量化器随知识库在创建时固定，之后每个版本沿用同一形态。</p>
+                        <div class="field-row">
+                          <label>量化器
+                            <select name="quantizer">
+                              <option value="QUANTIZER_OFF">OFF（全精度）</option>
+                              <option value="QUANTIZER_SQ8">SQ8（8 位标量量化，需训练）</option>
+                              <option value="QUANTIZER_SQ_BF16">SQ_BF16（bfloat16，免训练）</option>
+                              <option value="QUANTIZER_SQ_FP16">SQ_FP16（fp16，免训练）</option>
+                              <option value="QUANTIZER_PQ">PQ（乘积量化，需训练）</option>
+                            </select>
+                          </label>
+                          <label class="pq-only">PQ 子向量数 m<input name="pq_m" type="number" min="1" placeholder="默认 96" disabled></label>
+                          <label class="pq-only">PQ 位宽 nbits<input name="pq_nbits" type="number" min="1" max="16" placeholder="默认 8" disabled></label>
+                        </div>
+                      </fieldset>
+                      <fieldset>
+                        <legend>embed 配置</legend>
+                        <label>服务地址<input name="service_addr" placeholder="留空使用服务端默认（http://localhost:8080）"></label>
+                        <label>模型 ID<input name="model_id" placeholder="留空使用服务端默认"></label>
+                      </fieldset>
                     </div>
-                  </fieldset>
-                  <fieldset>
-                    <legend>索引与相似度</legend>
-                    <div class="field-row">
-                      <label>索引类型
-                        <select name="index_type">
-                          <option value="INDEX_TYPE_HNSW">HNSW</option>
-                          <option value="INDEX_TYPE_IVF" disabled>IVF（预留）</option>
-                          <option value="INDEX_TYPE_FLAT" disabled>FLAT（预留）</option>
-                        </select>
-                      </label>
-                      <label>相似度
-                        <select name="similarity">
-                          <option value="SIMILARITY_COSINE">COSINE</option>
-                          <option value="SIMILARITY_EUCLIDEAN">EUCLIDEAN</option>
-                          <option value="SIMILARITY_INNER_PRODUCT">INNER_PRODUCT</option>
-                        </select>
-                      </label>
-                    </div>
-                  </fieldset>
-                  <fieldset>
-                    <legend>embed 配置</legend>
-                    <label>服务地址<input name="service_addr" placeholder="http://localhost:8080"></label>
-                    <label>模型 ID<input name="model_id" required></label>
-                  </fieldset>
+                  </details>
                   <div class="form-actions">
                     <button type="button" id="cancel-create-kb" class="btn">取消</button>
                     <button type="submit" class="btn btn-primary">创建</button>
@@ -183,15 +206,21 @@
 
             <h3>创建版本</h3>
             <form id="create-version-form" class="form">
-              <label>父版本
-                <select name="parent_version_id" id="parent-version-select"></select>
-              </label>
+              <p class="form-hint">贴入文档内容提交即可生成一个新版本；doc_id 可留空，会自动编号。</p>
               <div id="changes-editor"></div>
               <div class="changes-empty" id="changes-empty">
-                尚无文档变更 —— 点击下方按钮添加 ADD / UPDATE / DELETE 操作
+                尚无内容 —— 点击下方按钮添加一条文档
               </div>
+              <details class="advanced">
+                <summary>高级设置（父版本）</summary>
+                <div class="advanced-body">
+                  <label>父版本
+                    <select name="parent_version_id" id="parent-version-select"></select>
+                  </label>
+                </div>
+              </details>
               <div class="form-actions">
-                <button type="button" id="add-change-btn" class="btn">＋ 添加一条变更</button>
+                <button type="button" id="add-change-btn" class="btn">＋ 添加文档</button>
                 <button type="submit" class="btn btn-primary">创建版本</button>
               </div>
             </form>
@@ -206,23 +235,27 @@
         <div class="card">
           <h2>向量检索</h2>
           <form id="query-form" class="form">
-            <label>知识库 ID<input name="knowledge_base_id" required list="kb-datalist" placeholder="选择或输入 kb_id"></label>
-            <label>版本
-              <select id="query-version-mode">
-                <option value="active">活跃版本（默认）</option>
-                <option value="specific">指定版本</option>
-              </select>
+            <label>知识库<input name="knowledge_base_id" required list="kb-datalist" placeholder="选择「知识库」页中的库后自动填入"></label>
+            <label>查询向量（JSON 数组）
+              <textarea name="vector" rows="4" placeholder='[0.1, 0.2, 0.3, ...]'></textarea>
             </label>
-            <!-- 仅「指定版本」时滑入 -->
-            <div id="query-version-id-field" class="collapse">
-              <div class="collapse-inner">
-                <label>版本 ID<input name="version_id" type="number" min="1" placeholder="输入版本号"></label>
-              </div>
-            </div>
-            <label>top_k<input name="top_k" type="number" value="10" min="1"></label>
+            <p class="form-hint">向量需由与知识库相同的 embed 模型生成；留空其他参数即查活跃版本的前 10 条。</p>
             <details class="advanced">
-              <summary>高级选项</summary>
+              <summary>高级选项（版本 / 条数 / 阈值 / 聚合）</summary>
               <div class="advanced-body">
+                <label>版本
+                  <select id="query-version-mode">
+                    <option value="active">活跃版本（默认）</option>
+                    <option value="specific">指定版本</option>
+                  </select>
+                </label>
+                <!-- 仅「指定版本」时滑入 -->
+                <div id="query-version-id-field" class="collapse">
+                  <div class="collapse-inner">
+                    <label>版本 ID<input name="version_id" type="number" min="1" placeholder="输入版本号"></label>
+                  </div>
+                </div>
+                <label>top_k<input name="top_k" type="number" value="10" min="1"></label>
                 <label>相似度阈值（可选）<input name="threshold" type="number" step="0.01"></label>
                 <label>聚合方式
                   <select name="aggregation">
@@ -233,9 +266,6 @@
                 </label>
               </div>
             </details>
-            <label>查询向量（JSON 数组）
-              <textarea name="vector" rows="3" placeholder='[0.1, 0.2, 0.3, ...]'></textarea>
-            </label>
             <button type="submit" class="btn btn-primary" id="query-submit">检索</button>
           </form>
           <datalist id="kb-datalist"></datalist>
@@ -278,34 +308,40 @@
       </div>
 
       <div class="card">
-        <h2>集群参数 <span class="muted" style="text-transform:none;letter-spacing:0">（集群级统一配置，修改后需重建集群生效）</span></h2>
-        <form id="dk-config-form" class="form">
-          <div class="field-row">
-            <label>编排方式
-              <select id="dk-cfg-topology">
-                <option value="single">单层（所有节点同构）</option>
-                <option value="two-tier">两层（控制层 + 存储层）</option>
-              </select>
-            </label>
-            <label>节点数（两层时指控制层）<input id="dk-cfg-nodes" type="number" min="1"></label>
-            <label>基础端口（两层时指控制层）<input id="dk-cfg-baseport" type="number" min="1"></label>
+        <h2>集群参数</h2>
+        <p class="form-hint">已按当前配置填好，通常无需改动；修改后需重建集群生效。</p>
+        <details class="advanced">
+          <summary>高级设置（拓扑 / 节点数 / 端口 / 镜像）</summary>
+          <div class="advanced-body">
+            <form id="dk-config-form" class="form">
+              <div class="field-row">
+                <label>编排方式
+                  <select id="dk-cfg-topology">
+                    <option value="single">单层（所有节点同构）</option>
+                    <option value="two-tier">两层（控制层 + 存储层）</option>
+                  </select>
+                </label>
+                <label>节点数（两层时指控制层）<input id="dk-cfg-nodes" type="number" min="1"></label>
+                <label>基础端口（两层时指控制层）<input id="dk-cfg-baseport" type="number" min="1"></label>
+              </div>
+              <div class="field-row">
+                <label>存储节点数（仅两层）<input id="dk-cfg-storage-nodes" type="number" min="1"></label>
+                <label>存储层起始端口（仅两层）<input id="dk-cfg-storage-port" type="number" min="1"></label>
+                <label>Docker 网络<input id="dk-cfg-network" placeholder="stratum-net"></label>
+              </div>
+              <div class="field-row">
+                <label>镜像<input id="dk-cfg-image" placeholder="stratum-node:latest"></label>
+                <label>容器前缀<input id="dk-cfg-prefix" placeholder="stratum-node"></label>
+                <label class="chk">同时启动 mock-embed<input id="dk-cfg-embed" type="checkbox"></label>
+              </div>
+              <div class="form-actions">
+                <button type="button" id="dk-config-reset" class="btn">放弃修改</button>
+                <button type="submit" class="btn btn-primary">保存参数</button>
+                <button type="button" id="dk-config-apply" class="btn">保存并重建集群</button>
+              </div>
+            </form>
           </div>
-          <div class="field-row">
-            <label>存储节点数（仅两层）<input id="dk-cfg-storage-nodes" type="number" min="1"></label>
-            <label>存储层起始端口（仅两层）<input id="dk-cfg-storage-port" type="number" min="1"></label>
-            <label>Docker 网络<input id="dk-cfg-network" placeholder="stratum-net"></label>
-          </div>
-          <div class="field-row">
-            <label>镜像<input id="dk-cfg-image" placeholder="stratum-node:latest"></label>
-            <label>容器前缀<input id="dk-cfg-prefix" placeholder="stratum-node"></label>
-            <label class="chk">同时启动 mock-embed<input id="dk-cfg-embed" type="checkbox"></label>
-          </div>
-          <div class="form-actions">
-            <button type="button" id="dk-config-reset" class="btn">放弃修改</button>
-            <button type="submit" class="btn btn-primary">保存参数</button>
-            <button type="button" id="dk-config-apply" class="btn">保存并重建集群</button>
-          </div>
-        </form>
+        </details>
       </div>
 
       <div class="card">

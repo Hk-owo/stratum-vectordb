@@ -1,29 +1,32 @@
 package splitter
 
-import (
-	"crypto/sha256"
-	"encoding/hex"
+import "stratum/internal/types"
 
-	"stratum/internal/types"
-)
-
-// SlidingWindowSplitter is the default ChunkSplitter implementation: it
-// slides a fixed-size window over the document, advancing by
-// (windowSize - overlapSize) runes each step, so consecutive chunks share
-// overlapSize runes of content.
+// SlidingWindowSplitter is the fixed-offset ChunkSplitter implementation: it
+// slides a window of params.WindowSize runes over the document, advancing by
+// (WindowSize - OverlapSize) runes each step, so consecutive chunks share
+// OverlapSize runes of content.
 //
-// Splitting operates on runes, not bytes, so that windowSize and
-// overlapSize counts behave correctly for multi-byte text (e.g. Chinese).
+// Splitting operates on runes, not bytes, so that windowSize and overlapSize
+// counts behave correctly for multi-byte text (e.g. Chinese).
+//
+// The boundaries depend on nothing but the offset from the start of the
+// document, which is exactly why a mid-document insertion or deletion shifts
+// every chunk after it and invalidates their IDs
+// (docs/content-defined-chunking-plan.md §1.2). CDCSplitter is the
+// content-defined alternative; this one stays as the default mode and as the
+// baseline the CDC tests compare against.
 type SlidingWindowSplitter struct{}
 
-// NewSlidingWindowSplitter constructs the default splitter. It holds no
+// NewSlidingWindowSplitter constructs the sliding-window splitter. It holds no
 // state; a single instance can be shared across knowledge bases and goroutines.
 func NewSlidingWindowSplitter() *SlidingWindowSplitter {
 	return &SlidingWindowSplitter{}
 }
 
 // Split implements ChunkSplitter.
-func (s *SlidingWindowSplitter) Split(content string, windowSize int, overlapSize int, embedConfigID string) []types.Chunk {
+func (s *SlidingWindowSplitter) Split(content string, params types.ChunkParams, embedConfigID string) []types.Chunk {
+	windowSize, overlapSize := params.WindowSize, params.OverlapSize
 	runes := []rune(content)
 	n := len(runes)
 
@@ -72,16 +75,6 @@ func (s *SlidingWindowSplitter) Split(content string, windowSize int, overlapSiz
 		}
 	}
 	return chunks
-}
-
-// newChunk computes ChunkID = SHA-256(chunk text + embedConfigID) and
-// packages it with the chunk text.
-func newChunk(text string, embedConfigID string) types.Chunk {
-	h := sha256.Sum256([]byte(text + embedConfigID))
-	return types.Chunk{
-		ChunkID: hex.EncodeToString(h[:]),
-		Content: text,
-	}
 }
 
 var _ ChunkSplitter = (*SlidingWindowSplitter)(nil)
