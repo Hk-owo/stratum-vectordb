@@ -266,6 +266,15 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	c.RegisterPendingDispatch(kbID, dispatchID, parentVersionID, changes)
 
 	opts := []raft.ProposeOption{raft.WithClientRequestID(dispatchID)}
+	if len(changes) == 0 {
+		// A version with no document changes has nothing to fan out and nothing for a
+		// writer to report a digest about, so its data side is settled at creation
+		// rather than waiting for a report that can never come
+		// (raft.WithEmptyVersion). Left PENDING it stays that way forever, and a
+		// replica that restarts cannot step its cursor over it — which in turn blocks
+		// the promotion of every version after it.
+		opts = append(opts, raft.WithEmptyVersion())
+	}
 	versionID, err := c.cfg.RaftNode.ProposeCreateVersion(ctx, kbID, parentVersionID, opts...)
 	if err != nil {
 		// The entry never landed: drop the registration, or it would later be

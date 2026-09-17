@@ -104,6 +104,16 @@ message VersionInfo {
   // queryable while its data is still being written, and it can have durable
   // data with no index at all.
   DataStatus data_status = 6;
+  // doc_id_set_hash is the version's document-set digest (§7.9): the canonical
+  // SHA-256 of the version's sorted document IDs, and the digest of the EMPTY set
+  // for a version that has no documents. It travels because the storage layer
+  // cannot otherwise tell an empty version from one whose digest was never
+  // committed — and that distinction decides whether a node may step its cursor
+  // over the version (see wire.VersionFromInfo).
+  //
+  // An empty string means "no digest has been committed", which is NOT the same as
+  // the empty set's digest.
+  string doc_id_set_hash = 7;
 }
 
 // KnowledgeBaseInfo is the console-facing metadata of a knowledge base,

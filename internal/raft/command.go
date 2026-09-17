@@ -58,6 +58,12 @@ type command struct {
 	// apply allocated instead of allocating another one
 	// (Stratum_设计文档v13.md §7.12).
 	ClientRequestID string `json:"client_request_id,omitempty"`
+	// cmdCreateVersion: the version carries no document changes. Its DATA side is
+	// settled as durable at creation, because such a version is never fanned out and
+	// no writer reports a digest for it — leaving it PENDING would make a restarting
+	// replica unable to step its cursor over the version, and the cursor is what
+	// promotes every later version (see WithEmptyVersion).
+	EmptyVersion bool `json:"empty_version,omitempty"`
 
 	// cmdUpdateVersionStatus / cmdMarkVersionDeleting / cmdRemoveVersionMeta
 	VersionID int64             `json:"version_id,omitempty"`
@@ -132,12 +138,13 @@ func newRemoveKBMetaCommand(kbID string) command {
 	return command{Type: cmdRemoveKBMeta, KBID: kbID}
 }
 
-func newCreateVersionCommand(kbID string, parentVersionID int64, clientRequestID string) command {
+func newCreateVersionCommand(kbID string, parentVersionID int64, clientRequestID string, emptyVersion bool) command {
 	return command{
 		Type:            cmdCreateVersion,
 		KBID:            kbID,
 		ParentVersionID: parentVersionID,
 		ClientRequestID: clientRequestID,
+		EmptyVersion:    emptyVersion,
 	}
 }
 

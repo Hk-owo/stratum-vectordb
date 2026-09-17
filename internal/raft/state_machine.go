@@ -651,13 +651,33 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 			zap.Int64("version_id", versionID), zap.String("kb_id", cmd.KBID), zap.Error(err))
 	}
 
-	sm.versions[versionID] = types.VersionMeta{
+	meta := types.VersionMeta{
 		VersionID:       versionID,
 		ParentVersionID: cmd.ParentVersionID,
 		KBID:            cmd.KBID,
 		CreatedAt:       time.Now().Unix(),
 		IndexStatus:     types.IndexStatusPending,
 	}
+	if cmd.EmptyVersion {
+		// No document changes means there is nothing for the data side to persist, so
+		// it is durable from the start rather than waiting for a report that can never
+		// come: such a version is never fanned out, and no writer reports a digest for
+		// it. Left PENDING it would block every replica that restarts — the cursor
+		// cannot step over a version this node does not "hold", holding it is judged
+		// from the DATA side, and the DATA side would be waiting on a promotion whose
+		// only input is that very cursor (see WithEmptyVersion).
+		//
+		// The EMPTY set's digest is recorded at the same time, and that is what makes
+		// the state readable rather than merely true. A storage node decides whether it
+		// holds a version from the metadata alone (holdsVersionLocally), and "durable
+		// with no digest" is ALSO what a version carrying real documents looks like when
+		// its digest was never committed — a cursor promotion sets exactly that pair.
+		// Recording the empty set's digest separates the two: one means "there is
+		// nothing to hold", the other means "I cannot tell".
+		meta.DataStatus = types.DataStatusDurable
+		meta.DocIDSetHash = types.EmptyDocIDSetHash
+	}
+	sm.versions[versionID] = meta
 	sm.versionsByKB[cmd.KBID] = append(sm.versionsByKB[cmd.KBID], versionID)
 	if cmd.ClientRequestID != "" {
 		sm.versionsByRequest[requestKey(cmd.KBID, cmd.ClientRequestID)] = versionID

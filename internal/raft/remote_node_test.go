@@ -206,7 +206,7 @@ func TestRemoteRaftNode_FollowsARedirectToTheRealLeader(t *testing.T) {
 	if len(atLeader) != 1 {
 		t.Fatalf("leader received %d commands, want 1", len(atLeader))
 	}
-	want := newCreateVersionCommand("kb-1", 3, "req-9")
+	want := newCreateVersionCommand("kb-1", 3, "req-9", false)
 	if atLeader[0] != want {
 		t.Errorf("command at the leader = %+v, want %+v", atLeader[0], want)
 	}

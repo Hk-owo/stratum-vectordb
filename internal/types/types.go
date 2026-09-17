@@ -131,6 +131,16 @@ const (
 	DataStatusFailedPermanent
 )
 
+// EmptyDocIDSetHash is the document-set digest of a version with no documents:
+// SHA-256 of empty input, which is what sync.ComputeDocIDSetHash(nil) returns.
+//
+// It is written out here, beside the metadata that stores it, because both layers
+// need it and neither may import the other: the control layer records it when a
+// version is created with no document changes, and the storage layer compares
+// against it when deciding whether a node holds such a version. A test in
+// internal/sync keeps this value and that function in step.
+const EmptyDocIDSetHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
 // String returns a human-readable name for the status, primarily for logging.
 func (s DataStatus) String() string {
 	switch s {

@@ -55,10 +55,12 @@ func KnowledgeBaseFromInfo(info *pb.KnowledgeBaseInfo) (types.KnowledgeBaseMeta,
 // than read off the message: it is not on the wire, and the caller already knows
 // which knowledge base it asked about.
 //
-// DocIDSetHash is deliberately left empty — VersionInfo does not carry it, and
-// filling in anything else would make a caller believe a digest had been
-// committed when none had. A caller that needs the digest must read it from a
-// source that has it.
+// Every field VersionInfo carries is carried across — the digest especially. A
+// storage node decides whether it holds a version from this metadata alone, and
+// "durable with no digest" is exactly how a version whose digest was never committed
+// looks, as well as how an empty version looks. An empty string means "unknown", the
+// empty set's own digest means "there is nothing to hold", and that difference decides
+// whether a restarting node's cursor may step over the version.
 func VersionFromInfo(kbID string, info *pb.VersionInfo) types.VersionMeta {
 	return types.VersionMeta{
 		VersionID:       info.GetVersionId(),
@@ -66,6 +68,37 @@ func VersionFromInfo(kbID string, info *pb.VersionInfo) types.VersionMeta {
 		KBID:            kbID,
 		CreatedAt:       info.GetCreatedAt(),
 		IndexStatus:     indexStatusFromProto(info.GetIndexStatus()),
+		// Both of these are on the wire and have to be carried across. Left at their
+		// zero values they do not read as "absent" downstream — they read as positive
+		// facts:
+		//
+		//   - a dropped DataStatus is PENDING, and PENDING is what a recovering node
+		//     consults to conclude it does not hold a version
+		//     (LocalDataPlane.holdsVersionLocally), which is what lets its cursor step
+		//     over one. Measured: every storage node read a DURABLE empty version as
+		//     PENDING, so each restart reported cursor 0 for the whole knowledge base
+		//     and no cursor promotion could ever move it.
+		//   - a dropped Deleting is "not being deleted", the unsafe direction for
+		//     anything that reclaims data.
+		//
+		DataStatus:   dataStatusFromProto(info.GetDataStatus()),
+		Deleting:     info.GetDeleting(),
+		DocIDSetHash: info.GetDocIdSetHash(),
+	}
+}
+
+// dataStatusFromProto mirrors indexStatusFromProto for the DATA side, which is a
+// separate state on the same version (Stratum_设计文档v13.md §10.1b). PENDING is the
+// default because it is the conservative one: "not known to be durable" must never
+// be read as "durable".
+func dataStatusFromProto(s pb.DataStatus) types.DataStatus {
+	switch s {
+	case pb.DataStatus_DATA_STATUS_DURABLE:
+		return types.DataStatusDurable
+	case pb.DataStatus_DATA_STATUS_FAILED_PERMANENT:
+		return types.DataStatusFailedPermanent
+	default:
+		return types.DataStatusPending
 	}
 }
 

@@ -147,13 +147,13 @@ func TestLocalDataPlane_RecoverLocalCursors_NeverMovesBackwards(t *testing.T) {
 	}
 }
 
-// TestLocalDataPlane_RecoverLocalCursors_EmptyInitialVersionIsHeld covers the
-// exact shape the 3+3 cluster has: every knowledge base's first version is
-// created with no changes, so no digest is ever committed for it (""), and it
-// has no artifact either — the index manager answers "version has no chunks;
-// nothing to build" for it. It is READY, though, and that plus the missing
-// digest is what identifies it as a version with no content rather than one this
-// node never received.
+// TestLocalDataPlane_RecoverLocalCursors_EmptyInitialVersionIsHeld covers the exact
+// shape the 3+3 cluster has: every knowledge base's first version is created with no
+// changes, so the control layer records the EMPTY set's digest for it, and no artifact
+// is built for it (the index manager answers "version has no chunks; nothing to
+// build"). That digest is what identifies it as a version with no content rather than
+// one this node never received — and, unlike the pair it replaced ("durable, no
+// digest"), it cannot be produced by a version that does have content.
 func TestLocalDataPlane_RecoverLocalCursors_EmptyInitialVersionIsHeld(t *testing.T) {
 	const kbID = "kb-empty-head"
 
@@ -163,8 +163,8 @@ func TestLocalDataPlane_RecoverLocalCursors_EmptyInitialVersionIsHeld(t *testing
 	meta := &stubMetadata{
 		kbs: []types.KnowledgeBaseMeta{{KBID: kbID}},
 		versions: map[string][]types.VersionMeta{kbID: {
-			// created with no changes: no digest, no artifact, but durably replicated
-			{KBID: kbID, VersionID: 60, DocIDSetHash: "", DataStatus: types.DataStatusDurable},
+			// Created with no changes: the empty set's digest, no artifact, durably replicated.
+			{KBID: kbID, VersionID: 60, DocIDSetHash: types.EmptyDocIDSetHash, DataStatus: types.DataStatusDurable},
 			{KBID: kbID, VersionID: 61, DocIDSetHash: "h61"},
 			{KBID: kbID, VersionID: 62, DocIDSetHash: "h62"},
 		}},
@@ -178,10 +178,10 @@ func TestLocalDataPlane_RecoverLocalCursors_EmptyInitialVersionIsHeld(t *testing
 	}
 }
 
-// TestLocalDataPlane_RecoverLocalCursors_EmptyKnowledgeBaseIsServable pins the
-// shape a 3+3 cluster actually produced (KB datavolume-178944190-11): a
-// knowledge base holding nothing but empty versions — both durably replicated,
-// both with parent 0, no digest committed, and not one artifact on any replica.
+// TestLocalDataPlane_RecoverLocalCursors_EmptyKnowledgeBaseIsServable pins the shape a
+// 3+3 cluster actually produced (KB datavolume-178944190-11): a knowledge base holding
+// nothing but empty versions — both durably replicated, both with parent 0, the empty
+// set's digest on both, and not one artifact on any replica.
 //
 // Before, "no artifact" was read as "never received" whenever the knowledge base
 // had no footprint at all, so every replica reported cursor 0 while the station
@@ -198,8 +198,8 @@ func TestLocalDataPlane_RecoverLocalCursors_EmptyKnowledgeBaseIsServable(t *test
 	meta := &stubMetadata{
 		kbs: []types.KnowledgeBaseMeta{{KBID: kbID}},
 		versions: map[string][]types.VersionMeta{kbID: {
-			{KBID: kbID, VersionID: 71, DocIDSetHash: "", DataStatus: types.DataStatusDurable},
-			{KBID: kbID, VersionID: 72, DocIDSetHash: "", DataStatus: types.DataStatusDurable},
+			{KBID: kbID, VersionID: 71, DocIDSetHash: types.EmptyDocIDSetHash, DataStatus: types.DataStatusDurable},
+			{KBID: kbID, VersionID: 72, DocIDSetHash: types.EmptyDocIDSetHash, DataStatus: types.DataStatusDurable},
 		}},
 	}
 
@@ -208,6 +208,43 @@ func TestLocalDataPlane_RecoverLocalCursors_EmptyKnowledgeBaseIsServable(t *test
 	}
 	if got := dp.LocalVersionOf(kbID); got != 72 {
 		t.Fatalf("cursor = %d, want 72 — an empty knowledge base has no artifact anywhere and must still serve", got)
+	}
+}
+
+// TestLocalDataPlane_RecoverLocalCursors_DurableWithoutDigestIsNotAHold is the
+// regression the two states above were untangled for.
+//
+// "Durable with no digest" looks like an empty version and is NOT one: a version
+// carrying real documents whose digest was never committed has exactly that pair,
+// because a cursor promotion (§7.9) settles the data side without a digest. Reading it
+// as "held here" is what let a replica that had missed ONE version report the whole
+// chain as its own cursor — and then skip the fetch it needed, since EnsureIndex treats
+// "the cursor already reaches it" as "nothing to do".
+//
+// Measured in the 3+3 cluster: a storage node came back from a restart reporting v6
+// while its disk held only v5, and never pulled v6.
+func TestLocalDataPlane_RecoverLocalCursors_DurableWithoutDigestIsNotAHold(t *testing.T) {
+	const kbID = "kb-uncommitted-digest"
+
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		IndexManager: &stubIndexStore{exists: map[int64]bool{10: true}},
+	})
+	meta := &stubMetadata{
+		kbs: []types.KnowledgeBaseMeta{{KBID: kbID}},
+		versions: map[string][]types.VersionMeta{kbID: {
+			{KBID: kbID, VersionID: 10, DocIDSetHash: types.EmptyDocIDSetHash, DataStatus: types.DataStatusDurable},
+			// Real documents, digest never committed, no local artifact: NOT held.
+			{KBID: kbID, VersionID: 11, DocIDSetHash: "", DataStatus: types.DataStatusDurable},
+		}},
+	}
+
+	if err := dp.RecoverLocalCursors(context.Background(), meta); err != nil {
+		t.Fatalf("RecoverLocalCursors: %v", err)
+	}
+	if got := dp.LocalVersionOf(kbID); got != 10 {
+		t.Fatalf("cursor = %d, want 10: a durable version with no committed digest and no local "+
+			"artifact must NOT be claimed — claiming it makes the node skip the very fetch that "+
+			"would give it the data", got)
 	}
 }
 

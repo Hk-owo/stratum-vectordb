@@ -147,6 +147,17 @@ type ProposeOption func(*proposeOptions)
 
 type proposeOptions struct {
 	clientRequestID string
+
+	// emptyVersion marks a version created with NO document changes. Such a version
+	// is never fanned out and no writer ever reports a digest for it, so nothing
+	// would move its DATA side off PENDING — and the data side is what a recovering
+	// replica consults to decide whether it holds the version. Left PENDING it wedges
+	// the cursor of every replica that restarts: the cursor cannot step over the
+	// version, so the node reports 0, so the quorum minimum is 0, so nothing is ever
+	// promoted (measured: cursor recovery stopped at a knowledge base's initial
+	// version with "no local artifact", recovered_to 0, and every later catch-up
+	// re-reported the same stalemate).
+	emptyVersion bool
 }
 
 // WithClientRequestID attaches the client's idempotency key to the call: a
@@ -156,6 +167,14 @@ type proposeOptions struct {
 // (Stratum_设计文档v13.md §7.12). An empty key means "no idempotency".
 func WithClientRequestID(id string) ProposeOption {
 	return func(o *proposeOptions) { o.clientRequestID = id }
+}
+
+// WithEmptyVersion marks the version as carrying no document changes, so the control
+// layer settles its DATA side as durable the moment it is created (see
+// proposeOptions.emptyVersion). A version with no documents has nothing to persist,
+// so "durable" here is not a claim about data — it is the absence of one.
+func WithEmptyVersion() ProposeOption {
+	return func(o *proposeOptions) { o.emptyVersion = true }
 }
 
 func resolveProposeOptions(opts []ProposeOption) proposeOptions {

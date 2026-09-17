@@ -376,6 +376,13 @@ var _ DataPlane = (*LocalDataPlane)(nil)
 // control-data-separation-design.md §7 — and the index build is then scheduled
 // by the puller itself. Idempotent, so re-running it after a crash is safe.
 func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID int64) error {
+	if d.puller == nil {
+		// Nowhere to fetch from: this node has no storage-layer connection to a peer
+		// (a control node, or a plane assembled without one). Failing loudly beats
+		// dereferencing a nil puller, and it is also the truth the caller needs — this
+		// node cannot bring the version here.
+		return fmt.Errorf("plane: EnsureIndex(%s, %d): this node has no puller", kbID, versionID)
+	}
 	// Holding the version's data already is the authoritative "nothing to
 	// fetch" fact, and after §8.5 it is the *only* one: the old code read
 	// resolve()'s ok=false as "I am the writer", which held only while the
@@ -1059,45 +1066,127 @@ func newIndexPushSem(limit int) chan struct{} {
 	return make(chan struct{}, limit)
 }
 
+// The confirmation broadcast's budget. All placeholder values in the §10.4 sense:
+// what matters is the shape — a per-attempt deadline, a bounded number of
+// attempts, and a whole-broadcast ceiling with room for every peer to spend its
+// own retries.
+const (
+	// confirmAttempts is how many times one candidate is told the version reached
+	// quorum. A confirmation is idempotent and the receiver only stands down a
+	// timer, so a repeat costs nothing.
+	confirmAttempts = 3
+)
+
+// The timing values are variables rather than constants so a test can shrink them
+// (the takeoverTimeout precedent): the case worth pinning down is a peer that
+// hangs for its whole attempt deadline, and no test should spend seconds per
+// attempt to produce it. Unexported, and written nowhere outside tests.
+var (
+	// confirmAttemptTimeout bounds ONE attempt. Same order as peerCursorTimeout:
+	// this is a small RPC between peers, and one unreachable peer must not hold
+	// the broadcast.
+	confirmAttemptTimeout = 2 * time.Second
+	// confirmRetryBackoff is the pause between attempts — short enough that a
+	// peer's retries fit the broadcast budget, long enough to let a peer that is
+	// still coming up become reachable.
+	confirmRetryBackoff = 500 * time.Millisecond
+	// confirmBroadcastBudget bounds the whole broadcast, resolving the peers
+	// included: confirmAttempts × (confirmAttemptTimeout + confirmRetryBackoff)
+	// per peer, for a replica set of a few peers, with room to spare.
+	confirmBroadcastBudget = 60 * time.Second
+)
+
 // broadcastConfirmation tells the candidate replicas that the version reached
 // quorum, so any §7.3 takeover timer they started can stand down.
 //
 // Best effort and asynchronous: the write is already durable and reported, and
 // a replica that misses this message only checks for itself later — an extra
 // announcement, never a missing one. That asymmetry is why the caller is not
-// made to wait on it.
+// made to wait on it, and why everything below runs on its own budget.
 //
 // It goes to *every* candidate rather than only the replicas that acknowledged,
 // for the same reason the cleanup broadcast does (§10.6): the coordinator does
 // not track which push succeeded, and a stray confirmation to a replica that
 // never received the data is harmless.
+//
+// Each peer gets its OWN context and its own bounded retry budget. Sharing one
+// context across the loop was a real defect, and its failure mode is invisible in
+// the logs it produces: the first peer to hang — an offline replica is the normal
+// case, since the write that triggered this confirmation has just failed to push
+// to it — consumed the whole window, and every peer after it then failed instantly
+// with "context deadline exceeded" without ever being dialled. Measured with one
+// storage node down: the confirmation reached NEITHER of the other two, so no
+// quorum ever formed, the version's digest was never committed, and a returning
+// node could not tell that version from an empty one — it advances over an empty
+// version without fetching anything, so the miss reads as a successful catch-up.
 func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64, empty bool) {
 	if d.confirmer == nil || d.resolveReplicas == nil {
 		return
 	}
 	go func() {
-		// A fresh context: the request that ran the write is over by now.
-		ctx, cancel := context.WithTimeout(context.Background(), takeoverTimeout*5)
+		// A fresh context: the request that ran the write is over by now. This
+		// bounds the whole broadcast — including resolving the peers — so a slow
+		// peer cannot starve the ones behind it.
+		ctx, cancel := context.WithTimeout(context.Background(), confirmBroadcastBudget)
 		defer cancel()
 		peers, err := d.resolveReplicas(ctx)
 		if err != nil {
 			return
 		}
 		for _, peer := range peers {
-			// The confirmation doubles as the §8.5 announcement: it carries this
-			// node's own address so the peer records where the version's data
-			// is (see DataSourceRegistry). Empty means "announce nothing".
-			//
-			// empty tells the peer the version has no documents, so it can move
-			// its own cursor over it without fetching anything — the only cue
-			// such a version produces, since it is never fanned out.
-			if err := d.confirmer.ConfirmVersionWrite(ctx, peer, kbID, versionID, d.selfDataSyncAddr, empty); err != nil {
-				d.logger.Warn("plane: confirm version write",
-					zap.String("peer", peer), zap.String("kb_id", kbID),
-					zap.Int64("version_id", versionID), zap.Error(err))
-			}
+			d.confirmPeer(ctx, peer, kbID, versionID, empty)
 		}
 	}()
+}
+
+// confirmPeer tells one peer that the version reached quorum, retrying a bounded
+// number of times with a deadline of its own for each attempt.
+//
+// A context per attempt (rather than one for the whole peer) is what makes the
+// retry mean anything: a single unreachable address should cost one attempt's
+// deadline, not the peer's entire budget.
+func (d *LocalDataPlane) confirmPeer(ctx context.Context, peer, kbID string, versionID int64, empty bool) {
+	var lastErr error
+	for attempt := 1; attempt <= confirmAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			lastErr = err
+			break
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, confirmAttemptTimeout)
+		// The confirmation doubles as the §8.5 announcement: it carries this
+		// node's own address so the peer records where the version's data is
+		// (see DataSourceRegistry). An empty address means "announce nothing".
+		//
+		// empty tells the peer the version has no documents, so it can move its
+		// own cursor over it without fetching anything — the only cue such a
+		// version produces, since it is never fanned out.
+		err := d.confirmer.ConfirmVersionWrite(attemptCtx, peer, kbID, versionID, d.selfDataSyncAddr, empty)
+		cancel()
+		if err == nil {
+			if attempt > 1 {
+				// Worth a line: it says the earlier attempt was lost to something
+				// transient, which is the whole reason the retry exists.
+				d.logger.Info("plane: confirm version write landed on a retry",
+					zap.String("peer", peer), zap.String("kb_id", kbID),
+					zap.Int64("version_id", versionID), zap.Int("attempt", attempt))
+			}
+			return
+		}
+		lastErr = err
+		if attempt < confirmAttempts {
+			select {
+			case <-ctx.Done():
+			case <-time.After(confirmRetryBackoff):
+			}
+		}
+	}
+	// Still best effort, so this stays a warning: failing the write because a
+	// confirmation did not land would turn lost gossip into data loss. The
+	// attempts count is what separates "the peer was unreachable" from "we only
+	// tried once".
+	d.logger.Warn("plane: confirm version write",
+		zap.String("peer", peer), zap.String("kb_id", kbID),
+		zap.Int64("version_id", versionID), zap.Int("attempts", confirmAttempts), zap.Error(lastErr))
 }
 
 // classifyLocalWriteFailure decides how the control layer should treat a failed
@@ -1714,10 +1803,12 @@ func (d *LocalDataPlane) SafeDurableVersion(ctx context.Context, kbID string) (i
 	return reports[quorum-1], true, nil
 }
 
-// emptyDocIDSetHash is the digest of a version whose document set is empty —
-// the version every knowledge base is created with. It is a value, not an
-// absence: see sync.ComputeDocIDSetHash.
-var emptyDocIDSetHash = stratinternalsync.ComputeDocIDSetHash(nil)
+// emptyDocIDSetHash is the digest of a version whose document set is empty — the
+// version every knowledge base is created with, and any version created with no
+// document changes. It is a value, not an absence, and it is defined once in
+// internal/types because BOTH layers need it: the control layer records it when it
+// creates such a version, and this one recognises it.
+var emptyDocIDSetHash = types.EmptyDocIDSetHash
 
 // RecoverLocalCursors rebuilds this node's contiguous data cursor for every
 // knowledge base from LOCAL facts, once at startup.
@@ -1815,38 +1906,25 @@ func (d *LocalDataPlane) holdsVersionLocally(ctx context.Context, kbID string, v
 		return "local artifact", true
 	}
 	if v.DocIDSetHash == emptyDocIDSetHash {
-		// A committed empty document set: the empty set IS this version's
-		// content, so there is nothing on disk to find.
+		// The empty set IS this version's content: there is nothing on disk to look for
+		// and nothing to fetch from anyone. This is what keeps an empty knowledge base
+		// servable, and it is the ONLY thing that may claim a version this node holds no
+		// artifact for.
+		//
+		// It used to be a second branch as well — "durable DATA with no committed
+		// digest" — and that branch is gone because it could not tell two states apart.
+		// A version carrying real documents whose digest was never committed has
+		// exactly that pair, since a cursor promotion (§7.9) settles the data side
+		// without a digest. Reading it as "I hold this" is what let a replica that had
+		// missed ONE version report the whole chain as its cursor and then skip the fetch
+		// it needed (measured: cursor recovery returned v6 for a node holding only v5, so
+		// EnsureIndex concluded there was nothing to do — and the node stayed without
+		// the data while claiming to have it).
+		//
+		// The control layer now records the empty set's digest when it creates a version
+		// with no document changes, so "no documents" travels as a value instead of
+		// being inferred — see types.EmptyDocIDSetHash and the doc_id_set_hash field.
 		return "empty document set", true
-	}
-	if v.DataStatus == types.DataStatusDurable && v.DocIDSetHash == "" {
-		// Durable DATA with no committed digest is how a version created with no
-		// changes looks: the leader commits no digest for a version with no document
-		// set, and the data side is durable once a quorum confirmed it — which a
-		// version with no documents reaches trivially, since there is nothing to fan
-		// out.
-		//
-		// This case is what keeps an EMPTY knowledge base servable. Measured: a
-		// knowledge base holding only two empty versions (both with parent 0) had no
-		// artifact on any replica, so every restart left all three reporting cursor 0
-		// while the station demanded 71: permanently refused, and nothing would ever
-		// build an index for a version with no chunks to trigger a later advance.
-		//
-		// The DATA side is the one consulted, NOT the index side, and the difference
-		// is not cosmetic. An index reaches READY on every replica that builds it —
-		// including a replica whose fan-out fell short of quorum, which is exactly
-		// when the digest is deliberately NOT committed (see WriteVersionData:
-		// "making it without quorum would be a lie the control layer acts on").
-		// Reading index-READY as "this node holds it" therefore claims versions
-		// whose records never arrived here; and because the test runs per version,
-		// the cursor does not end up one too high — it goes all the way to the chain
-		// tail. Measured on a 3-node cluster: a replica that had been offline for 55
-		// versions came back reporting the tail as its own cursor, and no knowledge
-		// base's recovery ever stopped anywhere (not one "stopped at a version" line).
-		//
-		// Anything not durable (PENDING, FAILED) keeps the conservative answer below:
-		// a version still being written may have records this node does not hold.
-		return "durable data, no committed digest, no document set", true
 	}
 	return "no local artifact", false
 }

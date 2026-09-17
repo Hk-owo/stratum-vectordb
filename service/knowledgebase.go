@@ -154,8 +154,11 @@ func (s *KnowledgeBaseServiceImpl) CreateKnowledgeBase(ctx context.Context, req 
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
-	// Create the initial version.
-	versionID, err := s.raftNode.ProposeCreateVersion(ctx, kbID, 0)
+	// Create the initial version. It carries no document changes, so its DATA side is
+	// settled as durable at creation: there is nothing to persist, and a PENDING data
+	// side would leave every replica that restarts unable to step its cursor over this
+	// version (see raft.WithEmptyVersion).
+	versionID, err := s.raftNode.ProposeCreateVersion(ctx, kbID, 0, raft.WithEmptyVersion())
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
@@ -236,6 +239,10 @@ func (s *KnowledgeBaseServiceImpl) ListVersions(ctx context.Context, req *pb.Lis
 			// that only look at index_status cannot tell "the data never landed"
 			// from "everything is fine".
 			DataStatus: pb.DataStatus(v.DataStatus),
+			// And the digest, which the storage layer needs whole: it is what
+			// separates an empty version from one whose digest was never
+			// committed (see the field's comment in the proto).
+			DocIdSetHash: v.DocIDSetHash,
 		}
 	}
 	return &pb.ListVersionsResponse{Versions: out}, nil
