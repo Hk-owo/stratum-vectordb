@@ -104,6 +104,27 @@ type WAL interface {
 	// for versionID has finished. Idempotent per versionID.
 	WriteVersionDeleteComplete(ctx context.Context, kbID string, versionID int64) error
 
+	// WriteCursor records that this node's CONTIGUOUS data cursor for kbID has
+	// reached versionID (Stratum_设计文档v13.md §7.8). It is a local fact — never
+	// a consensus value — and the record exists so a restart can read the cursor
+	// back instead of inferring it: the cursor lives in memory, and the disk
+	// facts it used to be inferred from (an index artifact) are a cache the
+	// retention policy is free to delete.
+	//
+	// Monotone: a versionID at or below the recorded one is a no-op, so the
+	// stored value never moves backwards. The caller must only record a version
+	// its data has already reached, and only after that data has landed: a
+	// cursor ahead of the data would let a restarted node claim a history it
+	// does not hold.
+	WriteCursor(ctx context.Context, kbID string, versionID int64) error
+
+	// RecoverCursors returns the persisted cursor of every knowledge base this
+	// log holds a record for, read once at startup. A knowledge base ABSENT from
+	// the map means "no record" — an older WAL, or one never advanced since the
+	// record type existed — and the caller must read that as unknown rather than
+	// as cursor 0.
+	RecoverCursors(ctx context.Context) (map[string]int64, error)
+
 	// ChangesFor returns the replay input recorded for (kbID, versionID): the
 	// changes its writer applied. It answers a lagging peer's backfill request
 	// (Stratum_设计文档v13.md §7.5) with the very same BEGIN record crash

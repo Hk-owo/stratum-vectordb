@@ -20,6 +20,7 @@ func TestNameByNameRoundTripEverySentinel(t *testing.T) {
 		ErrKnowledgeBaseDeleted,
 		ErrIndexNotReady,
 		ErrInvalidArgument,
+		ErrEmptyChanges,
 		ErrIndexLoadTimeout,
 		ErrInvalidParentVersion,
 	} {

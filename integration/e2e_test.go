@@ -17,6 +17,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -203,6 +204,10 @@ type realNode struct {
 	versionDoc *versiondoc.PebbleVersionDocList
 	chunkStore *chunkstore.VecstoreChunkStore
 	indexMgr   *index.IndexManagerImpl
+	// vBloomStore is the per-version document filter a query applies on top of the
+	// search results. Exposed because it is cached (memory AND disk) the first time
+	// it is asked for, so it is where a good result can disappear for good.
+	vBloomStore *bloom.VersionBloomStore
 	// indexDistributor is the §8.4 shipping path, exposed so a test can assert
 	// what a replica received rather than what it built.
 	indexDistributor *plane.LocalDataPlane
@@ -392,6 +397,12 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		IndexManager: im,
 		IndexReader:  im,
 		IndexShipper: sync.NewIndexPusher(),
+		// §7.8/docs/cursor-persistence-plan.md §3: the cursor is persisted in the
+		// node's own WAL — the same file this stack already keeps — so a restart
+		// reads it back instead of inferring it from the index artifacts, which
+		// retention is free to delete. Production wires the same object
+		// (cmd/stratum's plane config).
+		CursorWAL: w,
 		// §7.3/§8.5: the confirmation this path sends carries the writer's own
 		// address, so replicas can record where a version's data lives.
 		SelfDataSyncAddr: grpcAddr,
@@ -498,6 +509,11 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 	// One data-plane service per node, as in the node assembly: the export side
 	// plus the receive side, so this stack can exercise both directions.
 	syncFollower := sync.NewFollower(ds, cdm, vd, cs, im)
+	// §7.8/§? : a replica that receives a version's data builds its document filter,
+	// exactly as the writer's transaction does. Without it a filter built before the
+	// data arrived (an early query) stays empty, and an empty filter drops every hit —
+	// the query then answers "nothing matched", with no error, for data it holds.
+	syncFollower.SetVersionBloom(vBloomStore)
 	pb.RegisterDataSyncServiceServer(srv, sync.NewNodeHandler(
 		sync.NewLeaderHandler(ds.DB(), cdm.DB(), vd.DB(), cs.VecstoreClient()),
 		sync.NewPushHandler(syncFollower, nodeID,
@@ -533,6 +549,7 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		versionDoc:       vd,
 		chunkStore:       cs,
 		indexMgr:         im,
+		vBloomStore:      vBloomStore,
 		indexDistributor: indexDistributor,
 		dataSources:      dataSources,
 		srv:              srv,
@@ -605,6 +622,7 @@ func wireProposeForwarding(t *testing.T, n *realNode, addrByID map[int64]string)
 func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 	t.Helper()
 	syncFollower := sync.NewFollower(n.docStore, n.chunkDoc, n.versionDoc, n.chunkStore, n.indexMgr)
+	syncFollower.SetVersionBloom(n.vBloomStore)
 	n.raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
 		ctx := context.Background()
 		// §7.5: the version EXISTS as of this apply, so the plane records that
@@ -620,12 +638,21 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 		// is the test-stack equivalent of the data plane's cursor check, which
 		// keeps a writer from pulling back its own data in production.
 		if verifyFollowerPull(ctx, n, kbID, versionID) {
+			// The data is already here, so the cursor may say so: production
+			// advances it from exactly this point (the sync push handler and the
+			// pull path), and the advance is what writes a record into this node's
+			// WAL (docs/cursor-persistence-plan.md §3.2).
+			n.indexDistributor.MarkVersionContiguous(kbID, versionID)
 			return
 		}
 		if versionID <= 1 {
 			if addr := sourceAddrFor(ctx, n, kbID, versionID, addrByID); addr != "" {
 				_ = syncFollower.PullVersion(ctx, addr, kbID, versionID)
 			}
+			// A version with no document set has no digest to verify: the successful
+			// (no-op) pull IS the evidence that this node holds it, which is the same
+			// judgement the data plane's pull loop makes for an empty version.
+			n.indexDistributor.MarkVersionContiguous(kbID, versionID)
 			return
 		}
 		deadline := time.Now().Add(15 * time.Second)
@@ -638,6 +665,8 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 				_ = syncFollower.PullVersion(ctx, addr, kbID, versionID)
 			}
 			if verifyFollowerPull(ctx, n, kbID, versionID) {
+				// Held, so the cursor may move — see the note above.
+				n.indexDistributor.MarkVersionContiguous(kbID, versionID)
 				return
 			}
 			if time.Now().After(deadline) {
@@ -718,19 +747,119 @@ func waitQueryDoc(t *testing.T, n *realNode, kbID string, versionID int64, vec [
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	backoff := 50 * time.Millisecond
+
+	// The query is issued here rather than through queryTolerant so that the
+	// failure below can say WHY it kept failing: a transient error and a genuinely
+	// empty answer both arrive as "no result", and they are different bugs.
+	var lastErr error
+	var lastResults []*pb.QueryResult
 	for {
-		res := n.queryTolerant(context.Background(), kbID, versionID, vec, 10)
-		if r := findResult(res, docID); r != nil {
-			return r
+		resp, err := n.Query.Query(context.Background(), &pb.QueryRequest{
+			KnowledgeBaseId: kbID,
+			VersionId:       &versionID,
+			Vector:          vec,
+			TopK:            10,
+		})
+		switch {
+		case err != nil && isTransientQueryError(err):
+			lastErr, lastResults = err, nil
+		case err != nil:
+			t.Fatalf("node %d: Query(kb=%s, v=%d): %v", n.nodeID, kbID, versionID, err)
+		default:
+			lastErr = nil
+			lastResults = resp.GetResults()
+			if r := findResult(lastResults, docID); r != nil {
+				return r
+			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("node %d: query never returned %s on v%d; last results: %+v", n.nodeID, docID, versionID, res)
+			t.Fatalf("node %d: query never returned %s on v%d; last results: %+v; last error: %v; local state: %s",
+				n.nodeID, docID, versionID, lastResults, lastErr, describeLocalState(n, kbID, versionID, docID))
 		}
 		time.Sleep(backoff)
 		if backoff < time.Second {
 			backoff *= 2
 		}
 	}
+}
+
+// describeLocalState is what a failure here needs in order to be actionable. An
+// empty answer is the same in three different situations — the data never arrived,
+// the index exists but holds no vectors, or the index answers and the service layer
+// filters everything out — and they are three different bugs, so the message has to
+// say which state this node is actually in.
+func describeLocalState(n *realNode, kbID string, versionID int64, queryDoc string) string {
+	ctx := context.Background()
+	docs, derr := n.versionDoc.ListDocIDs(ctx, kbID, versionID)
+	indexData, sidecar := indexFileOf(n.baseDir, kbID, versionID)
+
+	status := "version unknown"
+	if versions, err := n.raftNode.ListVersions(ctx, kbID); err == nil {
+		for _, v := range versions {
+			if v.VersionID == versionID {
+				status = fmt.Sprintf("index=%s data=%s digest=%q", v.IndexStatus, v.DataStatus, v.DocIDSetHash)
+				break
+			}
+		}
+	}
+
+	// The index asked directly, bypassing the service layer: if it answers here but
+	// the query above did not, the miss is in the filtering; if it answers nothing,
+	// the artifact itself is empty. The chunks it returns are resolved back to their
+	// documents for the same reason — "the index holds doc-1 and doc-2 but not doc-3"
+	// and "it holds doc-3 and the service layer dropped it" are different bugs.
+	direct, searchErr := n.indexMgr.Search(ctx, kbID, versionID, contentVector(queryDoc, 4), 10)
+	directDocs := make([]string, 0, len(direct))
+	for _, r := range direct {
+		back, _ := n.chunkDoc.ListDocIDs(ctx, kbID, r.ChunkID)
+		directDocs = append(directDocs, r.ChunkID+"->"+strings.Join(back, "+"))
+	}
+
+	// And whether this node's vecstore can actually serve the version's chunks. A
+	// non-empty chunk→doc mapping at the Pebble layer says nothing about that: the
+	// vectors live in the vecstore, and a build that cannot read them persists an
+	// EMPTY index, which then answers every query with nothing and reports no error.
+	readable, total, dim := chunkVectorStats(ctx, n, kbID, docs)
+
+	// The version bloom is the LAST place a good result can be dropped, and it is
+	// cached — in memory and on disk — the first time it is asked for. A filter built
+	// before the version's documents arrived holds nothing, and every later query
+	// then discards every hit without an error. The hit count says whether that is
+	// what happened: it should be len(versiondoc).
+	bloomHits, bloomErr := -1, error(nil)
+	if b, err := n.vBloomStore.Get(ctx, kbID, versionID); err != nil {
+		bloomErr = err
+	} else {
+		bloomHits = 0
+		for _, d := range docs {
+			if b.Test(d) {
+				bloomHits++
+			}
+		}
+	}
+
+	return fmt.Sprintf("versiondoc=%d (err=%v), index_file=%d bytes (sidecar=%d), %s, direct_search=%d results (err=%v) %v, chunk_vectors_readable=%d/%d dim=%d, version_bloom_hits=%d/%d (err=%v)",
+		len(docs), derr, len(indexData), len(sidecar), status, len(direct), searchErr, directDocs, readable, total, dim, bloomHits, len(docs), bloomErr)
+}
+
+// chunkVectorStats reports how many of the version's chunks this node's vecstore can
+// hand back, and the dimension of the vectors it does return.
+func chunkVectorStats(ctx context.Context, n *realNode, kbID string, docs []string) (readable, total, dim int) {
+	chunkIDs, err := n.chunkDoc.ListChunkIDsByDocs(ctx, kbID, docs)
+	if err != nil {
+		return 0, 0, 0
+	}
+	client := n.chunkStore.VecstoreClient()
+	for _, id := range chunkIDs {
+		total++
+		resp, err := client.Read(ctx, &vecstorepb.ReadChunkRequest{Key: chunkstore.EncodeKey(kbID, id)})
+		if err != nil || len(resp.GetVector()) == 0 {
+			continue
+		}
+		readable++
+		dim = len(resp.GetVector())
+	}
+	return readable, total, dim
 }
 
 // versionHash returns the committed document-ID set digest for the
@@ -908,7 +1037,11 @@ func (n *realNode) createTestKB(ctx context.Context, name string) (string, int64
 	if err != nil {
 		n.t.Fatalf("node %d: CreateKnowledgeBase: %v", n.nodeID, err)
 	}
-	return resp.KnowledgeBaseId, resp.InitialVersionId
+	// A knowledge base no longer comes with a version
+	// (docs/cursor-persistence-plan.md §5): a change-less version is refused, so
+	// the READY root these real-stack tests build on is created here.
+	v1 := seedRootVersion(n.t, n.raftNode, ctx, resp.KnowledgeBaseId)
+	return resp.KnowledgeBaseId, v1
 }
 
 // chunkIDFor computes the chunk ID the splitter would produce for a

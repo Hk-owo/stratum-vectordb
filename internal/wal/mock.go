@@ -20,6 +20,7 @@ const (
 	recordDeleteComplete
 	recordVersionDeleteMark
 	recordVersionDeleteComplete
+	recordCursor
 )
 
 type record struct {
@@ -58,6 +59,10 @@ type MockWAL struct {
 	// WriteVersionID).
 	beginDataByVersion map[int64]beginData
 
+	// cursors mirrors FileWAL's: the persisted data cursor per knowledge base,
+	// kept as the maximum over the recorded values.
+	cursors map[string]int64
+
 	replayCounters map[replayKey]int
 }
 
@@ -71,6 +76,7 @@ func NewMockWAL() *MockWAL {
 		versionDeleteMarked: make(map[int64]string),
 		versionDeleteDone:   make(map[int64]bool),
 		beginDataByVersion:  make(map[int64]beginData),
+		cursors:             make(map[string]int64),
 		replayCounters:      make(map[replayKey]int),
 	}
 }
@@ -156,6 +162,31 @@ func (w *MockWAL) WriteVersionDeleteComplete(_ context.Context, kbID string, ver
 	w.versionDeleteDone[versionID] = true
 	w.records = append(w.records, record{kind: recordVersionDeleteComplete, kbID: kbID, versionID: versionID})
 	return nil
+}
+
+// WriteCursor records the knowledge base's contiguous data cursor. Idempotent
+// and monotone, like FileWAL's: a value at or below the recorded one is a no-op.
+func (w *MockWAL) WriteCursor(_ context.Context, kbID string, versionID int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if versionID <= w.cursors[kbID] {
+		return nil // idempotent
+	}
+	w.cursors[kbID] = versionID
+	w.records = append(w.records, record{kind: recordCursor, kbID: kbID, versionID: versionID})
+	return nil
+}
+
+// RecoverCursors returns a copy of the persisted cursors, one per knowledge
+// base that has one. A knowledge base absent from the map is "unknown", not 0.
+func (w *MockWAL) RecoverCursors(_ context.Context) (map[string]int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make(map[string]int64, len(w.cursors))
+	for kbID, versionID := range w.cursors {
+		out[kbID] = versionID
+	}
+	return out, nil
 }
 
 // IsDeleteMarked reports whether a DeleteKnowledgeBase marker was written
@@ -317,6 +348,25 @@ func (w *MockWAL) Truncate(n int) {
 			delete(w.versionDeleteDone, r.versionID)
 		}
 	}
+	// Cursors are a maximum over their records rather than a flag per record, so
+	// dropping one is not a single map delete: the value has to be recomputed
+	// from what is left, or Truncate would leave a cursor behind that the
+	// truncated log no longer contains.
+	w.rebuildCursorsLocked()
+}
+
+// rebuildCursorsLocked recomputes the cursor map from the remaining record log.
+// Must be called with w.mu held.
+func (w *MockWAL) rebuildCursorsLocked() {
+	w.cursors = make(map[string]int64)
+	for _, r := range w.records {
+		if r.kind != recordCursor {
+			continue
+		}
+		if r.versionID > w.cursors[r.kbID] {
+			w.cursors[r.kbID] = r.versionID
+		}
+	}
 }
 
 // Reset clears all stored state. Convenience for tests; not part of the
@@ -331,6 +381,7 @@ func (w *MockWAL) Reset() {
 	w.deleteCompleted = make(map[string]bool)
 	w.versionDeleteMarked = make(map[int64]string)
 	w.versionDeleteDone = make(map[int64]bool)
+	w.cursors = make(map[string]int64)
 	w.replayCounters = make(map[replayKey]int)
 }
 

@@ -191,8 +191,11 @@ func TestIntegration_CreateKB_CreateVersion_Query(t *testing.T) {
 	}
 	kbID := createResp.KnowledgeBaseId
 
-	// Step 2: Set initial version to READY so it can be used as parent.
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady, 0)
+	// Step 2: create the root version and mark it READY so it can be used as
+	// parent. A knowledge base no longer comes with a version
+	// (docs/cursor-persistence-plan.md §5): a change-less version is refused, so
+	// the empty READY root these suites fork from is asked for explicitly.
+	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	// Step 3: Create a version with documents.
 	// First, seed the mock chunk store with vectors for the chunks that
@@ -205,7 +208,7 @@ func TestIntegration_CreateKB_CreateVersion_Query(t *testing.T) {
 	// The MockChunkStore's Write stores vectors that subsequent reads can retrieve.
 	createVerResp, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
-		ParentVersionId: 1,
+		ParentVersionId: v1,
 		Changes: []*pb.DocChange{
 			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-1", Content: "hello world this is test content for integration"},
 			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-2", Content: "another document with some different text here"},
@@ -257,18 +260,29 @@ func TestIntegration_ListVersions(t *testing.T) {
 		t.Fatalf("CreateKnowledgeBase failed: %v", err)
 	}
 
-	resp, err := cluster.KBClient.ListVersions(ctx, &pb.ListVersionsRequest{
-		KnowledgeBaseId: createResp.KnowledgeBaseId,
-	})
+	kbID := createResp.KnowledgeBaseId
+
+	// A knowledge base starts with NO version (docs/cursor-persistence-plan.md §5),
+	// and that is the first fact worth pinning: there is nothing to list until
+	// something is written.
+	resp, err := cluster.KBClient.ListVersions(ctx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
 	if err != nil {
 		t.Fatalf("ListVersions failed: %v", err)
 	}
-
-	if len(resp.Versions) != 1 {
-		t.Errorf("expected 1 initial version, got %d", len(resp.Versions))
+	if len(resp.Versions) != 0 {
+		t.Errorf("expected 0 versions right after CreateKnowledgeBase, got %d", len(resp.Versions))
 	}
-	if resp.Versions[0].VersionId != 1 {
-		t.Errorf("expected version_id=1, got %d", resp.Versions[0].VersionId)
+
+	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
+	resp, err = cluster.KBClient.ListVersions(ctx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
+	if err != nil {
+		t.Fatalf("ListVersions failed: %v", err)
+	}
+	if len(resp.Versions) != 1 {
+		t.Fatalf("expected 1 version once the root exists, got %d", len(resp.Versions))
+	}
+	if resp.Versions[0].VersionId != v1 {
+		t.Errorf("expected version_id=%d, got %d", v1, resp.Versions[0].VersionId)
 	}
 }
 
@@ -291,22 +305,23 @@ func TestIntegration_RollbackVersion(t *testing.T) {
 	}
 	kbID := createResp.KnowledgeBaseId
 
-	// Set initial version to READY so we can rollback to it.
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady, 0)
+	// The root to roll back to: created here and left READY, because a knowledge
+	// base no longer comes with one (docs/cursor-persistence-plan.md §5).
+	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	// Create a new version to rollback from.
 	cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
-		ParentVersionId: 1,
+		ParentVersionId: v1,
 		Changes: []*pb.DocChange{
 			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-x", Content: "some content"},
 		},
 	})
 
-	// Rollback to version 1.
+	// Rollback to the root.
 	_, err = cluster.KBClient.RollbackVersion(ctx, &pb.RollbackVersionRequest{
 		KnowledgeBaseId: kbID,
-		TargetVersionId: 1,
+		TargetVersionId: v1,
 	})
 	if err != nil {
 		t.Fatalf("RollbackVersion failed: %v", err)
@@ -376,11 +391,20 @@ func TestIntegration_DeleteVersion(t *testing.T) {
 		t.Fatalf("CreateKnowledgeBase failed: %v", err)
 	}
 	kbID := createResp.KnowledgeBaseId
-	v1 := createResp.InitialVersionId
+	// A knowledge base no longer comes with a version
+	// (docs/cursor-persistence-plan.md §5): the chain starts with an explicit,
+	// READY root.
+	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
+	// Made ACTIVE on purpose: what this test pins is that deleting the active
+	// version is refused. A knowledge base no longer comes with an active version
+	// (docs/cursor-persistence-plan.md §5) — it has none until one is chosen — so
+	// the test that needs the state asks for it.
+	if err := cluster.RaftNode.ProposeRollback(ctx, kbID, v1); err != nil {
+		t.Fatalf("activate v%d: %v", v1, err)
+	}
 
 	// Build a chain v1 -> v2 -> v3, each READY (bypassing async index
 	// build by setting status directly, like the other integration tests).
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady, 0)
 
 	v2Resp, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
@@ -532,9 +556,13 @@ func TestIntegration_WarmupVersion(t *testing.T) {
 		t.Fatalf("CreateKnowledgeBase failed: %v", err)
 	}
 
+	// A version has to exist for Warmup to mean anything: a knowledge base no
+	// longer comes with one (docs/cursor-persistence-plan.md §5).
+	v1 := seedRootVersion(t, cluster.RaftNode, ctx, createResp.KnowledgeBaseId)
+
 	resp, err := cluster.AdminClient.WarmupVersion(ctx, &pb.WarmupVersionRequest{
 		KnowledgeBaseId: createResp.KnowledgeBaseId,
-		VersionId:       1,
+		VersionId:       v1,
 	})
 	if err != nil {
 		t.Fatalf("WarmupVersion failed: %v", err)
@@ -564,11 +592,15 @@ func TestIntegration_ForkRejected(t *testing.T) {
 		t.Fatalf("CreateKnowledgeBase failed: %v", err)
 	}
 	kbID := createResp.KnowledgeBaseId
+	// The parent both attempts below name. It must be READY before anything forks
+	// off it, and a knowledge base no longer comes with one
+	// (docs/cursor-persistence-plan.md §5).
+	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	// The first child of v1 is accepted.
 	verA, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
-		ParentVersionId: 1,
+		ParentVersionId: v1,
 		Changes: []*pb.DocChange{
 			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-a", Content: "branch a"},
 		},
@@ -582,7 +614,7 @@ func TestIntegration_ForkRejected(t *testing.T) {
 	// equivalent to the ancestor chain when there are no forks).
 	if _, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
-		ParentVersionId: 1,
+		ParentVersionId: v1,
 		Changes: []*pb.DocChange{
 			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-b", Content: "branch b"},
 		},
@@ -619,8 +651,10 @@ func TestIntegration_ConcurrentCreateVersion(t *testing.T) {
 	}
 	kbID := createResp.KnowledgeBaseId
 
-	// Set initial version to READY so it can be used as parent.
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusReady, 0)
+	// The parent every concurrent write names: it has to exist and be READY first,
+	// because a knowledge base no longer comes with a version
+	// (docs/cursor-persistence-plan.md §5).
+	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	// Launch concurrent CreateVersion calls with the same parent. The chain
 	// is strictly linear, so exactly one may win; the other four must be
@@ -635,7 +669,7 @@ func TestIntegration_ConcurrentCreateVersion(t *testing.T) {
 			defer wg.Done()
 			resp, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 				KnowledgeBaseId: kbID,
-				ParentVersionId: 1,
+				ParentVersionId: v1,
 				Changes: []*pb.DocChange{
 					{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-" + string(rune('a'+idx)), Content: "content"},
 				},
@@ -692,10 +726,13 @@ func TestIntegration_ParentVersionCrossKB(t *testing.T) {
 		t.Fatalf("CreateKB B failed: %v", err)
 	}
 
+	// kb-a needs a version of its own for the cross-KB attempt to name.
+	rootA := seedRootVersion(t, cluster.RaftNode, ctx, respA.KnowledgeBaseId)
+
 	// Try to create a version in kb-b with parent from kb-a — should fail.
 	_, err = cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: respB.KnowledgeBaseId,
-		ParentVersionId: respA.InitialVersionId, // wrong KB!
+		ParentVersionId: rootA, // wrong KB!
 		Changes:         []*pb.DocChange{{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "x", Content: "x"}},
 	})
 	if err == nil {
@@ -777,13 +814,17 @@ func TestIntegration_RebuildIndex(t *testing.T) {
 		t.Fatalf("CreateKnowledgeBase failed: %v", err)
 	}
 
-	// Mark initial version as FAILED.
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, 1, types.IndexStatusFailed, 0)
+	// A version has to exist for RebuildIndex to act on: a knowledge base no longer
+	// comes with one (docs/cursor-persistence-plan.md §5).
+	v1 := seedRootVersion(t, cluster.RaftNode, ctx, createResp.KnowledgeBaseId)
+
+	// Mark it FAILED.
+	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusFailed, 0)
 
 	// Trigger rebuild.
 	resp, err := cluster.AdminClient.RebuildIndex(ctx, &pb.RebuildIndexRequest{
 		KnowledgeBaseId: createResp.KnowledgeBaseId,
-		VersionId:       1,
+		VersionId:       v1,
 	})
 	if err != nil {
 		t.Fatalf("RebuildIndex failed: %v", err)
@@ -815,4 +856,33 @@ func TestIntegration_StuckVersionsInSystemStatus(t *testing.T) {
 		t.Fatalf("GetSystemStatus failed: %v", err)
 	}
 	_ = resp
+}
+
+// rootVersionProposer is the slice of the Raft surface seedRootVersion needs. Both
+// the mock cluster and a real node satisfy it, which is what lets one helper serve
+// the in-process suites and the real-stack ones.
+type rootVersionProposer interface {
+	ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64, opts ...raft.ProposeOption) (int64, error)
+	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error
+}
+
+// seedRootVersion creates kbID's ROOT version and leaves it READY, returning the
+// version id.
+//
+// A knowledge base no longer comes with a version (docs/cursor-persistence-plan.md
+// §5): creating one with no document changes is refused, because a version's
+// document set is inherited from its parent — so "no changes" means "unchanged",
+// and only at the root of a chain does that coincide with "empty". These suites
+// were written around the older shape (a KB whose v1 is an empty, READY root), so
+// the root they fork from, roll back to or warm up is asked for explicitly.
+func seedRootVersion(t testing.TB, rn rootVersionProposer, ctx context.Context, kbID string) int64 {
+	t.Helper()
+	v, err := rn.ProposeCreateVersion(ctx, kbID, 0)
+	if err != nil {
+		t.Fatalf("create the root version of %s: %v", kbID, err)
+	}
+	if err := rn.ProposeUpdateVersionStatus(ctx, v, types.IndexStatusReady, 0); err != nil {
+		t.Fatalf("mark v%d of %s READY: %v", v, kbID, err)
+	}
+	return v
 }

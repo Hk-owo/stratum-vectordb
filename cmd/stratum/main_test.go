@@ -474,6 +474,60 @@ func TestReconcileIndexStatus(t *testing.T) {
 	}
 }
 
+// TestReconcileIndexStatus_ReadsTheCursorBackBeforeAnythingElse pins the startup
+// order docs/cursor-persistence-plan.md §3.5 asks for: the persisted cursor is read
+// first, and it is right even when every artifact this node could have been
+// inferred from is gone.
+//
+// The order matters because the step that follows (ReconcileIndexes) is about the
+// ARTIFACTS — what to rebuild, what counts as durable. The cursor is not an input
+// to that decision any more; it is a local fact read out of the node's own log, so
+// what reconcile concludes about the disk cannot lower it.
+func TestReconcileIndexStatus_ReadsTheCursorBackBeforeAnythingElse(t *testing.T) {
+	ctx := context.Background()
+	logger := zap.NewNop()
+
+	const kbID = "kb-restart"
+	rn := &reconcileRaftNode{
+		kbs: []types.KnowledgeBaseMeta{{KBID: kbID, ActiveVersionID: 4}},
+		versions: map[string][]types.VersionMeta{
+			kbID: {
+				{VersionID: 1, KBID: kbID, IndexStatus: types.IndexStatusReady},
+				{VersionID: 2, KBID: kbID, IndexStatus: types.IndexStatusReady},
+				{VersionID: 3, KBID: kbID, IndexStatus: types.IndexStatusReady},
+				{VersionID: 4, KBID: kbID, IndexStatus: types.IndexStatusReady},
+			},
+		},
+	}
+	// Not one artifact survived — the state the retention policy leaves behind.
+	im := &reconcileIndexMgr{exists: map[int64]bool{}, triggered: map[int64]bool{}}
+
+	w := wal.NewMockWAL()
+	if err := w.WriteCursor(ctx, kbID, 3); err != nil {
+		t.Fatalf("WriteCursor: %v", err)
+	}
+
+	dp := plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{IndexManager: im, CursorWAL: w})
+	cp := plane.NewLocalControlPlane(rn)
+
+	durable := reconcileIndexStatus(ctx, logger, dp, cp, rn, 0)
+	reportEpoch(ctx, logger, dp, cp, durable)
+
+	// Read back, not inferred: the record says 3, and nothing on this node's disk
+	// could have produced that answer.
+	if got := dp.LocalVersionOf(kbID); got != 3 {
+		t.Fatalf("cursor after the startup reconcile = %d, want 3", got)
+	}
+	// The reconcile half is unchanged: with no artifact anywhere, nothing is durable
+	// and nothing gets promoted. The cursor being right is not the reconcile's doing.
+	if len(durable) != 0 {
+		t.Errorf("durable set = %v, want empty (no artifacts are on disk)", durable)
+	}
+	if len(rn.proposed) != 0 {
+		t.Errorf("proposed statuses = %v, want none", rn.proposed)
+	}
+}
+
 // reconcileIndexMgr implements index.IndexManager for reconcile tests.
 type reconcileIndexMgr struct {
 	exists    map[int64]bool

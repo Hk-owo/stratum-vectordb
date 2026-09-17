@@ -19,6 +19,13 @@ import (
 //
 // # What it never drops
 //
+// CURSOR records are not changes and are therefore outside the reclaim
+// watermark entirely: the watermark says which CHANGES every replica already
+// has, while a cursor is this node's own knowledge of how far its history
+// reaches. Only the newest cursor per knowledge base is kept — the older ones
+// say strictly less, since the value is a scalar — and that is the one record
+// per knowledge base a restart reads back (Stratum_设计文档v13.md §7.8).
+//
 // A version is only dropped when it is BOTH at or below its knowledge base's
 // watermark AND committed. An uncommitted flow is exactly what Recover exists to
 // finish, so its BEGIN/VERSION_ID records are kept no matter how old they are;
@@ -74,6 +81,14 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	// nine bytes and Recover wants it, so keeping all of them is both simpler and
 	// safer than encoding an assumption about versionID reuse.
 	reclaimed := make(map[int64]bool)
+	// The newest cursor per knowledge base, read in a pass of its own before the
+	// rewrite. Compaction is a streaming rewrite and cannot know whether a cursor
+	// it just read is the newest one until it has seen the whole log — so the
+	// question is answered first, rather than by buffering records it may drop.
+	maxCursor, err := w.maxCursorByKB()
+	if err != nil {
+		return fmt.Errorf("wal: compact: scan cursor records: %w", err)
+	}
 	buf := bufio.NewWriter(out)
 
 	in, err := os.Open(w.path)
@@ -129,6 +144,17 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 				}
 			}
 			pending = nil
+
+		case recordTypeCursor:
+			// Cursors are not changes: the reclaim watermark does not apply to
+			// them at all (see the doc comment). Only the newest value per
+			// knowledge base survives; an older one is dropped because the
+			// scalar it carries is already implied by the newer one.
+			if rec.versionID == maxCursor[rec.kbID] {
+				if _, err := buf.Write(raw.raw); err != nil {
+					return fmt.Errorf("wal: compact: write %s: %w", tmpPath, err)
+				}
+			}
 
 		case recordTypeCommit:
 			// Kept unconditionally: see the note on reclaimed.
@@ -272,8 +298,47 @@ func readRawRecord(r *bufio.Reader) (parsedRecord, *rawRecord, error) {
 		}
 		rec.versionID = int64(binary.BigEndian.Uint64(payload[:8]))
 		rec.kbID = string(payload[8:])
+	case recordTypeCursor:
+		kbID, versionID, err := decodeCursorPayload(payload)
+		if err != nil {
+			return parsedRecord{}, nil, err
+		}
+		rec.kbID = kbID
+		rec.versionID = versionID
+		raw.kbID = kbID
 	default:
 		return parsedRecord{}, nil, fmt.Errorf("wal: unknown record type 0x%02x", rec.kind)
 	}
 	return rec, raw, nil
+}
+
+// maxCursorByKB returns the highest CURSOR value recorded per knowledge base. It
+// is the pre-scan Compact needs: the rewrite keeps the newest cursor record of
+// each knowledge base and drops the rest (the value is a scalar, so an older
+// record says nothing the newer one does not).
+//
+// A corrupt or truncated tail simply ends the scan, exactly as it ends every
+// other reader of this log: everything before it is the valid log.
+func (w *FileWAL) maxCursorByKB() (map[string]int64, error) {
+	in, err := os.Open(w.path)
+	if err != nil {
+		return nil, err
+	}
+	defer in.Close()
+
+	out := make(map[string]int64)
+	reader := bufio.NewReader(in)
+	for {
+		rec, _, err := readRawRecord(reader)
+		if err != nil {
+			break
+		}
+		if rec.kind != recordTypeCursor {
+			continue
+		}
+		if rec.versionID > out[rec.kbID] {
+			out[rec.kbID] = rec.versionID
+		}
+	}
+	return out, nil
 }

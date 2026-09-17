@@ -2,13 +2,48 @@ package bloom
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"stratum/internal/versiondoc"
 )
+
+// bloomHeaderLen is the size of the fingerprint prefix every persisted filter now
+// carries: the document set the filter was built from, so a filter found on disk can
+// be checked against the version's CURRENT set instead of being trusted because it
+// exists. A file written before this prefix existed fails the length check and is
+// treated as a miss — rebuilding is always safe, since the filter is derived data.
+const bloomHeaderLen = 8
+
+// bloomEntry is one cached filter plus the fingerprint of the document set it was
+// built from. The fingerprint is what makes a stale filter DETECTABLE: the filter is
+// only trusted while the version's document set still hashes to it.
+type bloomEntry struct {
+	filter BloomFilter
+	fp     uint64
+}
+
+// documentSetFingerprint fingerprints a version's document set, order-insensitively:
+// the set arrives from a prefix scan whose order is not part of any contract, and the
+// write path forms it from its own changes, so two callers describing the same set
+// must agree.
+func documentSetFingerprint(docIDs []string) uint64 {
+	ids := make([]string, len(docIDs))
+	copy(ids, docIDs)
+	sort.Strings(ids)
+
+	h := fnv.New64a()
+	for _, id := range ids {
+		_, _ = h.Write([]byte(id))
+		_, _ = h.Write([]byte{0}) // separator: "ab","c" must not hash like "a","bc"
+	}
+	return h.Sum64()
+}
 
 // versionKey identifies a single version's document bloom filter within a
 // knowledge base.
@@ -43,7 +78,7 @@ type VersionBloomStore struct {
 	vdl           versiondoc.VersionDocList
 
 	mu    sync.Mutex
-	cache map[versionKey]BloomFilter
+	cache map[versionKey]bloomEntry
 }
 
 // NewVersionBloomStore constructs a VersionBloomStore persisting filters
@@ -55,41 +90,61 @@ func NewVersionBloomStore(dir string, expectedItems uint, fpRate float64, vdl ve
 		expectedItems: expectedItems,
 		fpRate:        fpRate,
 		vdl:           vdl,
-		cache:         make(map[versionKey]BloomFilter),
+		cache:         make(map[versionKey]bloomEntry),
 	}
 }
 
-// Get returns the document bloom filter for (kbID, versionID): from the
-// in-memory cache, else from disk, else rebuilt from the version's
-// VersionDocList and persisted. The returned filter must not be mutated
-// by the caller.
+// Get returns the document bloom filter for (kbID, versionID), correct for the
+// version's CURRENT document set — from the cache when that set is unchanged, else
+// rebuilt from the VersionDocList (the authoritative source) and persisted. The
+// returned filter must not be mutated by the caller.
+//
+// Correct is the load-bearing word. A filter is only usable for the document set it
+// was built from, and a filter built BEFORE a version's documents arrived holds
+// nothing — an empty filter does not merely filter imprecisely, it rejects every
+// hit. So a replica asked early (a restart catching up, a push racing a query) would
+// answer "nothing matched" for a version it holds in full, with no error for the
+// caller to retry on. That state used to be permanent: the filter was cached in
+// memory and on disk and never re-derived, so the replica kept answering empty long
+// after its data had arrived.
 func (s *VersionBloomStore) Get(ctx context.Context, kbID string, versionID int64) (BloomFilter, error) {
+	docIDs, err := s.vdl.ListDocIDs(ctx, kbID, versionID)
+	if err != nil {
+		return nil, fmt.Errorf("bloom: VersionBloomStore.Get(%s,%d): read the version's documents: %w", kbID, versionID, err)
+	}
+	return s.GetForDocuments(kbID, versionID, docIDs), nil
+}
+
+// GetForDocuments is Get for a caller that has already read the version's document
+// set. The query path reads it anyway (it is the authoritative membership test that
+// confirms a bloom hit), so handing the same list over keeps the filter and the
+// membership test derived from one snapshot — and saves a second prefix scan.
+func (s *VersionBloomStore) GetForDocuments(kbID string, versionID int64, docIDs []string) BloomFilter {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := versionKey{kbID: kbID, versionID: versionID}
-	if f, ok := s.cache[key]; ok {
-		return f, nil
+	fp := documentSetFingerprint(docIDs)
+	if e, ok := s.cache[key]; ok && e.fp == fp {
+		return e.filter
 	}
 
-	if f, err := s.loadFromDisk(kbID, versionID); err == nil {
-		s.cache[key] = f
-		return f, nil
+	// A disk copy is used only when it carries the SAME fingerprint. Anything else
+	// is a filter for a document set this version no longer has, and using it would
+	// drop hits that are really there.
+	if f, diskFP, err := s.loadFromDisk(kbID, versionID); err == nil && diskFP == fp {
+		s.cache[key] = bloomEntry{filter: f, fp: fp}
+		return f
 	}
 
-	// Rebuild from the authoritative source.
-	docIDs, err := s.vdl.ListDocIDs(ctx, kbID, versionID)
-	if err != nil {
-		return nil, fmt.Errorf("bloom: VersionBloomStore.Get(%s,%d): rebuild: %w", kbID, versionID, err)
-	}
 	f := s.build(docIDs)
-	if err := s.persist(kbID, versionID, f); err != nil {
-		// A persistence failure is non-fatal: the filter is still usable
-		// in memory, and the next Get will retry the disk write.
-		return f, nil
+	if err := s.persist(kbID, versionID, fp, f); err != nil {
+		// A persistence failure is non-fatal: the filter is still usable in memory,
+		// and the next call retries the disk write.
+		_ = err
 	}
-	s.cache[key] = f
-	return f, nil
+	s.cache[key] = bloomEntry{filter: f, fp: fp}
+	return f
 }
 
 // BuildAndPersist builds a document bloom filter from docIDs, caches it
@@ -101,10 +156,11 @@ func (s *VersionBloomStore) BuildAndPersist(kbID string, versionID int64, docIDs
 	defer s.mu.Unlock()
 
 	f := s.build(docIDs)
-	if err := s.persist(kbID, versionID, f); err != nil {
+	fp := documentSetFingerprint(docIDs)
+	if err := s.persist(kbID, versionID, fp, f); err != nil {
 		return nil, err
 	}
-	s.cache[versionKey{kbID: kbID, versionID: versionID}] = f
+	s.cache[versionKey{kbID: kbID, versionID: versionID}] = bloomEntry{filter: f, fp: fp}
 	return f, nil
 }
 
@@ -181,14 +237,20 @@ func (s *VersionBloomStore) filterPath(kbID string, versionID int64) string {
 // needed). No-op when persistence is unconfigured (dir == ""), so the store
 // stays a pure in-memory accelerator — matching DeleteByVersion/DeleteByKB,
 // which already guard on the same condition.
-func (s *VersionBloomStore) persist(kbID string, versionID int64, f BloomFilter) error {
+func (s *VersionBloomStore) persist(kbID string, versionID int64, fp uint64, f BloomFilter) error {
 	if s.dir == "" {
 		return nil
 	}
-	data, err := f.Serialize()
+	body, err := f.Serialize()
 	if err != nil {
 		return fmt.Errorf("bloom: VersionBloomStore persist(%s,%d): serialize: %w", kbID, versionID, err)
 	}
+	// The fingerprint goes in front of the filter's own bytes, so a filter read back
+	// from disk can say which document set it describes (see loadFromDisk).
+	data := make([]byte, bloomHeaderLen+len(body))
+	binary.BigEndian.PutUint64(data[:bloomHeaderLen], fp)
+	copy(data[bloomHeaderLen:], body)
+
 	path := s.filterPath(kbID, versionID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("bloom: VersionBloomStore persist(%s,%d): mkdir: %w", kbID, versionID, err)
@@ -202,14 +264,18 @@ func (s *VersionBloomStore) persist(kbID string, versionID int64, f BloomFilter)
 // loadFromDisk reads and deserializes (kbID, versionID)'s filter. Any
 // error (missing file, crash-truncated write, corrupt bytes) reports a
 // miss; the caller falls back to rebuilding from the version doc list.
-func (s *VersionBloomStore) loadFromDisk(kbID string, versionID int64) (BloomFilter, error) {
+func (s *VersionBloomStore) loadFromDisk(kbID string, versionID int64) (BloomFilter, uint64, error) {
 	data, err := os.ReadFile(s.filterPath(kbID, versionID))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	if len(data) < bloomHeaderLen {
+		return nil, 0, fmt.Errorf("bloom: %s/%d: persisted filter carries no document-set fingerprint (written by an older build)", kbID, versionID)
+	}
+	fp := binary.BigEndian.Uint64(data[:bloomHeaderLen])
 	f := NewBitsAndBloomsFilter(s.expectedItems, s.fpRate)
-	if err := f.Deserialize(data); err != nil {
-		return nil, err
+	if err := f.Deserialize(data[bloomHeaderLen:]); err != nil {
+		return nil, 0, err
 	}
-	return f, nil
+	return f, fp, nil
 }

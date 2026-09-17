@@ -116,7 +116,7 @@ func (r *RemoteRaftNode) ProposeRemoveKBMeta(ctx context.Context, kbID string) e
 
 func (r *RemoteRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64, opts ...ProposeOption) (int64, error) {
 	o := resolveProposeOptions(opts)
-	res, err := r.propose(ctx, newCreateVersionCommand(kbID, parentVersionID, o.clientRequestID, o.emptyVersion))
+	res, err := r.propose(ctx, newCreateVersionCommand(kbID, parentVersionID, o.clientRequestID))
 	if err != nil {
 		return 0, err
 	}

@@ -124,15 +124,19 @@ message ConfirmVersionWriteRequest {
   // unusable: `integration` went from 26s to 462s and timed out). Empty when
   // the sender does not announce itself; receivers then simply learn nothing.
   string source_addr = 3;
-  // empty_version says this version carries no document changes. It is what
-  // lets a receiving replica know it holds the version without fetching
-  // anything: there is nothing to fetch, and no document-set digest is ever
-  // committed for it. Such a version is never fanned out (there are no records
-  // to send), so this announcement is the ONLY cue it produces — and without
-  // acting on it a replica's contiguous cursor stays behind a version it in
-  // fact holds, which the station's freshness check reads as "stale" (§9.3(2))
-  // and refuses the replica's queries for.
-  bool empty_version = 4;
+  // Field 4 was `bool empty_version`, removed together with the ban on
+  // change-less versions (docs/cursor-persistence-plan.md §5). The flag told a
+  // replica "this version has no documents, move your cursor over it without
+  // fetching" — but a version's document set is INHERITED from its parent, so
+  // "no changes" only coincides with "no documents" at the root of a chain. A
+  // version that removes every document still has an empty set and is still
+  // never fanned out; it is now recognised by its (empty) digest, which the
+  // writer does report, instead of by a flag on the confirmation.
+  //
+  // The number is reserved rather than reused: an older peer may still send it,
+  // and reusing the tag for a different meaning is exactly how a mixed-version
+  // cluster corrupts data quietly.
+  reserved 4;
 }
 
 message ConfirmVersionWriteResponse {

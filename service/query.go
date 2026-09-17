@@ -236,6 +236,19 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 			return nil, stratumerrors.ToGRPCStatus(err)
 		}
 		versionID = kb.ActiveVersionID
+		if versionID == 0 {
+			// A knowledge base with nothing written yet has NO active version, and
+			// that is an empty result rather than a missing one
+			// (docs/cursor-persistence-plan.md §5.1): a version now comes into
+			// existence only when something is written, so refusing here would make
+			// "create a knowledge base, then query it" fail against a knowledge
+			// base that has done nothing wrong — it is simply unpopulated.
+			//
+			// Only the IMPLICIT lookup is answered this way. A caller that names a
+			// version explicitly still gets version_not_found for an id that does
+			// not exist, because it asked about that version in particular.
+			return &pb.QueryResponse{Results: nil, VersionId: 0}, nil
+		}
 	}
 
 	// Check version status.
@@ -318,10 +331,15 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		// An empty version (no documents) has no index entry, so Search
 		// reports ErrIndexNotReady. Treat a genuinely empty version as an
 		// empty result set rather than an error.
-		if errors.Is(err, stratumerrors.ErrIndexNotReady) {
-			if docIDs, derr := s.versionDocList.ListDocIDs(ctx, kbID, versionID); derr == nil && len(docIDs) == 0 {
-				return &pb.QueryResponse{Results: nil, VersionId: versionID}, nil
-			}
+		// Only a version whose document set is PROVABLY empty is answered with an empty
+		// result: the control layer records the empty set's digest for exactly that
+		// state, so anything else means "this node cannot serve it YET" — which has to
+		// travel as a retryable error. Answering empty here made a replica that had not
+		// finished catching up indistinguishable from a version with no documents: the
+		// caller gets a well-formed answer with nothing in it, and no reason to ask
+		// another node.
+		if errors.Is(err, stratumerrors.ErrIndexNotReady) && targetVersion.DocIDSetHash == types.EmptyDocIDSetHash {
+			return &pb.QueryResponse{Results: nil, VersionId: versionID}, nil
 		}
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
@@ -339,15 +357,31 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	}
 	docMap := make(map[string]*docScore)
 
-	// Per-version document bloom filter. A Get failure (e.g. the version's
-	// doc list is temporarily unavailable) degrades to no filtering: the
-	// authoritative confirmations below still keep results correct, at the
-	// cost of extra work.
+	// Per-version document state, read ONCE for the whole query: the document-ID set is
+	// both the filter's input and the authoritative membership test below.
 	//
-	// bloom_us covers the filter plus the version's doc-ID set (one prefix scan):
-	// both are local Pebble reads, so this is what "reading our own storage" costs.
+	// Derived from one snapshot on purpose. The filter decides which search hits are
+	// dropped, so a filter that disagrees with the set it is meant to describe does not
+	// merely lose precision — it deletes hits that are really there. The store rebuilds
+	// a filter whenever that set changes (bloom.VersionBloomStore.GetForDocuments), and
+	// handing the set over here is what keeps the two in step.
+	//
+	// bloom_us covers the set plus the filter: both are local reads, so this is what
+	// "reading our own storage" costs.
+	//
+	// A failed read leaves both empty and filtering is then SKIPPED rather than applied
+	// with an empty set: "the set is unavailable" must not read as "no document is in
+	// this version", which would drop every hit and answer empty.
 	bloomStart := time.Now()
-	vBloom, vBloomErr := s.vBloomStore.Get(ctx, kbID, versionID)
+	ids, idsErr := s.versionDocList.ListDocIDs(ctx, kbID, versionID)
+	var (
+		vDocs     map[string]struct{}
+		vBloom    bloom.BloomFilter
+		vBloomErr error
+	)
+	if idsErr != nil {
+		vBloomErr = idsErr
+	}
 
 	// The version's document-ID set, materialized ONCE for the whole query.
 	//
@@ -363,14 +397,12 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// A failed fetch leaves vDocs nil, and every membership test then fails —
 	// the same conservative "cannot confirm, so skip" the per-candidate fetch
 	// had when its own call errored.
-	var vDocs map[string]struct{}
-	if vBloomErr == nil {
-		if ids, err := s.versionDocList.ListDocIDs(ctx, kbID, versionID); err == nil {
-			vDocs = make(map[string]struct{}, len(ids))
-			for _, id := range ids {
-				vDocs[id] = struct{}{}
-			}
+	if idsErr == nil {
+		vDocs = make(map[string]struct{}, len(ids))
+		for _, id := range ids {
+			vDocs[id] = struct{}{}
 		}
+		vBloom = s.vBloomStore.GetForDocuments(kbID, versionID, ids)
 	}
 	stageBloom = time.Since(bloomStart)
 

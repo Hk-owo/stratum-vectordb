@@ -7,6 +7,7 @@ import (
 	"io"
 	"sort"
 
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -117,6 +118,12 @@ type PushHandler struct {
 
 	// installer receives indexes built elsewhere (§8.4).
 	installer IndexInstaller
+
+	// logger records the receive side's own decisions. Nop unless wired, but
+	// wiring it matters for one decision in particular: a §8.4(a) probe that
+	// could not be answered turns a skip back into a full transfer, and without
+	// a log line that looks identical to "the peer really did not have it".
+	logger *zap.Logger
 
 	// dataSources, when set, records which peer announced it holds a version's
 	// data (§8.5): the confirmation carries the writer's own address, and the
@@ -322,11 +329,28 @@ func WithVersionWriteWatcher(w VersionWriteWatcher) PushHandlerOption {
 // (Stratum_设计文档v13.md §8.4). *index.IndexManagerImpl implements it.
 type IndexInstaller interface {
 	InstallIndex(ctx context.Context, kbID string, versionID int64, indexData, sidecarData []byte) error
+	// HasIndex reports whether this node already holds an on-disk artifact for
+	// the version — the fact §8.4(a)'s probe answers with. Read-only by
+	// contract: it must not build, load or fetch anything, because every caller
+	// asks it precisely to avoid that work.
+	HasIndex(ctx context.Context, kbID string, versionID int64) (bool, error)
 }
 
 // WithIndexInstaller wires the §8.4 destination of a pushed index.
 func WithIndexInstaller(i IndexInstaller) PushHandlerOption {
 	return func(h *PushHandler) { h.installer = i }
+}
+
+// WithLogger wires the receive side's log. Optional, but a §8.4(a) probe that
+// fails is otherwise invisible: "I could not find out" and "it is not there"
+// lead to the same behaviour — accept the push — and only one of them is
+// routine.
+func WithLogger(l *zap.Logger) PushHandlerOption {
+	return func(h *PushHandler) {
+		if l != nil {
+			h.logger = l
+		}
+	}
 }
 
 // PushHandlerOption configures a PushHandler.
@@ -356,7 +380,7 @@ func WithLocalVersionAdvancer(a LocalVersionAdvancer) PushHandlerOption {
 
 // NewPushHandler returns a PushHandler applying through follower.
 func NewPushHandler(follower *Follower, nodeID int64, opts ...PushHandlerOption) *PushHandler {
-	h := &PushHandler{follower: follower, nodeID: nodeID}
+	h := &PushHandler{follower: follower, nodeID: nodeID, logger: zap.NewNop()}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
@@ -405,6 +429,11 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 		if h.advanceVersion != nil {
 			h.advanceVersion.MarkVersionContiguous(kbID, versionID)
 		}
+		// Same step as the pull path: the version's document filter is derived from the
+		// document set that just landed here (see Follower.SetVersionBloom).
+		if h.follower != nil {
+			h.follower.rebuildVersionBloom(ctx, kbID, versionID)
+		}
 		if err := h.follower.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
 			return fmt.Errorf("sync: push trigger build (%s v%d): %w", kbID, versionID, err)
 		}
@@ -430,10 +459,8 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 // records where the version's data lives; later readers resolve it from that
 // fact instead of asking the leader (see plane.DataSourceRegistry).
 //
-// It is ALSO this node's cue that the version exists, which matters most for the
-// version nobody sends: one with no document changes is never fanned out, so
-// without acting here a replica would never learn of it and its cursor would
-// stay behind a version it in fact holds.
+// It is also this node's cue that the version exists — a replica that missed the
+// push learns of it here, which is why it does not merely stop a timer.
 func (h *PushHandler) ConfirmVersionWrite(_ context.Context, req *pb.ConfirmVersionWriteRequest) (*pb.ConfirmVersionWriteResponse, error) {
 	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
 	if h.watcher != nil {
@@ -441,15 +468,6 @@ func (h *PushHandler) ConfirmVersionWrite(_ context.Context, req *pb.ConfirmVers
 	}
 	if h.dataSources != nil && req.GetSourceAddr() != "" {
 		h.dataSources.Register(kbID, versionID, req.GetSourceAddr())
-	}
-	// empty_version: this version has no document changes, so it was never
-	// fanned out and there is nothing to fetch. Moving the cursor here is the
-	// whole job — and it costs no I/O, which is why the coordinator sends the
-	// fact rather than expecting the replica to discover it by pulling. Without
-	// it the replica answers "version 0" to the station's freshness check
-	// (§9.3(2)) for a version it holds, and its queries get refused.
-	if req.GetEmptyVersion() && h.advanceVersion != nil {
-		h.advanceVersion.MarkVersionContiguous(kbID, versionID)
 	}
 	return &pb.ConfirmVersionWriteResponse{NodeId: h.nodeID}, nil
 }
@@ -682,6 +700,11 @@ func (h *PushHandler) PushIndexData(stream pb.DataSyncService_PushIndexDataServe
 		versionID  int64
 		indexBuf   bytes.Buffer
 		sidecarBuf bytes.Buffer
+		// frames counts what has arrived, so "probe" can mean the first frame and
+		// nothing else; probed remembers that the first frame was one, which is
+		// what the bare-probe answer below turns on.
+		frames int
+		probed bool
 	)
 	for {
 		chunk, err := stream.Recv()
@@ -693,6 +716,34 @@ func (h *PushHandler) PushIndexData(stream pb.DataSyncService_PushIndexDataServe
 		}
 		kbID = chunk.GetKnowledgeBaseId()
 		versionID = chunk.GetVersionId()
+
+		// §8.4(a) probe: the sender asks "do you already hold this artifact?"
+		// with a zero-length frame before spending tens of megabytes. Answering
+		// AlreadyExists closes the stream, so the transfer never starts.
+		//
+		// It has to be the FIRST frame, and the frame count — not merely "no probe
+		// seen yet" — is what says so. A real transfer opens with a sidecar chunk
+		// (Sidecar=true) and the sending side refuses an empty index payload, so
+		// this combination does not occur in the normal flow; but a zero-length
+		// frame arriving mid-transfer must be treated as the data frame it is
+		// rather than raced against as a probe.
+		isProbe := frames == 0 && len(chunk.GetData()) == 0 && !chunk.GetSidecar() && !chunk.GetLast()
+		frames++
+		if isProbe {
+			probed = true
+			held, err := h.installer.HasIndex(stream.Context(), kbID, versionID)
+			if err != nil {
+				// "I could not find out" is not "it is absent": accept the push
+				// rather than silently skipping a ship that was actually needed.
+				h.logger.Warn("sync: PushIndexData: presence probe failed; accepting the push",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			} else if held {
+				return status.Errorf(codes.AlreadyExists,
+					"sync: PushIndexData: %s v%d already holds an artifact; skipping the ship", kbID, versionID)
+			}
+			continue
+		}
+
 		if chunk.GetSidecar() {
 			sidecarBuf.Write(chunk.GetData())
 		} else {
@@ -704,6 +755,15 @@ func (h *PushHandler) PushIndexData(stream pb.DataSyncService_PushIndexDataServe
 	}
 	if kbID == "" {
 		return status.Error(codes.InvalidArgument, "sync: PushIndexData: no knowledge base id in the stream")
+	}
+	// A probe that arrived and then closed the stream with nothing behind it is
+	// the §8.4(a) pre-flight, not a transfer: the sender wants a yes/no answer
+	// and got "not held" from HasIndex above. Answering NotFound makes that
+	// explicit, so the sender's probe does not have to be inferred from the
+	// side effect of an empty install.
+	if probed && indexBuf.Len() == 0 && sidecarBuf.Len() == 0 {
+		return status.Errorf(codes.NotFound,
+			"sync: PushIndexData: this node holds no artifact for %s v%d", kbID, versionID)
 	}
 	if h.installer == nil {
 		return status.Error(codes.FailedPrecondition, "sync: PushIndexData: index install is not wired on this node")

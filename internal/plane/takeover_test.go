@@ -3,6 +3,7 @@ package plane
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,7 +11,13 @@ import (
 )
 
 // takeoverControl records the durable reports a takeover produces.
+//
+// The lock is not decoration: the reports arrive on the takeover timer's own
+// goroutine (LocalDataPlane.WatchVersionWrite's timer), while the tests read
+// them from the test goroutine. Without it every case below is a data race on
+// the slice — measured with -race on the tests that poll for an announcement.
 type takeoverControl struct {
+	mu      sync.Mutex
 	durable []durableReport
 }
 
@@ -21,8 +28,26 @@ type durableReport struct {
 }
 
 func (c *takeoverControl) ReportDataDurable(_ context.Context, kbID string, versionID int64, digest string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.durable = append(c.durable, durableReport{kbID: kbID, versionID: versionID, digest: digest})
 	return nil
+}
+
+// count is how many announcements have landed so far — the polling condition
+// the tests wait on.
+func (c *takeoverControl) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.durable)
+}
+
+// reports returns a copy of the announcements, so a test can assert on a stable
+// snapshot rather than on a slice the timer may still be appending to.
+func (c *takeoverControl) reports() []durableReport {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]durableReport(nil), c.durable...)
 }
 
 func (c *takeoverControl) SetFailureBudget(context.Context, string, int) error { return nil }
@@ -94,6 +119,17 @@ func shortenTakeover(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { takeoverTimeout = old })
 }
 
+// waitForAnnouncements blocks until want announcements have landed, so a case
+// asserts on a snapshot instead of polling the control directly.
+func waitForAnnouncements(t *testing.T, c *takeoverControl, want int) []durableReport {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for c.count() < want && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	return c.reports()
+}
+
 // The §7.3 path: the coordinator went quiet, a quorum holds the version, so
 // this replica announces it — with the digest it computed itself, because
 // followers will verify their pulls against exactly that value.
@@ -107,15 +143,12 @@ func TestLocalDataPlane_TakeoverAnnouncesWhenAQuorumHoldsTheVersion(t *testing.T
 	)
 
 	dp.WatchVersionWrite("kb-1", 7)
-	deadline := time.Now().Add(2 * time.Second)
-	for len(control.durable) == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	reports := waitForAnnouncements(t, control, 1)
 
-	if len(control.durable) != 1 {
-		t.Fatalf("durable reports = %+v, want exactly one", control.durable)
+	if len(reports) != 1 {
+		t.Fatalf("durable reports = %+v, want exactly one", reports)
 	}
-	got := control.durable[0]
+	got := reports[0]
 	if got.kbID != "kb-1" || got.versionID != 7 {
 		t.Errorf("announced %s v%d, want kb-1 v7", got.kbID, got.versionID)
 	}
@@ -138,8 +171,8 @@ func TestLocalDataPlane_TakeoverStaysSilentWithoutAQuorum(t *testing.T) {
 	dp.WatchVersionWrite("kb-1", 7)
 	time.Sleep(200 * time.Millisecond)
 
-	if len(control.durable) != 0 {
-		t.Fatalf("durable reports = %+v, want none on a minority", control.durable)
+	if reports := control.reports(); len(reports) != 0 {
+		t.Fatalf("durable reports = %+v, want none on a minority", reports)
 	}
 }
 
@@ -157,13 +190,10 @@ func TestLocalDataPlane_TakeoverIgnoresUnreachablePeers(t *testing.T) {
 	)
 
 	dp.WatchVersionWrite("kb-1", 7)
-	deadline := time.Now().Add(2 * time.Second)
-	for len(control.durable) == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	reports := waitForAnnouncements(t, control, 1)
 
-	if len(control.durable) != 1 {
-		t.Fatalf("durable reports = %+v, want one: peer-b's answer is enough for a quorum", control.durable)
+	if len(reports) != 1 {
+		t.Fatalf("durable reports = %+v, want one: peer-b's answer is enough for a quorum", reports)
 	}
 }
 
@@ -195,8 +225,8 @@ func TestLocalDataPlane_ConfirmStandsDownTheTakeover(t *testing.T) {
 	dp.ConfirmVersionWrite("kb-1", 7)
 	time.Sleep(300 * time.Millisecond)
 
-	if len(control.durable) != 0 {
-		t.Fatalf("durable reports = %+v, want none after the confirmation", control.durable)
+	if reports := control.reports(); len(reports) != 0 {
+		t.Fatalf("durable reports = %+v, want none after the confirmation", reports)
 	}
 }
 
@@ -211,8 +241,8 @@ func TestLocalDataPlane_ConfirmWithoutWatchIsHarmless(t *testing.T) {
 	dp.ConfirmVersionWrite("kb-1", 7)
 	time.Sleep(50 * time.Millisecond)
 
-	if len(control.durable) != 0 {
-		t.Fatalf("durable reports = %+v, want none", control.durable)
+	if reports := control.reports(); len(reports) != 0 {
+		t.Fatalf("durable reports = %+v, want none", reports)
 	}
 }
 
@@ -248,9 +278,12 @@ func TestLocalDataPlane_WatchIsIdempotentPerVersion(t *testing.T) {
 
 	dp.WatchVersionWrite("kb-1", 7)
 	dp.WatchVersionWrite("kb-1", 7)
+	// The replaced timer fires at 30ms; waiting well past that gives it every
+	// chance to also announce, so "exactly one" is a real assertion rather than
+	// a race won by the fast path.
 	time.Sleep(300 * time.Millisecond)
 
-	if len(control.durable) != 1 {
-		t.Fatalf("durable reports = %+v, want exactly one announcement", control.durable)
+	if reports := control.reports(); len(reports) != 1 {
+		t.Fatalf("durable reports = %+v, want exactly one announcement", reports)
 	}
 }

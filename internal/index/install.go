@@ -27,6 +27,28 @@ func installShardOf(key indexKey) int {
 	return int(h % installShardCount)
 }
 
+// HasIndex reports whether this node already holds an on-disk artifact for
+// (kbID, versionID) — the question §8.4(a)'s pre-flight probe asks so a sender
+// never spends tens of megabytes shipping a copy the receiver already has.
+//
+// Read-only on purpose: it stats the persisted file rather than building,
+// loading or fetching anything, because the whole point of asking is to avoid
+// that work on the sending side. With an empty IndexDataDir (persistence
+// unconfigured) it reports false, exactly as IndexExists does.
+//
+// It defers to IndexExists rather than re-deriving the answer: the startup
+// reconcile asks the same question, and two answers to one question are two
+// answers that can drift.
+//
+// This probe is why IndexExists has to stay on the IndexManager interface: it is
+// that method's only remaining caller on a MAIN path (docs/cursor-persistence-plan.md
+// §4 downgraded the cursor's use of it to a fallback, and that downgrade must not
+// reach here — see the note on IndexExists itself for why the two questions only
+// look alike).
+func (im *IndexManagerImpl) HasIndex(ctx context.Context, kbID string, versionID int64) (bool, error) {
+	return im.IndexExists(ctx, kbID, versionID)
+}
+
 // InstallIndex writes an index built elsewhere into this node's index
 // directory and loads it, so a replica can serve a version it never built
 // (Stratum_设计文档v13.md §8.4: "建一次、分发 N 份").

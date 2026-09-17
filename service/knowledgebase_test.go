@@ -60,8 +60,18 @@ func TestKnowledgeBaseService_CreateKnowledgeBase(t *testing.T) {
 	if resp.KnowledgeBaseId == "" {
 		t.Error("expected non-empty knowledge_base_id")
 	}
-	if resp.InitialVersionId != 1 {
-		t.Errorf("expected initial_version_id=1, got %d", resp.InitialVersionId)
+	if resp.InitialVersionId != 0 {
+		t.Errorf("initial_version_id = %d, want 0: creating a knowledge base no longer creates a version, "+
+			"because a change-less version is refused (docs/cursor-persistence-plan.md §5)", resp.InitialVersionId)
+	}
+	// The knowledge base starts with an EMPTY version chain, and that is the state
+	// the query path treats as "no results yet" rather than as a missing version.
+	versions, err := h.raftNode.ListVersions(context.Background(), resp.KnowledgeBaseId)
+	if err != nil {
+		t.Fatalf("ListVersions after create: %v", err)
+	}
+	if len(versions) != 0 {
+		t.Errorf("versions after CreateKnowledgeBase = %d, want 0", len(versions))
 	}
 
 	// Verify the KB was persisted in the RaftNode.
@@ -163,16 +173,23 @@ func TestKnowledgeBaseService_ListVersions(t *testing.T) {
 		},
 	})
 
-	// CreateVersion will add a version to the mock's internal state.
+	// The knowledge base has no version of its own any more
+	// (docs/cursor-persistence-plan.md §5), so the first one is proposed here.
+	// CreateVersion itself goes through the write coordinator, whose mock does not
+	// touch the Raft state machine — so the version that shows up below is this one.
+	v1, err := h.raftNode.ProposeCreateVersion(context.Background(), createResp.KnowledgeBaseId, 0)
+	if err != nil {
+		t.Fatalf("create v1: %v", err)
+	}
+
 	h.writeC.SetExecuteResult(2, nil)
-	_, err := h.svc.CreateVersion(context.Background(), &pb.CreateVersionRequest{
+	if _, err := h.svc.CreateVersion(context.Background(), &pb.CreateVersionRequest{
 		KnowledgeBaseId: createResp.KnowledgeBaseId,
-		ParentVersionId: 1,
+		ParentVersionId: v1,
 		Changes: []*pb.DocChange{
 			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-1", Content: "content"},
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("CreateVersion failed: %v", err)
 	}
 
@@ -182,13 +199,9 @@ func TestKnowledgeBaseService_ListVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListVersions failed: %v", err)
 	}
-	// We have initial version (1) plus one more from the Raft mock.
-	// The mock won't know about versions created via MockWriteCoordinator.
-	// At minimum, initial version 1 should be listed.
-	if len(resp.Versions) < 1 {
-		t.Errorf("expected at least 1 version, got %d", len(resp.Versions))
+	if len(resp.Versions) != 1 || resp.Versions[0].VersionId != v1 {
+		t.Errorf("versions = %v, want exactly v%d — the only version the state machine knows", resp.Versions, v1)
 	}
-	t.Logf("versions: %d", len(resp.Versions))
 }
 
 func TestKnowledgeBaseService_RollbackVersion(t *testing.T) {
@@ -204,14 +217,20 @@ func TestKnowledgeBaseService_RollbackVersion(t *testing.T) {
 		},
 	})
 
-	// Initial version is PENDING by default; mark it as READY to allow rollback.
-	h.raftNode.ProposeUpdateVersionStatus(context.Background(), 1, types.IndexStatusReady, 0)
-
-	_, err := h.svc.RollbackVersion(context.Background(), &pb.RollbackVersionRequest{
-		KnowledgeBaseId: createResp.KnowledgeBaseId,
-		TargetVersionId: 1,
-	})
+	// A version must exist before it can be the rollback target.
+	v1, err := h.raftNode.ProposeCreateVersion(context.Background(), createResp.KnowledgeBaseId, 0)
 	if err != nil {
+		t.Fatalf("create v1: %v", err)
+	}
+	// It is PENDING by default; mark it as READY to allow rollback.
+	if err := h.raftNode.ProposeUpdateVersionStatus(context.Background(), v1, types.IndexStatusReady, 0); err != nil {
+		t.Fatalf("v1 READY: %v", err)
+	}
+
+	if _, err := h.svc.RollbackVersion(context.Background(), &pb.RollbackVersionRequest{
+		KnowledgeBaseId: createResp.KnowledgeBaseId,
+		TargetVersionId: v1,
+	}); err != nil {
 		t.Fatalf("RollbackVersion failed: %v", err)
 	}
 }
@@ -400,8 +419,21 @@ func TestKnowledgeBaseService_DeleteVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateKnowledgeBase: %v", err)
 	}
-	// Initial version (v1) is active. Fork a second version and make it READY.
-	v2, err := h.raftNode.ProposeCreateVersion(ctx, createResp.KnowledgeBaseId, createResp.InitialVersionId)
+	// The knowledge base has no version of its own, so v1 is created and made the
+	// active version here — which is what "deleting the active version is rejected"
+	// needs.
+	v1, err := h.raftNode.ProposeCreateVersion(ctx, createResp.KnowledgeBaseId, 0)
+	if err != nil {
+		t.Fatalf("create v1: %v", err)
+	}
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady, 0); err != nil {
+		t.Fatalf("v1 READY: %v", err)
+	}
+	if err := h.raftNode.ProposeRollback(ctx, createResp.KnowledgeBaseId, v1); err != nil {
+		t.Fatalf("activate v1: %v", err)
+	}
+	// v1 is active. Fork a second version and make it READY.
+	v2, err := h.raftNode.ProposeCreateVersion(ctx, createResp.KnowledgeBaseId, v1)
 	if err != nil {
 		t.Fatalf("create v2: %v", err)
 	}
@@ -412,7 +444,7 @@ func TestKnowledgeBaseService_DeleteVersion(t *testing.T) {
 	// Deleting the active version is rejected.
 	_, err = h.svc.DeleteVersion(ctx, &pb.DeleteVersionRequest{
 		KnowledgeBaseId: createResp.KnowledgeBaseId,
-		VersionId:       createResp.InitialVersionId,
+		VersionId:       v1,
 	})
 	if err == nil {
 		t.Fatal("expected error deleting the active version")
@@ -467,7 +499,18 @@ func kbSvcTestHarnessWithChain(t *testing.T, h *kbSvcTestHarness) (string, int64
 	if err != nil {
 		t.Fatalf("CreateKnowledgeBase: %v", err)
 	}
-	kbID, v1 := createResp.KnowledgeBaseId, createResp.InitialVersionId
+	kbID := createResp.KnowledgeBaseId
+	// A knowledge base now starts with an empty version chain, so the chain begins
+	// with an explicit v1 (docs/cursor-persistence-plan.md §5).
+	v1, err := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
+	if err != nil {
+		t.Fatalf("create v1: %v", err)
+	}
+	// READY before anything forks off it: the state machine rejects a PENDING
+	// parent, so the chain can only grow once v1 has been built.
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady, 0); err != nil {
+		t.Fatalf("v1 READY: %v", err)
+	}
 	v2, err := h.raftNode.ProposeCreateVersion(ctx, kbID, v1)
 	if err != nil {
 		t.Fatalf("create v2: %v", err)

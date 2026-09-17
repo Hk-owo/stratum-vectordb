@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
@@ -33,6 +34,19 @@ type Follower struct {
 	// check (§9.3(2)) then refuses a replica that is in fact current, and the
 	// read falls through to whichever node answers "0 < required".
 	advanceVersion LocalVersionAdvancer
+
+	// versionBloom rebuilds a version's document filter once its data has landed.
+	// Optional, but a replica that never rebuilds keeps whatever filter it built
+	// first — and a filter built before the data arrived is empty, which drops every
+	// search hit (see SetVersionBloom).
+	versionBloom VersionBloomStore
+}
+
+// VersionBloomStore is the slice of bloom.VersionBloomStore the sync paths need: the
+// REBUILD of a version's document filter from a document set that is now local.
+// Declared here so this package depends on none of the store's read/delete surface.
+type VersionBloomStore interface {
+	BuildAndPersist(kbID string, versionID int64, docIDs []string) (bloom.BloomFilter, error)
 }
 
 // SetLocalVersionAdvancer wires the cursor update a completed pull performs.
@@ -41,6 +55,36 @@ type Follower struct {
 // implements it is built after the follower in every assembly.
 func (f *Follower) SetLocalVersionAdvancer(a LocalVersionAdvancer) {
 	f.advanceVersion = a
+}
+
+// SetVersionBloom wires the document-filter rebuild a completed transfer performs.
+//
+// The writer builds this filter inside its write transaction; a replica that receives
+// the same data has to build it too. That is not a nicety: the filter drops the search
+// hits that are not in the version, so a replica whose filter was built before the
+// data arrived (a query that came in early, a push racing a read) answers "nothing
+// matched" — with no error — for a version it holds in full. A setter rather than a
+// constructor argument, following SetLocalVersionAdvancer: the store is assembled
+// after the follower in every assembly.
+func (f *Follower) SetVersionBloom(b VersionBloomStore) {
+	f.versionBloom = b
+}
+
+// rebuildVersionBloom re-derives the version's document filter from the document set
+// that just landed. Best effort: the filter is an accelerator, so a failure costs
+// precision and never correctness — the query path confirms every hit against the
+// version doc list anyway.
+func (f *Follower) rebuildVersionBloom(ctx context.Context, kbID string, versionID int64) {
+	if f.versionBloom == nil {
+		return
+	}
+	docIDs, err := f.versionDoc.ListDocIDs(ctx, kbID, versionID)
+	if err != nil {
+		return
+	}
+	if _, err := f.versionBloom.BuildAndPersist(kbID, versionID, docIDs); err != nil {
+		_ = err // non-fatal; the next transfer or the query path rebuilds it
+	}
 }
 
 // markVersionContiguous moves the cursor if an advancer is wired.
@@ -152,6 +196,11 @@ func (f *Follower) PullVersionWith(ctx context.Context, leaderAddr string, kbID 
 	// it. The cursor is what §9.3(2) reads, and a replica whose cursor never
 	// moves is refused as stale however complete its data is.
 	f.markVersionContiguous(kbID, versionID)
+
+	// The data is complete, so the version's document filter can be derived from it —
+	// the same step the writer's transaction performs. See SetVersionBloom for why a
+	// replica has to do this rather than inherit the writer's filter.
+	f.rebuildVersionBloom(ctx, kbID, versionID)
 
 	// All data written; trigger an independent HNSW build on this node.
 	if opts.SkipIndexBuild {

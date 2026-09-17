@@ -126,12 +126,7 @@ func NewConfirmBroadcaster(cfg PresenceCheckerConfig) *ConfirmBroadcaster {
 // A dial or RPC failure is returned so the caller can log which replica stayed
 // in the dark — it will simply check for itself later, which is the safe
 // direction (an extra announcement, never a missing one).
-//
-// empty carries the fact that this version has no document changes. The peer
-// needs it because such a version is never fanned out: the announcement is the
-// only thing that tells a replica the version exists, and the only thing that
-// can move its cursor over it.
-func (c *ConfirmBroadcaster) ConfirmVersionWrite(ctx context.Context, peerAddr, kbID string, versionID int64, sourceAddr string, empty bool) error {
+func (c *ConfirmBroadcaster) ConfirmVersionWrite(ctx context.Context, peerAddr, kbID string, versionID int64, sourceAddr string) error {
 	conn, err := c.dial(ctx, peerAddr)
 	if err != nil {
 		return fmt.Errorf("sync: dial replica %s: %w", peerAddr, err)
@@ -143,8 +138,7 @@ func (c *ConfirmBroadcaster) ConfirmVersionWrite(ctx context.Context, peerAddr, 
 		VersionId:       versionID,
 		// sourceAddr is the writer's own address: the confirmation is also the
 		// §8.5 announcement of where this version's data lives.
-		SourceAddr:   sourceAddr,
-		EmptyVersion: empty,
+		SourceAddr: sourceAddr,
 	}); err != nil {
 		return fmt.Errorf("sync: ConfirmVersionWrite(%s v%d) at %s: %w", kbID, versionID, peerAddr, err)
 	}

@@ -36,8 +36,15 @@ var (
 	// from ErrIndexNotReady — "we took it down on purpose" and "it has not been
 	// built yet" share a gRPC code (neither is fixable by retrying THIS node)
 	// but are different root causes, and whoever reads a log wants to know which.
-	ErrIndexMaintenance     = errors.New("index under maintenance")
-	ErrInvalidArgument      = errors.New("invalid argument")
+	ErrIndexMaintenance = errors.New("index under maintenance")
+	ErrInvalidArgument  = errors.New("invalid argument")
+	// ErrEmptyChanges rejects a CreateVersion whose changes list is empty. A
+	// version's document set is INHERITED from its parent, so an empty changes
+	// list does not mean "the empty set" — it means "the same set as my parent",
+	// and only at the ROOT of a chain is there no parent to inherit from. The
+	// control layer therefore refuses the write rather than creating a version
+	// whose document set it cannot state (docs/cursor-persistence-plan.md §5).
+	ErrEmptyChanges         = errors.New("empty changes")
 	ErrIndexLoadTimeout     = errors.New("index load timeout")
 	ErrInvalidParentVersion = errors.New("invalid parent version")
 )
@@ -66,6 +73,7 @@ var sentinelNames = []struct {
 	{"index_not_ready", ErrIndexNotReady},
 	{"index_maintenance", ErrIndexMaintenance},
 	{"invalid_argument", ErrInvalidArgument},
+	{"empty_changes", ErrEmptyChanges},
 	{"index_load_timeout", ErrIndexLoadTimeout},
 	{"invalid_parent_version", ErrInvalidParentVersion},
 }
@@ -109,6 +117,7 @@ var grpcCodeMap = map[error]codes.Code{
 	ErrIndexNotReady:         codes.FailedPrecondition,
 	ErrIndexMaintenance:      codes.FailedPrecondition,
 	ErrInvalidArgument:       codes.InvalidArgument,
+	ErrEmptyChanges:          codes.InvalidArgument,
 	ErrIndexLoadTimeout:      codes.DeadlineExceeded,
 	ErrInvalidParentVersion:  codes.InvalidArgument,
 }

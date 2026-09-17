@@ -17,19 +17,22 @@ func (f versionDigestFunc) DigestOf(ctx context.Context, kbID string, versionID 
 	return f(ctx, kbID, versionID)
 }
 
-// TestLocalDataPlane_EnsureIndex_AdvancesCursorForAnEmptyVersion pins the fix
-// for "a freshly created knowledge base's first query is refused".
+// TestLocalDataPlane_EnsureIndex_AdvancesCursorForAnEmptyVersion pins the fix for
+// "a version with no documents never converges".
 //
-// The state it describes is ordinary, not exotic: a knowledge base's initial
-// version is created with no document changes, and version ids increase
-// globally — so by the time a test or a client creates a new knowledge base,
-// that version's id is far above 1, and the "initial version" fast path
-// (versionID <= 1) does not apply. Nothing commits a document-set digest for a
-// version with no document set, so §7.5's pull loop — which waits for that
-// digest to match — spun out its whole timeout while the node's contiguous
-// cursor stayed at 0. The station's freshness check (§9.3(2)) reads that cursor,
-// so the query was refused with "local history reaches version 0", depending on
-// whether the route table had refreshed yet.
+// The state it describes is ordinary: deleting a knowledge base's last document
+// produces a version whose document set is EMPTY, and no writer commits a
+// document-set digest for it (there is no set to hash). §7.5's pull loop waits for
+// that digest to match, so it would spin out its whole timeout while the node's
+// contiguous cursor stayed below a version it in fact holds. The station's
+// freshness check (§9.3(2)) reads that cursor, so queries were refused with
+// "local history reaches version 0".
+//
+// The empty set is a property of a version's DOCUMENT SET, which is why it
+// outlives the empty CHANGES list that used to be conflated with it
+// (docs/cursor-persistence-plan.md §5.4): the coordinator now refuses a change-less
+// version, but a version that removes every document is still perfectly legal and
+// still carries no digest.
 func TestLocalDataPlane_EnsureIndex_AdvancesCursorForAnEmptyVersion(t *testing.T) {
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
 		IndexManager: &stubIndexStore{},
@@ -48,11 +51,11 @@ func TestLocalDataPlane_EnsureIndex_AdvancesCursorForAnEmptyVersion(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	const versionID = 51 // a later knowledge base's initial version, not 1
-	if err := dp.EnsureIndex(ctx, "kb-new", versionID); err != nil {
+	const versionID = 51
+	if err := dp.EnsureIndex(ctx, "kb-empty", versionID); err != nil {
 		t.Fatalf("EnsureIndex on an empty version: %v", err)
 	}
-	if got := dp.LocalVersionOf("kb-new"); got != versionID {
+	if got := dp.LocalVersionOf("kb-empty"); got != versionID {
 		t.Fatalf("cursor = %d, want %d — a version with no documents is held once its (empty) pull succeeds",
 			got, versionID)
 	}
@@ -60,8 +63,8 @@ func TestLocalDataPlane_EnsureIndex_AdvancesCursorForAnEmptyVersion(t *testing.T
 
 // TestLocalDataPlane_VersionHasNoDocuments pins the judgement itself, including
 // the direction it must fail in: with no digest source the answer is "no", so a
-// missing seam degrades to the old behaviour (wait, then fail) rather than
-// advancing a cursor on evidence the node does not have.
+// missing seam degrades to the conservative behaviour (wait, then fail) rather
+// than advancing a cursor on evidence the node does not have.
 func TestLocalDataPlane_VersionHasNoDocuments(t *testing.T) {
 	empty := stratinternalsync.ComputeDocIDSetHash(nil)
 

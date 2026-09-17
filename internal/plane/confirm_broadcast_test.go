@@ -29,7 +29,7 @@ func newStubConfirmRecorder() *stubConfirmRecorder {
 	}
 }
 
-func (c *stubConfirmRecorder) ConfirmVersionWrite(ctx context.Context, peerAddr, _ string, _ int64, _ string, _ bool) error {
+func (c *stubConfirmRecorder) ConfirmVersionWrite(ctx context.Context, peerAddr, _ string, _ int64, _ string) error {
 	c.mu.Lock()
 	c.attempts[peerAddr]++
 	n := c.attempts[peerAddr]
@@ -105,7 +105,7 @@ func TestConfirmBroadcastRetriesEachPeer(t *testing.T) {
 	confirmer.alwaysFail = true
 	plane := confirmPlane(confirmer, "peer-a:7000")
 
-	plane.broadcastConfirmation("kb-1", 7, false)
+	plane.broadcastConfirmation("kb-1", 7)
 
 	awaitCondition(t, func() bool { return confirmer.attemptsFor("peer-a:7000") == confirmAttempts })
 }
@@ -126,7 +126,7 @@ func TestConfirmBroadcastDoesNotLetAHungPeerStarveTheRest(t *testing.T) {
 	confirmer.failFirst["peer-b:7000"] = 1 // transient: succeeds on the retry
 	plane := confirmPlane(confirmer, "peer-a:7000", "peer-b:7000")
 
-	plane.broadcastConfirmation("kb-1", 7, false)
+	plane.broadcastConfirmation("kb-1", 7)
 
 	awaitCondition(t, func() bool { return confirmer.attemptsFor("peer-b:7000") >= 2 })
 
@@ -148,7 +148,7 @@ func TestConfirmBroadcastDoesNotRetryASuccessfulPeer(t *testing.T) {
 	confirmer := newStubConfirmRecorder()
 	plane := confirmPlane(confirmer, "peer-a:7000")
 
-	plane.broadcastConfirmation("kb-1", 7, false)
+	plane.broadcastConfirmation("kb-1", 7)
 
 	awaitCondition(t, func() bool { return confirmer.attemptsFor("peer-a:7000") >= 1 })
 	time.Sleep(50 * time.Millisecond) // room for a second attempt, if one were coming

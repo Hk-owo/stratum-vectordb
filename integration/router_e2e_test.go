@@ -100,7 +100,10 @@ func TestRouter_ThreeNodeCluster(t *testing.T) {
 		t.Fatalf("CreateKnowledgeBase via router: %v", err)
 	}
 	kbID := kbResp.KnowledgeBaseId
-	v1 := kbResp.InitialVersionId
+	// A knowledge base no longer comes with a version
+	// (docs/cursor-persistence-plan.md §5): the root this test forks from is
+	// created on the leader.
+	v1 := seedRootVersion(t, leader.raftNode, ctx, kbID)
 
 	// === read via router: ListKnowledgeBases round-trips through the cluster ===
 	if err := waitListedViaRouter(ctx, kbViaRouter, kbID); err != nil {

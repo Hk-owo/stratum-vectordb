@@ -30,10 +30,13 @@ func TestIntegration_CreateVersionIdempotentRetry(t *testing.T) {
 		t.Fatalf("CreateKnowledgeBase failed: %v", err)
 	}
 	kbID := createResp.KnowledgeBaseId
+	// The parent the retried request names: a knowledge base no longer comes with a
+	// version, so the root is created here (docs/cursor-persistence-plan.md §5).
+	root := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	req := &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
-		ParentVersionId: 1,
+		ParentVersionId: root,
 		ClientRequestId: "retry-key-1",
 		Changes: []*pb.DocChange{
 			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-1", Content: "hello world"},

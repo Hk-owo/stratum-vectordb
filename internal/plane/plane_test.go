@@ -333,23 +333,6 @@ func TestLocalDataPlane_EnsureIndex_PullsUntilVerified(t *testing.T) {
 	}
 }
 
-func TestLocalDataPlane_EnsureIndex_InitialVersionPullsOnce(t *testing.T) {
-	puller := &stubPuller{}
-	dp := NewLocalDataPlane(LocalDataPlaneConfig{
-		IndexManager: &stubIndexStore{},
-		Puller:       puller,
-		Verify:       func(context.Context, string, int64) bool { return false },
-		Resolve:      func(context.Context, string, int64) (string, bool, error) { return "peer:7000", true, nil },
-	})
-
-	if err := dp.EnsureIndex(context.Background(), "kb-1", 1); err != nil {
-		t.Fatalf("EnsureIndex: %v", err)
-	}
-	if puller.calls != 1 {
-		t.Fatalf("puller calls = %d, want 1 (the initial version carries no data)", puller.calls)
-	}
-}
-
 func TestLocalDataPlane_EnsureIndex_ResolveErrorPropagates(t *testing.T) {
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
 		IndexManager: &stubIndexStore{},

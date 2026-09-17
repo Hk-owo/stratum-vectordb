@@ -3,23 +3,44 @@ package plane
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
+	stratuminternalsync "stratum/internal/sync"
 )
 
-// stubIndexReader returns fixed index bytes.
+// stubIndexReader returns fixed index bytes, and counts the calls: the §8.4(a)
+// pre-flight's whole point is that a fully-skipped distribution never reads the
+// file, so the count is the evidence for it.
 type stubIndexReader struct {
 	index   []byte
 	sidecar []byte
 	err     error
+
+	mu    sync.Mutex
+	reads int
 }
 
 func (r *stubIndexReader) ReadIndexFiles(string, int64) ([]byte, []byte, error) {
+	r.mu.Lock()
+	r.reads++
+	r.mu.Unlock()
 	if r.err != nil {
 		return nil, nil, r.err
 	}
 	return r.index, r.sidecar, nil
+}
+
+func (r *stubIndexReader) readCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reads
 }
 
 var _ IndexReader = (*stubIndexReader)(nil)
@@ -32,6 +53,14 @@ type stubIndexShipper struct {
 	targets  []string
 	versions []int64
 	fail     map[string]bool
+	// holds names the peers whose §8.4(a) probe answers "already held";
+	// probeErr names the ones whose probe fails; alreadyPresent names the ones
+	// whose SHIP answers "already held". probes records every target probed, so
+	// a test can tell a skip apart from a peer never asked.
+	holds          map[string]bool
+	probeErr       map[string]bool
+	alreadyPresent map[string]bool
+	probes         []string
 	// block, when non-nil, is received from inside PushIndex — the hook that
 	// holds a distribution open long enough for the ceiling to be observed.
 	block chan struct{}
@@ -39,6 +68,28 @@ type stubIndexShipper struct {
 	// mark, which is what the concurrency test asserts on.
 	inflight int
 	peak     int
+}
+
+func (s *stubIndexShipper) ProbeIndex(_ context.Context, targetAddr, _ string, _ int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.probes = append(s.probes, targetAddr)
+	if s.probeErr[targetAddr] {
+		return false, errors.New("probe unreachable")
+	}
+	return s.holds[targetAddr], nil
+}
+
+func (s *stubIndexShipper) probedTargets() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.probes...)
+}
+
+func (s *stubIndexShipper) shippedTargets() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.targets...)
 }
 
 func (s *stubIndexShipper) PushIndex(_ context.Context, targetAddr, _ string, versionID int64, _, _ []byte) error {
@@ -49,7 +100,7 @@ func (s *stubIndexShipper) PushIndex(_ context.Context, targetAddr, _ string, ve
 	}
 	s.targets = append(s.targets, targetAddr)
 	s.versions = append(s.versions, versionID)
-	block, fail := s.block, s.fail[targetAddr]
+	block, fail, already := s.block, s.fail[targetAddr], s.alreadyPresent[targetAddr]
 	s.mu.Unlock()
 
 	if block != nil {
@@ -60,7 +111,12 @@ func (s *stubIndexShipper) PushIndex(_ context.Context, targetAddr, _ string, ve
 	s.inflight--
 	s.mu.Unlock()
 
-	if fail {
+	switch {
+	case already:
+		// The ship opens with the same probe the pre-flight sent, so a peer can
+		// answer "already held" here too. It is a skip, not a failure.
+		return stratuminternalsync.ErrIndexAlreadyPresent
+	case fail:
 		return errors.New("replica unreachable")
 	}
 	return nil
@@ -88,6 +144,17 @@ func newIndexPlane(reader IndexReader, shipper IndexShipper, peers []string) *Lo
 // ceiling, so the concurrency tests do not have to reason about the default.
 // A non-positive limit takes the default, exactly as production does.
 func newIndexPlaneWithPushLimit(reader IndexReader, shipper IndexShipper, peers []string, limit int) *LocalDataPlane {
+	return newIndexPlaneFor(reader, shipper, peers, limit, nil)
+}
+
+// newIndexPlaneWithLogger is newIndexPlane with an observer attached: the
+// §8.4(a) skip is only worth having if it is reported, and reporting is what
+// these tests assert on.
+func newIndexPlaneWithLogger(reader IndexReader, shipper IndexShipper, peers []string, logger *zap.Logger) *LocalDataPlane {
+	return newIndexPlaneFor(reader, shipper, peers, 0, logger)
+}
+
+func newIndexPlaneFor(reader IndexReader, shipper IndexShipper, peers []string, limit int, logger *zap.Logger) *LocalDataPlane {
 	tr := &tracer{}
 	return NewLocalDataPlane(LocalDataPlaneConfig{
 		IndexManager:           &stubIndexStore{},
@@ -96,6 +163,7 @@ func newIndexPlaneWithPushLimit(reader IndexReader, shipper IndexShipper, peers 
 		IndexReader:            reader,
 		IndexShipper:           shipper,
 		MaxConcurrentIndexPush: limit,
+		Logger:                 logger,
 		ResolveReplicas: func(context.Context) ([]string, error) {
 			return peers, nil
 		},
@@ -234,6 +302,173 @@ func TestLocalDataPlane_PushIndexToReplicasHonoursContextWhileQueued(t *testing.
 
 	close(block)
 	<-holding
+}
+
+// §8.4(a): a peer that already holds the artifact is dropped at the probe, and
+// the peers that do NOT hold it are still served — the pre-flight narrows the
+// fan-out, it does not replace it.
+func TestLocalDataPlane_PushIndexToReplicasSkipsPeersThatHoldTheArtifact(t *testing.T) {
+	shipper := &stubIndexShipper{holds: map[string]bool{"peer-a": true}}
+	reader := &stubIndexReader{index: []byte("idx"), sidecar: []byte("side")}
+	dp := newIndexPlane(reader, shipper, []string{"peer-a", "peer-b", "peer-c"})
+
+	if err := dp.PushIndexToReplicas(context.Background(), "kb-1", 7); err != nil {
+		t.Fatalf("PushIndexToReplicas: %v", err)
+	}
+	if got := shipper.probedTargets(); !reflect.DeepEqual(got, []string{"peer-a", "peer-b", "peer-c"}) {
+		t.Errorf("probed %v, want every candidate", got)
+	}
+	if got := shipper.shippedTargets(); !reflect.DeepEqual(got, []string{"peer-b", "peer-c"}) {
+		t.Errorf("shipped to %v, want only the peers that did not hold it", got)
+	}
+	if got := reader.readCount(); got != 1 {
+		t.Errorf("read the index %d times, want 1: something still had to be shipped", got)
+	}
+}
+
+// Every candidate already holds it: neither the read nor the fan-out may
+// happen, because that is where the memory peak and the outbound bytes were.
+func TestLocalDataPlane_PushIndexToReplicasReadsNothingWhenEveryPeerHoldsIt(t *testing.T) {
+	shipper := &stubIndexShipper{holds: map[string]bool{"peer-a": true, "peer-b": true}}
+	reader := &stubIndexReader{index: []byte("idx"), sidecar: []byte("side")}
+	dp := newIndexPlane(reader, shipper, []string{"peer-a", "peer-b"})
+
+	if err := dp.PushIndexToReplicas(context.Background(), "kb-1", 7); err != nil {
+		t.Fatalf("PushIndexToReplicas: %v", err)
+	}
+	if got := reader.readCount(); got != 0 {
+		t.Errorf("read the index %d times, want 0: every peer already had it", got)
+	}
+	if got := shipper.shippedTargets(); len(got) != 0 {
+		t.Errorf("shipped to %v, want nobody", got)
+	}
+	if got := shipper.peakSeen(); got != 0 {
+		t.Errorf("opened %d distributions, want 0", got)
+	}
+}
+
+// A probe that cannot be answered must NOT become a skip: not knowing is not
+// the same as knowing the peer has it, and guessing that way would leave the
+// replica to build for itself while the log called it an optimisation.
+func TestLocalDataPlane_PushIndexToReplicasShipsWhenTheProbeFails(t *testing.T) {
+	logger, logs := testIndexLogger()
+	shipper := &stubIndexShipper{probeErr: map[string]bool{"peer-a": true}}
+	dp := newIndexPlaneWithLogger(
+		&stubIndexReader{index: []byte("idx"), sidecar: []byte("side")}, shipper,
+		[]string{"peer-a"}, logger)
+
+	if err := dp.PushIndexToReplicas(context.Background(), "kb-1", 7); err != nil {
+		t.Fatalf("PushIndexToReplicas: %v", err)
+	}
+	if got := shipper.shippedTargets(); !reflect.DeepEqual(got, []string{"peer-a"}) {
+		t.Errorf("shipped to %v, want the peer whose probe failed", got)
+	}
+	if got := countMessages(logs, "plane: index presence probe failed; shipping anyway"); got != 1 {
+		t.Errorf("saw %d probe-failure reports, want 1", got)
+	}
+}
+
+// The skip is invisible without the report, and a skip is not a failure: the
+// log has to say how many replicas were spared and warn about none of them.
+func TestLocalDataPlane_PushIndexToReplicasReportsSkipsAsSkips(t *testing.T) {
+	logger, logs := testIndexLogger()
+	shipper := &stubIndexShipper{holds: map[string]bool{"peer-a": true}}
+	dp := newIndexPlaneWithLogger(
+		&stubIndexReader{index: []byte("idx"), sidecar: []byte("side")}, shipper,
+		[]string{"peer-a", "peer-b"}, logger)
+
+	if err := dp.PushIndexToReplicas(context.Background(), "kb-1", 7); err != nil {
+		t.Fatalf("PushIndexToReplicas: %v", err)
+	}
+	for _, entry := range logs.All() {
+		if entry.Level >= zapcore.WarnLevel {
+			t.Errorf("%s warned: %s", entry.Level, entry.Message)
+		}
+	}
+	entry, ok := findMessage(logs, "plane: index distribution skipped replicas that already hold the artifact")
+	if !ok {
+		t.Fatal("no skip report; the optimisation is invisible without it")
+	}
+	if got := entry.ContextMap()["skipped"]; got != int64(1) {
+		t.Errorf("skipped = %v, want 1", got)
+	}
+}
+
+// One skip, one failure, one success: each path is counted where it belongs,
+// rather than collapsing into "the distribution had problems".
+func TestLocalDataPlane_PushIndexToReplicasSeparatesSkipFromFailure(t *testing.T) {
+	logger, logs := testIndexLogger()
+	shipper := &stubIndexShipper{
+		holds: map[string]bool{"peer-a": true},
+		fail:  map[string]bool{"peer-b": true},
+	}
+	dp := newIndexPlaneWithLogger(
+		&stubIndexReader{index: []byte("idx"), sidecar: []byte("side")}, shipper,
+		[]string{"peer-a", "peer-b", "peer-c"}, logger)
+
+	if err := dp.PushIndexToReplicas(context.Background(), "kb-1", 7); err != nil {
+		t.Fatalf("a per-replica failure must not fail the distribution: %v", err)
+	}
+	if got := shipper.shippedTargets(); !reflect.DeepEqual(got, []string{"peer-b", "peer-c"}) {
+		t.Errorf("shipped to %v, want the two that had to be served", got)
+	}
+	if got := countMessages(logs, "plane: index distribution failed; that replica will build its own"); got != 1 {
+		t.Errorf("saw %d failure warnings, want 1 (peer-b)", got)
+	}
+	if got := countMessages(logs, "plane: index distribution skipped replicas that already hold the artifact"); got != 1 {
+		t.Errorf("saw %d skip reports, want 1", got)
+	}
+}
+
+// A peer can also answer "already held" at the SHIP's own first frame, which is
+// the same probe arriving in between the pre-flight and the transfer. That
+// answer is the same skip, not a failure.
+func TestLocalDataPlane_PushIndexToReplicasCountsAnInStreamSkipAsASkip(t *testing.T) {
+	logger, logs := testIndexLogger()
+	shipper := &stubIndexShipper{alreadyPresent: map[string]bool{"peer-a": true}}
+	dp := newIndexPlaneWithLogger(
+		&stubIndexReader{index: []byte("idx"), sidecar: []byte("side")}, shipper,
+		[]string{"peer-a", "peer-b"}, logger)
+
+	if err := dp.PushIndexToReplicas(context.Background(), "kb-1", 7); err != nil {
+		t.Fatalf("PushIndexToReplicas: %v", err)
+	}
+	if got := countMessages(logs, "plane: index distribution failed; that replica will build its own"); got != 0 {
+		t.Errorf("saw %d failure warnings for an in-stream skip, want 0", got)
+	}
+	entry, ok := findMessage(logs, "plane: index distribution skipped replicas that already hold the artifact")
+	if !ok {
+		t.Fatal("no skip report for an in-stream skip")
+	}
+	if got := entry.ContextMap()["skipped"]; got != int64(1) {
+		t.Errorf("skipped = %v, want 1", got)
+	}
+}
+
+// testIndexLogger returns a logger that records what was written, so the
+// §8.4(a) report can be asserted on instead of merely hoped for.
+func testIndexLogger() (*zap.Logger, *observer.ObservedLogs) {
+	core, logs := observer.New(zap.DebugLevel)
+	return zap.New(core), logs
+}
+
+func countMessages(logs *observer.ObservedLogs, message string) int {
+	n := 0
+	for _, entry := range logs.All() {
+		if entry.Message == message {
+			n++
+		}
+	}
+	return n
+}
+
+func findMessage(logs *observer.ObservedLogs, message string) (observer.LoggedEntry, bool) {
+	for _, entry := range logs.All() {
+		if entry.Message == message {
+			return entry, true
+		}
+	}
+	return observer.LoggedEntry{}, false
 }
 
 // waitForInflight blocks until want distributions are inside the stub's

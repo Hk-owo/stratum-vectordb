@@ -80,6 +80,11 @@ type VersionPusher interface {
 // (DataSyncService.PushIndexData). *sync.IndexPusher implements it.
 type IndexShipper interface {
 	PushIndex(ctx context.Context, targetAddr, kbID string, versionID int64, indexData, sidecarData []byte) error
+	// ProbeIndex asks a peer whether it already holds (kbID, versionID)'s
+	// artifact, WITHOUT shipping it, so the caller can drop that peer before
+	// reading the file it would have shipped (§8.4(a)). A peer that cannot
+	// answer is reported as an error and the caller ships to it anyway.
+	ProbeIndex(ctx context.Context, targetAddr, kbID string, versionID int64) (bool, error)
 }
 
 // IndexReader reads a version's persisted index files from this node's disk.
@@ -94,7 +99,7 @@ type IndexReader interface {
 // replica records it, so a later reader knows where the data is instead of
 // having to ask the leader. *sync.ConfirmBroadcaster implements it.
 type WriteConfirmer interface {
-	ConfirmVersionWrite(ctx context.Context, peerAddr, kbID string, versionID int64, sourceAddr string, empty bool) error
+	ConfirmVersionWrite(ctx context.Context, peerAddr, kbID string, versionID int64, sourceAddr string) error
 }
 
 // VersionPresenceQuerier asks a peer whether it holds a version's data
@@ -173,6 +178,7 @@ type LocalDataPlane struct {
 	verify          DataVerifier
 	resolve         SourceResolver
 	wal             TransactionWAL
+	cursorWAL       CursorStore
 	executor        VersionWriteExecutor
 	control         ControlPlane
 	pusher          VersionPusher
@@ -234,6 +240,22 @@ type LocalDataPlane struct {
 	handledAbove   map[string]map[int64]struct{}
 	announcedAbove map[string]map[int64]struct{}
 
+	// cursorMu guards cursorPending and cursorFlushing: the queue of cursor
+	// values waiting to be persisted, and the flag saying a flusher goroutine
+	// is already draining it.
+	//
+	// The queue exists because versionMu must never be held across IO. Every
+	// read path (EnsureIndex, announce, prune, a peer's cursor query) takes that
+	// lock, so an fsync inside it would stall all of them behind the disk. The
+	// value handed over here is read UNDER versionMu and queued outside it,
+	// which is what keeps the lock's critical section free of IO.
+	//
+	// Only the HIGHEST pending value per knowledge base is kept: the cursor is a
+	// scalar, so an intermediate value carries nothing the newer one does not.
+	cursorMu       sync.Mutex
+	cursorPending  map[string]int64
+	cursorFlushing bool
+
 	// takeoverMu guards pendingTakeovers: the §7.3 timers this node started
 	// for versions it received via fan-out, keyed like the failure counters.
 	takeoverMu       sync.Mutex
@@ -263,6 +285,11 @@ type LocalDataPlaneConfig struct {
 	SelfDataSyncAddr string
 	// WAL frames the storage layer's write transaction (WriteVersionData).
 	WAL TransactionWAL
+	// CursorWAL persists this node's contiguous data cursor, so a restart reads
+	// it back instead of inferring it from disk facts (docs/cursor-persistence-plan.md
+	// §3). Optional: without it the cursor stays in memory and startup falls back
+	// to the inference below, exactly as before.
+	CursorWAL CursorStore
 	// Executor performs the per-version storage writes inside that
 	// transaction.
 	Executor VersionWriteExecutor
@@ -345,6 +372,7 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		verify:           cfg.Verify,
 		resolve:          cfg.Resolve,
 		wal:              cfg.WAL,
+		cursorWAL:        cfg.CursorWAL,
 		executor:         cfg.Executor,
 		control:          cfg.Control,
 		pusher:           cfg.Pusher,
@@ -365,6 +393,7 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		handledAbove:     make(map[string]map[int64]struct{}),
 		announcedAbove:   make(map[string]map[int64]struct{}),
 		pendingTakeovers: make(map[string]*takeoverWatch),
+		cursorPending:    make(map[string]int64),
 	}
 }
 
@@ -411,23 +440,6 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 	// completeness" would stop holding.
 	if err := d.backfillTo(ctx, addr, kbID, versionID); err != nil {
 		return err
-	}
-
-	if versionID <= 1 {
-		// Version 1: created together with the knowledge base and carrying no
-		// document changes, so no digest is ever committed for it. Pull once (a
-		// no-op stream) and done.
-		//
-		// This is only the FAST PATH for the case where the id really is 1.
-		// Version ids increase globally, so a knowledge base created later gets
-		// an initial version numbered far above 1 — that one is caught by the
-		// empty-version check inside the pull loop below, which is what makes
-		// "a new knowledge base's first query" work at all.
-		if err := d.puller.PullVersion(ctx, addr, kbID, versionID); err != nil {
-			return err
-		}
-		d.advanceLocalVersion(kbID, versionID)
-		return nil
 	}
 
 	// Pull with digest verification, retrying until the data is complete. The
@@ -566,8 +578,8 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 // for the future, not a retroactive correction.
 func (d *LocalDataPlane) advanceLocalVersion(kbID string, versionID int64) {
 	d.versionMu.Lock()
-	defer d.versionMu.Unlock()
 	if versionID <= d.localVersion[kbID] {
+		d.versionMu.Unlock()
 		return
 	}
 	handled := d.handledAbove[kbID]
@@ -577,6 +589,20 @@ func (d *LocalDataPlane) advanceLocalVersion(kbID string, versionID int64) {
 	}
 	handled[versionID] = struct{}{}
 	d.advanceCursorLocked(kbID)
+	cursor := d.localVersion[kbID]
+	d.versionMu.Unlock()
+
+	// Data first, cursor second — the invariant the whole record depends on. It
+	// is enforced HERE, on the single path every advance goes through, rather
+	// than at the call sites: there are a dozen of them (write, pull, push,
+	// backfill, drop, full-state transfer), and one forgetting the order would
+	// let a restarted node claim history it does not hold.
+	//
+	// The value queued is the cursor AFTER the step, not versionID: the cursor
+	// only moves over a contiguous run, so after an advance it may have stepped
+	// over several versions at once — and that boundary is the thing worth
+	// recording.
+	d.persistCursor(kbID, cursor)
 }
 
 // AnnounceVersion records that the control layer says versionID exists. It is the
@@ -658,7 +684,6 @@ func (d *LocalDataPlane) lowestAboveLocked(kbID string) (int64, bool) {
 // pending sets once per version.
 func (d *LocalDataPlane) markVersionsHandled(kbID string, from, to int64) {
 	d.versionMu.Lock()
-	defer d.versionMu.Unlock()
 	handled := d.handledAbove[kbID]
 	if handled == nil {
 		handled = make(map[int64]struct{})
@@ -670,6 +695,9 @@ func (d *LocalDataPlane) markVersionsHandled(kbID string, from, to int64) {
 		}
 	}
 	d.advanceCursorLocked(kbID)
+	cursor := d.localVersion[kbID]
+	d.versionMu.Unlock()
+	d.persistCursor(kbID, cursor)
 }
 
 // MarkVersionContiguous implements sync.LocalVersionAdvancer: a version whose
@@ -697,6 +725,127 @@ func (d *LocalDataPlane) localVersionOf(kbID string) int64 {
 	d.versionMu.RLock()
 	defer d.versionMu.RUnlock()
 	return d.localVersion[kbID]
+}
+
+// cursorWriteTimeout bounds ONE cursor record's write. The write is a local
+// append plus fsync, so this is generous; it exists so a stuck disk can never
+// pin the flusher goroutine forever — the value stays queued either way.
+const cursorWriteTimeout = 5 * time.Second
+
+// cursorRetryDelay is how long flushCursors waits before retrying a batch it
+// could not write. It only ever applies to a FAILED batch — the happy path never
+// reaches it — and it exists for the same reason the failed value is re-queued at
+// all: without a delay, re-queueing spins the flusher at disk-error speed, one
+// repeated warning per fsync attempt, for as long as the disk misbehaves.
+const cursorRetryDelay = time.Second
+
+// persistCursor queues a cursor value for persistence. It never blocks and never
+// touches the disk itself: the callers are the write path (§7.7) and the Raft
+// apply path (via onVersionCreated), and IO there would stall everything behind
+// it.
+//
+// Merging is per knowledge base and keeps only the highest pending value,
+// because the cursor is a scalar: an intermediate value says nothing the newer
+// one does not, so a burst of advances costs ONE record.
+func (d *LocalDataPlane) persistCursor(kbID string, versionID int64) {
+	if d.cursorWAL == nil || versionID <= 0 {
+		return
+	}
+	d.cursorMu.Lock()
+	if versionID > d.cursorPending[kbID] {
+		d.cursorPending[kbID] = versionID
+	}
+	if d.cursorFlushing {
+		d.cursorMu.Unlock()
+		return
+	}
+	d.cursorFlushing = true
+	d.cursorMu.Unlock()
+	go d.flushCursors()
+}
+
+// flushCursors drains the queue, one knowledge base at a time, on its own
+// goroutine. Exactly one flusher runs at a time (cursorFlushing), so the records
+// for one knowledge base are written in the order they were queued.
+//
+// A failed write is logged and its value goes back in the queue, AFTER a delay
+// (cursorRetryDelay). Both halves matter, and they pull in opposite directions:
+// dropping the value would leave the cursor unpersisted until some later advance
+// happened to come along, while re-queueing it with no delay turns a disk outage
+// into a hot loop — the same warning at fsync speed for as long as the outage
+// lasts.
+//
+// The in-memory cursor is deliberately NOT rolled back. Rolling it back would
+// make this node re-fetch data it has already served — and the lagging record is
+// safe by construction: it can only understate the cursor, so a restart backfills
+// a little more than it strictly must. Only the CRASHED state is low, never the
+// running one.
+func (d *LocalDataPlane) flushCursors() {
+	for {
+		d.cursorMu.Lock()
+		pending := d.cursorPending
+		d.cursorPending = make(map[string]int64)
+		if len(pending) == 0 {
+			d.cursorFlushing = false
+			d.cursorMu.Unlock()
+			return
+		}
+		d.cursorMu.Unlock()
+
+		var failed bool
+		for kbID, versionID := range pending {
+			ctx, cancel := context.WithTimeout(context.Background(), cursorWriteTimeout)
+			err := d.cursorWAL.WriteCursor(ctx, kbID, versionID)
+			cancel()
+			if err == nil {
+				continue
+			}
+			failed = true
+			d.logger.Warn("plane: persisting the data cursor failed; it will be retried, and the record lags the data meanwhile",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			d.cursorMu.Lock()
+			if versionID > d.cursorPending[kbID] {
+				// Nothing newer superseded this value while the write was in
+				// flight, so it goes back in the queue — it must not be dropped,
+				// because another advance is not guaranteed to come and the
+				// record is the only thing a restart reads.
+				d.cursorPending[kbID] = versionID
+			}
+			d.cursorMu.Unlock()
+		}
+		if failed {
+			// Back off rather than spin, once per batch rather than per record.
+			// An advance arriving during the sleep is not lost: it lands in
+			// cursorPending (cursorFlushing still reports a flusher running) and
+			// the next pass of this loop picks it up.
+			time.Sleep(cursorRetryDelay)
+		}
+	}
+}
+
+// persistedCursors reads back the cursors this node recorded. A plane assembled
+// without a cursor store answers "nothing persisted", which is exactly what the
+// inference fallback needs to see.
+func (d *LocalDataPlane) persistedCursors(ctx context.Context) (map[string]int64, error) {
+	if d.cursorWAL == nil {
+		return nil, nil
+	}
+	return d.cursorWAL.RecoverCursors(ctx)
+}
+
+// installPersistedCursor installs a cursor read back from the WAL.
+//
+// It deliberately does NOT go through advanceLocalVersion: that path exists to
+// PERSIST the value, and this value came from the log — writing it again would
+// be a redundant fsync on every startup. Monotone for the same reason the cursor
+// is: memory may already have moved past the record (a write that landed before
+// this ran), and moving back would forget versions this node holds.
+func (d *LocalDataPlane) installPersistedCursor(kbID string, versionID int64) {
+	d.versionMu.Lock()
+	defer d.versionMu.Unlock()
+	if versionID > d.localVersion[kbID] {
+		d.localVersion[kbID] = versionID
+	}
 }
 
 // DataVersionsSnapshot returns a copy of every knowledge base's contiguous
@@ -990,7 +1139,7 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 	// learn it exists — and their cursors would stay behind it, which the
 	// station reads as "stale" (§9.3(2)).
 	stepStart = time.Now()
-	d.broadcastConfirmation(kbID, versionID, len(docIDs) == 0)
+	d.broadcastConfirmation(kbID, versionID)
 	tConfirm = time.Since(stepStart)
 	return nil
 }
@@ -1015,6 +1164,58 @@ func (d *LocalDataPlane) PushIndexToReplicas(ctx context.Context, kbID string, v
 	if d.indexReader == nil || d.indexShipper == nil || d.resolveReplicas == nil {
 		return nil // distribution not wired; each replica builds its own
 	}
+	peers, err := d.resolveReplicas(ctx)
+	if err != nil {
+		return fmt.Errorf("plane: PushIndexToReplicas: resolve replicas: %w", err)
+	}
+
+	// §8.4(a) probe before the read. The probe needs only the ids, while the read
+	// is where the memory peaks (tens of megabytes held in the builder for as long
+	// as the fan-out runs), so asking first turns "everyone already has it" — the
+	// multi-builder round-robin this exists for — into N small RTTs: no read, no
+	// distribution slot, no outbound bytes.
+	//
+	// The probes deliberately sit OUTSIDE indexPushSem. That gate means "one
+	// whole-file read plus its fan-out"; a probe queued behind one would lose
+	// exactly the head start it is here to win. A peer that cannot answer counts
+	// as "ship it": not knowing is not the same as knowing it is absent.
+	needed := make([]string, 0, len(peers))
+	var skipped int
+	for _, peer := range peers {
+		probeCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		held, probeErr := d.indexShipper.ProbeIndex(probeCtx, peer, kbID, versionID)
+		cancel()
+		switch {
+		case probeErr != nil:
+			d.logger.Debug("plane: index presence probe failed; shipping anyway",
+				zap.String("peer", peer), zap.String("kb_id", kbID),
+				zap.Int64("version_id", versionID), zap.Error(probeErr))
+			needed = append(needed, peer)
+		case held:
+			skipped++
+		default:
+			needed = append(needed, peer)
+		}
+	}
+
+	// The ship that follows probes too — PushIndex opens with the same frame — so
+	// a peer can still answer "already held" between the two checks. Both feed the
+	// same tally: the line below is about how much distribution the probe saved,
+	// not about which of the two noticed. It is a deferred report because the
+	// count is only final once the fan-out has finished.
+	defer func() {
+		if skipped > 0 {
+			d.logger.Info("plane: index distribution skipped replicas that already hold the artifact",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("skipped", skipped))
+		}
+	}()
+
+	if len(needed) == 0 {
+		// Every candidate already holds the artifact: the read and the fan-out are
+		// both unnecessary, so neither happens.
+		return nil
+	}
+
 	// Acquire before the read, not before the ship: the read is what makes the
 	// memory peak, so it has to be inside the gate. Honouring ctx matters as much
 	// as the bound — the callers are background goroutines (the build callback in
@@ -1032,12 +1233,16 @@ func (d *LocalDataPlane) PushIndexToReplicas(ctx context.Context, kbID string, v
 	if err != nil {
 		return fmt.Errorf("plane: PushIndexToReplicas(%s v%d): read local index: %w", kbID, versionID, err)
 	}
-	peers, err := d.resolveReplicas(ctx)
-	if err != nil {
-		return fmt.Errorf("plane: PushIndexToReplicas: resolve replicas: %w", err)
-	}
-	for _, peer := range peers {
-		if err := d.indexShipper.PushIndex(ctx, peer, kbID, versionID, indexData, sidecarData); err != nil {
+	for _, peer := range needed {
+		err := d.indexShipper.PushIndex(ctx, peer, kbID, versionID, indexData, sidecarData)
+		switch {
+		case err == nil:
+		case errors.Is(err, stratinternalsync.ErrIndexAlreadyPresent):
+			// The peer answered the in-stream probe with "already held". No bytes
+			// moved for it, and the read above could not know that in advance
+			// because the other peers did need the ship.
+			skipped++
+		default:
 			d.logger.Warn("plane: index distribution failed; that replica will build its own",
 				zap.String("peer", peer), zap.String("kb_id", kbID),
 				zap.Int64("version_id", versionID), zap.Error(err))
@@ -1119,7 +1324,7 @@ var (
 // quorum ever formed, the version's digest was never committed, and a returning
 // node could not tell that version from an empty one — it advances over an empty
 // version without fetching anything, so the miss reads as a successful catch-up.
-func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64, empty bool) {
+func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64) {
 	if d.confirmer == nil || d.resolveReplicas == nil {
 		return
 	}
@@ -1134,7 +1339,7 @@ func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64, emp
 			return
 		}
 		for _, peer := range peers {
-			d.confirmPeer(ctx, peer, kbID, versionID, empty)
+			d.confirmPeer(ctx, peer, kbID, versionID)
 		}
 	}()
 }
@@ -1145,7 +1350,7 @@ func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64, emp
 // A context per attempt (rather than one for the whole peer) is what makes the
 // retry mean anything: a single unreachable address should cost one attempt's
 // deadline, not the peer's entire budget.
-func (d *LocalDataPlane) confirmPeer(ctx context.Context, peer, kbID string, versionID int64, empty bool) {
+func (d *LocalDataPlane) confirmPeer(ctx context.Context, peer, kbID string, versionID int64) {
 	var lastErr error
 	for attempt := 1; attempt <= confirmAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -1156,11 +1361,7 @@ func (d *LocalDataPlane) confirmPeer(ctx context.Context, peer, kbID string, ver
 		// The confirmation doubles as the §8.5 announcement: it carries this
 		// node's own address so the peer records where the version's data is
 		// (see DataSourceRegistry). An empty address means "announce nothing".
-		//
-		// empty tells the peer the version has no documents, so it can move its
-		// own cursor over it without fetching anything — the only cue such a
-		// version produces, since it is never fanned out.
-		err := d.confirmer.ConfirmVersionWrite(attemptCtx, peer, kbID, versionID, d.selfDataSyncAddr, empty)
+		err := d.confirmer.ConfirmVersionWrite(attemptCtx, peer, kbID, versionID, d.selfDataSyncAddr)
 		cancel()
 		if err == nil {
 			if attempt > 1 {
@@ -1584,6 +1785,20 @@ type TransactionWAL interface {
 	WriteCommit(ctx context.Context, versionID int64) error
 }
 
+// CursorStore persists this node's contiguous data cursor per knowledge base,
+// so a restart reads the local fact back instead of inferring it from disk
+// (Stratum_设计文档v13.md §7.8; docs/cursor-persistence-plan.md §3). *wal.FileWAL
+// satisfies it. Deliberately narrow — two calls, not the whole log surface —
+// so the plane stays independent of the WAL's transaction and recovery halves.
+type CursorStore interface {
+	// WriteCursor records that this node's contiguous history for kbID has
+	// reached versionID. Monotone; a lower value is a no-op.
+	WriteCursor(ctx context.Context, kbID string, versionID int64) error
+	// RecoverCursors returns every cursor this node recorded. A knowledge base
+	// absent from the map has no record, which is not the same as cursor 0.
+	RecoverCursors(ctx context.Context) (map[string]int64, error)
+}
+
 // VersionWriteExecutor performs one version's storage-layer writes: split,
 // embed, chunk/docstore/versiondoc writes and the version document bloom. It
 // deliberately does NOT frame the WAL transaction (BEGIN/COMMIT) — that
@@ -1629,6 +1844,17 @@ func (d *LocalDataPlane) EnforceRetention(ctx context.Context, meta MetadataList
 //
 // A var so tests can shorten it.
 var takeoverTimeout = 200 * time.Millisecond
+
+// takeoverCheckTimeout bounds the whole quorum check attemptTakeover runs once
+// the timer fires.
+//
+// It is deliberately NOT derived from takeoverTimeout. That one is a test-tunable
+// knob, and this bound is read from the timer's own goroutine — deriving one from
+// the other would make a test that shortens the knob race with a previous test's
+// still-running check on the same variable (measured with -race). It is also the
+// honest number: the check is a handful of small RPCs, not something whose budget
+// should shrink to tens of milliseconds because a test wanted a prompt timer.
+const takeoverCheckTimeout = 2 * time.Second
 
 // takeoverWatch is one pending §7.3 timer.
 type takeoverWatch struct {
@@ -1690,7 +1916,7 @@ func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64) {
 
 	// A fresh context: the request that delivered the data is long gone by
 	// now, and the announcement is this node's own business.
-	ctx, cancel := context.WithTimeout(context.Background(), takeoverTimeout*10)
+	ctx, cancel := context.WithTimeout(context.Background(), takeoverCheckTimeout)
 	defer cancel()
 
 	peers, err := d.resolveReplicas(ctx)
@@ -1842,12 +2068,36 @@ func (d *LocalDataPlane) RecoverLocalCursors(ctx context.Context, meta MetadataL
 	if meta == nil {
 		return nil
 	}
+	// The persisted record comes FIRST (docs/cursor-persistence-plan.md §3.5).
+	// It is a direct statement of the local fact, so a knowledge base that has
+	// one needs no inference — and the inference below is exactly what the record
+	// exists to replace: it reads an index artifact off this node's disk, and an
+	// artifact is a CACHE the retention policy may have deleted. Judging "what I
+	// hold" from a cache is what let a node holding v1..v10 report a cursor of 0
+	// after a restart.
+	persisted, err := d.persistedCursors(ctx)
+	if err != nil {
+		d.logger.Warn("plane: cursor recovery: reading the persisted cursors failed; inferring instead",
+			zap.Error(err))
+	}
+
 	kbs, err := meta.ListKnowledgeBases(ctx)
 	if err != nil {
 		return fmt.Errorf("plane: RecoverLocalCursors: list knowledge bases: %w", err)
 	}
 
 	for _, kb := range kbs {
+		if versionID, ok := persisted[kb.KBID]; ok {
+			d.installPersistedCursor(kb.KBID, versionID)
+			// Logged even when it changed nothing, and worded so it cannot be
+			// mistaken for the inference below: "read the record back" and
+			// "reconstructed from what the disk still held" are different facts,
+			// and an operator looking at a low cursor needs to know which one.
+			d.logger.Info("plane: cursor recovery: read the persisted data cursor back",
+				zap.String("kb_id", kb.KBID), zap.Int64("version_id", versionID))
+			continue
+		}
+
 		versions, err := meta.ListVersions(ctx, kb.KBID)
 		if err != nil {
 			d.logger.Warn("plane: cursor recovery: ListVersions failed",
@@ -1886,6 +2136,13 @@ func (d *LocalDataPlane) RecoverLocalCursors(ctx context.Context, meta MetadataL
 // holdsVersionLocally reports whether this node holds the version's data —
 // judged only by facts about this node and the version's own metadata — and
 // says why, so the startup log shows an operator which version broke the chain.
+//
+// Deprecated: this is the FALLBACK, reached only for a knowledge base that has
+// no persisted cursor record — an older WAL, or one this node has not advanced
+// since the record type existed (docs/cursor-persistence-plan.md §3.5). Every
+// knowledge base with a record is answered by that record instead, which is the
+// only evidence here that is not a cache: both branches below bottom out in an
+// index artifact, which the retention policy is free to delete.
 //
 // The order matters, and the artifact is consulted first: of the three facts it
 // is the only one backed by a completed build, so no inference is involved. The
@@ -1931,6 +2188,10 @@ func (d *LocalDataPlane) holdsVersionLocally(ctx context.Context, kbID string, v
 
 // hasLocalArtifact reports whether this node holds the version's artifact on
 // disk. A missing index store means "no".
+//
+// Deprecated: only the holdsVersionLocally fallback calls this. An artifact is a
+// cache, not a source of truth about what this node holds — the persisted cursor
+// record is (docs/cursor-persistence-plan.md §4.1).
 func (d *LocalDataPlane) hasLocalArtifact(ctx context.Context, kbID string, versionID int64) bool {
 	if d.indexMgr == nil {
 		return false

@@ -989,8 +989,16 @@ type CreateKnowledgeBaseResponse struct {
 	sizeCache     protoimpl.SizeCache
 	unknownFields protoimpl.UnknownFields
 
-	KnowledgeBaseId  string `protobuf:"bytes,1,opt,name=knowledge_base_id,json=knowledgeBaseId,proto3" json:"knowledge_base_id,omitempty"`
-	InitialVersionId int64  `protobuf:"varint,2,opt,name=initial_version_id,json=initialVersionId,proto3" json:"initial_version_id,omitempty"`
+	KnowledgeBaseId string `protobuf:"bytes,1,opt,name=knowledge_base_id,json=knowledgeBaseId,proto3" json:"knowledge_base_id,omitempty"`
+	// initial_version_id is always 0: creating a knowledge base no longer creates
+	// a version (docs/cursor-persistence-plan.md §5). A version's document set is
+	// inherited from its parent, so a version created with an empty changes list
+	// would mean "unchanged", not "empty" — and the two were only ever the same
+	// thing at the root of a chain. A first version now appears when something is
+	// written; until then the knowledge base is empty and stays queryable. The
+	// field is kept so existing clients keep compiling; treat 0 as "no version
+	// yet" rather than as a valid id.
+	InitialVersionId int64 `protobuf:"varint,2,opt,name=initial_version_id,json=initialVersionId,proto3" json:"initial_version_id,omitempty"`
 }
 
 func (x *CreateKnowledgeBaseResponse) Reset() {

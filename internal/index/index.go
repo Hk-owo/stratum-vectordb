@@ -88,7 +88,18 @@ type IndexManager interface {
 	// filesystem, so it answers correctly even right after a vecstore
 	// restart. This is the authoritative "is this version's index built
 	// and durable" fact that the startup reconcile derives READY status
-	// from.
+	// from, and — through IndexManagerImpl.HasIndex — the answer §8.4(a)'s
+	// distribution probe ships on.
+	//
+	// Do NOT delete it because "holding a version must not be judged from an
+	// artifact" (docs/cursor-persistence-plan.md §4). That rule is about the
+	// CURSOR, and it is right there: an artifact is a cache the retention policy
+	// may delete, so it cannot answer "does this node hold the version". The
+	// distribution probe asks a different question in the same words — "is this
+	// file on your disk" — and for it the artifact IS the answer, because a file
+	// that is not there is a file that has to be re-sent. Removing this method
+	// removes the probe's only way to ask, and the failure mode is silent:
+	// distribution falls back to shipping everything, with no error.
 	IndexExists(ctx context.Context, kbID string, versionID int64) (bool, error)
 
 	// Evict removes a single version's index from memory (if loaded; a

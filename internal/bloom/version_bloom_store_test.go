@@ -58,9 +58,14 @@ func TestVersionBloomStore(t *testing.T) {
 		}
 	})
 
-	t.Run("BuildAndPersist then Get hits cache/disk", func(t *testing.T) {
+	t.Run("BuildAndPersist then Get reuses the disk copy", func(t *testing.T) {
 		dir := t.TempDir()
-		s := NewVersionBloomStore(dir, 1000, 0.01, vdl)
+		// The source has to agree with what was persisted. The filter is DERIVED data:
+		// a disk copy is reused only while the version's document set still matches it
+		// (see GetForDocuments), so a source that disagrees is the "stale copy" case,
+		// covered by TestVersionBloomStore_StaleFilterIsRebuilt.
+		src := &mockVdl{docs: map[int64][]string{5: {"x", "y"}}}
+		s := NewVersionBloomStore(dir, 1000, 0.01, src)
 		f, err := s.BuildAndPersist("kb-1", 5, []string{"x", "y"})
 		if err != nil {
 			t.Fatalf("BuildAndPersist: %v", err)
@@ -69,17 +74,97 @@ func TestVersionBloomStore(t *testing.T) {
 			t.Fatalf("built filter must contain x")
 		}
 
-		// New store over the same dir: Get must return a filter containing
-		// x and y (loaded from disk — the source mock has no version 5).
-		s2 := NewVersionBloomStore(dir, 1000, 0.01, vdl)
+		// New store over the same dir: Get must return a filter containing x and y.
+		s2 := NewVersionBloomStore(dir, 1000, 0.01, src)
 		f2, err := s2.Get(ctx, "kb-1", 5)
 		if err != nil {
-			t.Fatalf("Get from disk: %v", err)
+			t.Fatalf("Get after a restart: %v", err)
 		}
 		if !f2.Test("x") || !f2.Test("y") {
-			t.Fatalf("disk-loaded filter must contain x and y")
+			t.Fatalf("the filter must contain x and y")
 		}
 	})
+}
+
+// TestVersionBloomStore_StaleFilterIsRebuilt is the regression test for the way a
+// replica could answer "nothing matched" (and no error) for a version it holds in
+// full.
+//
+// The trap: a filter built BEFORE the version's documents arrived holds nothing, and
+// an empty filter does not merely filter imprecisely — it rejects every hit. The store
+// used to keep that filter forever (cached in memory, and reused from disk after a
+// restart), so the replica stayed wrong long after its data had landed and its
+// document set was complete.
+func TestVersionBloomStore_StaleFilterIsRebuilt(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	src := &mockVdl{docs: map[int64][]string{}}
+	s := NewVersionBloomStore(dir, 1000, 0.01, src)
+
+	// The early query: this version's documents are not here yet.
+	f, err := s.Get(ctx, "kb-1", 7)
+	if err != nil {
+		t.Fatalf("Get before the documents arrive: %v", err)
+	}
+	if f.Test("doc-a") {
+		t.Fatal("precondition: nothing is known about this version yet")
+	}
+
+	// The data lands, and the next query must see a filter derived from it.
+	src.docs[7] = []string{"doc-a", "doc-b"}
+	f2, err := s.Get(ctx, "kb-1", 7)
+	if err != nil {
+		t.Fatalf("Get after the documents arrive: %v", err)
+	}
+	if !f2.Test("doc-a") || !f2.Test("doc-b") {
+		t.Fatal("the filter must be re-derived from the version's document set: an empty one drops every hit")
+	}
+
+	// And the stale copy was REPLACED on disk, not kept: a restarted process has to
+	// reach the same answer.
+	s2 := NewVersionBloomStore(dir, 1000, 0.01, src)
+	f3, err := s2.Get(ctx, "kb-1", 7)
+	if err != nil {
+		t.Fatalf("Get after a restart: %v", err)
+	}
+	if !f3.Test("doc-a") {
+		t.Error("the on-disk copy still describes the empty document set")
+	}
+}
+
+// TestVersionBloomStore_FilterFollowsTheDocumentSetForwardsAndBackwards keeps the
+// derivation honest in both directions: the filter is not merely "rebuilt once and then
+// trusted" — it tracks the set it describes.
+func TestVersionBloomStore_FilterFollowsTheDocumentSetForwardsAndBackwards(t *testing.T) {
+	ctx := context.Background()
+	src := &mockVdl{docs: map[int64][]string{3: {"doc-a"}}}
+	s := NewVersionBloomStore(t.TempDir(), 1000, 0.01, src)
+
+	f, err := s.Get(ctx, "kb-1", 3)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !f.Test("doc-a") || f.Test("doc-z") {
+		t.Fatal("the filter must describe exactly the current document set")
+	}
+
+	src.docs[3] = []string{"doc-a", "doc-z"}
+	f2, err := s.Get(ctx, "kb-1", 3)
+	if err != nil {
+		t.Fatalf("Get after the set grew: %v", err)
+	}
+	if !f2.Test("doc-z") {
+		t.Error("a document added to the version must be in the rebuilt filter")
+	}
+
+	src.docs[3] = []string{"doc-z"}
+	f3, err := s.Get(ctx, "kb-1", 3)
+	if err != nil {
+		t.Fatalf("Get after the set shrank: %v", err)
+	}
+	if f3.Test("doc-a") {
+		t.Error("a document removed from the version must be gone from the rebuilt filter")
+	}
 }
 
 // TestVersionBloomStore_DeleteByKB verifies that DeleteByKB removes the
@@ -110,7 +195,7 @@ func TestVersionBloomStore_DeleteByKB(t *testing.T) {
 		t.Fatalf("Get kb-1 after delete: %v", err) // rebuilds from vdl, fine
 	}
 	// kb-2's on-disk file must still exist.
-	if _, err := s.loadFromDisk("kb-2", 2); err != nil {
+	if _, _, err := s.loadFromDisk("kb-2", 2); err != nil {
 		t.Errorf("kb-2 bloom file should survive: %v", err)
 	}
 	// Missing directory: idempotent no-error.
@@ -149,20 +234,20 @@ func TestVersionBloomStore_DeleteByVersion(t *testing.T) {
 	}
 
 	// The target's file and cache entry are gone.
-	if _, err := s.loadFromDisk("kb-1", 1); err == nil {
+	if _, _, err := s.loadFromDisk("kb-1", 1); err == nil {
 		t.Error("kb-1/v1 bloom file should be gone after DeleteByVersion")
 	}
 	if _, ok := s.cache[versionKey{kbID: "kb-1", versionID: 1}]; ok {
 		t.Error("kb-1/v1 cache entry should be dropped")
 	}
 	// Sibling versions and other KBs survive, on disk and in cache.
-	if _, err := s.loadFromDisk("kb-1", 2); err != nil {
+	if _, _, err := s.loadFromDisk("kb-1", 2); err != nil {
 		t.Errorf("kb-1/v2 bloom file should survive: %v", err)
 	}
 	if _, ok := s.cache[versionKey{kbID: "kb-1", versionID: 2}]; !ok {
 		t.Error("kb-1/v2 cache entry should survive")
 	}
-	if _, err := s.loadFromDisk("kb-2", 1); err != nil {
+	if _, _, err := s.loadFromDisk("kb-2", 1); err != nil {
 		t.Errorf("kb-2/v1 bloom file should survive: %v", err)
 	}
 

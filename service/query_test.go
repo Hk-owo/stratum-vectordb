@@ -65,6 +65,169 @@ func newQuerySvcHarness(t *testing.T) *querySvcHarness {
 	}
 }
 
+// TestQueryService_EmptyKnowledgeBaseAnswersWithNoResults pins §5.1 of
+// docs/cursor-persistence-plan.md: a knowledge base that has never been written to
+// has NO active version, and querying it answers with an empty result rather than
+// version_not_found.
+//
+// Refusing would make "create a knowledge base, then query it" fail — for a
+// knowledge base that has done nothing wrong, it is simply unpopulated. The
+// version id in the response is 0, which is the honest report of "nothing has been
+// written yet", and the freshness credential is absent for the same reason: there
+// is no version for a node to be behind on (see KBServer.Query's ExpectedVersion
+// use).
+func TestQueryService_EmptyKnowledgeBaseAnswersWithNoResults(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	const kbID = "kb-empty"
+	if err := h.raftNode.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID:             kbID,
+		Name:             "empty",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig:      types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
+	}); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+
+	resp, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err != nil {
+		t.Fatalf("Query on a knowledge base with no version: %v", err)
+	}
+	if len(resp.GetResults()) != 0 {
+		t.Errorf("results = %d, want 0 (the knowledge base has nothing in it)", len(resp.GetResults()))
+	}
+	if resp.GetVersionId() != 0 {
+		t.Errorf("version_id = %d, want 0: no version exists yet", resp.GetVersionId())
+	}
+}
+
+// A caller that NAMES a version still gets version_not_found when that version
+// does not exist: the empty-answer rule above is about the implicit "serve this
+// knowledge base" lookup, not about a specific id someone asked for.
+func TestQueryService_ExplicitMissingVersionIsStillNotFound(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	const kbID = "kb-empty"
+	if err := h.raftNode.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID:             kbID,
+		Name:             "empty",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig:      types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
+	}); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+
+	missing := int64(4242)
+	_, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &missing,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("explicit missing version: code = %v (err %v), want NotFound", status.Code(err), err)
+	}
+}
+
+// TestQueryService_UnavailableVersionDataIsNotAnEmptyResult pins the difference between
+// "this version has no documents" and "this node cannot serve it yet".
+//
+// The first is an ANSWER — the control layer records the empty set's digest for exactly
+// that state — so an empty result is right. The second is a retryable failure, and
+// answering it with an empty result (which the code did whenever the local document list
+// was empty) made a replica that had not finished catching up indistinguishable from a
+// version with nothing in it: the caller got a well-formed answer with no results and no
+// reason to ask another node.
+func TestQueryService_UnavailableVersionDataIsNotAnEmptyResult(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	const kbID = "kb-not-here-yet"
+	if err := h.raftNode.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID:             kbID,
+		Name:             "not-here-yet",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig:      types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
+	}); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	vID, err := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
+	if err != nil {
+		t.Fatalf("ProposeCreateVersion: %v", err)
+	}
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0); err != nil {
+		t.Fatalf("READY: %v", err)
+	}
+	// A committed digest that is NOT the empty set's: the version has documents, they
+	// just have not reached this node.
+	if err := h.raftNode.ProposeUpdateVersionSummary(ctx, vID, "digest-of-real-documents"); err != nil {
+		t.Fatalf("ProposeUpdateVersionSummary: %v", err)
+	}
+
+	_, err = h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err == nil {
+		t.Fatal("want a retryable error for a version this node cannot serve yet, got an empty answer")
+	}
+	if code := status.Code(err); code != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition (retryable: another replica may hold it)", code)
+	}
+}
+
+// The other half: a version whose document set IS empty is answered with an empty
+// result — the control layer records that digest precisely so this case is sayable.
+func TestQueryService_EmptyDocumentSetVersionAnswersWithNoResults(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	const kbID = "kb-empty-set"
+	if err := h.raftNode.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID:             kbID,
+		Name:             "empty-set",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig:      types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
+	}); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	vID, err := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
+	if err != nil {
+		t.Fatalf("ProposeCreateVersion: %v", err)
+	}
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0); err != nil {
+		t.Fatalf("READY: %v", err)
+	}
+	if err := h.raftNode.ProposeUpdateVersionSummary(ctx, vID, types.EmptyDocIDSetHash); err != nil {
+		t.Fatalf("ProposeUpdateVersionSummary: %v", err)
+	}
+
+	resp, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err != nil {
+		t.Fatalf("Query on a version with an empty document set: %v", err)
+	}
+	if len(resp.GetResults()) != 0 {
+		t.Errorf("results = %d, want 0", len(resp.GetResults()))
+	}
+}
+
 // setupQueryableKB creates a KB with a READY version containing the given
 // doc-to-chunks mapping. Returns (kbID, versionID).
 func (h *querySvcHarness) setupQueryableKB(t *testing.T, docChunks map[string][]string) (string, int64) {

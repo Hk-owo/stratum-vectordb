@@ -231,6 +231,14 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 		return routeSnapshot{}, lastErr
 	}
 	for _, kb := range kbResp.GetKnowledgeBases() {
+		if kb.GetActiveVersionId() == 0 {
+			// A knowledge base with no active version — nothing written yet. It is
+			// left out of the table rather than recorded as version 0: "who holds
+			// version 0" has no answer, so asking would narrow the KB to nothing by
+			// accident, and the freshness credential below would carry a version
+			// that exists nowhere (docs/cursor-persistence-plan.md §5.3).
+			continue
+		}
 		snap.expected[kb.GetKnowledgeBaseId()] = kb.GetActiveVersionId()
 	}
 

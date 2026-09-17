@@ -37,10 +37,14 @@ func TestIntegration_FailureBudgetDeclaresVersionFailedPermanent(t *testing.T) {
 		t.Fatalf("CreateKnowledgeBase failed: %v", err)
 	}
 	kbID := createResp.KnowledgeBaseId
+	// A knowledge base no longer comes with a version
+	// (docs/cursor-persistence-plan.md §5): the root this version forks from is
+	// created here.
+	root := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	verResp, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
-		ParentVersionId: 1,
+		ParentVersionId: root,
 		ClientRequestId: "failed-permanent-1",
 		Changes: []*pb.DocChange{
 			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-1", Content: "hello world"},

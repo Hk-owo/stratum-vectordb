@@ -88,8 +88,12 @@ func (s *QueryServer) Query(ctx context.Context, req *pb.QueryRequest) (*pb.Quer
 	// A caller that already set min_version keeps its own value: it is asking
 	// for something stricter than the station's default, and there is no reason
 	// to loosen that.
+	// A knowledge base with no active version carries no credential: there is no
+	// version to be fresh at, and attaching min_version 0 would have every query
+	// refused by its own credential — version 0 exists nowhere
+	// (docs/cursor-persistence-plan.md §5.3).
 	if req.MinVersion == nil {
-		if v, ok := s.r.ExpectedVersion(req.GetKnowledgeBaseId()); ok {
+		if v, ok := s.r.ExpectedVersion(req.GetKnowledgeBaseId()); ok && v > 0 {
 			req.MinVersion = &v
 		}
 	}

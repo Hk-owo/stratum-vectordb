@@ -28,6 +28,7 @@ const (
 	recordTypeDeleteComplete        recordType = 0x05
 	recordTypeVersionDeleteMark     recordType = 0x06
 	recordTypeVersionDeleteComplete recordType = 0x07
+	recordTypeCursor                recordType = 0x08
 )
 
 // On-disk record framing: [1 byte type][4 byte big-endian payload
@@ -52,6 +53,10 @@ const (
 //   - VERSION_DELETE_MARK, VERSION_DELETE_COMPLETE: 8-byte big-endian
 //     versionID followed by raw kbID bytes (kbID for recovery context;
 //     the versionID alone keys idempotency).
+//   - CURSOR: uint32 big-endian kbID length followed by the raw kbID
+//     bytes, then an 8-byte big-endian versionID. It is deliberately not
+//     shaped like DELETE_MARK's "the payload is exactly the kbID": the
+//     version is what the record is about, so both fields are explicit.
 const (
 	recordHeaderLen = 1 + 4 // type + length
 	recordCRCLen    = 4
@@ -227,6 +232,12 @@ type FileWAL struct {
 	// written since this process started — not only for those on disk at Open.
 	beginDataByVersion map[int64]beginData
 
+	// cursors is the data cursor per knowledge base that this log has
+	// recorded: the highest version the node's contiguous history was known to
+	// reach. Rebuilt by rebuildIndex on Open so a restart can read it back
+	// instead of inferring it (§7.8), which is the whole point of the record.
+	cursors map[string]int64
+
 	// pendingBegin is the BEGIN record still awaiting its VERSION_ID — the
 	// runtime counterpart of rebuildIndex's local pendingBegin.
 	pendingBegin *beginData
@@ -253,6 +264,7 @@ func NewFileWAL(path string) (*FileWAL, error) {
 		versionDeleteMarked: make(map[int64]string),
 		versionDeleteDone:   make(map[int64]bool),
 		beginDataByVersion:  make(map[int64]beginData),
+		cursors:             make(map[string]int64),
 		replayCounters:      make(map[replayKey]int),
 	}
 
@@ -423,6 +435,13 @@ func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 		}
 		rec.versionID = int64(binary.BigEndian.Uint64(payload[:8]))
 		rec.kbID = string(payload[8:])
+	case recordTypeCursor:
+		kbID, versionID, err := decodeCursorPayload(payload)
+		if err != nil {
+			return parsedRecord{}, 0, err
+		}
+		rec.kbID = kbID
+		rec.versionID = versionID
 	default:
 		return parsedRecord{}, 0, fmt.Errorf("wal: unknown record type 0x%02x", kind)
 	}
@@ -448,6 +467,13 @@ func (w *FileWAL) applyRecordLocked(rec parsedRecord) {
 		w.versionDeleteMarked[rec.versionID] = rec.kbID
 	case recordTypeVersionDeleteComplete:
 		w.versionDeleteDone[rec.versionID] = true
+	case recordTypeCursor:
+		// A cursor is a scalar: the newest record for a knowledge base says
+		// everything an older one does, so recovery only ever needs the
+		// maximum (and compaction keeps exactly that — see Compact).
+		if rec.versionID > w.cursors[rec.kbID] {
+			w.cursors[rec.kbID] = rec.versionID
+		}
 	case recordTypeBegin:
 		// BEGIN carries no state of its own to track; its presence only
 		// matters as a transaction-start marker for whoever reads the raw
@@ -641,6 +667,83 @@ func (w *FileWAL) ChangesInRange(_ context.Context, kbID string, fromExclusive, 
 		if versionID > fromExclusive && versionID <= toInclusive && bd.kbID == kbID {
 			out[versionID] = VersionDelta{VersionID: versionID, ParentVersionID: bd.parentVersionID, Changes: bd.changes}
 		}
+	}
+	return out, nil
+}
+
+// encodeCursorPayload serializes a CURSOR record's payload:
+//
+//	kbID:      uint32 big-endian length + raw bytes
+//	versionID: int64 big-endian
+func encodeCursorPayload(kbID string, versionID int64) []byte {
+	payload := make([]byte, 4+len(kbID)+8)
+	binary.BigEndian.PutUint32(payload[:4], uint32(len(kbID)))
+	copy(payload[4:], kbID)
+	binary.BigEndian.PutUint64(payload[4+len(kbID):], uint64(versionID))
+	return payload
+}
+
+// decodeCursorPayload parses a CURSOR record's payload. The length check is
+// exact rather than a minimum: unlike a version-delete record, whose kbID is
+// context trailing a fixed prefix, both fields here are explicitly sized, so
+// anything else is a corrupt payload rather than a shape this code must accept.
+func decodeCursorPayload(payload []byte) (string, int64, error) {
+	if len(payload) < 4 {
+		return "", 0, fmt.Errorf("wal: truncated CURSOR payload (have %d bytes)", len(payload))
+	}
+	kbLen := int(binary.BigEndian.Uint32(payload[:4]))
+	if len(payload) != 4+kbLen+8 {
+		return "", 0, fmt.Errorf("wal: malformed CURSOR payload length %d (kb_id %d)", len(payload), kbLen)
+	}
+	return string(payload[4 : 4+kbLen]), int64(binary.BigEndian.Uint64(payload[4+kbLen:])), nil
+}
+
+// WriteCursor records that this node's CONTIGUOUS data cursor for kbID has
+// reached versionID. It is what lets a restart read the cursor back instead of
+// inferring it from disk facts (§7.8): the cursor lives in memory, so without
+// this record a restarted node starts at 0 while holding everything.
+//
+// The value is a cursor, not a per-version receipt: it means "my history for
+// this knowledge base is unbroken to here". A scalar is therefore enough —
+// nothing about the versions below it has to be replayed — and an older value
+// can be discarded rather than stored, because it says strictly less than the
+// newer one that supersedes it.
+//
+// Idempotent and monotone: a versionID at or below the one already recorded
+// returns without writing. The on-disk value can thus never move backwards,
+// and a repeated advance (a retry, a replay) costs nothing.
+//
+// Ordering is the caller's obligation, not this method's: the cursor may never
+// exceed what the node actually holds, so it is written only AFTER the data it
+// describes has landed (see LocalDataPlane.advanceLocalVersion).
+func (w *FileWAL) WriteCursor(_ context.Context, kbID string, versionID int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if versionID <= w.cursors[kbID] {
+		return nil // idempotent: the cursor is a scalar and only moves forward
+	}
+	if err := w.writeRecordLocked(recordTypeCursor, encodeCursorPayload(kbID, versionID)); err != nil {
+		return fmt.Errorf("wal: WriteCursor(%s, %d): %w", kbID, versionID, err)
+	}
+	w.cursors[kbID] = versionID
+	return nil
+}
+
+// RecoverCursors returns the persisted cursor of every knowledge base this log
+// has a CURSOR record for. It is read once at startup.
+//
+// A knowledge base ABSENT from the map is one this log never recorded a cursor
+// for: an older WAL written before the record type existed, or a knowledge base
+// this node has not advanced since. The caller must read that as "unknown"
+// rather than as "cursor 0" — the distinction is exactly what lets it fall back
+// to inferring the cursor from local facts (and persist the result) instead of
+// claiming a node with a full disk holds nothing.
+func (w *FileWAL) RecoverCursors(_ context.Context) (map[string]int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make(map[string]int64, len(w.cursors))
+	for kbID, versionID := range w.cursors {
+		out[kbID] = versionID
 	}
 	return out, nil
 }

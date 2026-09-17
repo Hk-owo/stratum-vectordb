@@ -154,26 +154,23 @@ func (s *KnowledgeBaseServiceImpl) CreateKnowledgeBase(ctx context.Context, req 
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
-	// Create the initial version. It carries no document changes, so its DATA side is
-	// settled as durable at creation: there is nothing to persist, and a PENDING data
-	// side would leave every replica that restarts unable to step its cursor over this
-	// version (see raft.WithEmptyVersion).
-	versionID, err := s.raftNode.ProposeCreateVersion(ctx, kbID, 0, raft.WithEmptyVersion())
-	if err != nil {
-		return nil, stratumerrors.ToGRPCStatus(err)
-	}
-
-	// Mark the initial version as READY (there are no chunks to index).
-	// nodeID 0: settled by the control layer, not reported by a replica.
-	_ = s.raftNode.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, 0)
-
-	// Set the active version. Since the RaftNode interface has no explicit
-	// "set active version" RPC outside of Rollback, we use Rollback to set it.
-	_ = s.raftNode.ProposeRollback(ctx, kbID, versionID)
-
+	// NO version is created here (docs/cursor-persistence-plan.md §5): the knowledge
+	// base becomes visible with an empty version chain, and its first version comes
+	// from the client's first non-empty write. Creating a change-less version here
+	// was what conflated "the document set is empty" with "this version changed
+	// nothing" — a version's document set is inherited from its parent, so the two
+	// only coincide at the root of a chain — and both layers carried the special
+	// case for it.
+	//
+	// An empty knowledge base remains QUERYABLE: with no active version the query
+	// path answers an empty result instead of refusing (docs/cursor-persistence-plan.md
+	// §5.1), so a client that creates and queries one sees no behaviour change.
 	return &pb.CreateKnowledgeBaseResponse{
-		KnowledgeBaseId:  kbID,
-		InitialVersionId: versionID,
+		KnowledgeBaseId: kbID,
+		// InitialVersionId is 0: no version exists yet. The field stays on the wire
+		// for compatibility, and 0 is the honest answer — a version appears only once
+		// something is written.
+		InitialVersionId: 0,
 	}, nil
 }
 

@@ -43,6 +43,11 @@ type discardRecorder struct{}
 
 func (discardRecorder) Record(int64, string, map[string]int64) {}
 
+// KnowledgeBases is the aggregator's second half: the leader names every chain
+// it knows about, so a reporter that missed one entirely still learns there is
+// something to be behind on. This case discards everything, so it knows nothing.
+func (discardRecorder) KnowledgeBases() []string { return nil }
+
 // TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack is the point of
 // the watermark round trip: the node whose WAL grows is the one that WROTE the data, and
 // under §7.13.2 that need not be the leader. It therefore cannot compute the watermark

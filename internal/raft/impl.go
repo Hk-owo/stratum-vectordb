@@ -515,7 +515,7 @@ func (impl *RaftNodeImpl) ProposeRemoveKBMeta(ctx context.Context, kbID string) 
 
 func (impl *RaftNodeImpl) ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64, opts ...ProposeOption) (int64, error) {
 	o := resolveProposeOptions(opts)
-	res, err := impl.proposeAndWait(ctx, newCreateVersionCommand(kbID, parentVersionID, o.clientRequestID, o.emptyVersion))
+	res, err := impl.proposeAndWait(ctx, newCreateVersionCommand(kbID, parentVersionID, o.clientRequestID))
 	if err != nil {
 		return 0, err
 	}

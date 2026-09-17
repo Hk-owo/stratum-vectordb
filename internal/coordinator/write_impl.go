@@ -15,6 +15,7 @@ import (
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
 	"stratum/internal/embed"
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
 	"stratum/internal/kvraft"
 	"stratum/internal/plane"
@@ -250,6 +251,23 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 		return 0, kvraft.ErrNotLeader
 	}
 
+	// An empty changes list is refused, not accepted as "a version with no
+	// documents" (docs/cursor-persistence-plan.md §5): a new version's document set
+	// is its PARENT's set plus these changes, so an empty list means "unchanged" —
+	// and the empty set is merely one thing that can be unchanged, at the root of a
+	// chain. Treating the two as the same code path made a 0-change version
+	// indistinguishable from an empty one everywhere downstream: a version marked
+	// as an empty document set whose real content was its parent's.
+	//
+	// The check is here, before the version id is allocated, because a version's
+	// document set has to be statable from the moment it exists.
+	//
+	// Idempotent replays are unaffected: the same (kbID, ClientRequestID) still
+	// returns the version the first attempt allocated.
+	if len(changes) == 0 {
+		return 0, fmt.Errorf("coordinator: CreateVersion(%s): %w", kbID, stratumerrors.ErrEmptyChanges)
+	}
+
 	// Step 1-2: the control layer allocates the version ID (its apply phase
 	// writes the WAL's VERSION_ID record). Everything the version needs to
 	// exist is now in replicated metadata; the data itself is the storage
@@ -266,15 +284,6 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	c.RegisterPendingDispatch(kbID, dispatchID, parentVersionID, changes)
 
 	opts := []raft.ProposeOption{raft.WithClientRequestID(dispatchID)}
-	if len(changes) == 0 {
-		// A version with no document changes has nothing to fan out and nothing for a
-		// writer to report a digest about, so its data side is settled at creation
-		// rather than waiting for a report that can never come
-		// (raft.WithEmptyVersion). Left PENDING it stays that way forever, and a
-		// replica that restarts cannot step its cursor over it — which in turn blocks
-		// the promotion of every version after it.
-		opts = append(opts, raft.WithEmptyVersion())
-	}
 	versionID, err := c.cfg.RaftNode.ProposeCreateVersion(ctx, kbID, parentVersionID, opts...)
 	if err != nil {
 		// The entry never landed: drop the registration, or it would later be

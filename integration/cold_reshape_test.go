@@ -75,19 +75,28 @@ func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) 
 
 // TestRealStack_ColdRebuildRedistributesTheArtifact is the cluster-level proof
 // of the last piece of Stratum_设计文档v13.md §8.6(a): a version that has gone
-// cold is rebuilt in the graph-free shape, and the replicas end up serving that
-// rebuilt artifact — §8.4's callback chain reused, with no new channel.
+// cold is rebuilt in the graph-free shape, and §8.4's callback chain is what
+// puts that rebuild through — no new channel.
 //
-// Only node 1 runs the cold evaluator; node 2 never reshapes anything by
-// itself. That is what makes the final byte-for-byte equality meaningful: node
-// 2's index can only have changed because node 1 shipped its reshaped artifact,
-// the same argument TestRealStack_IndexDistributionInstallsTheBuildersArtifact
-// makes for the first distribution.
+// What the rebuild does NOT do, now that §8.4(a)'s presence probe has landed, is
+// replace a replica's artifact. The probe answers "do you already have it", not
+// "is yours the same shape" (docs/index-push-probe-plan.md §3, with the
+// content-level tightening that would change that deliberately left to §10.1),
+// so a replica already holding the version keeps its own copy. That is the trade
+// the plan records as acceptable: the two shapes are retrieval-equivalent
+// (§8.6a), so the cost is a resource-suboptimal (still graphed) artifact on the
+// replica — never an unservable version.
+//
+// Only node 1 runs the cold evaluator; node 2 never reshapes anything by itself.
+// That is what makes the assertions meaningful in both directions: node 1's
+// smaller file can only have come from the reshape, and node 2's UNCHANGED file
+// can only have come from the probe having skipped it — node 2 has no other
+// route to an artifact at all.
 //
 // The threshold is set well above the time the first distribution needs, so the
 // phases are ordered: the version is graphed and distributed, then it ages
-// (nobody queries it, which is exactly what makes it cold), then the reshape is
-// distributed too.
+// (nobody queries it, which is exactly what makes it cold), then node 1 reshapes
+// it.
 func TestRealStack_ColdRebuildRedistributesTheArtifact(t *testing.T) {
 	vecAddrs := [2]string{
 		startVecstoreServerForTest(t),
@@ -156,7 +165,9 @@ func TestRealStack_ColdRebuildRedistributesTheArtifact(t *testing.T) {
 
 	// Both nodes must agree on the first (graphed) artifact before we start
 	// watching for a change: otherwise a late independent build could be
-	// mistaken for the reshape.
+	// mistaken for the reshape. This is also the §8.4 distribution working —
+	// node 2 has no other way to get an index — and it is the one moment when
+	// byte-for-byte equality between the nodes is expected.
 	if !waitUntil(30*time.Second, func() bool {
 		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
 		b, _ := indexFileOf(baseDirs[1], kbID, versionID)
@@ -202,21 +213,36 @@ func TestRealStack_ColdRebuildRedistributesTheArtifact(t *testing.T) {
 	reshaped, _ := indexFileOf(baseDirs[0], kbID, versionID)
 	t.Logf("reshaped index: %d bytes (graphed was %d)", len(reshaped), len(graphed))
 
-	// Node 2 never reshapes on its own, so it can only hold these bytes if
-	// node 1 shipped them: §8.4 reused for the reshape.
-	if !waitUntil(60*time.Second, func() bool {
+	// The reshape stays node 1's. Allowing a little time for the redistribution
+	// the build callback drives, node 1 must hold the reshaped bytes — and node 2
+	// must NOT: it already held an artifact when the reshaped one was offered, so
+	// §8.4(a)'s probe answers AlreadyExists and the ship is skipped
+	// (docs/index-push-probe-plan.md §3).
+	//
+	// Asserting node 2's file is UNCHANGED is asserting the probe, and it is
+	// stable rather than racy: node 2 is data-only (wireSyncPullDataOnly) and
+	// never builds, reshapes or receives a second copy for this version.
+	if !waitUntil(30*time.Second, func() bool {
 		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
 		b, _ := indexFileOf(baseDirs[1], kbID, versionID)
-		return bytes.Equal(a, reshaped) && bytes.Equal(b, reshaped)
+		return bytes.Equal(a, reshaped) && len(b) > 0
 	}) {
 		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
 		b, _ := indexFileOf(baseDirs[1], kbID, versionID)
-		t.Fatalf("the replica never installed the reshaped artifact: node 1 %d bytes, node 2 %d bytes, reshaped %d",
+		t.Fatalf("node 1 never published the reshaped artifact: n1=%d n2=%d reshaped=%d",
 			len(a), len(b), len(reshaped))
 	}
+	if node2, _ := indexFileOf(baseDirs[1], kbID, versionID); !bytes.Equal(node2, graphed) {
+		t.Errorf("node 2's artifact is now %d bytes (graphed was %d): §8.4(a)'s probe was supposed to skip a replica that already holds the version, leaving it with the shape it has",
+			len(node2), len(graphed))
+	} else {
+		t.Logf("node 2 kept its graphed artifact (%d bytes): the probe skipped a ship it did not need", len(node2))
+	}
 
-	// The reshaped version must still answer queries on both nodes: the
-	// graph-free form changes the index type, not the answers' availability.
+	// The point of accepting that skip is that it costs nothing a reader can
+	// see: §8.6a makes the two shapes retrieval-equivalent, so both nodes must
+	// still answer for the reshaped version — one from the graph-free artifact,
+	// the other from the graphed one it kept.
 	vec := make([]float32, 16)
 	vec[0] = 1
 	for _, n := range nodes {

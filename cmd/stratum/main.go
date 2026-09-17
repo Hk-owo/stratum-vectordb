@@ -609,6 +609,11 @@ func main() {
 	// the leader. The sync module is wired via OnVersionCreated.
 	if storageLocal {
 		syncFollower = stratumsync.NewFollower(ds, cdm, vd, chunkStore, indexMgr)
+		// A replica that receives a version's data builds its document filter, exactly as
+		// the writer's transaction does: the filter drops the search hits that are not in
+		// the version, so one built before the data arrived is empty — and an empty filter
+		// answers "nothing matched", with no error, for data this node holds in full.
+		syncFollower.SetVersionBloom(vBloomStore)
 	}
 
 	// DataPlane owns "does this node need the version's data, and where from"
@@ -669,9 +674,14 @@ func main() {
 	})
 
 	dataPlane = plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
-		IndexManager:  indexMgr,
-		Puller:        syncFollower,
-		WAL:           walImpl,
+		IndexManager: indexMgr,
+		Puller:       syncFollower,
+		WAL:          walImpl,
+		// §7.8/docs/cursor-persistence-plan.md §3: the cursor is persisted in the
+		// WAL this node already fsyncs, so a restart reads it back instead of
+		// inferring it from index artifacts the retention policy may have
+		// deleted. Same file, one more record type.
+		CursorWAL:     walImpl,
 		Executor:      writeCoord,
 		Control:       controlPlane,
 		Pusher:        replicaPusher{pusher: syncPusher},
@@ -1057,6 +1067,9 @@ func main() {
 			stratumsync.WithVersionDataDropper(writeCoord),
 			stratumsync.WithVersionWriteWatcher(dataPlane),
 			stratumsync.WithIndexInstaller(indexMgr),
+			// §8.4(a): the presence probe's answer and its failures are only
+			// visible in the log, so the receive side gets this node's logger.
+			stratumsync.WithLogger(logger),
 			// §8.5: record the writers' data-source announcements (they ride the
 			// §7.3 confirmation) so this node can resolve a version's data
 			// without asking the leader.
