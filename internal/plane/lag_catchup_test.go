@@ -21,7 +21,6 @@ func TestLagCatchup_CatchesUpWhatIsBehind(t *testing.T) {
 	done := make(chan struct{}, 4)
 
 	l := NewLagCatchup(LagCatchupConfig{
-		Enabled:        true,
 		MinLagVersions: 1,
 		Ensure: func(_ context.Context, kbID string, versionID int64) error {
 			mu.Lock()
@@ -58,7 +57,6 @@ func TestLagCatchup_MinLagVersionsRaisesTheBar(t *testing.T) {
 	var calls []ensureCall
 
 	l := NewLagCatchup(LagCatchupConfig{
-		Enabled:        true,
 		MinLagVersions: 2,
 		Ensure: func(_ context.Context, kbID string, versionID int64) error {
 			mu.Lock()
@@ -91,31 +89,15 @@ func TestLagCatchup_MinLagVersionsRaisesTheBar(t *testing.T) {
 	}
 }
 
-// The switch is the whole feature: off means the node keeps the lazy recovery it has
-// always had, and a signal changes nothing.
-func TestLagCatchup_DisabledDoesNothing(t *testing.T) {
-	var mu sync.Mutex
-	var calls []ensureCall
+// Nothing wired, nothing done: a node that never assembled the catch-up must absorb a
+// signal without starting anything (and without panicking). The component is
+// unconditional now, so "not wired" is the only remaining absent state.
+func TestLagCatchup_UnwiredDoesNothing(t *testing.T) {
+	l := NewLagCatchup(LagCatchupConfig{})
 
-	l := NewLagCatchup(LagCatchupConfig{
-		Enabled: false,
-		Ensure: func(_ context.Context, kbID string, versionID int64) error {
-			mu.Lock()
-			calls = append(calls, ensureCall{kbID, versionID})
-			mu.Unlock()
-			return nil
-		},
-		Cursor: func() map[string]int64 { return map[string]int64{"kb": 1} },
-	})
-
+	// No Ensure and no Cursor: this must be a no-op, not a panic.
 	l.SetChainTails(map[string]int64{"kb": 99})
-	time.Sleep(100 * time.Millisecond)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(calls) != 0 {
-		t.Fatalf("a disabled catch-up acted on a signal: %v", calls)
-	}
+	time.Sleep(50 * time.Millisecond)
 }
 
 // A knowledge base already catching up is not started again: the signal repeats every
@@ -126,7 +108,6 @@ func TestLagCatchup_DoesNotStartTheSameKnowledgeBaseTwice(t *testing.T) {
 	release := make(chan struct{})
 
 	l := NewLagCatchup(LagCatchupConfig{
-		Enabled: true,
 		Ensure: func(ctx context.Context, _ string, _ int64) error {
 			started <- struct{}{}
 			<-release
@@ -162,7 +143,6 @@ func TestLagCatchup_BoundsConcurrentCatchUps(t *testing.T) {
 	release := make(chan struct{})
 
 	l := NewLagCatchup(LagCatchupConfig{
-		Enabled:          true,
 		MaxConcurrentKBs: 1,
 		Ensure: func(ctx context.Context, _ string, _ int64) error {
 			started <- struct{}{}
@@ -195,8 +175,7 @@ func TestLagCatchup_JitterIsBoundedAndDelaysTheStart(t *testing.T) {
 	done := make(chan struct{}, 1)
 
 	cfg := LagCatchupConfig{
-		Enabled: true,
-		Jitter:  500 * time.Millisecond,
+		Jitter: 500 * time.Millisecond,
 		Ensure: func(_ context.Context, _ string, _ int64) error {
 			done <- struct{}{}
 			return nil

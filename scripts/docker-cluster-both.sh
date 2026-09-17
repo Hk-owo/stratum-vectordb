@@ -282,11 +282,9 @@ index_manager:
   serving_replica_min: 2
   append_max_dead_ratio: 0.95
 
-# Active lag detection (docs/active-lag-detection-design.md). Off by default here,
-# matching the production default; open it with LAG_CATCHUP_ENABLED=true to run the
-# "a returning node catches up on its own" case.
+# Active lag detection (docs/active-lag-detection-design.md). There is no switch: a
+# replica that fell behind catches up on its own. The knobs below set the pace.
 lag_catchup:
-  enabled: ${LAG_CATCHUP_ENABLED:-false}
   min_lag_versions: ${LAG_CATCHUP_MIN_LAG:-1}
   jitter_ms: ${LAG_CATCHUP_JITTER_MS:-0}
   max_concurrent_kbs: ${LAG_CATCHUP_MAX_KBS:-0}

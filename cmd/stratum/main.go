@@ -1111,28 +1111,36 @@ func main() {
 	}()
 
 	// docs/active-lag-detection-design.md: turn the chain tail the leader sends back
-	// into a background catch-up. It is off by default, and when on it is deliberately
-	// damped — a random delay per signal and a bound on how many knowledge bases may
-	// catch up at once — because the alternative is a node returning from an outage
-	// starting every knowledge base together. It schedules nothing of its own:
-	// Ensure is the same call a query makes, so the existing gates still apply.
-	lagCatchup := plane.NewLagCatchup(plane.LagCatchupConfig{
-		Enabled:          cfg.LagCatchupEnabled,
-		MinLagVersions:   int64(cfg.LagCatchupMinLagVersions),
-		Jitter:           time.Duration(cfg.LagCatchupJitterMS) * time.Millisecond,
-		MaxConcurrentKBs: cfg.LagCatchupMaxConcurrentKBs,
-		Ensure:           dataPlane.EnsureIndex,
-		Cursor:           dataPlane.DataVersionsSnapshot,
-		Logger:           logger,
-	})
-	// Say so at startup: whether this is on is otherwise invisible until it does
-	// something, and "nothing happened" is exactly what an operator needs to be able
-	// to tell apart from "it is not wired".
-	logger.Info("lag catch-up wired",
-		zap.Bool("enabled", cfg.LagCatchupEnabled),
-		zap.Int("min_lag_versions", cfg.LagCatchupMinLagVersions),
-		zap.Int("jitter_ms", cfg.LagCatchupJitterMS),
-		zap.Int("max_concurrent_kbs", cfg.LagCatchupMaxConcurrentKBs))
+	// into a background catch-up. There is no switch, and it is deliberately damped — a
+	// random delay per signal and a bound on how many knowledge bases may catch up at
+	// once — because the alternative is a node returning from an outage starting every
+	// knowledge base together. It schedules nothing of its own: Ensure is the same call
+	// a query makes, so the existing gates still apply.
+	//
+	// A control node gets NO catch-up, and that is not an optimisation. It has no
+	// storage: no cursor to compare against a chain tail, and no puller to fetch with.
+	// Wiring it anyway is what made every control node crash-loop (11–14 restarts, stack
+	// at LagCatchup.catchUp → EnsureIndex → a nil *Follower) the moment the switch that
+	// used to hide it was removed. "Can this node catch up at all" is a property of the
+	// deployment, so the gate belongs here, in the assembly.
+	var chainTails stratumsync.ChainTailSink
+	if storageLocal {
+		chainTails = plane.NewLagCatchup(plane.LagCatchupConfig{
+			MinLagVersions:   int64(cfg.LagCatchupMinLagVersions),
+			Jitter:           time.Duration(cfg.LagCatchupJitterMS) * time.Millisecond,
+			MaxConcurrentKBs: cfg.LagCatchupMaxConcurrentKBs,
+			Ensure:           dataPlane.EnsureIndex,
+			Cursor:           dataPlane.DataVersionsSnapshot,
+			Logger:           logger,
+		})
+		// Say so at startup: the pace it runs at is otherwise invisible until it does
+		// something, and "nothing happened" is exactly what an operator needs to be able
+		// to tell apart from "it is not wired".
+		logger.Info("lag catch-up wired",
+			zap.Int("min_lag_versions", cfg.LagCatchupMinLagVersions),
+			zap.Int("jitter_ms", cfg.LagCatchupJitterMS),
+			zap.Int("max_concurrent_kbs", cfg.LagCatchupMaxConcurrentKBs))
+	}
 
 	// §7.13.4: report this node's data cursors to the control leader every
 	// interval. The leader it resolves is looked up per interval, never cached:
@@ -1154,7 +1162,7 @@ func main() {
 		// be reclaimed even when this node is not the leader.
 		Watermarks: controlPlane,
 		// And the chain tails, which are what tell this node it has fallen behind.
-		ChainTails: lagCatchup,
+		ChainTails: chainTails,
 		// And the control leader's answer to "who holds this version", which the
 		// data-source lookup mirrors. That lookup may run on the apply path, so it
 		// cannot ask for itself; this response is what fills the mirror.
@@ -1692,15 +1700,14 @@ type appConfig struct {
 
 	// LagCatchup configures the background catch-up that turns the chain tail the
 	// control leader reports into an occasional recovery
-	// (lag_catchup.*, docs/active-lag-detection-design.md). Off by default: the lazy
-	// recovery it replaces is what the cluster has always run on, so turning it on is
-	// an operator's decision.
+	// (lag_catchup.*, docs/active-lag-detection-design.md). There is no switch: a
+	// replica that is behind and stays behind is one nothing routes to, so catching up
+	// is ordinary behaviour rather than an operator's opt-in.
 	//
 	// LagCatchupJitterMS damps the trigger — each signal is followed by a random
 	// delay in [0, that) — and LagCatchupMaxConcurrentKBs bounds how many knowledge
 	// bases may catch up at once (<= 0 takes the default). LagCatchupMinLagVersions
 	// is how far behind the tail counts as left behind.
-	LagCatchupEnabled          bool
 	LagCatchupMinLagVersions   int
 	LagCatchupJitterMS         int
 	LagCatchupMaxConcurrentKBs int
@@ -1875,10 +1882,9 @@ type fileConfig struct {
 	// docs/active-lag-detection-design.md: the node reads the chain tail the control
 	// leader carries back on its cursor report and catches up when it is behind.
 	LagCatchup struct {
-		Enabled          bool `yaml:"enabled"`
-		MinLagVersions   int  `yaml:"min_lag_versions"`
-		JitterMS         int  `yaml:"jitter_ms"`
-		MaxConcurrentKBs int  `yaml:"max_concurrent_kbs"`
+		MinLagVersions   int `yaml:"min_lag_versions"`
+		JitterMS         int `yaml:"jitter_ms"`
+		MaxConcurrentKBs int `yaml:"max_concurrent_kbs"`
 	} `yaml:"lag_catchup"`
 }
 
@@ -2044,9 +2050,8 @@ func loadConfig(path string) (appConfig, error) {
 		cfg.GCSweepIntervalSec = fc.GC.SweepIntervalSec
 	}
 
-	// lag_catchup.*. Enabled is the switch; the other three only matter when it is
-	// on, and each keeps its own "unset" meaning (<= 0 for the bounds, 1 for the lag).
-	cfg.LagCatchupEnabled = fc.LagCatchup.Enabled
+	// lag_catchup.*. Each field keeps its own "unset" meaning (<= 0 for the bounds,
+	// 1 for the lag); there is no switch to read.
 	if fc.LagCatchup.MinLagVersions != 0 {
 		cfg.LagCatchupMinLagVersions = fc.LagCatchup.MinLagVersions
 	}

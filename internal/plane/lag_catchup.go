@@ -22,11 +22,18 @@ import (
 //     from a long outage would start every knowledge base at once, and the leader's
 //     next interval would have every returning node do it together.
 //
-// Three things are therefore deliberate. It is opt-in (Config.Enabled). A signal is
-// followed by a random delay (Config.Jitter) before anything starts, which spreads
-// "all at once" into a window. And it bounds how many knowledge bases it works on at
-// once (Config.MaxConcurrentKBs) — jitter alone is not an upper bound once the number
-// of lagging knowledge bases exceeds what anyone expected.
+// Two things are therefore deliberate. A signal is followed by a random delay
+// (Config.Jitter) before anything starts, which spreads "all at once" into a window.
+// And it bounds how many knowledge bases it works on at once (Config.MaxConcurrentKBs)
+// — jitter alone is not an upper bound once the number of lagging knowledge bases
+// exceeds what anyone expected.
+//
+// There is no switch, deliberately. Catching up on its own is the node's ordinary
+// behaviour rather than an operator's opt-in: a replica that is behind and stays behind
+// is one nothing ever routes to, so "leave it lazy" reads as "leave it unserviceable".
+// What an operator still tunes is the PACE (the jitter window and the concurrency bound
+// above), which is where the real risk lives — a returning node starting every
+// knowledge base at once.
 //
 // It schedules no builds of its own: it calls Config.Ensure, the same path a query
 // takes, so the existing gates (the per-KB write limit, the build pool's backfill
@@ -40,10 +47,6 @@ type LagCatchup struct {
 
 // LagCatchupConfig wires a LagCatchup.
 type LagCatchupConfig struct {
-	// Enabled turns the whole mechanism on. False is the default, and means the node
-	// keeps the lazy recovery it has always had.
-	Enabled bool
-
 	// MinLagVersions is how far behind the tail a knowledge base must be before it
 	// counts as left behind; 1 means "any gap". Raising it trades a slower reaction
 	// for fewer wake-ups on ordinary write races, where a report can overlap the
@@ -116,7 +119,7 @@ func NewLagCatchup(cfg LagCatchupConfig) *LagCatchup {
 // random — but unchanged code with a known history beats a fix whose premise was
 // false, and nothing measured the sorted version.
 func (l *LagCatchup) SetChainTails(tails map[string]int64) {
-	if !l.cfg.Enabled || l.cfg.Ensure == nil || l.cfg.Cursor == nil {
+	if l.cfg.Ensure == nil || l.cfg.Cursor == nil {
 		return
 	}
 	// Kept from the diagnosis that found the wiring bug, and worth keeping: "the

@@ -247,8 +247,8 @@ func lagCatchupTimeout() time.Duration {
 // line the catch-up itself writes, because "an artifact appeared" alone would also be
 // explained by the startup reconcile giving the active version a head start.
 //
-// The cluster must be built with LAG_CATCHUP_ENABLED=true (scripts/docker-cluster-both.sh
-// reads it, and LOG_LEVEL=debug makes the scheduler's decisions visible).
+// Catch-up has no switch (scripts/docker-cluster-both.sh always sets the pace knobs),
+// so this runs on any cluster; LOG_LEVEL=debug makes the scheduler's decisions visible.
 //
 // SKIPPED_FIXED: the two prerequisites this case was blocked on are both repaired.
 //
@@ -274,13 +274,6 @@ func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
 	defer cancel()
 
 	waitForStorageGroupReady(t, 3*time.Minute)
-
-	enabled := dockerCmd(t, "exec", storageServices[0], "sh", "-c",
-		"grep -A1 '^lag_catchup:' /etc/stratum/config.yaml 2>/dev/null || true")
-	if !strings.Contains(enabled, "enabled: true") {
-		t.Skipf("cluster was built without lag_catchup enabled "+
-			"(rebuild with LAG_CATCHUP_ENABLED=true); config reads: %q", strings.TrimSpace(enabled))
-	}
 
 	leaderIdx, kbID := waitForLeader(t, ctx, "lag-active", 60*time.Second)
 	leaderAddr := nodeAddrs[leaderIdx]
@@ -328,7 +321,7 @@ func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
 	}
 	after := artifactCount(t, behind, kbID)
 
-	t.Logf("LAG_CATCHUP_ENABLED=true, %d versions while offline", versions)
+	t.Logf("%d versions while offline", versions)
 	t.Logf("artifacts on the returning node: %d → %d", before, after)
 	t.Logf("caught up on its own (logged): %v", caughtUp)
 
