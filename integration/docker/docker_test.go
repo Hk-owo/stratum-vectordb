@@ -250,18 +250,9 @@ func waitForNodeToSeeKB(t *testing.T, ctx context.Context, addr, kbID string, ti
 // === T4-1: Distributed correctness ===
 
 func TestT4_MultiNode_Consistency(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	// NOTE (unresolved): this case still fails, and deliberately so — it is one
-	// of the assumptions this suite accumulated while it could never run. It
-	// reuses the probe's KB and expects that KB's single version to be EMPTY, but
-	// a working probe has to commit a document to prove leadership, and the
-	// product refuses an empty CreateVersion ("empty changes") — which is why the
-	// probe never worked. Giving this test its own KB is not the fix either: a
-	// freshly created KB has no version at all (initial_version_id 0). Resolving
-	// it means redesigning the probe (a way to create a version with no chunks)
-	// or rewriting the assertions. Left as-is on purpose.
 	leaderIdx, kbID := waitForLeader(t, ctx, "consistency", 30*time.Second)
 	leaderAddr := nodeAddrs[leaderIdx]
 	t.Logf("leader is node %d (%s), KB %s", leaderIdx, leaderAddr, kbID)
@@ -272,62 +263,89 @@ func TestT4_MultiNode_Consistency(t *testing.T) {
 	}
 	defer conn.Close()
 	kb := pb.NewKnowledgeBaseServiceClient(conn)
-	// Poll instead of asserting once. This lookup goes through the station, which
-	// load-balances READS across the control nodes — only writes are pinned to the
-	// leader (internal/router/router.go's Forward), so a KB created a moment ago
-	// may not be on whichever node answers this call. The wait further down for
-	// nodeSeesKB exists for exactly this reason; this lookup just used to run
-	// before it.
-	var initialVersionID int64
-	{
-		deadline := time.Now().Add(15 * time.Second)
-		for {
-			versions, listErr := kb.ListVersions(ctx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
-			if listErr == nil && len(versions.Versions) > 0 {
-				initialVersionID = versions.Versions[0].VersionId
-				break
-			}
-			if time.Now().After(deadline) {
-				if listErr != nil {
-					t.Fatalf("ListVersions on leader: %v", listErr)
-				}
-				t.Fatal("leader should see the version it created")
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-	}
 
-	time.Sleep(2 * time.Second) // wait for Raft replication
-
-	// Verify the same KB is visible from every node (replicated metadata).
-	for i, addr := range nodeAddrs {
-		if !nodeSeesKB(ctx, addr, kbID) {
-			t.Errorf("node %d (%s) should see the version created on the leader", i, addr)
-		}
-	}
-
-	// Query the (empty) initial version on the leader — must succeed and
-	// return an empty result set.
-	// Reads are served by the storage tier: QueryService reads the index manager
-	// and the local stores directly, so a control node has nothing to answer
-	// with. Asking a storage node also checks the data actually got there — the
-	// version was committed by the control tier and dispatched here.
-	_, q, _, qconn, err := dialNode(storageAddrs[0])
-	if err != nil {
-		t.Fatalf("dial leader: %v", err)
-	}
-	defer qconn.Close()
-	queryResp, err := q.Query(ctx, &pb.QueryRequest{
+	// Commit a version of this test's own and assert on THAT version.
+	//
+	// There is no such thing as an "empty initial version" to assert against: the
+	// product refuses a CreateVersion with no changes (ErrEmptyChanges), because a
+	// version's document set is its parent's plus those changes — so an empty list
+	// means "unchanged", not "empty" (internal/coordinator/write_impl.go:254).
+	// And a freshly created KB has no version at all: CreateKnowledgeBase answers
+	// initial_version_id 0, meaning "no version exists yet"
+	// (service/knowledgebase.go:170). So the version under test is one we write.
+	const docID = "consistency-doc"
+	createResp, err := kb.CreateVersion(ctx, &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
-		VersionId:       &initialVersionID,
-		Vector:          queryVector(768),
-		TopK:            5,
+		ClientRequestId: fmt.Sprintf("consistency-%d", time.Now().UnixNano()),
+		Changes: []*pb.DocChange{{
+			Op:      pb.ChangeOp_CHANGE_OP_ADD,
+			DocId:   docID,
+			Content: "多节点一致性：版本元数据要在每个节点可见，且该版本可查询到写入的文档。",
+		}},
 	})
 	if err != nil {
-		t.Fatalf("Query on leader failed: %v", err)
+		t.Fatalf("CreateVersion: %v", err)
 	}
-	if len(queryResp.Results) != 0 {
-		t.Errorf("empty initial version: expected 0 results, got %d", len(queryResp.Results))
+	versionID := createResp.GetVersionId()
+
+	// Metadata replication: every control node must come to see the version. This
+	// is polled, not asserted once — a read through the station is load-balanced
+	// across the control nodes (only writes are pinned to the leader; see
+	// internal/router/router.go's Forward), so the node answering may simply not
+	// have applied the entry yet.
+	replication := time.Now().Add(20 * time.Second)
+	for {
+		allSee := true
+		for _, addr := range nodeAddrs {
+			if !nodeSeesKB(ctx, addr, kbID) {
+				allSee = false
+				break
+			}
+		}
+		if allSee {
+			break
+		}
+		if time.Now().After(replication) {
+			for i, addr := range nodeAddrs {
+				if !nodeSeesKB(ctx, addr, kbID) {
+					t.Errorf("node %d (%s) never saw the version created on the leader", i, addr)
+				}
+			}
+			t.FailNow()
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// Data landed and is queryable. Reads are served by the storage tier — a
+	// control node holds no data to answer with — and the index build is
+	// asynchronous, so the version is not queryable the instant it is committed:
+	// poll until the document that was written comes back.
+	_, q, _, qconn, err := dialNode(storageAddrs[0])
+	if err != nil {
+		t.Fatalf("dial storage: %v", err)
+	}
+	defer qconn.Close()
+
+	build := time.Now().Add(90 * time.Second)
+	var lastErr error
+	for {
+		queryResp, qerr := q.Query(ctx, &pb.QueryRequest{
+			KnowledgeBaseId: kbID,
+			VersionId:       &versionID,
+			Vector:          queryVector(768),
+			TopK:            5,
+		})
+		if qerr == nil && len(queryResp.GetResults()) > 0 {
+			if got := queryResp.GetResults()[0].GetDocId(); got != docID {
+				t.Errorf("top hit docId = %q, want %q", got, docID)
+			}
+			break
+		}
+		lastErr = qerr
+		if time.Now().After(build) {
+			t.Fatalf("the written version never became queryable (last error: %v)", lastErr)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
