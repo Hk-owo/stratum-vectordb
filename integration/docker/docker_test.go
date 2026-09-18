@@ -164,9 +164,22 @@ func probeLeaderOnce(ctx context.Context, label string) (int, string, bool) {
 		}
 		// Confirm this node leads by making it commit something that cannot be
 		// forwarded.
+		//
+		// The change must be NON-EMPTY: the coordinator rejects a CreateVersion
+		// with no changes (InvalidArgument, "empty changes"), so a probe built on
+		// one can never see verr == nil — every caller of waitForLeader times out,
+		// and the whole -tags=docker suite fails at its first step instead of at
+		// whatever it was written to check. The document is never read back; the
+		// KB is fresh per probe, so committing it only serves to prove that this
+		// node is the one that can commit.
 		_, verr := kb.CreateVersion(ctx, &pb.CreateVersionRequest{
 			KnowledgeBaseId: resp.GetKnowledgeBaseId(),
 			ClientRequestId: fmt.Sprintf("probe-%d", time.Now().UnixNano()),
+			Changes: []*pb.DocChange{{
+				Op:      pb.ChangeOp_CHANGE_OP_ADD,
+				DocId:   "probe-doc",
+				Content: "leader probe",
+			}},
 		})
 		conn.Close()
 		if verr == nil {

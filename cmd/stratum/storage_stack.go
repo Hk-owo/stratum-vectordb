@@ -137,9 +137,10 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		// retrain the quantizer. Gated by the KB's quantizer inside the
 		// IndexManager: only SQ8 / PQ learn a codebook, so OFF / SQ_FP16 /
 		// SQ_BF16 KBs never trigger it.
-		MaxCodebookDriftRatio: cfg.IndexMaxCodebookDriftRatio,
-		MaxCodebookAppends:    cfg.IndexMaxCodebookAppends,
-		BuildAbandonTimeout:   cfg.IndexBuildAbandonTimeout,
+		MaxCodebookDriftRatio:      cfg.IndexMaxCodebookDriftRatio,
+		MaxCodebookAppends:         cfg.IndexMaxCodebookAppends,
+		MinCodebookBaselineVectors: cfg.IndexMinCodebookBaselineVectors,
+		BuildAbandonTimeout:        cfg.IndexBuildAbandonTimeout,
 		// §8.6(d) collection. NodeID is deliberately NOT set here: it arrives with
 		// SetGCReplicaCounter below, together with the control-plane client that
 		// answers "how many other replicas are serving" — and without that client

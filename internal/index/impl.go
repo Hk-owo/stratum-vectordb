@@ -163,6 +163,12 @@ type IndexManagerConfig struct {
 	// DefaultMaxCodebookAppends。
 	MaxCodebookDriftRatio float64
 	MaxCodebookAppends    int64
+	// MinCodebookBaselineVectors is the baseline size below which the cumulative
+	// ratio is ignored (only the append-count fallback applies). It exists
+	// because the ratio is scale-free: without a floor, a tiny KB rebuilds on
+	// nearly every version for no benefit. <= 0 takes
+	// DefaultMinCodebookBaselineVectors; NEGATIVE removes the floor.
+	MinCodebookBaselineVectors int64
 
 	// GCRatioThreshold is the dead-vector share above which an ACTIVE version
 	// becomes a §8.6(d) cleanup candidate. It is a separate knob from
@@ -286,6 +292,16 @@ const DefaultMaxCodebookDriftRatio = 0.25
 // added. It covers the KB that writes many small versions, where the cumulative
 // share climbs too slowly to trip the ratio.
 const DefaultMaxCodebookAppends = 50
+
+// DefaultMinCodebookBaselineVectors is the baseline size below which the
+// cumulative ratio is not consulted at all.
+//
+// The ratio is scale-free, so a 4-vector KB trips it by adding a single vector:
+// a full rebuild whose benefit is nil (quantization error cannot matter across
+// four vectors) and whose only observable effect is churn, plus a log line per
+// rebuild claiming the codebook was refreshed. Below this floor only the
+// append-count fallback applies.
+const DefaultMinCodebookBaselineVectors = 1000
 
 // IndexManagerImpl is the real IndexManager implementation, backed by the
 // C++ vecstore's VectorIndexService gRPC. It manages per-version HNSW
@@ -1842,20 +1858,47 @@ func (im *IndexManagerImpl) appendMaxDeadRatio() float64 {
 	return im.cfg.AppendMaxDeadRatio
 }
 
-// maxCodebookDriftRatio / maxCodebookAppends resolve the two §3 triggers that
-// retire a stale codebook (docs/codebook-refresh-plan.md).
-func (im *IndexManagerImpl) maxCodebookDriftRatio() float64 {
-	if im.cfg.MaxCodebookDriftRatio <= 0 {
-		return DefaultMaxCodebookDriftRatio
+// codebookDriftTrigger / codebookAppendsTrigger resolve the two §3 triggers that
+// retire a stale codebook (docs/codebook-refresh-plan.md). A NEGATIVE config
+// value disables that trigger; 0 takes the default.
+//
+// 1.0 does NOT disable the ratio trigger, unlike AppendMaxDeadRatio's 1.0: a
+// dead-vector share cannot exceed 1, but a growth ratio can (a codebook trained
+// on N vectors can face 2N), so 1.0 merely means "the corpus must double". Use a
+// negative value to switch a trigger off.
+func (im *IndexManagerImpl) codebookDriftTrigger() (limit float64, enabled bool) {
+	switch {
+	case im.cfg.MaxCodebookDriftRatio < 0:
+		return 0, false
+	case im.cfg.MaxCodebookDriftRatio == 0:
+		return DefaultMaxCodebookDriftRatio, true
+	default:
+		return im.cfg.MaxCodebookDriftRatio, true
 	}
-	return im.cfg.MaxCodebookDriftRatio
 }
 
-func (im *IndexManagerImpl) maxCodebookAppends() int64 {
-	if im.cfg.MaxCodebookAppends <= 0 {
-		return DefaultMaxCodebookAppends
+func (im *IndexManagerImpl) codebookAppendsTrigger() (limit int64, enabled bool) {
+	switch {
+	case im.cfg.MaxCodebookAppends < 0:
+		return 0, false
+	case im.cfg.MaxCodebookAppends == 0:
+		return DefaultMaxCodebookAppends, true
+	default:
+		return im.cfg.MaxCodebookAppends, true
 	}
-	return im.cfg.MaxCodebookAppends
+}
+
+// minCodebookBaselineVectors is the baseline size below which the cumulative
+// ratio is not consulted (see DefaultMinCodebookBaselineVectors). <= 0 takes the
+// default; a negative value removes the floor.
+func (im *IndexManagerImpl) minCodebookBaselineVectors() int64 {
+	if im.cfg.MinCodebookBaselineVectors < 0 {
+		return 0
+	}
+	if im.cfg.MinCodebookBaselineVectors == 0 {
+		return DefaultMinCodebookBaselineVectors
+	}
+	return im.cfg.MinCodebookBaselineVectors
 }
 
 // quantizerNeedsTraining reports whether this shape keeps a TRAINED codebook.
@@ -1911,15 +1954,29 @@ func (im *IndexManagerImpl) codebookRefreshNeeded(
 		// codebook anyway, so there is nothing stale to refresh.
 		return false, "", 0
 	}
+	// The parent's artifact must be on THIS node. When it is not — ordinary in a
+	// multi-node deployment, where a node may never have built the parent — that
+	// is not a lost baseline but the case appendBase already handles by giving up
+	// the reuse. Reporting "baseline unknown" here would send an operator looking
+	// for a damaged artifact when the real reason is just "the artifact is not
+	// here", so let appendBase do the attributing.
+	if !fileExists(im.indexPath(kbID, parent)) || !fileExists(im.sidecarPath(kbID, parent)) {
+		return false, "", 0
+	}
 	trainedNtotal, appends, known := im.artifactTrainedBaseline(kbID, parent)
 	if !known || trainedNtotal <= 0 {
 		return true, "baseline unknown", 0
 	}
-	if appends >= im.maxCodebookAppends() {
+	if limit, enabled := im.codebookAppendsTrigger(); enabled && appends >= limit {
 		return true, "appends since training", 0
 	}
 	ratio := (float64(totalChunks) - float64(trainedNtotal)) / float64(trainedNtotal)
-	if ratio >= im.maxCodebookDriftRatio() {
+	if floor := im.minCodebookBaselineVectors(); trainedNtotal < floor {
+		// Baseline too small for the ratio to mean anything (see
+		// minCodebookBaselineVectors): report the ratio, decide nothing.
+		return false, "", ratio
+	}
+	if limit, enabled := im.codebookDriftTrigger(); enabled && ratio >= limit {
 		return true, "cumulative drift ratio", ratio
 	}
 	return false, "", ratio

@@ -2637,12 +2637,24 @@ func codebookRefreshManager(
 	maxDrift float64, maxAppends int64,
 ) *IndexManagerImpl {
 	t.Helper()
+	return codebookRefreshManagerFull(t, ds, quantizer, vc, maxDrift, maxAppends, 0)
+}
+
+// codebookRefreshManagerFull is codebookRefreshManager with an explicit
+// MinCodebookBaselineVectors (0 = the IndexManager's default floor, negative =
+// no floor).
+func codebookRefreshManagerFull(
+	t *testing.T, ds *docSource, quantizer string, vc *mockVectorIndexClient,
+	maxDrift float64, maxAppends, minBaseline int64,
+) *IndexManagerImpl {
+	t.Helper()
 	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
-		LRUCapacity:           4,
-		LoadWaitTimeout:       5 * time.Second,
-		IndexDataDir:          t.TempDir(),
-		MaxCodebookDriftRatio: maxDrift,
-		MaxCodebookAppends:    maxAppends,
+		LRUCapacity:                4,
+		LoadWaitTimeout:            5 * time.Second,
+		IndexDataDir:               t.TempDir(),
+		MaxCodebookDriftRatio:      maxDrift,
+		MaxCodebookAppends:         maxAppends,
+		MinCodebookBaselineVectors: minBaseline,
 	})
 	im.SetVersionParentGetter(func(_ context.Context, _ string, versionID int64) (int64, error) {
 		if versionID == 2 {
@@ -2659,11 +2671,16 @@ func codebookRefreshManager(
 }
 
 // 累积新增向量比超阈值 ⇒ 不走追加复用（不调 LoadForAppend），整份重建。
-// 基线 1、现在 4 个向量：ratio = 3.0，远超默认 0.25。
+//
+// 基线取 1000 而不是 1 是刻意的：低于 MinCodebookBaselineVectors 的基线会被比例
+// 判据跳过（见 TestIndexManager_BuildSkipsDriftRatioBelowMinBaseline）。
 func TestIndexManager_BuildRefreshesCodebookWhenDriftRatioExceedsThreshold(t *testing.T) {
 	vc := newMockVectorIndexClient()
-	im := codebookRefreshManager(t, fourChunkDocSource(), "SQ8", vc, 0, 0)
-	installParentArtifact(t, im, sidecarWithCodebookBaseline(1, 0))
+	// 门槛显式压到 2：默认门槛（1000）会让 ratio 恒为负（基线 1000 vs 4 个向量），
+	// 那样测的是门槛而不是比例判据。门槛本身由 BelowMinBaseline 用例覆盖。
+	im := codebookRefreshManagerFull(t, fourChunkDocSource(), "SQ8", vc, 0, 0, 2)
+	// 基线 3、现在 4 个向量 ⇒ ratio = 1/3 ≈ 0.333 ≥ 默认 0.25。
+	installParentArtifact(t, im, sidecarWithCodebookBaseline(3, 0))
 
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
@@ -2748,5 +2765,89 @@ func TestIndexManager_BuildSkipsCodebookRefreshWithoutQuantizer(t *testing.T) {
 	defer vc.mu.Unlock()
 	if vc.loadForAppendCalls != 1 {
 		t.Fatalf("LoadForAppend calls = %d, want 1: a full-precision KB has no codebook", vc.loadForAppendCalls)
+	}
+}
+
+// 基线小于门槛（默认 1000）时比例判据不参与：3 个 chunk 的库加 1 个就是 33%，
+// 判据成立，但重训一个 3 个向量的码本毫无收益。这正是端到端实测里踩到的形状
+// （v50 有 4 个 chunk、v52 有 5 个 ⇒ 每约 25% 增长就整份重建一次）。
+func TestIndexManager_BuildSkipsDriftRatioBelowMinBaseline(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManager(t, fourChunkDocSource(), "SQ8", vc, 0, 0)
+	// 基线 3、现在 4 个向量 ⇒ ratio = 1/3 ≈ 0.333 ≥ 默认 0.25，但 3 < 1000。
+	installParentArtifact(t, im, sidecarWithCodebookBaseline(3, 0))
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1: a 3-vector baseline must not trip the ratio",
+			vc.loadForAppendCalls)
+	}
+}
+
+// 负值 = 关闭比例判据。0 只能表示"用默认"，所以没有别的取值能关掉它。
+// 同时把门槛也去掉，否则"没重建"可能是被门槛拦住的，测不到禁用本身。
+func TestIndexManager_BuildDriftRatioDisabledByNegative(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManagerFull(t, fourChunkDocSource(), "SQ8", vc, -1, 0, -1)
+	// 基线 1、现在 4 个向量 ⇒ ratio = 3.0；门槛已去掉，唯一能拦住它的就是禁用。
+	installParentArtifact(t, im, sidecarWithCodebookBaseline(1, 0))
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1: a disabled ratio trigger must never rebuild",
+			vc.loadForAppendCalls)
+	}
+}
+
+// 1.0 **不**等于关闭：dead-vector share 不可能超过 1，但增长比可以 —— 码本训在 N 个
+// 向量上、后来面对 2N 是常态，所以 1.0 只是"要求语料翻倍"，仍会触发。
+func TestIndexManager_BuildRatioOnePointZeroStillFires(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManagerFull(t, fourChunkDocSource(), "SQ8", vc, 1.0, 0, -1)
+	// 基线 2、现在 4 个向量 ⇒ ratio 恰好 1.0 ≥ 1.0。
+	installParentArtifact(t, im, sidecarWithCodebookBaseline(2, 0))
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 0 {
+		t.Fatalf("LoadForAppend calls = %d, want 0: 1.0 must still fire at a doubled corpus",
+			vc.loadForAppendCalls)
+	}
+}
+
+// 父产物不在本节点 ⇒ 这**不是**"基线丢失"。多节点下某台节点从没构建过父版本是常态，
+// appendBase 本来就会因此放弃复用；这里必须返回 false，把归因留给 appendBase 的日志
+// （报 baseline unknown 会让人去找一个根本不存在的损坏产物）。
+func TestIndexManager_CodebookRefreshSkipsWhenParentArtifactIsAbsent(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManager(t, fourChunkDocSource(), "SQ8", vc, 0, 0)
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild v1: %v", err)
+	}
+	waitIndexLoaded(t, im, "kb-1", 1)
+	// 刻意不写 im.indexPath("kb-1", 1)：父产物不在本节点。
+
+	needed, reason, _ := im.codebookRefreshNeeded(context.Background(), "kb-1", 2,
+		vecstorepb.QuantizerTypeProto_QUANTIZER_SQ8, 4)
+	if needed {
+		t.Fatalf("codebookRefreshNeeded = true (reason %q), want false: an absent parent artifact is not a lost baseline", reason)
+	}
+}
+
+// 坏的基线行按"未知"处理（fail-safe 重建一次），绝不猜一个值 —— 猜错会让机制静默
+// 失效，那比多重建一次糟得多。
+func TestIndexManager_BuildTreatsMalformedBaselineAsUnknown(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := codebookRefreshManager(t, fourChunkDocSource(), "SQ8", vc, 0, 0)
+	installParentArtifact(t, im,
+		"stratum-index-1\n2\n0\n1\ngraph_free 0\ntrained not-a-number x\n")
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+	if vc.loadForAppendCalls != 0 {
+		t.Fatalf("LoadForAppend calls = %d, want 0: a malformed baseline must fail safe into a rebuild",
+			vc.loadForAppendCalls)
 	}
 }

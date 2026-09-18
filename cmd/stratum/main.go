@@ -1712,6 +1712,10 @@ type appConfig struct {
 	// those KBs never trigger a refresh however these knobs are set.
 	IndexMaxCodebookDriftRatio float64
 	IndexMaxCodebookAppends    int64
+	// IndexMinCodebookBaselineVectors is the baseline size below which the drift
+	// ratio is ignored (index_manager.min_codebook_baseline_vectors); <= 0 takes
+	// the IndexManager's default, NEGATIVE removes the floor.
+	IndexMinCodebookBaselineVectors int64
 
 	// IndexGCEnabled turns on §8.6(d) collection (index_manager.gc_enabled). Off
 	// by default: the scanner always runs and only reports, but collection
@@ -1864,6 +1868,9 @@ type fileConfig struct {
 		// codebook (OFF / SQ_FP16 / SQ_BF16); <= 0 takes the default.
 		MaxCodebookDriftRatio float64 `yaml:"max_codebook_drift_ratio"`
 		MaxCodebookAppends    int64   `yaml:"max_codebook_appends"`
+		// MinBaselineVectors is the baseline size below which the drift ratio is
+		// ignored, so a tiny KB does not rebuild on every version.
+		MinBaselineVectors int64 `yaml:"min_codebook_baseline_vectors"`
 		// §8.6(d) collection. GCEnabled is the opt-in: the scanner always runs (it
 		// only reads), but rewriting a SERVING artifact happens only when an
 		// operator says so.
@@ -2051,6 +2058,9 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.IndexManager.MaxCodebookAppends != 0 {
 		cfg.IndexMaxCodebookAppends = fc.IndexManager.MaxCodebookAppends
 	}
+	if fc.IndexManager.MinBaselineVectors != 0 {
+		cfg.IndexMinCodebookBaselineVectors = fc.IndexManager.MinBaselineVectors
+	}
 	// §8.6(d). gc_enabled is a plain bool: absent and false both mean "collect
 	// nothing", which is the only safe reading of a config file that predates the
 	// feature.
@@ -2165,6 +2175,8 @@ func defaultConfig() appConfig {
 		// learns a codebook (SQ8 / PQ) can trigger it.
 		IndexMaxCodebookDriftRatio: 0,
 		IndexMaxCodebookAppends:    0,
+		// 0 => the IndexManager's floor (1000); negative removes it.
+		IndexMinCodebookBaselineVectors: 0,
 
 		// §8.6(d) collection: 0/false means the IndexManager's own defaults, which
 		// are "do not collect" for gc_enabled and 2 for serving_replica_min. The
