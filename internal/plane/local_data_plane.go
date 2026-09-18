@@ -426,11 +426,34 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 		return fmt.Errorf("plane: EnsureIndex(%s, %d): resolve data source: %w", kbID, versionID, err)
 	}
 	if !ok {
-		// No source is known yet (nobody has announced this version, and there
-		// is no leader to fall back on): nothing to do here. The next apply or
-		// reconcile pass tries again, by which time the writer's announcement
-		// has usually arrived.
-		return nil
+		// No source is known yet: nobody has announced this version, and there is
+		// no leader to fall back on. NOTHING WAS DONE here — so this must not read
+		// as success.
+		//
+		// Returning nil is exactly the trap data_source_registry.go:107 already
+		// names ("an ok=false here makes EnsureIndex give up silently, which is
+		// worse than an address that fails"), and it misleads every caller that
+		// acts on the result:
+		//   - plane/lag_catchup.go logs "caught up with the chain tail" for a node
+		//     that caught up nothing. Measured on the 3+3 cluster: a storage replica
+		//     that was away for 55 versions came back with its pre-restart cursor
+		//     (365 against a chain tail of 420) and its artifact count unchanged
+		//     (2 → 2), while the log claimed a catch-up;
+		//   - service/query.go's bounded retry reads nil as "the pull finished" and
+		//     stops retrying — though its own comment notes the announcement that
+		//     would ask for the pull is best-effort and "if this attempt fails
+		//     nothing else will come along";
+		//   - cmd/stratum's apply hook logs an error only for a non-nil result, so
+		//     this outcome was invisible there too.
+		//
+		// ErrIndexNotReady is the right sentinel rather than a new one: its wire
+		// name is already part of the node-to-node protocol (a mixed-version
+		// cluster keeps agreeing on it) and router.retryableReasons already maps it
+		// to "another candidate may have it". The message carries the diagnosis,
+		// since the sentinel alone cannot say which of the two reasons applies.
+		return fmt.Errorf("%w: EnsureIndex(%s, %d): no data source known yet "+
+			"(nothing has announced it and there is no leader to fall back on)",
+			stratumerrors.ErrIndexNotReady, kbID, versionID)
 	}
 
 	// A node must never hold version V without holding V-1: fill any known gap

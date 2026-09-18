@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"testing"
 
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/types"
 )
 
@@ -295,7 +296,13 @@ func TestLocalControlPlane_ReportEpoch_ListErrorPropagates(t *testing.T) {
 
 // --- LocalDataPlane: EnsureIndex -------------------------------------------
 
-func TestLocalDataPlane_EnsureIndex_NoSourceIsNoop(t *testing.T) {
+// A resolve that knows no source must NOT read as success: nothing was fetched, and
+// reporting that as "done" is indistinguishable from a finished pull. It is what let
+// a storage replica that had been away for 55 versions claim a catch-up while its
+// cursor and artifact count stood still (lag_catchup logs "caught up with the chain
+// tail" on a nil result). The error must stay retryable, because another candidate —
+// or the same one a moment later, once the announcement arrives — may have the data.
+func TestLocalDataPlane_EnsureIndex_NoSourceIsNotSuccess(t *testing.T) {
 	puller := &stubPuller{}
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
 		IndexManager: &stubIndexStore{},
@@ -304,11 +311,15 @@ func TestLocalDataPlane_EnsureIndex_NoSourceIsNoop(t *testing.T) {
 		Resolve:      func(context.Context, string, int64) (string, bool, error) { return "", false, nil },
 	})
 
-	if err := dp.EnsureIndex(context.Background(), "kb-1", 4); err != nil {
-		t.Fatalf("EnsureIndex: %v", err)
+	err := dp.EnsureIndex(context.Background(), "kb-1", 4)
+	if err == nil {
+		t.Fatal("EnsureIndex reported success with no data source: nothing was fetched, so no caller can tell this from a completed pull")
+	}
+	if !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+		t.Fatalf("error = %v, want it to wrap ErrIndexNotReady — that sentinel is what keeps it retryable", err)
 	}
 	if puller.calls != 0 {
-		t.Fatalf("puller calls = %d, want 0 (this node is the writer / no leader yet)", puller.calls)
+		t.Fatalf("puller calls = %d, want 0 (there is nothing to pull from)", puller.calls)
 	}
 }
 
