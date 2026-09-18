@@ -13,14 +13,23 @@ import (
 )
 
 // stubStorageGate is a StorageDegradationSource under the test's control.
+//
+// The two tiers are set independently because they are independent answers on the
+// wire; a test that wants "the storage layer is gone" sets unavailable, and one
+// that wants "short a quorum" sets degraded.
 type stubStorageGate struct {
-	degraded bool
-	detail   string
-	known    bool
+	degraded    bool
+	unavailable bool
+	detail      string
+	known       bool
 }
 
 func (g *stubStorageGate) StorageDegraded(string) (bool, string, bool) {
 	return g.degraded, g.detail, g.known
+}
+
+func (g *stubStorageGate) StorageUnavailable(string) (bool, string, bool) {
+	return g.unavailable, g.detail, g.known
 }
 
 // stubHolderSource is a VersionHolderSource under the test's control.
@@ -95,6 +104,37 @@ func TestKnowledgeBaseService_CreateVersionAllowsWhenTheVerdictIsUnknown(t *test
 	}
 }
 
+// The extreme tier gets the other sentinel: "the storage layer is gone" is a
+// different sentence from "it is short a quorum", and the two names are what let a
+// client tell them apart (docs/storage-degradation-signal-plan.md §4.1). The
+// refusal itself is identical — retryable, and the write never reaches the
+// coordinator either way.
+func TestKnowledgeBaseService_CreateVersionNamesTheClusterTier(t *testing.T) {
+	h := newKBSvcTestHarness()
+	h.svc.SetStorageDegradationSource(&stubStorageGate{
+		unavailable: true,
+		detail:      "kb-1: no required replica is live (the quorum is 2); silent: 1 (never reported), 2 (never reported)",
+		known:       true,
+	})
+
+	_, err := h.svc.CreateVersion(context.Background(), createVersionRequest("kb-1"))
+	if err == nil {
+		t.Fatal("want a refusal while not one required replica is live")
+	}
+	if got := status.Code(err); got != codes.Unavailable {
+		t.Errorf("code = %s, want Unavailable (retryable either way)", got)
+	}
+	if got := stratumerrors.ReasonOf(err); got != "storage_unavailable" {
+		t.Errorf("reason = %q, want storage_unavailable", got)
+	}
+	if !strings.Contains(err.Error(), "no required replica is live") {
+		t.Errorf("error = %q, want the cluster-tier diagnosis", err.Error())
+	}
+	if calls := h.writeC.Calls(); len(calls) != 0 {
+		t.Errorf("WriteCoordinator called %d times; the extreme tier must also fail before anything is allocated", len(calls))
+	}
+}
+
 // Without a gate the service behaves exactly as it did before this existed: every
 // existing deployment and test wires no source, and must see no change.
 func TestKnowledgeBaseService_CreateVersionUnchangedWithoutAGate(t *testing.T) {
@@ -166,8 +206,37 @@ func TestKnowledgeBaseService_GetDataVersionHoldersCarriesTheVerdict(t *testing.
 		if err != nil {
 			t.Fatalf("GetDataVersionHolders failed: %v", err)
 		}
-		if resp.GetDegradationKnown() || resp.GetDegraded() {
+		if resp.GetDegradationKnown() || resp.GetDegraded() || resp.GetStorageUnavailable() {
 			t.Error("an unwired gate has no information, which is exactly what degradation_known=false says")
+		}
+	})
+
+	// The extreme tier travels on the same response so the station can name the
+	// refusal the way the control layer does (§4.1) — and its detail has to be the
+	// more specific one, or the station would report "1 of 3" for a cluster where
+	// nobody answers.
+	t.Run("the cluster tier rides along and wins the diagnosis", func(t *testing.T) {
+		h := newKBSvcTestHarness()
+		h.svc.SetStorageDegradationSource(&stubStorageGate{
+			unavailable: true,
+			detail:      "no required replica is live (the quorum is 2); silent: 1 (never reported), 2 (never reported)",
+			known:       true,
+		})
+
+		resp, err := h.svc.GetDataVersionHolders(context.Background(),
+			&pb.GetDataVersionHoldersRequest{KnowledgeBaseId: "kb-1", VersionId: 1})
+		if err != nil {
+			t.Fatalf("GetDataVersionHolders failed: %v", err)
+		}
+		if !resp.GetDegradationKnown() || !resp.GetStorageUnavailable() {
+			t.Errorf("degradation = (known=%v, unavailable=%v), want (true, true)",
+				resp.GetDegradationKnown(), resp.GetStorageUnavailable())
+		}
+		if resp.GetDegraded() {
+			t.Error("degraded must stay false: the two tiers are exclusive on the wire")
+		}
+		if !strings.Contains(resp.GetDegradationDetail(), "no required replica is live") {
+			t.Errorf("detail = %q, want the cluster-tier diagnosis", resp.GetDegradationDetail())
 		}
 	})
 

@@ -51,6 +51,28 @@ func TestRouter_WriteGateRefusesWhenTheSnapshotSaysDegraded(t *testing.T) {
 	}
 }
 
+// The station names the extreme tier the same way the control layer would, so a
+// client sees one error for one fault whichever gate caught it (§4.1).
+func TestRouter_WriteGateNamesTheClusterTier(t *testing.T) {
+	r := &Router{routes: tableWithVerdicts(map[string]degradationVerdict{
+		"kb-1": {unavailable: true, detail: "no required replica is live (the quorum is 2)"},
+	})}
+
+	err := r.writeGate("kb-1")
+	if err == nil {
+		t.Fatal("want a refusal when not one required replica is live")
+	}
+	if got := status.Code(err); got != codes.Unavailable {
+		t.Errorf("code = %s, want Unavailable", got)
+	}
+	if got := stratumerrors.ReasonOf(err); got != "storage_unavailable" {
+		t.Errorf("reason = %q, want storage_unavailable — the same name the control layer gives this fault", got)
+	}
+	if !strings.Contains(err.Error(), "no required replica is live") {
+		t.Errorf("error = %q, want the diagnosis", err.Error())
+	}
+}
+
 // Everything the station cannot judge allows. The snapshot is periodic and carries
 // soft state, so "cannot tell" must fall in the harmless direction or a failover
 // becomes a write outage (§3.3).
@@ -94,12 +116,41 @@ func TestRouteTable_Degradation(t *testing.T) {
 		"kb-1": {degraded: true, detail: "1 of 3 required replicas live"},
 	})
 
-	degraded, detail, known := table.Degradation("kb-1")
-	if !known || !degraded || detail != "1 of 3 required replicas live" {
-		t.Errorf("Degradation(kb-1) = (%v, %q, %v), want (true, the detail, true)", degraded, detail, known)
+	verdict, known := table.Degradation("kb-1")
+	if !known || !verdict.degraded || verdict.unavailable || verdict.detail != "1 of 3 required replicas live" {
+		t.Errorf("Degradation(kb-1) = (%+v, %v), want the degraded verdict", verdict, known)
+	}
+	if !verdict.unhealthy() {
+		t.Error("a KB short of quorum cannot be written")
 	}
 
-	if _, _, known := table.Degradation("kb-other"); known {
+	if _, known := table.Degradation("kb-other"); known {
 		t.Error("a KB the snapshot never saw has no verdict, and absence is not a clean bill of health")
+	}
+}
+
+// The two tiers travel as two fields, and both are "cannot write" — the write gate
+// is what turns the difference into a different sentinel.
+func TestRouteTable_VerdictTiers(t *testing.T) {
+	table := tableWithVerdicts(map[string]degradationVerdict{
+		"kb-gone": {unavailable: true, detail: "no required replica is live (the quorum is 2)"},
+	})
+
+	verdict, known := table.Degradation("kb-gone")
+	if !known {
+		t.Fatal("the snapshot carries a verdict for this KB")
+	}
+	if verdict.degraded {
+		t.Error("degraded must stay false when nobody at all is answering: the tiers are exclusive on the wire")
+	}
+	if !verdict.unavailable || !verdict.unhealthy() {
+		t.Errorf("verdict = %+v, want the unavailable tier and unhealthy", verdict)
+	}
+
+	// The summary is the "is anything wrong" answer, so either tier has to satisfy
+	// it — a read-only client asking about the storage layer does not care which.
+	unhealthy, detail, known := table.DegradationSummary()
+	if !known || !unhealthy || detail == "" {
+		t.Errorf("DegradationSummary = (%v, %q, %v), want the unavailable tier reported as unhealthy", unhealthy, detail, known)
 	}
 }

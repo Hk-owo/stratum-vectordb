@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"strings"
 
 	pb "stratum/api/proto/stratum"
 )
@@ -97,9 +98,28 @@ func (s *QueryServer) Query(ctx context.Context, req *pb.QueryRequest) (*pb.Quer
 			req.MinVersion = &v
 		}
 	}
-	return Forward(s.r, ctx, pb.QueryService_Query_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.QueryResponse, error) {
+	resp, err := Forward(s.r, ctx, pb.QueryService_Query_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.QueryResponse, error) {
 		return s.r.querys[idx].Query(ctx, req)
 	})
+	if err != nil {
+		return nil, err
+	}
+	// §10.1: the storage layer's health rides the READ response, so a client that
+	// only ever reads still learns the cluster is below quorum. Without it the
+	// only way to find out is a write failing, which leaves a read-only caller
+	// permanently blind to a storage layer that is one replica from being unable
+	// to accept anything.
+	//
+	// The verdict comes from THIS station's snapshot, not from the node that
+	// answered, and that is the whole reason the field is set here: the aggregate
+	// is control-leader-side soft state, so a storage node does not have it. The
+	// flag stays false when the snapshot has no verdict, which is the same value
+	// as "healthy" — see the field's comment in the proto for why that collapse is
+	// deliberate.
+	if degraded, _, known := s.r.routes.DegradationSummary(); known {
+		resp.StorageDegraded = degraded
+	}
+	return resp, nil
 }
 
 // AdminServer re-exposes AdminService on the router. Health/system reads
@@ -114,10 +134,43 @@ func NewAdminServer(r *Router) *AdminServer {
 	return &AdminServer{r: r}
 }
 
+// HealthCheck proxies the storage node's LOCAL health and appends the one thing
+// that node cannot know: whether the storage layer as a whole is below quorum.
+//
+// The append is the point (docs/storage-degradation-signal-plan.md §10.1). The
+// verdict lives in the control leader's aggregate, and the node answering
+// HealthCheck is a storage node — its "am I the control leader" answer is
+// constant false (RemoteRaftNode.IsLeader), so the line can never come from
+// there. Without this, storage-layer health is invisible to any probe that does
+// not attempt a write.
+//
+// It goes in Details and NOT in the status: below quorum a replica that still
+// holds the data still serves reads, so a probe that turned this unhealthy would
+// pull traffic off a node that is doing its job (§2 non-goals).
+//
+// An all-in-one node populates the same line from its own control plane (it IS
+// the leader there), so the append is skipped when the line is already present
+// rather than reported twice.
 func (s *AdminServer) HealthCheck(ctx context.Context, req *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
-	return Forward(s.r, ctx, pb.AdminService_HealthCheck_FullMethodName, "", func(idx int, ctx context.Context) (*pb.HealthCheckResponse, error) {
+	resp, err := Forward(s.r, ctx, pb.AdminService_HealthCheck_FullMethodName, "", func(idx int, ctx context.Context) (*pb.HealthCheckResponse, error) {
 		return s.r.admins[idx].HealthCheck(ctx, req)
 	})
+	if err != nil {
+		return nil, err
+	}
+	degraded, detail, known := s.r.routes.DegradationSummary()
+	if !known || !degraded || strings.Contains(resp.GetDetails(), "storage: ") {
+		return resp, nil
+	}
+	// "ok" is what a node with no complaints says; keeping it in front of a
+	// degradation would read as a contradiction, so it is replaced rather than
+	// prefixed.
+	if resp.Details == "" || resp.Details == "ok" {
+		resp.Details = "storage: " + detail
+	} else {
+		resp.Details += "; storage: " + detail
+	}
+	return resp, nil
 }
 
 func (s *AdminServer) GetSystemStatus(ctx context.Context, req *pb.GetSystemStatusRequest) (*pb.GetSystemStatusResponse, error) {

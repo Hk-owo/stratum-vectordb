@@ -315,4 +315,25 @@ message GetDataVersionHoldersResponse {
   // replicas are live, the quorum they must reach, and how long the silent ones
   // have been quiet. Empty when degradation_known is false.
   string degradation_detail = 5;
+
+  // storage_unavailable is the cluster-tier half of the same answer: NOT ONE of
+  // the replicas that must hold a version is live.
+  //
+  // It is strictly narrower than `degraded`, and the three states are:
+  //   degraded=false, storage_unavailable=false  → a quorum is live
+  //   degraded=true,  storage_unavailable=false  → short of a quorum, but someone answers
+  //   degraded=false, storage_unavailable=true   → nobody answers at all
+  // A caller deciding whether a WRITE can land must therefore check both; a caller
+  // reporting "how bad is it" can treat either as unhealthy.
+  //
+  // Why a separate field rather than one tri-state: the two produce different
+  // refusals (kb_storage_degraded vs storage_unavailable), and whoever reads an
+  // error should be able to tell "the storage layer is gone" from "it is one
+  // replica short" (docs/storage-degradation-signal-plan.md §4.1).
+  //
+  // It fires only in the extreme today, because there is one cluster-wide replica
+  // topology: no knowledge base could be in this state while another is not
+  // (§3.1, §12.3). Per-KB placement (§10.2) is what would make the distinction
+  // routine. Like `degraded`, it is only meaningful when degradation_known.
+  bool storage_unavailable = 6;
 }

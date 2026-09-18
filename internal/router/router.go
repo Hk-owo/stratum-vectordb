@@ -274,8 +274,9 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 		// answer would launder missing information into a clean bill of health.
 		if answer.degradationKnown {
 			snap.degradation[kbID] = degradationVerdict{
-				degraded: answer.degraded,
-				detail:   answer.detail,
+				degraded:    answer.degraded,
+				unavailable: answer.unavailable,
+				detail:      answer.detail,
 			}
 		}
 	}
@@ -294,9 +295,12 @@ type holdersAnswer struct {
 	// addrs are the storage addresses the leader named for this version.
 	addrs []string
 
-	// degraded and detail carry the redundancy verdict.
-	degraded bool
-	detail   string
+	// degraded / unavailable / detail carry the redundancy verdict: the two
+	// failure tiers and the diagnosis, straight off the wire. They become a
+	// degradationVerdict in the snapshot, which is what the write gate reads.
+	degraded    bool
+	unavailable bool
+	detail      string
 
 	// degradationKnown is false when the leader reported no verdict: an older
 	// peer that predates the field, or a leader whose replica topology is not
@@ -336,6 +340,7 @@ func (r *Router) versionHolders(ctx context.Context, kbID string, version int64)
 		answer := holdersAnswer{
 			addrs:            make([]string, 0, len(resp.GetHolders())),
 			degraded:         resp.GetDegraded(),
+			unavailable:      resp.GetStorageUnavailable(),
 			detail:           resp.GetDegradationDetail(),
 			degradationKnown: resp.GetDegradationKnown(),
 		}
@@ -454,18 +459,25 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 // Unknown ALWAYS allows: no verdict for the KB, an unwired table, or a KB the
 // snapshot never saw. The snapshot is periodic and what it carries is soft state,
 // so it can be wrong in either direction — which is why the refusal is retryable
-// (ErrKBStorageDegraded is codes.Unavailable) and why this signal never decides
+// (both sentinels are codes.Unavailable) and why this signal never decides
 // correctness, only fails earlier and with a reason the caller can read.
+//
+// Which sentinel it carries follows the leader's verdict: the two tiers get the
+// two names, so a client sees the same error whether the station caught it or the
+// control layer did (§4.1).
 func (r *Router) writeGate(kbID string) error {
 	if r.routes == nil || kbID == "" {
 		return nil
 	}
-	degraded, detail, known := r.routes.Degradation(kbID)
-	if !known || !degraded {
+	verdict, known := r.routes.Degradation(kbID)
+	if !known || !verdict.unhealthy() {
 		return nil
 	}
-	return stratumerrors.ToGRPCStatus(fmt.Errorf("%w: %s",
-		stratumerrors.ErrKBStorageDegraded, detail))
+	sentinel := stratumerrors.ErrKBStorageDegraded
+	if verdict.unavailable {
+		sentinel = stratumerrors.ErrStorageUnavailable
+	}
+	return stratumerrors.ToGRPCStatus(fmt.Errorf("%w: %s", sentinel, verdict.detail))
 }
 
 // budgetSlice bounds one attempt's share of the client's remaining deadline

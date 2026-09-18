@@ -69,22 +69,113 @@ func TestDataVersionRegistry_DegradeWindowIsTheHysteresis(t *testing.T) {
 	reg := NewDataVersionRegistry()
 	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
 
-	required := []int64{1}
+	required := []int64{1, 2, 3}
 	window := 30 * time.Second
 
-	if d := reg.Degrade(required, time.Now(), window); d.State != StorageHealthy {
-		t.Errorf("a report inside the window must count as live: State = %s, want HEALTHY", d.State)
+	if d := reg.Degrade(required, time.Now(), window); d.State != StorageDegraded {
+		t.Errorf("a report inside the window must count as live: State = %s, want DEGRADED (1 of 3 live)", d.State)
 	}
 
-	// Same report, clock moved past the window: it is stale now, and a
-	// single-replica set cannot reach a quorum without it.
+	// Same report, clock moved past the window: it is stale now, and nothing is
+	// left answering — which is the extreme tier, not merely "short".
 	d := reg.Degrade(required, time.Now().Add(window+time.Second), window)
-	if d.State != StorageDegraded {
-		t.Errorf("a report older than the window must not count: State = %s, want DEGRADED", d.State)
+	if d.State != StorageUnavailable {
+		t.Errorf("a report older than the window must not count: State = %s, want UNAVAILABLE", d.State)
 	}
 	if !strings.Contains(d.Detail, "1 (last report") {
 		t.Errorf("Detail = %q, want the age of the last report", d.Detail)
 	}
+}
+
+// The two failure tiers are separate states, and the boundary between them is
+// exactly "is anyone at all still answering" (docs/storage-degradation-signal-plan.md
+// §4.1): one live replica out of three is degraded, zero is unavailable.
+func TestDataVersionRegistry_DegradeTiers(t *testing.T) {
+	reg := NewDataVersionRegistry()
+	required := []int64{1, 2, 3}
+
+	t.Run("one replica answering is DEGRADED", func(t *testing.T) {
+		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+		d := reg.Degrade(required, time.Now(), DefaultStorageSilenceWindow)
+		if d.State != StorageDegraded {
+			t.Errorf("State = %s, want DEGRADED: 1 of 3 is short of the quorum of 2 but someone answers", d.State)
+		}
+		if d.Live != 1 {
+			t.Errorf("Live = %d, want 1", d.Live)
+		}
+	})
+
+	t.Run("nobody answering is UNAVAILABLE", func(t *testing.T) {
+		empty := NewDataVersionRegistry() // not one report for this replica set
+		empty.Record(99, "10.0.0.99:7000", map[string]int64{"kb-1": 9})
+		d := empty.Degrade(required, time.Now(), DefaultStorageSilenceWindow)
+		if d.State != StorageUnavailable {
+			t.Errorf("State = %s, want UNAVAILABLE: none of the required replicas is live", d.State)
+		}
+		if d.Live != 0 || d.Quorum != 2 {
+			t.Errorf("Live/Quorum = %d/%d, want 0/2", d.Live, d.Quorum)
+		}
+		// The diagnosis has to say what makes it the extreme tier, or an operator
+		// cannot tell it from "one short".
+		if !strings.Contains(d.Detail, "no required replica is live") {
+			t.Errorf("Detail = %q, want it to say nobody is answering", d.Detail)
+		}
+		if got := d.State.String(); got != "UNAVAILABLE" {
+			t.Errorf("String() = %q, want UNAVAILABLE", got)
+		}
+	})
+}
+
+// The two reducers the service layer consumes have to disagree in exactly the way
+// the states do, because the pair is what picks the sentinel.
+func TestLocalControlPlane_StorageTierReducers(t *testing.T) {
+	gate := NewLeaderGate(func() bool { return true }, nil)
+
+	cases := []struct {
+		name            string
+		reportedNodes   []int64
+		wantDegraded    bool
+		wantUnavailable bool
+	}{
+		{"a quorum live", []int64{1, 2}, false, false},
+		{"short of a quorum", []int64{1}, true, false},
+		// Node 99 is not in the replica set: the aggregate is non-empty, so this is
+		// a KNOWABLE "nobody required is answering" — distinct from the empty
+		// aggregate below, which is "unknown" and has to fail open.
+		{"nobody required is answering", []int64{99}, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := NewDataVersionRegistry()
+			for _, nodeID := range tc.reportedNodes {
+				reg.Record(nodeID, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+			}
+			c := NewLocalControlPlane(nil,
+				WithDataVersionView(reg, gate),
+				WithRequiredReplicas(func() ([]int64, error) { return []int64{1, 2, 3}, nil }))
+
+			degraded, _, degradedOK := c.StorageDegraded("kb-1")
+			unavailable, _, unavailableOK := c.StorageUnavailable("kb-1")
+			if !degradedOK || !unavailableOK {
+				t.Fatalf("both reducers must have a verdict here (ok = %v / %v)", degradedOK, unavailableOK)
+			}
+			if degraded != tc.wantDegraded || unavailable != tc.wantUnavailable {
+				t.Errorf("reducers = (degraded=%v, unavailable=%v), want (%v, %v)",
+					degraded, unavailable, tc.wantDegraded, tc.wantUnavailable)
+			}
+		})
+	}
+
+	t.Run("unknown leaves both false", func(t *testing.T) {
+		c := NewLocalControlPlane(nil,
+			WithDataVersionView(NewDataVersionRegistry(), gate),
+			WithRequiredReplicas(func() ([]int64, error) { return []int64{1, 2, 3}, nil }))
+		degraded, _, _ := c.StorageDegraded("kb-1")
+		unavailable, _, _ := c.StorageUnavailable("kb-1")
+		if degraded || unavailable {
+			t.Errorf("reducers = (%v, %v), want both false: a caller checking either alone must fail open", degraded, unavailable)
+		}
+	})
 }
 
 // Every way of not knowing is UNKNOWN, never "unavailable" — a fresh leader, an

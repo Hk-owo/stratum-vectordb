@@ -2329,7 +2329,8 @@ func (s versionHolderSource) DataVersionHolders(kbID string, versionID int64) ([
 	return out, true
 }
 
-// StorageDegraded reports whether the storage layer is below quorum for kbID.
+// StorageDegraded reports whether the storage layer is short of a quorum for
+// kbID, with a real replica still answering.
 //
 // ok=false means the verdict is unavailable — this node does not lead, or its
 // replica topology is not wired — and every caller treats that as "allow". See
@@ -2337,4 +2338,12 @@ func (s versionHolderSource) DataVersionHolders(kbID string, versionID int64) ([
 // ever cost a retry, never a refused write that would otherwise have succeeded.
 func (s versionHolderSource) StorageDegraded(kbID string) (bool, string, bool) {
 	return s.cp.StorageDegraded(kbID)
+}
+
+// StorageUnavailable is the other tier: not one required replica is live. The two
+// are separate methods because service declares its own narrow interface rather
+// than importing plane's state enum, and the pair of answers is what decides which
+// sentinel a refusal carries (§4.1).
+func (s versionHolderSource) StorageUnavailable(kbID string) (bool, string, bool) {
+	return s.cp.StorageUnavailable(kbID)
 }

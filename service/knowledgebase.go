@@ -72,12 +72,24 @@ func (s *KnowledgeBaseServiceImpl) SetVersionHolderSource(src VersionHolderSourc
 // WRITE's durability contract for a knowledge base: are enough of the replicas
 // that must hold a version still alive?
 //
-// degraded=false with ok=true means healthy. ok=false means the judgement cannot
-// be made — this node is not the control leader, the replica topology is not
-// wired, or the aggregate has folded no report yet — and callers MUST read that
-// as "allow" rather than as "unavailable". The verdict is soft state, so letting
-// a leadership change refuse writes would turn a failover into an outage
-// (docs/storage-degradation-signal-plan.md §3.3).
+// It reports the two failure tiers separately, because they produce different
+// refusals (docs/storage-degradation-signal-plan.md §4.1):
+//
+//   - StorageDegraded: short of a quorum, with at least one replica still
+//     answering — "this knowledge base cannot be written right now";
+//   - StorageUnavailable: NOT ONE required replica is live — "the storage layer
+//     is gone".
+//
+// They are separate calls rather than one tri-state so this package does not have
+// to import plane's state enum (see the note below); a caller asking "can a write
+// land" consults both, and the order it consults them in decides which name the
+// refusal carries.
+//
+// ok=false means the judgement cannot be made — this node is not the control
+// leader, the replica topology is not wired, or the aggregate has folded no
+// report yet — and callers MUST read that as "allow" rather than as
+// "unavailable". The verdict is soft state, so letting a leadership change refuse
+// writes would turn a failover into an outage (§3.3).
 //
 // detail is the diagnosis a refusal carries: how many replicas are live, the
 // quorum they must reach, and how long the silent ones have been quiet. A refusal
@@ -87,6 +99,7 @@ func (s *KnowledgeBaseServiceImpl) SetVersionHolderSource(src VersionHolderSourc
 // does not depend on plane.
 type StorageDegradationSource interface {
 	StorageDegraded(kbID string) (degraded bool, detail string, ok bool)
+	StorageUnavailable(kbID string) (unavailable bool, detail string, ok bool)
 }
 
 // SetStorageDegradationSource wires the redundancy verdict that the CreateVersion
@@ -124,6 +137,14 @@ func (s *KnowledgeBaseServiceImpl) GetDataVersionHolders(ctx context.Context, re
 		if ok {
 			resp.DegradationDetail = detail
 		}
+		// The cluster tier travels on the same response, so the station names the
+		// refusal the same way the control layer does (§4.1) instead of calling
+		// "the storage layer is gone" a KB-level problem. Its detail is the more
+		// specific one, so it replaces the diagnosis above when it fires.
+		if unavailable, unavailableDetail, ok := s.storageGate.StorageUnavailable(kbID); ok && unavailable {
+			resp.StorageUnavailable = true
+			resp.DegradationDetail = unavailableDetail
+		}
 	}
 
 	if s.versionHolders == nil {
@@ -156,6 +177,13 @@ func (s *KnowledgeBaseServiceImpl) GetDataVersionHolders(ctx context.Context, re
 func (s *KnowledgeBaseServiceImpl) checkStorageWritable(kbID string) error {
 	if s.storageGate == nil {
 		return nil
+	}
+	// The extreme first. "The storage layer is gone" is a KB-level verdict only in
+	// the sense that it applies to every KB; naming it kb_storage_degraded would be
+	// true but unhelpful, and the refusal is identical either way (retryable,
+	// codes.Unavailable) — only the name and the detail differ (§4.1).
+	if unavailable, detail, ok := s.storageGate.StorageUnavailable(kbID); ok && unavailable {
+		return fmt.Errorf("%w: %s", stratumerrors.ErrStorageUnavailable, detail)
 	}
 	degraded, detail, ok := s.storageGate.StorageDegraded(kbID)
 	if !ok || !degraded {

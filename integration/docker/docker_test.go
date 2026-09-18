@@ -208,16 +208,19 @@ func measurementKB(t *testing.T, ctx context.Context, addr, label, probeKB strin
 //
 // The KB from a node that turns out not to lead is left behind. It is harmless
 // (test names are unique) and cheaper than a two-phase probe.
-func probeLeaderOnce(ctx context.Context, label string) (int, string, bool) {
+func probeLeaderOnce(ctx context.Context, label string) (int, string, bool, error) {
 	req := newKBRequest(label)
+	var lastErr error
 	for i, addr := range nodeAddrs {
 		kb, _, _, conn, err := dialNode(addr)
 		if err != nil {
+			lastErr = fmt.Errorf("dial %s: %w", addr, err)
 			continue
 		}
 		resp, err := kb.CreateKnowledgeBase(ctx, req)
 		if err != nil {
 			conn.Close()
+			lastErr = fmt.Errorf("CreateKnowledgeBase on %s: %w", addr, err)
 			continue
 		}
 		// Confirm this node leads by making it commit something that cannot be
@@ -241,10 +244,16 @@ func probeLeaderOnce(ctx context.Context, label string) (int, string, bool) {
 		})
 		conn.Close()
 		if verr == nil {
-			return i, resp.GetKnowledgeBaseId(), true
+			return i, resp.GetKnowledgeBaseId(), true, nil
 		}
+		// Why it failed matters, and folding the reasons together is how a suite
+		// reports "no leader" for a fault that has nothing to do with leadership: a
+		// storage refusal, for instance, means the write DID reach a leader and was
+		// refused further down. waitForLeader reports this string, so the next
+		// person to see a timeout knows which fault they are looking at.
+		lastErr = fmt.Errorf("CreateVersion on %s: %w", addr, verr)
 	}
-	return 0, "", false
+	return 0, "", false, lastErr
 }
 
 // waitForLeader polls probeLeaderOnce until a leader accepts a write or the
@@ -261,17 +270,24 @@ func waitForLeader(t *testing.T, ctx context.Context, label string, timeout time
 	// probe produces. Two consecutive answers from one node is what makes the
 	// write that follows unlikely to race an election.
 	stable := -1
+	var lastErr error
 	for {
-		if idx, kb, ok := probeLeaderOnce(ctx, label); ok {
+		if idx, kb, ok, err := probeLeaderOnce(ctx, label); ok {
 			if idx == stable {
 				return idx, kb
 			}
 			stable = idx
 		} else {
 			stable = -1
+			if err != nil {
+				lastErr = err
+			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for a leader to accept writes")
+			// The cause travels with the timeout. Without it a storage refusal and a
+			// missing leader look identical from here, which is exactly how a suite
+			// ends up blaming leadership for something else entirely.
+			t.Fatalf("timed out waiting for a leader to accept writes; last probe error: %v", lastErr)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

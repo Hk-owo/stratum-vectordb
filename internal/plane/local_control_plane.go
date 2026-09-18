@@ -511,12 +511,32 @@ func (c *LocalControlPlane) StorageDegradation(kbID string) (StorageState, strin
 // interface rather than importing this package, so the state enum never crosses
 // that boundary.
 //
+// STRICTLY "short of a quorum with someone still answering": a caller asking
+// whether a write can land must ask StorageUnavailable as well, and the two
+// answers together decide which sentinel the refusal carries (§4.1). Keeping them
+// apart here is what lets "the storage layer is gone" read differently from "it is
+// one replica short".
+//
 // ok=false keeps its meaning from StorageDegradation: unknown, and therefore
 // ALLOW. degraded is false whenever ok is false, so a caller that checks the flag
 // alone still fails open.
 func (c *LocalControlPlane) StorageDegraded(kbID string) (degraded bool, detail string, ok bool) {
 	state, detail, ok := c.StorageDegradation(kbID)
 	return ok && state == StorageDegraded, detail, ok
+}
+
+// StorageUnavailable is the same reduction for the extreme: NOT ONE required
+// replica is live.
+//
+// It exists so a refusal can say which of the two happened without the service
+// layer importing this package's state enum. Callers that want "can a write land
+// at all" must consult this AND StorageDegraded; callers that want the diagnosis
+// take detail from either.
+//
+// ok=false is unknown, as everywhere else, and therefore ALLOW.
+func (c *LocalControlPlane) StorageUnavailable(kbID string) (unavailable bool, detail string, ok bool) {
+	state, detail, ok := c.StorageDegradation(kbID)
+	return ok && state == StorageUnavailable, detail, ok
 }
 
 // ReclaimableChangesThrough reports the highest version V such that the WAL changes

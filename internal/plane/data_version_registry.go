@@ -204,14 +204,29 @@ const (
 	// somewhere to reach quorum.
 	StorageHealthy StorageState = iota
 
-	// StorageDegraded: fewer than a quorum of the required replicas is live, so a
-	// write cannot reach its durability target. Refusing it up front is the whole
-	// point of this signal: otherwise the attempt spends a version number, a Raft
-	// entry and a retry budget before failing at fan-out (§1.1).
+	// StorageDegraded: fewer than a quorum of the required replicas is live, but
+	// at least one is, so a write cannot reach its durability target. Refusing it
+	// up front is the whole point of this signal: otherwise the attempt spends a
+	// version number, a Raft entry and a retry budget before failing at fan-out
+	// (§1.1).
 	//
 	// Reads are deliberately NOT affected — a replica that still holds the data
 	// can still serve it, and this design keeps that trade-off (§2, non-goals).
 	StorageDegraded
+
+	// StorageUnavailable: NOT ONE required replica is live.
+	//
+	// It is the same "cannot write" answer as StorageDegraded, split out because
+	// "the storage layer is gone" and "it is one replica short of a quorum" are
+	// different diagnoses for whoever reads the error, and §4.1 names them
+	// separately. The refusal itself is identical (retryable, codes.Unavailable) —
+	// only the name and the detail differ.
+	//
+	// NARROWER than it sounds: with a cluster-wide replica topology there is no
+	// knowledge base this could be true for and another it could not, so it fires
+	// only in the extreme (§3.1, §12.3). Per-KB placement (§10.2) is what would
+	// make the distinction between this and StorageDegraded routine.
+	StorageUnavailable
 )
 
 // String renders a StorageState for logs and error details.
@@ -221,6 +236,8 @@ func (s StorageState) String() string {
 		return "HEALTHY"
 	case StorageDegraded:
 		return "DEGRADED"
+	case StorageUnavailable:
+		return "UNAVAILABLE"
 	default:
 		return "UNKNOWN"
 	}
@@ -338,6 +355,15 @@ func (r *DataVersionRegistry) Degrade(required []int64, now time.Time, window ti
 		d.Detail = fmt.Sprintf(
 			"%d of %d required replicas live, below the quorum of %d; silent: %s",
 			live, len(required), quorum, joinLabels(quiet))
+	}
+	// Not one replica answering is a different sentence from "one short", so it
+	// gets its own state (and its own sentinel upstream). It is still the same
+	// refusal: retryable, and it costs the caller nothing but the round trip.
+	if live == 0 {
+		d.State = StorageUnavailable
+		d.Detail = fmt.Sprintf(
+			"no required replica is live (the quorum is %d); silent: %s",
+			quorum, joinLabels(quiet))
 	}
 	return d
 }

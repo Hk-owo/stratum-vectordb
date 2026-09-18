@@ -23,7 +23,7 @@
 - **写幂等 + 卡住的版本有明确归宿** —— `CreateVersion` 的 `client_request_id` 让重试复用首次分配的版本而非另分配一个；PENDING 不再等同于"永远在构建"：**DATA_MISSING**（没有任何候选副本持有该版本的数据，只能由写入方按同一 key 重发救回）与 **FAILED_PERMANENT**（重试预算耗尽或不可恢复，只有运维能重试或放弃）都会在 `GetSystemStatus` 里显式列出。**数据与索引各有自己的状态与终态**（`DataStatus` / `IndexStatus`，判死时标明落在哪一侧），数据写失败不再被记成索引失败。
 - **落后副本自己追上来** —— 存储节点每 5 秒上报一次自己的连续游标，leader 在响应里捎带每个知识库的**链尾**；发现自己落后的节点随即在后台补齐数据、再触发索引（可能直接装载分发来的产物）。**没有开关**：落后自愈是常态，能调的只是节奏（滞后阈值、抖动窗口、并发上限）。
 - **数据源解析有四层** —— 本地注册表 → leader 回退 → 游标探测 → **控制层 holders 镜像**（心跳响应捎带、本地缓存，查表即可，绝不在 Raft apply 路径上发 RPC）。一个错过 push 广播的副本仍能自己找到持有者。
-- **存储层退化是显式信号** —— 存活副本低于 quorum 时，**写被明确拒绝**（`kb_storage_degraded` / `storage_unavailable`，可重试），而**读照常服务**：判据来自已有的周期上报聚合，未知态一律放行；服务站转发前拦一道（省掉注定失败的往返），控制层在提交 Raft 之前再拦一道（不浪费版本号与日志）。
+- **存储层退化是显式信号** —— 存活副本低于 quorum 时，**写被明确拒绝**（`kb_storage_degraded` / `storage_unavailable`，可重试），而**读照常服务**：判据来自已有的周期上报聚合，未知态一律放行；服务站转发前拦一道（省掉注定失败的往返），控制层在提交 Raft 之前再拦一道（不浪费版本号与日志）。**只读调用方也能发现它**：查询响应上的 `storage_degraded` 由服务站填，不必先撞上一次写失败。
 - **自动存储卫生** —— 周期 chunk GC、每版本布隆过滤器、磁盘保留策略的**访问保护**（还在被读的老版本不会被当成死版本删掉）、构建残留的自超时回收、以及可选的墓碑回收；启动时从磁盘事实与持久化游标推导版本可服务状态，不依赖构建回调确实送达。
 - **开箱可运维** —— 三态健康检查；Prometheus `/metrics` 端点（`node.metrics_addr`）；HTTP 网关 + Web 控制台（同源提供、免 CORS）；`start.sh` 一条命令拉起完整链路。
 
@@ -211,11 +211,13 @@ CDC 的默认参数:最小 256 B、最大 1536 B、期望平均 2^9 = 512 B。�
 
 副本不足时,系统的行为**有名字**,而不是"写入一直 PENDING 然后消失":
 
-- **写被明确拒绝**:该 KB 的存活副本低于 quorum 时返回 `kb_storage_degraded`;整个存储层低于 quorum 时返回 `storage_unavailable`。两者都是 `codes.Unavailable`——**可重试**,因为判据是软状态(周期上报的聚合),它也可能偏乐观,调用方必须能回来拿权威结论。
-- **读不受影响**:低于 quorum 时,手里有数据且索引就绪的副本照样服务。这是明确的取舍,不是遗漏。
+- **写被明确拒绝**:该 KB 的存活副本低于 quorum 时返回 `kb_storage_degraded`;一个必需副本都不活时返回 `storage_unavailable`。两者都是 `codes.Unavailable`——**可重试**,因为判据是软状态(周期上报的聚合),它也可能偏乐观,调用方必须能回来拿权威结论。
+- **读不受影响,但读能看到它**:低于 quorum 时,手里有数据且索引就绪的副本照样服务——这是明确的取舍,不是遗漏。而查询响应上的 `storage_degraded` 位由**服务站**填(判定在控制 leader 的聚合里,存储节点没有),所以**只读客户端不必先撞上一次写失败**才知道存储层已经降级。这一位只有一 bit,`false` 同时表示"健康"与"未知":判据是换届即清空的软状态,绝不能把换届读成故障。
 - **判据不新建采集**:用已有的 §7.13.4 周期上报聚合,分母取副本拓扑(不是"谁报了",否则沉默的节点会悄悄退出要求),阈值是 quorum,新鲜度用上报时间窗(`-storage-silence-window`,默认 3 个上报周期 = 15 s)。窗口本身就是滞回,单次缺失不翻转。
+- **三态而不是两态**:`HEALTHY` / `DEGRADED`(有人活但不够 quorum) / `UNAVAILABLE`(**一个必需副本都不活**,即 `live == 0`)。前两档决定写拒绝的 sentinel 名,所以"存储层没了"和"还差一个副本"在读错误的人眼里是两句不同的话。当前只有一份集群级副本拓扑,所以第三档只在极端处触发;per-KB 副本集到位后,这两档的边界才会真正按 KB 划分。
 - **未知一律放行**:判不出有四种来源(本节点不是 leader、聚合为空或换届刚清空、拓扑未装配、拓扑读不到),全部 fail-open——换届瞬间变成写熔断是不可接受的。
-- **两道门控**:服务站刷新路由表时把判定存进快照,转发写之前先拦(提前返回,省掉一次注定失败的控制层往返);控制层 `CreateVersion` 在提交 Raft **之前**再判一次(请求可能绕过服务站直达),否则会先花掉版本号与日志条目。两处的拒绝都带诊断:缺几个副本、最后上报多久。
+- **两道门控**:服务站刷新路由表时把判定存进快照,转发写之前先拦(提前返回,省掉一次注定失败的控制层往返);控制层 `CreateVersion` 在提交 Raft **之前**再判一次(请求可能绕过服务站直达),否则会先花掉版本号与日志条目。两处的拒绝都带诊断:缺几个副本、最后上报多久;两处报的**是同一个 sentinel 名**,同一个故障不会因经过哪道门而换名字。
+- **运维可见**:`HealthCheck` / `GetSystemStatus` 把诊断放进 `Details`,不改状态位——低于 quorum 时读仍在服务,探针报 UNHEALTHY 会把流量从一个正常干活的节点上摘走。这一行由**服务站**补:判定在 leader 手里,而答 HealthCheck 的存储节点不是 leader(`RemoteRaftNode.IsLeader()` 恒为 false),自己永远填不出这一行。
 
 ## 部署形态
 
@@ -296,19 +298,19 @@ Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部�
 | `RollbackVersion` | 切换活跃版本,无停机 |
 | `ListKnowledgeBases` / `GetKnowledgeBase` | 列出 / 查询知识库及其活跃版本 |
 | `DeleteVersion` | 按 `mode` 删除版本:`SUBTREE`(默认,含后代)/ `SINGLE`(仅该版本,子版本改挂其父)/ `ANCESTORS`(删前置版本,使其成为新基底);清理异步执行 |
-| `GetDataVersionHolders` | "哪些节点报过持有该 KB 的这个版本",读控制 leader 的内存聚合(**软状态**:空答案只意味着"我没听到过",不是"没人有");同一响应回带该 KB 的存储层退化判定与诊断 |
+| `GetDataVersionHolders` | "哪些节点报过持有该 KB 的这个版本",读控制 leader 的内存聚合(**软状态**:空答案只意味着"我没听到过",不是"没人有");同一响应回带该 KB 的存储层退化判定(`degraded` / `storage_unavailable` / `degradation_known`)与诊断(`degradation_detail`);服务站据此拦写,并把它变成下面 `Query` 响应上的可见标记 |
 
 **QueryService**
 
 | RPC | 说明 |
 |---|---|
-| `Query` | 向量相似度检索(阈值、top-k、聚合) |
+| `Query` | 向量相似度检索(阈值、top-k、聚合);响应带回 `storage_degraded`("存储层现在低于 quorum"),由**服务站**填(判定在控制 leader 手里,存储节点没有)——**只读客户端靠它就能发现退化**,不必先撞上一次写失败 |
 
 **AdminService**
 
 | RPC | 说明 |
 |---|---|
-| `HealthCheck` | 三态健康检查(HEALTHY / DEGRADED / UNHEALTHY) |
+| `HealthCheck` | 三态健康检查(HEALTHY / DEGRADED / UNHEALTHY);存储层退化**只写进 `Details`、不改状态位**——低于 quorum 时读仍在服务,报 UNHEALTHY 会把流量从一个正常干活的节点上摘走。这一行由**服务站**补:答话的存储节点不是 leader(`RemoteRaftNode.IsLeader()` 恒 false),自己填不出来 |
 | `GetSystemStatus` | 卡住版本、**数据缺失版本**(DATA_MISSING)、**永久失败版本**(FAILED_PERMANENT,带 `side` 说明哪一侧)、**GC 受阻版本**(`gc_blocked_versions`)、删除失败的知识库、删除中的版本、WAL 告警、资源占用 |
 | `GetClusterStatus` | 节点 Raft 视图(node_id / leader_id / member_count),供服务站发现 leader |
 | `RebuildIndex` / `WarmupVersion` | 重试失败版本的索引构建 / 预热版本索引入内存(不切换活跃版本);两者都会登记"被需要",产物受保留策略保护 |
@@ -361,7 +363,8 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 | `TestT4_MinorityFaultTolerance` / `TestT4_LeaderFailover` / `TestT4_NodeRestartRecovery` | 少数派故障、换届、节点重启后的恢复 |
 | `TestT4_QueryLatency` / `TestT4_DataVolume` / `TestT4_MultiVersionEviction` / `TestT4_GCPressure` | 延迟、写入量、多版本换出、墓碑回收 |
 | `TestTwoTier_EveryStorageNodeServesTheWrittenVersion` / `TestTwoTier_StorageGroupToleratesOneNodeDown` | 存储组每个副本都能服务写过的版本;挂一个副本仍可用 |
-| `TestT4_StorageDegradationRefusesWritesButStillServesReads` | 副本低于 quorum:写被明确拒绝、读照常 |
+| `TestT4_StorageDegradationRefusesWritesButStillServesReads` | 副本低于 quorum:写被明确拒绝、读照常;恢复一个副本后门控消失 |
+| `TestT4_StorageUnavailabilityIsNamedDistinctly` | 一个必需副本都不活:改报 `storage_unavailable`——"存储层整体没了"与"还差一个副本"是两句不同的话,且都要能重试 |
 | `TestT4_ActiveLagCatchupCatchesUpWithoutAQuery` / `TestT4_LagCatchupRetentionWindow` | 落后副本不靠查询自己追上;分发能修复的落后深度 |
 | `TestT4_HoldersFallbackPullsTheVersionItMissed` | 错过 push 的副本经控制层 holders 兜底找到数据源 |
 

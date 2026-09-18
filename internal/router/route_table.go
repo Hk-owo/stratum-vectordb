@@ -83,13 +83,29 @@ type routeSnapshot struct {
 
 // degradationVerdict is one knowledge base's redundancy verdict as the leader
 // reported it.
+//
+// degraded and unavailable are mutually exclusive on the wire — they are the two
+// failure tiers of the same judgement (see GetDataVersionHoldersResponse in
+// knowledgebase.proto) — and are kept as two fields rather than one tri-state
+// because that is what the leader sends.
 type degradationVerdict struct {
 	degraded bool
-	detail   string
+	// unavailable means NOT ONE required replica is live: the station names this
+	// refusal storage_unavailable rather than kb_storage_degraded, matching what
+	// the control layer would have answered directly (§4.1).
+	unavailable bool
+	detail      string
+}
+
+// unhealthy reports whether this verdict says a write cannot land, whichever tier
+// it is. Anything asking "can a write succeed here" wants this; anything asking
+// "which failure is it" wants the two fields.
+func (v degradationVerdict) unhealthy() bool {
+	return v.degraded || v.unavailable
 }
 
 // Degradation reports whether the last snapshot says a write for kbID cannot
-// reach quorum, with the leader's diagnosis.
+// reach quorum, which failure tier it is, and the leader's diagnosis.
 //
 // known=false means this station holds no verdict for the KB: no successful
 // refresh yet, the KB was absent from the last one, or the leader answered no
@@ -97,20 +113,63 @@ type degradationVerdict struct {
 // the write then. The verdict is soft state — a leadership change empties the
 // leader's aggregate — so "cannot tell" has to fall in the harmless direction,
 // or a failover becomes a write outage (§3.3, §4.3).
-func (t *RouteTable) Degradation(kbID string) (degraded bool, detail string, known bool) {
+func (t *RouteTable) Degradation(kbID string) (verdict degradationVerdict, known bool) {
+	if t == nil {
+		return degradationVerdict{}, false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if !t.ready {
+		return degradationVerdict{}, false
+	}
+	verdict, ok := t.snapshot.degradation[kbID]
+	if !ok {
+		return degradationVerdict{}, false
+	}
+	return verdict, true
+}
+
+// DegradationSummary reports whether ANY knowledge base in the last snapshot
+// cannot be written — either failure tier — with that verdict's diagnosis.
+//
+// It answers the station's cluster-level questions: the `storage_degraded` flag on
+// a read response, and the storage line HealthCheck appends. Both ask "is the
+// storage layer unhealthy", where BOTH tiers are a yes — the distinction between
+// "short a quorum" and "nobody answering" is worth naming on a refusal (§4.1), but
+// not worth hiding from a caller asking whether things are well.
+//
+// With a single cluster-wide replica topology every KB shares the verdict
+// (docs/storage-degradation-signal-plan.md §3.1), so "some KB is unhealthy" and
+// "the storage layer is unhealthy" are the same statement; per-KB placement
+// (§10.2) is what would make the difference meaningful, and this method is where
+// it would have to be drawn.
+//
+// known=false means the snapshot holds no verdict at all — no successful refresh
+// yet, or the leader reported none — and callers must read it as "report
+// nothing", never as "healthy".
+func (t *RouteTable) DegradationSummary() (unhealthy bool, detail string, known bool) {
 	if t == nil {
 		return false, "", false
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if !t.ready {
+	if !t.ready || len(t.snapshot.degradation) == 0 {
 		return false, "", false
 	}
-	verdict, ok := t.snapshot.degradation[kbID]
-	if !ok {
-		return false, "", false
+	// Sorted so the answer does not depend on map iteration order: a station
+	// answering two identical requests with two different diagnoses would be a
+	// debugging trap.
+	kbs := make([]string, 0, len(t.snapshot.degradation))
+	for kbID := range t.snapshot.degradation {
+		kbs = append(kbs, kbID)
 	}
-	return verdict.degraded, verdict.detail, true
+	sort.Strings(kbs)
+	for _, kbID := range kbs {
+		if verdict := t.snapshot.degradation[kbID]; verdict.unhealthy() {
+			return true, verdict.detail, true
+		}
+	}
+	return false, "", true
 }
 
 // NewRouteTable returns a table refreshed by refresh every interval.

@@ -137,7 +137,17 @@ func (s *AdminServiceImpl) HealthCheck(ctx context.Context, req *pb.HealthCheckR
 	// same answer (§3.1). Per-KB placement (§10.2) is what would make naming
 	// individual knowledge bases meaningful.
 	if s.storageGate != nil {
+		// Either tier is worth reporting here: this line exists so an operator can
+		// see the storage layer's state without attempting a write, and "nobody is
+		// answering" matters at least as much as "one short". Which tier it was is
+		// in the detail; the refusal's NAME is what distinguishes them, and that
+		// belongs on the write (§4.1).
 		if degraded, detail, ok := s.storageGate.StorageDegraded(""); ok && degraded {
+			if details != "" {
+				details += "; "
+			}
+			details += "storage: " + detail
+		} else if unavailable, detail, ok := s.storageGate.StorageUnavailable(""); ok && unavailable {
 			if details != "" {
 				details += "; "
 			}

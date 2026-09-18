@@ -65,4 +65,29 @@ message QueryRequest {
 message QueryResponse {
   repeated QueryResult results = 1;
   int64 version_id = 2; // the version actually queried
+
+  // storage_degraded reports that the storage layer is below quorum for this
+  // knowledge base: fewer than QuorumSize(replicas) of the replicas that must
+  // hold it are still reporting (docs/storage-degradation-signal-plan.md §10.1).
+  //
+  // It rides a READ response on purpose, and it is a REPORT rather than an error
+  // condition: the results above are complete and were served by a replica that
+  // does hold the data. Below quorum this design keeps serving reads (§2), and
+  // this field is how a caller learns that fact WITHOUT having to attempt a
+  // write — otherwise the storage layer's health is discoverable only by a write
+  // failing, which leaves a read-only client permanently blind.
+  //
+  // One bit, deliberately, meaning exactly:
+  //   false = "not degraded, or not known";  true = "below quorum".
+  // The two false cases are collapsed because the judgement is leader-side soft
+  // state that a leadership change empties, so "we cannot tell" must have the
+  // same value as the safe direction — a client must never read a failover as a
+  // broken cluster. A caller that ignores this field behaves exactly as it did
+  // before the field existed; the diagnosis ("1 of 3 required replicas live,
+  // silent: 12") is only available from a write refusal or a health check.
+  //
+  // The station sets it, not the storage node: the verdict lives in the control
+  // leader's aggregate, and the station is what holds a refreshed copy of it. A
+  // read sent DIRECTLY to a storage node therefore carries false regardless.
+  bool storage_degraded = 3;
 }
