@@ -36,6 +36,12 @@ type KnowledgeBaseServiceImpl struct {
 	// -design.md §3.1). Optional: without it the RPC answers known=false and the
 	// station keeps its previous behaviour.
 	versionHolders VersionHolderSource
+
+	// storageGate answers the other half of the same question, from the same
+	// aggregate: can the storage layer still meet a WRITE's durability contract?
+	// Optional, and an unwired gate means "unknown" — which callers read as
+	// "allow" (docs/storage-degradation-signal-plan.md §3.3).
+	storageGate StorageDegradationSource
 }
 
 // VersionHolder is one node that reported holding a version, with the address it
@@ -62,29 +68,100 @@ func (s *KnowledgeBaseServiceImpl) SetVersionHolderSource(src VersionHolderSourc
 	s.versionHolders = src
 }
 
-// GetDataVersionHolders answers the station's route-table question: which nodes
-// reported a contiguous cursor reaching versionID for kbID.
+// StorageDegradationSource answers whether the storage layer can still meet a
+// WRITE's durability contract for a knowledge base: are enough of the replicas
+// that must hold a version still alive?
+//
+// degraded=false with ok=true means healthy. ok=false means the judgement cannot
+// be made — this node is not the control leader, the replica topology is not
+// wired, or the aggregate has folded no report yet — and callers MUST read that
+// as "allow" rather than as "unavailable". The verdict is soft state, so letting
+// a leadership change refuse writes would turn a failover into an outage
+// (docs/storage-degradation-signal-plan.md §3.3).
+//
+// detail is the diagnosis a refusal carries: how many replicas are live, the
+// quorum they must reach, and how long the silent ones have been quiet. A refusal
+// nobody can act on is worse than the retry it saves (§4.3).
+//
+// *plane.LocalControlPlane implements it; declared narrow here so this package
+// does not depend on plane.
+type StorageDegradationSource interface {
+	StorageDegraded(kbID string) (degraded bool, detail string, ok bool)
+}
+
+// SetStorageDegradationSource wires the redundancy verdict that the CreateVersion
+// gate and the holders RPC both read.
+func (s *KnowledgeBaseServiceImpl) SetStorageDegradationSource(src StorageDegradationSource) {
+	s.storageGate = src
+}
+
+// GetDataVersionHolders answers the station's two route-table questions about
+// kbID: which nodes reported a contiguous cursor reaching versionID, and whether
+// the storage layer can still meet a write's durability contract.
 //
 // Deliberately not an error when this node is not the leader: it answers
 // known=false, which the station reads as "ask someone else" rather than as a
 // fact about where data lives. A station treating a follower's empty list as
 // "nobody has it" would route every query away from nodes that do hold it.
+//
+// The redundancy half rides along instead of getting an RPC of its own
+// (docs/storage-degradation-signal-plan.md §4.2): the station already polls this
+// call on every route refresh, and both answers come from the same leader-side
+// aggregate. It is filled even when the holders half cannot answer — the two
+// share an aggregate but not a precondition, and the station's write gate must
+// not go blind merely because the leader has no holder to name.
 func (s *KnowledgeBaseServiceImpl) GetDataVersionHolders(ctx context.Context, req *pb.GetDataVersionHoldersRequest) (*pb.GetDataVersionHoldersResponse, error) {
+	kbID := req.GetKnowledgeBaseId()
+	resp := &pb.GetDataVersionHoldersResponse{}
+
+	if s.storageGate != nil {
+		degraded, detail, ok := s.storageGate.StorageDegraded(kbID)
+		// Degraded is false whenever ok is false, so a reader that ignores
+		// degradation_known still lands on "allow" — see the field's comment in
+		// the proto.
+		resp.Degraded = degraded
+		resp.DegradationKnown = ok
+		if ok {
+			resp.DegradationDetail = detail
+		}
+	}
+
 	if s.versionHolders == nil {
-		return &pb.GetDataVersionHoldersResponse{}, nil
+		return resp, nil
 	}
-	holders, ok := s.versionHolders.DataVersionHolders(req.GetKnowledgeBaseId(), req.GetVersionId())
+	holders, ok := s.versionHolders.DataVersionHolders(kbID, req.GetVersionId())
 	if !ok {
-		return &pb.GetDataVersionHoldersResponse{}, nil
+		return resp, nil
 	}
-	resp := &pb.GetDataVersionHoldersResponse{
-		Known:   true,
-		Holders: make([]*pb.DataVersionHolder, 0, len(holders)),
-	}
+	resp.Known = true
+	resp.Holders = make([]*pb.DataVersionHolder, 0, len(holders))
 	for _, h := range holders {
 		resp.Holders = append(resp.Holders, &pb.DataVersionHolder{NodeId: h.NodeID, Address: h.Address})
 	}
 	return resp, nil
+}
+
+// checkStorageWritable refuses a write whose durability contract the storage
+// layer cannot currently meet (docs/storage-degradation-signal-plan.md §4.3).
+//
+// It runs BEFORE the write coordinator, and that placement is the whole point:
+// letting the write proceed spends a version number and a Raft entry on an
+// attempt that must fail at fan-out, and then bills it to the version's retry
+// budget until it is declared FAILED_PERMANENT (§1.1). Failing here costs one
+// RPC.
+//
+// An unknown verdict (ok=false) ALLOWS. The storage layer's redundancy is soft
+// state that a leadership change empties, so refusing on "cannot tell" would turn
+// a failover into an outage; §3.3 takes the write instead.
+func (s *KnowledgeBaseServiceImpl) checkStorageWritable(kbID string) error {
+	if s.storageGate == nil {
+		return nil
+	}
+	degraded, detail, ok := s.storageGate.StorageDegraded(kbID)
+	if !ok || !degraded {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", stratumerrors.ErrKBStorageDegraded, detail)
 }
 
 // NewKnowledgeBaseService constructs a KnowledgeBaseServiceImpl.
@@ -192,7 +269,23 @@ func (s *KnowledgeBaseServiceImpl) DeleteKnowledgeBase(ctx context.Context, req 
 }
 
 // CreateVersion implements KnowledgeBaseServiceServer.
+//
+// It is the authoritative half of the storage gate (docs/storage-degradation-signal-plan.md
+// §4.3): a request that reaches the control layer directly never passed the
+// service station, and one that did may have passed a station whose snapshot was
+// stale. The check therefore has to live here too, and it has to run before the
+// write coordinator allocates anything — a version number, a Raft entry and the
+// version's retry budget are all spent by an attempt that cannot reach quorum,
+// and the caller gets only a PENDING version that later disappears.
+//
+// The verdict is soft state, so the refusal is retryable (ErrKBStorageDegraded
+// maps to codes.Unavailable): the next attempt is the one that gets the
+// authoritative answer once the aggregate has caught up.
 func (s *KnowledgeBaseServiceImpl) CreateVersion(ctx context.Context, req *pb.CreateVersionRequest) (*pb.CreateVersionResponse, error) {
+	if err := s.checkStorageWritable(req.KnowledgeBaseId); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+
 	changes := make([]types.DocChange, len(req.Changes))
 	for i, c := range req.Changes {
 		op := types.ChangeOpAdd

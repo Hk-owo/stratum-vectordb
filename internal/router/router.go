@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -212,7 +213,11 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 	// trying to avoid, and it was live until this mark was added.
 	ctx = authmeta.WithVerifiedMark(ctx)
 
-	snap := routeSnapshot{servable: map[string]map[int]bool{}, expected: map[string]int64{}}
+	snap := routeSnapshot{
+		servable:    map[string]map[int]bool{},
+		expected:    map[string]int64{},
+		degradation: map[string]degradationVerdict{},
+	}
 
 	// The control layer is the authority on what exists and what version should
 	// be visible; any control node can answer, they share the log.
@@ -242,39 +247,78 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 		snap.expected[kb.GetKnowledgeBaseId()] = kb.GetActiveVersionId()
 	}
 
-	// Per knowledge base, ask which nodes reported holding its expected version.
+	// Per knowledge base, ask which nodes reported holding its expected version,
+	// and whether a write for it can still reach quorum.
 	//
 	// A KB whose query fails, or whose answer comes from a non-leader, is simply
 	// left out: Servable then does not narrow for it, which is the same answer it
-	// gives before the first refresh. The freshness credential still rides the
+	// gives before the first refresh, and the write gate reads a missing verdict
+	// as unknown — which allows. The freshness credential still rides the
 	// forwarded query, so nothing about correctness depends on this succeeding.
 	for kbID, version := range snap.expected {
-		holders, err := r.versionHolders(ctx, kbID, version)
+		answer, err := r.versionHolders(ctx, kbID, version)
 		if err != nil {
 			r.logger.Debug("route table: holders query failed; leaving the KB unnarrowed",
 				zap.String("kb_id", kbID), zap.Int64("version", version), zap.Error(err))
 			continue
 		}
-		set := make(map[int]bool, len(holders))
-		for _, addr := range holders {
+		set := make(map[int]bool, len(answer.addrs))
+		for _, addr := range answer.addrs {
 			if idx, ok := r.storageIndexByAddr[addr]; ok {
 				set[idx] = true
 			}
 		}
 		snap.servable[kbID] = set
+		// Only a KNOWN verdict is recorded. An absent entry is what makes the
+		// write gate allow, so storing a zero-valued "healthy" for an unknown
+		// answer would launder missing information into a clean bill of health.
+		if answer.degradationKnown {
+			snap.degradation[kbID] = degradationVerdict{
+				degraded: answer.degraded,
+				detail:   answer.detail,
+			}
+		}
 	}
 	return snap, nil
 }
 
+// holdersAnswer is one control node's answer to the holders question: the storage
+// addresses that reported holding the version, plus the leader's redundancy
+// verdict for the knowledge base.
+//
+// Both ride one response because both come from one aggregate
+// (docs/storage-degradation-signal-plan.md §4.2), and because the station needs
+// them on one schedule: the write gate reads the verdict, the route table reads
+// the addresses, and a single refresh keeps the two consistent with each other.
+type holdersAnswer struct {
+	// addrs are the storage addresses the leader named for this version.
+	addrs []string
+
+	// degraded and detail carry the redundancy verdict.
+	degraded bool
+	detail   string
+
+	// degradationKnown is false when the leader reported no verdict: an older
+	// peer that predates the field, or a leader whose replica topology is not
+	// wired. That is emphatically not "not degraded" — see
+	// RouteTable.Degradation.
+	degradationKnown bool
+}
+
 // versionHolders asks the control layer which nodes hold kbID at version, and
-// returns their addresses.
+// returns them together with the leader's redundancy verdict for the knowledge
+// base.
 //
 // ok=false from the leader is not an error: it means the node we reached is not
 // the leader and has folded no reports, so the empty answer carries no
 // information. Returning it as a failure is what makes the caller leave the KB
 // unnarrowed instead of recording "no holders", which Servable would otherwise
 // have to interpret.
-func (r *Router) versionHolders(ctx context.Context, kbID string, version int64) ([]string, error) {
+//
+// A non-leader's verdict is skipped along with its holder list, for the same
+// reason it is skipped for the list: an empty aggregate has no verdict to give,
+// and the caller moves on to the node that has one.
+func (r *Router) versionHolders(ctx context.Context, kbID string, version int64) (holdersAnswer, error) {
 	var lastErr error
 	for i := range r.kbs {
 		resp, err := r.kbs[i].GetDataVersionHolders(ctx, &pb.GetDataVersionHoldersRequest{
@@ -289,18 +333,23 @@ func (r *Router) versionHolders(ctx context.Context, kbID string, version int64)
 			lastErr = errors.New("router: holders answer came from a non-leader")
 			continue
 		}
-		addrs := make([]string, 0, len(resp.GetHolders()))
+		answer := holdersAnswer{
+			addrs:            make([]string, 0, len(resp.GetHolders())),
+			degraded:         resp.GetDegraded(),
+			detail:           resp.GetDegradationDetail(),
+			degradationKnown: resp.GetDegradationKnown(),
+		}
 		for _, h := range resp.GetHolders() {
 			if h.GetAddress() != "" {
-				addrs = append(addrs, h.GetAddress())
+				answer.addrs = append(answer.addrs, h.GetAddress())
 			}
 		}
-		return addrs, nil
+		return answer, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("router: no control node answered the holders query")
 	}
-	return nil, lastErr
+	return holdersAnswer{}, lastErr
 }
 
 // candidates narrows a storage-layer call to the nodes the routing table says
@@ -383,9 +432,40 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 		return forwardRead(r, ctx, r.candidates(kbID, expected, n), r.storageBreakers, fn)
 	}
 	if isWriteMethod(fullMethod) {
+		// §4.3(1): refuse a write this station already knows cannot reach quorum,
+		// rather than paying a control-layer round trip to be told the same thing.
+		if err := r.writeGate(kbID); err != nil {
+			return zero, err
+		}
 		return forwardWrite(r, ctx, fn)
 	}
 	return forwardRead(r, ctx, allIndexes(len(r.controlAddrs)), r.controlBreakers, fn)
+}
+
+// writeGate refuses a write the routing cache already knows cannot reach quorum
+// (docs/storage-degradation-signal-plan.md §4.3, first line).
+//
+// This is the station's half of the gate and deliberately the cheap half: it
+// answers from the snapshot the background refresh already took, so the common
+// case costs a map lookup and the doomed control-layer round trip never happens.
+// The control layer checks again regardless, because a request can reach it
+// without passing a station at all.
+//
+// Unknown ALWAYS allows: no verdict for the KB, an unwired table, or a KB the
+// snapshot never saw. The snapshot is periodic and what it carries is soft state,
+// so it can be wrong in either direction — which is why the refusal is retryable
+// (ErrKBStorageDegraded is codes.Unavailable) and why this signal never decides
+// correctness, only fails earlier and with a reason the caller can read.
+func (r *Router) writeGate(kbID string) error {
+	if r.routes == nil || kbID == "" {
+		return nil
+	}
+	degraded, detail, known := r.routes.Degradation(kbID)
+	if !known || !degraded {
+		return nil
+	}
+	return stratumerrors.ToGRPCStatus(fmt.Errorf("%w: %s",
+		stratumerrors.ErrKBStorageDegraded, detail))
 }
 
 // budgetSlice bounds one attempt's share of the client's remaining deadline

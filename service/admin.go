@@ -36,6 +36,12 @@ type AdminServiceImpl struct {
 	// because too few replicas would remain serving. Optional: a control node
 	// keeps no index manager and has nothing to report.
 	gcPressure GCPressureReporter
+
+	// storageGate answers whether the storage layer can still meet a write's
+	// durability contract (docs/storage-degradation-signal-plan.md §4.5).
+	// Optional, and nil means "unknown" — which reports nothing rather than
+	// vouching for a storage layer it cannot see.
+	storageGate StorageDegradationSource
 }
 
 // GCPressureReporter reports the versions whose §8.6(d) dead-weight collection is
@@ -51,6 +57,13 @@ type GCPressureReporter interface {
 // SetGCPressureReporter wires the §8.6(d) blocked-collection report.
 func (s *AdminServiceImpl) SetGCPressureReporter(r GCPressureReporter) {
 	s.gcPressure = r
+}
+
+// SetStorageDegradationSource wires the storage-redundancy verdict that
+// HealthCheck reports in its details. Optional: without it health says nothing
+// about storage rather than reporting it as fine.
+func (s *AdminServiceImpl) SetStorageDegradationSource(src StorageDegradationSource) {
+	s.storageGate = src
 }
 
 // dataMissingMinAgeSec is how long a PENDING version may legitimately still be
@@ -108,6 +121,28 @@ func (s *AdminServiceImpl) HealthCheck(ctx context.Context, req *pb.HealthCheckR
 			details += "; "
 		}
 		details += "index manager: " + err.Error()
+	}
+
+	// Storage redundancy (docs/storage-degradation-signal-plan.md §4.5).
+	//
+	// It belongs in Details and NOT in the status, deliberately: a probe that
+	// turned UNHEALTHY here would have a load balancer pull traffic off a node
+	// whose READS are perfectly fine. Below quorum, a replica that still holds the
+	// data still serves it, and keeping that is the availability trade-off §2
+	// lists as a non-goal to change. The write side fails with a named, retryable
+	// error instead; this line is for whoever has to diagnose it.
+	//
+	// The knowledge base is passed empty because the verdict is currently
+	// KB-independent — the replica topology is cluster-wide, so every KB gets the
+	// same answer (§3.1). Per-KB placement (§10.2) is what would make naming
+	// individual knowledge bases meaningful.
+	if s.storageGate != nil {
+		if degraded, detail, ok := s.storageGate.StorageDegraded(""); ok && degraded {
+			if details != "" {
+				details += "; "
+			}
+			details += "storage: " + detail
+		}
 	}
 
 	if status == pb.HealthStatus_HEALTH_STATUS_HEALTHY && details == "" {

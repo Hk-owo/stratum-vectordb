@@ -47,6 +47,23 @@ var (
 	ErrEmptyChanges         = errors.New("empty changes")
 	ErrIndexLoadTimeout     = errors.New("index load timeout")
 	ErrInvalidParentVersion = errors.New("invalid parent version")
+	// ErrKBStorageDegraded refuses a WRITE to a knowledge base whose live
+	// replicas are below quorum (docs/storage-degradation-signal-plan.md §4.1).
+	//
+	// It is deliberately Unavailable — retryable — and not a terminal
+	// FailedPrecondition: the judgement behind it is soft state (a periodic
+	// aggregate over node reports), so it can be stale in the optimistic
+	// direction too, and the caller has to be able to come back and get the
+	// authoritative verdict. A refusal that a caller cannot act on is worse than
+	// the retry it saves.
+	//
+	// Reads are NOT refused by it. Below quorum a replica that still has the data
+	// can still serve, and this design keeps that trade-off (§2, non-goals).
+	ErrKBStorageDegraded = errors.New("knowledge base storage degraded")
+	// ErrStorageUnavailable is the cluster-wide counterpart: the storage layer as
+	// a whole is below quorum, so no knowledge base can be written. Retryable for
+	// the same reason as ErrKBStorageDegraded.
+	ErrStorageUnavailable = errors.New("storage unavailable")
 )
 
 // sentinelNames gives every sentinel a stable wire name. A proposal forwarded
@@ -76,6 +93,8 @@ var sentinelNames = []struct {
 	{"empty_changes", ErrEmptyChanges},
 	{"index_load_timeout", ErrIndexLoadTimeout},
 	{"invalid_parent_version", ErrInvalidParentVersion},
+	{"kb_storage_degraded", ErrKBStorageDegraded},
+	{"storage_unavailable", ErrStorageUnavailable},
 }
 
 // Name returns the stable wire name of the sentinel err wraps, or "" when err
@@ -120,6 +139,12 @@ var grpcCodeMap = map[error]codes.Code{
 	ErrEmptyChanges:          codes.InvalidArgument,
 	ErrIndexLoadTimeout:      codes.DeadlineExceeded,
 	ErrInvalidParentVersion:  codes.InvalidArgument,
+	// Unavailable, not FailedPrecondition: below quorum the storage layer is
+	// temporarily unable to accept this write — the storage layer is coming back
+	// or a failover is in flight, and the caller should retry rather than treat
+	// the version as rejected. See the sentinel's comment.
+	ErrKBStorageDegraded:  codes.Unavailable,
+	ErrStorageUnavailable: codes.Unavailable,
 }
 
 // ToGRPCStatus converts a business error into a gRPC status error. It walks

@@ -95,6 +95,16 @@ func main() {
 	grpcAddrFlag := flag.String("grpc-addr", "", "gRPC listen address (default 0.0.0.0:7000)")
 	vecstoreAddrFlag := flag.String("vecstore-addr", "", "vecstore gRPC address (default 127.0.0.1:7100)")
 	embedAddrFlag := flag.String("embed-addr", "", "embed service address (default http://localhost:8080)")
+	// How long a required replica may go quiet before the storage-redundancy
+	// verdict stops counting it live (docs/storage-degradation-signal-plan.md
+	// §3.2). Zero keeps the plane's own default, which is three report intervals.
+	//
+	// A flag rather than a YAML key on purpose: it is one of the §10.4 numbers
+	// still to be calibrated against a real deployment, and a wrong verdict is
+	// retryable by design, so getting it wrong costs a retry rather than an
+	// outage.
+	storageSilenceWindowFlag := flag.Duration("storage-silence-window", 0,
+		"how long a required replica may go without reporting before it stops counting as live (default: 3 report intervals)")
 	flag.Parse()
 
 	// --- Configuration ---
@@ -275,7 +285,11 @@ func main() {
 				return nil, errors.New("stratum: replica topology not assembled yet")
 			}
 			return requiredReplicaIDs()
-		}))
+		}),
+		// §3.2: how long a required replica may go quiet before the redundancy
+		// verdict stops counting it live. Zero keeps the plane's default, so an
+		// unconfigured node behaves like every node did before this existed.
+		plane.WithStorageSilenceWindow(*storageSilenceWindowFlag))
 	// Build completion is reported through that contract rather than by
 	// proposing metadata directly: the storage layer no longer reaches into
 	// the Raft state machine itself.
@@ -994,6 +1008,12 @@ func main() {
 		// nodes itself. The adapter bridges plane's Holder to the service's own
 		// type so the service does not import plane.
 		kbSvc.SetVersionHolderSource(versionHolderSource{controlPlane})
+		// §4.3: the same aggregate's other answer — whether a write can still
+		// reach quorum — so a doomed write is refused before the version number,
+		// the Raft entry and the retry budget are spent on it. An unreadable
+		// verdict allows the write, which is how a leadership change stays a
+		// failover rather than an outage.
+		kbSvc.SetStorageDegradationSource(versionHolderSource{controlPlane})
 		pb.RegisterKnowledgeBaseServiceServer(grpcServer, kbSvc)
 	}
 
@@ -1040,6 +1060,12 @@ func main() {
 		// remedy is a larger replica count — so it goes out with the other
 		// needs-a-human signals rather than only into the node's log.
 		adminSvc.SetGCPressureReporter(indexMgr)
+		// §4.5: report storage redundancy through health details. It stays out of
+		// the health STATUS on purpose — a probe that reported UNHEALTHY here
+		// would pull traffic off a node whose reads are still being served. The
+		// verdict is unknown on a node that does not lead, and unknown reports
+		// nothing rather than vouching for storage it cannot see.
+		adminSvc.SetStorageDegradationSource(versionHolderSource{controlPlane})
 		pb.RegisterQueryServiceServer(grpcServer, querySvc)
 		pb.RegisterAdminServiceServer(grpcServer, adminSvc)
 	} else {
@@ -2202,12 +2228,16 @@ func defaultConfig() appConfig {
 	}
 }
 
-// versionHolderSource adapts the control plane's data-version aggregate to what
-// the knowledge base service exposes to the station (§3.1).
+// versionHolderSource adapts the control plane's data-version aggregate to the
+// two things the service layer asks of it: which nodes hold a version (§3.1), and
+// whether the storage layer can still meet a write's durability contract (§4.3).
 //
 // It exists to keep the dependency pointing one way: service does not import
 // plane, so the two Holder types (identical in content) are bridged here, where
-// both are already visible.
+// both are already visible. The redundancy verdict is bridged in the same place
+// for the same reason, and both service callers that need it — the CreateVersion
+// gate and HealthCheck — take this one adapter, so the two type systems meet in
+// exactly one spot.
 type versionHolderSource struct {
 	cp *plane.LocalControlPlane
 }
@@ -2225,4 +2255,14 @@ func (s versionHolderSource) DataVersionHolders(kbID string, versionID int64) ([
 		out = append(out, service.VersionHolder{NodeID: h.NodeID, Address: h.Address})
 	}
 	return out, true
+}
+
+// StorageDegraded reports whether the storage layer is below quorum for kbID.
+//
+// ok=false means the verdict is unavailable — this node does not lead, or its
+// replica topology is not wired — and every caller treats that as "allow". See
+// service.StorageDegradationSource: the verdict is soft state, so it may only
+// ever cost a retry, never a refused write that would otherwise have succeeded.
+func (s versionHolderSource) StorageDegraded(kbID string) (bool, string, bool) {
+	return s.cp.StorageDegraded(kbID)
 }

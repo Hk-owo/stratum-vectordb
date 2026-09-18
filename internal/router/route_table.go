@@ -66,6 +66,51 @@ type routeSnapshot struct {
 	// served at — the control layer's answer, which becomes the freshness
 	// credential on a forwarded query.
 	expected map[string]int64
+
+	// degradation[kbID] is the control leader's redundancy verdict for that
+	// knowledge base (docs/storage-degradation-signal-plan.md §4.3): whether a
+	// write for it can still reach a quorum of the replicas that must hold it.
+	//
+	// It rides the same refresh as `servable` because the leader answers both
+	// from one aggregate, on the RPC this station already polls (§4.2) — no new
+	// channel and no second collection.
+	//
+	// An absent entry means the leader reported no verdict for this KB, which is
+	// "no information": never "healthy", never "unavailable". The write gate lets
+	// the write through on absence — see Degradation.
+	degradation map[string]degradationVerdict
+}
+
+// degradationVerdict is one knowledge base's redundancy verdict as the leader
+// reported it.
+type degradationVerdict struct {
+	degraded bool
+	detail   string
+}
+
+// Degradation reports whether the last snapshot says a write for kbID cannot
+// reach quorum, with the leader's diagnosis.
+//
+// known=false means this station holds no verdict for the KB: no successful
+// refresh yet, the KB was absent from the last one, or the leader answered no
+// verdict for it (a follower, an unwired replica topology). A caller MUST allow
+// the write then. The verdict is soft state — a leadership change empties the
+// leader's aggregate — so "cannot tell" has to fall in the harmless direction,
+// or a failover becomes a write outage (§3.3, §4.3).
+func (t *RouteTable) Degradation(kbID string) (degraded bool, detail string, known bool) {
+	if t == nil {
+		return false, "", false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if !t.ready {
+		return false, "", false
+	}
+	verdict, ok := t.snapshot.degradation[kbID]
+	if !ok {
+		return false, "", false
+	}
+	return verdict.degraded, verdict.detail, true
 }
 
 // NewRouteTable returns a table refreshed by refresh every interval.

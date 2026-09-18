@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -78,6 +79,12 @@ type LocalControlPlane struct {
 	// requirement, and the reclaim verdict would then be derived from the very
 	// reports it is supposed to be checked against.
 	requiredReplicas func() ([]int64, error)
+
+	// silenceWindow is how long a required replica may go without reporting
+	// before the redundancy verdict stops counting it as live
+	// (docs/storage-degradation-signal-plan.md §3.2). It is the verdict's
+	// hysteresis: see Degrade. Zero means DefaultStorageSilenceWindow.
+	silenceWindow time.Duration
 }
 
 // ControlPlaneOption configures a LocalControlPlane.
@@ -440,6 +447,76 @@ func (c *LocalControlPlane) DataVersionHolders(kbID string, versionID int64) ([]
 		return nil, false
 	}
 	return c.dataVersions.Holders(kbID, versionID), true
+}
+
+// WithStorageSilenceWindow sets how long a required replica may go without
+// reporting before the redundancy verdict stops counting it live
+// (docs/storage-degradation-signal-plan.md §3.2). Non-positive values keep
+// DefaultStorageSilenceWindow, which is three report intervals.
+func WithStorageSilenceWindow(d time.Duration) ControlPlaneOption {
+	return func(c *LocalControlPlane) {
+		if d > 0 {
+			c.silenceWindow = d
+		}
+	}
+}
+
+// StorageDegradation reports whether the storage layer can still meet a write's
+// durability contract for kbID, and why not when it cannot.
+//
+// ok=false means the judgement cannot be made — this node is not the control
+// leader, no replica topology is wired, the topology cannot be read, or the
+// aggregate has folded no report yet. Every one of those means the same thing to
+// a caller: ALLOW. This is an expression-layer signal rather than a correctness
+// gate, so "cannot tell" must not become a refusal — see Degradation.Known and
+// the plan's §3.3 (fail-open).
+//
+// kbID is deliberately not part of the judgement. The question a write gate has
+// to answer is "can a quorum of the replicas that must hold this version be
+// reached", and with a single cluster-wide replica topology that answer is the
+// same for every knowledge base (docs/storage-degradation-signal-plan.md §3.1).
+// Per-KB placement (§10.2) is what would separate the two scopes; until then kbID
+// is carried only so the diagnosis names the knowledge base it was asked about.
+//
+// The verdict is soft state and can be stale in either direction, so a refusal
+// must be retryable: the aggregate moves with the periodic reports, and the caller's
+// next attempt is the one that gets the authoritative answer (§4.3).
+func (c *LocalControlPlane) StorageDegradation(kbID string) (StorageState, string, bool) {
+	if c.dataVersions == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
+		return StorageHealthy, "storage redundancy unknown: not the control leader", false
+	}
+	if c.requiredReplicas == nil {
+		return StorageHealthy, "storage redundancy unknown: replica topology not wired", false
+	}
+	required, err := c.requiredReplicas()
+	if err != nil {
+		// An unreadable topology is "unknown", never "unavailable": §3.3 lists it
+		// beside the empty aggregate for exactly that reason.
+		return StorageHealthy, fmt.Sprintf(
+			"storage redundancy unknown: read replica topology: %v", err), false
+	}
+	d := c.dataVersions.Degrade(required, time.Now(), c.silenceWindow)
+	if !d.Known {
+		return StorageHealthy, d.Detail, false
+	}
+	detail := d.Detail
+	if kbID != "" {
+		detail = kbID + ": " + d.Detail
+	}
+	return d.State, detail, true
+}
+
+// StorageDegraded is StorageDegradation reduced to the single bit a write gate
+// needs, in the shape the service layer consumes — it declares its own narrow
+// interface rather than importing this package, so the state enum never crosses
+// that boundary.
+//
+// ok=false keeps its meaning from StorageDegradation: unknown, and therefore
+// ALLOW. degraded is false whenever ok is false, so a caller that checks the flag
+// alone still fails open.
+func (c *LocalControlPlane) StorageDegraded(kbID string) (degraded bool, detail string, ok bool) {
+	state, detail, ok := c.StorageDegradation(kbID)
+	return ok && state == StorageDegraded, detail, ok
 }
 
 // ReclaimableChangesThrough reports the highest version V such that the WAL changes

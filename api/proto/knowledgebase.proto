@@ -292,4 +292,27 @@ message GetDataVersionHoldersResponse {
   // aggregate is empty only because it has never folded a report. The caller
   // should re-resolve the leader rather than read the empty list as a fact.
   bool known = 2;
+
+  // degraded reports whether fewer than a quorum of the replicas that must hold
+  // a version are live, so a WRITE for this knowledge base cannot reach its
+  // durability target (docs/storage-degradation-signal-plan.md §3).
+  //
+  // It rides this response because the station already polls this RPC on every
+  // route refresh (§4.2): no new channel and no new collection, since the
+  // control leader's §7.13.4 aggregate already holds every input the verdict
+  // needs.
+  bool degraded = 3;
+
+  // degradation_known is the same discipline as `known` above: false means
+  // "no information", which is neither healthy nor unavailable. Callers MUST
+  // allow the write when it is false — the verdict is soft state, so a
+  // leadership change (an empty aggregate) must not become a write outage.
+  // A caller that ignores this and reads a zero `degraded` as authoritative
+  // still ends up right, because failing open is the default.
+  bool degradation_known = 4;
+
+  // degradation_detail is the diagnosis a refusal should carry: how many
+  // replicas are live, the quorum they must reach, and how long the silent ones
+  // have been quiet. Empty when degradation_known is false.
+  string degradation_detail = 5;
 }
