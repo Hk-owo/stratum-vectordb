@@ -10,7 +10,6 @@ package errors
 
 import (
 	"errors"
-	"fmt"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
@@ -239,12 +238,4 @@ func ReasonOf(err error) string {
 		}
 	}
 	return ""
-}
-
-// Wrap is a thin convenience wrapper around fmt.Errorf("...: %w", err) for
-// call sites that want to attach context to a business error while
-// preserving errors.Is matchability. It exists purely for readability at
-// call sites; using fmt.Errorf directly is equally correct.
-func Wrap(msg string, err error) error {
-	return fmt.Errorf("%s: %w", msg, err)
 }

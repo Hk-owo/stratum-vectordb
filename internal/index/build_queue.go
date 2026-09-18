@@ -74,7 +74,6 @@ type buildPool struct {
 	backfill    []buildRequest
 	closed      bool
 	inFlight    int
-	peak        int
 	wg          sync.WaitGroup
 }
 
@@ -125,9 +124,6 @@ func (p *buildPool) worker() {
 		}
 		req, _ := p.nextLocked()
 		p.inFlight++
-		if p.inFlight > p.peak {
-			p.peak = p.inFlight
-		}
 		p.mu.Unlock()
 
 		p.fn(req)
@@ -173,12 +169,4 @@ func (p *buildPool) Close() {
 	p.cond.Broadcast()
 	p.mu.Unlock()
 	p.wg.Wait()
-}
-
-// stats reports the builds running right now and the high-water mark. For tests and
-// diagnostics.
-func (p *buildPool) stats() (inFlight, peak int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.inFlight, p.peak
 }

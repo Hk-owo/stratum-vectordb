@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -474,9 +473,4 @@ func cfgNodeID(o OpsConfig) int64 {
 		return o.Services.Stratum.NodeID
 	}
 	return int64(o.NodeID)
-}
-
-// duration converts an ms int to time.Duration (used by tests).
-func msToDuration(ms int64) time.Duration {
-	return time.Duration(ms) * time.Millisecond
 }
