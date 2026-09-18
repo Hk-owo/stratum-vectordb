@@ -268,6 +268,14 @@ func main() {
 	// requiredReplicaIDs is assigned once peerAddrByID exists, further down.
 	var requiredReplicaIDs func() ([]int64, error)
 	controlPlane := plane.NewLocalControlPlane(rn,
+		// The control plane's own advisory logging (the chain-tail signal it
+		// hands back to nodes, and the reports it drops) goes to the node's
+		// logger. Without this it stays on zap.NewNop() and every one of those
+		// lines is discarded.
+		plane.WithControlLogger(logger),
+		// §10.1: how many failed attempts precede the FAILED_PERMANENT verdict.
+		// Zero (the default) keeps plane.DefaultFailureBudget.
+		plane.WithFailureBudget(cfg.ControlPlaneFailureBudget),
 		// §8.6(d): index-readiness reports name the reporter, so the control
 		// layer can tell "how many replicas are serving this version" from
 		// "someone is" — the rolling cleanup asks that before taking one out of
@@ -1143,9 +1151,30 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// node.metrics_addr: the Prometheus endpoint, when the deployment asked for
+	// one. Started before the signal handler so the handler can close it, and a
+	// listen failure is only a warning — losing metrics must not keep the node
+	// from serving.
+	metricsSource := nodeMetricsSource{}
+	if indexMgr != nil {
+		metricsSource.LoadedIndexes = indexMgr.LoadedCount
+	}
+	if chunkStore != nil {
+		metricsSource.ChunkStoreBytes = chunkStore.DiskUsage
+	}
+	metricsSrv, err := startMetricsServer(cfg.MetricsAddr, logger, metricsSource)
+	if err != nil {
+		logger.Warn("metrics endpoint not started", zap.Error(err))
+	}
+
 	go func() {
 		sig := <-sigCh
 		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
+		if metricsSrv != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = metricsSrv.Shutdown(shutdownCtx)
+		}
 		grpcServer.GracefulStop()
 	}()
 
@@ -1630,6 +1659,10 @@ type appConfig struct {
 	RaftAddr string
 	Peers    []raft.PeerConfig
 
+	// MetricsAddr is where this node serves Prometheus /metrics
+	// (node.metrics_addr). Empty — the default — leaves the endpoint off.
+	MetricsAddr string
+
 	// RequireAuthenticated makes this node accept client-facing calls
 	// (KnowledgeBaseService / QueryService / AdminService) only when they carry
 	// the service station's trust mark (Stratum_设计文档v13.md §9.3(5)).
@@ -1667,6 +1700,17 @@ type appConfig struct {
 	// requested; 0 = kvraft default (1000).
 	MaxLogLength uint64
 
+	// ControlPlaneFailureBudget is the global default for how many failed
+	// attempts a version tolerates before the control layer declares it
+	// FAILED_PERMANENT (Stratum_设计文档v13.md §10.1), from
+	// control_plane.failure_budget. Zero or negative keeps
+	// plane.DefaultFailureBudget.
+	//
+	// It is only the default: the control plane also carries a per-KB override
+	// (plane.DurabilityPolicy.MaxFailures). Nothing in the node assembly sets
+	// that one today, so this value is what actually decides the verdict.
+	ControlPlaneFailureBudget int
+
 	VecstoreGRPCAddr string
 	EmbedServiceAddr string
 
@@ -1700,6 +1744,11 @@ type appConfig struct {
 	// IndexMemoryThresholdMB bounds estimated in-memory footprint of all
 	// loaded indexes (index_manager.memory_threshold_mb); <= 0 disables.
 	IndexMemoryThresholdMB int64
+
+	// IndexCandidateN is the coarse-pass candidate budget sent to the vector
+	// store on every search (index_manager.candidate_n, §2.2); <= 0 leaves the
+	// field unset so the vector store applies clamp(top_k × 8, 16, 4096).
+	IndexCandidateN int
 
 	// IndexColdThreshold is how long a version may go unqueried before
 	// the background evaluator rebuilds it in the graph-free form
@@ -1826,6 +1875,7 @@ type fileConfig struct {
 		Role                 string `yaml:"role"`
 		GRPCAddr             string `yaml:"grpc_addr"`
 		RaftAddr             string `yaml:"raft_addr"`
+		MetricsAddr          string `yaml:"metrics_addr"`
 		RequireAuthenticated bool   `yaml:"require_authenticated"`
 	} `yaml:"node"`
 
@@ -1850,6 +1900,16 @@ type fileConfig struct {
 		MaxLogLength int64 `yaml:"max_log_length"`
 	} `yaml:"raft"`
 
+	// ControlPlane carries the control layer's own knobs. Today that is the
+	// failure budget behind the FAILED_PERMANENT verdict (§10.1).
+	ControlPlane struct {
+		// FailureBudget is how many failed attempts a version tolerates before
+		// the control layer declares it FAILED_PERMANENT. 0 keeps the plane's
+		// default (5); a negative value also means "keep the default", since the
+		// plane only accepts positive overrides.
+		FailureBudget int `yaml:"failure_budget"`
+	} `yaml:"control_plane"`
+
 	Storage struct {
 		DataDir string `yaml:"data_dir"`
 
@@ -1871,8 +1931,11 @@ type fileConfig struct {
 	} `yaml:"embed"`
 
 	IndexManager struct {
-		LRUCapacity         int `yaml:"lru_capacity"`
-		MemoryThresholdMB   int `yaml:"memory_threshold_mb"`
+		LRUCapacity       int `yaml:"lru_capacity"`
+		MemoryThresholdMB int `yaml:"memory_threshold_mb"`
+		// CandidateN is the coarse-pass budget for quantized search (§2.2).
+		// 0 leaves it to the vector store's own clamp(top_k × 8, 16, 4096).
+		CandidateN          int `yaml:"candidate_n"`
 		LoadWaitTimeoutMS   int `yaml:"load_wait_timeout_ms"`
 		CallbackMaxRetries  int `yaml:"callback_max_retries"`
 		CallbackRetryBaseMS int `yaml:"callback_retry_base_interval_ms"`
@@ -1984,6 +2047,9 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.Node.RaftAddr != "" {
 		cfg.RaftAddr = fc.Node.RaftAddr
 	}
+	if fc.Node.MetricsAddr != "" {
+		cfg.MetricsAddr = fc.Node.MetricsAddr
+	}
 	if len(fc.Raft.Peers) > 0 {
 		peers := make([]raft.PeerConfig, 0, len(fc.Raft.Peers))
 		for _, p := range fc.Raft.Peers {
@@ -2017,6 +2083,9 @@ func loadConfig(path string) (appConfig, error) {
 		}
 		cfg.Role = role
 	}
+	if fc.ControlPlane.FailureBudget != 0 {
+		cfg.ControlPlaneFailureBudget = fc.ControlPlane.FailureBudget
+	}
 	if fc.Storage.DataDir != "" {
 		cfg.DataDir = fc.Storage.DataDir
 	}
@@ -2041,6 +2110,9 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	if fc.IndexManager.MemoryThresholdMB != 0 {
 		cfg.IndexMemoryThresholdMB = int64(fc.IndexManager.MemoryThresholdMB)
+	}
+	if fc.IndexManager.CandidateN != 0 {
+		cfg.IndexCandidateN = fc.IndexManager.CandidateN
 	}
 	if fc.IndexManager.LoadWaitTimeoutMS != 0 {
 		cfg.IndexLoadWaitTimeout = time.Duration(fc.IndexManager.LoadWaitTimeoutMS) * time.Millisecond

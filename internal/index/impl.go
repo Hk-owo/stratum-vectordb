@@ -96,6 +96,18 @@ type IndexManagerConfig struct {
 	// threshold; LRUCapacity still applies.
 	MemoryThresholdMB int64
 
+	// CandidateN is the coarse-pass budget every search asks the vector store
+	// to use (Stratum_设计文档v12.md §2.2). It is the one knob that trades
+	// quantized recall for latency: the candidate set is what gets re-ranked
+	// against full-precision vectors, so a wider set covers more of the true
+	// neighbours and costs more disk reads.
+	//
+	// <= 0 leaves the field unset on the request, and the vector store applies
+	// its own default — clamp(top_k × 8, 16, 4096). Setting it here overrides
+	// that for every query on this node, which is coarser than deciding per
+	// query but is what the config file can express today.
+	CandidateN int
+
 	// ColdThreshold is how long a version may go without a Search before
 	// the background evaluator rebuilds it in the graph-free form
 	// (§8.6a). The HNSW graph dominates both build time and resident
@@ -557,6 +569,26 @@ func (im *IndexManagerImpl) Close() error {
 	return nil
 }
 
+// searchRequest builds the vector-store search request, applying the node's
+// coarse-pass budget when one is configured (Stratum_设计文档v12.md §2.2).
+//
+// CandidateN stays unset at zero on purpose: the vector store already reads 0
+// as "use my own default" (clamp(top_k × 8, 16, 4096)), and leaving the field
+// out keeps a node that does not configure it identical on the wire to one
+// built before this knob existed.
+func (im *IndexManagerImpl) searchRequest(kbID string, versionID int64, vector []float32, topK int) *vecstorepb.SearchIndexRequest {
+	req := &vecstorepb.SearchIndexRequest{
+		KbId:      kbID,
+		VersionId: versionID,
+		Vector:    vector,
+		TopK:      int32(topK),
+	}
+	if im.cfg.CandidateN > 0 {
+		req.CandidateN = int32(im.cfg.CandidateN)
+	}
+	return req
+}
+
 // Search implements IndexManager.
 func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) {
 	select {
@@ -615,12 +647,7 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 	}
 	defer im.release(key)
 
-	resp, err := im.vectorIndexClient.Search(ctx, &vecstorepb.SearchIndexRequest{
-		KbId:      kbID,
-		VersionId: versionID,
-		Vector:    vector,
-		TopK:      int32(topK),
-	})
+	resp, err := im.vectorIndexClient.Search(ctx, im.searchRequest(kbID, versionID, vector, topK))
 	if err != nil {
 		// Translate the vector store's own classification rather than re-inventing it.
 		// The C++ side already answers a search on a still-building index with

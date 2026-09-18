@@ -48,16 +48,21 @@ except ImportError:
     sys.exit(1)
 
 # 与 cmd/stratum 内置默认值 / configs/config1.yaml 对齐的模板。
-# 注意：fileConfig 目前只解析 node.* / raft.peers / storage.data_dir /
-# vecstore.grpc_addr / embed.service_addr / index_manager.* /
-# write_coordinator.* / delete_coordinator.*；其余字段仅为文档/预留。
+# 注意：fileConfig 只解析它自己结构里带 yaml tag 的键（node.* / raft.* /
+# storage.data_dir / storage.nodes / vecstore.grpc_addr / embed.service_addr /
+# index_manager.* / write_coordinator.* / delete_coordinator.* / bloom_filter.* /
+# gc.* / lag_catchup.* / logging.*）。这里只列真正会被解析的键：写进来而不被
+# 解析的键会静默失效，比不写更糟。
 DEFAULT_TEMPLATE = {
     "node": {
         "node_id": 1,
         "grpc_addr": "0.0.0.0:7000",
         "raft_addr": "0.0.0.0:8000",
         "metrics_addr": "0.0.0.0:9000",
-        "gateway_http_addr": "0.0.0.0:8081",
+    },
+    "control_plane": {
+        # 判 FAILED_PERMANENT 之前容忍的失败次数（§10.1）。0 = 默认（5）。
+        "failure_budget": 0,
     },
     "raft": {
         "peers": [
@@ -76,6 +81,8 @@ DEFAULT_TEMPLATE = {
     "index_manager": {
         "lru_capacity": 16,
         "memory_threshold_mb": 4096,
+        # 量化粗筛候选数（§2.2）。0 = 由 vecstore 用 clamp(top_k × 8, 16, 4096)。
+        "candidate_n": 0,
         "load_wait_timeout_ms": 5000,
         "callback_max_retries": 3,
         "callback_retry_base_interval_ms": 200,

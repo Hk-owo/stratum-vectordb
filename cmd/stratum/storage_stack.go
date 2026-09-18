@@ -129,9 +129,12 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		RetentionProtectWindow: cfg.IndexRetentionProtectWindow,
 		RetentionProtectMax:    cfg.IndexRetentionProtectMax,
 		MemoryThresholdMB:      cfg.IndexMemoryThresholdMB,
-		ColdThreshold:          cfg.IndexColdThreshold,
-		ColdSweepInterval:      cfg.IndexColdSweepInterval,
-		AppendMaxDeadRatio:     cfg.IndexAppendMaxDeadRatio,
+		// §2.2: the coarse-pass budget for quantized search. 0 leaves the field
+		// off the request, so the vector store applies clamp(top_k × 8, 16, 4096).
+		CandidateN:         cfg.IndexCandidateN,
+		ColdThreshold:      cfg.IndexColdThreshold,
+		ColdSweepInterval:  cfg.IndexColdSweepInterval,
+		AppendMaxDeadRatio: cfg.IndexAppendMaxDeadRatio,
 		// §3 codebook refresh (docs/codebook-refresh-plan.md §3). Firing either
 		// trigger rebuilds the version from scratch, which is the only way to
 		// retrain the quantizer. Gated by the KB's quantizer inside the

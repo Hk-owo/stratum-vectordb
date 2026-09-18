@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/cockroachdb/pebble v1.1.5
+	github.com/prometheus/client_golang v1.20.5
 	github.com/restic/chunker v0.2.0
 	go.uber.org/zap v1.28.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20241015192408-796eee8c2d53
@@ -31,7 +32,6 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/prometheus/client_golang v1.20.5 // indirect
 	github.com/prometheus/client_model v0.6.1 // indirect
 	github.com/prometheus/common v0.55.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect

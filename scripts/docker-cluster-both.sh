@@ -198,6 +198,10 @@ node:
   require_authenticated: $REQUIRE_AUTH
   grpc_addr: "0.0.0.0:7000"
   raft_addr: "0.0.0.0:8000"
+  # Prometheus /metrics. In-container, so it is reachable from inside the
+  # container (`docker exec <node> ... 9000/metrics`) — the port is deliberately
+  # not published to the host.
+  metrics_addr: "0.0.0.0:9000"
 
 raft:
   heartbeat_interval_ms: 200
@@ -241,6 +245,8 @@ node:
   require_authenticated: $REQUIRE_AUTH
   grpc_addr: "0.0.0.0:7000"
   raft_addr: "0.0.0.0:8000"
+  # Prometheus /metrics (see the control tier's note).
+  metrics_addr: "0.0.0.0:9000"
 
 raft:
   # The control cluster. A storage node keeps no log of its own.

@@ -1,7 +1,10 @@
 # config1.yaml — Stratum single-node configuration
 #
-# See doc/Stratum_代码风格v2.md "配置文件 Schema" for the authoritative
-# field reference. ${data_dir} is expanded at startup by the application.
+# 权威字段参考是 cmd/stratum 里 config 结构的 yaml tag:本文件只列真正被解析的键,
+# 写在这里而不被解析的键会静默失效,所以宁可少写。
+#
+# 目录布局(docstore / chunkdoc / versiondoc / wal / index)由代码固定在 storage.data_dir
+# 之下,不做配置项 —— 改它们没有任何效果。
 #
 # This file defines a minimal single-node deployment suitable for
 # development and testing against a local vecstore process and a mock
@@ -12,7 +15,11 @@ node:
   grpc_addr: "0.0.0.0:7000"         # KnowledgeBaseService / QueryService / AdminService
   raft_addr: "0.0.0.0:8000"         # Raft internal communication
   metrics_addr: "0.0.0.0:9000"      # Prometheus /metrics
-  gateway_http_addr: "0.0.0.0:8081" # stratum-gateway HTTP (web console + REST /api)
+
+control_plane:
+  # 判 FAILED_PERMANENT 之前容忍的失败次数（Stratum_设计文档v13.md §10.1）。
+  # 0 = 用 plane.DefaultFailureBudget（5）。
+  failure_budget: 0
 
 raft:
   peers:
@@ -21,16 +28,11 @@ raft:
 
 storage:
   data_dir: "/var/lib/stratum/node1"
-  doc_store_path: "${data_dir}/docstore"
-  chunkdoc_path: "${data_dir}/chunkdoc"
-  versiondoc_path: "${data_dir}/versiondoc"
-  wal_path: "${data_dir}/wal"
-  index_path: "${data_dir}/index"
 
 vecstore:
-  rocksdb_path: "${data_dir}/vecstore_rocksdb"
+  # 节点只连 vecstore 的 gRPC 端口;vecstore 进程自己的 --rocksdb_path / --health_addr
+  # 由启动它的脚本给出,不在节点配置里。
   grpc_addr: "127.0.0.1:7100"
-  health_addr: "127.0.0.1:7101"
 
 write_coordinator:
   max_retries: 3
@@ -47,6 +49,11 @@ index_manager:
   # 粗筛器口径记账（单条目显著变小）。启用量化后同样预算可驻留更多版本，
   # 阈值可按部署内存压力自行调整（调低 = 更早换出冷版本粗筛器）。
   memory_threshold_mb: 4096
+  # 量化粗筛的候选数（Stratum_设计文档v12.md §2.2）。它是「量化召回 / 延迟」
+  # 之间唯一的旋钮：候选集就是拿去与全精度向量 rerank 的那批，放大它覆盖更多
+  # 真实近邻、代价是更多磁盘读。0 = 不发送该字段，由 vecstore 用自带默认
+  # clamp(top_k × 8, 16, 4096)。
+  candidate_n: 0
   load_wait_timeout_ms: 5000
   callback_max_retries: 3
   callback_retry_base_interval_ms: 200
@@ -118,19 +125,11 @@ bloom_filter:
   expected_items: 1000000
   false_positive_rate: 0.01
 
-knowledge_base_defaults:
-  chunk_window_size: 512
-  chunk_overlap_size: 64
-  index_type: "HNSW"
-  similarity: "COSINE"
-
-wal:
-  replay_retry_threshold: 3
+# 切块的默认值不在这里:CDC 的 256 B / 1536 B / 512 B 与窗口模式的 512 / 64 都是
+# internal/types 的常量,知识库创建时由请求覆盖。
 
 gc:
   version_retention_count: 50
-  gc_interval_s: 3600
-  audit_log_retention_days: 30
   sweep_interval_s: 300
 
 # 主动落后追赶（docs/active-lag-detection-design.md）。节点每 5 秒向控制 leader 上报
