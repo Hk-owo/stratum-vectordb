@@ -329,8 +329,61 @@ func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
 		t.Errorf("%s never reported a chain-tail catch-up within %v: with nothing asking "+
 			"it for data, it stayed behind", behindSvc, lagCatchupSettle())
 	}
-	if after <= before {
-		t.Errorf("artifacts on %s did not grow (%d → %d), so the catch-up landed nothing",
-			behindSvc, before, after)
+	// What a catch-up moves is this node's CONTIGUOUS HISTORY, not its artifacts.
+	// Artifacts are §8.6(b) lazy by design — a node that holds the data but not the
+	// artifact rebuilds it on demand — and the lag-catch-up design says so outright
+	// (docs/active-lag-detection-design.md:104, "追赶仍是后台预热，缺失产物照旧可按需
+	// 重建"). Counting artifacts therefore asserted something the design never
+	// promises; the cursor is the thing the catch-up actually maintains.
+	//
+	// Note that this cursor already equals the chain tail the moment the node comes
+	// back (RecoverLocalCursors hands a returning node one), so what it states is
+	// where the node ended up — not evidence of what the catch-up did. That evidence
+	// is the log assertion above.
+	// storageHostAddrs, not storageAddrs: the latter is the tier's READ entry point
+	// (TestMain points it at the station), while DataSyncService is node-to-node and
+	// must be dialled directly. Poll, because the node was restarted a moment ago
+	// and its gRPC socket may not be accepting yet.
+	var cursor int64
+	{
+		deadline := time.Now().Add(60 * time.Second)
+		var lastErr error
+		for {
+			c, err := cursorOn(ctx, storageHostAddrs[behind], kbID)
+			if err == nil {
+				cursor = c
+				break
+			}
+			lastErr = err
+			if time.Now().After(deadline) {
+				t.Fatalf("LocalVersion on %s never answered: %v", behindSvc, lastErr)
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
+	t.Logf("cursor on the returning node: %d (chain tail v%d)", cursor, parent)
+	if cursor < parent {
+		t.Errorf("%s cursor = %d, want >= %d (the chain tail it was away from)",
+			behindSvc, cursor, parent)
+	}
+}
+
+// cursorOn asks ONE node how far its contiguous history reaches for kbID, via the
+// node-to-node DataSyncService — §9.3(5) gates the client-facing services, not this
+// one, so no station trust mark is needed and the answer is about that node's own
+// state rather than the tier's.
+func cursorOn(ctx context.Context, hostAddr, kbID string) (int64, error) {
+	conn, err := storageDial(hostAddr)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+
+	resp, err := pb.NewDataSyncServiceClient(conn).LocalVersion(ctx, &pb.LocalVersionRequest{
+		KnowledgeBaseId: kbID,
+	})
+	if err != nil {
+		return 0, err
+	}
+	return resp.GetVersion(), nil
 }
