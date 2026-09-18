@@ -109,8 +109,18 @@ func (c *HTTPEmbedClient) Embed(ctx context.Context, chunks []types.Chunk) (map[
 	if err := json.Unmarshal(respBytes, &embedResp); err != nil {
 		return nil, fmt.Errorf("embed: unmarshal response: %w", err)
 	}
-	if len(embedResp.Vectors) != len(chunks) {
-		return nil, fmt.Errorf("embed: expected %d vectors, got %d", len(chunks), len(embedResp.Vectors))
+	// The response is keyed by ChunkID, so a request that names the same chunk
+	// twice yields ONE entry — correct, not a shortfall: identical content hashes
+	// to the same ChunkID and therefore the same vector. Comparing lengths against
+	// the request therefore rejects a perfectly good response, and every write
+	// whose documents share content hits it — which content addressing makes
+	// common, not rare, since generated/boilerplate text repeats.
+	//
+	// What must hold instead is that every DISTINCT chunk came back.
+	for _, ch := range chunks {
+		if _, ok := embedResp.Vectors[ch.ChunkID]; !ok {
+			return nil, fmt.Errorf("embed: response is missing chunk %q", ch.ChunkID)
+		}
 	}
 
 	return embedResp.Vectors, nil

@@ -190,3 +190,52 @@ func TestHTTPEmbedClient_DeterministicVectors(t *testing.T) {
 		}
 	}
 }
+
+// A request that names the same chunk twice must NOT be treated as a shortfall:
+// the response is keyed by ChunkID, and identical content is the same chunk with
+// the same vector. Comparing lengths rejected this — and since ChunkID is
+// content-addressed, every write whose documents share text hit it. That is
+// exactly how the docker integration's datavolume case stalled: a document
+// sliced into 5 chunks whose texts repeat yielded 3 distinct ids, and all three
+// storage nodes refused the write ("expected 5 vectors, got 3").
+func TestHTTPEmbedClient_AcceptsDuplicateChunksInRequest(t *testing.T) {
+	srv, _ := startMockEmbedServer(8, 0)
+	defer srv.Close()
+
+	client := NewHTTPEmbedClient(srv.URL, 5*time.Second)
+	vectors, err := client.Embed(context.Background(), []types.Chunk{
+		{ChunkID: "dup", Content: "same"},
+		{ChunkID: "other", Content: "different"},
+		{ChunkID: "dup", Content: "same"}, // same content ⇒ same ChunkID ⇒ one entry
+	})
+	if err != nil {
+		t.Fatalf("Embed with a repeated chunk failed: %v", err)
+	}
+	if len(vectors) != 2 {
+		t.Fatalf("vectors = %d, want 2 (one per distinct ChunkID)", len(vectors))
+	}
+	if _, ok := vectors["dup"]; !ok {
+		t.Error("missing vector for dup")
+	}
+	if _, ok := vectors["other"]; !ok {
+		t.Error("missing vector for other")
+	}
+}
+
+// Dropping a chunk the request actually asked for is still an error: the check
+// is about coverage of the distinct ids, not about counting entries.
+func TestHTTPEmbedClient_RejectsResponseMissingAChunk(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"vectors":{"only-one":[]}}`))
+	}))
+	defer srv.Close()
+
+	client := NewHTTPEmbedClient(srv.URL, 5*time.Second)
+	if _, err := client.Embed(context.Background(), []types.Chunk{
+		{ChunkID: "only-one", Content: "a"},
+		{ChunkID: "missing", Content: "b"},
+	}); err == nil {
+		t.Fatal("Embed accepted a response that omitted a requested chunk")
+	}
+}

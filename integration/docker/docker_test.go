@@ -253,25 +253,49 @@ func TestT4_MultiNode_Consistency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// NOTE (unresolved): this case still fails, and deliberately so — it is one
+	// of the assumptions this suite accumulated while it could never run. It
+	// reuses the probe's KB and expects that KB's single version to be EMPTY, but
+	// a working probe has to commit a document to prove leadership, and the
+	// product refuses an empty CreateVersion ("empty changes") — which is why the
+	// probe never worked. Giving this test its own KB is not the fix either: a
+	// freshly created KB has no version at all (initial_version_id 0). Resolving
+	// it means redesigning the probe (a way to create a version with no chunks)
+	// or rewriting the assertions. Left as-is on purpose.
 	leaderIdx, kbID := waitForLeader(t, ctx, "consistency", 30*time.Second)
 	leaderAddr := nodeAddrs[leaderIdx]
 	t.Logf("leader is node %d (%s), KB %s", leaderIdx, leaderAddr, kbID)
 
-	// Look up the initial version id on the leader so we can query it.
 	_, _, _, conn, err := dialNode(leaderAddr)
 	if err != nil {
 		t.Fatalf("dial leader: %v", err)
 	}
 	defer conn.Close()
 	kb := pb.NewKnowledgeBaseServiceClient(conn)
-	versions, err := kb.ListVersions(ctx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
-	if err != nil {
-		t.Fatalf("ListVersions on leader: %v", err)
+	// Poll instead of asserting once. This lookup goes through the station, which
+	// load-balances READS across the control nodes — only writes are pinned to the
+	// leader (internal/router/router.go's Forward), so a KB created a moment ago
+	// may not be on whichever node answers this call. The wait further down for
+	// nodeSeesKB exists for exactly this reason; this lookup just used to run
+	// before it.
+	var initialVersionID int64
+	{
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			versions, listErr := kb.ListVersions(ctx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
+			if listErr == nil && len(versions.Versions) > 0 {
+				initialVersionID = versions.Versions[0].VersionId
+				break
+			}
+			if time.Now().After(deadline) {
+				if listErr != nil {
+					t.Fatalf("ListVersions on leader: %v", listErr)
+				}
+				t.Fatal("leader should see the version it created")
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
-	if len(versions.Versions) < 1 {
-		t.Fatal("leader should see the version it created")
-	}
-	initialVersionID := versions.Versions[0].VersionId
 
 	time.Sleep(2 * time.Second) // wait for Raft replication
 
