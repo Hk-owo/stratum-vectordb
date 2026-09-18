@@ -137,6 +137,64 @@ func newKBRequest(label string) *pb.CreateKnowledgeBaseRequest {
 	}
 }
 
+// stressQuantizer is the quantizer the measurement cases (stress_test.go,
+// datavolume_test.go) build their knowledge base with.
+//
+// Default OFF: full precision, single-stage search. STRATUM_T4_QUANTIZER names
+// one of the §2.4 variants so the same case can be run against a quantized
+// knowledge base and the two runs compared — that comparison is the point
+// (quantization trades memory for a rerank against disk), and it has to use one
+// harness, one cluster and one query generator to mean anything.
+func stressQuantizer() pb.QuantizerType {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("STRATUM_T4_QUANTIZER"))) {
+	case "sq8":
+		return pb.QuantizerType_QUANTIZER_SQ8
+	case "sq_fp16":
+		return pb.QuantizerType_QUANTIZER_SQ_FP16
+	case "sq_bf16":
+		return pb.QuantizerType_QUANTIZER_SQ_BF16
+	case "pq":
+		return pb.QuantizerType_QUANTIZER_PQ
+	default:
+		return pb.QuantizerType_QUANTIZER_OFF
+	}
+}
+
+// measurementKB returns the knowledge base a measurement case should fill.
+//
+// With the default quantizer it is the leader probe's own KB, unchanged. With a
+// quantizer set it is a fresh KB built for the purpose: the probe's KB is created
+// before the quantizer is known and holds a single document — far too few to
+// train SQ8/PQ's codebook — and the quantizer is immutable after creation, so
+// getting it wrong there could not be repaired by a later call.
+func measurementKB(t *testing.T, ctx context.Context, addr, label, probeKB string) string {
+	q := stressQuantizer()
+	if q == pb.QuantizerType_QUANTIZER_OFF {
+		return probeKB
+	}
+	t.Helper()
+
+	req := newKBRequest(label)
+	req.Quantizer = q
+	if q == pb.QuantizerType_QUANTIZER_PQ {
+		req.PqM = 96 // d=768 → 96 sub-vectors of 8 dims
+		req.PqNbits = 8
+	}
+
+	kb, _, _, conn, err := dialNode(addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	defer conn.Close()
+
+	resp, err := kb.CreateKnowledgeBase(ctx, req)
+	if err != nil {
+		t.Fatalf("CreateKnowledgeBase(quantizer=%v): %v", q, err)
+	}
+	t.Logf("measuring with quantizer %v, KB %s", q, resp.GetKnowledgeBaseId())
+	return resp.GetKnowledgeBaseId()
+}
+
 // probeLeaderOnce finds the node that actually accepts writes, returning its
 // index and the KB it created.
 //

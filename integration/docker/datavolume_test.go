@@ -188,6 +188,7 @@ func TestT4_DataVolume(t *testing.T) {
 
 	leaderIdx, kbID := waitForLeader(t, ctx, "datavolume", 30*time.Second)
 	leaderAddr := nodeAddrs[leaderIdx]
+	kbID = measurementKB(t, ctx, leaderAddr, "datavolume", kbID)
 	t.Logf("leader is node %d (%s), KB %s, writing %d documents", leaderIdx, leaderAddr, kbID, docCount)
 
 	_, _, _, conn, err := dialNode(leaderAddr)

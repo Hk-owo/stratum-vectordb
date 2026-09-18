@@ -278,6 +278,7 @@ func TestT4_QueryLatency(t *testing.T) {
 
 	leaderIdx, kbID := waitForLeader(t, ctx, "stress-latency", 30*time.Second)
 	leaderAddr := nodeAddrs[leaderIdx]
+	kbID = measurementKB(t, ctx, leaderAddr, "stress-latency", kbID)
 	docCount := stressDocs()
 	t.Logf("leader is node %d (%s), KB %s, writing %d documents", leaderIdx, leaderAddr, kbID, docCount)
 
