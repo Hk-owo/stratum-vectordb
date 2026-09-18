@@ -310,11 +310,22 @@ func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
 	// rebuild. Whatever it does, it does on its own.
 	startNode(t, behindSvc)
 
+	// Match the LINE, including this KB's id — not the whole log blob. The line is
+	// JSON and carries kb_id, and a previous case's knowledge base may still be
+	// catching up: "caught up with the chain tail" for THAT one is not evidence
+	// about this one. Measured before this was fixed: a run reported caughtUp=true
+	// for a KB whose cursor never moved, on the strength of a catch-up logged for
+	// two-tier-fault-*.
 	deadline := time.Now().Add(lagCatchupSettle())
 	caughtUp := false
 	for time.Now().Before(deadline) {
-		if strings.Contains(nodeLogsSince(t, behindSvc), "caught up with the chain tail") {
-			caughtUp = true
+		for _, line := range strings.Split(nodeLogsSince(t, behindSvc), "\n") {
+			if strings.Contains(line, "caught up with the chain tail") && strings.Contains(line, kbID) {
+				caughtUp = true
+				break
+			}
+		}
+		if caughtUp {
 			break
 		}
 		time.Sleep(5 * time.Second)
