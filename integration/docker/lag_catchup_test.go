@@ -316,7 +316,19 @@ func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
 	// about this one. Measured before this was fixed: a run reported caughtUp=true
 	// for a KB whose cursor never moved, on the strength of a catch-up logged for
 	// two-tier-fault-*.
-	deadline := time.Now().Add(lagCatchupSettle())
+	// Scale the wait with the SIZE OF THE GAP, not with the shared default settle:
+	// this case deliberately writes lagCatchupVersions() of them, and under the load
+	// of a full suite each one costs a pull plus a build. Measured: a run whose
+	// catch-up had actually finished (log: "caught up with the chain tail" v841) was
+	// declared "never caught up", because the 45 s window closed while that node was
+	// still pulling — its cursor read 786 (the pre-restart value) and its artifact
+	// count had already grown from the §8.4 distribution, which runs ahead of the
+	// data. The window has to describe the gap, not the clock.
+	settle := lagCatchupSettle()
+	if scaled := time.Duration(versions) * 3 * time.Second; scaled > settle {
+		settle = scaled
+	}
+	deadline := time.Now().Add(settle)
 	caughtUp := false
 	for time.Now().Before(deadline) {
 		for _, line := range strings.Split(nodeLogsSince(t, behindSvc), "\n") {
@@ -338,7 +350,7 @@ func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
 
 	if !caughtUp {
 		t.Errorf("%s never reported a chain-tail catch-up within %v: with nothing asking "+
-			"it for data, it stayed behind", behindSvc, lagCatchupSettle())
+			"it for data, it stayed behind", behindSvc, settle)
 	}
 	// What a catch-up moves is this node's CONTIGUOUS HISTORY, not its artifacts.
 	// Artifacts are §8.6(b) lazy by design — a node that holds the data but not the
