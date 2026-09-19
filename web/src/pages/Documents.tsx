@@ -1,9 +1,11 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { ApiError } from '../api/client'
+import { appendHistory } from '../history/store'
 import { useKnowledgeBase, useRollbackVersion, useVersions } from '../api/queries'
 import { submitBatches } from '../ingest/batch'
 import { chainTail } from '../ingest/chainTail'
+import { loadPrefs, savePrefs } from '../settings/store'
 import { docIdOf } from '../ingest/docid'
 import { sha256Hex } from '../ingest/hash'
 import { UnsupportedFileError, acceptedExtensions, parseFile } from '../ingest/parsers'
@@ -42,6 +44,18 @@ export function Documents({ kbId }: { kbId: string | null }) {
    * 激活」正是 `AWAIT_TARGET_DATA_DURABLE` 存在的理由。
    */
   const [durableOnly, setDurableOnly] = useState(false)
+
+  // 恢复上次的导入模式。与检索参数同理：只读一次，此后以用户的操作为准。
+  useEffect(() => {
+    void (async () => {
+      setDurableOnly((await loadPrefs()).durable_only)
+    })()
+  }, [])
+
+  function toggleDurableOnly(next: boolean) {
+    setDurableOnly(next)
+    void savePrefs({ durable_only: next })
+  }
 
   const fileInput = useRef<HTMLInputElement>(null)
   const dirInput = useRef<HTMLInputElement>(null)
@@ -160,6 +174,17 @@ export function Documents({ kbId }: { kbId: string | null }) {
       saveDigests(digests)
 
       const done = summary.versions.length
+      // 只记真正落地的批次。没落地的那些在「在途」面板里有更详细的状态，混进
+      // 历史会让"我提交过什么"这件事变得不可信。
+      if (done > 0) {
+        void appendHistory({
+          kind: 'submit',
+          knowledge_base_id: kbId,
+          detail:
+            `${ready.length} 个文件 → ${done} 个版本（${summary.versions.map((v) => `v${v}`).join('、')}）` +
+            (durableOnly ? '，按 DATA_DURABLE 收口' : ''),
+        })
+      }
       // 提交 ≠ 发布：落地的版本如果不是当前**激活**版本，检索页就还看不到它。
       //
       // 导入模式（等 DATA_DURABLE）下刻意不提激活：那个版本还没 READY，而激活一个
@@ -221,7 +246,7 @@ export function Documents({ kbId }: { kbId: string | null }) {
           type="checkbox"
           checked={durableOnly}
           disabled={disabled}
-          onChange={(e) => setDurableOnly(e.target.checked)}
+          onChange={(e) => toggleDurableOnly(e.target.checked)}
         />
         <span>
           <strong>导入模式</strong>

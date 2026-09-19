@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 
+import { appendHistory } from '../history/store'
 import {
   DataStatus,
   IndexStatus,
@@ -73,6 +74,18 @@ export function Versions({ kbId }: { kbId: string | null }) {
     try {
       const outcome = await resendPending(w, chainTail(versions.data?.versions ?? []), {
         onProgress: (stage) => setResendNote((p) => ({ ...p, [w.id]: `等待中 · ${stage}` })),
+      })
+      // 只有真的落地才算"重发成功"——DISCARD 意味着数据找不回来，那是另一种结局，
+      // 值得在历史里分开记，而不是混进"我重发过了"。
+      void appendHistory({
+        kind: 'resend',
+        knowledge_base_id: w.knowledge_base_id,
+        detail:
+          outcome.decision === 'DONE'
+            ? `v${outcome.versionId} 落地（${w.changes.length} 处变更）`
+            : outcome.decision === 'DISCARD'
+              ? `放弃：数据已不可找回（${w.changes.length} 处变更）`
+              : `未到终局：${outcome.stage}`,
       })
       setResendNote((p) => ({
         ...p,
@@ -162,7 +175,17 @@ export function Versions({ kbId }: { kbId: string | null }) {
                     disabled={busy || v.version_id === activeId}
                     title={v.version_id === activeId ? '已经是激活版本' : '把激活版本切到这一个（发布 / 回滚）'}
                     onClick={() =>
-                      rollback.mutate({ knowledge_base_id: kbId, target_version_id: v.version_id })
+                      rollback.mutate(
+                        { knowledge_base_id: kbId, target_version_id: v.version_id },
+                        {
+                          onSuccess: () =>
+                            void appendHistory({
+                              kind: 'activate',
+                              knowledge_base_id: kbId,
+                              detail: `激活 v${v.version_id}`,
+                            }),
+                        },
+                      )
                     }
                   >
                     激活
@@ -220,7 +243,19 @@ export function Versions({ kbId }: { kbId: string | null }) {
                         type="button"
                         disabled={busy}
                         title="放弃一个从未落地的 PENDING 版本"
-                        onClick={() => discard.mutate({ knowledge_base_id: kbId, version_id: v.version_id })}
+                        onClick={() =>
+                          discard.mutate(
+                            { knowledge_base_id: kbId, version_id: v.version_id },
+                            {
+                              onSuccess: () =>
+                                void appendHistory({
+                                  kind: 'discard',
+                                  knowledge_base_id: kbId,
+                                  detail: `放弃 v${v.version_id}`,
+                                }),
+                            },
+                          )
+                        }
                       >
                         放弃
                       </button>
@@ -239,11 +274,21 @@ export function Versions({ kbId }: { kbId: string | null }) {
                     disabled={busy || v.version_id === activeId}
                     title="删除该版本及其子树（活跃版本不可删）"
                     onClick={() =>
-                      del.mutate({
-                        knowledge_base_id: kbId,
-                        version_id: v.version_id,
-                        mode: VersionDeleteMode.VERSION_DELETE_MODE_SUBTREE,
-                      })
+                      del.mutate(
+                        {
+                          knowledge_base_id: kbId,
+                          version_id: v.version_id,
+                          mode: VersionDeleteMode.VERSION_DELETE_MODE_SUBTREE,
+                        },
+                        {
+                          onSuccess: () =>
+                            void appendHistory({
+                              kind: 'delete',
+                              knowledge_base_id: kbId,
+                              detail: `删除 v${v.version_id} 及其子树`,
+                            }),
+                        },
+                      )
                     }
                   >
                     删除

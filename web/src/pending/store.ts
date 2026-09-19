@@ -19,6 +19,7 @@
  */
 import type { ChangeOp } from '../api/gen/knowledgebase'
 import { desktop, isDesktop, type DesktopChange, type DesktopPendingWrite } from '../desktop/tauri'
+import { PENDING_STORE, run } from '../idb'
 
 /** 一条文档变更，与线上 DocChange 同形。 */
 export interface Change {
@@ -58,47 +59,8 @@ function fromDesktop(w: DesktopPendingWrite): PendingWrite {
 
 // ---------------------------------------------------------------- 浏览器后端
 
-const DB_NAME = 'stratum-console'
-const DB_VERSION = 1
-const STORE = 'pending-writes'
-
-function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    let req: IDBOpenDBRequest
-    try {
-      req = indexedDB.open(DB_NAME, DB_VERSION)
-    } catch (cause) {
-      // 隐私模式下 indexedDB 可能直接抛。这不是"没有记录"，而是"无法记录"，
-      // 两者对调用方的意义完全不同，所以原样抛出去。
-      reject(cause instanceof Error ? cause : new Error(String(cause)))
-      return
-    }
-    req.onupgradeneeded = () => {
-      const db = req.result
-      if (!db.objectStoreNames.contains(STORE)) {
-        db.createObjectStore(STORE, { keyPath: 'id' })
-      }
-    }
-    req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error ?? new Error('indexedDB.open failed'))
-  })
-}
-
-function run<T>(
-  mode: IDBTransactionMode,
-  fn: (store: IDBObjectStore) => IDBRequest<T>,
-): Promise<T> {
-  return openDB().then(
-    (db) =>
-      new Promise<T>((resolve, reject) => {
-        const tx = db.transaction(STORE, mode)
-        const req = fn(tx.objectStore(STORE))
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error ?? new Error('indexedDB request failed'))
-        tx.oncomplete = () => db.close()
-      }),
-  )
-}
+// 连接与事务辅助在 ../idb.ts：两个 store（pending-writes / history）共用同一个
+// 库，各开各的连接会让 onupgradeneeded 互相踩。
 
 // ---------------------------------------------------------------- 公开 API
 
@@ -108,7 +70,7 @@ export async function loadPending(): Promise<PendingWrite[]> {
     const all = (await desktop.loadPending()).map(fromDesktop)
     return all.sort((a, b) => a.submitted_at.localeCompare(b.submitted_at))
   }
-  const all = await run<PendingWrite[]>('readonly', (s) => s.getAll() as IDBRequest<PendingWrite[]>)
+  const all = await run<PendingWrite[]>(PENDING_STORE, 'readonly', (s) => s.getAll() as IDBRequest<PendingWrite[]>)
   return all.sort((a, b) => a.submitted_at.localeCompare(b.submitted_at))
 }
 
@@ -121,7 +83,7 @@ export async function getPending(id: string): Promise<PendingWrite | undefined> 
   if (isDesktop()) {
     return (await loadPending()).find((w) => w.id === id)
   }
-  return run<PendingWrite | undefined>('readonly', (s) =>
+  return run<PendingWrite | undefined>(PENDING_STORE, 'readonly', (s) =>
     s.get(id) as IDBRequest<PendingWrite | undefined>,
   )
 }
@@ -137,7 +99,7 @@ export async function upsertPending(w: PendingWrite): Promise<void> {
     await desktop.upsertPending(toDesktop(w))
     return
   }
-  await run<IDBValidKey>('readwrite', (s) => s.put(w))
+  await run<IDBValidKey>(PENDING_STORE, 'readwrite', (s) => s.put(w))
 }
 
 export async function removePending(id: string): Promise<void> {
@@ -145,7 +107,7 @@ export async function removePending(id: string): Promise<void> {
     await desktop.removePending(id)
     return
   }
-  await run<undefined>('readwrite', (s) => s.delete(id) as IDBRequest<undefined>)
+  await run<undefined>(PENDING_STORE, 'readwrite', (s) => s.delete(id) as IDBRequest<undefined>)
 }
 
 /**

@@ -1,11 +1,13 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import type { HealthStatus } from './api/gen/admin'
 import { useHealth, useSystemStatus } from './api/queries'
 import { InFlightPanel } from './components/InFlightPanel'
 import { SettingsDialog } from './components/SettingsDialog'
 import { KbPicker } from './components/KbPicker'
+import { loadPrefs, savePrefs } from './settings/store'
 import { Documents } from './pages/Documents'
+import { History } from './pages/History'
 import { Search } from './pages/Search'
 import { SystemStatus } from './pages/SystemStatus'
 import { Versions } from './pages/Versions'
@@ -23,12 +25,13 @@ import { Versions } from './pages/Versions'
  * 前端路由吞掉。
  */
 
-type PageId = 'search' | 'documents' | 'versions' | 'status'
+type PageId = 'search' | 'documents' | 'versions' | 'history' | 'status'
 
 const PAGES: ReadonlyArray<{ id: PageId; label: string }> = [
   { id: 'search', label: '检索' },
   { id: 'documents', label: '文档' },
   { id: 'versions', label: '版本' },
+  { id: 'history', label: '历史' },
   { id: 'status', label: '系统状态' },
 ]
 
@@ -65,6 +68,22 @@ export default function App() {
   const [kbId, setKbId] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
 
+  // 恢复上次选中的知识库。读设置失败不阻塞：退回"未选中"，用户重选一次即可
+  // ——总比界面起不来强。
+  useEffect(() => {
+    void (async () => {
+      const p = await loadPrefs()
+      if (p.selected_kb_id !== null) setKbId(p.selected_kb_id)
+    })()
+  }, [])
+
+  // 选中即持久化。写在 handler 里而不是 effect 里：effect 会在恢复阶段把刚读到
+  // 的值再写回去一次，那一次写没有意义。
+  function selectKb(next: string) {
+    setKbId(next)
+    void savePrefs({ selected_kb_id: next })
+  }
+
   // 5 秒轮询健康：这是控制台唯一需要"自己动"的指标。
   const health = useHealth(5000)
   const status = useSystemStatus()
@@ -100,7 +119,7 @@ export default function App() {
         <div className="topbar">
           <h1 className="title">{PAGES.find((p) => p.id === page)?.label ?? ''}</h1>
           <div className="topbar-right">
-            <KbPicker value={kbId} onChange={setKbId} />
+            <KbPicker value={kbId} onChange={selectKb} />
             <span className={healthClass(health.data?.status)} title={health.data?.details ?? ''}>
               <span className="dot" />
               {health.isPending ? '连接中…' : healthLabel(health.data?.status)}
@@ -131,6 +150,7 @@ export default function App() {
         {page === 'search' && <Search kbId={kbId} />}
         {page === 'documents' && <Documents kbId={kbId} />}
         {page === 'versions' && <Versions kbId={kbId} />}
+        {page === 'history' && <History />}
         {page === 'status' && <SystemStatus />}
 
         <InFlightPanel />

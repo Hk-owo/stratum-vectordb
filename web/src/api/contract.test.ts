@@ -10,6 +10,12 @@
  * 仍然全绿。跑它之前先起链路：
  *
  *     ./start.sh        # 或手动起 router + gateway + /ops/start
+ *
+ * **后端必须只服务这一个测试。** 这份文件建库、删库、放弃版本，前提是没有别人在
+ * 动同一个集群。实测过一次反面：另一套集成测试（1000+ 个知识库）共用同一批节点时，
+ * 建库返回成功而紧随其后的 GET 报 not found —— 不是代码错，是两端在同一份状态上
+ * 互相踩。遇到这种间歇失败，先确认后端是独占的，再怀疑代码；用 STRATUM_GATEWAY
+ * 指向一个专属实例即可。
  */
 import { beforeAll, describe, expect, it } from 'vitest'
 
@@ -240,7 +246,10 @@ describe.skipIf(!alive)('与真实 gateway 的契约', () => {
       // "被拒时说人话"：不报笼统的 no leader，且状态码可编程判定。
       return
     }
-    expect(err.message ?? '').toContain('PENDING')
+    // 服务端有两条措辞不同的消息（`version is pending` 与
+    // `version 136 is PENDING: version is pending`），大小写也不一致。断言只该
+    // 钉住"它说清了卡在 pending 这个状态"，而不是某一条具体文案。
+    expect(err.message ?? '').toMatch(/pending/i)
     expect(err.status).toBe(412)
     expect(err.message ?? '').not.toContain('no leader')
   })

@@ -1,8 +1,10 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 
 import { ApiError } from '../api/client'
 import { AggregationMethod } from '../api/gen/query'
 import { useQueryText } from '../api/queries'
+import { appendHistory } from '../history/store'
+import { DEFAULT_PREFS, loadPrefs, savePrefs } from '../settings/store'
 
 /**
  * 检索页 —— 最终用户的主界面。
@@ -24,21 +26,49 @@ export function Search({ kbId }: { kbId: string | null }) {
   const [versionId, setVersionId] = useState('')
   const [advanced, setAdvanced] = useState(false)
 
+  // 恢复上次用的检索参数。只在挂载时读一次：此后用户改的就是权威值，别让一次
+  // 迟到的读把它顶掉。查询文本和版本号**不**恢复——前者是这一问的内容，后者
+  // 是"这次要看哪个版本"的一次性选择，留着它们反而会让下一次检索查错地方。
+  useEffect(() => {
+    void (async () => {
+      const p = await loadPrefs()
+      setTopK(String(p.top_k))
+      setAggregation(p.aggregation as AggregationMethod)
+    })()
+  }, [])
+
   const q = useQueryText()
 
   function submit(e: FormEvent) {
     e.preventDefault()
     if (kbId === null || text.trim() === '') return
-    q.mutate({
-      knowledge_base_id: kbId,
-      text: text.trim(),
-      top_k: Number(topK) || 5,
-      threshold: threshold.trim() === '' ? undefined : Number(threshold),
-      // 原样传字符串：protojson 的 int64 是字符串，拿响应里的值再传回来才不会
-      // 出现 "12" === 12 这种恒假比较。
-      version_id: versionId.trim() === '' ? undefined : versionId.trim(),
-      aggregation,
-    })
+    const k = Number(topK) || DEFAULT_PREFS.top_k
+    const asked = text.trim()
+    q.mutate(
+      {
+        knowledge_base_id: kbId,
+        text: asked,
+        top_k: k,
+        threshold: threshold.trim() === '' ? undefined : Number(threshold),
+        // 原样传字符串：protojson 的 int64 是字符串，拿响应里的值再传回来才不会
+        // 出现 "12" === 12 这种恒假比较。
+        version_id: versionId.trim() === '' ? undefined : versionId.trim(),
+        aggregation,
+      },
+      {
+        // 记录"问过什么"。用返回的命中数而不是请求参数——历史要能回答"这一问
+        // 有没有结果"，而那是响应才知道的事。
+        onSuccess: (resp) => {
+          void appendHistory({
+            kind: 'query',
+            knowledge_base_id: kbId,
+            detail: `${asked} → 命中 ${resp.results.length} 条`,
+          })
+        },
+      },
+    )
+    // 记下这次实际用的参数，下次打开就是它。
+    void savePrefs({ top_k: k, aggregation })
   }
 
   const resp = q.data
