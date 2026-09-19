@@ -56,10 +56,11 @@ jobs:
         run: go test -race ./internal/kvraft/... ./internal/raft/... ./internal/index/... -timeout 300s -count=1
 
   docker-integration:
-    name: T4 三节点 Docker 集群集成测试
+    name: T4 两层 Docker 集群集成测试
     runs-on: ubuntu-latest
     needs: go
-    timeout-minutes: 30
+    # C++ 侧（Faiss 源码构建）本身十几分钟，加镜像与整套用例（实测 685s）。
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -68,22 +69,56 @@ jobs:
           go-version: '1.24.x'
           cache: true
 
-      - name: 构建镜像 (docker-cluster.sh build)
-        run: scripts/docker-cluster.sh build
+      # --- C++ 侧：照搬 vecstore-cpp.yml 的依赖清单与构建顺序 ---
+      # 这一步不能省：T4 的存储半边镜像与宿主 vecstore 都来自
+      # run/bin/vecstore_server，而 run/ 不在版本库里（.gitignore 忽略它）。
+      # 少了 C++，集群会起来、但没有任何版本能变成 READY，需要 READY 的用例全红。
+      - name: 安装 C++ 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
+            libgrpc++-dev librocksdb-dev \
+            libblas-dev liblapack-dev libgtest-dev libprometheus-cpp-dev
 
-      - name: 启动 3 节点集群 (--with-embed)
-        run: scripts/docker-cluster.sh up 3 --with-embed
+      - name: 构建 Faiss (v1.9.0, HNSW, 静态)
+        run: |
+          git clone --depth 1 --branch v1.9.0 \
+            https://github.com/facebookresearch/faiss.git "$HOME/faiss"
+          cmake -B "$HOME/faiss/build" -S "$HOME/faiss" \
+            -DFAISS_ENABLE_GPU=OFF -DFAISS_ENABLE_PYTHON=OFF \
+            -DFAISS_ENABLE_C_API=OFF -DBUILD_TESTING=OFF \
+            -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$HOME/faiss/build" -j"$(nproc)"
 
-      # 排除 TestT4_DataVolume：它需要宿主 :7100 上的 vecstore_server
-      # （C++ 构建产物），常规 CI 不构建 C++ 侧；其余两个长时基准
+      - name: 构建 vecstore_server
+        run: |
+          cmake -S . -B run/cmake
+          cmake --build run/cmake --target vecstore_server -j"$(nproc)"
+          mkdir -p run/bin
+          cp run/cmake/vecstore/vecstore_server run/bin/vecstore_server
+
+      # --- 两层拓扑（控制组 3 + 存储组 3）---
+      # 用两层而不是 all-in-one：后者的宿主 vecstore 目前会在 Save 时抛异常
+      # （节点日志 "index: Save RPC: ... Unexpected error in RPC handling"），
+      # 于是没有版本能到 READY。两层下每个容器自带 vecstore，同一套用例实测全绿。
+      - name: 构建镜像 (docker-cluster-both.sh build)
+        run: scripts/docker-cluster-both.sh build
+
+      - name: 启动两层集群
+        run: scripts/docker-cluster-both.sh up
+
+      # 排除 TestT4_DataVolume：它要宿主 :7100 上单独一个 vecstore；这台机器在
+      # CI 里只为镜像与宿主进程构建 C++，不额外起那一个。其余两个长时基准
       # （TestT4_PerformanceBaseline / TestT4_StorageEfficiency）内部自行 skip。
-      # timeout 提到 900s：await/discard 的用例里有一条
-      # （TestT4_DiscardVersion_AbandonsAWriteThatCannotLand）故意停掉 embedder，
-      # 等过 dataMissingMinAgeSec（120s）的门槛再断言 data_missing 变成 true ——
-      # 那是"数据从未落地"这条路上唯一测不到别处的部分，值这 2 分钟。
+      # timeout 900s：整套实测 685s，其中含一条故意停掉 embedder、等过
+      # dataMissingMinAgeSec（120s）再断言 data_missing 的用例。
       - name: 运行 T4 集群容错测试
+        env:
+          STRATUM_T4_NODE_SERVICES: stratum-node-control1,stratum-node-control2,stratum-node-control3
         run: go test ./integration/docker/... -tags=docker -v -timeout 900s -skip 'TestT4_DataVolume'
 
       - name: 清理集群
         if: always()
-        run: scripts/docker-cluster.sh down
+        run: scripts/docker-cluster-both.sh down
