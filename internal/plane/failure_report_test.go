@@ -36,7 +36,7 @@ type failureReport struct {
 func (c *stubControl) ReportDataDurable(context.Context, string, int64, string) error {
 	return c.durableErr
 }
-func (c *stubControl) ReportIndexReady(context.Context, string, int64) error          { return nil }
+func (c *stubControl) ReportIndexReady(context.Context, string, int64) error { return nil }
 func (c *stubControl) ReportEpoch(context.Context, uint64, map[string]int64, map[string][]int64) error {
 	return nil
 }

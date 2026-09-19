@@ -220,9 +220,19 @@ func indexBytes(t *testing.T) int64 {
 }
 
 // nodeLogsSince returns a storage node's container logs.
+//
+// `--tail` is not cosmetic here. `docker logs <name>` without it stops at the first
+// malformed line in the container's json log, and a container killed with SIGKILL —
+// which is exactly what these fault-injection tests do — can leave one behind.
+// Measured on the 3+3 cluster (docker 29.1.3): the storage node's log file held 6255
+// lines while `docker logs` returned 641 of them, cutting off the very
+// "caught up with the chain tail" line the caller was looking for; one truncated
+// record at line 642 (written when the container was killed mid-startup) was the
+// whole cause. `--tail` reads backwards from the end, so a bad record earlier in the
+// file cannot hide the recent lines that these assertions are about.
 func nodeLogsSince(t *testing.T, service string) string {
 	t.Helper()
-	out, err := exec.Command("docker", "logs", service).CombinedOutput()
+	out, err := exec.Command("docker", "logs", "--tail", "5000", service).CombinedOutput()
 	if err != nil {
 		return ""
 	}

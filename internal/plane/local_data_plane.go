@@ -189,13 +189,13 @@ type LocalDataPlane struct {
 	// LocalDataPlaneConfig.
 	replicaCount  int
 	cursorQuerier CursorQuerier
-	dropper         VersionDataDropper
-	cleaner         VersionDataCleaner
-	presence        VersionPresenceQuerier
-	digest          VersionDigest
-	confirmer       WriteConfirmer
-	indexReader     IndexReader
-	indexShipper    IndexShipper
+	dropper       VersionDataDropper
+	cleaner       VersionDataCleaner
+	presence      VersionPresenceQuerier
+	digest        VersionDigest
+	confirmer     WriteConfirmer
+	indexReader   IndexReader
+	indexShipper  IndexShipper
 	// indexPushSem bounds how many PushIndexToReplicas runs may be in flight at
 	// once. One run reads a whole index file into memory and ships it to N
 	// replicas, so this is simultaneously the cap on distribution's memory peak
