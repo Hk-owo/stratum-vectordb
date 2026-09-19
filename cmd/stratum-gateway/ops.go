@@ -85,7 +85,7 @@ func (m *opsManager) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /ops/config", m.handlePutConfig)
 	mux.HandleFunc("GET /ops/logs/{service}", m.handleLogs)
 
-	// --- docker 集群管理（集群级统一参数，转调 docker-cluster.sh） ---
+	// --- docker 集群管理（集群级统一参数，转调 scripts/cluster.sh） ---
 	mux.HandleFunc("GET /ops/docker/status", m.handleDockerStatus)
 	mux.HandleFunc("GET /ops/docker/config", m.handleDockerGetConfig)
 	mux.HandleFunc("PUT /ops/docker/config", m.handleDockerPutConfig)
@@ -607,9 +607,8 @@ func (m *opsManager) handleDockerNode(action string) http.HandlerFunc {
 			return
 		}
 		id, err := strconv.Atoi(r.PathValue("id"))
-		if err != nil || id < 1 || id > cfg.Nodes {
-			writeOpsError(w, http.StatusBadRequest,
-				fmt.Sprintf("invalid node id（1-%d）", cfg.Nodes))
+		if err != nil || !dockerNodeIDValid(cfg, id) {
+			writeOpsError(w, http.StatusBadRequest, dockerNodeIDHint(cfg))
 			return
 		}
 		var out string
@@ -636,9 +635,8 @@ func (m *opsManager) handleDockerNodeLogs(w http.ResponseWriter, r *http.Request
 		return
 	}
 	id, err := strconv.Atoi(r.PathValue("id"))
-	if err != nil || id < 1 || id > cfg.Nodes {
-		writeOpsError(w, http.StatusBadRequest,
-			fmt.Sprintf("invalid node id（1-%d）", cfg.Nodes))
+	if err != nil || !dockerNodeIDValid(cfg, id) {
+		writeOpsError(w, http.StatusBadRequest, dockerNodeIDHint(cfg))
 		return
 	}
 	lines := 200

@@ -43,7 +43,7 @@ import {
  *   · **破坏性操作要二次确认**。这里最轻的操作也会踢掉一个正在服务的进程，最重的
  *     （docker clean）连数据卷一起删——而"清理"和"重启"在按钮上只有两个字号的区别。
  *   · **失败要逐个说清楚**。`/ops/start` 会返回每个服务的结果，一个失败不该让
- *     其余的看起来没发生；编排脚本的输出（docker-cluster*.sh 的 stdout）原样显示，
+ *     其余的看起来没发生；编排脚本（scripts/cluster.sh）的输出原样显示，
  *     因为真正的报错往往就在里面。
  *   · 参数保存**不等于生效**：正在跑的进程不换参数，服务端返回的 note 也是这么说的。
  *     界面上照抄这句话，免得有人保存完以为改完了。
@@ -763,7 +763,7 @@ function DockerPanel() {
       </div>
       <p className="muted small">
         参数是集群级统一配置：改完要<b>重建</b>才生效（单节点差异化修改没有意义）。操作由
-        <code>docker-cluster*.sh</code> 执行，输出原样显示在下面。
+        <code>scripts/cluster.sh</code> 执行，输出原样显示在下面。
       </p>
 
       {status.error !== null && (

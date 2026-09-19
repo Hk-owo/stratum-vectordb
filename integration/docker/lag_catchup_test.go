@@ -247,7 +247,7 @@ func lagCatchupTimeout() time.Duration {
 // line the catch-up itself writes, because "an artifact appeared" alone would also be
 // explained by the startup reconcile giving the active version a head start.
 //
-// Catch-up has no switch (scripts/docker-cluster-both.sh always sets the pace knobs),
+// Catch-up has no switch (scripts/cluster.sh --topology two-tier always sets the pace knobs),
 // so this runs on any cluster; LOG_LEVEL=debug makes the scheduler's decisions visible.
 //
 // SKIPPED_FIXED: the two prerequisites this case was blocked on are both repaired.

@@ -5,7 +5,7 @@
 // is running.
 //
 // Path defaults are relative to the gateway's working directory so the
-// one-click start.sh layout (run/bin, run/log, run/data) is reused as-is.
+// one-click scripts/gateway.sh layout (run/bin, run/log, run/data) is reused as-is.
 package main
 
 import (
@@ -30,7 +30,7 @@ type OpsConfig struct {
 	Cluster []ClusterNode `yaml:"cluster" json:"cluster"`
 
 	// Docker: 集群级 docker 管理参数（整个集群统一，不做单节点差异化修改）。
-	// 启用后控制台通过转调 docker-cluster.sh 管理节点生命周期。
+	// 启用后控制台通过转调编排脚本 scripts/cluster.sh 管理节点生命周期。
 	Docker DockerClusterConfig `yaml:"docker" json:"docker"`
 
 	Services ServiceConfigs `yaml:"services" json:"services"`
@@ -41,17 +41,18 @@ type OpsConfig struct {
 type DockerClusterConfig struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
 
-	// Topology 选择控制台驱动的编排方式：""/"single" 为所有节点同构的单层集群
-	// （docker-cluster.sh），"two-tier" 为控制层只持元数据、存储层只持数据的两层
-	// 集群（docker-cluster-both.sh，Stratum_设计文档v13.md §11 阶段 ④）。
+	// Topology 选择控制台驱动的编排方式：""/"single" 为所有节点同构的单层集群，
+	// "two-tier" 为控制层只持元数据、存储层只持数据的两层集群
+	// （Stratum_设计文档v13.md §11 阶段 ④）。两者由同一个编排脚本
+	// （scripts/cluster.sh）执行，靠 --topology 区分。
 	//
 	// 两者不可互换，控制台也不该假装可以：两层拓扑里一个节点要么是控制节点、
 	// 要么是存储节点，页面因此分两组展示——把节点列表当成同一个池子，就会把
 	// 读请求发给一个提供不了该服务的节点。
 	Topology string `yaml:"topology" json:"topology"`
 
-	Script          string `yaml:"script" json:"script"`                       // 单层编排脚本（docker-cluster.sh）
-	ScriptTwoTier   string `yaml:"script_two_tier" json:"script_two_tier"`     // 两层编排脚本（docker-cluster-both.sh）
+	Script          string `yaml:"script" json:"script"`                       // 单层编排脚本（scripts/cluster.sh）
+	ScriptTwoTier   string `yaml:"script_two_tier" json:"script_two_tier"`     // 两层编排脚本（同一个 cluster.sh，靠 --topology 区分）
 	Nodes           int    `yaml:"nodes" json:"nodes"`                         // 单层：集群节点数；两层：控制层节点数
 	StorageNodes    int    `yaml:"storage_nodes" json:"storage_nodes"`         // 两层：存储层节点数
 	BasePort        int    `yaml:"base_port" json:"base_port"`                 // 起始 gRPC 宿主端口（两层时指控制层）
@@ -144,7 +145,7 @@ const (
 var AllServices = []ServiceID{ServiceVecstore, ServiceEmbed, ServiceStratum}
 
 // defaultOpsConfig returns the console defaults. Relative paths resolve
-// against the working directory (matching the start.sh run/ layout).
+// against the working directory (matching the scripts/gateway.sh run/ layout).
 func defaultOpsConfig(nodeID int) OpsConfig {
 	return OpsConfig{
 		NodeID:    nodeID,
@@ -156,7 +157,8 @@ func defaultOpsConfig(nodeID int) OpsConfig {
 		},
 		Docker: DockerClusterConfig{
 			Enabled:         true,
-			Script:          filepath.Join("scripts", "docker-cluster.sh"),
+			Script:          filepath.Join("scripts", "cluster.sh"),
+			ScriptTwoTier:   filepath.Join("scripts", "cluster.sh"),
 			Nodes:           3,
 			BasePort:        17000,
 			Network:         "stratum-net",
@@ -239,8 +241,16 @@ func applyOpsDefaults(cfg *OpsConfig) {
 	}
 
 	dk := &cfg.Docker
+	// 老配置里可能还写着 scripts/docker-cluster.sh / docker-cluster-both.sh
+	// （合并成一个 cluster.sh 之前的名字）。就地迁移而不是让它去调用一个已经不存在
+	// 的脚本：那种失败是「运维页的按钮没反应」，比一个配置项难懂得多。
+	dk.Script = migrateClusterScript(dk.Script)
+	dk.ScriptTwoTier = migrateClusterScript(dk.ScriptTwoTier)
 	if dk.Script == "" {
-		dk.Script = filepath.Join("scripts", "docker-cluster.sh")
+		dk.Script = filepath.Join("scripts", "cluster.sh")
+	}
+	if dk.ScriptTwoTier == "" {
+		dk.ScriptTwoTier = filepath.Join("scripts", "cluster.sh")
 	}
 	if dk.Nodes <= 0 {
 		dk.Nodes = 3
@@ -473,4 +483,21 @@ func cfgNodeID(o OpsConfig) int64 {
 		return o.Services.Stratum.NodeID
 	}
 	return int64(o.NodeID)
+}
+
+// migrateClusterScript 把合并前的编排脚本名换成统一的 scripts/cluster.sh。
+//
+// 合并前是两个脚本（scripts/docker-cluster.sh 单层、scripts/docker-cluster-both.sh
+// 两层），合并后是同一个 scripts/cluster.sh + --topology。老 run/console.yaml 里仍
+// 写着旧名，照用会去执行一个已经删除的文件——表面上只是控制台上那几个 docker 按钮
+// 全失败，错误信息却说"文件不存在"，与哪个配置项有关看不出来。
+//
+// 只认这两个历史名字；别的路径一律原样保留：这个字段允许指向自定义脚本，不能替
+// 用户改。
+func migrateClusterScript(script string) string {
+	switch filepath.Base(script) {
+	case "docker-cluster.sh", "docker-cluster-both.sh":
+		return filepath.Join(filepath.Dir(script), "cluster.sh")
+	}
+	return script
 }

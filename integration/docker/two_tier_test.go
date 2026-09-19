@@ -3,9 +3,9 @@
 // These exercise what the split is for, and what the all-in-one T4 suite in
 // docker_test.go cannot see: the control tier commits a write and the storage
 // tier is what actually holds and serves it. Both tiers run from
-// scripts/docker-cluster-both.sh:
+// scripts/cluster.sh --topology two-tier:
 //
-//	scripts/docker-cluster-both.sh up
+//	scripts/cluster.sh --topology two-tier up
 //	STRATUM_T4_NODE_ADDRS=localhost:17000,localhost:17001,localhost:17002 \
 //	STRATUM_T4_NODE_SERVICES=stratum-node-control1,stratum-node-control2,stratum-node-control3 \
 //	go test ./integration/docker/... -tags=docker -run TwoTier -v -timeout 600s

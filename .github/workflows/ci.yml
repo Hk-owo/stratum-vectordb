@@ -2,8 +2,8 @@
 #
 #   job go                 Go 侧全量检查：gofmt 格式、go vet、go build、
 #                          单元测试（23 个包）、raft/kvraft/index 竞态检测。
-#   job docker-integration 三节点 Docker 集群（T4）容错测试，见
-#                          README「Testing」与 scripts/docker-cluster.sh。
+#   job docker-integration 两层 Docker 集群（T4）容错测试，见
+#                          README「Testing」与 scripts/cluster.sh（--topology two-tier）。
 #
 # C++ vecstore 侧（Faiss/RocksDB/gRPC，依赖极重）不在常规 CI 内，
 # 由 .github/workflows/vecstore-cpp.yml 手动触发。
@@ -100,14 +100,16 @@ jobs:
           cp run/cmake/vecstore/vecstore_server run/bin/vecstore_server
 
       # --- 两层拓扑（控制组 3 + 存储组 3）---
-      # 用两层而不是 all-in-one：后者的宿主 vecstore 目前会在 Save 时抛异常
+      # 用两层而不是 single：后者的宿主 vecstore 目前会在 Save 时抛异常
       # （节点日志 "index: Save RPC: ... Unexpected error in RPC handling"），
       # 于是没有版本能到 READY。两层下每个容器自带 vecstore，同一套用例实测全绿。
-      - name: 构建镜像 (docker-cluster-both.sh build)
-        run: scripts/docker-cluster-both.sh build
+      #
+      # 两种拓扑现在是同一个脚本（scripts/cluster.sh），用 --topology 区分。
+      - name: 构建镜像 (cluster.sh --topology two-tier build)
+        run: scripts/cluster.sh --topology two-tier build
 
       - name: 启动两层集群
-        run: scripts/docker-cluster-both.sh up
+        run: scripts/cluster.sh --topology two-tier up
 
       # 排除 TestT4_DataVolume：它要宿主 :7100 上单独一个 vecstore；这台机器在
       # CI 里只为镜像与宿主进程构建 C++，不额外起那一个。其余两个长时基准
@@ -121,4 +123,4 @@ jobs:
 
       - name: 清理集群
         if: always()
-        run: scripts/docker-cluster-both.sh down
+        run: scripts/cluster.sh --topology two-tier down

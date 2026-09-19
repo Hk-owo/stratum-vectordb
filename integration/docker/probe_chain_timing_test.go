@@ -19,7 +19,7 @@ import (
 // it splits the read path into externally observable segments, because the
 // server exposes no metrics and logs no per-stage durations (checked: no
 // prometheus anywhere, no time.Since in service/query.go or index/impl.go, and
-// docker-cluster-both.sh does not even publish the metrics port).
+// scripts/cluster.sh --topology two-tier does not even publish the metrics port).
 //
 // Segments, all measured through the station (the only public entry point):
 //

@@ -1,7 +1,8 @@
 // docker_cluster.go — 控制台对 docker 集群的管理封装。
 //
-// 控制台（stratum-gateway）不直接调 docker CLI，而是转调
-// scripts/docker-cluster.sh（统一入口，保证与命令行操作行为一致）。
+// 控制台（stratum-gateway）不直接调 docker CLI，而是转调编排脚本
+// scripts/cluster.sh（统一入口，保证与命令行操作行为一致）。两种拓扑由同一个
+// 脚本执行，靠 --topology single|two-tier 区分。
 // 集群参数（节点数/端口/网络/镜像/embed）是集群级统一配置，不做单节点
 // 差异化修改：修改参数后重建整个集群。
 package main
@@ -21,16 +22,15 @@ func newCmdContext(timeout time.Duration) (context.Context, context.CancelFunc) 
 	return context.WithTimeout(context.Background(), timeout)
 }
 
-// dockerCluster 封装对 docker-cluster.sh 的调用。
-// dockerCluster 封装对编排脚本的调用。脚本路径来自集群配置（按拓扑选择），
-// 所以这里不持有它。
+// dockerCluster 封装对编排脚本（scripts/cluster.sh）的调用。
+// 脚本路径来自集群配置（可以换成自定义脚本），所以这里不持有它。
 type dockerCluster struct{}
 
-// scriptPath 返回当前拓扑要驱动的编排脚本的绝对路径（相对路径按工作目录解析）。
+// scriptPath 返回要驱动的编排脚本的绝对路径（相对路径按工作目录解析）。
 //
-// 两种拓扑各有一个脚本，且它们不是同一个脚本的两套参数：两层拓扑的节点分为
-// 控制组与存储组，脚本本身不同。缺失时报错而不是退回单层脚本——把它交给一个
-// 只认单层命令的脚本，会得到一个说"命令未知"的失败，比配置错误难懂得多。
+// 两种拓扑现在由**同一个**脚本执行（scripts/cluster.sh），靠 --topology 区分；配置里
+// 仍留着两个键，是为了让部署能分别指向自己的脚本。缺了就报错，而不是退回一个默认
+// 路径：把集群管理交给一个运维没配置过的脚本，失败会出现在按钮上而不是配置上。
 func (d *dockerCluster) scriptPath(cfg DockerClusterConfig) (string, error) {
 	p := cfg.Script
 	if cfg.Topology == TopologyTwoTier {
@@ -39,7 +39,7 @@ func (d *dockerCluster) scriptPath(cfg DockerClusterConfig) (string, error) {
 			return "", fmt.Errorf("两层拓扑未配置编排脚本（ops config 的 docker.script_two_tier）")
 		}
 	} else if p == "" {
-		return "", fmt.Errorf("docker-cluster.sh 未配置（ops config 的 docker.script）")
+		return "", fmt.Errorf("未配置编排脚本（ops config 的 docker.script）")
 	}
 	if !filepath.IsAbs(p) {
 		abs, err := filepath.Abs(p)
@@ -69,22 +69,28 @@ func (d *dockerCluster) run(timeout time.Duration, cfg DockerClusterConfig, args
 		if msg == "" {
 			msg = err.Error()
 		}
-		return strings.TrimSpace(out.String()), fmt.Errorf("docker-cluster %s: %s", strings.Join(args, " "), msg)
+		return strings.TrimSpace(out.String()), fmt.Errorf("cluster %s: %s", strings.Join(args, " "), msg)
 	}
 	return strings.TrimSpace(out.String()), nil
 }
 
 // baseArgs 从集群统一配置组装公共选项。
 //
-// 两层拓扑把"节点"分成两档（控制组/存储组），所以选项也分成两档；单层拓扑保持
-// 原样。两个脚本的选项形状是对齐的（见 scripts/docker-cluster-both.sh），因此这里
-// 只有一处分支：加哪些选项。
+// 第一项永远是 --topology：两种拓扑由同一个脚本执行，脚本靠它决定节点命名、端口
+// 派生与配置生成方式。其余选项按拓扑分档——两层把「节点」分成控制组/存储组，所以
+// 数量和端口也分两档。
 func (d *dockerCluster) baseArgs(cfg DockerClusterConfig) []string {
 	if cfg.Topology == TopologyTwoTier {
 		args := []string{
+			"--topology", "two-tier",
 			"--control-base-port", fmt.Sprintf("%d", cfg.BasePort),
 			"--network", cfg.Network,
-			"--image", cfg.Image,
+		}
+		// 两层节点必须自带 vecstore（镜像里带着 C++ 侧）。配置里的单层默认镜像
+		// （stratum-node:latest）是 all-in-one 的，用它节点会起不来数据层，所以
+		// 这里不传，让脚本用两层的默认镜像（stratum-storage:latest）。
+		if cfg.Image != "" && cfg.Image != "stratum-node:latest" {
+			args = append(args, "--image", cfg.Image)
 		}
 		if cfg.Nodes > 0 {
 			args = append(args, "--control-nodes", fmt.Sprintf("%d", cfg.Nodes))
@@ -98,6 +104,7 @@ func (d *dockerCluster) baseArgs(cfg DockerClusterConfig) []string {
 		return args
 	}
 	return []string{
+		"--topology", "single",
 		"--base-port", fmt.Sprintf("%d", cfg.BasePort),
 		"--network", cfg.Network,
 		"--image", cfg.Image,
@@ -187,4 +194,35 @@ func (d *dockerCluster) NodeLogs(cfg DockerClusterConfig, id int, lines int) (st
 	}
 	return d.run(30*time.Second, cfg, append(d.baseArgs(cfg),
 		"logs", fmt.Sprintf("%d", id), "--lines", fmt.Sprintf("%d", lines))...)
+}
+
+// twoTierStorageIDBase 与编排脚本的 STORAGE_ID_BASE 对应：两层的存储节点从 11 起
+// 编号（scripts/cluster.sh 的 storage_id）。它是 storage.nodes 的键，节点按 node_id
+// 在那张表里解析自身地址，所以两边必须一致。
+const twoTierStorageIDBase = 10
+
+// dockerNodeIDValid 判断 id 是不是这个集群里的节点。两层拓扑的 id 有**两段**：
+// 控制节点 1..Nodes，存储节点 11..(10+StorageNodes)。只认第一段，会让运维页对存储
+// 节点的启停与日志按钮全部回 "invalid node id"——而它们恰恰是两层拓扑里干活的那批。
+func dockerNodeIDValid(cfg DockerClusterConfig, id int) bool {
+	if id >= 1 && id <= cfg.Nodes {
+		return true
+	}
+	if cfg.Topology == TopologyTwoTier && cfg.StorageNodes > 0 {
+		return id > twoTierStorageIDBase && id <= twoTierStorageIDBase+cfg.StorageNodes
+	}
+	return false
+}
+
+// dockerNodeIDHint 是 id 非法时的提示，说清这个集群认哪些 id。
+func dockerNodeIDHint(cfg DockerClusterConfig) string {
+	if cfg.Topology == TopologyTwoTier {
+		storage := "无"
+		if cfg.StorageNodes > 0 {
+			storage = fmt.Sprintf("%d-%d",
+				twoTierStorageIDBase+1, twoTierStorageIDBase+cfg.StorageNodes)
+		}
+		return fmt.Sprintf("invalid node id（控制节点 1-%d，存储节点 %s）", cfg.Nodes, storage)
+	}
+	return fmt.Sprintf("invalid node id（1-%d）", cfg.Nodes)
 }

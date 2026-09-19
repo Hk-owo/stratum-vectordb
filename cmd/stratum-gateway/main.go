@@ -122,7 +122,7 @@ func main() {
 	// --- Ops console (control plane) ---
 	// Serves /ops/* independently of the database stack: cluster node
 	// list, service start/stop/restart, startup parameter edit, and log
-	// tailing. Default config path follows the start.sh run/ layout.
+	// tailing. Default config path follows the scripts/gateway.sh run/ layout.
 	opsPath := *opsConfigPath
 	if opsPath == "" {
 		opsPath = filepath.Join("run", "console.yaml")
@@ -155,7 +155,7 @@ func main() {
 
 	// Graceful shutdown: on SIGINT/SIGTERM stop accepting requests, then
 	// stop the managed local services so no orphan processes survive the
-	// gateway (start.sh's Ctrl+C path relies on this). main() waits for
+	// gateway (scripts/gateway.sh's Ctrl+C path relies on this). main() waits for
 	// the shutdown goroutine to finish before exiting, otherwise the
 	// managed child processes would be orphaned.
 	srv := &http.Server{Addr: *httpAddr, Handler: logRequests(mux)}

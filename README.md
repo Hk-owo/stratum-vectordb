@@ -25,7 +25,7 @@
 - **数据源解析有四层** —— 本地注册表 → leader 回退 → 游标探测 → **控制层 holders 镜像**（心跳响应捎带、本地缓存，查表即可，绝不在 Raft apply 路径上发 RPC）。一个错过 push 广播的副本仍能自己找到持有者。
 - **存储层退化是显式信号** —— 存活副本低于 quorum 时，**写被明确拒绝**（`kb_storage_degraded` / `storage_unavailable`，可重试），而**读照常服务**：判据来自已有的周期上报聚合，未知态一律放行；服务站转发前拦一道（省掉注定失败的往返），控制层在提交 Raft 之前再拦一道（不浪费版本号与日志）。**只读调用方也能发现它**：查询响应上的 `storage_degraded` 由服务站填，不必先撞上一次写失败。
 - **自动存储卫生** —— 周期 chunk GC、每版本布隆过滤器、磁盘保留策略的**访问保护**（还在被读的老版本不会被当成死版本删掉）、构建残留的自超时回收、以及可选的墓碑回收；启动时从磁盘事实与持久化游标推导版本可服务状态，不依赖构建回调确实送达。
-- **开箱可运维** —— 三态健康检查；Prometheus `/metrics` 端点（`node.metrics_addr`）；HTTP 网关 + Web 控制台（同源提供、免 CORS）；`start.sh` 一条命令拉起完整链路。
+- **开箱可运维** —— 三态健康检查；Prometheus `/metrics` 端点（`node.metrics_addr`）；HTTP 网关 + Web 控制台（同源提供、免 CORS）；`scripts/gateway.sh --with-db` 一条命令拉起完整链路。
 
 Stratum 是 RAG 管线的**存储与检索层**：不处理聊天历史、用户会话或 prompt 构造——这些属于其上方的应用层。
 
@@ -45,7 +45,7 @@ go test -race ./internal/kvraft/... ./internal/raft/... ./internal/index/...
 go run ./cmd/stratum/
 
 # 一键拉起完整链路:vecstore(C++) → stratum(gRPC) → 服务站 → gateway(HTTP) + Web UI
-./start.sh            # 然后打开 http://localhost:8081
+scripts/gateway.sh --with-db        # 然后打开 http://localhost:8081
 ```
 
 `cmd/stratum` 接受可选 YAML 配置用于多节点部署，命令行 flag 优先于文件：
@@ -57,19 +57,19 @@ go run ./cmd/stratum/ -config integration/docker/config1.yaml
 **3 节点 Docker 集群**（CI 同款，`integration/docker` + `docker` 构建标签）：
 
 ```bash
-scripts/docker-cluster.sh up 3 --with-embed
+scripts/cluster.sh up 3 --with-embed
 go test ./integration/docker/... -tags=docker -timeout 300s
-scripts/docker-cluster.sh down
+scripts/cluster.sh down
 ```
 
 **两层拓扑（控制组 + 存储组）**同样一键起停，细节见脚本头部：
 
 ```bash
-scripts/docker-cluster-both.sh build     # 两个镜像;存储镜像自带 vecstore
-scripts/docker-cluster-both.sh up        # 控制组 1..3(17000+) + 存储组 11..13(17100+) + mock-embed
+scripts/cluster.sh --topology two-tier build   # 两个镜像;存储镜像自带 vecstore
+scripts/cluster.sh --topology two-tier up      # 控制组 1..3(17000+) + 存储组 11..13(17100+) + mock-embed
 STRATUM_T4_NODE_SERVICES=stratum-node-control1,stratum-node-control2,stratum-node-control3 \
   go test ./integration/docker/... -tags=docker -v -timeout 900s
-scripts/docker-cluster-both.sh status    # 每容器状态与控制组 leader
+scripts/cluster.sh --topology two-tier status  # 每容器状态与控制组 leader
 ```
 
 ## 架构
@@ -115,7 +115,7 @@ scripts/docker-cluster-both.sh status    # 每容器状态与控制组 leader
 
 控制面与存储面之间是一条**只传逻辑对象、不传放置细节**的契约(`internal/plane`)。契约的同进程实现(`LocalControlPlane` / `LocalDataPlane`,连同写门、leader 门、数据版本注册表、holders 镜像、回收水位、追链 backfill)已落地,它也是把两层拆成独立进程的前提;`internal/wire` 负责 gRPC proto 与领域类型的**双向**映射,避免某个字段只在一侧被加上而另一侧静默丢弃。
 
-两层既能在同一进程里跑,也能分开部署:`role=control` 的节点不写本地存储(只有 Raft 日志与快照),`role=storage` 的节点不参与选举(它从控制面读元数据、向控制面报告进度)。上面的服务站是**独立形态**——`scripts/docker-cluster-both.sh up --with-station` 一次拉起"控制面 + 存储面 + 服务站 + embed"的完整拓扑。
+两层既能在同一进程里跑,也能分开部署:`role=control` 的节点不写本地存储(只有 Raft 日志与快照),`role=storage` 的节点不参与选举(它从控制面读元数据、向控制面报告进度)。上面的服务站是**独立形态**——`scripts/cluster.sh --topology two-tier up --with-station` 一次拉起"控制面 + 存储面 + 服务站 + embed"的完整拓扑。
 
 **数据传输有闸门,且不推无用之物**。三条会成规模消耗资源的路径各自有上限:增量恢复的文档写(`maxConcurrentDocumentWrites`,8 路)、索引本地重建(`index_manager.build_concurrency`,构建池同时是两级优先队列)、索引分发(`index_manager.push_concurrency`,默认 4)。分发前还会**先探测对端是否已持有该版本产物**——已持有则一个字节都不传,也不占分发额度。
 
@@ -269,8 +269,11 @@ Web UI ⇄ gateway(:8081) ⇄ station(:7009) ⇄ 存储节点(读) / 控制节�
 > 浏览器打不开 `http://localhost:7009` 是**正常的**:那是 gRPC 端口,HTTP/1.1 请求会得到 `Received HTTP/0.9`,HTTP/2 请求得到 `415`(只接受 `application/grpc`)。要看界面请用网关的 `:8081`。
 
 ```bash
-scripts/gateway.sh [single|build|stop]   # 默认:构建后起 Docker 集群模式;single=连 127.0.0.1:7000
-scripts/router.sh status|stop            # 单独管理服务站(两层拓扑下会从 run/console.yaml 自动派生 -storage-nodes)
+scripts/gateway.sh [up|stop|status|logs|build|db|router]   # 服务站 + 控制台(本地入口)
+scripts/gateway.sh --with-db             # 连数据库三件套一起拉起(原来 start.sh 的一键)
+scripts/gateway.sh --in-docker           # 控制台跑进集群容器网络(容器名形式的 embed 地址可达)
+scripts/gateway.sh router status|stop    # 只操作服务站(两层拓扑下自动派生 -storage-nodes)
+scripts/cluster.sh [--topology single|two-tier] <命令>      # Docker 集群编排
 
 # 手动等价:先起服务站,再起 gateway(始终指向服务站)
 ./run/bin/stratum-router  -listen 0.0.0.0:7009 -nodes 127.0.0.1:7000
@@ -279,7 +282,7 @@ scripts/router.sh status|stop            # 单独管理服务站(两层拓扑下
 
 环境变量可覆盖默认:`STRATUM_HTTP_ADDR`(网关监听,默认 `0.0.0.0:8081`)、`STRATUM_ROUTER_ADDR`(默认 `127.0.0.1:7009`)、`STRATUM_GRPC_ADDR`(单机模式下服务站应连的节点,默认 `127.0.0.1:7000`)。
 
-`start.sh` 一键构建并启动完整链路:服务站与控制台先行,数据库服务经控制台 `/ops/start` 端点拉起——Web UI(默认 `http://localhost:8081`,含「运维」页)在数据库未运行时也可用;Ctrl+C 干净停止,日志在 `run/log/`。仅需运维:直接运行 `./run/bin/stratum-gateway`,在「运维」页编辑 `run/console.yaml` 的启动参数并启停服务。
+`scripts/gateway.sh --with-db` 一键构建并启动完整链路:服务站与控制台先行,数据库服务经控制台 `/ops/start` 端点拉起——Web UI(默认 `http://localhost:8081`,含「运维」页)在数据库未运行时也可用;Ctrl+C 干净停止,日志在 `run/log/`。仅需运维:直接运行 `./run/bin/stratum-gateway`,在「运维」页编辑 `run/console.yaml` 的启动参数并启停服务。
 
 > Docker 集群模式下 vecstore 是宿主机上的外部依赖(`vecstore.grpc_addr: host.docker.internal:7100`),必须监听宿主机的**对外接口**(`--grpc_addr=0.0.0.0:7100`);只绑 `127.0.0.1` 时容器内无法访问,会导致索引构建失败、删除报错等连锁问题。
 
@@ -380,7 +383,7 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 
 ## 性能实测
 
-> 以下为 **2026-09-18** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,由 `scripts/docker-cluster-both.sh` 起集群、经服务站测量。宿主 **12 核 / 15 GB**,容器与压测进程共享这台机器。
+> 以下为 **2026-09-18** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,由 `scripts/cluster.sh --topology two-tier` 起集群、经服务站测量。宿主 **12 核 / 15 GB**,容器与压测进程共享这台机器。
 
 ### 查询延迟
 
@@ -562,7 +565,8 @@ cmd/stratum-gateway/ # HTTP/JSON 网关 + /ops 控制台控制面
 vecstore/            # C++ 向量存储:Faiss HNSW + RocksDB,支持量化两段式检索
 web/                 # Web 控制台前端(HTML/CSS/JS)
 integration/         # mock 集成 + 真实栈 e2e + docker/(T4 集群测试)
-scripts/             # docker-cluster.sh / docker-cluster-both.sh / gateway.sh / router.sh 等
+scripts/             # cluster.sh(集群编排) / gateway.sh(本地入口) / t4-integration.sh / update-all.sh / ops/(运维 CLI)
+                     #   用法与选项见 scripts/README.md(脚本文档,随脚本一起纳入版本控制)
 configs/             # 示例配置文件
 ```
 

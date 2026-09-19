@@ -5,11 +5,11 @@
 // both — which is why the node addresses and container names come from the
 // environment (see splitEnv):
 //
-//   - all-in-one: every node runs both halves (scripts/docker-cluster.sh).
+//   - all-in-one: every node runs both halves (scripts/cluster.sh --topology single).
 //     nodeAddrs are 3 such nodes and every one of them serves reads.
 //   - split (Stratum_设计文档v13.md §11 阶段 ④): a control group that holds no
 //     storage and a storage group that holds no metadata
-//     (scripts/docker-cluster-both.sh). nodeAddrs are the control nodes;
+//     (scripts/cluster.sh --topology two-tier). nodeAddrs are the control nodes;
 //     storageAddrs (see two_tier_test.go) are where reads are served.
 //
 // Where a test reads, it reads from the storage tier: QueryService takes the
@@ -18,10 +18,10 @@
 //
 // Run (split topology):
 //
-//	scripts/docker-cluster-both.sh up
+//	scripts/cluster.sh --topology two-tier up
 //	STRATUM_T4_NODE_SERVICES=stratum-node-control1,stratum-node-control2,stratum-node-control3 \
 //	go test ./integration/docker/... -tags=docker -v -timeout 600s
-//	scripts/docker-cluster-both.sh down
+//	scripts/cluster.sh --topology two-tier down
 //
 //go:build docker
 // +build docker
@@ -45,9 +45,9 @@ import (
 
 // nodeAddrs are the gRPC addresses of the control-tier nodes under test.
 //
-// They default to the all-in-one layout (scripts/docker-cluster.sh, which CI
+// They default to the all-in-one layout (scripts/cluster.sh --topology single, which CI
 // runs) and can be pointed at the two-tier one
-// (scripts/docker-cluster-both.sh) without editing this file:
+// (scripts/cluster.sh --topology two-tier) without editing this file:
 //
 //	STRATUM_T4_NODE_ADDRS=localhost:17000,localhost:17001,localhost:17002
 //	STRATUM_T4_NODE_SERVICES=stratum-node-control1,stratum-node-control2,stratum-node-control3
@@ -93,7 +93,7 @@ func dialNode(addr string) (pb.KnowledgeBaseServiceClient, pb.QueryServiceClient
 
 // === docker fault-injection helpers ===
 //
-// 集群由 scripts/docker-cluster.sh 以原生 docker 容器方式启动（替代 docker-compose），
+// 集群由 scripts/cluster.sh --topology single 以原生 docker 容器方式启动（替代 docker-compose），
 // 节点容器名即 stratum-node{1,2,3}（与上方 nodeServices 一致），故直接用 docker CLI 管理。
 
 // dockerCmd runs a `docker` command. It fails the test on error.

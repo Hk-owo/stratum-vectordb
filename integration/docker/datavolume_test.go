@@ -26,7 +26,7 @@ import (
 )
 
 // storageDataDir is where storage node i keeps its data inside its container.
-// Storage nodes are numbered from 11 (see scripts/docker-cluster-both.sh), and
+// Storage nodes are numbered from 11 (see scripts/cluster.sh --topology two-tier), and
 // that number is what the directory is named after.
 func storageDataDir(i int) string {
 	return fmt.Sprintf("/var/lib/stratum/node%d", 10+i+1)
@@ -129,7 +129,7 @@ func duBytes(path string) (int64, error) {
 }
 
 // duNodeBytes returns the recursive byte size of a path inside a running
-// node container. The cluster is started by scripts/docker-cluster.sh with
+// node container. The cluster is started by scripts/cluster.sh --topology single with
 // plain `docker run` (no compose project), so plain `docker exec` is used.
 func duNodeBytes(t *testing.T, service, path string) int64 {
 	t.Helper()

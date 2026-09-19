@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # t4-integration.sh — 跑 T4 的 Docker 集群集成套件（integration/docker, -tags=docker）。
 #
-# 两种拓扑，对应 docs/await-version-plan.md §14 的两份验证记录：
+# 两种拓扑（都由 scripts/cluster.sh 起，用 --topology 区分）：
 #
-#   both        控制组 3 + 存储组 3（scripts/docker-cluster-both.sh）。每个容器自带
-#               vecstore，索引在容器内构建。
-#   all-in-one  3 个统一节点 + 宿主 vecstore 进程（scripts/docker-cluster.sh），
-#               也就是 CI 用的那一种。
+#   both        两层：控制组 3 + 存储组 3。每个容器自带 vecstore，索引在容器内构建。
+#   all-in-one  单层：3 个统一节点 + 宿主 vecstore 进程，也就是 CI 早期用的那一种。
 #
 # 用法：
 #   scripts/t4-integration.sh                          # both 拓扑，整套
@@ -16,10 +14,10 @@
 #   scripts/t4-integration.sh --down                   # 跑完把集群停掉（默认不停）
 #   scripts/t4-integration.sh -- -v -count=1           # 额外参数透传给 go test
 #
-# 注意（2025-09 实测，未修）：all-in-one 拓扑下宿主 vecstore 的 Save 会失败
+# 注意（2025-09 实测，未修）：单层拓扑下宿主 vecstore 的 Save 会失败
 # （节点日志里 "index: Save RPC: rpc error ... Unexpected error in RPC handling"），
 # 于是没有任何版本能变成 READY —— 需要 READY 的用例（含 await/SDK 那几条）都会红，
-# 而这与用例本身无关。both 拓扑不受影响。
+# 而这与用例本身无关。两层拓扑不受影响，CI 也因此只用两层。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,22 +37,22 @@ while [[ $# -gt 0 ]]; do
     --no-up)       DO_UP=0; shift ;;
     --down)        DO_DOWN=1; shift ;;
     --)            shift; EXTRA=("$@"); break ;;
-    -h|--help)     sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help)     awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"; exit 0 ;;
     *) echo "未知参数: $1（试试 --help）" >&2; exit 2 ;;
   esac
 done
 
 case "$TOPOLOGY" in
   both)
-    UP_CMD=("$ROOT/scripts/docker-cluster-both.sh" up)
+    UP_CMD=("$ROOT/scripts/cluster.sh" --topology two-tier up)
     export STRATUM_T4_NODE_SERVICES="stratum-node-control1,stratum-node-control2,stratum-node-control3"
     export STRATUM_T4_STORAGE_SERVICES="stratum-node-storage1,stratum-node-storage2,stratum-node-storage3"
-    DOWN_CMD=("$ROOT/scripts/docker-cluster-both.sh" down)
+    DOWN_CMD=("$ROOT/scripts/cluster.sh" --topology two-tier down)
     ;;
   all-in-one)
-    UP_CMD=("$ROOT/scripts/docker-cluster.sh" up 3 --with-embed)
+    UP_CMD=("$ROOT/scripts/cluster.sh" up 3 --with-embed)
     export STRATUM_T4_NODE_SERVICES="stratum-node1,stratum-node2,stratum-node3"
-    DOWN_CMD=("$ROOT/scripts/docker-cluster.sh" down)
+    DOWN_CMD=("$ROOT/scripts/cluster.sh" down)
     ;;
   *)
     echo "未知拓扑: $TOPOLOGY（可选 both / all-in-one）" >&2

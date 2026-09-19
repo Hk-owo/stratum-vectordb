@@ -69,8 +69,8 @@ function dockerConfig(): DockerClusterConfig {
   return {
     enabled: true,
     topology: 'two-tier',
-    script: 'scripts/docker-cluster.sh',
-    script_two_tier: 'scripts/docker-cluster-both.sh',
+    script: 'scripts/cluster.sh',
+    script_two_tier: 'scripts/cluster.sh',
     nodes: 2,
     storage_nodes: 1,
     base_port: 17000,

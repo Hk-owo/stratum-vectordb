@@ -9,11 +9,11 @@ import (
 	"testing"
 )
 
-// fakeDockerScript 生成一个假的 docker-cluster.sh：记录被调用的参数，
+// fakeDockerScript 生成一个假的编排脚本：记录被调用的参数，
 // 按子命令输出预置结果（status 输出 JSON，logs 输出文本，其余输出调用摘要）。
 func fakeDockerScript(t *testing.T, dir string) string {
 	t.Helper()
-	path := filepath.Join(dir, "fake-docker-cluster.sh")
+	path := filepath.Join(dir, "fake-cluster.sh")
 	content := `#!/bin/sh
 echo "called:$*" >> "$FAKE_CALL_LOG"
 case " $* " in

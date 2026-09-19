@@ -33,7 +33,7 @@ import (
 // the suite dials the station. That is the deployed shape with the container
 // boundary shifted by one hop.
 //
-// The cluster itself must already be up (scripts/docker-cluster-both.sh up).
+// The cluster itself must already be up (scripts/cluster.sh --topology two-tier up).
 // Set STRATUM_T4_STATION_ADDR to use an existing station instead of starting
 // one — CI may want the station it deployed rather than a second one.
 func TestMain(m *testing.M) {
@@ -61,7 +61,7 @@ func TestMain(m *testing.M) {
 	// start, and a kill has to name a container however the client reaches the
 	// cluster.
 	//
-	// The defaults match scripts/docker-cluster-both.sh, whose containers carry
+	// The defaults match scripts/cluster.sh --topology two-tier, whose containers carry
 	// their tier in the name. Leaving the all-in-one names would make every kill
 	// fail with "no such container" — which is exactly what happened: the suite
 	// reached the cluster through the station and then could not fault it.

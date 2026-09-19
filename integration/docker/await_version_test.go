@@ -370,7 +370,7 @@ func TestT4_DiscardVersion_AbandonsAWriteThatCannotLand(t *testing.T) {
 	kbID := createKB(t, ctx, "discard-pending")
 
 	// The container name is the same in both supported topologies
-	// (scripts/docker-cluster.sh and scripts/docker-cluster-both.sh both call it
+	// (scripts/cluster.sh --topology single and scripts/cluster.sh --topology two-tier both call it
 	// stratum-embed), so this case runs unchanged under CI's all-in-one cluster.
 	dockerCmd(t, "stop", "stratum-embed")
 	defer func() {
