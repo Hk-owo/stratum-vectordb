@@ -20,6 +20,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"io"
@@ -28,6 +30,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +44,8 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/embed"
+	"stratum/internal/types"
 )
 
 var (
@@ -57,6 +64,28 @@ type gateway struct {
 	kb    pb.KnowledgeBaseServiceClient
 	query pb.QueryServiceClient
 	admin pb.AdminServiceClient
+
+	// embedClients keeps one HTTP embed client per service address, for
+	// /api/query-text. A search is a short-lived request, so re-dialing per call
+	// would add a round trip to every one of them. Guarded: the gateway serves
+	// concurrently.
+	embedMu      sync.Mutex
+	embedClients map[string]embed.EmbedClient
+}
+
+// embedClientFor returns the embed client for an address, dialing once per address.
+func (g *gateway) embedClientFor(addr string) embed.EmbedClient {
+	g.embedMu.Lock()
+	defer g.embedMu.Unlock()
+	if g.embedClients == nil {
+		g.embedClients = map[string]embed.EmbedClient{}
+	}
+	if c, ok := g.embedClients[addr]; ok {
+		return c
+	}
+	c := embed.NewHTTPEmbedClient(addr, 10*time.Second)
+	g.embedClients[addr] = c
+	return c
 }
 
 func main() {
@@ -64,7 +93,10 @@ func main() {
 	// 负责 leader 发现、写转发与读负载均衡；gateway 只维护一条 gRPC 连接。
 	grpcAddr := flag.String("grpc-addr", "127.0.0.1:7009", "routing layer (stratum-router) gRPC address")
 	httpAddr := flag.String("http-addr", "0.0.0.0:8081", "gateway HTTP listen address")
-	staticDir := flag.String("static", "./web", "frontend static asset directory")
+	// web/dist is the Vite build output: web/ is now a Vite project whose
+	// sources live in web/src/ (`npm --prefix web run build` produces dist/).
+	// Pointing at web/ itself would serve the un-transpiled entry index.html.
+	staticDir := flag.String("static", "./web/dist", "frontend static asset directory")
 	opsConfigPath := flag.String("ops-config", "", "console ops config YAML (default ./run/console.yaml)")
 	nodeID := flag.Int("node-id", 1, "this node's ID for the ops console")
 	flag.Parse()
@@ -263,6 +295,13 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 			return g.query.Query(ctx, r)
 		},
 	))
+
+	// Text search: the console asks in words, the gateway embeds with the
+	// knowledge base's OWN embed config and forwards the vector to /api/query's
+	// service. It is not a proto message on purpose — the wire contract stays
+	// "a vector", and this is a convenience for callers that have no embedder of
+	// their own (web/src/api/queries.ts describes the same split from the UI side).
+	mux.HandleFunc("POST /api/query-text", g.handleQueryText)
 }
 
 // handle adapts a no-path-parameter gRPC method into an http.HandlerFunc.
@@ -375,4 +414,110 @@ func noCacheStatic(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// queryTextRequest is the body of POST /api/query-text.
+type queryTextRequest struct {
+	KnowledgeBaseID string   `json:"knowledge_base_id"`
+	Text            string   `json:"text"`
+	TopK            int32    `json:"top_k"`
+	Threshold       *float32 `json:"threshold,omitempty"`
+	// VersionID is a string because protojson encodes int64 as a JSON string, and
+	// the console passes back the value it read from a response verbatim.
+	VersionID   *string `json:"version_id,omitempty"`
+	Aggregation string  `json:"aggregation,omitempty"`
+}
+
+// handleQueryText embeds the text with the knowledge base's own embed config and
+// forwards the resulting vector to QueryService.
+//
+// The embed config comes from the knowledge base, never from the request: a
+// caller may choose WHAT to ask, but only the knowledge base decides HOW its text
+// is turned into vectors — a model chosen per request could silently answer from
+// a different vector space, and similarity across two models means nothing.
+func (g *gateway) handleQueryText(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	var body queryTextRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, status.Error(codes.InvalidArgument, "invalid JSON body: "+err.Error()))
+		return
+	}
+	if body.KnowledgeBaseID == "" {
+		writeError(w, status.Error(codes.InvalidArgument, "knowledge_base_id is required"))
+		return
+	}
+	if strings.TrimSpace(body.Text) == "" {
+		writeError(w, status.Error(codes.InvalidArgument, "text is required"))
+		return
+	}
+
+	kbResp, err := g.kb.GetKnowledgeBase(ctx, &pb.GetKnowledgeBaseRequest{KnowledgeBaseId: body.KnowledgeBaseID})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	cfg := kbResp.GetKnowledgeBase().GetEmbedConfig()
+	if cfg.GetServiceAddr() == "" {
+		writeError(w, status.Error(codes.FailedPrecondition,
+			"this knowledge base has no embed service configured, so its text cannot be embedded here"))
+		return
+	}
+
+	chunkID := queryChunkID(body.Text, cfg.GetModelId())
+	vectors, err := g.embedClientFor(cfg.GetServiceAddr()).Embed(ctx,
+		[]types.Chunk{{ChunkID: chunkID, Content: body.Text}})
+	if err != nil {
+		// No silent fallback. A vector the index never saw would still return
+		// results, and those results would be meaningless rather than empty —
+		// worse than an error. Say what could not be reached and what to do.
+		writeError(w, status.Errorf(codes.Unavailable,
+			"cannot embed the query text: %v (the gateway has to be able to reach the knowledge base's embed service at %s; otherwise embed the text yourself and call POST /api/query)",
+			err, cfg.GetServiceAddr()))
+		return
+	}
+	vector, ok := vectors[chunkID]
+	if !ok {
+		writeError(w, status.Error(codes.Internal, "the embed service returned no vector for the query text"))
+		return
+	}
+
+	q := &pb.QueryRequest{
+		KnowledgeBaseId: body.KnowledgeBaseID,
+		Vector:          vector,
+		TopK:            body.TopK,
+		Threshold:       body.Threshold,
+	}
+	if body.VersionID != nil {
+		v, err := strconv.ParseInt(*body.VersionID, 10, 64)
+		if err != nil {
+			writeError(w, status.Errorf(codes.InvalidArgument, "version_id %q is not a number", *body.VersionID))
+			return
+		}
+		q.VersionId = &v
+	}
+	if body.Aggregation != "" {
+		v, ok := pb.AggregationMethod_value[body.Aggregation]
+		if !ok {
+			writeError(w, status.Errorf(codes.InvalidArgument, "unknown aggregation %q", body.Aggregation))
+			return
+		}
+		q.Aggregation = pb.AggregationMethod(v)
+	}
+
+	resp, err := g.query.Query(ctx, q)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, resp)
+}
+
+// queryChunkID is the id the embed layer keys a chunk by: SHA-256 of the text plus
+// the knowledge base's model id — the same rule internal/splitter applies to
+// document chunks. It has to match, or the embed service would compute a vector
+// under one key while we look it up under another.
+func queryChunkID(text, modelID string) string {
+	sum := sha256.Sum256([]byte(text + modelID))
+	return hex.EncodeToString(sum[:])
 }
