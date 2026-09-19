@@ -1661,6 +1661,15 @@ func (im *IndexManagerImpl) saveToDisk(ctx context.Context, kbID string, version
 	if err := os.Chmod(dir, 0o777); err != nil {
 		return fmt.Errorf("index: save chmod: %w", err)
 	}
+	// The INTERMEDIATE level is shared as well. MkdirAll applies its mode only to
+	// the leaves it creates, and umask narrows it further, so <IndexDataDir>/index
+	// ends up 0755 root — and a vecstore running as another user then cannot create
+	// anything under it. Harmless while this node creates every version directory
+	// first (which it does), but it contradicts what the mode above promises, and
+	// it silently breaks any path where the vecstore side makes a directory itself.
+	if err := os.Chmod(filepath.Dir(dir), 0o777); err != nil {
+		return fmt.Errorf("index: save chmod parent: %w", err)
+	}
 	if _, err := im.vectorIndexClient.Save(ctx, &vecstorepb.SaveIndexRequest{
 		KbId: kbID, VersionId: versionID, Path: path,
 	}); err != nil {
