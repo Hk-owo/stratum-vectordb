@@ -35,6 +35,7 @@ var writeMethods = map[string]bool{
 	pb.KnowledgeBaseService_CreateVersion_FullMethodName:       true,
 	pb.KnowledgeBaseService_RollbackVersion_FullMethodName:     true,
 	pb.KnowledgeBaseService_DeleteVersion_FullMethodName:       true,
+	pb.KnowledgeBaseService_DiscardVersion_FullMethodName:      true,
 	pb.AdminService_RebuildIndex_FullMethodName:                true,
 	pb.AdminService_WarmupVersion_FullMethodName:               true,
 }

@@ -46,6 +46,11 @@ var (
 	ErrEmptyChanges         = errors.New("empty changes")
 	ErrIndexLoadTimeout     = errors.New("index load timeout")
 	ErrInvalidParentVersion = errors.New("invalid parent version")
+	// ErrVersionNotPending rejects a DiscardVersion for a version that is not
+	// (or no longer) PENDING. Discarding is for a write that never landed; a
+	// version whose data side has already settled is DeleteVersion's business
+	// (docs/await-version-plan.md §5 contract 7, §7 Step 6).
+	ErrVersionNotPending = errors.New("version is not pending")
 	// ErrKBStorageDegraded refuses a WRITE to a knowledge base whose live
 	// replicas are below quorum (docs/storage-degradation-signal-plan.md §4.1).
 	//
@@ -84,6 +89,7 @@ var sentinelNames = []struct {
 	{"version_failed", ErrVersionFailed},
 	{"version_deleting", ErrVersionDeleting},
 	{"version_is_active", ErrVersionIsActive},
+	{"version_not_pending", ErrVersionNotPending},
 	{"knowledge_base_not_found", ErrKnowledgeBaseNotFound},
 	{"knowledge_base_deleted", ErrKnowledgeBaseDeleted},
 	{"index_not_ready", ErrIndexNotReady},
@@ -130,6 +136,7 @@ var grpcCodeMap = map[error]codes.Code{
 	ErrVersionFailed:         codes.FailedPrecondition,
 	ErrVersionDeleting:       codes.FailedPrecondition,
 	ErrVersionIsActive:       codes.FailedPrecondition,
+	ErrVersionNotPending:     codes.FailedPrecondition,
 	ErrKnowledgeBaseNotFound: codes.NotFound,
 	ErrKnowledgeBaseDeleted:  codes.FailedPrecondition,
 	ErrIndexNotReady:         codes.FailedPrecondition,

@@ -468,6 +468,53 @@ func (r *MockRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, 
 	return nil
 }
 
+// ProposeDiscardVersion implements RaftNode.
+//
+// The mock mirrors the state machine's compare-and-set so service-level tests
+// exercise the same admission rule (docs/await-version-plan.md §5 contract 7):
+// only a PENDING, non-active, childless version can be discarded. Unlike the
+// mock's other removals it ALSO prunes versionsByRequest — that pruning is part
+// of what discarding means (a re-send under the same key must allocate a new
+// version, §7 Step 6), so a test that leaves it out would be testing a
+// different operation.
+func (r *MockRaftNode) ProposeDiscardVersion(_ context.Context, kbID string, versionID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kb, ok := r.kbs[kbID]
+	if !ok {
+		return stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	v, ok := r.versions[versionID]
+	if !ok || v.KBID != kbID {
+		return stratumerrors.ErrVersionNotFound
+	}
+	if kb.ActiveVersionID == versionID {
+		return stratumerrors.ErrVersionIsActive
+	}
+	if v.DataStatus != types.DataStatusPending || v.Deleting {
+		return stratumerrors.ErrVersionNotPending
+	}
+	for _, id := range r.versionsByKB[kbID] {
+		if child, ok := r.versions[id]; ok && child.ParentVersionID == versionID {
+			return stratumerrors.ErrInvalidParentVersion
+		}
+	}
+	delete(r.versions, versionID)
+	list := r.versionsByKB[kbID]
+	for i, id := range list {
+		if id == versionID {
+			r.versionsByKB[kbID] = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	for key, id := range r.versionsByRequest {
+		if id == versionID {
+			delete(r.versionsByRequest, key)
+		}
+	}
+	return nil
+}
+
 // mockVersionSubtree returns rootID plus every descendant of rootID within
 // kbID (following ParentVersionID edges), mirroring the state machine's
 // collectVersionSubtree.
@@ -540,14 +587,30 @@ func (r *MockRaftNode) GetClusterStatus(_ context.Context) (types.ClusterStatus,
 	return types.ClusterStatus{HasLeader: true, MemberCount: 1, LeaderID: 1}, nil
 }
 
-// GetVersion is a test convenience helper (not part of the RaftNode
+// VersionByID is a test convenience helper (not part of the RaftNode
 // interface) for tests that want to inspect a single version's metadata
-// directly rather than scanning ListVersions.
-func (r *MockRaftNode) GetVersion(versionID int64) (types.VersionMeta, bool) {
+// directly rather than scanning ListVersions. It is exported because tests in
+// other packages use it; the interface method is GetVersion below, and the two
+// cannot share a name.
+func (r *MockRaftNode) VersionByID(versionID int64) (types.VersionMeta, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	v, ok := r.versions[versionID]
 	return v, ok
+}
+
+// GetVersion implements RaftNode.
+func (r *MockRaftNode) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.kbs[kbID]; !ok {
+		return types.VersionMeta{}, stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	v, ok := r.versions[versionID]
+	if !ok || v.KBID != kbID {
+		return types.VersionMeta{}, stratumerrors.ErrVersionNotFound
+	}
+	return v, nil
 }
 
 // Reset clears all stored state. Convenience for tests; not part of the

@@ -112,6 +112,18 @@ func (r *gcWriteRaftNode) ListVersions(_ context.Context, kbID string) ([]types.
 	return append([]types.VersionMeta(nil), r.versions[kbID]...), nil
 }
 
+// GetVersion satisfies raft.RaftNode, answering from the same fixture data.
+func (r *gcWriteRaftNode) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, v := range r.versions[kbID] {
+		if v.VersionID == versionID {
+			return v, nil
+		}
+	}
+	return types.VersionMeta{}, nil
+}
+
 func (r *gcWriteRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -144,6 +156,11 @@ func (r *gcWriteRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string
 	return nil, nil
 }
 func (r *gcWriteRaftNode) ProposeRemoveVersionMeta(_ context.Context, _ string, _ int64) error {
+	return nil
+}
+
+// ProposeDiscardVersion satisfies raft.RaftNode; these tests never discard.
+func (r *gcWriteRaftNode) ProposeDiscardVersion(_ context.Context, _ string, _ int64) error {
 	return nil
 }
 func (r *gcWriteRaftNode) GetClusterStatus(_ context.Context) (types.ClusterStatus, error) {

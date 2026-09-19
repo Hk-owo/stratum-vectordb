@@ -78,11 +78,21 @@ func (r *deleteTestRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID st
 	r.removedMetadata = append(r.removedMetadata, kbID)
 	return nil
 }
+
+// ProposeDiscardVersion satisfies raft.RaftNode; these tests never discard.
+func (r *deleteTestRaftNode) ProposeDiscardVersion(_ context.Context, _ string, _ int64) error {
+	return nil
+}
 func (r *deleteTestRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
 	return types.KnowledgeBaseMeta{}, nil
 }
 func (r *deleteTestRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
 	return nil, nil
+}
+
+// GetVersion satisfies raft.RaftNode; this stub models no versions.
+func (r *deleteTestRaftNode) GetVersion(_ context.Context, _ string, _ int64) (types.VersionMeta, error) {
+	return types.VersionMeta{}, nil
 }
 func (r *deleteTestRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
 	return nil, nil

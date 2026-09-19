@@ -25,6 +25,16 @@ func (r *gcTestRaftNode) ListKnowledgeBases(_ context.Context) ([]types.Knowledg
 func (r *gcTestRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
 	return r.versions[kbID], nil
 }
+
+// GetVersion satisfies raft.RaftNode, answering from the same fixture data.
+func (r *gcTestRaftNode) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
+	for _, v := range r.versions[kbID] {
+		if v.VersionID == versionID {
+			return v, nil
+		}
+	}
+	return types.VersionMeta{}, nil
+}
 func (r *gcTestRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBaseMeta) error {
 	return nil
 }
@@ -57,6 +67,11 @@ func (r *gcTestRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string,
 	return nil, nil
 }
 func (r *gcTestRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
+	return nil
+}
+
+// ProposeDiscardVersion satisfies raft.RaftNode; these tests never discard.
+func (r *gcTestRaftNode) ProposeDiscardVersion(_ context.Context, _ string, _ int64) error {
 	return nil
 }
 func (r *gcTestRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {

@@ -124,11 +124,34 @@ type RaftNode interface {
 	// re-propose this any number of times.
 	ProposeRemoveVersionMeta(ctx context.Context, kbID string, versionID int64) error
 
+	// ProposeDiscardVersion removes a version the CALLER has declared abandoned:
+	// a write that never landed, so there is nothing to reclaim
+	// (docs/await-version-plan.md §7 Step 6).
+	//
+	// Admission is a compare-and-set applied in the state machine, not a check
+	// the caller performs: the version must still be PENDING at apply time.
+	// Rejected with ErrVersionNotFound (unknown version, or one in another KB),
+	// ErrVersionIsActive (it is the active version), ErrVersionNotPending (its
+	// data side already settled — use DeleteVersion for those) or
+	// ErrInvalidParentVersion (it has a child, which a PENDING version should
+	// never have).
+	ProposeDiscardVersion(ctx context.Context, kbID string, versionID int64) error
+
 	// GetKB returns kbID's current metadata.
 	GetKB(ctx context.Context, kbID string) (types.KnowledgeBaseMeta, error)
 
 	// ListVersions returns the full version list for kbID.
 	ListVersions(ctx context.Context, kbID string) ([]types.VersionMeta, error)
+
+	// GetVersion returns ONE version's metadata within kbID, so a caller can
+	// ask about a single version without pulling the whole chain: ListVersions
+	// is O(versions) in the KB and the await path polls it repeatedly
+	// (docs/await-version-plan.md §7 Step 2).
+	//
+	// kbID is required because a version id is unique within a knowledge base,
+	// not globally. Unknown kbID → ErrKnowledgeBaseNotFound; an unknown version
+	// id, or one belonging to another knowledge base → ErrVersionNotFound.
+	GetVersion(ctx context.Context, kbID string, versionID int64) (types.VersionMeta, error)
 
 	// ListKnowledgeBases returns metadata for every knowledge base known to
 	// the Raft state machine. Used by the console (ListKnowledgeBases RPC)

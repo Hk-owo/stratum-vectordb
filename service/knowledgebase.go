@@ -10,8 +10,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -42,6 +45,30 @@ type KnowledgeBaseServiceImpl struct {
 	// Optional, and an unwired gate means "unknown" — which callers read as
 	// "allow" (docs/storage-degradation-signal-plan.md §3.3).
 	storageGate StorageDegradationSource
+
+	// logger carries the per-stage timings of a write, the control-plane half of
+	// the chain stage 5 continues on the storage node (see CreateVersion). Debug
+	// level and silent by default: one line per write at info would be noise, but
+	// the alternative — today — is that a write's cost is broken down only AFTER
+	// it has been handed off, with nothing measuring the part the client actually
+	// waited for. See SetLogger.
+	logger *zap.Logger
+
+	// presence + replicas feed the await path's data_missing probe (see
+	// await_version.go). Optional: without them the probe is skipped and
+	// data_missing stays false — "unknown", never a claim that the data is
+	// there.
+	presence PresenceChecker
+	replicas func() []string
+
+	// probeCache remembers probe verdicts and bounds how many probes run at
+	// once (docs/await-version-plan.md §6.4).
+	probeCache *awaitProbe
+
+	// versionWatcher is the event-driven half of the await path
+	// (docs/await-version-plan.md §12 item 1). Optional: without it await polls
+	// the state machine, which is correct but pays up to one interval of latency.
+	versionWatcher VersionWatcher
 }
 
 // VersionHolder is one node that reported holding a version, with the address it
@@ -204,6 +231,17 @@ func NewKnowledgeBaseService(
 		writeCoord:         wc,
 		deleteCoord:        dc,
 		deleteVersionCoord: dvc,
+		logger:             zap.NewNop(),
+		probeCache:         newAwaitProbe(),
+	}
+}
+
+// SetLogger wires the logger that carries CreateVersion's per-stage timings.
+// Optional: without it those timings go nowhere, which is the pre-existing
+// behaviour (nothing about correctness depends on them).
+func (s *KnowledgeBaseServiceImpl) SetLogger(l *zap.Logger) {
+	if l != nil {
+		s.logger = l
 	}
 }
 
@@ -310,10 +348,45 @@ func (s *KnowledgeBaseServiceImpl) DeleteKnowledgeBase(ctx context.Context, req 
 // maps to codes.Unavailable): the next attempt is the one that gets the
 // authoritative answer once the aggregate has caught up.
 func (s *KnowledgeBaseServiceImpl) CreateVersion(ctx context.Context, req *pb.CreateVersionRequest) (*pb.CreateVersionResponse, error) {
-	if err := s.checkStorageWritable(req.KnowledgeBaseId); err != nil {
+	// Per-stage timings of one write, at debug level.
+	//
+	// Why it exists: this is the entry the client's clock is measuring, and the
+	// chain it starts is split across three processes — the station in front
+	// (router), this control node, and the storage node that ends up owning the
+	// transaction (write: stage timings). kb_id + version_id are what join the
+	// three lines back into one request; the version id is filled in by the
+	// deferred function below, so a write that fails before the version exists
+	// still reports its line with the id absent rather than not at all.
+	//
+	// What this line adds over the coordinator's own (coordinator: write execute
+	// timings) is the boundary: gate_us is the storage-degradation check, which
+	// happens before any version number is spent, and convert_us is the proto
+	// conversion. execute_us is the coordinator's total, so the two lines agree
+	// by construction — which is what makes a disagreement a real finding rather
+	// than a rounding difference.
+	start := time.Now()
+	var tGate, tConvert, tExecute time.Duration
+	var versionID int64
+	defer func() {
+		s.logger.Debug("service: create version timings",
+			zap.String("kb_id", req.GetKnowledgeBaseId()),
+			zap.String("client_request_id", req.GetClientRequestId()),
+			zap.Int64("version_id", versionID),
+			zap.Int("changes", len(req.GetChanges())),
+			zap.Int64("gate_us", tGate.Microseconds()),
+			zap.Int64("convert_us", tConvert.Microseconds()),
+			zap.Int64("execute_us", tExecute.Microseconds()),
+			zap.Int64("total_us", time.Since(start).Microseconds()))
+	}()
+
+	stepStart := time.Now()
+	err := s.checkStorageWritable(req.KnowledgeBaseId)
+	tGate = time.Since(stepStart)
+	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
+	stepStart = time.Now()
 	changes := make([]types.DocChange, len(req.Changes))
 	for i, c := range req.Changes {
 		op := types.ChangeOpAdd
@@ -329,13 +402,25 @@ func (s *KnowledgeBaseServiceImpl) CreateVersion(ctx context.Context, req *pb.Cr
 			Content: c.Content,
 		}
 	}
+	tConvert = time.Since(stepStart)
 
-	versionID, err := s.writeCoord.Execute(ctx, req.KnowledgeBaseId, req.ParentVersionId, changes, req.ClientRequestId)
+	stepStart = time.Now()
+	// §7 Step 4: the key is settled HERE, before the proposal, because the caller
+	// is told about it in the response. Leaving it to the coordinator's own
+	// "generate one if it is empty" branch produced a key nobody outside this
+	// process could see, which is what left a client that omitted one unable to
+	// re-send under it (docs/await-version-plan.md §7 Step 4).
+	requestID := req.GetClientRequestId()
+	if requestID == "" {
+		requestID = coordinator.NewDispatchID()
+	}
+	versionID, err = s.writeCoord.Execute(ctx, req.KnowledgeBaseId, req.ParentVersionId, changes, requestID)
+	tExecute = time.Since(stepStart)
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
-	return &pb.CreateVersionResponse{VersionId: versionID}, nil
+	return &pb.CreateVersionResponse{VersionId: versionID, ClientRequestId: requestID}, nil
 }
 
 // ListVersions implements KnowledgeBaseServiceServer.
@@ -347,21 +432,7 @@ func (s *KnowledgeBaseServiceImpl) ListVersions(ctx context.Context, req *pb.Lis
 
 	out := make([]*pb.VersionInfo, len(versions))
 	for i, v := range versions {
-		out[i] = &pb.VersionInfo{
-			VersionId:       v.VersionID,
-			ParentVersionId: v.ParentVersionID,
-			CreatedAt:       v.CreatedAt,
-			IndexStatus:     pb.IndexStatus(v.IndexStatus),
-			Deleting:        v.Deleting,
-			// The data side travels alongside the index side (§10.1b): callers
-			// that only look at index_status cannot tell "the data never landed"
-			// from "everything is fine".
-			DataStatus: pb.DataStatus(v.DataStatus),
-			// And the digest, which the storage layer needs whole: it is what
-			// separates an empty version from one whose digest was never
-			// committed (see the field's comment in the proto).
-			DocIdSetHash: v.DocIDSetHash,
-		}
+		out[i] = versionInfoToProto(v)
 	}
 	return &pb.ListVersionsResponse{Versions: out}, nil
 }
@@ -430,6 +501,48 @@ func (s *KnowledgeBaseServiceImpl) DeleteVersion(ctx context.Context, req *pb.De
 	}()
 
 	return &pb.DeleteVersionResponse{Success: true, DeletedVersionIds: deleted}, nil
+}
+
+// DiscardVersion implements KnowledgeBaseServiceServer.
+//
+// The caller is declaring that it is abandoning a version whose write never
+// landed (docs/await-version-plan.md §7 Step 6). Whether that is admissible is
+// decided by the state machine at apply time, not here: this RPC relays the
+// declaration, which is what keeps the check from racing the very write it is
+// meant to protect (§5 contract 7).
+func (s *KnowledgeBaseServiceImpl) DiscardVersion(ctx context.Context, req *pb.DiscardVersionRequest) (*pb.DiscardVersionResponse, error) {
+	err := s.raftNode.ProposeDiscardVersion(ctx, req.GetKnowledgeBaseId(), req.GetVersionId())
+	if err == nil {
+		s.logDiscard(req, true)
+		return &pb.DiscardVersionResponse{Discarded: true}, nil
+	}
+	if errors.Is(err, stratumerrors.ErrVersionNotFound) {
+		// Already gone: the caller's intent is satisfied, so report that rather
+		// than an error. A retry after a lost response then costs nothing, which
+		// is the whole point of admitting this RPC as idempotent.
+		s.logDiscard(req, false)
+		return &pb.DiscardVersionResponse{Discarded: false}, nil
+	}
+	return nil, stratumerrors.ToGRPCStatus(err)
+}
+
+// logDiscard is §12 item 6's audit trail.
+//
+// Raft's own log carries the command (cmdDiscardVersion) and is the authoritative
+// record; this line is what makes the event visible to whoever reads a service
+// log. Without it an abandoned version is indistinguishable from a version number
+// that was never valid — the version simply stops appearing, and "the caller gave
+// up on it" is not something anyone can reconstruct after the fact.
+//
+// It also explains a later surprise: the discarding caller may have had a write
+// in flight whose chunks still land, so those chunks can arrive after their
+// metadata is gone. They become orphans for the chunk GC, and this line is the
+// only place that connects them to the decision that caused them.
+func (s *KnowledgeBaseServiceImpl) logDiscard(req *pb.DiscardVersionRequest, removed bool) {
+	s.logger.Info("version discarded by the caller",
+		zap.String("kb_id", req.GetKnowledgeBaseId()),
+		zap.Int64("version_id", req.GetVersionId()),
+		zap.Bool("metadata_removed", removed))
 }
 
 // versionDeleteModeFromProto maps the wire enum onto the internal type.

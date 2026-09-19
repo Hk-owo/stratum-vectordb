@@ -185,6 +185,14 @@ func (r *RemoteRaftNode) ProposeRemoveVersionMeta(ctx context.Context, kbID stri
 	return res.Err
 }
 
+func (r *RemoteRaftNode) ProposeDiscardVersion(ctx context.Context, kbID string, versionID int64) error {
+	res, err := r.propose(ctx, newDiscardVersionCommand(kbID, versionID))
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
 // propose carries one command to a control node and returns its apply outcome.
 //
 // Candidates are the cached leader first, then every control node in ascending
@@ -325,6 +333,30 @@ func (r *RemoteRaftNode) ListVersions(ctx context.Context, kbID string) ([]types
 		return nil
 	})
 	return out, kbScopedError(err)
+}
+
+// GetVersion implements RaftNode.
+//
+// A storage node has no local state machine, so this goes through the same
+// ListVersions RPC and filters — it is NOT the O(1) read the control node
+// offers, and that is deliberate rather than overlooked. GetVersion exists for
+// the await path, and await only ever runs where the state machine lives: a
+// storage node does not register the knowledge-base service at all
+// (docs/await-version-plan.md §6.1). Filtering here keeps the two RaftNode
+// shapes honest — a storage node answers correctly, just not cheaply — while a
+// control-plane RPC for a single version would be new protocol surface with no
+// caller (recorded as future work in that plan's §12).
+func (r *RemoteRaftNode) GetVersion(ctx context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
+	versions, err := r.ListVersions(ctx, kbID)
+	if err != nil {
+		return types.VersionMeta{}, err
+	}
+	for _, v := range versions {
+		if v.VersionID == versionID {
+			return v, nil
+		}
+	}
+	return types.VersionMeta{}, stratumerrors.ErrVersionNotFound
 }
 
 // ListKnowledgeBases implements RaftNode.

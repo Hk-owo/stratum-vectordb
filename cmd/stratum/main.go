@@ -951,42 +951,7 @@ func main() {
 	// arrives first wins, the other becomes a no-op.
 	if raftNode != nil {
 		raftNode.SetOnVersionCommittedAsLeader(func(kbID string, versionID, parentVersionID int64, clientRequestID string) {
-			regParentID, changes, ok := writeCoord.TakePendingDispatch(kbID, clientRequestID)
-			if !ok {
-				// Nothing registered on THIS node. Two very different cases hide
-				// behind that, and they used to be answered the same way (a log
-				// line and a return):
-				//
-				//   - the background dispatch already took it (Execute dispatches
-				//     the moment the version is committed; Take is once-only), so
-				//     the write is on its way and there is nothing to do;
-				//   - nobody holds the changes at all — the process that proposed
-				//     them is gone (a restarted or deposed leader), and the Raft
-				//     command deliberately carries no changes (§7.7). Then this
-				//     version will never be written by anyone, and leaving it
-				//     PENDING is what made Query answer "try again later" forever.
-				//
-				// The second case is the one that needs settling, and §10.1 owns
-				// the verdict (retry or FAILED_PERMANENT) — AbandonDispatch is how
-				// it gets asked. A false positive (case 1) is harmless: the retry
-				// budget records one transient failure for a version that is in
-				// fact being written.
-				writeCoord.AbandonDispatch(ctx, kbID, versionID, types.FailureTransient,
-					"no pending dispatch on this node: the changes were never registered here")
-				logger.Warn("version committed here without a pending dispatch",
-					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
-					zap.String("client_request_id", clientRequestID))
-				return
-			}
-			if regParentID != 0 {
-				parentVersionID = regParentID
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			if _, err := writeDispatcher.Dispatch(ctx, kbID, versionID, parentVersionID, changes); err != nil {
-				logger.Warn("write dispatch failed; the client's retry or the retry budget takes over",
-					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-			}
+			dispatchCommittedVersion(writeCoord, writeDispatcher, logger, kbID, versionID, parentVersionID, clientRequestID)
 		})
 	}
 
@@ -1009,6 +974,21 @@ func main() {
 		grpc.ChainStreamInterceptor(service.StreamAuthGate(cfg.RequireAuthenticated)),
 	)
 
+	// The candidate replicas that may hold a version's data, as a plain address
+	// list. Two consumers ask that question in different shapes — the admin
+	// status view and the await path's data_missing probe — and sharing one
+	// closure is what keeps them from answering differently. Resolved per call,
+	// not once: resolveReplicaAddrs is late-bound (see its declaration), so
+	// resolving eagerly here would freeze a topology the cluster may still be
+	// forming.
+	replicaAddrsForProbe := func() []string {
+		addrs, err := resolveReplicaAddrs(context.Background())
+		if err != nil {
+			return nil
+		}
+		return addrs
+	}
+
 	if raftNode != nil {
 		kbSvc := service.NewKnowledgeBaseService(rn, writeCoord, deleteCoord, deleteVersionCoord)
 		// §9.3(1)/§4.3(1): the station's route table reads "which nodes hold this
@@ -1022,6 +1002,23 @@ func main() {
 		// verdict allows the write, which is how a leadership change stays a
 		// failover rather than an outage.
 		kbSvc.SetStorageDegradationSource(versionHolderSource{controlPlane})
+		// Per-stage write timings, at debug level. The storage node's own
+		// stages (write: stage timings) already existed; what was missing is the
+		// half the CLIENT waits for — the control node's handling up to the
+		// version commit — which is only observable from here.
+		kbSvc.SetLogger(logger)
+		// The await path's data_missing probe asks the same two questions
+		// AdminService's status view asks — "which nodes may hold this version"
+		// and "does any of them actually have it" — so it is wired from the same
+		// sources (docs/await-version-plan.md §6.4). A control node holds no
+		// chunks itself, which is precisely why this probe goes over the network,
+		// and an unreachable replica counts as unknown rather than missing.
+		kbSvc.SetPresenceProbe(stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{}), replicaAddrsForProbe)
+		// The event-driven half of await (§12 item 1): the node tells the service
+		// when a version's replicated state moves, so the wait wakes on the apply
+		// instead of on the next poll. Only a node holding the state machine can do
+		// this, which is exactly the node the service is registered on.
+		kbSvc.SetVersionWatcher(raftNode)
 		pb.RegisterKnowledgeBaseServiceServer(grpcServer, kbSvc)
 	}
 
@@ -1054,13 +1051,7 @@ func main() {
 		// instrumentation (v13 §5 #18).
 		querySvc.SetLogger(logger)
 		adminSvc := service.NewAdminService(cfg.NodeID, rn, indexMgr, ds, chunkStore, walImpl,
-			func() []string {
-				addrs, err := resolveReplicaAddrs(context.Background())
-				if err != nil {
-					return nil
-				}
-				return addrs
-			},
+			replicaAddrsForProbe,
 			presenceChecker,
 		)
 		// §8.6(d): surface versions whose dead weight cannot be collected because
@@ -2346,4 +2337,67 @@ func (s versionHolderSource) StorageDegraded(kbID string) (bool, string, bool) {
 // sentinel a refusal carries (§4.1).
 func (s versionHolderSource) StorageUnavailable(kbID string) (bool, string, bool) {
 	return s.cp.StorageUnavailable(kbID)
+}
+
+// pendingDispatchRegistry is the part of the write coordinator the §7.13.2
+// hand-off uses: the once-only take of a write's changes, and the give-up path
+// it deliberately no longer calls on a miss.
+type pendingDispatchRegistry interface {
+	TakePendingDispatch(kbID, clientRequestID string) (int64, []types.DocChange, bool)
+	AbandonDispatch(ctx context.Context, kbID string, versionID int64, class types.FailureClass, detail string)
+}
+
+// versionWriteDispatcher is the one call the hand-off makes on the dispatcher,
+// declared narrowly so a test can stand in for a live one.
+type versionWriteDispatcher interface {
+	Dispatch(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) (string, error)
+}
+
+// dispatchCommittedVersion is the §7.13.2 hand-off, extracted from the apply
+// callback so the case Step 0 is about can be tested without a live cluster
+// (docs/await-version-plan.md §4.3, §7 Step 0).
+//
+// The changes live in THIS process's memory — the Raft command deliberately
+// carries none (§7.7) — so a missing TakePendingDispatch means one of two
+// things and this node cannot tell which:
+//
+//   - the background dispatch already took them (Execute dispatches the moment
+//     the version is committed; Take is once-only), so the write is on its way;
+//   - nobody holds them at all: the process that proposed them is gone (a
+//     restarted or deposed leader).
+//
+// It used to report a transient failure on the miss, and that was wrong twice
+// over: an in-memory miss on one node proves neither case, so the retry budget
+// could spend a version whose write was in fact in flight; and declaring a
+// version dead is the caller's decision, not this node's. What settles such a
+// version is the DATA-side existence probe (the same one GetSystemStatus uses),
+// which the await path exposes as data_missing, followed by the caller either
+// re-sending the changes or discarding the version. Until then it stays
+// PENDING — which is the truth: nobody on this node knows.
+func dispatchCommittedVersion(
+	registry pendingDispatchRegistry,
+	dispatcher versionWriteDispatcher,
+	logger *zap.Logger,
+	kbID string,
+	versionID, parentVersionID int64,
+	clientRequestID string,
+) {
+	regParentID, changes, ok := registry.TakePendingDispatch(kbID, clientRequestID)
+	if !ok {
+		logger.Warn("version committed here without a pending dispatch; leaving it PENDING",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+			zap.String("client_request_id", clientRequestID))
+		return
+	}
+	if regParentID != 0 {
+		parentVersionID = regParentID
+	}
+	// Its own context: this runs from the apply loop's callback, so it must not
+	// be cancelled by whatever request happened to carry the write in.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if _, err := dispatcher.Dispatch(ctx, kbID, versionID, parentVersionID, changes); err != nil {
+		logger.Warn("write dispatch failed; the client's retry or the retry budget takes over",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
 }

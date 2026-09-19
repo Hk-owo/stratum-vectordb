@@ -228,18 +228,58 @@ func (c *WriteCoordinatorImpl) SetDataPlane(dp plane.DataPlane) {
 	c.cfg.DataPlane = dp
 }
 
-// newDispatchID mints an idempotency key for a write that arrived without one.
+// NewDispatchID mints an idempotency key for a write that arrived without one.
+//
+// Exported because the service layer needs the same generator: it stamps the key
+// onto CreateVersionResponse, so the format a caller is handed is the format the
+// coordinator's own log lines show (docs/await-version-plan.md §7 Step 4).
 // Execute runs under txnMu, so the timestamp alone is unambiguous.
-func newDispatchID() string {
+func NewDispatchID() string {
 	return fmt.Sprintf("auto-%d", time.Now().UnixNano())
 }
 
 // Execute implements WriteCoordinator.
 func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange, clientRequestID string) (int64, error) {
+	// Per-stage timings of one write's control-plane half, at debug level.
+	//
+	// Why they are here: this is the only stage the CLIENT waits for. The
+	// response carries the version id; the storage transaction (stage 5, on
+	// whichever node coordinates it) and the index build (stage 6) both happen
+	// after it. So this line answers "why is CreateVersion slow" on its own, with
+	// the two parts that can be slow for reasons the caller cannot see:
+	//
+	//   - txn_wait_us is the serialization of §7.7 (txnMu): writes to one
+	//     knowledge base run one at a time, so a burst of concurrent versions
+	//     shows up here and nowhere else.
+	//   - propose_us is the Raft round trip plus the apply phase that allocates
+	//     the version id — the only replicated step in the path.
+	//
+	// storage_us is filled on the un-dispatched path only (Dispatch == nil),
+	// where the storage transaction runs inline and this call really does wait
+	// for it; on the dispatched path it stays 0 because the work has been handed
+	// off, and the node that takes it reports its own stages after this returns.
+	execStart := time.Now()
+	var txnWait, tRegister, tPropose, tHandoff, tInline time.Duration
+	var versionID int64
+	var dispatched bool
+	defer func() {
+		c.logger().Debug("coordinator: write execute timings",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+			zap.Int("changes", len(changes)), zap.Bool("dispatched", dispatched),
+			zap.Int64("txn_wait_us", txnWait.Microseconds()),
+			zap.Int64("register_us", tRegister.Microseconds()),
+			zap.Int64("propose_us", tPropose.Microseconds()),
+			zap.Int64("storage_us", tInline.Microseconds()),
+			zap.Int64("handoff_us", tHandoff.Microseconds()),
+			zap.Int64("total_us", time.Since(execStart).Microseconds()))
+	}()
+
 	// Serialize the whole transaction (BEGIN through COMMIT) so the WAL's
 	// BEGIN -> VERSION_ID binding per version stays unambiguous (see
 	// txnMu's doc comment).
+	txnStart := time.Now()
 	c.txnMu.Lock()
+	txnWait = time.Since(txnStart)
 	defer c.txnMu.Unlock()
 
 	// §7.13.2: only the leader accepts a write. It is the node that can put the
@@ -279,12 +319,16 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	// a generated one — without it there would be nothing to register against.
 	dispatchID := clientRequestID
 	if dispatchID == "" {
-		dispatchID = newDispatchID()
+		dispatchID = NewDispatchID()
 	}
+	stepStart := time.Now()
 	c.RegisterPendingDispatch(kbID, dispatchID, parentVersionID, changes)
+	tRegister = time.Since(stepStart)
 
 	opts := []raft.ProposeOption{raft.WithClientRequestID(dispatchID)}
+	stepStart = time.Now()
 	versionID, err := c.cfg.RaftNode.ProposeCreateVersion(ctx, kbID, parentVersionID, opts...)
+	tPropose = time.Since(stepStart)
 	if err != nil {
 		// The entry never landed: drop the registration, or it would later be
 		// dispatched against a version that does not exist.
@@ -300,7 +344,10 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 		// writes → COMMIT), reports the document-set digest up and schedules the
 		// index build (control-data-separation-design.md §5.1; the split write
 		// path of Stratum_设计文档v13.md §7.12).
-		if err := c.cfg.DataPlane.WriteVersionData(ctx, kbID, versionID, parentVersionID, changes); err != nil {
+		stepStart = time.Now()
+		err := c.cfg.DataPlane.WriteVersionData(ctx, kbID, versionID, parentVersionID, changes)
+		tInline = time.Since(stepStart)
+		if err != nil {
 			return 0, err
 		}
 		return versionID, nil
@@ -313,7 +360,10 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	// registration is TAKEN, not read, so exactly one of the two wins and the
 	// other is a no-op; and racing it here is what lets a client retry — same
 	// idempotency key, so no new apply happens — still get its write dispatched.
+	stepStart = time.Now()
 	c.dispatchInBackground(kbID, versionID, dispatchID)
+	tHandoff = time.Since(stepStart)
+	dispatched = true
 	return versionID, nil
 }
 

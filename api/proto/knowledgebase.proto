@@ -4,11 +4,15 @@
 // See Stratum_接口设计v9.md "KnowledgeBaseService" for the authoritative
 // specification.
 //
-// Reserved (not implemented): GetVersion, DiffVersions, TagVersion. Per
+// Reserved (not implemented): DiffVersions, TagVersion. Per
 // Stratum_代码风格v2.md's convention of not creating empty placeholder
 // files/stubs for unimplemented future work (see IVF/FLAT under vecstore),
 // these are documented here but intentionally have no corresponding RPC
 // or message definitions yet.
+//
+// GetVersion is no longer on this list: the control layer reads a single
+// version through raft.RaftNode.GetVersion, and callers reach the same
+// information through AwaitVersion below (docs/await-version-plan.md §7).
 syntax = "proto3";
 package stratum;
 
@@ -138,8 +142,29 @@ service KnowledgeBaseService {
   rpc DeleteKnowledgeBase(DeleteKnowledgeBaseRequest) returns (DeleteKnowledgeBaseResponse);
   rpc CreateVersion(CreateVersionRequest) returns (CreateVersionResponse);
   rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+
+  // AwaitVersion waits for a version to reach a target state. It reports the
+  // version's current stage instead of failing when the target has not been
+  // reached yet ("not yet" is not an error — docs/await-version-plan.md §5).
+  //
+  // It is a READ: it holds no state, may be repeated, run concurrently, and
+  // sent to any control node, so a caller that reconnects or moves does not
+  // lose its place.
+  rpc AwaitVersion(AwaitVersionRequest) returns (AwaitVersionResponse);
+
   rpc RollbackVersion(RollbackVersionRequest) returns (RollbackVersionResponse);
   rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse);
+
+  // DiscardVersion is the CALLER's declaration that it is abandoning a version
+  // whose write never landed (docs/await-version-plan.md §5 contract 7, §7
+  // Step 6). It is not DeleteVersion under another name: discarding has no data
+  // to reclaim and no children to rewire — removing the metadata is the whole
+  // operation.
+  //
+  // It is a WRITE (it removes replicated metadata), admissible only while the
+  // version is still PENDING. A version whose data landed is DeleteVersion's
+  // business, and is refused with version_not_pending.
+  rpc DiscardVersion(DiscardVersionRequest) returns (DiscardVersionResponse);
   rpc ListKnowledgeBases(ListKnowledgeBasesRequest) returns (ListKnowledgeBasesResponse);
   rpc GetKnowledgeBase(GetKnowledgeBaseRequest) returns (GetKnowledgeBaseResponse);
 
@@ -200,6 +225,15 @@ message CreateVersionRequest {
 }
 message CreateVersionResponse {
   int64 version_id = 1; // newly created version; PENDING, index building asynchronously
+  // client_request_id is the idempotency key this write was committed under: the
+  // caller's own when it sent one, otherwise the one the control layer generated.
+  // It travels back so a caller that omitted it still has something to re-send
+  // under — the only way to recover a version whose data never landed
+  // (Stratum_设计文档v13.md §7.12, docs/await-version-plan.md §7 Step 4).
+  //
+  // What it is NOT: a promise that the version will complete. It is a handle for
+  // a decision the caller owns (§2.1).
+  string client_request_id = 2;
 }
 
 message ListVersionsRequest {
@@ -207,6 +241,45 @@ message ListVersionsRequest {
 }
 message ListVersionsResponse {
   repeated VersionInfo versions = 1;
+}
+
+// AwaitTarget is what a caller is waiting for. It is deliberately NOT
+// DataStatus: INDEX_READY is an IndexStatus value, so a DataStatus-typed field
+// could not represent the default target at all (docs/await-version-plan.md §5).
+enum AwaitTarget {
+  AWAIT_TARGET_INDEX_READY = 0;  // default: queryable — also the precondition for activating a version
+  AWAIT_TARGET_DATA_DURABLE = 1; // data durable only: batch imports that rebuild indexes afterwards
+}
+
+message AwaitVersionRequest {
+  string knowledge_base_id = 1; // required: a version id is unique within a knowledge base
+  int64 version_id = 2;
+  AwaitTarget target = 3;    // default AWAIT_TARGET_INDEX_READY
+  int64 wait_timeout_ms = 4; // this call's longest wait; the server caps it
+}
+
+message AwaitVersionResponse {
+  VersionInfo version = 1; // full metadata: both status fields, the document-set digest, created_at
+  string stage = 2;        // the derived stage below, so a caller can switch on one value
+  int64 retry_after_ms = 3; // suggested re-ask interval while the target is not reached
+
+  // data_missing is the result of a DATA-side existence probe: true means no
+  // reachable replica holds any of this version's data. It is only meaningful
+  // while the version is PENDING and older than the probe's age threshold, and
+  // it does NOT change stage — it is the fact a caller needs in order to decide
+  // between re-sending its changes and discarding the version. The server never
+  // makes that choice for the caller (docs/await-version-plan.md §4.3).
+  bool data_missing = 4;
+}
+
+message DiscardVersionRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+}
+message DiscardVersionResponse {
+  // false when there was nothing left to discard (an already-removed version),
+  // so a retrying caller can treat the call as idempotent.
+  bool discarded = 1;
 }
 
 message RollbackVersionRequest {

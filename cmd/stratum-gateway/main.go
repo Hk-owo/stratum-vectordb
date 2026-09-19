@@ -203,6 +203,18 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 			return g.kb.CreateVersion(ctx, r)
 		},
 	))
+
+	// AwaitVersion is a read exposed over POST because it carries a body
+	// (version_id, target, wait_timeout_ms). The HTTP request is held until the
+	// target is reached or the server's wait cap expires, and "not reached yet"
+	// comes back as a stage rather than as an HTTP error.
+	mux.HandleFunc("POST /api/knowledge-bases/{id}/await", handleWithID(
+		func() *pb.AwaitVersionRequest { return &pb.AwaitVersionRequest{} },
+		func(r *pb.AwaitVersionRequest, id string) { r.KnowledgeBaseId = id },
+		func(ctx context.Context, r *pb.AwaitVersionRequest) (*pb.AwaitVersionResponse, error) {
+			return g.kb.AwaitVersion(ctx, r)
+		},
+	))
 	mux.HandleFunc("POST /api/knowledge-bases/{id}/rollback", handleWithID(
 		func() *pb.RollbackVersionRequest { return &pb.RollbackVersionRequest{} },
 		func(r *pb.RollbackVersionRequest, id string) { r.KnowledgeBaseId = id },
@@ -229,6 +241,18 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 		func(r *pb.DeleteVersionRequest, id string) { r.KnowledgeBaseId = id },
 		func(ctx context.Context, r *pb.DeleteVersionRequest) (*pb.DeleteVersionResponse, error) {
 			return g.kb.DeleteVersion(ctx, r)
+		},
+	))
+
+	// DiscardVersion abandons a version whose write never landed: a write to the
+	// leader, admissible only while the version is still PENDING
+	// (docs/await-version-plan.md §7 Step 6). A version that already has data is
+	// delete-version's business, and is refused with version_not_pending.
+	mux.HandleFunc("POST /api/knowledge-bases/{id}/discard-version", handleWithID(
+		func() *pb.DiscardVersionRequest { return &pb.DiscardVersionRequest{} },
+		func(r *pb.DiscardVersionRequest, id string) { r.KnowledgeBaseId = id },
+		func(ctx context.Context, r *pb.DiscardVersionRequest) (*pb.DiscardVersionResponse, error) {
+			return g.kb.DiscardVersion(ctx, r)
 		},
 	))
 

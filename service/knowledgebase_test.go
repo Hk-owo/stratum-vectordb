@@ -554,7 +554,7 @@ func TestKnowledgeBaseService_DeleteVersion_SingleMode(t *testing.T) {
 	if len(resp.DeletedVersionIds) != 1 || resp.DeletedVersionIds[0] != v2 {
 		t.Errorf("deleted_version_ids = %v, want [%d]", resp.DeletedVersionIds, v2)
 	}
-	child, ok := h.raftNode.GetVersion(v3)
+	child, ok := h.raftNode.VersionByID(v3)
 	if !ok {
 		t.Fatal("v3 metadata missing")
 	}
@@ -601,7 +601,7 @@ func TestKnowledgeBaseService_DeleteVersion_AncestorsMode(t *testing.T) {
 	for id := range want {
 		t.Errorf("v%d missing from deleted_version_ids", id)
 	}
-	base, ok := h.raftNode.GetVersion(v3)
+	base, ok := h.raftNode.VersionByID(v3)
 	if !ok {
 		t.Fatal("v3 metadata missing")
 	}
@@ -632,7 +632,7 @@ func TestKnowledgeBaseService_DeleteVersion_RejectsUnknownMode(t *testing.T) {
 	if status.Code(err) != codes.InvalidArgument {
 		t.Errorf("unknown-mode error code = %v, want InvalidArgument", status.Code(err))
 	}
-	meta, ok := h.raftNode.GetVersion(v2)
+	meta, ok := h.raftNode.VersionByID(v2)
 	if !ok {
 		t.Fatal("v2 metadata missing")
 	}

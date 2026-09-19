@@ -434,3 +434,44 @@ func TestRemoteRaftNode_SkipsAFailingReadNode(t *testing.T) {
 		t.Errorf("kb = %+v, want kb-1 with active version 5", kb)
 	}
 }
+
+// TestRemoteRaftNode_GetVersionReadsOneVersionAndReportsMissing covers the
+// storage node's shape of the read the await path makes
+// (docs/await-version-plan.md §7 Step 2). A storage node has no state machine,
+// so it answers by filtering the ListVersions RPC: correct, just not the O(1)
+// read a control node offers — and correct is what matters, because await only
+// ever runs where the state machine lives.
+func TestRemoteRaftNode_GetVersionReadsOneVersionAndReportsMissing(t *testing.T) {
+	control := &fakeControlNode{versions: []*pb.VersionInfo{
+		{VersionId: 1, ParentVersionId: 0, CreatedAt: 100, IndexStatus: pb.IndexStatus_INDEX_STATUS_READY},
+		{VersionId: 2, ParentVersionId: 1, CreatedAt: 200, IndexStatus: pb.IndexStatus_INDEX_STATUS_PENDING},
+	}}
+	node, cleanup := newRemoteNode(t, map[int64]*fakeControlNode{1: control})
+	defer cleanup()
+	ctx := context.Background()
+
+	got, err := node.GetVersion(ctx, "kb-1", 2)
+	if err != nil {
+		t.Fatalf("GetVersion: %v", err)
+	}
+	if got.VersionID != 2 || got.ParentVersionID != 1 {
+		t.Errorf("GetVersion(2) = %+v, want id 2 with parent 1", got)
+	}
+	if got.KBID != "kb-1" {
+		t.Errorf("KBID = %q, want kb-1 (threaded in, not on the wire)", got.KBID)
+	}
+	if got.IndexStatus != types.IndexStatusPending {
+		t.Errorf("index status = %v, want Pending", got.IndexStatus)
+	}
+
+	if _, err := node.GetVersion(ctx, "kb-1", 99); !errors.Is(err, stratumerrors.ErrVersionNotFound) {
+		t.Errorf("GetVersion(99) = %v, want ErrVersionNotFound", err)
+	}
+
+	// An unreachable control tier is an ERROR, not an empty answer: "I could not
+	// ask" must never be reported as "it is not there".
+	control.versionsErr = errors.New("control tier down")
+	if _, err := node.GetVersion(ctx, "kb-1", 2); err == nil {
+		t.Error("GetVersion with an unreachable control tier = nil error, want a failure")
+	}
+}

@@ -127,6 +127,14 @@ type RaftNodeImpl struct {
 	// rather than at propose time, because a forwarded proposal is applied by
 	// whoever leads then, and a since-deposed leader must not dispatch.
 	onVersionCommittedAsLeader func(kbID string, versionID, parentVersionID int64, clientRequestID string)
+
+	// versionWatchers are the local waiters registered through WatchVersion,
+	// keyed by version ID. Its own mutex, not sm.mu: notifications come from the
+	// apply loop while registration and cancellation come from whichever
+	// goroutine is serving the client call, and the apply path must never wait on
+	// a client.
+	versionWatchersMu sync.Mutex
+	versionWatchers   map[int64]map[chan struct{}]struct{}
 }
 
 // NewRaftNodeImpl constructs and starts a RaftNodeImpl: it starts the
@@ -283,6 +291,85 @@ func (impl *RaftNodeImpl) runApplyLoop() {
 	}
 }
 
+// WatchVersion returns a channel signalled whenever versionID's replicated
+// metadata changes, plus the function that stops watching. stop is idempotent,
+// and the caller MUST call it: a registration outlives the wait otherwise.
+//
+// Keyed by version ID alone. Versions live in one state-machine map allocated
+// from one counter, so the id is unique across the cluster; "unique within a
+// knowledge base" is the contract clients may rely on, not the limit of the data
+// structure.
+//
+// The channel is signal-only (one pending token per version, coalesced): a waiter
+// re-reads the state machine after every signal, so a coalesced duplicate costs
+// nothing and no change is missed as long as the waiter registered BEFORE the
+// read it is waiting on.
+func (impl *RaftNodeImpl) WatchVersion(versionID int64) (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+
+	impl.versionWatchersMu.Lock()
+	if impl.versionWatchers == nil {
+		impl.versionWatchers = make(map[int64]map[chan struct{}]struct{})
+	}
+	waiters, ok := impl.versionWatchers[versionID]
+	if !ok {
+		waiters = make(map[chan struct{}]struct{})
+		impl.versionWatchers[versionID] = waiters
+	}
+	waiters[ch] = struct{}{}
+	impl.versionWatchersMu.Unlock()
+
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			impl.versionWatchersMu.Lock()
+			defer impl.versionWatchersMu.Unlock()
+			waiters, ok := impl.versionWatchers[versionID]
+			if !ok {
+				return
+			}
+			delete(waiters, ch)
+			if len(waiters) == 0 {
+				delete(impl.versionWatchers, versionID)
+			}
+		})
+	}
+	return ch, stop
+}
+
+// notifyVersionChanged wakes every local waiter for versionID.
+//
+// It runs on the apply loop, so it must not block under any circumstance: a
+// waiter that has not drained its previous signal re-reads the state machine
+// anyway and needs nothing more from this call.
+func (impl *RaftNodeImpl) notifyVersionChanged(versionID int64) {
+	if versionID == 0 {
+		return
+	}
+
+	impl.versionWatchersMu.Lock()
+	waiters := impl.versionWatchers[versionID]
+	impl.versionWatchersMu.Unlock()
+
+	for ch := range waiters {
+		select {
+		case ch <- struct{}{}:
+		default:
+			// Already holding a signal: coalescing is the contract.
+		}
+	}
+}
+
+// versionIDOf is the version an applied command is about: the command's own
+// VersionID, or the one cmdCreateVersion just allocated. Zero means "no single
+// version" — a knowledge-base command, or a command that failed to decode.
+func versionIDOf(cmd command, result applyResult) int64 {
+	if cmd.Type == cmdCreateVersion {
+		return result.VersionID
+	}
+	return cmd.VersionID
+}
+
 func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	if len(msg.Command) == 0 {
 		// kvraft's automatic no-op entry, proposed internally whenever a
@@ -304,6 +391,13 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	} else {
 		result = impl.sm.apply(context.Background(), cmd, impl.wal, impl.logger)
 	}
+
+	// Wake local awaiters: this version's replicated state just moved
+	// (docs/await-version-plan.md §12 item 1). Cheap and unconditional — a map
+	// lookup plus a non-blocking send — and it fires for every applied command
+	// that names a version, which is exactly the set that can change what a
+	// waiter is looking at.
+	impl.notifyVersionChanged(versionIDOf(cmd, result))
 
 	impl.pendingMu.Lock()
 	waiter, ok := impl.pending[msg.Index]
@@ -605,6 +699,14 @@ func (impl *RaftNodeImpl) ProposeRemoveVersionMeta(ctx context.Context, kbID str
 	return res.Err
 }
 
+func (impl *RaftNodeImpl) ProposeDiscardVersion(ctx context.Context, kbID string, versionID int64) error {
+	res, err := impl.proposeAndWait(ctx, newDiscardVersionCommand(kbID, versionID))
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
 func (impl *RaftNodeImpl) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
 	impl.sm.mu.RLock()
 	defer impl.sm.mu.RUnlock()
@@ -627,6 +729,25 @@ func (impl *RaftNodeImpl) ListVersions(_ context.Context, kbID string) ([]types.
 		out = append(out, impl.sm.versions[id])
 	}
 	return out, nil
+}
+
+// GetVersion returns one version's metadata, read straight out of the state
+// machine under the same RLock ListVersions takes. It is the O(1) sibling the
+// await path polls (docs/await-version-plan.md §7 Step 2).
+func (impl *RaftNodeImpl) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
+	impl.sm.mu.RLock()
+	defer impl.sm.mu.RUnlock()
+	if _, ok := impl.sm.kbs[kbID]; !ok {
+		return types.VersionMeta{}, stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	v, ok := impl.sm.versions[versionID]
+	if !ok || v.KBID != kbID {
+		// One answer for "no such version" and for "that version belongs to a
+		// different knowledge base": the caller asked about (kbID, versionID)
+		// and from its side both mean "not in this KB".
+		return types.VersionMeta{}, stratumerrors.ErrVersionNotFound
+	}
+	return v, nil
 }
 
 // ListKnowledgeBases returns metadata for every knowledge base in the

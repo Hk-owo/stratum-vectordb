@@ -33,6 +33,14 @@ const (
 	// version's data sits on a quorum's worth of disks, and this is how that fact
 	// becomes replicated state (Stratum_设计文档v13.md §10.1b, §7.9).
 	cmdMarkDataDurable commandType = "MarkDataDurable"
+
+	// cmdDiscardVersion is the CALLER's declaration that it is abandoning a
+	// version whose write never landed — the counterpart of §7.12's re-send,
+	// for a caller that no longer holds the changes
+	// (docs/await-version-plan.md §7 Step 6). It is deliberately not a
+	// DeleteVersion: discarding has nothing to reclaim, so the whole operation
+	// is removing metadata that never came with data.
+	cmdDiscardVersion commandType = "DiscardVersion"
 )
 
 // command is the JSON-encoded payload carried inside each kvraft log
@@ -162,6 +170,10 @@ func newMarkVersionDeletingCommand(kbID string, versionID int64, mode types.Vers
 
 func newRemoveVersionMetaCommand(kbID string, versionID int64) command {
 	return command{Type: cmdRemoveVersionMeta, KBID: kbID, VersionID: versionID}
+}
+
+func newDiscardVersionCommand(kbID string, versionID int64) command {
+	return command{Type: cmdDiscardVersion, KBID: kbID, VersionID: versionID}
 }
 
 func newMarkVersionFailedPermanentCommand(kbID string, versionID int64, side types.FailureSide, reason string, count int32) command {

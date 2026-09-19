@@ -318,7 +318,7 @@ func TestDeleteVersionCoordinator_KeepsRecordsSurvivorReads(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 
-	if _, ok := rn.GetVersion(v2); ok {
+	if _, ok := rn.VersionByID(v2); ok {
 		t.Error("v2 metadata should be gone after cleanup")
 	}
 	// v3 still resolves doc-b through v2's retained MVCC entry.
@@ -415,7 +415,7 @@ func TestDeleteVersionCoordinator_KeepsRecordsForLinearDeletion(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 
-	if _, ok := rn.GetVersion(v2); ok {
+	if _, ok := rn.VersionByID(v2); ok {
 		t.Error("v2 metadata should be gone after cleanup")
 	}
 	// v4 must still read doc-b through v2's retained record. Deleting it here

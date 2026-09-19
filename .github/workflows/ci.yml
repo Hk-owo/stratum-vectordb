@@ -77,8 +77,12 @@ jobs:
       # 排除 TestT4_DataVolume：它需要宿主 :7100 上的 vecstore_server
       # （C++ 构建产物），常规 CI 不构建 C++ 侧；其余两个长时基准
       # （TestT4_PerformanceBaseline / TestT4_StorageEfficiency）内部自行 skip。
+      # timeout 提到 900s：await/discard 的用例里有一条
+      # （TestT4_DiscardVersion_AbandonsAWriteThatCannotLand）故意停掉 embedder，
+      # 等过 dataMissingMinAgeSec（120s）的门槛再断言 data_missing 变成 true ——
+      # 那是"数据从未落地"这条路上唯一测不到别处的部分，值这 2 分钟。
       - name: 运行 T4 集群容错测试
-        run: go test ./integration/docker/... -tags=docker -v -timeout 300s -skip 'TestT4_DataVolume'
+        run: go test ./integration/docker/... -tags=docker -v -timeout 900s -skip 'TestT4_DataVolume'
 
       - name: 清理集群
         if: always()

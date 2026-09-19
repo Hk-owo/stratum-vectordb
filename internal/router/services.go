@@ -44,6 +44,14 @@ func (s *KBServer) ListVersions(ctx context.Context, req *pb.ListVersionsRequest
 	})
 }
 
+// AwaitVersion is a read: it holds no state, so the station may spread repeated
+// calls across nodes, and a caller that reconnects lands wherever it lands.
+func (s *KBServer) AwaitVersion(ctx context.Context, req *pb.AwaitVersionRequest) (*pb.AwaitVersionResponse, error) {
+	return Forward(s.r, ctx, pb.KnowledgeBaseService_AwaitVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.AwaitVersionResponse, error) {
+		return s.r.kbs[idx].AwaitVersion(ctx, req)
+	})
+}
+
 func (s *KBServer) RollbackVersion(ctx context.Context, req *pb.RollbackVersionRequest) (*pb.RollbackVersionResponse, error) {
 	return Forward(s.r, ctx, pb.KnowledgeBaseService_RollbackVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.RollbackVersionResponse, error) {
 		return s.r.kbs[idx].RollbackVersion(ctx, req)
@@ -53,6 +61,14 @@ func (s *KBServer) RollbackVersion(ctx context.Context, req *pb.RollbackVersionR
 func (s *KBServer) DeleteVersion(ctx context.Context, req *pb.DeleteVersionRequest) (*pb.DeleteVersionResponse, error) {
 	return Forward(s.r, ctx, pb.KnowledgeBaseService_DeleteVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.DeleteVersionResponse, error) {
 		return s.r.kbs[idx].DeleteVersion(ctx, req)
+	})
+}
+
+// DiscardVersion is a write: it removes replicated metadata, so it goes to the
+// leader like every other proposal.
+func (s *KBServer) DiscardVersion(ctx context.Context, req *pb.DiscardVersionRequest) (*pb.DiscardVersionResponse, error) {
+	return Forward(s.r, ctx, pb.KnowledgeBaseService_DiscardVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.DiscardVersionResponse, error) {
+		return s.r.kbs[idx].DiscardVersion(ctx, req)
 	})
 }
 

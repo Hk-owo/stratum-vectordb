@@ -1041,7 +1041,7 @@ func TestMockAndStateMachine_VersionDeleteModesAgree(t *testing.T) {
 				t.Helper()
 				for _, id := range ids {
 					smMeta := sm.versions[id]
-					mockMeta, ok := mock.GetVersion(id)
+					mockMeta, ok := mock.VersionByID(id)
 					if !ok {
 						t.Fatalf("mock lost version %d", id)
 					}

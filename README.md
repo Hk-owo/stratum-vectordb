@@ -20,7 +20,7 @@
 - **Raft 强一致 + 崩溃一致性** —— 元数据写操作经 leader 并受 WAL 保护；查询可负载均衡到任意节点；快照不阻塞心跳与写入。存储节点的**数据游标同样落在 WAL 里**，重启后立即准确可用，不再靠扫产物的结论推断。
 - **控制面 / 存储面契约分离** —— `internal/plane` 定义两层之间的契约（`ControlPlane` / `DataPlane`），只传逻辑对象（知识库、版本、抽象可用性），**从不暴露副本数、纠删码、文件路径或节点身份**，因此两层可以拆成独立进程/集群而控制层无需知道数据放在哪。`node.role` 支持 `all`（默认，两层同进程）、`control`（只跑控制面：Raft 日志与元数据，不建数据目录、不建索引）与 `storage`（只跑存储层，不留 Raft 日志，元数据经 `RemoteRaftNode` 走 gRPC 读取），`storage.nodes` 声明存储组。
 - **任何节点都能发起写** —— Raft 只在 leader 追加日志，但"刚写完一个版本""启动 reconcile 有结论"这类事实可能发生在任何节点，所以非 leader 把提案经内部 `InternalService.Propose` 转给 leader（转发不成链）；错误以稳定 wire name 跨进程传递，转发后 `errors.Is` 依然成立。
-- **写幂等 + 卡住的版本有明确归宿** —— `CreateVersion` 的 `client_request_id` 让重试复用首次分配的版本而非另分配一个；PENDING 不再等同于"永远在构建"：**DATA_MISSING**（没有任何候选副本持有该版本的数据，只能由写入方按同一 key 重发救回）与 **FAILED_PERMANENT**（重试预算耗尽或不可恢复，只有运维能重试或放弃）都会在 `GetSystemStatus` 里显式列出。**数据与索引各有自己的状态与终态**（`DataStatus` / `IndexStatus`，判死时标明落在哪一侧），数据写失败不再被记成索引失败。
+- **写幂等 + 卡住的版本有明确归宿** —— `CreateVersion` 的 `client_request_id` 让重试复用首次分配的版本而非另分配一个；PENDING 不再等同于"永远在构建"：**DATA_MISSING**（没有任何候选副本持有该版本的数据，写入方可按同一 key 重发，或用 `DiscardVersion` 放弃）与 **FAILED_PERMANENT**（重试预算耗尽或不可恢复，只有运维能重试或放弃）都会在 `GetSystemStatus` 里显式列出。**数据与索引各有自己的状态与终态**（`DataStatus` / `IndexStatus`，判死时标明落在哪一侧），数据写失败不再被记成索引失败。
 - **落后副本自己追上来** —— 存储节点每 5 秒上报一次自己的连续游标，leader 在响应里捎带每个知识库的**链尾**；发现自己落后的节点随即在后台补齐数据、再触发索引（可能直接装载分发来的产物）。**没有开关**：落后自愈是常态，能调的只是节奏（滞后阈值、抖动窗口、并发上限）。
 - **数据源解析有四层** —— 本地注册表 → leader 回退 → 游标探测 → **控制层 holders 镜像**（心跳响应捎带、本地缓存，查表即可，绝不在 Raft apply 路径上发 RPC）。一个错过 push 广播的副本仍能自己找到持有者。
 - **存储层退化是显式信号** —— 存活副本低于 quorum 时，**写被明确拒绝**（`kb_storage_degraded` / `storage_unavailable`，可重试），而**读照常服务**：判据来自已有的周期上报聚合，未知态一律放行；服务站转发前拦一道（省掉注定失败的往返），控制层在提交 Raft 之前再拦一道（不浪费版本号与日志）。**只读调用方也能发现它**：查询响应上的 `storage_degraded` 由服务站填，不必先撞上一次写失败。
@@ -129,7 +129,7 @@ scripts/docker-cluster-both.sh status    # 每容器状态与控制组 leader
 - **垃圾回收**:`ChunkGarbageCollector` 周期性(默认 5 分钟,`gc.sweep_interval_s`)清扫不再被任何版本引用的 chunk。sweep 两遍:先无锁枚举孤儿候选,再持写锁按 Raft **当前**版本复查后删除,与并发写入互斥、不依赖过期快照(stale-snapshot race 免疫),锁粒度为一个 chunk,阻塞毫秒级。
 - **写幂等**:`CreateVersion.client_request_id` 是可选幂等键——同一知识库上重发同一 key 会复用首次分配的版本,而不是再分配一个。这是"数据没落地的版本"能被客户端救回的**唯一**途径(§7.12);省略则保持历史语义,每次调用分配新版本。
 - **任何节点都能写**:非 leader 节点把已编码的提案经内部 `InternalService.Propose` 交给 leader 执行;接收方不是 leader 时回传 `leader_id` 让调用方改问,转发不会成链。错误以稳定 wire name(`internal/errors.Name` / `ByName`)跨进程传递,认不出某个名字的一方只保留 message,不臆造 sentinel。
-- **卡住的版本有明确归宿**:PENDING 的版本若没有任何候选副本持有其数据,即为 **DATA_MISSING**(写入方在分配版本后、数据落盘前死亡,或每次都推送失败),只能靠客户端按同一 `client_request_id` 重发恢复;失败尝试耗尽重试预算或撞上不可恢复错误时,控制面判定 **FAILED_PERMANENT**,不再自动重试,只有运维能重试或放弃——放弃会向**所有**候选副本广播物理回收,因为控制面并不知道数据实际落在哪几个副本上(§10.1 / §10.6)。
+- **卡住的版本有明确归宿**:PENDING 的版本若没有任何候选副本持有其数据,即为 **DATA_MISSING**(写入方在分配版本后、数据落盘前死亡,或每次都推送失败),客户端可以 `AwaitVersion` 看到 `data_missing` 后按同一 `client_request_id` 重发,或用 **`DiscardVersion`** 放弃;失败尝试耗尽重试预算或撞上不可恢复错误时,控制面判定 **FAILED_PERMANENT**,不再自动重试,只有运维能重试或放弃——放弃会向**所有**候选副本广播物理回收,因为控制面并不知道数据实际落在哪几个副本上(§10.1 / §10.6)。
 - **数据侧与索引侧各有终态**(§10.1b):`DataStatus`(PENDING / DURABLE / FAILED_PERMANENT)与 `IndexStatus`(PENDING / READY / FAILED / FAILED_PERMANENT)互相独立——一个有持久数据却没有可用索引的版本,与一个索引从未构建的版本,是两件不同的事;判死时 `FailureSide` 说明原因链描述的是哪一侧,运维据此决定"重发写入"还是"重建索引"。版本元数据还携带文档集摘要 `doc_id_set_hash`(§7.9),让存储层能区分"空版本"与"摘要从未提交"。
 
 ## 文档切分与向量检索
@@ -293,11 +293,13 @@ Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部�
 |---|---|
 | `CreateKnowledgeBase` | 创建知识库(embed 配置、切块参数、索引类型、量化类型);**不创建版本** |
 | `DeleteKnowledgeBase` | 标记删除,清理异步执行 |
-| `CreateVersion` | 应用文档变更(ADD / DELETE / UPDATE)并产出新版本;可带 `client_request_id` 幂等键;空 changes 被拒 |
+| `CreateVersion` | 应用文档变更(ADD / DELETE / UPDATE)并产出新版本;可带 `client_request_id` 幂等键(没带时服务端生成并**随响应回传**);空 changes 被拒 |
 | `ListVersions` | 返回知识库版本链(含 `IndexStatus` 与 `DataStatus` 两侧状态) |
 | `RollbackVersion` | 切换活跃版本,无停机 |
 | `ListKnowledgeBases` / `GetKnowledgeBase` | 列出 / 查询知识库及其活跃版本 |
 | `DeleteVersion` | 按 `mode` 删除版本:`SUBTREE`(默认,含后代)/ `SINGLE`(仅该版本,子版本改挂其父)/ `ANCESTORS`(删前置版本,使其成为新基底);清理异步执行 |
+| `AwaitVersion` | **等一个版本到达目标状态**(`DATA_DURABLE` 或 `INDEX_READY`,后者也是激活的前置);"还没好"**正常返回**(`stage` + `retry_after_ms`),不是错误;事件驱动(apply 后广播,不靠轮询等),没有 watcher 时退回 200 ms 轮询;响应还带 `data_missing`(可达副本里没有任何一份数据,先问控制 leader 的聚合,聚合答不了才探副本) |
+| `DiscardVersion` | **客户端放弃一个从未落地的版本**:只接受仍是 PENDING 的版本(已落地的回 `version_not_pending`,那属于 `DeleteVersion`);幂等(版本已不在时回 `discarded=false`);会清掉幂等键映射,因此同 key 重发分配**新**版本 |
 | `GetDataVersionHolders` | "哪些节点报过持有该 KB 的这个版本",读控制 leader 的内存聚合(**软状态**:空答案只意味着"我没听到过",不是"没人有");同一响应回带该 KB 的存储层退化判定(`degraded` / `storage_unavailable` / `degradation_known`)与诊断(`degradation_detail`);服务站据此拦写,并把它变成下面 `Query` 响应上的可见标记 |
 
 **QueryService**
@@ -450,7 +452,40 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 
 ### 写入成本的构成
 
-存储节点内的分段计时(`write: stage timings`):
+**一条写链路有六个分段,横跨三个进程。** 只有前两段是**客户端在等**的:版本号提交后响应就返回,数据落盘(段 5)与索引构建(段 6)都在后台继续——所以"`CreateVersion` 慢"和"版本迟迟不可查"是两个问题,各有各的段。全部段都在 debug 级别产生(节点: `logging.level: debug`;服务站: `-log-level debug`),跨节点用 `kb_id` + `version_id` 拼接:同一知识库的每个写都有独立版本号,所以并发写不会串线。
+
+| # | 段(它做什么) | 日志 | 字段 | 产生在 |
+|---|---|---|---|---|
+| 1 | 服务站转发:鉴权 + 存储门 → 找 leader → 转发 RPC | `router: write forward timings` | `admission_us` · `leader_lookup_us` · `attempt_us` · `attempts` · `leader_index` | 服务站 |
+| 2 | 控制面入口:存储门 → proto 转换 → 调协调器 | `service: create version timings` | `gate_us` · `convert_us` · `execute_us` | 控制节点 |
+| 3 | 控制面事务:等 `txnMu` → 注册变更 → Raft 提交 → 交接 dispatch | `coordinator: write execute timings` | `txn_wait_us` · `register_us` · `propose_us` · `handoff_us` · `storage_us` · `dispatched` | 控制节点 |
+| 4 | 分发:解析候选(µs 级) → **把写交给入选者执行并等它做完**(这一层包着段 5) | `plane: dispatch timings` | `resolve_us` · `attempts_us` · `tried` / `tried_us` · `chosen` · `budget_ms` | 控制节点(后台) |
+| 5 | 存储节点写事务 | `write: stage timings` | `acquire_us` · `local_us` · `fanout_us` · `report_us` · `confirm_us` | 存储节点 |
+| 6 | 索引构建:排队 → 构建 | `index: build timings` | `queue_us` · `build_us` · `size_bytes` · `status` | 存储节点(后台) |
+
+嵌套关系(按定义成立,不是巧合):段 1 的 `attempt_us` ⊇ 段 2 + 段 3 + 网络;段 2 的 `execute_us` ⊇ 段 3 的 `total_us`(只差函数进出的几十 µs);段 4 的 `tried_us` 里成功那一次的耗时 ⊇ 段 5 的 `total_us`(候选是本地时就是它自己);段 5 的 `report_us` 只覆盖"入队",段 6 才是构建本身。**读法是各段对同一 `(kb_id, version_id)` 的 `*_us` 纵向对比**,而不是把跨节点的绝对时刻相减——不同进程的时钟不做假设。
+
+实测一例(3+3 容器集群,一批 1,000 篇;第一列是同一写法的两次独立测量,第三列是单篇探测写入):
+
+| 段 | 1,000 篇(稳态) | 1,000 篇(首轮) | 1 篇 |
+|---|---|---|---|
+| 段 1 `total_us`(其中 `leader_lookup_us` / `attempt_us`) | 55.4 ms(1.8 / 53.6) | 62.0 ms(1.7 / 60.3) | 10.1 ms(1.7 / 8.4) |
+| 段 2 `total_us`(其中 `gate_us` / `convert_us` / `execute_us`) | 9.7 ms(0.01 / 0.02 / 9.6) | 12.0 ms(0.01 / 0.02 / 12.0) | 7.3 ms(0.06 / 0 / 7.2) |
+| 段 3 `total_us`(其中 `txn_wait_us` / `propose_us` / `handoff_us`) | 9.6 ms(0 / 9.6 / 0) | 12.0 ms(0 / 11.9 / 0) | 7.2 ms(0 / 7.2 / 0) |
+| 段 4 `total_us`(其中 `tried_us` 唯一那次) | **5,035.5 ms**(5,035.5) | 6,245.6 ms(6,245.6) | 213.7 ms(213.7) |
+| 段 5 `total_us`(其中 `local_us` / `fanout_us` / `report_us`) | **4,964.6 ms**(1,332.4 / 3,618.6 / 13.6) | 4,978.3 ms(1,366.2 / 3,596.8 / 15.3) | 36.7 ms(23.8 / 6.7 / 6.3) |
+| 段 6 `total_us`(其中 `queue_us` / `build_us`) | **21.4 ms**(0.04 / 11.0) | 20.1 ms(0.07 / 8.2) | 21.2 ms(0.10 / 5.4) |
+
+四条从这张表里读出来、别处看不到的事:
+
+- **客户端等的时间主要不是节点算的。** 段 1 的 55.4 ms 里,节点内部只占 9.7 ms(段 2),其余 ~44 ms 是把这 1,000 篇搬过服务站→控制节点那条 wire(收发 + 序列化)。单篇时同一差额只有 ~1.1 ms,可见它随 payload 而不是随请求数走。
+- **批量写的成本在复制,不在本地处理。** 段 5 的 4.96 s 里 `fanout_us` 3.62 s、`local_us` 1.33 s(切分 + embed + 落盘)。要压批量写入的墙钟时间,该看的是副本侧,不是本机。
+- **段 4 量的不是"挑候选",是"等候选干完"。** 挑候选只花 `resolve_us`(读副本拓扑 + 排序 + 健康排序,本例 **2 µs**);`tried_us` 里那 5,035.5 ms 是**候选节点执行写事务**的墙钟时间,它 ⊇ 段 5 的 4,964.6 ms。要问"轮询了几个候选",看的是 `tried` 的长度:长度为 1 且其值 ≈ 段 5 ⇒ 第一个候选就接下来了;多个元素、每个都逼近 `budget_ms`(1,000 篇时 65 s)⇒ 前面的候选不可达、各自吃满了预算(§7.13.2 的候选轮询),那才是段 4 真正会爆的时候。
+- **"等 READY"和"构建索引"不是一回事。** 测试用例报的 `build-accum`(从 `CreateVersion` 返回到 READY)在 1,000 篇时是 5.5 s,而段 6 的 `build_us` 只有 11 ms——两者差 500 倍,因为 `CreateVersion` 在**版本提交**时就返回了,之后的 5.0 s 是段 4 的数据落盘,不是构建。拿 `build-accum` 当"索引构建耗时"会把它高估两个数量级。
+
+各段为什么存在:`txn_wait_us` 是唯一能看见 §7.7 串行化的地方(同一知识库的写排成一队,突发的并发版本只在这里显形);段 6 的 `queue_us` / `build_us` 必须分开——同样的 90 s 排在队列里是并发度问题,花在 `build()` 里是 vecstore / 批次问题,而下游只能看到"PENDING 了 90 s";段 4 的 `tried_us` 分开记每个候选,是因为"第一个候选已失联、吃掉了整个预算"和"候选真的在写 1,000 篇"总耗时相同。
+
+存储节点内的分段计时(`write: stage timings`)——上表的段 5:
 
 | 段 | 做什么 | 单篇(`changes=1`) | 1,000 篇(全精度) | 1,000 篇(SQ8) |
 |---|---|---|---|---|
@@ -531,6 +566,7 @@ configs/             # 示例配置文件
 - `Stratum_接口设计v9.md` —— gRPC/内部接口与语义
 - `Stratum_设计目标.md` —— 功能目标、性能指标与验收标准
 - `Stratum_测试顺序.md` / `Stratum_实现顺序.md` / `Stratum_代码风格.md`
+- `client-integration-guide.md` —— **客户端接入指南**(调用方视角:数据模型、怎么选择文档提交、REST / gRPC 调用全流程、幂等与责任边界)
 - 专题计划与落地记录:`content-defined-chunking-plan.md`、`codebook-refresh-plan.md`、`cursor-persistence-plan.md`、`active-lag-detection-design.md`、`data-source-holders-fallback-plan.md`、`index-distribution-backpressure-plan.md`、`index-push-probe-plan.md`、`storage-degradation-signal-plan.md`
 - `HANDOFF.md` —— 故障史与排查记录;`改动内容.md` —— 开发日志
 

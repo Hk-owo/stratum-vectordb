@@ -34,6 +34,11 @@ type WriteCoordinatorCall struct {
 	KBID            string
 	ParentVersionID int64
 	Changes         []types.DocChange
+	// ClientRequestID is what the service layer passed down. It is recorded
+	// because §7 Step 4's contract is about the key's JOURNEY: generated or
+	// echoed, it has to reach the coordinator under the same value the caller is
+	// told about.
+	ClientRequestID string
 }
 
 // ReplayVersionCall records a single ReplayVersionStorageWrites
@@ -53,7 +58,7 @@ func NewMockWriteCoordinator() *MockWriteCoordinator {
 
 func (c *MockWriteCoordinator) Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange, clientRequestID string) (int64, error) {
 	c.mu.Lock()
-	c.calls = append(c.calls, WriteCoordinatorCall{KBID: kbID, ParentVersionID: parentVersionID, Changes: changes})
+	c.calls = append(c.calls, WriteCoordinatorCall{KBID: kbID, ParentVersionID: parentVersionID, Changes: changes, ClientRequestID: clientRequestID})
 	fn := c.executeFunc
 	versionID, err := c.nextVersionID, c.nextErr
 	c.mu.Unlock()

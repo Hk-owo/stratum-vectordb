@@ -157,7 +157,7 @@ func TestMockRaftNode_ProposeCreateVersion_WritesWALBeforeStateMachine(t *testin
 		t.Fatalf("WAL has no VERSION_ID record for newly created version %d; PendingVersionIDs = %v", versionID, pending)
 	}
 
-	if _, ok := r.GetVersion(versionID); !ok {
+	if _, ok := r.VersionByID(versionID); !ok {
 		t.Fatalf("state machine has no version %d after ProposeCreateVersion", versionID)
 	}
 }
@@ -304,7 +304,7 @@ func TestMockRaftNode_ProposeUpdateVersionSummary(t *testing.T) {
 	if err := r.ProposeUpdateVersionSummary(ctx, vID, "digest"); err != nil {
 		t.Fatalf("ProposeUpdateVersionSummary: %v", err)
 	}
-	if v, ok := r.GetVersion(vID); !ok || v.DocIDSetHash != "digest" {
+	if v, ok := r.VersionByID(vID); !ok || v.DocIDSetHash != "digest" {
 		t.Errorf("version digest = %q (ok=%v), want digest", v.DocIDSetHash, ok)
 	}
 

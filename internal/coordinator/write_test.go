@@ -407,6 +407,11 @@ func (r *testRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string, _
 func (r *testRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
 	return nil
 }
+
+// ProposeDiscardVersion satisfies raft.RaftNode; these tests never discard.
+func (r *testRaftNode) ProposeDiscardVersion(_ context.Context, _ string, _ int64) error {
+	return nil
+}
 func (r *testRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -418,6 +423,11 @@ func (r *testRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBas
 }
 func (r *testRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
 	return nil, nil
+}
+
+// GetVersion satisfies raft.RaftNode; this stub models no versions.
+func (r *testRaftNode) GetVersion(_ context.Context, _ string, _ int64) (types.VersionMeta, error) {
+	return types.VersionMeta{}, nil
 }
 func (r *testRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
 	return nil, nil

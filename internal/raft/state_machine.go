@@ -207,6 +207,9 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 	case cmdRemoveVersionMeta:
 		return sm.applyRemoveVersionMeta(cmd)
 
+	case cmdDiscardVersion:
+		return sm.applyDiscardVersion(cmd)
+
 	default:
 		return applyResult{Err: fmt.Errorf("raft: unknown command type %q", cmd.Type)}
 	}
@@ -546,6 +549,64 @@ func (sm *stateMachine) applyRemoveVersionMeta(cmd command) applyResult {
 			break
 		}
 	}
+	sm.dropRequestMappings(cmd.KBID, cmd.VersionID)
+	return applyResult{}
+}
+
+// applyDiscardVersion handles cmdDiscardVersion: the CALLER's declaration that
+// it is abandoning a version whose write never landed
+// (docs/await-version-plan.md §7 Step 6).
+//
+// It is not DeleteVersion under another name, and the two refuse each other's
+// work on purpose:
+//
+//   - DeleteVersion requires a version that HAS state to reclaim (it refuses
+//     PENDING outright, and its flow rewires children, checks the active version
+//     and drives asynchronous cleanup);
+//   - discarding is about a version that never acquired any: no data, no index,
+//     nothing to reclaim. Removing the metadata is the whole operation.
+//
+// The admission check is a compare-and-set inside the apply, not a read followed
+// by a decision in the caller: the version must still be PENDING *at apply time*.
+// A caller deciding to discard from a data_missing observation may race a write
+// that just landed, and this is what keeps that race from deleting durable data
+// (§5 contract 7).
+func (sm *stateMachine) applyDiscardVersion(cmd command) applyResult {
+	kb, ok := sm.kbs[cmd.KBID]
+	if !ok {
+		return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
+	}
+	v, ok := sm.versions[cmd.VersionID]
+	if !ok || v.KBID != cmd.KBID {
+		return applyResult{Err: stratumerrors.ErrVersionNotFound}
+	}
+	if kb.ActiveVersionID == cmd.VersionID {
+		return applyResult{Err: fmt.Errorf("version %d is the active version of %s: %w", cmd.VersionID, cmd.KBID, stratumerrors.ErrVersionIsActive)}
+	}
+	if v.DataStatus != types.DataStatusPending || v.Deleting {
+		return applyResult{Err: fmt.Errorf("version %d is not PENDING (data_status=%s, deleting=%v): %w",
+			cmd.VersionID, v.DataStatus.String(), v.Deleting, stratumerrors.ErrVersionNotPending)}
+	}
+	// A PENDING version cannot have children (applyCreateVersion refuses a PENDING
+	// parent), so this guards an invariant rather than handling a case that arises
+	// today: discarding a parent would leave its child inheriting from a version
+	// that no longer exists.
+	for _, id := range sm.versionsByKB[cmd.KBID] {
+		if child, ok := sm.versions[id]; ok && child.ParentVersionID == cmd.VersionID {
+			return applyResult{Err: fmt.Errorf("version %d has child version %d: %w", cmd.VersionID, id, stratumerrors.ErrInvalidParentVersion)}
+		}
+	}
+	delete(sm.versions, cmd.VersionID)
+	list := sm.versionsByKB[cmd.KBID]
+	for i, id := range list {
+		if id == cmd.VersionID {
+			sm.versionsByKB[cmd.KBID] = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	// The idempotency mapping goes with it: the caller is starting over, and
+	// leaving the mapping behind would make a re-send under the same key resolve
+	// to a version that no longer exists (§7 Step 6).
 	sm.dropRequestMappings(cmd.KBID, cmd.VersionID)
 	return applyResult{}
 }
