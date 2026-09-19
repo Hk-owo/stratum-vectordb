@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # kb-versions.sh — 查看知识库的版本链。
 #
-# 每个版本显示：版本号、父版本、创建时间、索引状态
-# （PENDING 构建中 / READY 可查询 / FAILED 构建失败可重建）。
+# 每个版本显示：版本号、父版本、索引状态与数据状态、是否正在删除、创建时间
+# （Unix 秒）。
+#   index_status  PENDING 构建中 / READY 可查询 / FAILED 构建失败可重建 /
+#                 FAILED_PERMANENT 控制层判定，只能人工处置
+#   data_status   PENDING 写入中 / DURABLE 已持久 / FAILED_PERMANENT 数据不会到
+#   deleting      true 表示异步删除清理还没收尾
 #
 # 用法：
 #   scripts/ops/kb-versions.sh <知识库ID>
@@ -43,8 +47,13 @@ if [[ "$JSON" -eq 1 ]]; then
 fi
 
 count=$(echo "$resp" | jq -r '[.versions[]?] | length')
+if [[ "$count" -eq 0 ]]; then
+  echo "知识库 $KB_ID 还没有版本（创建知识库不再产生初始版本；写入第一批文档后才有）"
+  exit 0
+fi
 echo "知识库 $KB_ID 共 $count 个版本："
 echo
 echo "$resp" | jq -r '
+  def short: sub("^(INDEX|DATA)_STATUS_"; "");
   .versions[]? |
-  "  版本 \(.version_id)  父版本 \(.parent_version_id)  状态 \(.index_status)  创建于 \(.created_at)"' || true
+  "  版本 \(.version_id)  父版本 \(.parent_version_id)  索引 \(.index_status|short)  数据 \(.data_status|short)\(if .deleting then "  [删除中]" else "" end)  创建于 \(.created_at)"'

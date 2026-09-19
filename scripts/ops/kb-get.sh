@@ -39,13 +39,16 @@ if [[ "$JSON" -eq 1 ]]; then
   exit 0
 fi
 
+# short 把枚举全名削短（gateway 以 proto 名返回：KB_STATUS_ACTIVE、
+# INDEX_TYPE_HNSW、QUANTIZER_SQ_BF16…）。
 echo "$resp" | jq -r '
   .knowledge_base |
   "知识库 ID:     \(.knowledge_base_id)",
   "名称:          \(.name)",
-  "状态:          \(.status)",
+  "状态:          \(.status|sub("^KB_STATUS_"; ""))",
   "分块窗口:      \(.chunk_window_size)（重叠 \(.chunk_overlap_size)）",
-  "索引/相似度:   \(.index_type) / \(.similarity)",
-  "激活版本:      \(.active_version_id)",
+  "索引/相似度:   \(.index_type|sub("^INDEX_TYPE_"; "")) / \(.similarity|sub("^SIMILARITY_"; ""))",
+  "量化器:        \(.quantizer|sub("^QUANTIZER_"; ""))\(if .quantizer == "QUANTIZER_PQ" then "（m=\(.pq_m)，nbits=\(.pq_nbits)）" else "" end)",
+  "激活版本:      \(.active_version_id)\(if .active_version_id == 0 then "（尚无版本）" else "" end)",
   "embed 服务:    \(.embed_config.service_addr)",
   "embed 模型:    \(.embed_config.model_id)"'

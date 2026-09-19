@@ -44,4 +44,11 @@ if [[ ! "$code" =~ ^2[0-9][0-9]$ ]]; then
   exit 1
 fi
 
-echo "已切换：知识库 $KB_ID 的激活版本 → $VERSION"
+# 接口用 success 表达"这次切换是否生效"（单独看 HTTP 200 是不够的：目标版本不存在
+# 或状态不满足时它可以是 200 + success=false）。
+if [[ "$(echo "$resp" | jq -r '.success // false')" != "true" ]]; then
+  echo "$resp" | jq . >&2
+  echo "错误：切换未生效（服务端 success=false）" >&2
+  exit 1
+fi
+echo "已切换：知识库 $KB_ID 的激活版本 → $VERSION（旧版本数据保留，可随时再切回做 A/B）"

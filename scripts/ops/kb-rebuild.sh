@@ -44,4 +44,10 @@ if [[ ! "$code" =~ ^2[0-9][0-9]$ ]]; then
   exit 1
 fi
 
+# success=false 表示服务端没有接受这次重建（例如版本不存在或状态不允许）。
+if [[ "$(echo "$resp" | jq -r '.success // false')" != "true" ]]; then
+  echo "$resp" | jq . >&2
+  echo "错误：重建未被接受（服务端 success=false）" >&2
+  exit 1
+fi
 echo "已触发重建：知识库 $KB_ID 版本 $VERSION（后台异步，可用 kb-versions.sh 观察状态）"

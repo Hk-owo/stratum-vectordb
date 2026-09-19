@@ -3,9 +3,15 @@
 #
 # 向量来源二选一：
 #   --vector "0.1,0.2,…"    直接传向量（维度须与库内向量一致）
-#   --text "文本"            用 mock embed 的确定性算法从文本生成向量
-#                            （仅当知识库使用 mock embed 服务时有效；
-#                             生产 embed 服务请自行调用后传 --vector）
+#   --text "文本"            走 gateway 的 /api/query-text：**服务端**用该知识库
+#                            自己的 embed 配置（service_addr + model_id）把文本
+#                            转成向量再检索。不需要在本地复刻 embed 算法，也不会
+#                            出现"本地算法和知识库实际使用的模型不一致"这种
+#                            静默查错空间的事。
+#
+# 注意 --text 的前提：gateway 要能访问该知识库的 embed 服务地址。容器集群里
+# embed 常是容器名（http://stratum-embed:8080），宿主进程解析不了 —— 那种情况
+# 用 scripts/gateway.sh --in-docker 把控制台放进集群网络，或自己算好向量用 --vector。
 #
 # 默认查询激活版本；--version-id 可指定版本（版本间可 A/B 对比）。
 #
@@ -19,8 +25,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 KB_ID=""
 VECTOR=""
 TEXT=""
-MODEL_ID="mock-embed-v1"
-DIM=768
 TOP_K=10
 THRESHOLD=""
 VERSION_ID=""
@@ -31,8 +35,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --vector) VECTOR="$2"; shift 2 ;;
     --text) TEXT="$2"; shift 2 ;;
-    --model-id) MODEL_ID="$2"; shift 2 ;;
-    --dim) DIM="$2"; shift 2 ;;
     --top-k) TOP_K="$2"; shift 2 ;;
     --threshold) THRESHOLD="$2"; shift 2 ;;
     --version-id) VERSION_ID="$2"; shift 2 ;;
@@ -57,46 +59,47 @@ if [[ -z "$TEXT" && -z "$VECTOR" ]]; then
   exit 1
 fi
 
-# ---------- 生成/解析向量 ----------
-if [[ -n "$TEXT" ]]; then
-  VECTOR=$(python3 - "$TEXT" "$MODEL_ID" "$DIM" <<'PYEOF'
-import hashlib, math, struct, sys
-
-text, model_id, dim = sys.argv[1], sys.argv[2], int(sys.argv[3])
-chunk_id = hashlib.sha256((text + model_id).encode("utf-8")).hexdigest()
-h = hashlib.sha256(chunk_id.encode("ascii")).digest()
-vec = []
-for i in range(dim):
-    b = h[(i + i // 32) % 32] / 255.0
-    vec.append(struct.unpack("f", struct.pack("f", b))[0])
-norm = math.sqrt(sum(x * x for x in vec)) or 1.0
-vec = [struct.unpack("f", struct.pack("f", x / norm))[0] for x in vec]
-print(",".join(repr(x) for x in vec))
-PYEOF
-) || { echo "错误：文本生成向量失败" >&2; exit 1; }
-  echo "（已用 mock embed 算法从文本生成 $DIM 维向量）"
-fi
+# 聚合方式要发 proto 全名，两种端点都是：/api/query 走 protojson（认不出的
+# 枚举名静默丢弃 → MAX 变 MEDIAN），/api/query-text 是显式查表，写错直接 400。
+AGG="$(proto_enum aggregation "$AGGREGATION")" || exit 1
 
 # ---------- 组装 body ----------
-body=$(jq -nc \
-  --arg id "$KB_ID" \
-  --arg vec "$VECTOR" \
-  --argjson topk "$TOP_K" \
-  --arg agg "$AGGREGATION" \
-  '{
-    knowledge_base_id: $id,
-    vector: ($vec | split(",") | map(tonumber)),
-    top_k: $topk,
-    aggregation: $agg
-  }')
+if [[ -n "$TEXT" ]]; then
+  ENDPOINT="/api/query-text"
+  # /api/query-text 的 version_id 是 JSON 字符串（protojson 把 int64 编码成字符串，
+  # 控制台也是原样回传），所以这里不能用 --argjson。
+  body=$(jq -nc \
+    --arg id "$KB_ID" \
+    --arg text "$TEXT" \
+    --argjson topk "$TOP_K" \
+    --arg agg "$AGG" \
+    '{knowledge_base_id: $id, text: $text, top_k: $topk, aggregation: $agg}')
+else
+  ENDPOINT="/api/query"
+  body=$(jq -nc \
+    --arg id "$KB_ID" \
+    --arg vec "$VECTOR" \
+    --argjson topk "$TOP_K" \
+    --arg agg "$AGG" \
+    '{
+      knowledge_base_id: $id,
+      vector: ($vec | split(",") | map(tonumber)),
+      top_k: $topk,
+      aggregation: $agg
+    }')
+fi
 if [[ -n "$THRESHOLD" ]]; then
   body=$(echo "$body" | jq -c --argjson t "$THRESHOLD" '.threshold = $t')
 fi
 if [[ -n "$VERSION_ID" ]]; then
-  body=$(echo "$body" | jq -c --argjson v "$VERSION_ID" '.version_id = $v')
+  if [[ -n "$TEXT" ]]; then
+    body=$(echo "$body" | jq -c --arg v "$VERSION_ID" '.version_id = $v')
+  else
+    body=$(echo "$body" | jq -c --argjson v "$VERSION_ID" '.version_id = $v')
+  fi
 fi
 
-resp=$(curl -sS -w $'\n%{http_code}' -X POST "$STRATUM_API/api/query" \
+resp=$(curl -sS -w $'\n%{http_code}' -X POST "$STRATUM_API$ENDPOINT" \
   -H 'Content-Type: application/json' --data "$body") || {
   echo "错误：无法连接 $STRATUM_API" >&2
   exit 1
@@ -115,7 +118,13 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
 fi
 
 vid=$(echo "$resp" | jq -r '.version_id')
-echo "查询知识库 $KB_ID（命中版本 $vid，top-k=${TOP_K}${THRESHOLD:+，threshold=$THRESHOLD}）"
+degraded=$(echo "$resp" | jq -r '.storage_degraded // false')
+echo "查询知识库 $KB_ID（命中版本 $vid，top-k=${TOP_K}${THRESHOLD:+，threshold=$THRESHOLD}，aggregation=$(proto_enum_short "$AGG")）"
+# storage_degraded：存储层副本不足的**报告**，不是错误——结果是完整的，但
+# 该知道（docs/storage-degradation-signal-plan.md §10.1）。
+if [[ "$degraded" == "true" ]]; then
+  echo "  ⚠ storage_degraded：该知识库的存储副本低于法定数，结果仍完整但持久性有风险"
+fi
 echo
 n=$(echo "$resp" | jq -r '[.results[]?] | length')
 if [[ "$n" -eq 0 ]]; then

@@ -23,6 +23,8 @@ resp=$(curl -sS "$STRATUM_API/api/knowledge-bases") || {
 count=$(echo "$resp" | jq -r '[.knowledge_bases[]?] | length')
 echo "共 $count 个知识库"
 echo
+# 状态/索引类型等由 gateway 以 proto 名返回（KB_STATUS_ACTIVE、INDEX_TYPE_HNSW），
+# 显示时削掉前缀。激活版本 0 = 还没有版本（创建知识库不再产生初始版本）。
 echo "$resp" | jq -r '
   .knowledge_bases[]? |
-  "  \(.knowledge_base_id)  \(.name)  [\(.status)]  激活版本: \(.active_version_id)  (\(.index_type)/\(.similarity))"' || true
+  "  \(.knowledge_base_id)  \(.name)  [\(.status|sub("^KB_STATUS_"; ""))]  激活版本: \(.active_version_id)  (\(.index_type|sub("^INDEX_TYPE_"; ""))/\(.similarity|sub("^SIMILARITY_"; "")) 量化 \(.quantizer|sub("^QUANTIZER_"; "")))"' || true

@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
-# stop.sh — 停止 start.sh 拉起的全部 Stratum 服务。
+# stop.sh — 进程级兜底：按二进制名停掉 run/bin 下的全部 Stratum 服务。
 #
-# 停止顺序（与启动相反）：gateway → stratum → mock-embed → vecstore_server。
-# 先发 SIGTERM 优雅退出，5 秒后仍未退出再发 SIGKILL。
+# 与 scripts/gateway.sh stop 的分工：
+#   - scripts/gateway.sh stop 是**首选**：它走控制台的 /ops/stop，让控制台收掉自己
+#     管理的子进程，再停控制台与服务站。控制台还能用的时候应该用它。
+#   - 本脚本不看控制台，只按 run/bin 下的进程名停：控制台已经挂了、或者进程是别的
+#     方式拉起来的（scripts/cluster.sh 的宿主 vecstore、手工 nohup 的节点）时用它。
+#
+# 停止顺序（与启动相反）：gateway → 服务站(stratum-router) → stratum →
+# mock-embed → vecstore_server。先发 SIGTERM 优雅退出，5 秒后仍未退出再发 SIGKILL。
+#
+# 注意：容器形态的节点归 scripts/cluster.sh 管（cluster.sh down），本脚本只处理
+# 宿主进程，不碰容器。
 #
 # 用法：
 #   scripts/ops/stop.sh              # 停止全部服务
@@ -15,7 +24,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$ROOT/run/bin"
 
 # 停止顺序：先停依赖方，再停基础组件。
-BINS=("stratum-gateway" "stratum" "mock-embed" "vecstore_server")
+BINS=("stratum-gateway" "stratum-router" "stratum" "mock-embed" "vecstore_server")
 
 DRY_RUN=0
 FORCE=0
