@@ -183,7 +183,12 @@ type LocalDataPlane struct {
 	control         ControlPlane
 	pusher          VersionPusher
 	resolveReplicas ReplicaResolver
-	cursorQuerier   CursorQuerier
+	// replicaCount is how many replicas should hold a written version, this node
+	// included (1 = no replication). fanOut needs it to tell an expected empty
+	// target list from a broken one; see the field of the same name on
+	// LocalDataPlaneConfig.
+	replicaCount  int
+	cursorQuerier CursorQuerier
 	dropper         VersionDataDropper
 	cleaner         VersionDataCleaner
 	presence        VersionPresenceQuerier
@@ -316,6 +321,18 @@ type LocalDataPlaneConfig struct {
 	// is the whole quorum — the single-node and test default. It doubles as
 	// the candidate set for backfill sources.
 	ResolveReplicas ReplicaResolver
+	// ReplicaCount is how many replicas should hold a written version, this node
+	// included; 1 (or, for a caller that does not set it, the zero value) means
+	// "no replication".
+	//
+	// fanOut needs it because an empty ResolveReplicas result has two meanings
+	// and only one is a fault: on a single-replica deployment the target list is
+	// empty by construction — the local write IS the quorum — while on a
+	// multi-replica one it means the peer list could not be built and the write
+	// will never reach the other replicas. Without the count, fanOut warned on
+	// both, and since the first case happens on every write the warning was
+	// noise that hid the second.
+	ReplicaCount int
 	// CursorQuerier asks peers how far their history reaches, so a backfill
 	// can pick a source that holds the gap (v13 §7.6). Optional: without it
 	// the source stays whatever SourceResolver returned.
@@ -377,6 +394,7 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		control:          cfg.Control,
 		pusher:           cfg.Pusher,
 		resolveReplicas:  cfg.ResolveReplicas,
+		replicaCount:     cfg.ReplicaCount,
 		cursorQuerier:    cfg.CursorQuerier,
 		dropper:          cfg.DataDropper,
 		cleaner:          cfg.CleanupBroadcaster,
@@ -1551,15 +1569,26 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 		return fmt.Errorf("plane: fan-out for version %d: resolve replicas: %w", versionID, err)
 	}
 	if len(targets) == 0 {
-		// 解析不出任何副本。这里从前静默返回成功,而"没有副本"在 quorum 判定上
-		// 与"副本就是我自己"是同一件事——于是这一版被当成已复制完成,控制层据此
-		// 推进,其余副本永远拿不到它。
+		// 解析不出任何副本。"没有副本"在 quorum 判定上与"副本就是我自己"是同一
+		// 件事——于是这一版被当成已复制完成,控制层据此推进。这里从前静默返回成
+		// 功,而沉默有代价:多副本部署里它意味着其余副本永远拿不到这一版。
 		//
-		// 单层集群里协调者就是受理者,它的副本列表非空,这条路径不会走到;派发
-		// 真正生效之后(§7.13.2)就会:写入落在一台远程节点上,而那台节点解析不出
-		// 副本列表时,它会把单副本当成 quorum。
-		d.logger.Warn("plane: fan-out found no replica targets; treating this node's own copy as the quorum",
-			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+		// 但空列表有两种来源,只有一种是故障。单副本部署里它**结构上就是空的**
+		// (ResolveReplicas 列的是"除我之外的副本",而我之外没有副本),那种情况
+		// 下本地写就是整个 quorum,是正常结果。ReplicaCount 用来区分二者:不区分
+		// 的话每次写都会告警,而真正的故障会淹在里头。
+		fields := []zap.Field{
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+			zap.Int("replica_count", d.replicaCount),
+		}
+		if d.replicaCount <= 1 {
+			d.logger.Debug("plane: fan-out has no replica targets; this node's own copy is the whole quorum",
+				fields...)
+			return nil
+		}
+		d.logger.Warn("plane: fan-out found no replica targets on a multi-replica deployment; "+
+			"treating this node's own copy as the quorum, and the other replicas will not receive this version",
+			fields...)
 		return nil
 	}
 
@@ -1694,15 +1723,30 @@ func (d *LocalDataPlane) reportAndSchedule(ctx context.Context, kbID string, ver
 	if d.control != nil {
 		digest := stratinternalsync.ComputeDocIDSetHash(docIDs)
 		if err := d.control.ReportDataDurable(ctx, kbID, versionID, digest); err != nil {
-			// This used to be discarded (`_ =`), and the silence is expensive: with no
-			// digest the version carries no evidence of having been durably
-			// replicated, so cursor recovery reads it as "not held here"
-			// (holdsVersionLocally) and the data side never leaves PENDING.
-			// Measured on a 3-node cluster: not one version reached DATA_DURABLE, while
-			// fan-out itself never failed — so whatever goes wrong, it goes wrong
-			// here.
-			d.logger.Warn("plane: reporting the version's digest failed; it keeps no durable digest",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			if errors.Is(err, stratumerrors.ErrVersionNotFound) {
+				// The version is gone — discarded by its caller, or deleted — while
+				// its write path was still finishing. Discarding means "act as if
+				// this never existed", so a later digest report for it has nowhere
+				// to land: expected, not a failure. The index build's callback
+				// reaches the same conclusion the same way (see internal/index's
+				// invokeCallback).
+				//
+				// Telling this apart matters because the warning below is the one
+				// worth reading — a version with no durable digest never leaves
+				// PENDING — and firing it on every discard is what buries that.
+				d.logger.Debug("plane: the version is gone (discarded or deleted); no digest to report",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+			} else {
+				// This used to be discarded (`_ =`), and the silence is expensive: with no
+				// digest the version carries no evidence of having been durably
+				// replicated, so cursor recovery reads it as "not held here"
+				// (holdsVersionLocally) and the data side never leaves PENDING.
+				// Measured on a 3-node cluster: not one version reached DATA_DURABLE, while
+				// fan-out itself never failed — so whatever goes wrong, it goes wrong
+				// here.
+				d.logger.Warn("plane: reporting the version's digest failed; it keeps no durable digest",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			}
 		} else {
 			d.logger.Debug("plane: reported the version's digest",
 				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("docs", len(docIDs)))

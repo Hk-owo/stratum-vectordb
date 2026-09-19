@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -167,8 +168,22 @@ func TestForwardWrite_NoLeaderAllFail(t *testing.T) {
 	_, err := forwardWrite(r, context.Background(), "", 0, func(idx int, ctx context.Context) (string, error) {
 		return "", notLeaderErr()
 	})
-	if err == nil || err.Error() != "router: no leader available" {
-		t.Errorf("err = %v, want 'router: no leader available'", err)
+	if err == nil {
+		t.Fatal("want an error, got nil")
+	}
+	// The message must still say the station found no leader…
+	if !strings.Contains(err.Error(), "router: no leader available") {
+		t.Errorf("err = %v, want it to still mention 'router: no leader available'", err)
+	}
+	// …but it must now ALSO carry why. That cause is the only thing separating
+	// "there really is no leader" from "the leader was found and the write did
+	// not land" — dropping it is what sent us auditing a healthy cluster while
+	// GetClusterStatus was answering has_leader=true.
+	if !strings.Contains(err.Error(), "kvraft: not leader") {
+		t.Errorf("err = %v, want it to carry the underlying cause", err)
+	}
+	if got := status.Code(err); got != codes.Internal {
+		t.Errorf("status.Code(err) = %v, want Internal — the cause's code must survive the wrapping", got)
 	}
 }
 

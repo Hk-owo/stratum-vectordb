@@ -16,6 +16,10 @@ type stubControl struct {
 	// terminal is what ReportVersionFailure answers, so a test can drive the
 	// §10.6 cleanup trigger.
 	terminal bool
+
+	// durableErr is what ReportDataDurable answers; nil (the default) means the
+	// report succeeded, which is what every other test wants.
+	durableErr error
 }
 
 // ReclaimableChangesThrough defaults to "unknown": a stub must keep the data,
@@ -29,7 +33,9 @@ type failureReport struct {
 	class     types.FailureClass
 }
 
-func (c *stubControl) ReportDataDurable(context.Context, string, int64, string) error { return nil }
+func (c *stubControl) ReportDataDurable(context.Context, string, int64, string) error {
+	return c.durableErr
+}
 func (c *stubControl) ReportIndexReady(context.Context, string, int64) error          { return nil }
 func (c *stubControl) ReportEpoch(context.Context, uint64, map[string]int64, map[string][]int64) error {
 	return nil

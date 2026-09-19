@@ -56,10 +56,41 @@ func TestIsRetryableErr_DecidesOnTheSentinelNotTheCode(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isRetryableErr(tc.err); got != tc.want {
-				t.Fatalf("isRetryableErr(%v) = %v, want %v", tc.err, got, tc.want)
+			// These verdicts are the same for a read and a write: index_* means
+			// "another replica may have it", and the terminal ones mean "do not
+			// retry anywhere". version_pending is the one reason that differs by
+			// path, and it has its own case below.
+			for _, forWrite := range []bool{false, true} {
+				if got := isRetryableErr(tc.err, forWrite); got != tc.want {
+					t.Fatalf("isRetryableErr(%v, forWrite=%v) = %v, want %v", tc.err, forWrite, got, tc.want)
+				}
 			}
 		})
+	}
+}
+
+// TestIsRetryableErr_VersionPendingDependsOnThePath pins the one reason whose
+// verdict is opposite on the two paths — the whole point of forWrite.
+//
+// Read: this replica's storage-layer write for the version is still in progress,
+// so another replica may already be serving it; asking someone else is worth the
+// hop.
+//
+// Write: a write goes through Raft, so every replica shares one state machine and
+// another candidate refuses for exactly this reason. Retrying buys nothing and
+// costs something — it swaps a terminal, self-describing FailedPrecondition
+// ("version 95 is PENDING") for a flat "no leader available", which names neither
+// the version nor its state and reads like an infrastructure fault. That message
+// sent us auditing a healthy cluster while GetClusterStatus answered
+// has_leader=true and the timing line showed leader_index=0.
+func TestIsRetryableErr_VersionPendingDependsOnThePath(t *testing.T) {
+	err := stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionPending)
+
+	if !isRetryableErr(err, false) {
+		t.Error("version_pending must stay retryable on a read: another replica may be serving it")
+	}
+	if isRetryableErr(err, true) {
+		t.Error("version_pending must be terminal on a write: Raft state agrees everywhere")
 	}
 }
 
@@ -71,8 +102,10 @@ func TestIsRetryableErr_DecidesOnTheSentinelNotTheCode(t *testing.T) {
 func TestIsRetryableErr_UnnamedFailedPreconditionIsTerminal(t *testing.T) {
 	unnamed := status.Error(codes.FailedPrecondition, "index is still building")
 
-	if isRetryableErr(unnamed) {
-		t.Fatal("an unnamed FailedPrecondition must stay terminal")
+	for _, forWrite := range []bool{false, true} {
+		if isRetryableErr(unnamed, forWrite) {
+			t.Fatal("an unnamed FailedPrecondition must stay terminal")
+		}
 	}
 }
 
@@ -81,13 +114,13 @@ func TestIsRetryableErr_UnnamedFailedPreconditionIsTerminal(t *testing.T) {
 // kvraft "not leader" (which is matched by message because no sentinel exists for
 // it yet).
 func TestIsRetryableErr_KeepsTheTransportAndNotLeaderRules(t *testing.T) {
-	if !isRetryableErr(status.Error(codes.Unavailable, "connection refused")) {
+	if !isRetryableErr(status.Error(codes.Unavailable, "connection refused"), true) {
 		t.Error("an unreachable node must be retried on another candidate")
 	}
-	if !isRetryableErr(status.Error(codes.Internal, "kvraft: not leader")) {
+	if !isRetryableErr(status.Error(codes.Internal, "kvraft: not leader"), true) {
 		t.Error("a forwarded not-leader must be retried on another candidate")
 	}
-	if isRetryableErr(errors.New("plain error")) {
+	if isRetryableErr(errors.New("plain error"), true) {
 		t.Error("a plain error carries no status and must not be retried")
 	}
 }
@@ -100,7 +133,7 @@ func TestIsRetryableErr_TheReasonSurvivesARegistryHop(t *testing.T) {
 	// The node returns this.
 	onTheWire := stratumerrors.ToGRPCStatus(stratumerrors.ErrIndexMaintenance)
 	// The station hands the received status to the same rule.
-	if !isRetryableErr(onTheWire) {
+	if !isRetryableErr(onTheWire, false) {
 		t.Fatal("the maintenance identity must survive the hop")
 	}
 	// And the reason is readable as data, not as text.

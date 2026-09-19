@@ -139,10 +139,37 @@ type WriteCoordinatorImpl struct {
 	dispatchMu      sync.Mutex
 	pendingDispatch map[dispatchKey]pendingDispatchEntry
 
+	// claimedDispatch records the registrations Execute's own background dispatch
+	// took, keyed the same way and timed, so the apply hook can tell the two
+	// causes of a miss apart.
+	//
+	// Why it exists: a miss used to carry one message for both causes, and the
+	// message named the rarer one. "Nobody holds these changes" (the proposing
+	// process is gone) is the case worth warning about; "someone already took
+	// them" is the DESIGNED outcome of racing Execute's dispatch against the
+	// apply hook — Execute dispatches the moment the version is committed, and
+	// whichever side arrives first wins, the other becoming a no-op. Measured:
+	// every single write logged the warning, so the one occurrence that mattered
+	// was indistinguishable from the noise. The claim is timed because the two
+	// sides are milliseconds apart in the case this exists to recognise; a claim
+	// older than dispatchClaimWindow can no longer explain a miss, and dropping
+	// stale ones also keeps the map from growing without bound.
+	claimedDispatch map[dispatchKey]time.Time
+
 	// dispatchWG tracks in-flight background dispatches, so a shutdown (or a
 	// test) can wait for the ones already handed off.
 	dispatchWG sync.WaitGroup
 }
+
+// dispatchClaimWindow is how long a background dispatch's claim explains a later
+// miss by the apply hook.
+//
+// Generous next to the gap it measures (Execute hands off right after the
+// proposal returns; the apply loop is a goroutine away) because the cost of
+// being too large is only that a genuine "nobody holds these changes" gets
+// reported as noise — while the cost of being too small is a false warning on
+// every write, which is the state this replaced.
+const dispatchClaimWindow = 2 * time.Minute
 
 // dispatchKey identifies one in-flight write's pending dispatch.
 type dispatchKey struct {
@@ -186,6 +213,38 @@ func (c *WriteCoordinatorImpl) TakePendingDispatch(kbID, clientRequestID string)
 	}
 	delete(c.pendingDispatch, key)
 	return entry.parentVersionID, entry.changes, true
+}
+
+// claimDispatch records that the proposer's own background dispatch took this
+// registration, so a later miss by the apply hook can be attributed to the race
+// instead of to the version having no owner. See claimedDispatch.
+func (c *WriteCoordinatorImpl) claimDispatch(kbID, clientRequestID string) {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	if c.claimedDispatch == nil {
+		c.claimedDispatch = make(map[dispatchKey]time.Time)
+	}
+	now := time.Now()
+	// Sweep as we go: claims only matter for dispatchClaimWindow, and this keeps
+	// the map bounded without a background goroutine.
+	for k, at := range c.claimedDispatch {
+		if now.Sub(at) > dispatchClaimWindow {
+			delete(c.claimedDispatch, k)
+		}
+	}
+	c.claimedDispatch[dispatchKey{kbID: kbID, clientRequestID: clientRequestID}] = now
+}
+
+// DispatchClaimed reports whether the proposer's background dispatch took this
+// registration recently — i.e. the write is being handled, not orphaned.
+//
+// False means no claim is on record, which is what the apply hook's miss needs
+// to know before it calls the version ownerless.
+func (c *WriteCoordinatorImpl) DispatchClaimed(kbID, clientRequestID string) bool {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	at, ok := c.claimedDispatch[dispatchKey{kbID: kbID, clientRequestID: clientRequestID}]
+	return ok && time.Since(at) <= dispatchClaimWindow
 }
 
 // ForgetPendingDispatch drops a registration whose proposal never landed, so it
@@ -376,6 +435,10 @@ func (c *WriteCoordinatorImpl) dispatchInBackground(kbID string, versionID int64
 	if !ok {
 		return // the apply hook got there first
 	}
+	// Claim it so the apply hook, if it is still on its way, can see that this
+	// dispatch is the one handling the write — which is the normal outcome here,
+	// not an orphaned version.
+	c.claimDispatch(kbID, dispatchID)
 	c.dispatchWG.Add(1)
 	go func() {
 		defer c.dispatchWG.Done()

@@ -722,6 +722,18 @@ func main() {
 		IndexReader:     indexMgr,
 		IndexShipper:    stratumsync.NewIndexPusher(),
 		ResolveReplicas: resolveReplicaAddrs,
+		// The same topology resolveReplicaAddrs walks, counted this time: how many
+		// replicas should hold a written version. fanOut reads it to recognise the
+		// single-replica case, where an empty target list is the expected answer
+		// rather than a peer list that failed to build. Declared storage group
+		// when there is one (it includes this node), the Raft members otherwise —
+		// the same choice resolveReplicaAddrs makes two lines up.
+		ReplicaCount: func() int {
+			if len(cfg.StorageNodes) > 0 {
+				return len(cfg.StorageNodes)
+			}
+			return len(cfg.Peers)
+		}(),
 		// §8.4(a): bound how many distributions run at once; 0 takes the
 		// default (DefaultMaxConcurrentIndexPush).
 		MaxConcurrentIndexPush: cfg.IndexPushConcurrency,
@@ -2340,10 +2352,12 @@ func (s versionHolderSource) StorageUnavailable(kbID string) (bool, string, bool
 }
 
 // pendingDispatchRegistry is the part of the write coordinator the §7.13.2
-// hand-off uses: the once-only take of a write's changes, and the give-up path
-// it deliberately no longer calls on a miss.
+// hand-off uses: the once-only take of a write's changes, the question that tells
+// a lost race from an orphaned version, and the give-up path it deliberately no
+// longer calls on a miss.
 type pendingDispatchRegistry interface {
 	TakePendingDispatch(kbID, clientRequestID string) (int64, []types.DocChange, bool)
+	DispatchClaimed(kbID, clientRequestID string) bool
 	AbandonDispatch(ctx context.Context, kbID string, versionID int64, class types.FailureClass, detail string)
 }
 
@@ -2359,12 +2373,20 @@ type versionWriteDispatcher interface {
 //
 // The changes live in THIS process's memory — the Raft command deliberately
 // carries none (§7.7) — so a missing TakePendingDispatch means one of two
-// things and this node cannot tell which:
+// things. The registry tells them apart (DispatchClaimed):
 //
 //   - the background dispatch already took them (Execute dispatches the moment
-//     the version is committed; Take is once-only), so the write is on its way;
+//     the version is committed; Take is once-only), so the write is on its way.
+//     This is a DESIGNED outcome, not a fault: the hook and Execute race, and
+//     whichever arrives first wins. Logged at debug.
 //   - nobody holds them at all: the process that proposed them is gone (a
-//     restarted or deposed leader).
+//     restarted or deposed leader). Nothing is in flight, and this is the case
+//     worth a warning.
+//
+// Before DispatchClaimed existed the hook could not tell the two apart, so it
+// warned on both — and since the first cause happens on every write, the warning
+// was noise that hid the second. The distinction is what makes the message mean
+// something.
 //
 // It used to report a transient failure on the miss, and that was wrong twice
 // over: an in-memory miss on one node proves neither case, so the retry budget
@@ -2373,7 +2395,7 @@ type versionWriteDispatcher interface {
 // version is the DATA-side existence probe (the same one GetSystemStatus uses),
 // which the await path exposes as data_missing, followed by the caller either
 // re-sending the changes or discarding the version. Until then it stays
-// PENDING — which is the truth: nobody on this node knows.
+// PENDING — which is the truth for the orphaned case.
 func dispatchCommittedVersion(
 	registry pendingDispatchRegistry,
 	dispatcher versionWriteDispatcher,
@@ -2384,6 +2406,22 @@ func dispatchCommittedVersion(
 ) {
 	regParentID, changes, ok := registry.TakePendingDispatch(kbID, clientRequestID)
 	if !ok {
+		// A miss has two causes and only one of them is worth a warning. When the
+		// proposer's own background dispatch took the registration, the write is
+		// already being handled: this hook lost a race it is DESIGNED to lose
+		// sometimes, because Execute dispatches as soon as the version is
+		// committed and whichever side arrives first wins. Warning there fired on
+		// every single write, which buried the cause that matters.
+		//
+		// That other cause — nobody holds the changes, because the process that
+		// proposed them is gone — is what actually leaves a version PENDING with
+		// no owner. It is the one worth saying out loud.
+		if registry.DispatchClaimed(kbID, clientRequestID) {
+			logger.Debug("version committed here; the proposer's dispatch is already in flight",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.String("client_request_id", clientRequestID))
+			return
+		}
 		logger.Warn("version committed here without a pending dispatch; leaving it PENDING",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
 			zap.String("client_request_id", clientRequestID))

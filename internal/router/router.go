@@ -573,6 +573,15 @@ func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission 
 	var versionID int64
 	var tLeaderLookup, tAttempt time.Duration
 	attempts, leaderIdx := 0, -1
+	// lastErr keeps the last forwarded failure's cause.
+	//
+	// Why it exists: every error the loop sees is triaged by isRetryableErr, but
+	// the triage's INPUT was dropped, so every retryable failure converged on one
+	// flat "no leader available" — which names neither the node nor the reason.
+	// That message is what a caller sees when a write fails, and it sent us
+	// looking at the cluster when the leader was healthy the whole time
+	// (GetClusterStatus answered has_leader=true, and leader_index was 0).
+	var lastErr error
 	defer func() {
 		r.loggerOrNop().Debug("router: write forward timings",
 			zap.String("kb_id", kbID),
@@ -582,7 +591,8 @@ func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission 
 			zap.Int64("admission_us", admission.Microseconds()),
 			zap.Int64("leader_lookup_us", tLeaderLookup.Microseconds()),
 			zap.Int64("attempt_us", tAttempt.Microseconds()),
-			zap.Int64("total_us", time.Since(start).Microseconds()))
+			zap.Int64("total_us", time.Since(start).Microseconds()),
+			zap.Error(lastErr))
 	}()
 
 	// noteResponse picks up the version id when the response carries one, which
@@ -626,9 +636,17 @@ func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission 
 		if err == nil {
 			return noteResponse(resp), nil
 		}
-		if !isRetryableErr(err) {
+		lastErr = err
+		if !isRetryableErr(err, true) {
 			return zero, err
 		}
+	}
+	if lastErr != nil {
+		// Wrap rather than replace: the cause stays inspectable with errors.Is,
+		// and the message now says what actually went wrong. "no leader
+		// available" alone is wrong anyway — the leader was found and the write
+		// reached it.
+		return zero, fmt.Errorf("router: no leader available after %d attempt(s): %w", attempts, lastErr)
 	}
 	return zero, errors.New("router: no leader available")
 }
@@ -705,7 +723,9 @@ func forwardRead[T any](r *Router, ctx context.Context, candidates []int, breake
 		if err == nil {
 			return resp, nil
 		}
-		if !isRetryableErr(err) {
+		// Reads keep version_pending retryable: another replica may already be
+		// serving the version this one is still writing (see isRetryableErr).
+		if !isRetryableErr(err, false) {
 			return zero, err
 		}
 	}
@@ -721,6 +741,9 @@ func tryAll[T any](r *Router, ctx context.Context, fn func(idx int, ctx context.
 	var zero T
 	now := time.Now()
 	admitted := 0
+	// Same reason as forwardWrite's lastErr: the triage input must survive, or
+	// every retryable failure flattens into one reasonless message.
+	var lastErr error
 	for idx := range r.controlAddrs {
 		if idx < len(r.controlBreakers) && !r.controlBreakers[idx].allow(now) {
 			continue
@@ -733,12 +756,16 @@ func tryAll[T any](r *Router, ctx context.Context, fn func(idx int, ctx context.
 		if err == nil {
 			return resp, nil
 		}
-		if !isRetryableErr(err) {
+		lastErr = err
+		if !isRetryableErr(err, true) {
 			return zero, err
 		}
 	}
 	if admitted == 0 {
 		return zero, errors.New("router: every control node is circuit-broken")
+	}
+	if lastErr != nil {
+		return zero, fmt.Errorf("router: no leader available (tried every node): %w", lastErr)
 	}
 	return zero, errors.New("router: no leader available")
 }
@@ -756,6 +783,21 @@ func tryAll[T any](r *Router, ctx context.Context, fn func(idx int, ctx context.
 // ErrorInfo detail (errors.ReasonOf), which is what makes the distinction
 // available on this side of the wire at all.
 //
+// forWrite picks between the two paths, and it is not cosmetic: the same
+// sentinel means opposite things to each.
+//
+//   - version_pending, to a READ, means this replica's storage-layer write for
+//     the version is still in progress — another replica may already be serving
+//     it, so asking someone else is worth the hop.
+//   - version_pending, to a WRITE, means the version's data has not landed yet.
+//     A write goes through Raft, so every replica shares one state machine:
+//     another candidate refuses for exactly the same reason. Retrying buys
+//     nothing and costs something — it replaces a terminal, self-describing
+//     FailedPrecondition ("version 95 is PENDING") with a flat "no leader
+//     available", which names neither the version nor its state and reads like
+//     an infrastructure fault. That message sent us auditing a healthy cluster
+//     while GetClusterStatus was answering has_leader=true.
+//
 // The code-based fallback covers errors that carry no reason:
 //   - codes.Unavailable: node down / connection failed (leader failover or a
 //     stopped container) — worth another candidate.
@@ -763,8 +805,11 @@ func tryAll[T any](r *Router, ctx context.Context, fn func(idx int, ctx context.
 //     named sentinel of its own yet.
 //
 // Everything else (validation errors, terminal version states, ...) is terminal.
-func isRetryableErr(err error) bool {
+func isRetryableErr(err error, forWrite bool) bool {
 	if reason := stratumerrors.ReasonOf(err); reason != "" {
+		if forWrite && writeTerminalReasons[reason] {
+			return false
+		}
 		return retryableReasons[reason]
 	}
 	st, ok := status.FromError(err)
@@ -775,6 +820,19 @@ func isRetryableErr(err error) bool {
 		return true
 	}
 	return st.Code() == codes.Internal && strings.Contains(st.Message(), "not leader")
+}
+
+// writeTerminalReasons names the sentinels that are worth retrying to a reader
+// but terminal to a writer.
+//
+// Expressed as an exception list rather than a second table so the two paths
+// cannot drift: a new retryable reason is retryable on both unless it is named
+// here, which is the safe direction — the failure mode of an unlisted exception
+// is the extra hop this file's forWrite exists to avoid, not a lost write.
+var writeTerminalReasons = map[string]bool{
+	// Raft-replicated state, so no other candidate can disagree about whether
+	// the version's data has landed.
+	"version_pending": true,
 }
 
 // retryableReasons names the sentinels that mean "another candidate may

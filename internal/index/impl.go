@@ -2357,10 +2357,32 @@ func (im *IndexManagerImpl) invokeCallback(cb BuildCompleteCallback, kbID string
 		maxRetries = 3
 	}
 
+	// 记下最后一次的 err 并报出去。原实现把 err 的作用域关在 if 里，于是失败时
+	// 只留下"重试耗尽"——而**为什么**耗尽正是唯一的诊断信息。定位这个问题时，
+	// 就是因为这一行为空，才只能一路读代码去猜失败落在了哪一环。
+	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if err := cb(kbID, versionID, status); err == nil {
+		err := cb(kbID, versionID, status)
+		if err == nil {
 			return
 		}
+		// 版本已经不在了——被 `DiscardVersion` 放弃，或被 `DeleteVersion` 删掉，
+		// 而索引构建这时可能才刚跑完。它的上报撞上 "version not found" 是**预期
+		// 结果**，不是失败：放弃一个版本的语义本来就是"当它没存在过"，那么之后
+		// 为它上报索引就绪自然无处可报。
+		//
+		// 不识别这一条，每次 discard 都会留下 4 次退避重试（200+400+800ms）和一
+		// 条 error 级日志——把一次正常的放弃渲染成看起来像故障的东西，而真正的
+		// 故障会淹在这片噪音里。
+		if errors.Is(err, stratumerrors.ErrVersionNotFound) {
+			im.logger.Debug("build callback: version is gone (discarded or deleted); nothing to report",
+				zap.String("kb_id", kbID),
+				zap.Int64("version_id", versionID),
+				zap.String("status", status.String()),
+			)
+			return
+		}
+		lastErr = err
 		if attempt < maxRetries {
 			backoff := base * time.Duration(int64(math.Pow(2, float64(attempt))))
 			time.Sleep(backoff)
@@ -2370,6 +2392,8 @@ func (im *IndexManagerImpl) invokeCallback(cb BuildCompleteCallback, kbID string
 		zap.String("kb_id", kbID),
 		zap.Int64("version_id", versionID),
 		zap.String("status", status.String()),
+		zap.Int("attempts", maxRetries+1),
+		zap.Error(lastErr),
 	)
 }
 
