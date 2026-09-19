@@ -351,6 +351,10 @@ Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部�
 go test ./integration/... -run TestRealStack -v   # 全真实栈端到端(需 C++ 二进制,缺失时跳过)
 go test ./integration/... -run TestMultiNode -v   # 3 节点进程内集群:选主、复制 KB + 版本元数据
 STRATUM_STRESS_DOCS=20000 go test ./integration/docker/ -tags=docker -count=1 -run TestT4_QueryLatency -v
+
+scripts/t4-integration.sh                      # T4 整套(默认 both 拓扑,自动起集群)
+scripts/t4-integration.sh -t all-in-one        # 换 CI 用的那种拓扑
+scripts/t4-integration.sh -r 'TestT4_Await'    # 只跑某一组用例
 ```
 
 全量单测(24 个测试包)与 3 节点 Docker 集群(T4)命令见[快速开始](#快速开始)。
@@ -369,6 +373,10 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 | `TestT4_StorageUnavailabilityIsNamedDistinctly` | 一个必需副本都不活:改报 `storage_unavailable`——"存储层整体没了"与"还差一个副本"是两句不同的话,且都要能重试 |
 | `TestT4_ActiveLagCatchupCatchesUpWithoutAQuery` / `TestT4_LagCatchupRetentionWindow` | 落后副本不靠查询自己追上;分发能修复的落后深度 |
 | `TestT4_HoldersFallbackPullsTheVersionItMissed` | 错过 push 的副本经控制层 holders 兜底找到数据源 |
+| `TestT4_AwaitVersion_*` / `TestT4_CreateVersion_ReturnsTheKeyThatMakesAResendIdempotent` | 续等:`AwaitVersion` 收敛、"还没好"正常返回 stage 而不是错误、只有真的不存在才 `NotFound`;响应回传的 `client_request_id` 能用来重发并复用同一版本 |
+| `TestT4_AwaitVersion_EveryControlNodeAnswersOnItsOwn` | 绕过服务站直连每个控制节点:等待的锚点是复制状态,不是连接(服务站每次重选后端,会把这条性质藏起来) |
+| `TestT4_DiscardVersion_*` | 放弃从未落地的版本:拒绝已落地(`version_not_pending`)与激活版本(`version_is_active`);embedder 停机时版本停在 PENDING、越过探测门槛后 `data_missing=true`,放弃成功后同 key 重发拿到**新**版本 |
+| `TestT4_ClientSDK_*` | `client/` 包端到端:先落盘再提交、同 key 重发幂等、丢掉本地 changes 后只剩放弃;以及等就绪的完整流程(需要索引构建可用) |
 
 ## 性能实测
 
