@@ -1,0 +1,13 @@
+# stratum-gateway 镜像 —— 单阶段，只打包宿主构建好的静态二进制。
+#
+# 与 Dockerfile（节点镜像）同样的理由：这个环境拉不到 golang 基础镜像，二进制在
+# 宿主用本地工具链构建：
+#
+#   CGO_ENABLED=0 go build -o integration/docker/stratum-gateway ./cmd/stratum-gateway/
+#
+# 静态前端（web/dist）与 ops 配置**不进镜像**：它们由 scripts/gateway-docker.sh
+# 以只读方式挂载，于是改前端不必重建镜像、镜像里也不会躺着一份会过期的 dist。
+FROM alpine:latest
+COPY integration/docker/stratum-gateway /usr/local/bin/stratum-gateway
+EXPOSE 8081
+ENTRYPOINT ["stratum-gateway"]

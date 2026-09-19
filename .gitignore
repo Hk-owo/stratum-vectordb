@@ -8,6 +8,7 @@
 
 # === Docker test build artifacts (pre-built on host; see Dockerfile) ===
 /integration/docker/stratum
+/integration/docker/stratum-gateway
 /integration/docker/mock-embed
 
 # === Go build cache ===
