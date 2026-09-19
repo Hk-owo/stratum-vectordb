@@ -544,6 +544,31 @@ func (im *IndexManagerImpl) SetLogger(l *zap.Logger) {
 	im.logger = l
 }
 
+// buildPriorityName is what the build-timings line reports for a request's
+// priority. Spelled out rather than a boolean, because the reader's question is
+// "was this build one somebody was waiting for" and the answer is the queue it
+// went into.
+func buildPriorityName(p BuildPriority) string {
+	if p == BuildPriorityBackfill {
+		return "backfill"
+	}
+	return "interactive"
+}
+
+// buildLogger returns the configured logger, or a no-op one.
+//
+// The same accessor router.Router has, for the same reason: NewIndexManager
+// installs a no-op logger, but a manager built directly (tests do) has none, and
+// a nil *zap.Logger panics instead of staying quiet. The per-stage build timings
+// are emitted on EVERY build, success or failure, so they must not be the thing
+// that turns a logger-less manager into a crash.
+func (im *IndexManagerImpl) buildLogger() *zap.Logger {
+	if im.logger == nil {
+		return zap.NewNop()
+	}
+	return im.logger
+}
+
 // SetBuildDataSources wires the three data-source callbacks to real
 // implementations (VersionDocList, ChunkDocMapper, ChunkStore). Callers
 // must call this once before TriggerBuild is used.
@@ -1137,10 +1162,11 @@ func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree
 	// Queued, not spawned. The pool bounds how many builds run at once, and lets a
 	// build somebody is waiting for jump ahead of a reconcile sweep's backfill.
 	if !im.submitBuild(buildRequest{
-		kbID:      kbID,
-		versionID: versionID,
-		graphFree: graphFree,
-		priority:  priority,
+		kbID:       kbID,
+		versionID:  versionID,
+		graphFree:  graphFree,
+		priority:   priority,
+		enqueuedAt: time.Now(),
 	}) {
 		// The pool is shut down and will never run this. Clear the in-progress marker
 		// so the state stays truthful — a version that is NOT being built must not
@@ -1162,17 +1188,42 @@ func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree
 func (im *IndexManagerImpl) submitBuild(req buildRequest) bool {
 	im.buildPoolOnce.Do(func() {
 		im.buildPool = newBuildPool(im.cfg.BuildConcurrency, func(r buildRequest) {
-			im.doBuild(r.kbID, r.versionID, r.graphFree)
+			im.doBuild(r)
 		}, im.logger)
 	})
 	return im.buildPool.Submit(req)
 }
 
-func (im *IndexManagerImpl) doBuild(kbID string, versionID int64, graphFree bool) {
+func (im *IndexManagerImpl) doBuild(req buildRequest) {
+	kbID, versionID, graphFree := req.kbID, req.versionID, req.graphFree
 	key := indexKey{kbID, versionID}
 
 	status := types.IndexStatusReady
 	var sizeBytes int64
+
+	// Per-stage timings of one build, at debug level.
+	//
+	// Why they are here: this is stage 6 of the write path — the version is
+	// PENDING until this returns and the control layer records READY — and until
+	// now the only thing a caller could observe was the wait itself. Queueing and
+	// building are the two things that can make that wait long, and they call for
+	// opposite responses (more build workers vs. a look at vecstore and the
+	// batch), so the line separates them. build_us measures buildWithRetry, and
+	// therefore includes any retries it needed.
+	buildStart := time.Now()
+	var buildUs time.Duration
+	defer func() {
+		if !req.enqueuedAt.IsZero() {
+			im.buildLogger().Debug("index: build timings",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Bool("graph_free", graphFree), zap.String("priority", buildPriorityName(req.priority)),
+				zap.Int64("queue_us", buildStart.Sub(req.enqueuedAt).Microseconds()),
+				zap.Int64("build_us", buildUs.Microseconds()),
+				zap.Int64("total_us", time.Since(req.enqueuedAt).Microseconds()),
+				zap.String("status", status.String()),
+				zap.Int64("size_bytes", sizeBytes))
+		}
+	}()
 
 	// Deferred cleanup guarantees that loading is ALWAYS cleared and
 	// waiters are ALWAYS woken, even if build()/makeRoomLocked/panics
@@ -1242,6 +1293,7 @@ func (im *IndexManagerImpl) doBuild(kbID string, versionID int64, graphFree bool
 
 	var err error
 	sizeBytes, err = im.buildWithRetry(kbID, versionID, graphFree)
+	buildUs = time.Since(buildStart)
 	if err != nil {
 		im.logger.Error("index build failed",
 			zap.String("kb_id", kbID),

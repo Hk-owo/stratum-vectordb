@@ -3,6 +3,7 @@ package index
 import (
 	"runtime"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -29,6 +30,15 @@ type buildRequest struct {
 	versionID int64
 	graphFree bool
 	priority  BuildPriority
+
+	// enqueuedAt is when this request was handed to the pool. The pool carries it
+	// rather than letting the worker read the clock on pickup, because the
+	// difference between the two IS what a caller waiting for READY needs to
+	// know: a build that took 90 s behind four other builds is a capacity
+	// problem, while the same 90 s spent inside build() is a vecstore or CPU
+	// problem. Optional — a request built without it (the queue's own unit tests
+	// construct requests directly) simply reports no queueing time.
+	enqueuedAt time.Time
 }
 
 // defaultBuildConcurrency is how many builds may run at once when nothing is

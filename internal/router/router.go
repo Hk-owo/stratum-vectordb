@@ -55,6 +55,13 @@ type Config struct {
 	// which makes the station route every query to every storage node — the
 	// pre-§9 behaviour.
 	RouteRefreshInterval time.Duration
+
+	// Logger receives the station's own share of a write's cost (the per-stage
+	// timings of forwardWrite) and the routing refreshes' failures. Optional:
+	// nil means a no-op logger, which is what every station had before there
+	// were any timings. Debug level is what those timings are emitted at, so a
+	// station left at info logs nothing extra.
+	Logger *zap.Logger
 }
 
 // Router is the routing layer core: it holds connections to both layers,
@@ -122,6 +129,7 @@ func NewRouter(cfg Config) (*Router, error) {
 		storageAddrs:       append([]string(nil), storage...),
 		storageIndexByAddr: make(map[string]int, len(storage)),
 		auth:               cfg.Auth,
+		logger:             cfg.Logger,
 	}
 	if r.logger == nil {
 		r.logger = zap.NewNop()
@@ -258,7 +266,7 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 	for kbID, version := range snap.expected {
 		answer, err := r.versionHolders(ctx, kbID, version)
 		if err != nil {
-			r.logger.Debug("route table: holders query failed; leaving the KB unnarrowed",
+			r.loggerOrNop().Debug("route table: holders query failed; leaving the KB unnarrowed",
 				zap.String("kb_id", kbID), zap.Int64("version", version), zap.Error(err))
 			continue
 		}
@@ -406,6 +414,11 @@ func (r *Router) Close() {
 // forwarded.
 func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
 	var zero T
+	// The start of this station's own share of the call, so the write path can
+	// report what the station added on top of the node it forwards to. Nothing
+	// else on this path can measure that: from the client's side a station hop
+	// and a slow node look identical.
+	stationStart := time.Now()
 	if r.auth != nil {
 		if _, err := r.auth.Authorize(ctx, kbID, isWriteMethod(fullMethod)); err != nil {
 			return zero, err
@@ -442,7 +455,10 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 		if err := r.writeGate(kbID); err != nil {
 			return zero, err
 		}
-		return forwardWrite(r, ctx, fn)
+		// admission is everything the station decided for itself before asking
+		// anyone: the authorization check above plus the storage gate just now.
+		// forwardWrite reports it alongside its own stages.
+		return forwardWrite(r, ctx, kbID, time.Since(stationStart), fn)
 	}
 	return forwardRead(r, ctx, allIndexes(len(r.controlAddrs)), r.controlBreakers, fn)
 }
@@ -532,15 +548,68 @@ const minAttemptBudget = 200 * time.Millisecond
 // re-polled leader. With no known leader it falls back to trying every
 // node once. Non-retryable errors (validation, index failures, ...) are
 // returned as-is.
-func forwardWrite[T any](r *Router, ctx context.Context, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
+func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission time.Duration, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
 	var zero T
+
+	// Per-stage timings of one forwarded write, at debug level.
+	//
+	// Why it exists: the station is the first of the three processes a write
+	// passes through, and its share of the cost is the only part of the path
+	// that nothing behind it can measure — from the client's side, a station hop
+	// and a slow node look identical. admission_us is what this station decided
+	// on its own (credential check + §4.3(1)'s storage gate), leader_lookup_us is
+	// finding the leader, and attempt_us is the forwarded RPC, which contains the
+	// control node's whole handling (service: create version timings,
+	// coordinator: write execute timings) plus the wire. kb_id + version_id join
+	// this line to those; version_id is read out of the response, so it is
+	// present exactly when the write got as far as allocating a version.
+	//
+	// attempts is why this line is not just a sum: §9.3(4) retries a retryable
+	// failure on another node, so a write that took 4 s here may have been two
+	// attempts, and the first one is invisible everywhere else. leader_index
+	// says which node the leader poll landed on — negative means it found none
+	// and fell back to trying every node once.
+	start := time.Now()
+	var versionID int64
+	var tLeaderLookup, tAttempt time.Duration
+	attempts, leaderIdx := 0, -1
+	defer func() {
+		r.loggerOrNop().Debug("router: write forward timings",
+			zap.String("kb_id", kbID),
+			zap.Int64("version_id", versionID),
+			zap.Int("attempts", attempts),
+			zap.Int("leader_index", leaderIdx),
+			zap.Int64("admission_us", admission.Microseconds()),
+			zap.Int64("leader_lookup_us", tLeaderLookup.Microseconds()),
+			zap.Int64("attempt_us", tAttempt.Microseconds()),
+			zap.Int64("total_us", time.Since(start).Microseconds()))
+	}()
+
+	// noteResponse picks up the version id when the response carries one, which
+	// is what makes this line joinable to the control and storage nodes' lines.
+	// Not every forwarded call has an id (and a failed one has none), so this is
+	// best-effort rather than a required part of the contract.
+	noteResponse := func(resp T) T {
+		if v, ok := any(resp).(versionIdentified); ok {
+			versionID = v.GetVersionId()
+		}
+		return resp
+	}
+
 	for attempt := 0; attempt <= len(r.controlAddrs); attempt++ {
+		lookupStart := time.Now()
 		idx, ok := r.discoverer.LeaderNow(ctx)
+		tLeaderLookup += time.Since(lookupStart)
 		if !ok {
 			// Election in progress or discovery failed: try every node
 			// once — the real leader accepts the write if reachable.
-			return tryAll(r, ctx, fn)
+			attemptStart := time.Now()
+			resp, err := tryAll(r, ctx, fn)
+			tAttempt += time.Since(attemptStart)
+			attempts++
+			return noteResponse(resp), err
 		}
+		leaderIdx = idx
 		if !r.allowControl(idx) {
 			// The discovered leader is circuit-broken: trying it again is what
 			// the breaker exists to stop. Another attempt re-discovers, which is
@@ -548,17 +617,44 @@ func forwardWrite[T any](r *Router, ctx context.Context, fn func(idx int, ctx co
 			continue
 		}
 		attemptCtx, cancel := budgetSlice(ctx, len(r.controlAddrs)-attempt)
+		attemptStart := time.Now()
 		resp, err := fn(idx, attemptCtx)
 		cancel()
+		tAttempt += time.Since(attemptStart)
+		attempts++
 		r.observeControl(idx, err)
 		if err == nil {
-			return resp, nil
+			return noteResponse(resp), nil
 		}
 		if !isRetryableErr(err) {
 			return zero, err
 		}
 	}
 	return zero, errors.New("router: no leader available")
+}
+
+// loggerOrNop returns the configured logger, or a no-op one.
+//
+// NewRouter guarantees a non-nil logger, but a Router built directly — which the
+// tests do, to avoid dialling anything — has none, and a nil *zap.Logger is not a
+// usable no-op: its methods dereference the receiver and panic. The accessor is
+// what keeps a missing logger from being a crash on a path that only logs.
+func (r *Router) loggerOrNop() *zap.Logger {
+	if r.logger == nil {
+		return zap.NewNop()
+	}
+	return r.logger
+}
+
+// versionIdentified is implemented by the responses that name the version a
+// write produced. It is the station's half of the join key that ties one write's
+// lines together across the three processes: kb_id + version_id appear on the
+// station's line (router: write forward timings), the control node's two
+// (service: create version timings, coordinator: write execute timings), the
+// storage node's own staged transaction (write: stage timings) and its index
+// build (index: build timings).
+type versionIdentified interface {
+	GetVersionId() int64
 }
 
 // allowControl / recordControl guard the breaker slices: a Router built without

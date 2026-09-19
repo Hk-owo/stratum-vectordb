@@ -54,7 +54,7 @@ func TestForwardWrite_LeaderSuccess(t *testing.T) {
 		controlAddrs: []string{"a", "b", "c"},
 		discoverer:   &fakeResolver{order: []int{1}, ok: true},
 	}
-	got, err := forwardWrite(r, context.Background(), func(idx int, ctx context.Context) (string, error) {
+	got, err := forwardWrite(r, context.Background(), "", 0, func(idx int, ctx context.Context) (string, error) {
 		if idx != 1 {
 			t.Errorf("fn called with idx %d, want 1 (leader)", idx)
 		}
@@ -79,7 +79,7 @@ func TestForwardWrite_AlwaysRediscover(t *testing.T) {
 	// Two back-to-back writes. With TTL caching the second would hit the
 	// cached leader without re-polling; with LeaderNow it must re-poll.
 	for i := 0; i < 2; i++ {
-		if _, err := forwardWrite(r, context.Background(), func(idx int, ctx context.Context) (string, error) {
+		if _, err := forwardWrite(r, context.Background(), "", 0, func(idx int, ctx context.Context) (string, error) {
 			return "ok", nil
 		}); err != nil {
 			t.Fatalf("write %d: forwardWrite: %v", i, err)
@@ -94,7 +94,7 @@ func TestForwardWrite_NotLeaderRediscover(t *testing.T) {
 	fr := &fakeResolver{order: []int{1, 2}, ok: true}
 	r := &Router{controlAddrs: []string{"a", "b", "c"}, discoverer: fr}
 
-	got, err := forwardWrite(r, context.Background(), func(idx int, ctx context.Context) (string, error) {
+	got, err := forwardWrite(r, context.Background(), "", 0, func(idx int, ctx context.Context) (string, error) {
 		if idx == 1 {
 			return "", notLeaderErr() // stale leader: redirect
 		}
@@ -119,7 +119,7 @@ func TestForwardWrite_UnavailableRediscover(t *testing.T) {
 	fr := &fakeResolver{order: []int{2, 1}, ok: true}
 	r := &Router{controlAddrs: []string{"a", "b", "c"}, discoverer: fr}
 
-	got, err := forwardWrite(r, context.Background(), func(idx int, ctx context.Context) (string, error) {
+	got, err := forwardWrite(r, context.Background(), "", 0, func(idx int, ctx context.Context) (string, error) {
 		if idx == 2 {
 			return "", unavailableErr() // stale leader went down
 		}
@@ -145,7 +145,7 @@ func TestForwardWrite_NoLeaderTryAll(t *testing.T) {
 		controlAddrs: []string{"a", "b", "c"},
 		discoverer:   &fakeResolver{ok: false}, // no leader known
 	}
-	got, err := forwardWrite(r, context.Background(), func(idx int, ctx context.Context) (string, error) {
+	got, err := forwardWrite(r, context.Background(), "", 0, func(idx int, ctx context.Context) (string, error) {
 		if idx == 1 {
 			return "ok", nil // node 1 happens to accept the write
 		}
@@ -164,7 +164,7 @@ func TestForwardWrite_NoLeaderAllFail(t *testing.T) {
 		controlAddrs: []string{"a", "b", "c"},
 		discoverer:   &fakeResolver{ok: false},
 	}
-	_, err := forwardWrite(r, context.Background(), func(idx int, ctx context.Context) (string, error) {
+	_, err := forwardWrite(r, context.Background(), "", 0, func(idx int, ctx context.Context) (string, error) {
 		return "", notLeaderErr()
 	})
 	if err == nil || err.Error() != "router: no leader available" {
@@ -177,7 +177,7 @@ func TestForwardWrite_NonRetryable(t *testing.T) {
 	r := &Router{controlAddrs: []string{"a", "b", "c"}, discoverer: fr}
 
 	want := status.Error(codes.InvalidArgument, "bad request")
-	_, err := forwardWrite(r, context.Background(), func(idx int, ctx context.Context) (string, error) {
+	_, err := forwardWrite(r, context.Background(), "", 0, func(idx int, ctx context.Context) (string, error) {
 		return "", want
 	})
 	if err != want {

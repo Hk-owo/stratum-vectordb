@@ -157,7 +157,39 @@ func (d *CoordinatorDispatcher) candidateBudget(docs int) time.Duration {
 // wraps the last failure — the caller treats it as transient and lets the retry
 // budget decide (§7.13.2: "try candidates in order until one succeeds").
 func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) (string, error) {
+	// Per-stage timings of one dispatch, at debug level.
+	//
+	// Why they are here: the client was already answered when the version was
+	// committed (WriteCoordinator.Execute returns before this background
+	// dispatch runs), so a dispatch that spends the whole candidate budget is
+	// invisible from outside — its only symptom is a version that stays PENDING.
+	// The three things that can spend that budget are separated here: resolving
+	// the candidate list, the attempts themselves, and how many candidates were
+	// needed before one took the write. Without the per-candidate split, "the
+	// first candidate is gone and absorbed the budget" and "the candidate really
+	// did write 1,000 documents" produce the same total.
+	dispatchStart := time.Now()
+	var candidates []string
+	var budget time.Duration
+	var resolveUs, attemptsUs time.Duration
+	var tried []string
+	var triedUs []int64
+	var chosen string
+	defer func() {
+		d.logger.Debug("plane: dispatch timings",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+			zap.Int("changes", len(changes)), zap.Int("candidates", len(candidates)),
+			zap.Int64("resolve_us", resolveUs.Microseconds()),
+			zap.Strings("tried", tried), zap.Int64s("tried_us", triedUs),
+			zap.Int64("attempts_us", attemptsUs.Microseconds()),
+			zap.String("chosen", chosen),
+			zap.Int64("budget_ms", budget.Milliseconds()),
+			zap.Int64("total_us", time.Since(dispatchStart).Microseconds()))
+	}()
+
+	resolveStart := time.Now()
 	candidates, err := d.candidates(ctx)
+	resolveUs = time.Since(resolveStart)
 	if err != nil {
 		return "", err
 	}
@@ -165,18 +197,28 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 	// One budget for every candidate in this dispatch: they are being handed
 	// the same work, so a candidate that needs longer than the others is not
 	// slow, it is gone.
-	budget := d.candidateBudget(len(changes))
+	budget = d.candidateBudget(len(changes))
+
+	// recordAttempt is the one place an attempt is accounted for, so every exit
+	// from the loop below lands in the line above without three copies of it.
+	recordAttempt := func(addr string, dur time.Duration) {
+		tried = append(tried, addr)
+		triedUs = append(triedUs, dur.Microseconds())
+		attemptsUs += dur
+	}
 
 	var lastErr error
 	for _, addr := range candidates {
 		// Each candidate gets its own bounded turn: one that is unreachable must
 		// cost this dispatch a timeout, not the whole write.
 		attemptCtx, cancel := context.WithTimeout(ctx, budget)
+		attemptStart := time.Now()
 
 		if addr == d.selfAddr {
 			// Coordinating locally: no RPC, no serialization.
 			err := d.localhost(attemptCtx, kbID, versionID, parentVersionID, changes)
 			cancel()
+			recordAttempt(addr, time.Since(attemptStart))
 			// The local attempt is an observation too, but it is about this
 			// node rather than a peer: recording it would let a node demote
 			// itself, and §7.13.5's view exists to order PEERS.
@@ -186,11 +228,13 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
 				continue
 			}
+			chosen = addr
 			return addr, nil
 		}
 
 		err := d.dispatchTo(attemptCtx, addr, kbID, versionID, parentVersionID, changes)
 		cancel()
+		recordAttempt(addr, time.Since(attemptStart))
 		// §7.13.5: the attempt just made IS the observation — no probe loop,
 		// no extra RPC. It only ever reorders later dispatches.
 		d.health.Observe(addr, err == nil)
@@ -201,6 +245,7 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 				zap.String("candidate", addr), zap.Error(err))
 			continue
 		}
+		chosen = addr
 		return addr, nil
 	}
 

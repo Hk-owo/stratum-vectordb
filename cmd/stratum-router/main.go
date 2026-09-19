@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -23,11 +24,29 @@ import (
 	"syscall"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/router"
 )
+
+// newLogger builds the station's logger at the requested level.
+//
+// A flag rather than a config file, because that is the only configuration this
+// process has. It matters for observability specifically: the station's own
+// share of a write's cost is emitted at debug (router: write forward timings),
+// so an operator has to be able to turn it on without redeploying anything.
+func newLogger(level string) (*zap.Logger, error) {
+	var lvl zapcore.Level
+	if err := lvl.UnmarshalText([]byte(level)); err != nil {
+		return nil, fmt.Errorf("unknown log level %q: %w", level, err)
+	}
+	pc := zap.NewProductionConfig()
+	pc.Level = zap.NewAtomicLevelAt(lvl)
+	return pc.Build()
+}
 
 func main() {
 	listen := flag.String("listen", "0.0.0.0:7009", "router gRPC listen address")
@@ -35,6 +54,7 @@ func main() {
 	storageNodes := flag.String("storage-nodes", "", "comma-separated storage-layer node gRPC addresses (default: same as -nodes)")
 	tokensPath := flag.String("tokens", "", "path to the token table YAML; when set, client calls must present a credential from it")
 	routeRefresh := flag.Duration("route-refresh", 5*time.Second, "how often to re-observe storage cursors and expected versions (0 disables the routing table)")
+	logLevel := flag.String("log-level", "info", "log level; debug enables the per-stage write timings")
 	flag.Parse()
 
 	split := func(v string) []string {
@@ -56,7 +76,18 @@ func main() {
 	// 留空表示单层拓扑——每个节点两样都做，读也在 -nodes 里。
 	storage := split(*storageNodes)
 
-	cfg := router.Config{Addrs: addrs, StorageAddrs: storage, RouteRefreshInterval: *routeRefresh}
+	logger, err := newLogger(*logLevel)
+	if err != nil {
+		log.Fatalf("router: %v", err)
+	}
+	defer func() { _ = logger.Sync() }()
+
+	cfg := router.Config{
+		Addrs:                addrs,
+		StorageAddrs:         storage,
+		RouteRefreshInterval: *routeRefresh,
+		Logger:               logger,
+	}
 
 	// §9.3(5): the credential table is a static file, loaded once. Loading is
 	// all-or-nothing: a station that came up with a broken table would look
