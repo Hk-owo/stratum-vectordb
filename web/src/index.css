@@ -174,19 +174,6 @@ code {
   cursor: default;
 }
 
-.sidebar-foot {
-  margin-top: auto;
-  padding: 8px 12px;
-}
-
-.sidebar-foot a {
-  color: var(--muted);
-  text-decoration: none;
-}
-.sidebar-foot a:hover {
-  color: var(--text);
-}
-
 .main {
   flex: 1;
   padding: 18px 22px 40px;
@@ -557,4 +544,30 @@ select:focus {
 
 .inflight-toggle:hover {
   border-color: transparent;
+}
+
+/* ---------------------------------------------------------------- 运维页 */
+
+/* 日志与脚本输出：等宽、可滚动、保留原始换行。white-space 用 pre-wrap 而不是
+   pre —— 脚本输出里可能有很长的单行（镜像名、错误信息），不折行会把整页撑宽。 */
+.log-view {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  font-family: ui-monospace, 'SFMono-Regular', 'Cascadia Code', Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 「确认 / 取消」这一对要贴在一起，别在换行时被拆散。 */
+.confirm-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }

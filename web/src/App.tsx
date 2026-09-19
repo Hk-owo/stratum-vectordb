@@ -8,6 +8,7 @@ import { KbPicker } from './components/KbPicker'
 import { loadPrefs, savePrefs } from './settings/store'
 import { Documents } from './pages/Documents'
 import { History } from './pages/History'
+import { Ops } from './pages/Ops'
 import { Search } from './pages/Search'
 import { SystemStatus } from './pages/SystemStatus'
 import { Versions } from './pages/Versions'
@@ -21,11 +22,14 @@ import { Versions } from './pages/Versions'
  * 另外注意路由：这里用的是组件内状态，没引 router。原因是 gateway 用
  * `http.FileServer` 提供静态资源，对 `/versions` 这种深链会 404（没有 SPA
  * fallback）。改用状态切换就不必为此动网关，代价是 URL 不反映当前页——对一个
- * 控制台可接受，而 `/ops/` 那条由 gateway 自己的 mux 服务的路径也就绝不会被
- * 前端路由吞掉。
+ * 控制台可接受。
+ *
+ * 「运维」页不是一条指向别处的外链，而是这一层里的一个普通页面：网关的 `/ops/*`
+ * 是纯 JSON API（那里没有 HTML），所以运维能力只能由前端自己调它来做——以前 sidebar
+ * 底部那个 `<a href="/ops/">` 因此永远只会打开一个 404。
  */
 
-type PageId = 'search' | 'documents' | 'versions' | 'history' | 'status'
+type PageId = 'search' | 'documents' | 'versions' | 'history' | 'status' | 'ops'
 
 const PAGES: ReadonlyArray<{ id: PageId; label: string }> = [
   { id: 'search', label: '检索' },
@@ -33,6 +37,7 @@ const PAGES: ReadonlyArray<{ id: PageId; label: string }> = [
   { id: 'versions', label: '版本' },
   { id: 'history', label: '历史' },
   { id: 'status', label: '系统状态' },
+  { id: 'ops', label: '运维' },
 ]
 
 function healthLabel(status: HealthStatus | undefined): string {
@@ -108,11 +113,6 @@ export default function App() {
             {p.label}
           </button>
         ))}
-        <div className="sidebar-foot">
-          <a href="/ops/" className="muted small">
-            运维控制台 →
-          </a>
-        </div>
       </nav>
 
       <main className="main">
@@ -152,6 +152,7 @@ export default function App() {
         {page === 'versions' && <Versions kbId={kbId} />}
         {page === 'history' && <History />}
         {page === 'status' && <SystemStatus />}
+        {page === 'ops' && <Ops />}
 
         <InFlightPanel />
       </main>

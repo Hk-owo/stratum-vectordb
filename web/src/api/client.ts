@@ -110,7 +110,7 @@ function withBase(path: string): string {
   return baseUrl + path
 }
 
-async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
+async function request<T>(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<T> {
   let res: Response
   try {
     res = await fetch(withBase(path), {
@@ -139,6 +139,9 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
 export const api = {
   get: <T>(path: string): Promise<T> => request<T>('GET', path),
   post: <T>(path: string, body?: unknown): Promise<T> => request<T>('POST', path, body),
+  // PUT 只在 /ops/* 用得上（保存启动参数与 docker 集群参数），/api/* 的契约
+  // 里没有它：那里的写操作都是"提交一件事"，不是"替换一份配置"。
+  put: <T>(path: string, body?: unknown): Promise<T> => request<T>('PUT', path, body),
 }
 
 /** 路径里的 id 一律过一遍 encodeURIComponent：KB id 是服务端生成的，但不该假设它的字符集。 */
