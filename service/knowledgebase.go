@@ -328,7 +328,22 @@ func (s *KnowledgeBaseServiceImpl) DeleteKnowledgeBase(ctx context.Context, req 
 
 	// Launch async cleanup.
 	go func() {
-		_ = s.deleteCoord.Execute(context.Background(), kbID)
+		if err := s.deleteCoord.Execute(context.Background(), kbID); err != nil {
+			// The failure must be voiced. Execute's contract (see
+			// DeleteVersionCoordinator) is to leave the KB in DELETING once its
+			// retries are exhausted so GetSystemStatus surfaces it "for operator
+			// intervention" — and `_ =` defeated exactly that step: the state
+			// stayed, the reason vanished, and the caller had already been told
+			// success.
+			//
+			// No retry here: the retry budget belongs to Execute and it has spent
+			// it. What is missing is the next chance — startup's crash recovery
+			// re-runs this for any KB still carrying a delete mark
+			// (runCrashRecovery's PendingRecordTypeDeleteMark), so an operator who
+			// sees this line only has to call delete again.
+			s.logger.Warn("delete knowledge base: background cleanup did not finish; the KB stays in DELETING",
+				zap.String("kb_id", kbID), zap.Error(err))
+		}
 	}()
 
 	return &pb.DeleteKnowledgeBaseResponse{Success: true}, nil
@@ -497,7 +512,19 @@ func (s *KnowledgeBaseServiceImpl) DeleteVersion(ctx context.Context, req *pb.De
 	// version of the KB (including any left over from a previous crashed
 	// cleanup) and is idempotent end-to-end.
 	go func() {
-		_ = s.deleteVersionCoord.Execute(context.Background(), req.KnowledgeBaseId)
+		if err := s.deleteVersionCoord.Execute(context.Background(), req.KnowledgeBaseId); err != nil {
+			// Same reason as DeleteKnowledgeBase's: Execute's contract is to
+			// leave the version Deleting once retries are exhausted so
+			// GetSystemStatus shows it for operator intervention, and discarding
+			// the error hides the one thing that makes that state actionable —
+			// why. The caller has already been told success.
+			//
+			// Because Execute re-discovers every Deleting version, an operator
+			// (or a later delete on the same KB) is enough to finish the job;
+			// what was missing was knowing it needed finishing.
+			s.logger.Warn("delete version: background cleanup did not finish; the version stays in DELETING",
+				zap.String("kb_id", req.KnowledgeBaseId), zap.Error(err))
+		}
 	}()
 
 	return &pb.DeleteVersionResponse{Success: true, DeletedVersionIds: deleted}, nil

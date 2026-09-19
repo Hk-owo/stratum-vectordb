@@ -350,6 +350,45 @@ func main() {
 	var resolveReplicaAddrs func(ctx context.Context) ([]string, error)
 
 	var writeMu sync.Mutex
+
+	// The storage handles above are declared as concrete pointer types
+	// (var ds *docstore.PebbleDocStore, ...) because that is what the
+	// constructors produce, but the config fields are interfaces. Assigning a nil
+	// pointer straight through — `DocStore: ds` — yields an interface that is NOT
+	// nil while its receiver IS, so every `if cfg.DocStore != nil` guard passes
+	// and the first method call dereferences nil.
+	//
+	// Not hypothetical: on a control-role node, which has no local storage at
+	// all, deleting a knowledge base broadcast the drop to it and
+	// DropVersionStorage panicked inside Pebble, killing the process mid-cleanup
+	// and leaving the KB stuck in KB_STATUS_DELETING (once per delete, on every
+	// control node).
+	//
+	// Converting here keeps "not wired" meaning exactly one thing — a nil
+	// interface — which is what those guards can actually see.
+	var (
+		docStoreIface   docstore.DocStore
+		versionDocIface versiondoc.VersionDocList
+		chunkStoreIface chunkstore.ChunkStore
+		chunkDocIface   chunkdoc.ChunkDocMapper
+		indexMgrIface   index.IndexManager
+	)
+	if ds != nil {
+		docStoreIface = ds
+	}
+	if vd != nil {
+		versionDocIface = vd
+	}
+	if chunkStore != nil {
+		chunkStoreIface = chunkStore
+	}
+	if cdm != nil {
+		chunkDocIface = cdm
+	}
+	if indexMgr != nil {
+		indexMgrIface = indexMgr
+	}
+
 	writeCoord := coordinator.NewWriteCoordinatorImpl(coordinator.WriteCoordinatorConfig{
 		MaxRetries:          cfg.WriteMaxRetries,
 		RetryBaseIntervalMS: cfg.WriteRetryBaseMS,
@@ -360,11 +399,11 @@ func main() {
 		EmbedClient:         embedClient,
 		ChunkBloom:          chunkBloom,
 		VersionBloom:        vBloomStore,
-		ChunkStore:          chunkStore,
-		ChunkDocMapper:      cdm,
-		DocStore:            ds,
-		VersionDocList:      vd,
-		IndexManager:        indexMgr,
+		ChunkStore:          chunkStoreIface,
+		ChunkDocMapper:      chunkDocIface,
+		DocStore:            docStoreIface,
+		VersionDocList:      versionDocIface,
+		IndexManager:        indexMgrIface,
 		// §7.13.2: a committed write is handed to the coordinator the control
 		// layer picks, instead of being run by whoever accepted it. The dispatcher
 		// is built further down (it needs the data plane), so the call goes through

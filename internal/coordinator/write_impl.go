@@ -563,11 +563,27 @@ func (c *WriteCoordinatorImpl) ReplayVersionStorageWrites(ctx context.Context, k
 // Idempotent: both deletes are prefix scans, so a version that never arrived
 // here is a no-op rather than an error.
 func (c *WriteCoordinatorImpl) DropVersionStorage(ctx context.Context, kbID string, versionID int64) error {
-	if err := c.cfg.DocStore.DeleteByVersion(ctx, kbID, versionID); err != nil {
-		return fmt.Errorf("coordinator: DropVersionStorage: docstore %s v%d: %w", kbID, versionID, err)
+	// Each store is optional because this runs on nodes that hold none of the
+	// data. A control-role node has no local docstore and no version-doc list:
+	// its job is to ASK the nodes that do (§7.13.2, "asking rather than
+	// doing"), and it reaches them through the data plane — not through these
+	// fields. IndexManager was already guarded below for the same reason.
+	//
+	// The guards are not cosmetic. Without them a plain knowledge-base delete on
+	// a control node panics with a nil dereference deep inside Pebble
+	// (docstore.(*PebbleDocStore).DeleteByVersion on a nil receiver) and takes
+	// the whole process down: measured on the 2-tier container cluster, all three
+	// control nodes died mid-cleanup, each left its KB stuck in
+	// KB_STATUS_DELETING, and the API had already answered success.
+	if c.cfg.DocStore != nil {
+		if err := c.cfg.DocStore.DeleteByVersion(ctx, kbID, versionID); err != nil {
+			return fmt.Errorf("coordinator: DropVersionStorage: docstore %s v%d: %w", kbID, versionID, err)
+		}
 	}
-	if err := c.cfg.VersionDocList.DeleteByVersion(ctx, kbID, versionID); err != nil {
-		return fmt.Errorf("coordinator: DropVersionStorage: versiondoc %s v%d: %w", kbID, versionID, err)
+	if c.cfg.VersionDocList != nil {
+		if err := c.cfg.VersionDocList.DeleteByVersion(ctx, kbID, versionID); err != nil {
+			return fmt.Errorf("coordinator: DropVersionStorage: versiondoc %s v%d: %w", kbID, versionID, err)
+		}
 	}
 	// §10.6(4): reclaim the version's index artifacts too — the vecstore-side
 	// index object and its persisted files (.index, .ids, .index.mem). A version
