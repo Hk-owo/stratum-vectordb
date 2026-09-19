@@ -42,8 +42,6 @@ export interface AwaitOptions {
    * 默认 10 分钟。
    */
   maxTotalMs?: number
-  /** 每次 AwaitVersion 请求内服务端最长等多久。默认 30s（服务端还会再 cap）。 */
-  perCallTimeoutMs?: number
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -60,13 +58,15 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
+/** 服务端单次等待的上限（Go 侧 awaitMaxWait = 5s）。 */
+const SERVER_WAIT_TIMEOUT_MS = 5_000
+
 export async function awaitUntilTerminal(
   kbId: string,
   versionId: string,
   opts: AwaitOptions,
 ): Promise<AwaitOutcome> {
   const maxTotalMs = opts.maxTotalMs ?? 10 * 60 * 1000
-  const perCallTimeoutMs = opts.perCallTimeoutMs ?? 30_000
   const target: AwaitTargetKind = opts.target ?? 'INDEX_READY'
   const deadline = Date.now() + maxTotalMs
 
@@ -87,7 +87,11 @@ export async function awaitUntilTerminal(
           ? AwaitTarget.AWAIT_TARGET_DATA_DURABLE
           : AwaitTarget.AWAIT_TARGET_INDEX_READY,
       // int64 在 protojson 里是字符串（见 gen/README.md），所以这里要转。
-      wait_timeout_ms: String(perCallTimeoutMs),
+      //
+      // 值就取服务端自己的上限。以前这里传的是客户端的 30s 请求超时，而服务端每次
+      // 都会在 5s 窗口到点就返回——那个 30s 是个永不生效的数字，还让日志里"请求的
+      // 等待窗口"与实际等待对不上。要等更久是这个循环的事，不是单次请求的事。
+      wait_timeout_ms: String(SERVER_WAIT_TIMEOUT_MS),
     })
     rounds += 1
     opts.onProgress?.(last)
