@@ -52,12 +52,24 @@ else
   echo "==> [1/4] vecstore_server 已存在，跳过构建"
 fi
 
-# ---------- 2. 构建 Go 二进制 ----------
+# ---------- 2. 构建 Go 二进制与前端 ----------
 echo "==> [2/4] 构建 Go 二进制（stratum / stratum-gateway / stratum-router / mock-embed）…"
 go build -o "$BIN/stratum" ./cmd/stratum/
 go build -o "$BIN/stratum-gateway" ./cmd/stratum-gateway/
 go build -o "$BIN/stratum-router" ./cmd/stratum-router/
 go build -o "$BIN/mock-embed" ./integration/docker/mock_embed_server.go
+
+# 前端（web/ 是 Vite 工程）也要构建：gateway 的 -static 指向 web/dist，
+# 缺了它控制台页面会 404。API 与 /ops 不受影响，所以构建失败只警告不中断。
+if command -v npm >/dev/null 2>&1; then
+  if [ ! -d "$ROOT/web/node_modules" ]; then
+    npm --prefix "$ROOT/web" install --silent || true
+  fi
+  npm --prefix "$ROOT/web" run build >/dev/null \
+    || echo "    警告：前端构建失败，控制台静态页面将不可用（API 不受影响）"
+else
+  echo "    警告：未找到 npm，跳过前端构建（控制台静态页面将不可用）"
+fi
 
 # ---------- 3. 控制台配置 ----------
 # 首次启动按脚本默认值生成 run/console.yaml（与脚本的目录/端口一致）；
@@ -124,7 +136,7 @@ PIDS+=($!)
 "$BIN/stratum-gateway" \
   -grpc-addr "$ROUTER_ADDR" \
   -http-addr "$HTTP_ADDR" \
-  -static "$ROOT/web" \
+  -static "$ROOT/web/dist" \
   -ops-config "$CONSOLE_YAML" \
   >"$LOG/gateway.log" 2>&1 &
 PIDS+=($!)

@@ -33,7 +33,7 @@ cd "$ROOT"
 BIN="$ROOT/run/bin/stratum-gateway"
 ROUTER_BIN="$ROOT/run/bin/stratum-router"
 OPS_CONFIG="$ROOT/run/console.yaml"
-STATIC="$ROOT/web"
+STATIC="$ROOT/web/dist"          # Vite 构建产物（源码在 web/src/，npm --prefix web run build）
 HTTP_ADDR="${STRATUM_HTTP_ADDR:-0.0.0.0:8081}"
 ROUTER_ADDR="${STRATUM_ROUTER_ADDR:-127.0.0.1:7009}"
 ROUTER_PID_FILE="$ROOT/run/.router.pid"
