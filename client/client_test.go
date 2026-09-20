@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	pb "stratum/api/proto/stratum"
@@ -90,10 +93,16 @@ func (f *fakeCluster) discardCallsReceived() []*pb.DiscardVersionRequest {
 // keys, so "the same key" is something a test can name.
 func newTestClient(t *testing.T, fake *fakeCluster) *Client {
 	t.Helper()
+	return newTestClientWithAdmin(t, fake, newFakeAdmin())
+}
+
+func newTestClientWithAdmin(t *testing.T, fake *fakeCluster, admin *fakeAdmin) *Client {
+	t.Helper()
 
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
 	pb.RegisterKnowledgeBaseServiceServer(srv, fake)
+	pb.RegisterAdminServiceServer(srv, admin)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 
@@ -115,6 +124,7 @@ func newTestClient(t *testing.T, fake *fakeCluster) *Client {
 		conn:  conn,
 		kb:    pb.NewKnowledgeBaseServiceClient(conn),
 		query: pb.NewQueryServiceClient(conn),
+		admin: pb.NewAdminServiceClient(conn),
 		store: store,
 		now:   time.Now,
 		newID: func() string {
@@ -320,5 +330,96 @@ func TestAwaitOnce_WithoutAVersionPointsAtTheResend(t *testing.T) {
 	}
 	if got := fake.versionCallCount(); got != 1 {
 		t.Errorf("CreateVersion calls = %d, want 1", got)
+	}
+}
+
+// fakeAdmin answers the operator-facing calls this client makes and records what it
+// was asked. It can fail them on demand, which is how the pass-through contract is
+// pinned: a refused data-side retry must reach the caller with the server's
+// explanation intact.
+type fakeAdmin struct {
+	pb.UnimplementedAdminServiceServer
+
+	mu          sync.Mutex
+	lastList    *pb.ListFailedVersionsRequest
+	lastRetry   *pb.ForceRetryVersionRequest
+	lastAbandon *pb.ForceAbandonVersionRequest
+	failed      []*pb.FailedVersion
+	deleted     []int64
+	retryErr    error
+}
+
+func newFakeAdmin() *fakeAdmin { return &fakeAdmin{} }
+
+func (f *fakeAdmin) ListFailedVersions(_ context.Context, req *pb.ListFailedVersionsRequest) (*pb.ListFailedVersionsResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastList = req
+	return &pb.ListFailedVersionsResponse{Versions: f.failed}, nil
+}
+
+func (f *fakeAdmin) ForceRetryVersion(_ context.Context, req *pb.ForceRetryVersionRequest) (*pb.ForceRetryVersionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastRetry = req
+	if f.retryErr != nil {
+		return nil, f.retryErr
+	}
+	return &pb.ForceRetryVersionResponse{Success: true, Side: pb.FailureSide_FAILURE_SIDE_INDEX}, nil
+}
+
+func (f *fakeAdmin) ForceAbandonVersion(_ context.Context, req *pb.ForceAbandonVersionRequest) (*pb.ForceAbandonVersionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastAbandon = req
+	return &pb.ForceAbandonVersionResponse{Success: true, DeletedVersionIds: f.deleted}, nil
+}
+
+// TestClient_FailedVersionQueueAndTheTwoAnswers: the library carries the operator's
+// three calls like any other RPC and decides nothing itself. The load-bearing
+// assertion is the middle one — a data-side retry is refused by the server, and the
+// refusal (which names ForceAbandonVersion) must reach the caller rather than being
+// flattened into a generic error or, worse, swallowed.
+func TestClient_FailedVersionQueueAndTheTwoAnswers(t *testing.T) {
+	admin := newFakeAdmin()
+	c := newTestClientWithAdmin(t, newFakeCluster(), admin)
+	ctx := context.Background()
+
+	admin.failed = []*pb.FailedVersion{{
+		KbId: "kb-1", VersionId: 7, Reason: "data unavailable on every replica",
+		FailureCount: 5, Side: pb.FailureSide_FAILURE_SIDE_DATA,
+	}}
+
+	got, err := c.ListFailedVersions(ctx, "kb-1")
+	if err != nil {
+		t.Fatalf("ListFailedVersions: %v", err)
+	}
+	if len(got) != 1 || got[0].GetVersionId() != 7 || got[0].GetSide() != pb.FailureSide_FAILURE_SIDE_DATA {
+		t.Fatalf("queue = %v, want kb-1 v7 on the data side", got)
+	}
+	if admin.lastList.GetKnowledgeBaseId() != "kb-1" {
+		t.Errorf("asked about %q, want kb-1", admin.lastList.GetKnowledgeBaseId())
+	}
+
+	// A data-side verdict: the server refuses, and the operator has to see why.
+	admin.retryErr = status.Error(codes.FailedPrecondition,
+		"version 7's data side is FAILED_PERMANENT: its data will never arrive, "+
+			"so its index cannot be rebuilt — abandon the version instead (ForceAbandonVersion)")
+	if err := c.ForceRetryVersion(ctx, "kb-1", 7); err == nil {
+		t.Fatal("a refused retry must surface as an error, not as a silent success")
+	} else if !strings.Contains(err.Error(), "ForceAbandonVersion") {
+		t.Errorf("err = %v, want the server's explanation carried through", err)
+	}
+
+	admin.deleted = []int64{7}
+	ids, err := c.ForceAbandonVersion(ctx, "kb-1", 7)
+	if err != nil {
+		t.Fatalf("ForceAbandonVersion: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != 7 {
+		t.Errorf("deleted = %v, want [7]", ids)
+	}
+	if admin.lastAbandon.GetVersionId() != 7 {
+		t.Errorf("abandoned v%d, want v7", admin.lastAbandon.GetVersionId())
 	}
 }

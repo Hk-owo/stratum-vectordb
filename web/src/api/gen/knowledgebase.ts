@@ -200,6 +200,23 @@ export interface VersionInfo {
    * the empty set's digest.
    */
   doc_id_set_hash: string;
+  /**
+   * index_ready_nodes names the nodes that have reported this version's index
+   * built and serviceable — sorted and deduplicated, mirroring
+   * types.VersionMeta.IndexReadyNodes.
+   *
+   * It travels because the side that ASKS is the storage layer: the rolling
+   * cleanup (§8.6(d)) runs on a storage node and must learn "how many OTHER
+   * replicas still serve this version?" before taking itself out of service,
+   * while only the control layer aggregates those reports. Dropping it from the
+   * wire left every storage node reading an empty list — the count was always 0,
+   * so collection could never start. Measured on the 3+3 cluster, on a version
+   * all three replicas were serving:
+   *
+   * 	index: gc: skipping collection — too few replicas would remain serving
+   * 	  others_serving=0 minimum_required=2
+   */
+  index_ready_nodes: string[];
 }
 
 /**

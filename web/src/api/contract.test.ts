@@ -19,7 +19,7 @@
  */
 import { beforeAll, describe, expect, it } from 'vitest'
 
-import { api, kbPath, setApiBase } from './client'
+import { ApiError, api, kbPath, setApiBase } from './client'
 import { awaitVersionOnce } from './queries'
 import {
   AwaitTarget,
@@ -187,6 +187,25 @@ describe.skipIf(!alive)('与真实 gateway 的契约', () => {
     await expect(
       api.post(kbPath(kbId, '/rebuild'), { knowledge_base_id: kbId, version_id: vid }),
     ).resolves.toBeDefined()
+  })
+
+  it('GET …/failed-versions 与两个运维端点 → 端点与契约', async () => {
+    // 队列有两种形状：集群级与单库，都是 protojson（versions 数组）。
+    // 这里不挑一个"真的判死版本"——造出判死要把写入预算耗光，不是契约测试该做的
+    // 事；这两条要钉的是端点、请求形状与错误翻译。
+    const all = await api.get<{ versions: unknown[] }>('/api/failed-versions')
+    expect(Array.isArray(all.versions)).toBe(true)
+    const perKB = await api.get<{ versions: unknown[] }>(kbPath(kbId, '/failed-versions'))
+    expect(Array.isArray(perKB.versions)).toBe(true)
+
+    // 不存在的版本：两条路都以 404 收场（version_not_found），不是笼统的 500。
+    for (const suffix of ['/force-retry-version', '/force-abandon-version']) {
+      const err = await api
+        .post(kbPath(kbId, suffix), { knowledge_base_id: kbId, version_id: '999999999' })
+        .catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(ApiError)
+      expect((err as ApiError).status).toBe(404)
+    }
   })
 
   it('POST …/discard-version → 只接受仍 PENDING 的版本', async () => {

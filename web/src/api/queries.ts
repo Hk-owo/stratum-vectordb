@@ -32,6 +32,12 @@ import type {
   RollbackVersionResponse,
 } from './gen/knowledgebase'
 import type { RebuildIndexRequest, RebuildIndexResponse, WarmupVersionRequest, WarmupVersionResponse } from './gen/admin'
+import type {
+  ForceAbandonVersionRequest,
+  ForceAbandonVersionResponse,
+  ForceRetryVersionRequest,
+  ForceRetryVersionResponse,
+} from './gen/admin'
 import type { QueryRequest, QueryResponse } from './gen/query'
 
 /** 按实体+参数组织，以便 invalidate 精确命中。 */
@@ -195,6 +201,51 @@ export function useWarmupVersion(kbId: string) {
   return useMutation({
     mutationFn: (req: WarmupVersionRequest) =>
       api.post<WarmupVersionResponse>(kbPath(kbId, '/warmup'), req),
+  })
+}
+
+// ---------------------------------------------------------------- 判死版本（运维）
+
+/**
+ * 运维对一条 FAILED_PERMANENT 裁决的两种答复（§10.1）。
+ *
+ * 它们**不绑定 kbId**：判死版本是跨库一起看的（系统状态页一次列出全部），所以
+ * kbId 随调用点一起传进来。
+ *
+ * `version_id` 按 protojson 传**字符串**：int64 在 JSON 里就是字符串，这与
+ * `--ts_proto_opt=forceLong=string` 是同一套约定。
+ *
+ * 只有索引侧能重试：数据侧的裁决意味着"数据永远不会到"，没有可重建的东西——那种
+ * 版本只能放弃。这个区分**不在这里判断**：服务端会原样拒回并点明该用哪个接口，
+ * 前端再判一遍就等于让同一条规则有两份实现。
+ */
+export function useForceRetryVersion() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ kbId, versionId }: { kbId: string; versionId: string }) =>
+      api.post<ForceRetryVersionResponse>(kbPath(kbId, '/force-retry-version'), {
+        // 网关按 path 里的 id 覆盖它（handleWithID），带上是为了让请求体与 proto 类型一致。
+        knowledge_base_id: kbId,
+        version_id: versionId,
+      } satisfies ForceRetryVersionRequest),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.systemStatus })
+    },
+  })
+}
+
+/** 放弃一条判死裁决：版本离链（DeleteVersion 的 SINGLE 语义），清理异步执行。 */
+export function useForceAbandonVersion() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ kbId, versionId }: { kbId: string; versionId: string }) =>
+      api.post<ForceAbandonVersionResponse>(kbPath(kbId, '/force-abandon-version'), {
+        knowledge_base_id: kbId,
+        version_id: versionId,
+      } satisfies ForceAbandonVersionRequest),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.systemStatus })
+    },
   })
 }
 

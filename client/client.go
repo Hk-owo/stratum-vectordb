@@ -20,6 +20,7 @@ type Client struct {
 	conn  *grpc.ClientConn
 	kb    pb.KnowledgeBaseServiceClient
 	query pb.QueryServiceClient
+	admin pb.AdminServiceClient
 	store *Store
 
 	// now and newID are injectable so tests can hold the clock and the key
@@ -43,6 +44,7 @@ func Dial(addr, stateDir string) (*Client, error) {
 		conn:  conn,
 		kb:    pb.NewKnowledgeBaseServiceClient(conn),
 		query: pb.NewQueryServiceClient(conn),
+		admin: pb.NewAdminServiceClient(conn),
 		store: store,
 		now:   time.Now,
 		newID: newRequestID,
@@ -314,4 +316,55 @@ func (c *Client) Query(ctx context.Context, kbID string, versionID int64, vector
 		return nil, fmt.Errorf("client: Query(%s): %w", kbID, err)
 	}
 	return resp, nil
+}
+
+// ListFailedVersions returns the versions the control layer declared
+// FAILED_PERMANENT, each with the cause chain that says which half died
+// (Stratum_设计文档v13.md §10.1). An empty knowledgeBaseID asks across every
+// knowledge base — "this one has a version stuck" and "is anything else stuck?"
+// are different questions, and both are worth answering.
+//
+// A read: nothing retries or abandons anything on its own. That decision is the
+// operator's, which is the whole point of the verdict being terminal for machines.
+func (c *Client) ListFailedVersions(ctx context.Context, knowledgeBaseID string) ([]*pb.FailedVersion, error) {
+	resp, err := c.admin.ListFailedVersions(ctx, &pb.ListFailedVersionsRequest{KnowledgeBaseId: knowledgeBaseID})
+	if err != nil {
+		return nil, fmt.Errorf("client: list failed versions: %w", err)
+	}
+	return resp.GetVersions(), nil
+}
+
+// ForceRetryVersion revokes an INDEX-side FAILED_PERMANENT verdict and asks for
+// another build (§10.1).
+//
+// The data side is not retryable, and the server says so instead of accepting the
+// call: that verdict means the version's data will never arrive, so there is nothing
+// to rebuild from. The error is passed through unaltered — it names
+// ForceAbandonVersion as the operation that does apply, and re-wording it here would
+// throw away the one part an operator can act on.
+func (c *Client) ForceRetryVersion(ctx context.Context, knowledgeBaseID string, versionID int64) error {
+	if _, err := c.admin.ForceRetryVersion(ctx, &pb.ForceRetryVersionRequest{
+		KnowledgeBaseId: knowledgeBaseID,
+		VersionId:       versionID,
+	}); err != nil {
+		return fmt.Errorf("client: force retry version %d: %w", versionID, err)
+	}
+	return nil
+}
+
+// ForceAbandonVersion abandons a FAILED_PERMANENT version: it leaves the chain under
+// DeleteVersion's SINGLE semantics (any child is spliced onto its parent), and the
+// physical cleanup runs asynchronously. Returns the versions marked for deletion.
+//
+// Only a version carrying a verdict can be abandoned — a healthy version is
+// DeleteVersion's business, and the server refuses it here.
+func (c *Client) ForceAbandonVersion(ctx context.Context, knowledgeBaseID string, versionID int64) ([]int64, error) {
+	resp, err := c.admin.ForceAbandonVersion(ctx, &pb.ForceAbandonVersionRequest{
+		KnowledgeBaseId: knowledgeBaseID,
+		VersionId:       versionID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("client: force abandon version %d: %w", versionID, err)
+	}
+	return resp.GetDeletedVersionIds(), nil
 }

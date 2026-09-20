@@ -196,10 +196,90 @@ export interface WarmupVersionResponse {
   success: boolean;
 }
 
+/**
+ * ListFailedVersionsRequest asks which versions are waiting for a human: those the
+ * control layer declared FAILED_PERMANENT on either side (§10.1, §10.1b). Nothing
+ * retries them automatically, so this list IS the work queue.
+ */
+export interface ListFailedVersionsRequest {
+  /**
+   * Empty lists every knowledge base. The per-knowledge-base form is how an
+   * operator arrives ("this one has a version stuck"); the global form is the
+   * question they ask next ("is anything else stuck?"), and answering it here
+   * spares the caller a fan-out over ListKnowledgeBases.
+   */
+  knowledge_base_id: string;
+}
+
+export interface ListFailedVersionsResponse {
+  /**
+   * The same FailedVersion shape GetSystemStatus reports, so a console renders
+   * both without a second decoder — and so the two can never disagree about what
+   * a failed version looks like.
+   */
+  versions: FailedVersion[];
+}
+
+/**
+ * ForceRetryVersionRequest asks the control layer to put one side of a terminated
+ * version back into play.
+ */
+export interface ForceRetryVersionRequest {
+  knowledge_base_id: string;
+  version_id: string;
+}
+
+export interface ForceRetryVersionResponse {
+  success: boolean;
+  /**
+   * side names the half that was retried, so a caller that asked for "retry" and
+   * got success knows what it got.
+   *
+   * Only the INDEX side is retried by this RPC, and that is a property of the two
+   * verdicts rather than a limitation of the interface: an index-side verdict is a
+   * statement about a build, and a build can be revoked by rebuilding, while a
+   * DATA-side verdict says the version's data will never arrive — there is nothing
+   * to retry, and the honest answer is ForceAbandonVersion. Asking for a data-side
+   * retry is refused with that reason instead of silently succeeding at nothing.
+   */
+  side: FailureSide;
+}
+
+/**
+ * ForceAbandonVersionRequest abandons a terminated version — the other answer to a
+ * verdict the operator does not intend to fight.
+ */
+export interface ForceAbandonVersionRequest {
+  knowledge_base_id: string;
+  version_id: string;
+}
+
+export interface ForceAbandonVersionResponse {
+  success: boolean;
+  /**
+   * deleted_version_ids mirrors DeleteVersion's own field, because this is that
+   * operation under SINGLE semantics: the version leaves the chain, and any child
+   * is spliced onto its parent rather than removed with it.
+   */
+  deleted_version_ids: string[];
+}
+
 export interface AdminService {
   HealthCheck(request: HealthCheckRequest): Promise<HealthCheckResponse>;
   GetSystemStatus(request: GetSystemStatusRequest): Promise<GetSystemStatusResponse>;
   GetClusterStatus(request: GetClusterStatusRequest): Promise<GetClusterStatusResponse>;
   RebuildIndex(request: RebuildIndexRequest): Promise<RebuildIndexResponse>;
   WarmupVersion(request: WarmupVersionRequest): Promise<WarmupVersionResponse>;
+  /**
+   * The operator's three verbs for a version the control layer declared
+   * FAILED_PERMANENT (Stratum_设计文档v13.md §10.1): see it, retry it, abandon it.
+   *
+   * They live here rather than on KnowledgeBaseService because the caller is an
+   * operator acting on a verdict, not an application working with a version — and
+   * because a deployment that never needs them can leave them unused without that
+   * showing up in the application's contract.
+   */
+  ListFailedVersions(request: ListFailedVersionsRequest): Promise<ListFailedVersionsResponse>;
+  ForceRetryVersion(request: ForceRetryVersionRequest): Promise<ForceRetryVersionResponse>;
+  ForceAbandonVersion(request: ForceAbandonVersionRequest): Promise<ForceAbandonVersionResponse>;
 }

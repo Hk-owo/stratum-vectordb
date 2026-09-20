@@ -1,6 +1,6 @@
 import { ApiError } from '../api/client'
 import { FailureSide } from '../api/gen/knowledgebase'
-import { useSystemStatus } from '../api/queries'
+import { useForceAbandonVersion, useForceRetryVersion, useSystemStatus } from '../api/queries'
 
 /**
  * 系统状态页。
@@ -20,6 +20,10 @@ import { useSystemStatus } from '../api/queries'
  */
 export function SystemStatus() {
   const status = useSystemStatus()
+  // 两个 action 各建一个实例就够：放进 map 里会给每条版本各建一个（违反 hooks
+  // 规则），而 pending/error 共享正好符合"一次点一个"的用法。
+  const retry = useForceRetryVersion()
+  const abandon = useForceAbandonVersion()
 
   if (status.isPending) return <p className="muted">读取系统状态…</p>
 
@@ -64,7 +68,7 @@ export function SystemStatus() {
         title="永久失败（failed_permanent）"
         count={s.failed_permanent_versions.length}
         tone="bad"
-        hint="控制层已判死，不会再自动重试。只有运维能重试或放弃——前端重试是徒劳。"
+        hint="控制层已判死，不会再自动重试。索引侧可以重试（撤销裁决、清原因链、重建）；数据侧没有可重试的写入——只能放弃。放弃即版本离链，物理清理异步执行。"
       >
         {s.failed_permanent_versions.map((v) => (
           <li key={`${v.kb_id}-${v.version_id}`}>
@@ -77,9 +81,27 @@ export function SystemStatus() {
             </span>{' '}
             <span className="muted small">
               尝试 {v.failure_count} 次 · {v.reason}
-            </span>
+            </span>{' '}
+            {v.side === FailureSide.FAILURE_SIDE_INDEX && (
+              <button
+                type="button"
+                disabled={retry.isPending}
+                onClick={() => retry.mutate({ kbId: v.kb_id, versionId: v.version_id })}
+              >
+                重试索引
+              </button>
+            )}{' '}
+            <button
+              type="button"
+              disabled={abandon.isPending}
+              onClick={() => abandon.mutate({ kbId: v.kb_id, versionId: v.version_id })}
+            >
+              放弃
+            </button>
           </li>
         ))}
+        {retry.isError && <p className="muted small">重试失败：{String(retry.error)}</p>}
+        {abandon.isError && <p className="muted small">放弃失败：{String(abandon.error)}</p>}
       </Section>
 
       <Section
