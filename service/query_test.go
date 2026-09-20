@@ -228,6 +228,48 @@ func TestQueryService_EmptyDocumentSetVersionAnswersWithNoResults(t *testing.T) 
 	}
 }
 
+// The same rule on the FILTER side, which is a different branch: a replica can
+// hold the version's chunk mapping and its index — so the search finds
+// candidates — while still lacking the version's document set. The mapping and
+// the set land separately, so "search succeeded" says nothing about the set.
+//
+// Measured on the 3+3 cluster with one replica having missed the write: its query
+// log read `candidates=1 matched_docs=0 chunkmap_calls=1` — the search found the
+// chunk, the filter dropped it because the set it was filtering against was
+// empty — and the caller got `results=0, err=nil` for ~14 s until the replica
+// caught up. An empty answer carries no reason to retry, so nobody asks a
+// replica that can serve it.
+func TestQueryService_VersionSetMissingOnThisReplicaIsNotAnEmptyResult(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	kbID, vID := h.setupQueryableKB(t, map[string][]string{
+		"doc-1": {"chunk-x"},
+	})
+	// A committed digest that is NOT the empty set's: the version has documents,
+	// they have just not reached this replica.
+	if err := h.raftNode.ProposeUpdateVersionSummary(ctx, vID, "digest-of-real-documents"); err != nil {
+		t.Fatalf("ProposeUpdateVersionSummary: %v", err)
+	}
+	// The index and the chunk→doc mapping stay; the version's document set goes.
+	if err := h.versionDocs.DeleteByVersion(ctx, kbID, vID); err != nil {
+		t.Fatalf("DeleteByVersion: %v", err)
+	}
+
+	_, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err == nil {
+		t.Fatal("want a retryable error for a version whose document set this replica does not have, got an empty answer")
+	}
+	if code := status.Code(err); code != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition (retryable: another replica may hold it)", code)
+	}
+}
+
 // setupQueryableKB creates a KB with a READY version containing the given
 // doc-to-chunks mapping. Returns (kbID, versionID).
 func (h *querySvcHarness) setupQueryableKB(t *testing.T, docChunks map[string][]string) (string, int64) {

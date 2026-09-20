@@ -380,10 +380,11 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 | `TestT4_AwaitVersion_EveryControlNodeAnswersOnItsOwn` | 绕过服务站直连每个控制节点:等待的锚点是复制状态,不是连接(服务站每次重选后端,会把这条性质藏起来) |
 | `TestT4_DiscardVersion_*` | 放弃从未落地的版本:拒绝已落地(`version_not_pending`)与激活版本(`version_is_active`);embedder 停机时版本停在 PENDING、越过探测门槛后 `data_missing=true`,放弃成功后同 key 重发拿到**新**版本 |
 | `TestT4_ClientSDK_*` | `client/` 包端到端:先落盘再提交、同 key 重发幂等、丢掉本地 changes 后只剩放弃;以及等就绪的完整流程(需要索引构建可用) |
+| `TestT4_UnconvergedReplicaDoesNotAnswerEmpty` | **绕过服务站**直连一个刚重新加入、仍在追赶的副本:它在收到该版本之前只能**可重试地拒绝**,绝不能返回 `results=0, err=nil`——那种答案与"确实没有相关文档"不可区分,且不可重试,服务站也没理由换候选(见 `docs/stress-test-report.md` §7.4) |
 
 ## 性能实测
 
-> 以下为 **2026-09-20** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,由 `scripts/cluster.sh --topology two-tier` 起集群、经服务站测量。宿主 **12 核 / 15 GB**,容器与压测进程共享这台机器。**完整口径、原始数据与四条发现见 `docs/stress-test-report.md`**,本节只是它的摘要。
+> 以下为 **2026-09-20** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,由 `scripts/cluster.sh --topology two-tier` 起集群、经服务站测量。宿主 **12 核 / 15 GB**,容器与压测进程共享这台机器。**完整口径、原始数据与四条发现(其中一条已修)见 `docs/stress-test-report.md`**,本节只是它的摘要。
 
 ### 查询延迟
 
@@ -532,7 +533,7 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 | `TestT4_MultiVersionEviction` | 多版本分级换出的稳定性 | 8 版本 × 3 轮轮转,每个版本始终应答 |
 | `TestT4_GCPressure` | 墓碑回收的端到端可见性(写入 → 删除 → 观察产物 → 查询仍正确) | **SKIP**:开关这一轮是开的(`index_manager.gc_enabled: true`),但扫描器每 5 s 跑一轮、一个候选都没判出来——产物确实带着 2,379 个 chunk 的墓碑(删 1,600 / 2,000 后按估计 dead share ≈ 0.76 ≫ 阈值 0.2),所以这不是"没得收",而是判据没命中。原因未定,证据与下一步见 `docs/stress-test-report.md` §6 |
 
-测量类用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`(20,000 篇建议 `90m`)。**这一轮压测还抓到四条缺陷**(落后追赶的数据源解析落到控制节点、20,000 篇增量拉取的 30 s 窗口不收敛、GC 判据未命中、**长时间运行的服务站会静默返回空查询结果**),证据与下一步见 `docs/stress-test-report.md` §7。最后一条最重:它只在"同一个服务站进程长跑"时出现——常驻部署的形态,而不是 `info` 轮那种每个 `go test` 各起一个服务站的测试形态。
+测量类用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`(20,000 篇建议 `90m`)。**这一轮压测还抓到四条缺陷**(落后追赶的数据源解析落到控制节点、20,000 篇增量拉取的 30 s 窗口不收敛、GC 判据未命中、**未收敛的副本把"我还不能服务"答成"这里没有匹配的文档"**),证据与修复见 `docs/stress-test-report.md` §7。最后一条最重且**本轮已修**:过滤侧与索引扫描侧各把一处"空"当成了答案,于是一个还在追赶的副本会返回 `results=0, err=nil`——与"确实没有相关文档"在响应上无法区分。两处都改判成可重试的 `index_not_ready`,各有"撤掉修复即变红"的单测锁住。
 
 ```bash
 STRATUM_STRESS_DOCS=20000 STRATUM_STRESS_TIMEOUT=90m STRATUM_INDEX_BUILD_TIMEOUT=25m \

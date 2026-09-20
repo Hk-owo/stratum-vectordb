@@ -526,6 +526,67 @@ func TestIndexManager_SearchUnbuiltEmptyVersionStillReportsNotReady(t *testing.T
 	}
 }
 
+// A replica can hold a version's chunk MAPPING before it holds the vectors those
+// chunks point at — that is the window a catching-up replica sits in, and it is
+// invisible from the mapping side (the chunk list is non-empty, so the scan runs
+// and finds nothing to score).
+//
+// The scan must say "this replica cannot serve the version yet" rather than
+// "nothing matches": an empty answer carries no reason to retry, so the station
+// forwards it to the caller as a fact about the data. Measured on the 3+3
+// cluster before this was fixed: a replica that had missed a write answered
+// `results=0, err=nil` for ~6 s (probes at t+8/10/12 s) between a correctly
+// refused `index not ready` (t+4/6 s, chunk list still empty) and catching up
+// (t+14 s).
+func TestIndexManager_SearchUnbuiltVersionWithNoReadableVectorsReportsNotReady(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	// The document and its chunk are known; the chunk's vector is not.
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, nil)
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 50 * time.Millisecond,
+	})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	results, err := im.Search(context.Background(), "kb-1", 1, []float32{0.5, 0.5}, 2)
+	if !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+		t.Fatalf("err = %v (results=%+v), want ErrIndexNotReady: an empty answer to a version this replica cannot serve is not retryable, so nobody ever asks a replica that can", err, results)
+	}
+}
+
+// The partial case keeps the old tolerance: if SOME chunks are readable, the
+// scan answers with what it could score. Only "not a single vector readable" is
+// the unambiguous "this replica does not have the data" state.
+func TestIndexManager_SearchUnbuiltVersionWithSomeReadableVectorsStillAnswers(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x", "chunk-y"}, map[string][]float32{
+		"chunk-x": {0.5, 0.5}, // chunk-y has no vector
+	})
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 50 * time.Millisecond,
+	})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	results, err := im.Search(context.Background(), "kb-1", 1, []float32{0.5, 0.5}, 2)
+	if err != nil {
+		t.Fatalf("a partially readable version must still be answered by scanning: %v", err)
+	}
+	if len(results) != 1 || results[0].ChunkID != "chunk-x" {
+		t.Fatalf("results = %+v, want the one chunk whose vector could be read", results)
+	}
+}
+
 // Above the size threshold, scanning costs about as much as building, so the
 // caller waits for the build instead of paying for a scan.
 func TestIndexManager_SearchLargeUnbuiltVersionDoesNotScan(t *testing.T) {

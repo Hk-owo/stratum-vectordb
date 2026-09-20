@@ -100,6 +100,7 @@ func (im *IndexManagerImpl) bruteForceSearch(ctx context.Context, kbID string, v
 	similarity := im.similarityOf(ctx, kbID)
 
 	scored := make([]types.SearchResult, 0, len(chunkIDs))
+	unreadable := 0
 	for _, chunkID := range chunkIDs {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -108,6 +109,19 @@ func (im *IndexManagerImpl) bruteForceSearch(ctx context.Context, kbID string, v
 		if err != nil {
 			// A chunk that cannot be read is skipped rather than failing the
 			// whole query — the same tolerance the vecstore search path shows.
+			// What that tolerance must NOT swallow is the case where NO chunk is
+			// readable: a replica that has the version's chunk mapping but not
+			// its vectors yet (mid-catch-up, or a version whose data has not
+			// landed) would otherwise answer "no matches" to a query it cannot
+			// serve at all — and an empty answer is not retryable, so the caller
+			// has no reason to ask a replica that does serve it.
+			//
+			// Measured on the 3+3 cluster: one storage replica missing a write
+			// answered `results=0, err=nil` for ~6 s (probes at t+8/10/12 s)
+			// between a correctly refused `index not ready` (t+4/6 s, when its
+			// chunk list was still empty) and the version becoming servable
+			// (t+14 s). A caller asking through the station got the empty answer.
+			unreadable++
 			continue
 		}
 		score, ok := similarityScore(similarity, vector, chunkVector)
@@ -122,6 +136,18 @@ func (im *IndexManagerImpl) bruteForceSearch(ctx context.Context, kbID string, v
 	sort.Slice(scored, func(i, j int) bool { return scored[i].Score > scored[j].Score })
 	if len(scored) > topK {
 		scored = scored[:topK]
+	}
+	// Not one vector of the version could be read: this replica has the mapping
+	// but not the data. Answering empty here is the §9.1 risk 1 failure in its
+	// worst form — the caller receives a well-formed "nothing matches" for a
+	// version that has plenty of matching documents, and has no reason to retry
+	// anywhere. The wire name is the retryable one, so a station moves to a
+	// replica that can serve it.
+	if len(scored) == 0 && unreadable == len(chunkIDs) {
+		im.logger.Debug("index: a scan read none of the version's vectors; reporting not-ready instead of empty",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("chunks", len(chunkIDs)))
+		return nil, fmt.Errorf("%w: %s: none of the version %d's %d chunks could be read — this replica does not hold the version's vectors yet",
+			stratumerrors.ErrIndexNotReady, kbID, versionID, len(chunkIDs))
 	}
 	return scored, nil
 }

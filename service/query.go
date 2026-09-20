@@ -383,6 +383,32 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		vBloomErr = idsErr
 	}
 
+	// An empty read is only an answer when the VERSION is empty. A replica that
+	// has not received the version's documents yet reads the set successfully and
+	// gets nothing back, and the two states must not collapse: "this version has
+	// no documents" is a legitimate empty result, while "this replica does not
+	// know the version's documents" cannot serve the query at all and has to say
+	// so retryably, so the station asks a replica that can.
+	//
+	// The control layer already carries the distinction — the version's
+	// document-set digest. The empty set has its own digest
+	// (types.EmptyDocIDSetHash), so an empty read for a version that does NOT
+	// carry that digest is this replica missing the data, not an empty version.
+	// The Search-side branch below makes exactly this test for the same reason;
+	// the filter path needs it too because search can succeed while the set does
+	// not (the chunk mapping and the document set land separately).
+	//
+	// Measured on the 3+3 cluster, one replica having missed the write: its query
+	// log read `candidates=1 matched_docs=0 chunkmap_calls=1` — the search found
+	// the chunk, the filter dropped it because the set it was filtering against
+	// was empty — and the caller got `results=0, err=nil` for ~14 s (t+6…+18 s)
+	// until the replica caught up.
+	if idsErr == nil && len(ids) == 0 && targetVersion.DocIDSetHash != types.EmptyDocIDSetHash {
+		return nil, stratumerrors.ToGRPCStatus(fmt.Errorf(
+			"%w: %s: version %d's document set is not on this replica yet (its committed digest is not the empty set's)",
+			stratumerrors.ErrIndexNotReady, kbID, versionID))
+	}
+
 	// The version's document-ID set, materialized ONCE for the whole query.
 	//
 	// It used to be fetched INSIDE the loop below — once per candidate chunk,
