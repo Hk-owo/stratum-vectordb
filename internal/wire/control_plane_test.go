@@ -23,6 +23,8 @@ func TestVersionFromInfo_CarriesEveryFieldTheProtoHas(t *testing.T) {
 		IndexStatus:     pb.IndexStatus_INDEX_STATUS_READY,
 		DataStatus:      pb.DataStatus_DATA_STATUS_DURABLE,
 		Deleting:        true,
+		DocIdSetHash:    "digest-of-the-document-set",
+		IndexReadyNodes: []int64{11, 13},
 	})
 
 	if got.VersionID != 7 || got.ParentVersionID != 6 || got.KBID != "kb-1" || got.CreatedAt != 1234 {
@@ -38,10 +40,19 @@ func TestVersionFromInfo_CarriesEveryFieldTheProtoHas(t *testing.T) {
 	if !got.Deleting {
 		t.Error("deleting = false, want true: a dropped flag reads as a positive fact downstream")
 	}
-	// DocIDSetHash is deliberately NOT on the wire, and inventing one would make a
-	// caller believe a digest had been committed when none had.
-	if got.DocIDSetHash != "" {
-		t.Errorf("doc id set hash = %q, want empty (VersionInfo does not carry it)", got.DocIDSetHash)
+	// DocIDSetHash has to make the trip whole: it is what separates "this version
+	// has no documents" from "no digest was ever committed", and the storage layer
+	// is the side that has to tell those apart.
+	if got.DocIDSetHash != "digest-of-the-document-set" {
+		t.Errorf("doc id set hash = %q, want the one the proto carried", got.DocIDSetHash)
+	}
+	// IndexReadyNodes is the list §8.6(d)'s rolling cleanup counts before a
+	// storage node takes itself out of service. Only the control layer aggregates
+	// it and only this route carries it to a storage node, so dropping it here
+	// zeroed that count and made collection impossible — measured as
+	// `others_serving=0 minimum_required=2` on a version three replicas served.
+	if len(got.IndexReadyNodes) != 2 || got.IndexReadyNodes[0] != 11 || got.IndexReadyNodes[1] != 13 {
+		t.Errorf("index ready nodes = %v, want [11 13]", got.IndexReadyNodes)
 	}
 }
 

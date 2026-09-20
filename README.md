@@ -384,7 +384,7 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 
 ## 性能实测
 
-> 以下为 **2026-09-20** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,由 `scripts/cluster.sh --topology two-tier` 起集群、经服务站测量。宿主 **12 核 / 15 GB**,容器与压测进程共享这台机器。**完整口径、原始数据与四条发现(其中一条已修)见 `docs/stress-test-report.md`**,本节只是它的摘要。
+> 以下为 **2026-09-20** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,由 `scripts/cluster.sh --topology two-tier` 起集群、经服务站测量。宿主 **12 核 / 15 GB**,容器与压测进程共享这台机器。**完整口径、原始数据与四条发现(其中三条本轮已修)见 `docs/stress-test-report.md`**,本节只是它的摘要。
 
 ### 查询延迟
 
@@ -531,9 +531,9 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 | `TestTwoTier_EveryStorageNodeServesTheWrittenVersion` | 控制组提交的版本在每个存储副本上都能读到 | 每个存储副本都能服务写过的版本 |
 | `TestTwoTier_StorageGroupToleratesOneNodeDown` | 一个存储副本挂掉后写入与读取仍可用 | 通过 |
 | `TestT4_MultiVersionEviction` | 多版本分级换出的稳定性 | 8 版本 × 3 轮轮转,每个版本始终应答 |
-| `TestT4_GCPressure` | 墓碑回收的端到端可见性(写入 → 删除 → 观察产物 → 查询仍正确) | **SKIP**:开关这一轮是开的(`index_manager.gc_enabled: true`),但扫描器每 5 s 跑一轮、一个候选都没判出来——产物确实带着 2,379 个 chunk 的墓碑(删 1,600 / 2,000 后按估计 dead share ≈ 0.76 ≫ 阈值 0.2),所以这不是"没得收",而是判据没命中。原因未定,证据与下一步见 `docs/stress-test-report.md` §6 |
+| `TestT4_GCPressure` | 墓碑回收的端到端可见性(写入 → 删除 → 观察产物 → 查询仍正确) | **跑通了**:产物 99,194,878 B → **49,282,907 B(回收 50.3%)**,收集后查询仍返回结果;用时 43.7 s。这条路以前从来没真正跑通过——它被四层套着的因果挡着(delta 为空导致 §8.6(c) 重建、判据无日志、分发获得的副本不上报 READY、`IndexReadyNodes` 不过 wire),见 `docs/stress-test-report.md` §6 |
 
-测量类用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`(20,000 篇建议 `90m`)。**这一轮压测还抓到四条缺陷**(落后追赶的数据源解析落到控制节点、20,000 篇增量拉取的 30 s 窗口不收敛、GC 判据未命中、未收敛的副本把"我还不能服务"答成"这里没有匹配的文档"),证据与修复见 `docs/stress-test-report.md` §7。其中**两条本轮已修**:① 的数据源解析现在只接受存储层地址(控制节点被排除,实测 `this node exports no data` 从每知识库上百次降到 0,并补上了"候选为什么被排除"的日志);④ 的过滤侧与索引扫描侧各把一处"空"当成了答案,现在都改判成可重试的 `index_not_ready`。两条修复都带"撤掉即变红"的单测。
+测量类用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`(20,000 篇建议 `90m`)。**这一轮压测还抓到四条缺陷,其中三条已修**(详见 `docs/stress-test-report.md`):① 落后追赶的数据源解析会落到控制节点 ⇒ 现在只接受存储层地址(实测 `this node exports no data` 从每知识库上百次降到 0);③ §8.6(d) 的收集链路被四层因果挡死 ⇒ 拆到底后首次跑通,回收 50.3%(其中两个是生产缺陷:分发获得产物的副本**不上报 READY**、`IndexReadyNodes` **不过 wire**);④ 未收敛的副本把"我还不能服务"答成"这里没有匹配的文档" ⇒ 两处"空"都改判成可重试的 `index_not_ready`。**剩下未修的是 ②**:20,000 篇规模下增量拉取的 30 s 固定窗口不收敛。已修的每条都带"撤掉即变红"的单测。
 
 ```bash
 STRATUM_STRESS_DOCS=20000 STRATUM_STRESS_TIMEOUT=90m STRATUM_INDEX_BUILD_TIMEOUT=25m \

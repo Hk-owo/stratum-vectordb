@@ -923,6 +923,56 @@ func TestIndexManager_InstallIndexSeedsColdPolicyBaseline(t *testing.T) {
 	}
 }
 
+// A replica that RECEIVES an artifact must report it READY on itself, exactly as
+// the builder does.
+//
+// The report is what puts this node into the version's IndexReadyNodes, and
+// §8.6(d)'s rolling cleanup asks the control layer "how many OTHER replicas still
+// serve this version?" before taking one out of service. Under §8.4 ("build once,
+// distribute N") every replica but the builder gets its artifact this way, so
+// without this report the count stays at 1 forever — measured on the 3+3 cluster
+// as `index: gc: skipping collection — too few replicas would remain serving
+// (others_serving=0, minimum_required=2)` on a version all three replicas were
+// serving, i.e. collection could never start anywhere.
+func TestIndexManager_InstallIndexReportsReadyOnThisNode(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	im := newColdPolicyManager(t, vc, newDocSource(), IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+		IndexDataDir:    t.TempDir(),
+	})
+
+	// The mock vecstore, like the real one, refuses to Load an index it has never
+	// built.
+	vc.mu.Lock()
+	vc.built[indexKey{"kb-1", 7}] = nil
+	vc.mu.Unlock()
+
+	type report struct {
+		kbID      string
+		versionID int64
+		status    types.IndexStatus
+	}
+	got := make(chan report, 2)
+	im.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
+		got <- report{kbID, versionID, status}
+		return nil
+	})
+
+	if err := im.InstallIndex(context.Background(), "kb-1", 7, []byte("index-bytes"), []byte("sidecar")); err != nil {
+		t.Fatalf("InstallIndex failed: %v", err)
+	}
+
+	select {
+	case r := <-got:
+		if r.kbID != "kb-1" || r.versionID != 7 || r.status != types.IndexStatusReady {
+			t.Fatalf("callback = %+v, want kb-1/7/READY", r)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a received artifact must be reported READY on this node: the control layer's serving count, which §8.6(d) consults before collecting, depends on it")
+	}
+}
+
 // §8.6a: the shape travels with the artifact, so a replica that receives a
 // graph-free one can see what it got. Without that record every received
 // graph-free artifact looks "not reshaped yet" and is rebuilt — and

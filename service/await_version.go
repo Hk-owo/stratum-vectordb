@@ -358,5 +358,11 @@ func versionInfoToProto(v types.VersionMeta) *pb.VersionInfo {
 		// separates an empty version from one whose digest was never committed
 		// (see the field's comment in the proto).
 		DocIdSetHash: v.DocIDSetHash,
+		// And which replicas have reported this version's index ready. The
+		// storage layer reads versions THROUGH this contract — RemoteRaftNode over
+		// gRPC — and it is the storage layer that runs §8.6(d)'s rolling cleanup,
+		// so without this the serving count every replica computes is 0 and
+		// collection can never start (see the field's comment in the proto).
+		IndexReadyNodes: v.IndexReadyNodes,
 	}
 }

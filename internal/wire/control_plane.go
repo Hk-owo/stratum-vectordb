@@ -84,6 +84,12 @@ func VersionFromInfo(kbID string, info *pb.VersionInfo) types.VersionMeta {
 		DataStatus:   dataStatusFromProto(info.GetDataStatus()),
 		Deleting:     info.GetDeleting(),
 		DocIDSetHash: info.GetDocIdSetHash(),
+		// IndexReadyNodes is what §8.6(d)'s rolling cleanup counts before a
+		// storage node takes itself out of service. It is a fact the CONTROL layer
+		// aggregates, and this is the only route by which a storage node can read
+		// it — dropping it here silently zeroed that count and made collection
+		// impossible in every split deployment.
+		IndexReadyNodes: info.GetIndexReadyNodes(),
 	}
 }
 

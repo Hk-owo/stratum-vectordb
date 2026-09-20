@@ -208,15 +208,66 @@ func genUniqueDocs(n, targetRunes int) []docUnit {
 	return docs
 }
 
-// indexBytes sums the index directory across the whole storage group — the number
-// §8.6(d) exists to bring down.
-func indexBytes(t *testing.T) int64 {
+// versionIndexBytes sums the on-disk size of ONE version's artifact across the
+// storage group: the .index payload plus the .index.ids sidecar beside it.
+//
+// Deliberately not indexBytes, which du's the WHOLE index directory — every past
+// run of every case has written into it, so its movement says nothing about this
+// version's artifact. Measured: a collection that had just dropped most of a
+// version's vectors still showed the directory GROWING 33 MB from unrelated
+// builds, and the case failed on an assertion about the artifact (its own
+// message guessed the cause: "the bytes measured are not the artifact's"). The
+// artifact is what §8.6(d) reclaims, so that is what to measure.
+func versionIndexBytes(t *testing.T, kbID string, versionID int64) int64 {
 	t.Helper()
 	var total int64
 	for i, svc := range storageServices {
-		total += duNodeBytes(t, svc, indexDirOf(i))
+		dir := fmt.Sprintf("%s/index/%s", storageDataDir(i), kbID)
+		out, err := exec.Command("docker", "exec", svc, "sh", "-c",
+			fmt.Sprintf("du -sb %s/%d.index %s/%d.index.ids 2>/dev/null | awk '{s+=$1} END {print s+0}'",
+				dir, versionID, dir, versionID)).CombinedOutput()
+		if err != nil {
+			t.Fatalf("measuring %s v%d in %s: %v\n%s", kbID, versionID, svc, err, out)
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+		if err != nil {
+			t.Fatalf("measuring %s v%d in %s: parse %q: %v", kbID, versionID, svc, out, err)
+		}
+		total += n
 	}
 	return total
+}
+
+// awaitReplicaArtifact waits until every storage replica holds the version's
+// artifact on disk.
+//
+// Why the collection case needs it: §8.6(c) reuses the parent artifact only where
+// that parent IS. Its build ran on one node and §8.4 distributes it to the rest,
+// so a child version written while that distribution is still in flight reuses
+// nothing and is rebuilt from scratch — carrying no tombstones, which leaves
+// §8.6(d) with nothing to collect. Measured twice: 74 MB (reused, tombstones
+// present, collection ran and reclaimed 7,322 chunks) versus 41 MB against the
+// parent's 65 MB (rebuilt, no tombstones, case correctly refuses to continue).
+// The case is about collection, not about distribution timing, so it waits the
+// race out instead of rolling dice on which node dispatches picked.
+func awaitReplicaArtifact(t *testing.T, kbID string, versionID int64, timeout time.Duration) {
+	t.Helper()
+	for i, svc := range storageServices {
+		dir := fmt.Sprintf("%s/index/%s", storageDataDir(i), kbID)
+		deadline := time.Now().Add(timeout)
+		for {
+			out, _ := exec.Command("docker", "exec", svc, "sh", "-c",
+				fmt.Sprintf("test -s %s/%d.index && test -s %s/%d.index.ids && echo yes",
+					dir, versionID, dir, versionID)).Output()
+			if strings.Contains(string(out), "yes") {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("replica %s never received the artifact for %s v%d within %v", svc, kbID, versionID, timeout)
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
 }
 
 // nodeLogsSince returns a storage node's container logs.
@@ -388,8 +439,11 @@ func TestT4_GCPressure(t *testing.T) {
 
 	baseVersion := writeVersion(t, ctx, leaderAddr, kbID, docs)
 	waitVersionStatus(t, ctx, leaderAddr, kbID, baseVersion, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
-	before := indexBytes(t)
-	t.Logf("base version %d READY; index bytes across the storage group: %d", baseVersion, before)
+	// Every replica must hold the parent's artifact before the child is written:
+	// §8.6(c) can only reuse what is locally there (see awaitReplicaArtifact).
+	awaitReplicaArtifact(t, kbID, baseVersion, 120*time.Second)
+	baseBytes := versionIndexBytes(t, kbID, baseVersion)
+	t.Logf("base version %d READY on every replica; artifact bytes across the storage group: %d", baseVersion, baseBytes)
 
 	// Delete most of it AND add a little, in the SAME version. The mixture is the
 	// precondition, not decoration: §8.6(c) reuses the parent artifact only when
@@ -413,21 +467,48 @@ func TestT4_GCPressure(t *testing.T) {
 	}
 	for i := range added {
 		changes = append(changes, &pb.DocChange{
-			Op:      pb.ChangeOp_CHANGE_OP_ADD,
-			DocId:   fmt.Sprintf("late-%06d", i),
-			Content: added[i].content,
+			Op:    pb.ChangeOp_CHANGE_OP_ADD,
+			DocId: fmt.Sprintf("late-%06d", i),
+			// The content has to be NEW, not a copy of an existing document's.
+			//
+			// Chunks are content-addressed, so re-adding text the knowledge base
+			// already holds produces no new chunk at all — and with nothing to
+			// append, §8.6(c) rebuilds instead of reusing the parent (its own
+			// comment: "copy the parent, dead vectors and all, is never worth it
+			// when nothing new comes along"). A rebuilt artifact carries no
+			// tombstones, so §8.6(d) has nothing to collect and this case can never
+			// reach the chain it exists to exercise — it skips with "found NO
+			// candidate" no matter how it is configured.
+			//
+			// Measured with the reused text (genUniqueDocs is deterministic, so
+			// `added[i].content` duplicates document i): the version's artifact held
+			// 2,379 chunks against a parent's 9,590 — exactly the live set, i.e. a
+			// full rebuild — and the scan logged dead_share 0.000 with
+			// live_docs 501.
+			Content: fmt.Sprintf("late-%06d %s", i, added[i].content),
 		})
 	}
 	trimmed := writeChanges(t, ctx, leaderAddr, kbID, baseVersion, changes)
 	waitVersionStatus(t, ctx, leaderAddr, kbID, trimmed, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
-	afterDelete := indexBytes(t)
-	t.Logf("version %d READY after deleting %d/%d docs; index bytes: %d (delta %+d)",
-		trimmed, deleteCount, docCount, afterDelete, afterDelete-before)
+	// READY is the version's state, not the group's: §8.4's distribution is still
+	// in flight when it flips, and measuring before it lands reads a partial set of
+	// replicas — measured: 66.7 MB across the group for an artifact that settles at
+	// 99.2 MB (two replicas plus a fraction of the third), which then made the
+	// post-collection reading look unchanged.
+	awaitReplicaArtifact(t, kbID, trimmed, 120*time.Second)
+	afterDelete := versionIndexBytes(t, kbID, trimmed)
+	t.Logf("version %d READY after deleting %d/%d docs; artifact bytes: %d (parent's clean artifact: %d)",
+		trimmed, deleteCount, docCount, afterDelete, baseBytes)
 
-	if afterDelete <= before {
-		t.Logf("note: the artifact did not grow with the tombstoned vectors (%d → %d); "+
-			"the append may have rebuilt instead of reusing, which leaves no dead weight to collect",
-			before, afterDelete)
+	// The artifact must be BIGGER than its parent's clean one. The version's live
+	// set is 501 of the parent's 2,000 documents, so a rebuild of just those would
+	// be a fraction of the parent's size; anything above it is the parent's vectors
+	// still sitting there as TOMBSTONES — which is the dead weight §8.6(d) exists
+	// to reclaim. Without them the case below skips, and that is the honest
+	// outcome: there is nothing to collect.
+	if afterDelete <= baseBytes {
+		t.Fatalf("§8.6(c) did not reuse the parent: the version's artifact is %d bytes against the parent's clean %d, "+
+			"so it was rebuilt and carries no tombstones for §8.6(d) to reclaim", afterDelete, baseBytes)
 	}
 
 	// Make the tombstoned version the ACTIVE one — §8.6(d) collects active versions
@@ -447,12 +528,28 @@ func TestT4_GCPressure(t *testing.T) {
 	deadline := time.Now().Add(stressCollectTimeout())
 	var afterCollect int64
 	collected := false
+	// Scoped to THIS knowledge base and version. "Some collection happened" is not
+	// this case's collection: the cluster carries dozens of other active versions,
+	// any of whose collections would satisfy a bare "gc: collected" search — the
+	// same false signal a bare "caught up" search produced in the lag-catch-up
+	// cases (see lag_catchup_test.go).
+	collectedLog := fmt.Sprintf(`"index: gc: collected dead vectors","kb_id":"%s","version_id":%d`, kbID, trimmed)
 	for time.Now().Before(deadline) {
-		if anyStorageLogHas(t, "index: gc: collected") {
+		if anyStorageLogHas(t, collectedLog) {
 			collected = true
-			// Let the rewrite settle before reading sizes.
-			time.Sleep(2 * time.Second)
-			afterCollect = indexBytes(t)
+			// The log line is written when the collection succeeds; the rewritten
+			// artifact lands on disk after it, and tens of megabytes of index take
+			// seconds to rebuild and save. Poll for the size to move instead of
+			// sleeping a fixed 2 s — measured: with the fixed sleep the case read the
+			// artifact BEFORE the rewrite and reported 0.0% reclaimed on a collection
+			// that had just dropped 7,322 chunks (verified by hand: 24.7 MB → 19 MB
+			// per replica).
+			settleBy := time.Now().Add(45 * time.Second)
+			afterCollect = versionIndexBytes(t, kbID, trimmed)
+			for afterCollect >= afterDelete && time.Now().Before(settleBy) {
+				time.Sleep(time.Second)
+				afterCollect = versionIndexBytes(t, kbID, trimmed)
+			}
 			break
 		}
 		time.Sleep(3 * time.Second)
@@ -464,16 +561,13 @@ func TestT4_GCPressure(t *testing.T) {
 			t.Skip("the §8.6(d) scanner is not running on any storage node — " +
 				"check index_manager.gc_sweep_interval_ms (negative disables it) and the data dir")
 		case !anyStorageLogHas(t, "cleanup candidate"):
-			t.Skipf("the scanner ran but found NO candidate. §8.6(d) has a narrow "+
-				"precondition and any one of these defeats it — (1) the sealed artifact "+
-				"carries no tombstones, because §8.6(c) rebuilt instead of reusing: a "+
-				"version that only deletes has an empty delta, and a build whose parent "+
-				"artifact sits on another node cannot reuse either (1 of %d nodes here); "+
-				"(2) the dead share is at or below GCRatioThreshold; (3) AppendMaxDeadRatio "+
-				"and GCRatioThreshold share the 0.2 default, so §8.6(c) rebuilds at exactly "+
-				"the share §8.6(d) starts caring about, and (d) never sees anything. "+
-				"Index bytes across the group: %d → %d.",
-				len(storageServices), before, afterDelete)
+			t.Skipf("the scanner ran but found NO candidate, with the artifact at %d bytes "+
+				"against the parent's clean %d. The judgement needs the artifact to carry "+
+				"tombstones AND a dead share above GCRatioThreshold; the assertion above "+
+				"already established the tombstones are there, so this points at the "+
+				"threshold (AppendMaxDeadRatio must exceed the share §8.6(c) rebuilds at) "+
+				"or at the estimate itself.",
+				afterDelete, baseBytes)
 		default:
 			t.Skipf("a candidate was found but nothing was collected within %v — check "+
 				"index_manager.serving_replica_min (with %d storage replicas, collection "+
@@ -483,11 +577,12 @@ func TestT4_GCPressure(t *testing.T) {
 		}
 	}
 
-	t.Logf("COLLECTED: index bytes %d → %d (%.1f%% of the post-delete size reclaimed)",
+	t.Logf("COLLECTED: artifact bytes %d → %d (%.1f%% of the post-delete artifact reclaimed)",
 		afterDelete, afterCollect, 100*float64(afterDelete-afterCollect)/float64(afterDelete))
 	if afterCollect >= afterDelete {
-		t.Errorf("a collection was logged but the index did not shrink (%d → %d) — "+
-			"either the log is lying or the bytes measured are not the artifact's",
+		t.Errorf("a collection was logged but the version's artifact did not shrink (%d → %d); "+
+			"the bytes are the version's own .index and .index.ids, so either the log is lying "+
+			"or the rewrite did not drop the tombstones",
 			afterDelete, afterCollect)
 	}
 
@@ -502,8 +597,8 @@ func TestT4_GCPressure(t *testing.T) {
 	}
 	t.Logf("post-collection query returned %d results", len(resp.Results))
 
-	t.Logf("GC-PRESSURE SUMMARY: docs=%d deleted=%d indexBytes before=%d afterDelete=%d afterCollect=%d",
-		docCount, deleteCount, before, afterDelete, afterCollect)
+	t.Logf("GC-PRESSURE SUMMARY: docs=%d deleted=%d artifactBytes base=%d afterDelete=%d afterCollect=%d",
+		docCount, deleteCount, baseBytes, afterDelete, afterCollect)
 }
 
 // --- T4-7: Multi-version rotation stability ---------------------------------

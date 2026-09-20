@@ -185,20 +185,64 @@ func (im *IndexManagerImpl) scanGCCandidates(ctx context.Context) []gcCandidate 
 	// when you want to see this.
 	im.logger.Info("index: gc scan read the active versions",
 		zap.Int("active_versions", len(active)), zap.Float64("threshold", threshold))
+	// Why each version was rejected, as counts.
+	//
+	// The line above says how many versions were examined; this one says which of
+	// the four independent reasons rejected them. Without it they all look the
+	// same from outside — and a run whose audit measured ~2,379 tombstoned
+	// vectors in the ACTIVE artifact still reported no candidate, with nothing to
+	// say which reason applied. Same level and same cadence as the line above:
+	// production scans every few minutes, and when nothing is collected the only
+	// question worth answering is "why nothing".
+	var missingArtifact, missingSidecar, unestimable, belowThreshold int
+	var maxShare float64
 	var candidates []gcCandidate
 	for kbID, versionID := range active {
 		// A SEALED artifact is the prerequisite: the unsealed remains of a dead
 		// build are §8.8's business, and this node may not hold the version at
 		// all (the active version is served by whoever was picked for it).
-		if !fileExists(im.indexPath(kbID, versionID)) || !fileExists(im.sidecarPath(kbID, versionID)) {
+		if !fileExists(im.indexPath(kbID, versionID)) {
+			missingArtifact++
 			continue
 		}
-		share, ok := im.deadShare(ctx, kbID, versionID)
-		if !ok || share <= threshold {
+		if !fileExists(im.sidecarPath(kbID, versionID)) {
+			missingSidecar++
 			continue
 		}
-		candidates = append(candidates, gcCandidate{KBID: kbID, VersionID: versionID, DeadShare: share})
+		est, ok := im.deadShare(ctx, kbID, versionID)
+		if !ok {
+			unestimable++
+			im.logger.Debug("index: gc scan: could not estimate a version's dead share",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Int("artifact_chunks", est.ArtifactChunks), zap.Int("live_chunks", est.LiveChunks),
+				zap.Int("live_docs", est.LiveDocs))
+			continue
+		}
+		if est.Share > maxShare {
+			maxShare = est.Share
+		}
+		if est.Share <= threshold {
+			belowThreshold++
+			im.logger.Debug("index: gc scan: active version is under the dead-share threshold",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Float64("dead_share", est.Share),
+				zap.Int("artifact_chunks", est.ArtifactChunks),
+				zap.Int("live_chunks", est.LiveChunks),
+				zap.Int("live_docs", est.LiveDocs),
+				zap.Float64("threshold", threshold))
+			continue
+		}
+		candidates = append(candidates, gcCandidate{KBID: kbID, VersionID: versionID, DeadShare: est.Share})
 	}
+	im.logger.Info("index: gc scan result",
+		zap.Int("examined", len(active)),
+		zap.Int("no_artifact", missingArtifact),
+		zap.Int("no_sidecar", missingSidecar),
+		zap.Int("unestimable", unestimable),
+		zap.Int("below_threshold", belowThreshold),
+		zap.Int("candidates", len(candidates)),
+		zap.Float64("max_dead_share", maxShare),
+		zap.Float64("threshold", threshold))
 	for _, c := range candidates {
 		im.logger.Info("index: an active version carries dead index weight and is a §8.6(d) cleanup candidate",
 			zap.String("kb_id", c.KBID), zap.Int64("version_id", c.VersionID),
@@ -220,35 +264,62 @@ func (im *IndexManagerImpl) scanGCCandidates(ctx context.Context) []gcCandidate 
 // ok=false means "cannot tell": no artifact, an unreadable sidecar, or a failed
 // document lookup. A scan that cannot tell reports nothing rather than guessing,
 // because the action downstream (reopening the artifact) is not free.
-func (im *IndexManagerImpl) deadShare(ctx context.Context, kbID string, versionID int64) (float64, bool) {
-	total, err := im.artifactChunkCount(kbID, versionID)
-	if err != nil || total == 0 {
-		return 0, false
+func (im *IndexManagerImpl) deadShare(ctx context.Context, kbID string, versionID int64) (deadShareEstimate, bool) {
+	est := deadShareEstimate{}
+	artifactChunks, err := im.artifactChunkCount(kbID, versionID)
+	if err != nil || artifactChunks == 0 {
+		return est, false
 	}
+	est.ArtifactChunks = artifactChunks
 	docIDs, err := im.listDocIDs(ctx, kbID, versionID)
 	if err != nil {
-		return 0, false
+		return est, false
 	}
-	live := 0
+	est.LiveDocs = len(docIDs)
 	if len(docIDs) > 0 {
 		chunkIDs, err := im.listChunkIDsByDocs(ctx, kbID, docIDs)
 		if err != nil {
-			return 0, false
+			return est, false
 		}
 		distinct := make(map[string]struct{}, len(chunkIDs))
 		for _, id := range chunkIDs {
 			distinct[id] = struct{}{}
 		}
-		live = len(distinct)
+		est.LiveChunks = len(distinct)
 	}
-	dead := total - live
+	dead := est.ArtifactChunks - est.LiveChunks
 	if dead < 0 {
 		// The sidecar does not cover every live chunk. Treating that as "no dead
 		// weight" keeps the scan from reporting an artifact it does not
 		// understand, which is the conservative direction: nothing gets cleaned.
-		return 0, false
+		return est, false
 	}
-	return float64(dead) / float64(total), true
+	est.Share = float64(dead) / float64(est.ArtifactChunks)
+	return est, true
+}
+
+// deadShareEstimate is the measurement a candidate judgement is made from, kept
+// together so a rejection can be explained rather than only reported.
+//
+// It is an estimate, and allowed to be one: the artifact's size comes from the
+// sealed sidecar, the live set from the version's current documents. Counting a
+// chunk once however many live documents share it is correct for the question
+// being asked, and a chunk whose vector came along from an ancestor is
+// indistinguishable here from one whose document was deleted in this version —
+// both are weight the current document set does not justify.
+type deadShareEstimate struct {
+	// ArtifactChunks is how many chunk ids the sealed sidecar records.
+	ArtifactChunks int
+	// LiveChunks is how many distinct chunks the version's current documents
+	// justify.
+	LiveChunks int
+	// LiveDocs is how many documents the version's current set holds. It is what
+	// separates "this version really is small" from "this node believes the
+	// version still holds documents that were deleted from it" — two states whose
+	// dead share looks identical.
+	LiveDocs int
+	// Share is (ArtifactChunks - LiveChunks) / ArtifactChunks.
+	Share float64
 }
 
 // artifactChunkCount counts the chunk ids recorded in a version's sealed

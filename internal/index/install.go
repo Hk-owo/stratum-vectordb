@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"stratum/internal/types"
 )
 
 // installShardCount is the size of the install-lock table (see
@@ -122,6 +124,39 @@ func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versi
 	// retention pass or the startup EnforceRetention: installed, then dropped,
 	// for a version the sender just spent bandwidth shipping.
 	im.recordInterestNow(kbID, versionID)
+
+	// Report the artifact as READY on THIS node, through the same callback the
+	// build path uses.
+	//
+	// This is not bookkeeping. The control layer aggregates these reports into
+	// the version's IndexReadyNodes, and §8.6(d)'s rolling cleanup asks it "how
+	// many OTHER replicas still serve this version?" before it takes one out of
+	// service. A replica that received its artifact — which is every replica
+	// under §8.4's "build once, distribute N" — never reported one, so that count
+	// only ever held the builder. Measured on the 3+3 cluster, on a version all
+	// three replicas were serving:
+	//
+	//	index: gc: skipping collection — too few replicas would remain serving
+	//	  others_serving=0 minimum_required=2
+	//
+	// With serving_replica_min >= 2 the collection therefore could not start
+	// anywhere — the permanent-dead-weight shape the collector's own comment
+	// warns about. It was not "the deployment has no spare replica": the view was
+	// wrong.
+	//
+	// Off the caller's goroutine on purpose: this runs inside the install shard's
+	// lock, the callback is a Raft proposal, and the sender of the push is waiting
+	// on this call's ack. invokeCallback covers its own retries.
+	im.mu.Lock()
+	callbacks := append([]BuildCompleteCallback(nil), im.callbacks...)
+	im.mu.Unlock()
+	if len(callbacks) > 0 {
+		go func() {
+			for _, cb := range callbacks {
+				im.invokeCallback(cb, kbID, versionID, types.IndexStatusReady)
+			}
+		}()
+	}
 	return nil
 }
 
