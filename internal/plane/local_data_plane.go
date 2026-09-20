@@ -1006,13 +1006,36 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 	// (Stratum_设计文档v13.md §7.6).
 	source := d.pickBackfillSource(ctx, kbID, versionID-1, sourceAddr)
 
+	// The replicated metadata is read ONCE here and BOTH paths share it: the delta
+	// path needs it to know whether the gap holds a version that no longer exists, and
+	// the full-record path needs it to know whether the gap holds a version CONFIRMED
+	// deleted — which is the case transferFullState exists for. One read rather than
+	// one per path, and not one per version either: the gap may be long, and asking per
+	// version would re-read the whole version list at every step.
+	//
+	// A failed read is carried rather than resolved here, because the two paths answer
+	// it differently: the delta path turns its check OFF and replays as it did before
+	// the check existed, while the full-record path STOPS (it cannot decide what to
+	// pull without knowing what exists). The warning is emitted here so that a failure
+	// is logged once instead of once per path.
+	var existing map[int64]bool
+	var existingErr error
+	if d.versionExists != nil {
+		existing, existingErr = d.versionExists.ExistingVersions(ctx, kbID)
+		if existingErr != nil {
+			d.logger.Warn("plane: backfill cannot check which versions still exist",
+				zap.String("kb_id", kbID), zap.Int64("from_version", local),
+				zap.Int64("to_version", versionID-1), zap.Error(existingErr))
+		}
+	}
+
 	// §7.5: try the delta path first — it transfers what changed instead of every
 	// version's full record set. It only applies when the source has a record for
 	// EVERY version in the gap: a missing delta cannot be told apart from a version
 	// that changed nothing, and replaying the rest would leave a hole behind the
 	// cursor.
 	if d.changesFetcher != nil {
-		err := d.backfillByChanges(ctx, source, kbID, local, versionID)
+		err := d.backfillByChanges(ctx, source, kbID, local, versionID, existing)
 		if err == nil {
 			return nil
 		}
@@ -1025,16 +1048,12 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 		}
 	}
 
-	// Read the existing-version set ONCE, before the loop: the gap may be long, and
-	// asking per version would re-read the whole version list at every step.
-	var existing map[int64]bool
-	if d.versionExists != nil {
-		var err error
-		existing, err = d.versionExists.ExistingVersions(ctx, kbID)
-		if err != nil {
-			// "I could not find out" is not "it is gone": stop.
-			return fmt.Errorf("plane: backfill %s: read existing versions: %w", kbID, err)
-		}
+	if existingErr != nil {
+		// "I could not find out" is not "it is gone" — but unlike the delta path, this
+		// path has no conservative default to fall back on: it has to know which
+		// versions exist before it decides what to pull, so an unreadable answer stops
+		// the backfill here, exactly as it did before the read moved up.
+		return fmt.Errorf("plane: backfill %s: read existing versions: %w", kbID, existingErr)
 	}
 
 	for v := local + 1; v < versionID; v++ {
@@ -1048,7 +1067,7 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 		// fallback actually ran. Advancing the cursor over a vanished version would
 		// claim history this node never received, and the cursor's whole meaning is
 		// "contiguous up to here" (§7.5).
-		if d.versionExists != nil && !existing[v] {
+		if existing != nil && !existing[v] {
 			// §6.4: the version is confirmed gone (a middle version may be
 			// deleted), so its records exist nowhere and the gap cannot be filled
 			// version by version. Fall back to a full-state transfer.
@@ -1137,31 +1156,21 @@ var errBackfillGapIncomplete = errors.New("backfill: the gap cannot be replayed 
 //     that is missing. transferFullState exists for a gap holding a deleted
 //     version; the delta path has to hand the gap over instead of reconstructing it.
 //
-// "I could not read the metadata" is NOT "the version is gone", so a failed read
-// leaves this check OFF and the gap is replayed exactly as it was before the check
-// existed. That is the conservative direction available here: treating an
-// unreadable answer as a verdict would turn a transient metadata read failure on
-// this node into a full-state transfer — a transfer decision coupled to a local
-// read it does not belong to.
-func (d *LocalDataPlane) backfillByChanges(ctx context.Context, sourceAddr, kbID string, local, versionID int64) error {
+// "I could not read the metadata" is NOT "the version is gone", so a nil set — which
+// is what the caller passes when the read failed, or when no checker is wired at all
+// — leaves this check OFF and the gap is replayed exactly as it was before the check
+// existed. That is the conservative direction available here: treating an unreadable
+// answer as a verdict would turn a transient metadata read failure on this node into
+// a full-state transfer, a transfer decision coupled to a local read it does not
+// belong to.
+//
+// existing is the CALLER's read (see backfillTo), not one of this function's own: the
+// full-record path needs the same set, and reading it per path paid for one answer
+// twice on every gap that fell back.
+func (d *LocalDataPlane) backfillByChanges(ctx context.Context, sourceAddr, kbID string, local, versionID int64, existing map[int64]bool) error {
 	deltas, err := d.changesFetcher.ChangesInRange(ctx, sourceAddr, kbID, local, versionID-1)
 	if err != nil {
 		return fmt.Errorf("plane: delta backfill %s (%d,%d] from %s: %w", kbID, local, versionID-1, sourceAddr, err)
-	}
-
-	// One read for the whole gap, and only when there is a checker to consult:
-	// with no metadata wired there is no second opinion to have, and this
-	// function's job stays what it was.
-	var existing map[int64]bool
-	if d.versionExists != nil {
-		known, err := d.versionExists.ExistingVersions(ctx, kbID)
-		if err != nil {
-			d.logger.Warn("plane: delta backfill cannot check which versions still exist; replaying the gap as before",
-				zap.String("kb_id", kbID), zap.Int64("from_version", local),
-				zap.Int64("to_version", versionID-1), zap.Error(err))
-		} else {
-			existing = known
-		}
 	}
 
 	for v := local + 1; v < versionID; v++ {

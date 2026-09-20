@@ -230,3 +230,69 @@ func TestLocalDataPlane_BackfillReplaysWhenExistenceCannotBeRead(t *testing.T) {
 		t.Errorf("localVersion = %d, want 3 (every replayed version advances the cursor)", got)
 	}
 }
+
+// One read serves both paths. A gap that gives up on deltas and falls back to full
+// records needs the same version set the delta path just consulted, so reading it per
+// path paid for one answer twice — on the path that runs precisely when a version is
+// missing, which is the common case for a long gap.
+func TestLocalDataPlane_BackfillReadsTheVersionSetOnce(t *testing.T) {
+	tr := &tracer{}
+	puller := &stubPuller{}
+	fetcher := &recordingChangesFetcher{deltas: map[int64]wal.VersionDelta{
+		2: deltaFor(2, 1),
+		// v3 deliberately absent: the delta path gives up and the full-record path runs.
+	}}
+	existence := &stubVersionExistence{exists: map[int64]bool{1: true, 2: true, 3: true}}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		WAL:              &stubWAL{t: tr},
+		Executor:         &stubExecutor{t: tr},
+		Puller:           puller,
+		ChangesFetcher:   fetcher,
+		VersionExistence: existence,
+	})
+	dp.advanceLocalVersion("kb-1", 1)
+
+	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 4); err != nil {
+		t.Fatalf("backfillTo: %v", err)
+	}
+
+	if existence.calls != 1 {
+		t.Errorf("existing-version reads = %d, want 1: both paths share one read", existence.calls)
+	}
+	if puller.calls != 2 {
+		t.Errorf("full-record pulls = %d, want 2 (v2 and v3: the whole gap)", puller.calls)
+	}
+	if got := dp.LocalVersionOf("kb-1"); got != 3 {
+		t.Errorf("localVersion = %d, want 3", got)
+	}
+}
+
+// The two paths answer an unreadable metadata read differently, and the asymmetry is
+// deliberate: the delta path turns its check off and replays, while the full-record
+// path stops — it has to know which versions exist before it can decide what to pull,
+// so it has no conservative default to fall back on.
+func TestLocalDataPlane_BackfillStopsWhenTheVersionSetIsUnreadable(t *testing.T) {
+	tr := &tracer{}
+	puller := &stubPuller{}
+	existence := &stubVersionExistence{err: errors.New("metadata unavailable")}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		WAL:      &stubWAL{t: tr},
+		Executor: &stubExecutor{t: tr},
+		Puller:   puller,
+		// No ChangesFetcher: the delta path is not available, so the full-record path
+		// is the one that has to answer for the failed read.
+		VersionExistence: existence,
+	})
+	dp.advanceLocalVersion("kb-1", 1)
+
+	err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 4)
+	if err == nil {
+		t.Fatal("want an error: the full-record path cannot decide what to pull without the version set")
+	}
+	if puller.calls != 0 {
+		t.Errorf("full-record pulls = %d, want 0: nothing may be pulled on an unreadable version set", puller.calls)
+	}
+	if got := dp.LocalVersionOf("kb-1"); got != 1 {
+		t.Errorf("localVersion = %d, want 1 (the cursor must not move)", got)
+	}
+}
