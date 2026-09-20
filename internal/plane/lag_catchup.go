@@ -43,6 +43,49 @@ type LagCatchup struct {
 
 	mu       sync.Mutex
 	inflight map[string]bool // knowledge bases currently catching up
+
+	// tails is the latest chain-tail mirror the leader carried back, per knowledge
+	// base. Catch-up itself does not need to remember it (every report repeats it),
+	// but §8.6(d)'s tombstone scan does: "the versions with nothing after them" is
+	// exactly this map, and reading it here costs no RPC that is not already made.
+	tails map[string]int64
+}
+
+// storeTails keeps the latest mirror under the same lock as inflight. A copy, not
+// the caller's map: the caller is the sync layer's response handler and may reuse or
+// mutate what it decoded.
+func (l *LagCatchup) storeTails(tails map[string]int64) {
+	cp := make(map[string]int64, len(tails))
+	for kbID, versionID := range tails {
+		cp[kbID] = versionID
+	}
+	l.mu.Lock()
+	l.tails = cp
+	l.mu.Unlock()
+}
+
+// ChainTails returns the chain tails the leader last carried back, per knowledge
+// base — the versions with nothing after them.
+//
+// It exists for §8.6(d)'s tombstone scan, which needs those versions and would
+// otherwise have to ask the control layer again for a fact this node is handed every
+// report interval. A copy, for the same reason storeTails copies: the caller must not
+// be able to mutate the mirror, and the next report may replace it at any moment.
+//
+// An empty result means "not told yet", never "no chains" — the same reading the
+// chain_tails field documents, and the reason a caller must not treat absence as a
+// negative fact about a knowledge base.
+func (l *LagCatchup) ChainTails() map[string]int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.tails) == 0 {
+		return nil
+	}
+	cp := make(map[string]int64, len(l.tails))
+	for kbID, versionID := range l.tails {
+		cp[kbID] = versionID
+	}
+	return cp
 }
 
 // LagCatchupConfig wires a LagCatchup.
@@ -119,6 +162,10 @@ func NewLagCatchup(cfg LagCatchupConfig) *LagCatchup {
 // random — but unchanged code with a known history beats a fix whose premise was
 // false, and nothing measured the sorted version.
 func (l *LagCatchup) SetChainTails(tails map[string]int64) {
+	// Kept before any early return: a node that cannot catch up (no Ensure/Cursor) is
+	// still a node whose §8.6(d) scan wants to know where the chain ends.
+	l.storeTails(tails)
+
 	if l.cfg.Ensure == nil || l.cfg.Cursor == nil {
 		return
 	}

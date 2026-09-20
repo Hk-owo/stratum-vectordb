@@ -52,16 +52,40 @@ const (
 	chunkIDLength = 64
 )
 
-// SetActiveVersionsProvider wires the lookup §8.6(d) needs: which version is each
-// knowledge base serving right now.
+// SetActiveVersionsProvider wires one of §8.6(d)'s two target sources: which version
+// is each knowledge base serving right now.
 //
-// Only active versions are scanned, for two reasons given in §8.6(d): a version
-// with a successor is the append path's business, and a historical version is
-// queried too rarely for the cleanup to be worth its service interruption.
+// Active versions are scanned because a historical version is queried too rarely for
+// the cleanup to be worth its service interruption, and because a version WITH a
+// successor is the append path's business. The other half of that reasoning — a
+// version with no successor — is what SetChainTailVersionsProvider supplies, and it
+// is not optional in practice: CreateVersion does not move the active pointer.
 func (im *IndexManagerImpl) SetActiveVersionsProvider(fn func(ctx context.Context) (map[string]int64, error)) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 	im.activeVersions = fn
+}
+
+// SetChainTailVersionsProvider wires §8.6(d)'s second target source: the version with
+// nothing after it, per knowledge base.
+//
+// Without it the scan has a hole that is not hypothetical. CreateVersion does not move
+// the active pointer (only RollbackVersion does), so on a knowledge base that was never
+// rolled back the active map is EMPTY — the scan examines nothing at all — while the
+// tail keeps whatever tombstones its writes left. The tail is also the only version
+// that can be named for a knowledge base nobody has served yet, and it is the version
+// the append path can never reclaim (there is no append to trigger a rebuild).
+//
+// Optional: unwired means "active versions only". A storage node can wire it from the
+// chain-tail mirror its cursor report already brings back (the same signal §7.5's
+// catch-up reads), so this needs no new RPC.
+//
+// An absent knowledge base means "the control layer said nothing about it", never
+// "it has no tail" — the caller decides whether absence is worth a fallback.
+func (im *IndexManagerImpl) SetChainTailVersionsProvider(fn func(ctx context.Context) (map[string]int64, error)) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.chainTailVersions = fn
 }
 
 // SetVersionsProvider wires the authoritative version set the §8.6a cold
@@ -84,14 +108,14 @@ func (im *IndexManagerImpl) SetVersionsProvider(fn func(ctx context.Context) (ma
 // and reports, taking no part in consensus and talking to no peer.
 //
 // A negative GCSweepInterval disables it; <= 0 takes the default. It is a no-op
-// when the active-version provider is unwired (there is nothing to scan) or when
+// when BOTH target providers are unwired (there is nothing to scan) or when
 // persistence is unconfigured (there is no artifact).
 func (im *IndexManagerImpl) StartGCScanner() {
 	if im.cfg.GCSweepInterval < 0 || im.cfg.IndexDataDir == "" {
 		return
 	}
 	im.mu.Lock()
-	if im.activeVersions == nil {
+	if im.activeVersions == nil && im.chainTailVersions == nil {
 		im.mu.Unlock()
 		return
 	}
@@ -153,6 +177,16 @@ type gcCandidate struct {
 	DeadShare float64
 }
 
+// gcTarget is one (knowledge base, version) worth examining. A pair rather than two
+// separate maps, so that a version named by both sources (the served version that is
+// also the tail — the ordinary case for a fresh write) is examined ONCE: examining it
+// twice would spend a second document scan and, worse, count it twice in the
+// rejection tallies that exist to explain an empty scan.
+type gcTarget struct {
+	kbID      string
+	versionID int64
+}
+
 // scanGCCandidates reports the active versions whose artifacts carry more dead
 // weight than the threshold.
 //
@@ -163,8 +197,9 @@ type gcCandidate struct {
 func (im *IndexManagerImpl) scanGCCandidates(ctx context.Context) []gcCandidate {
 	im.mu.Lock()
 	provider := im.activeVersions
+	tailProvider := im.chainTailVersions
 	im.mu.Unlock()
-	if provider == nil || im.listDocIDs == nil || im.listChunkIDsByDocs == nil || im.cfg.IndexDataDir == "" {
+	if (provider == nil && tailProvider == nil) || im.listDocIDs == nil || im.listChunkIDsByDocs == nil || im.cfg.IndexDataDir == "" {
 		return nil
 	}
 	threshold := im.cfg.GCRatioThreshold
@@ -172,19 +207,50 @@ func (im *IndexManagerImpl) scanGCCandidates(ctx context.Context) []gcCandidate 
 		threshold = DefaultGCRatioThreshold
 	}
 
-	active, err := provider(ctx)
-	if err != nil {
-		im.logger.Warn("index: gc scan could not read the active versions", zap.Error(err))
-		return nil
+	// Two sources, one target set (see gcTarget for why the pair is the key).
+	targets := make(map[gcTarget]struct{})
+	var activeCount, tailCount int
+	if provider != nil {
+		active, err := provider(ctx)
+		if err != nil {
+			// With no active set there is nothing authoritative to scan, and treating
+			// "I could not read it" as "there is nothing" would silently drop every
+			// served version: skip the scan and try next time.
+			im.logger.Warn("index: gc scan could not read the active versions", zap.Error(err))
+			return nil
+		}
+		activeCount = len(active)
+		for kbID, versionID := range active {
+			if versionID > 0 {
+				targets[gcTarget{kbID: kbID, versionID: versionID}] = struct{}{}
+			}
+		}
 	}
-	// One line per scan, because the two ways this can find nothing — "the control
-	// layer reports no active version" and "the candidate judgement rejected them
-	// all" — look identical from the outside (nothing gets collected either way) and
-	// have entirely different causes. One line per scan is affordable: production
-	// scans every few minutes, and a test that shortens that to seconds is exactly
-	// when you want to see this.
-	im.logger.Info("index: gc scan read the active versions",
-		zap.Int("active_versions", len(active)), zap.Float64("threshold", threshold))
+	if tailProvider != nil {
+		tails, err := tailProvider(ctx)
+		if err != nil {
+			// Only the tails are lost, so this scan still has the active versions to
+			// work with: report and carry on rather than dropping a scan that can
+			// still find something.
+			im.logger.Warn("index: gc scan could not read the chain tails", zap.Error(err))
+		} else {
+			tailCount = len(tails)
+			for kbID, versionID := range tails {
+				if versionID > 0 {
+					targets[gcTarget{kbID: kbID, versionID: versionID}] = struct{}{}
+				}
+			}
+		}
+	}
+	// One line per scan, because the ways this can find nothing — "the control layer
+	// reported neither an active version nor a tail", "the two sources named the same
+	// version", and "the candidate judgement rejected them all" — look identical from
+	// the outside (nothing gets collected either way) and have entirely different
+	// causes. One line per scan is affordable: production scans every few minutes, and
+	// a test that shortens that to seconds is exactly when you want to see this.
+	im.logger.Info("index: gc scan read its targets",
+		zap.Int("active_versions", activeCount), zap.Int("chain_tails", tailCount),
+		zap.Int("targets", len(targets)), zap.Float64("threshold", threshold))
 	// Why each version was rejected, as counts.
 	//
 	// The line above says how many versions were examined; this one says which of
@@ -197,7 +263,8 @@ func (im *IndexManagerImpl) scanGCCandidates(ctx context.Context) []gcCandidate 
 	var missingArtifact, missingSidecar, unestimable, belowThreshold int
 	var maxShare float64
 	var candidates []gcCandidate
-	for kbID, versionID := range active {
+	for t := range targets {
+		kbID, versionID := t.kbID, t.versionID
 		// A SEALED artifact is the prerequisite: the unsealed remains of a dead
 		// build are §8.8's business, and this node may not hold the version at
 		// all (the active version is served by whoever was picked for it).
@@ -235,7 +302,7 @@ func (im *IndexManagerImpl) scanGCCandidates(ctx context.Context) []gcCandidate 
 		candidates = append(candidates, gcCandidate{KBID: kbID, VersionID: versionID, DeadShare: est.Share})
 	}
 	im.logger.Info("index: gc scan result",
-		zap.Int("examined", len(active)),
+		zap.Int("examined", len(targets)),
 		zap.Int("no_artifact", missingArtifact),
 		zap.Int("no_sidecar", missingSidecar),
 		zap.Int("unestimable", unestimable),

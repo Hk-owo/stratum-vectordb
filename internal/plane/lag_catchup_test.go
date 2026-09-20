@@ -205,3 +205,30 @@ func TestLagCatchup_JitterIsBoundedAndDelaysTheStart(t *testing.T) {
 		t.Fatalf("jitter = %v, want it inside [0, 500ms)", slept[0])
 	}
 }
+
+// TestLagCatchup_ChainTailsKeepsTheMirrorWithoutCatchUpWiring: §8.6(d)'s tombstone scan
+// reads the tail mirror, and a node that cannot catch up (no Ensure/Cursor wired) is
+// still a node whose scan wants to know where the chain ends. The returned map is a
+// copy — the caller must not be able to mutate the mirror the next report replaces.
+func TestLagCatchup_ChainTailsKeepsTheMirrorWithoutCatchUpWiring(t *testing.T) {
+	lc := NewLagCatchup(LagCatchupConfig{})
+	lc.SetChainTails(map[string]int64{"kb-1": 7})
+
+	got := lc.ChainTails()
+	if len(got) != 1 || got["kb-1"] != 7 {
+		t.Fatalf("ChainTails = %v, want kb-1→7 kept even without catch-up wiring", got)
+	}
+
+	got["kb-1"] = 99
+	got["kb-2"] = 1
+	again := lc.ChainTails()
+	if again["kb-1"] != 7 || len(again) != 1 {
+		t.Fatalf("ChainTails handed out the live mirror: %v", again)
+	}
+
+	// "Not told yet" must read as nil rather than as an empty set: the difference
+	// matters to callers that treat absence as a fact about a knowledge base.
+	if empty := NewLagCatchup(LagCatchupConfig{}).ChainTails(); empty != nil {
+		t.Errorf("an unwired mirror = %v, want nil", empty)
+	}
+}

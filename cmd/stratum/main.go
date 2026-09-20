@@ -1275,7 +1275,7 @@ func main() {
 	// deployment, so the gate belongs here, in the assembly.
 	var chainTails stratumsync.ChainTailSink
 	if storageLocal {
-		chainTails = plane.NewLagCatchup(plane.LagCatchupConfig{
+		lagCatchup := plane.NewLagCatchup(plane.LagCatchupConfig{
 			MinLagVersions:   int64(cfg.LagCatchupMinLagVersions),
 			Jitter:           time.Duration(cfg.LagCatchupJitterMS) * time.Millisecond,
 			MaxConcurrentKBs: cfg.LagCatchupMaxConcurrentKBs,
@@ -1283,6 +1283,20 @@ func main() {
 			Cursor:           dataPlane.DataVersionsSnapshot,
 			Logger:           logger,
 		})
+		chainTails = lagCatchup
+
+		// §8.6(d): the tombstone scan targets the versions a later append can never
+		// clean up — the one being served AND the one at the chain tail. "Served" alone
+		// leaves a hole that is not hypothetical: CreateVersion does not move the active
+		// pointer (only RollbackVersion does), so a knowledge base that was never rolled
+		// back has an EMPTY active set, the scan examines nothing, and its tail keeps
+		// whatever tombstones its writes left. The tail comes from the mirror the leader
+		// already feeds this node on every cursor report — no new RPC.
+		if indexMgr != nil {
+			indexMgr.SetChainTailVersionsProvider(func(context.Context) (map[string]int64, error) {
+				return lagCatchup.ChainTails(), nil
+			})
+		}
 		// Say so at startup: the pace it runs at is otherwise invisible until it does
 		// something, and "nothing happened" is exactly what an operator needs to be able
 		// to tell apart from "it is not wired".

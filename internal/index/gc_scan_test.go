@@ -256,3 +256,53 @@ func TestLooksLikeChunkID(t *testing.T) {
 		}
 	}
 }
+
+// TestGCScan_ReportsAChainTailThatNothingServes: the second target source. On a
+// knowledge base that was never rolled back the active map is empty, so without the
+// tail the scan examines nothing at all — and the tail is exactly the version the
+// append path can never reclaim (there is no successor to trigger a rebuild).
+func TestGCScan_ReportsAChainTailThatNothingServes(t *testing.T) {
+	dir := t.TempDir()
+	all := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		all = append(all, gcChunkID(i))
+	}
+	gcArtifact(t, dir, "kb-1", 7, gcHeader(), all)
+
+	// Nothing is active: the tail is the only thing that can name this version.
+	im := newGCManager(t, dir, map[int64][]string{7: all[:5]}, nil)
+	im.SetChainTailVersionsProvider(func(context.Context) (map[string]int64, error) {
+		return map[string]int64{"kb-1": 7}, nil
+	})
+
+	got := im.scanGCCandidates(context.Background())
+	if len(got) != 1 || got[0].VersionID != 7 {
+		t.Fatalf("candidates = %v, want exactly kb-1 v7 from the chain tail", got)
+	}
+	if want := 0.5; got[0].DeadShare != want {
+		t.Fatalf("dead share = %v, want %v", got[0].DeadShare, want)
+	}
+}
+
+// TestGCScan_ExaminesAVersionNamedByBothSourcesOnce: the served version that is also
+// the tail is the ordinary case (a fresh write, nothing rolled back yet), and
+// examining it twice would spend a second document scan and count it twice in the
+// rejection tallies that exist to explain an empty result.
+func TestGCScan_ExaminesAVersionNamedByBothSourcesOnce(t *testing.T) {
+	dir := t.TempDir()
+	all := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		all = append(all, gcChunkID(i))
+	}
+	gcArtifact(t, dir, "kb-1", 7, gcHeader(), all)
+
+	im := newGCManager(t, dir, map[int64][]string{7: all[:5]}, map[string]int64{"kb-1": 7})
+	im.SetChainTailVersionsProvider(func(context.Context) (map[string]int64, error) {
+		return map[string]int64{"kb-1": 7}, nil
+	})
+
+	got := im.scanGCCandidates(context.Background())
+	if len(got) != 1 {
+		t.Fatalf("candidates = %v, want one: the two sources named the same version", got)
+	}
+}

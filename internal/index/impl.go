@@ -432,6 +432,12 @@ type IndexManagerImpl struct {
 	// scanner entirely.
 	activeVersions func(ctx context.Context) (map[string]int64, error)
 
+	// chainTailVersions reports, per knowledge base, the version at the TAIL of the
+	// replicated chain — the second source of §8.6(d) targets (see
+	// SetChainTailVersionsProvider for why the active version alone leaves a hole).
+	// Optional: unwired means "active versions only", the pre-existing behaviour.
+	chainTailVersions func(ctx context.Context) (map[string]int64, error)
+
 	// gcCancel/gcWG govern the §8.6(d) background scanner. gcCancel is nil
 	// while it is off.
 	gcCancel context.CancelFunc
