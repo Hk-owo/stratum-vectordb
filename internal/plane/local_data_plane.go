@@ -470,7 +470,7 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 		// to "another candidate may have it". The message carries the diagnosis,
 		// since the sentinel alone cannot say which of the two reasons applies.
 		return fmt.Errorf("%w: EnsureIndex(%s, %d): no data source known yet "+
-			"(nothing has announced it and there is no leader to fall back on)",
+			"(no replica has announced this version, and no leader is a usable data source in this topology)",
 			stratumerrors.ErrIndexNotReady, kbID, versionID)
 	}
 

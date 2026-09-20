@@ -585,6 +585,24 @@ func main() {
 		}
 	}
 
+	// dataSourceAddrs is the set of addresses that can hold version data at all:
+	// the declared storage group when there is one, otherwise every Raft member
+	// (before the split every member also stored — the same fallback
+	// resolveReplicaAddrs makes below).
+	//
+	// It exists to keep the data-source lookup from naming a CONTROL node in a
+	// split deployment; see the resolver's third layer for what that cost.
+	dataSourceAddrs := make(map[string]bool, len(cfg.StorageNodes))
+	if len(cfg.StorageNodes) > 0 {
+		for _, n := range cfg.StorageNodes {
+			dataSourceAddrs[n.Addr] = true
+		}
+	} else {
+		for _, addr := range peerAddrByID {
+			dataSourceAddrs[addr] = true
+		}
+	}
+
 	// localAddr is this node's own service address as its peers see it: the
 	// address the dispatcher falls back to for local coordination, and the one a
 	// writer announces so replicas can find the data it just wrote. A storage
@@ -819,8 +837,24 @@ func main() {
 			if !ok {
 				return "", false, fmt.Errorf("sync: leader address unknown for node ID %d", status.LeaderID)
 			}
+			// §4 layer 3 的"回退问 leader"只在 **leader 自己也存数据** 时才成立 —— 那是
+			// 两层分层之前的形状。分层后 leader 是控制节点：它没有数据层，唯一可能的
+			// 回答是 `Unimplemented: this node exports no data`。把它的地址交出去不是
+			// "开始一次拉取"，而是一个不可能收敛的循环 —— EnsureIndex 每次重试都会重新
+			// 解析(必须如此:写入者要等自己的写落盘才公告自己)，lag catch-up 又每几秒
+			// 重入一次，每一轮都白付一次到控制节点的 gRPC。实测(3+3 集群):单个知识库
+			// 100+ 次失败，全部落在 Unimplemented 上，目标地址都是控制节点。
+			//
+			// 返回 ok=false 现在是安全的:EnsureIndex 把它变成可重试错误而不是静默成功，
+			// 所以调用方会继续等第一层(写入者公告)或第二层(holders 镜像)指名一个真正
+			// 持有该版本的副本。
+			if !dataSourceAddrs[addr] {
+				logger.Debug("sync: the leader holds no data in this topology; deferring to the announced sources",
+					zap.Int64("leader_id", status.LeaderID), zap.String("leader_addr", addr))
+				return "", false, nil
+			}
 			return addr, true, nil
-		}),
+		}, func(addr string) bool { return dataSourceAddrs[addr] }),
 		// §8.5: announce this node as the holder of the versions it writes, so
 		// replicas learn where the data is. It is its own DataSyncService
 		// address — the same gRPC endpoint serves every service.

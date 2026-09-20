@@ -102,27 +102,64 @@ func (r *DataSourceRegistry) Len() int {
 //     mirror is filled by the report heartbeat even when this node's own
 //     confirmation never arrived, which is what makes a replica that missed one
 //     still able to find a source (docs/data-source-holders-fallback-plan.md);
-//  3. the pre-§8.5 answer — the leader. In a two-tier deployment that address
-//     exports no data and refuses, but it is what starts the pull loop: an
-//     ok=false here makes EnsureIndex give up silently, which is worse than an
-//     address that fails.
+//  3. the pre-§8.5 answer — the leader.
+//
+// What every layer's answer must pass is dataCapable: "this address can hold
+// version data at all". Layer 3 is where that check earns its keep. Its
+// reasoning — "ask the leader" — predates the two-tier split, when the leader
+// also stored; in a split deployment the leader is a CONTROL node with no data
+// layer, so answering with its address does not start a pull, it starts a loop
+// that cannot converge: EnsureIndex re-resolves on every attempt (it has to —
+// the writer announces itself only after its own writes land) and the lag
+// catch-up re-enters every few seconds, each round paying a gRPC to a node whose
+// only possible answer is `Unimplemented: this node exports no data`. Measured
+// on the 3+3 cluster: 100+ such failures for a single knowledge base, spread
+// over several versions, all of them pointing at a control node.
+//
+// The earlier reasoning for allowing it anyway — "an ok=false here makes
+// EnsureIndex give up silently, which is worse than an address that fails" — no
+// longer holds: EnsureIndex turns ok=false into a retryable error
+// (ErrIndexNotReady) rather than a silent success, so declining to name a
+// source keeps the caller waiting for layer 1 or 2 to name a replica that
+// really holds the version.
 //
 // All three layers are pure map reads, and nothing on this path dials a peer —
 // that is the whole point (see §8.5's history above). Layer 2 is filled by the
 // report heartbeat's response, never by a call from here: the answer arrives
 // carrying the interval this node already sends.
-func ResolverWithRegistry(reg *DataSourceRegistry, holders *HoldersCache, fallback SourceResolver) SourceResolver {
+//
+// dataCapable may be nil, which disables the check (the single-tier shape, and
+// every unit test that does not care about topology).
+func ResolverWithRegistry(reg *DataSourceRegistry, holders *HoldersCache, fallback SourceResolver, dataCapable func(addr string) bool) SourceResolver {
+	usable := func(addr string) bool { return dataCapable == nil || dataCapable(addr) }
 	return func(ctx context.Context, kbID string, versionID int64) (string, bool, error) {
-		if addr, ok := reg.Lookup(kbID, versionID); ok {
+		if addr, ok := reg.Lookup(kbID, versionID); ok && usable(addr) {
 			return addr, true, nil
 		}
 		if holders != nil {
-			if addrs, ok := holders.Lookup(kbID, versionID); ok && len(addrs) > 0 {
+			if addrs, ok := holders.Lookup(kbID, versionID); ok {
 				// Ascending node id ⇒ reproducible; the rest are retry
-				// candidates for callers that keep the list.
-				return addrs[0], true, nil
+				// candidates for callers that keep the list. The first one that
+				// can actually hold data wins, rather than mechanically addrs[0]:
+				// a mirror entry that cannot serve would otherwise shadow the
+				// entries that can.
+				for _, addr := range addrs {
+					if usable(addr) {
+						return addr, true, nil
+					}
+				}
 			}
 		}
-		return fallback(ctx, kbID, versionID)
+		addr, ok, err := fallback(ctx, kbID, versionID)
+		if err != nil || !ok {
+			return addr, ok, err
+		}
+		// The last answer is checked too, so the invariant is the resolver's own
+		// rather than each caller's: what comes out of it can hold data. Layer 3
+		// is the one that needs it most — see the note above.
+		if !usable(addr) {
+			return "", false, nil
+		}
+		return addr, true, nil
 	}
 }

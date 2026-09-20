@@ -533,7 +533,7 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 | `TestT4_MultiVersionEviction` | 多版本分级换出的稳定性 | 8 版本 × 3 轮轮转,每个版本始终应答 |
 | `TestT4_GCPressure` | 墓碑回收的端到端可见性(写入 → 删除 → 观察产物 → 查询仍正确) | **SKIP**:开关这一轮是开的(`index_manager.gc_enabled: true`),但扫描器每 5 s 跑一轮、一个候选都没判出来——产物确实带着 2,379 个 chunk 的墓碑(删 1,600 / 2,000 后按估计 dead share ≈ 0.76 ≫ 阈值 0.2),所以这不是"没得收",而是判据没命中。原因未定,证据与下一步见 `docs/stress-test-report.md` §6 |
 
-测量类用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`(20,000 篇建议 `90m`)。**这一轮压测还抓到四条缺陷**(落后追赶的数据源解析落到控制节点、20,000 篇增量拉取的 30 s 窗口不收敛、GC 判据未命中、**未收敛的副本把"我还不能服务"答成"这里没有匹配的文档"**),证据与修复见 `docs/stress-test-report.md` §7。最后一条最重且**本轮已修**:过滤侧与索引扫描侧各把一处"空"当成了答案,于是一个还在追赶的副本会返回 `results=0, err=nil`——与"确实没有相关文档"在响应上无法区分。两处都改判成可重试的 `index_not_ready`,各有"撤掉修复即变红"的单测锁住。
+测量类用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`(20,000 篇建议 `90m`)。**这一轮压测还抓到四条缺陷**(落后追赶的数据源解析落到控制节点、20,000 篇增量拉取的 30 s 窗口不收敛、GC 判据未命中、未收敛的副本把"我还不能服务"答成"这里没有匹配的文档"),证据与修复见 `docs/stress-test-report.md` §7。其中**两条本轮已修**:① 的数据源解析现在只接受存储层地址(控制节点被排除,实测 `this node exports no data` 从每知识库上百次降到 0,并补上了"候选为什么被排除"的日志);④ 的过滤侧与索引扫描侧各把一处"空"当成了答案,现在都改判成可重试的 `index_not_ready`。两条修复都带"撤掉即变红"的单测。
 
 ```bash
 STRATUM_STRESS_DOCS=20000 STRATUM_STRESS_TIMEOUT=90m STRATUM_INDEX_BUILD_TIMEOUT=25m \

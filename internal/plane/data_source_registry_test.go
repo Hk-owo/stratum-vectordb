@@ -75,7 +75,7 @@ func TestResolverWithRegistryPrefersAnnouncedSourceAndFallsBack(t *testing.T) {
 		fallbackCalls++
 		return "leader:7000", true, nil
 	}
-	resolve := ResolverWithRegistry(reg, nil, fallback)
+	resolve := ResolverWithRegistry(reg, nil, fallback, nil)
 
 	addr, ok, err := resolve(context.Background(), "kb-1", 3)
 	if err != nil || !ok || addr != "leader:7000" {
@@ -104,7 +104,7 @@ func TestResolverWithRegistryPropagatesFallbackErrors(t *testing.T) {
 	wantErr := errors.New("no leader")
 	resolve := ResolverWithRegistry(NewDataSourceRegistry(), nil, func(context.Context, string, int64) (string, bool, error) {
 		return "", false, wantErr
-	})
+	}, nil)
 	if _, _, err := resolve(context.Background(), "kb-1", 1); !errors.Is(err, wantErr) {
 		t.Fatalf("err = %v, want the fallback's error", err)
 	}
@@ -116,7 +116,7 @@ func TestResolverWithRegistryPropagatesFallbackErrors(t *testing.T) {
 func TestResolverWithRegistryToleratesNilRegistry(t *testing.T) {
 	resolve := ResolverWithRegistry(nil, nil, func(context.Context, string, int64) (string, bool, error) {
 		return "leader:7000", true, nil
-	})
+	}, nil)
 	if addr, ok, err := resolve(context.Background(), "kb-1", 1); err != nil || !ok || addr != "leader:7000" {
 		t.Fatalf("resolve = (%q, %v, %v), want the fallback", addr, ok, err)
 	}
@@ -132,7 +132,7 @@ func TestResolverWithRegistryPrefersAnnouncementOverHolders(t *testing.T) {
 
 	resolve := ResolverWithRegistry(reg, holders, func(context.Context, string, int64) (string, bool, error) {
 		return "leader:7000", true, nil
-	})
+	}, nil)
 	if addr, ok, err := resolve(context.Background(), "kb-1", 3); err != nil || !ok || addr != "writer:7001" {
 		t.Fatalf("resolve = (%q, %v, %v), want the announced writer", addr, ok, err)
 	}
@@ -151,7 +151,7 @@ func TestResolverWithRegistryAnswersFromHoldersBeforeFallingBack(t *testing.T) {
 	}
 	holders := NewHoldersCache(HoldersCacheConfig{})
 	holders.Store("kb-1", 5, []string{"holder-a:7001", "holder-b:7002"})
-	resolve := ResolverWithRegistry(reg, holders, fallback)
+	resolve := ResolverWithRegistry(reg, holders, fallback, nil)
 
 	// Ascending node id ⇒ the first address is the reproducible first choice.
 	addr, ok, err := resolve(context.Background(), "kb-1", 5)
@@ -191,7 +191,7 @@ func TestResolverWithRegistryUsesTheMirrorAndNeverDials(t *testing.T) {
 	resolve := ResolverWithRegistry(NewDataSourceRegistry(), holders, func(context.Context, string, int64) (string, bool, error) {
 		calls++
 		return "leader:7000", true, nil
-	})
+	}, nil)
 
 	// A hit on the mirror: no fallback, no dial.
 	if addr, ok, err := resolve(context.Background(), "kb-1", 4); err != nil || !ok || addr != "holder:7001" {
@@ -208,5 +208,60 @@ func TestResolverWithRegistryUsesTheMirrorAndNeverDials(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("fallback calls = %d, want 1", calls)
+	}
+}
+
+// Not every address can hold data: in a split deployment the control tier holds
+// none, and its leader is what §4 layer 3 used to answer with. Every layer must
+// be able to refuse such an address, or a replica keeps pulling from a node
+// whose only possible answer is `Unimplemented: this node exports no data`.
+//
+// Measured on the 3+3 cluster before this was fixed: 100+ failures for a single
+// knowledge base, spread over several versions, every one of them under
+// Unimplemented and every one aimed at a control node — and none of them could
+// ever succeed, because EnsureIndex re-resolves on each attempt (it must: the
+// writer announces itself only after its own writes land) while the lag
+// catch-up re-enters every few seconds.
+func TestResolverWithRegistrySkipsSourcesThatCannotHoldData(t *testing.T) {
+	ctx := context.Background()
+	canHold := func(addr string) bool {
+		return addr == "storage1:7000" || addr == "storage2:7000"
+	}
+	unusableFallback := func(context.Context, string, int64) (string, bool, error) {
+		return "control1:7000", true, nil
+	}
+
+	// Layer 2: an entry that cannot hold data must not shadow one that can.
+	holders := NewHoldersCache(HoldersCacheConfig{})
+	holders.Store("kb-1", 5, []string{"control1:7000", "storage2:7000"})
+	resolve := ResolverWithRegistry(NewDataSourceRegistry(), holders, unusableFallback, canHold)
+	if addr, ok, err := resolve(ctx, "kb-1", 5); err != nil || !ok || addr != "storage2:7000" {
+		t.Fatalf("resolve = (%q, %v, %v), want the mirror entry that can hold data", addr, ok, err)
+	}
+
+	// Layer 1: an announcement that cannot hold data is not a source either.
+	reg := NewDataSourceRegistry()
+	reg.Register("kb-2", 1, "control3:7000")
+	holders.Store("kb-2", 1, []string{"storage1:7000"})
+	resolve = ResolverWithRegistry(reg, holders, unusableFallback, canHold)
+	if addr, ok, err := resolve(ctx, "kb-2", 1); err != nil || !ok || addr != "storage1:7000" {
+		t.Fatalf("resolve = (%q, %v, %v), want the mirror entry rather than the unusable announcement", addr, ok, err)
+	}
+
+	// Layer 3: a fallback naming an address that cannot hold data is declined
+	// here rather than passed on. The invariant is the resolver's own — what
+	// comes out of it can hold data — so a caller (EnsureIndex) turns the refusal
+	// into a retryable error and keeps waiting, instead of looping on a node that
+	// can only refuse.
+	resolve = ResolverWithRegistry(NewDataSourceRegistry(), nil, unusableFallback, canHold)
+	if addr, ok, err := resolve(ctx, "kb-9", 1); err != nil || ok || addr != "" {
+		t.Fatalf("resolve = (%q, %v, %v), want a refusal (no usable source)", addr, ok, err)
+	}
+
+	// nil disables the check: the single-tier shape, where the leader does store,
+	// must keep every answer it used to give.
+	resolve = ResolverWithRegistry(NewDataSourceRegistry(), nil, unusableFallback, nil)
+	if addr, ok, err := resolve(ctx, "kb-3", 1); err != nil || !ok || addr != "control1:7000" {
+		t.Fatalf("resolve = (%q, %v, %v), want the fallback untouched (no topology check)", addr, ok, err)
 	}
 }
