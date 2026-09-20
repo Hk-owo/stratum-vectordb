@@ -384,7 +384,7 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 
 ## 性能实测
 
-> 以下为 **2026-09-20** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,由 `scripts/cluster.sh --topology two-tier` 起集群、经服务站测量。宿主 **12 核 / 15 GB**,容器与压测进程共享这台机器。**完整口径、原始数据与四条发现(其中三条本轮已修)见 `docs/stress-test-report.md`**,本节只是它的摘要。
+> 以下为 **2026-09-20** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,由 `scripts/cluster.sh --topology two-tier` 起集群、经服务站测量。宿主 **12 核 / 15 GB**,容器与压测进程共享这台机器。**完整口径、原始数据与四条发现(四条本轮都已修)见 `docs/stress-test-report.md`**,本节只是它的摘要。
 
 ### 查询延迟
 
@@ -533,7 +533,7 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 | `TestT4_MultiVersionEviction` | 多版本分级换出的稳定性 | 8 版本 × 3 轮轮转,每个版本始终应答 |
 | `TestT4_GCPressure` | 墓碑回收的端到端可见性(写入 → 删除 → 观察产物 → 查询仍正确) | **跑通了**:产物 99,194,878 B → **49,282,907 B(回收 50.3%)**,收集后查询仍返回结果;用时 43.7 s。这条路以前从来没真正跑通过——它被四层套着的因果挡着(delta 为空导致 §8.6(c) 重建、判据无日志、分发获得的副本不上报 READY、`IndexReadyNodes` 不过 wire),见 `docs/stress-test-report.md` §6 |
 
-测量类用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`(20,000 篇建议 `90m`)。**这一轮压测还抓到四条缺陷,其中三条已修**(详见 `docs/stress-test-report.md`):① 落后追赶的数据源解析会落到控制节点 ⇒ 现在只接受存储层地址(实测 `this node exports no data` 从每知识库上百次降到 0);③ §8.6(d) 的收集链路被四层因果挡死 ⇒ 拆到底后首次跑通,回收 50.3%(其中两个是生产缺陷:分发获得产物的副本**不上报 READY**、`IndexReadyNodes` **不过 wire**);④ 未收敛的副本把"我还不能服务"答成"这里没有匹配的文档" ⇒ 两处"空"都改判成可重试的 `index_not_ready`。**剩下未修的是 ②**:20,000 篇规模下增量拉取的 30 s 固定窗口不收敛。已修的每条都带"撤掉即变红"的单测。
+测量类用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`(20,000 篇建议 `90m`)。**这一轮压测抓到四条缺陷,四条都已修**(详见 `docs/stress-test-report.md`):① 落后追赶的数据源解析会落到控制节点 ⇒ 现在只接受存储层地址(实测 `this node exports no data` 从每知识库上百次降到 0);② 大版本的拉取窗口是固定墙钟(15 s 盖住握手+整条流、30 s 盖住整个拉取循环且重试沿用同一窗口) ⇒ 改成**按无进展计时**+绝对上界,20,000 篇的副本补齐从"永不收敛"变成 28 s 追上,`DeadlineExceeded` 64 → 0;③ §8.6(d) 的收集链路被四层因果挡死 ⇒ 拆到底后首次跑通,回收 50.3%(其中两个是生产缺陷:分发获得产物的副本**不上报 READY**、`IndexReadyNodes` **不过 wire**);④ 未收敛的副本把"我还不能服务"答成"这里没有匹配的文档" ⇒ 两处"空"都改判成可重试的 `index_not_ready`。每条都带"撤掉即变红"的单测。
 
 ```bash
 STRATUM_STRESS_DOCS=20000 STRATUM_STRESS_TIMEOUT=90m STRATUM_INDEX_BUILD_TIMEOUT=25m \

@@ -196,6 +196,12 @@ type LocalDataPlane struct {
 	confirmer     WriteConfirmer
 	indexReader   IndexReader
 	indexShipper  IndexShipper
+	// pullIdleTimeout / pullMaxDuration bound the EnsureIndex pull loop by
+	// PROGRESS and by an absolute ceiling respectively (see the loop's comment).
+	// Zero means the Default* constants; the config carries them so a test can
+	// exercise the loop's bounds without waiting out 30 s.
+	pullIdleTimeout time.Duration
+	pullMaxDuration time.Duration
 	// indexPushSem bounds how many PushIndexToReplicas runs may be in flight at
 	// once. One run reads a whole index file into memory and ships it to N
 	// replicas, so this is simultaneously the cap on distribution's memory peak
@@ -288,6 +294,14 @@ type LocalDataPlaneConfig struct {
 	// this version's data lives (§8.5). Empty means "do not announce": the
 	// confirmation keeps its pre-§8.5 shape and receivers learn nothing.
 	SelfDataSyncAddr string
+	// PullIdleTimeout bounds how long the pull loop may go WITHOUT progress before
+	// it gives up. <= 0 means DefaultPullIdleTimeout. Progress is a completed
+	// transfer, not a clock tick — see EnsureIndex's pull loop.
+	PullIdleTimeout time.Duration
+	// PullMaxDuration is the pull loop's absolute ceiling, so a loop that keeps
+	// making a little progress forever still ends. <= 0 means
+	// DefaultPullMaxDuration.
+	PullMaxDuration time.Duration
 	// WAL frames the storage layer's write transaction (WriteVersionData).
 	WAL TransactionWAL
 	// CursorWAL persists this node's contiguous data cursor, so a restart reads
@@ -405,6 +419,8 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		indexShipper:     cfg.IndexShipper,
 		indexPushSem:     newIndexPushSem(cfg.MaxConcurrentIndexPush),
 		selfDataSyncAddr: cfg.SelfDataSyncAddr,
+		pullIdleTimeout:  cfg.PullIdleTimeout,
+		pullMaxDuration:  cfg.PullMaxDuration,
 		limiter:          newWriteLimiter(cfg.MaxInFlightWrites),
 		logger:           logger,
 		localVersion:     make(map[string]int64),
@@ -416,6 +432,18 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 }
 
 var _ DataPlane = (*LocalDataPlane)(nil)
+
+// DefaultPullIdleTimeout is how long a pull loop may go without a completed
+// transfer before it gives up (LocalDataPlaneConfig.PullIdleTimeout).
+//
+// PROGRESS is what this bounds, not elapsed time: a transfer that is merely large
+// is not a failure, and a 20,000-document version (~56 MB) does not fit in any
+// fixed window that a small one also fits in.
+const DefaultPullIdleTimeout = 30 * time.Second
+
+// DefaultPullMaxDuration is the pull loop's absolute ceiling, so a loop that makes
+// a little progress forever still ends (LocalDataPlaneConfig.PullMaxDuration).
+const DefaultPullMaxDuration = 10 * time.Minute
 
 // EnsureIndex brings (kbID, versionID) to a queryable state on this node:
 // the version's data is fetched if this node does not hold it yet — the
@@ -490,8 +518,33 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 	// pull arrives before the writer's writes land. If the digest never
 	// arrives (a missed propose on the writer), a pull that produced data is
 	// accepted (the verifier's fallback).
-	const pullTimeout = 30 * time.Second
-	deadline := time.Now().Add(pullTimeout)
+	// The loop's bound is about PROGRESS, not about wall clock.
+	//
+	// It used to be a flat 30 s over the whole loop. That works for a small version
+	// and is impossible for a large one: a 20,000-document version is ~56 MB, which
+	// does not cross the wire, land, and get applied inside 30 s — so every attempt
+	// timed out, and the retry used the same 30 s, which means the loop could not
+	// converge at any number of attempts. Measured on the 3+3 cluster: 64 rounds of
+	// `sync: recv SyncEntry: ... DeadlineExceeded` followed by "version data did not
+	// converge within 30s", while the same transfer completed perfectly well once
+	// given room.
+	//
+	// What failure actually looks like here — an unreachable peer, a source that no
+	// longer holds the version, a stream that keeps being refused — is attempts that
+	// make NO progress. So idle time is what gets bounded, with an absolute ceiling
+	// so that a pathological loop still ends.
+	pullIdleTimeout := d.pullIdleTimeout
+	if pullIdleTimeout <= 0 {
+		pullIdleTimeout = DefaultPullIdleTimeout
+	}
+	pullMaxDuration := d.pullMaxDuration
+	if pullMaxDuration <= 0 {
+		pullMaxDuration = DefaultPullMaxDuration
+	}
+	start := time.Now()
+	lastProgress := start
+	attempts := 0
+	var lastErr error
 	backoff := 200 * time.Millisecond
 	for {
 		// Re-checked every attempt: when this node is the coordinator, its own
@@ -513,31 +566,61 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 		} else if freshOK && fresh != addr {
 			addr = fresh
 		}
-		if err := d.puller.PullVersion(ctx, addr, kbID, versionID); err != nil {
+		attempts++
+		err := d.puller.PullVersion(ctx, addr, kbID, versionID)
+		if err != nil {
+			lastErr = err
 			d.logger.Warn("plane: data pull failed, will retry",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-		} else if d.verify(ctx, kbID, versionID) {
-			d.advanceLocalVersion(kbID, versionID)
-			return nil
-		} else if empty, emptyErr := d.versionHasNoDocuments(ctx, kbID, versionID); emptyErr == nil && empty {
-			// The pull succeeded and the version holds no documents — so the
-			// empty set IS its content. Waiting for a digest here means waiting
-			// forever: a writer never commits one for a version with no document
-			// set. The cursor would stay below a version this node in fact
-			// holds, which is what made a freshly created knowledge base answer
-			// "local history reaches version 0" to the station's freshness
-			// check (§9.3(2)) and refuse the query.
-			//
-			// Gated on the pull having SUCCEEDED just above: a pull that failed
-			// never reaches here, so a broken transfer can never be mistaken for
-			// an empty version.
-			d.advanceLocalVersion(kbID, versionID)
-			return nil
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Int("attempt", attempts),
+				zap.Duration("no_progress_for", time.Since(lastProgress)),
+				zap.Error(err))
+		} else {
+			// A COMPLETED transfer is progress, and it is recorded before the
+			// verification: the writer commits the version's digest only after its own
+			// storage writes finish, so "the data is here and the digest is not yet" is
+			// a reason to keep going, not to give up. Counting it as progress is what
+			// lets a large version finish across several attempts instead of timing out
+			// on a clock that was never about the data.
+			lastProgress = time.Now()
+			lastErr = nil
+			if d.verify(ctx, kbID, versionID) {
+				d.advanceLocalVersion(kbID, versionID)
+				return nil
+			}
+			if empty, emptyErr := d.versionHasNoDocuments(ctx, kbID, versionID); emptyErr == nil && empty {
+				// The pull succeeded and the version holds no documents — so the
+				// empty set IS its content. Waiting for a digest here means waiting
+				// forever: a writer never commits one for a version with no document
+				// set. The cursor would stay below a version this node in fact
+				// holds, which is what made a freshly created knowledge base answer
+				// "local history reaches version 0" to the station's freshness
+				// check (§9.3(2)) and refuse the query.
+				//
+				// Gated on the pull having SUCCEEDED just above: a pull that failed
+				// never reaches here, so a broken transfer can never be mistaken for
+				// an empty version.
+				d.advanceLocalVersion(kbID, versionID)
+				return nil
+			}
 		}
-		if time.Now().After(deadline) {
+		// Both ceilings carry the diagnosis the old message could not: how far this
+		// node got, how many attempts were spent, and what the last attempt said. A
+		// bare "did not converge within 30s" left an operator to guess whether the
+		// peer was gone, the transfer too big, or the digest missing.
+		if idle := time.Since(lastProgress); idle > pullIdleTimeout {
 			return fmt.Errorf(
-				"plane: EnsureIndex(%s, %d): version data did not converge within %s",
-				kbID, versionID, pullTimeout)
+				"plane: EnsureIndex(%s, %d): version data did not converge — %s without progress "+
+					"(attempts=%d, local cursor=%d, target=%d, elapsed=%s, last error=%v)",
+				kbID, versionID, idle.Round(time.Second), attempts,
+				d.localVersionOf(kbID), versionID, time.Since(start).Round(time.Second), lastErr)
+		}
+		if elapsed := time.Since(start); elapsed > pullMaxDuration {
+			return fmt.Errorf(
+				"plane: EnsureIndex(%s, %d): version data did not converge within %s "+
+					"(attempts=%d, local cursor=%d, target=%d, last error=%v)",
+				kbID, versionID, pullMaxDuration, attempts,
+				d.localVersionOf(kbID), versionID, lastErr)
 		}
 		time.Sleep(backoff)
 		if backoff < 5*time.Second {

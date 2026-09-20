@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -495,4 +496,78 @@ func TestFollower_PullVersion_TriggerBuildFailure(t *testing.T) {
 // this one; for this implementation it is the same build as TriggerBuild.
 func (r *recordingTrigger) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
 	return r.TriggerBuild(ctx, kbID, versionID)
+}
+
+// slowStreamServer streams a fixed number of entries with a delay between them, so
+// a transfer takes measurably longer than any handshake bound a test sets.
+type slowStreamServer struct {
+	pb.UnimplementedDataSyncServiceServer
+	entries int
+	delay   time.Duration
+}
+
+func (s *slowStreamServer) PullVersionData(req *pb.PullVersionDataRequest, stream pb.DataSyncService_PullVersionDataServer) error {
+	for i := 0; i < s.entries; i++ {
+		if err := stream.Send(&pb.SyncEntry{
+			EntryType: pb.SyncEntryType_SYNC_ENTRY_TYPE_VERSION_DOC_LIST,
+			KbId:      req.GetKnowledgeBaseId(),
+			VersionId: req.GetVersionId(),
+			DocId:     fmt.Sprintf("doc-%03d", i),
+		}); err != nil {
+			return err
+		}
+		time.Sleep(s.delay)
+	}
+	return nil
+}
+
+// A pull's handshake bound must not leak onto the transfer.
+//
+// It used to be one fixed 15 s window over handshake AND stream. A version's payload
+// grows with the knowledge base, so that window promises something no deployment can
+// keep at scale — at 20,000 documents (~56 MB) it produced 64 rounds of
+// `sync: recv SyncEntry: ... DeadlineExceeded` followed by "version data did not
+// converge within 30s", for a transfer that completes fine once given room. The bound
+// now covers the handshake only, and this pins that by keeping the stream open far
+// longer than the bound the test sets.
+func TestFollower_PullVersion_HandshakeBoundDoesNotBoundTheTransfer(t *testing.T) {
+	ds, err := docstore.NewPebbleDocStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cdm, err := chunkdoc.NewPebbleChunkDocMapper(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	vd, err := versiondoc.NewPebbleVersionDocList(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ds.Close()
+		cdm.Close()
+		vd.Close()
+	})
+
+	f := NewFollower(ds, cdm, vd, chunkstore.NewMockChunkStore(), &recordingTrigger{})
+	f.pullDialTimeout = 50 * time.Millisecond // far shorter than the transfer below
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterDataSyncServiceServer(srv, &slowStreamServer{entries: 8, delay: 40 * time.Millisecond}) // ~320 ms
+	go srv.Serve(lis)
+	t.Cleanup(srv.Stop)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := f.PullVersionWith(ctx, lis.Addr().String(), "kb-slow", 3, PullVersionOptions{SkipIndexBuild: true}); err != nil {
+		t.Fatalf("PullVersionWith: %v — the handshake bound must not bound the transfer", err)
+	}
+	docs, err := vd.ListDocIDs(ctx, "kb-slow", 3)
+	if err != nil || len(docs) != 8 {
+		t.Fatalf("version doc list = %v, %v, want the 8 streamed entries", docs, err)
+	}
 }

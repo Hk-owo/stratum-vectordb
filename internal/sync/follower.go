@@ -40,6 +40,22 @@ type Follower struct {
 	// first — and a filter built before the data arrived is empty, which drops every
 	// search hit (see SetVersionBloom).
 	versionBloom VersionBloomStore
+
+	// pullDialTimeout bounds the connection handshake of a pull, and ONLY the
+	// handshake. Zero means DefaultPullDialTimeout. Tests set it to prove the
+	// bound does not leak onto the transfer (see PullVersionWith).
+	pullDialTimeout time.Duration
+}
+
+// DefaultPullDialTimeout bounds the connection handshake of a pull.
+const DefaultPullDialTimeout = 15 * time.Second
+
+// dialTimeout returns the handshake bound, defaulting for a zero-valued Follower.
+func (f *Follower) dialTimeout() time.Duration {
+	if f.pullDialTimeout > 0 {
+		return f.pullDialTimeout
+	}
+	return DefaultPullDialTimeout
 }
 
 // VersionBloomStore is the slice of bloom.VersionBloomStore the sync paths need: the
@@ -152,17 +168,29 @@ func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID 
 
 // PullVersionWith is PullVersion with explicit control over the post-pull step.
 func (f *Follower) PullVersionWith(ctx context.Context, leaderAddr string, kbID string, versionID int64, opts PullVersionOptions) error {
-	// 兜底:不信任调用方 ctx 无超时(如 context.Background())。
-	// grpc.WithBlock() 在 leader 不可达(域名无法解析/拒绝连接)时会一直
-	// 等待连接建立;这里强制给整个拉取过程设上界,失败由调用方的 deadline
-	// 循环重试。否则一旦卡死会连带阻塞 raft 的 apply 循环。
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	conn, err := grpc.DialContext(ctx, leaderAddr,
+	// The connection HANDSHAKE gets its own bound; the TRANSFER does not.
+	//
+	// grpc.WithBlock() waits for the connection to be established, so a peer that
+	// cannot be reached at all (unresolvable name, refused connection) would wait
+	// forever without one — and that is the whole purpose of the bound below. What
+	// it must not do is bound the transfer as well: a version's payload grows with
+	// the knowledge base, and a single fixed window over "handshake + stream +
+	// apply" claims the pull fits in that window at every scale. Measured at 20,000
+	// documents (~56 MB): a 30 s window over the whole pull produced 64 rounds of
+	// `sync: recv SyncEntry: ... DeadlineExceeded` followed by "version data did not
+	// converge within 30s" — for a transfer that completes perfectly well once given
+	// room. The caller's context is the transfer's budget; EnsureIndex bounds it by
+	// PROGRESS (not by wall clock) and the lag catch-up by its own timeout.
+	//
+	// Nothing here runs on the Raft apply path, so a long transfer cannot stall
+	// log application: EnsureIndex is reached from the lag catch-up and from the
+	// query path's background pull, both off the apply loop.
+	dialCtx, cancelDial := context.WithTimeout(ctx, f.dialTimeout())
+	conn, err := grpc.DialContext(dialCtx, leaderAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
 	)
+	cancelDial()
 	if err != nil {
 		return fmt.Errorf("sync: dial leader %s: %w", leaderAddr, err)
 	}

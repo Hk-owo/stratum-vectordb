@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/types"
@@ -149,6 +151,31 @@ func (p *stubPuller) PullVersionData(ctx context.Context, sourceAddr, kbID strin
 
 func (p *stubPuller) PullVersion(context.Context, string, string, int64) error {
 	p.calls++
+	return p.err
+}
+
+// sequencedPuller can delay each call and fail them, so a test can tell "a
+// transfer that takes a while" from "a transfer that fails" — the two states the
+// pull loop's bound has to distinguish.
+type sequencedPuller struct {
+	calls int
+	err   error
+	delay time.Duration
+}
+
+func (p *sequencedPuller) PullVersionData(ctx context.Context, sourceAddr, kbID string, versionID int64) error {
+	return p.PullVersion(ctx, sourceAddr, kbID, versionID)
+}
+
+func (p *sequencedPuller) PullVersion(ctx context.Context, _, _ string, _ int64) error {
+	p.calls++
+	if p.delay > 0 {
+		select {
+		case <-time.After(p.delay):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	return p.err
 }
 
@@ -341,6 +368,96 @@ func TestLocalDataPlane_EnsureIndex_PullsUntilVerified(t *testing.T) {
 	}
 	if puller.calls != 2 {
 		t.Fatalf("puller calls = %d, want 2 (retry until the committed digest matches)", puller.calls)
+	}
+}
+
+// The pull loop's bound is about PROGRESS, not about a clock.
+//
+// This is the shape a large version arrives in. A 20,000-document version (~56 MB)
+// does not cross the wire, land and get applied inside any fixed window that a small
+// version also fits in — so a wall-clock bound over the whole loop times out on every
+// attempt and the retry uses the same window, which means the loop cannot converge at
+// any number of attempts. Measured on the 3+3 cluster: 64 rounds of
+// `sync: recv SyncEntry: ... DeadlineExceeded` followed by "version data did not
+// converge within 30s", for a transfer that completes fine once given room.
+//
+// Here two attempts complete without verifying and only the third verifies, with an
+// idle budget far shorter than the loop's total time: completed transfers are what
+// keeps the loop alive.
+func TestLocalDataPlane_EnsureIndex_ProgressKeepsTheLoopAlive(t *testing.T) {
+	puller := &sequencedPuller{delay: 30 * time.Millisecond}
+	verified := 0
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		IndexManager:    &stubIndexStore{},
+		Puller:          puller,
+		PullIdleTimeout: 20 * time.Millisecond, // far shorter than the whole loop takes
+		Verify: func(context.Context, string, int64) bool {
+			verified++
+			return verified >= 3
+		},
+		Resolve: func(context.Context, string, int64) (string, bool, error) { return "peer:7000", true, nil },
+	})
+
+	if err := dp.EnsureIndex(context.Background(), "kb-1", 4); err != nil {
+		t.Fatalf("EnsureIndex: %v — a completed transfer is progress, and progress must not run out of idle budget", err)
+	}
+	if puller.calls != 3 {
+		t.Fatalf("puller calls = %d, want 3", puller.calls)
+	}
+}
+
+// The other half: attempts that never complete ARE the failure mode, and the idle
+// bound has to end them — quickly, and with a diagnosis. The old message said only
+// "did not converge within 30s", which left an operator guessing between an
+// unreachable peer, a source that lost the version, and a transfer that was simply
+// too big.
+func TestLocalDataPlane_EnsureIndex_FailureWithoutProgressReportsDiagnosis(t *testing.T) {
+	puller := &sequencedPuller{err: errors.New("peer went away")}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		IndexManager:    &stubIndexStore{},
+		Puller:          puller,
+		PullIdleTimeout: 40 * time.Millisecond,
+		Verify:          func(context.Context, string, int64) bool { return false },
+		Resolve:         func(context.Context, string, int64) (string, bool, error) { return "peer:7000", true, nil },
+	})
+
+	start := time.Now()
+	err := dp.EnsureIndex(context.Background(), "kb-1", 7)
+	if err == nil {
+		t.Fatal("want an error: not one attempt ever completed")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("the idle bound did not end the loop in time (took %v)", elapsed)
+	}
+	for _, want := range []string{"attempts=", "local cursor=", "target=7", "peer went away"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not carry %q", err, want)
+		}
+	}
+	if puller.calls < 2 {
+		t.Errorf("puller calls = %d, want at least 2: the loop retries before it gives up", puller.calls)
+	}
+}
+
+// And the absolute ceiling, so a loop that keeps making a little progress forever
+// still ends.
+func TestLocalDataPlane_EnsureIndex_AbsoluteCeilingEndsAProgressingLoop(t *testing.T) {
+	puller := &sequencedPuller{}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		IndexManager:    &stubIndexStore{},
+		Puller:          puller,
+		PullIdleTimeout: time.Second,
+		PullMaxDuration: 80 * time.Millisecond,
+		Verify:          func(context.Context, string, int64) bool { return false }, // never satisfied
+		Resolve:         func(context.Context, string, int64) (string, bool, error) { return "peer:7000", true, nil },
+	})
+
+	err := dp.EnsureIndex(context.Background(), "kb-1", 9)
+	if err == nil {
+		t.Fatal("want an error: the loop must end even when every attempt completes")
+	}
+	if !strings.Contains(err.Error(), "within") {
+		t.Errorf("error = %v, want the absolute-ceiling wording", err)
 	}
 }
 
