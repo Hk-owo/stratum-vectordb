@@ -512,29 +512,11 @@ func (s *KnowledgeBaseServiceImpl) DeleteVersion(ctx context.Context, req *pb.De
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
-	deleted, err := s.raftNode.ProposeMarkVersionDeleting(ctx, req.KnowledgeBaseId, req.VersionId, mode)
+	deleted, err := markVersionDeletingThenCleanUp(ctx, s.raftNode, s.deleteVersionCoord, s.logger,
+		req.KnowledgeBaseId, req.VersionId, mode)
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
-
-	// Launch async cleanup. The coordinator re-discovers every Deleting
-	// version of the KB (including any left over from a previous crashed
-	// cleanup) and is idempotent end-to-end.
-	go func() {
-		if err := s.deleteVersionCoord.Execute(context.Background(), req.KnowledgeBaseId); err != nil {
-			// Same reason as DeleteKnowledgeBase's: Execute's contract is to
-			// leave the version Deleting once retries are exhausted so
-			// GetSystemStatus shows it for operator intervention, and discarding
-			// the error hides the one thing that makes that state actionable —
-			// why. The caller has already been told success.
-			//
-			// Because Execute re-discovers every Deleting version, an operator
-			// (or a later delete on the same KB) is enough to finish the job;
-			// what was missing was knowing it needed finishing.
-			s.logger.Warn("delete version: background cleanup did not finish; the version stays in DELETING",
-				zap.String("kb_id", req.KnowledgeBaseId), zap.Error(err))
-		}
-	}()
 
 	return &pb.DeleteVersionResponse{Success: true, DeletedVersionIds: deleted}, nil
 }

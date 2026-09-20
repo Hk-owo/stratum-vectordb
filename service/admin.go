@@ -588,22 +588,11 @@ func (s *AdminServiceImpl) ForceAbandonVersion(ctx context.Context, req *pb.Forc
 		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionNotFound)
 	}
 
-	deleted, err := s.raftNode.ProposeMarkVersionDeleting(ctx, kbID, versionID, types.VersionDeleteSingle)
+	deleted, err := markVersionDeletingThenCleanUp(ctx, s.raftNode, s.deleteVersionCoord, s.logger,
+		kbID, versionID, types.VersionDeleteSingle)
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
-
-	// The same asynchronous handoff as DeleteVersion, and the same reason for logging
-	// a failure rather than returning it: the caller has already been told the version
-	// is on its way out, and Execute's contract leaves it Deleting (visible in
-	// GetSystemStatus) once retries are exhausted. Because Execute re-discovers every
-	// Deleting version, the next call on this knowledge base finishes the job.
-	go func() {
-		if err := s.deleteVersionCoord.Execute(context.Background(), kbID); err != nil {
-			s.logger.Warn("force abandon: background cleanup did not finish; the version stays in DELETING",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-		}
-	}()
 
 	return &pb.ForceAbandonVersionResponse{Success: true, DeletedVersionIds: deleted}, nil
 }
