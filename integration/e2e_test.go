@@ -891,19 +891,38 @@ func versionHash(t *testing.T, n *realNode, kbID string, versionID int64) string
 // waitVersionReady polls ListVersions until versionID reports READY.
 func (n *realNode) waitVersionReady(ctx context.Context, kbID string, versionID int64) {
 	n.t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	// This deadline is the FIXTURE's patience, not the system's. The convergence logic
+	// under test bounds itself by PROGRESS, not by a wall clock (DefaultPullIdleTimeout
+	// and friends exist precisely because a fixed window made a 20,000-document catch-up
+	// look like a permanent failure). This helper only decides how long a test is willing
+	// to wait while the suite saturates the box, and 15 s was too tight there: a version
+	// that needs replication plus a build can legitimately take longer under load.
+	//
+	// The timeout message now carries what was actually observed. That distinction is the
+	// whole point: "still PENDING after 60 s" is a convergence problem worth chasing,
+	// while "we gave up at 15 s while the machine was busy" was the fixture failing a
+	// cluster that was doing its job.
+	deadline := time.Now().Add(60 * time.Second)
+	var last string
 	for time.Now().Before(deadline) {
 		resp, err := n.KB.ListVersions(ctx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
 		if err == nil {
+			last = "version not in the list"
 			for _, v := range resp.Versions {
-				if v.VersionId == versionID && v.IndexStatus == pb.IndexStatus_INDEX_STATUS_READY {
-					return
+				if v.VersionId == versionID {
+					last = v.IndexStatus.String() + "/" + v.DataStatus.String()
+					if v.IndexStatus == pb.IndexStatus_INDEX_STATUS_READY {
+						return
+					}
 				}
 			}
+		} else {
+			last = "ListVersions: " + err.Error()
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	n.t.Fatalf("node %d: version %d did not become READY within timeout", n.nodeID, versionID)
+	n.t.Fatalf("node %d: version %d did not become READY within timeout (last observed: %s)",
+		n.nodeID, versionID, last)
 }
 
 // waitVersions polls ListVersions until the version-ID set exactly matches
@@ -1343,6 +1362,26 @@ func TestRealStack_TwoNodeReplication(t *testing.T) {
 	// build-callback propose).
 	leader.waitVersionReady(ctx, kbID, v2)
 	follower.waitVersionReady(ctx, kbID, v2)
+
+	// READY is a CLUSTER-level fact, and that is not the same as "this node holds it":
+	// the status says someone built the version's index (§1.2 — the control layer is the
+	// only authority on the index side) and reaches every node through Raft replication.
+	// So a follower can read READY while its own stores are still empty — which is
+	// exactly what happens under load, where the pull that fills them lands later. What
+	// this test needs is the follower's OWN records, so wait for those; the query path
+	// refuses a replica in that state (it re-checks the version's document set and answers
+	// a retryable index_not_ready) rather than serving from it.
+	holdDeadline := time.Now().Add(60 * time.Second)
+	for {
+		docs, err := follower.versionDoc.ListDocIDs(ctx, kbID, v2)
+		if err == nil && len(docs) == 2 {
+			break
+		}
+		if time.Now().After(holdDeadline) {
+			t.Fatalf("follower never held v%d's records: docs = %v, err = %v", v2, docs, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 
 	// --- Metadata: the digest committed by the leader must have
 	// replicated to the follower, and both must match each node's local
