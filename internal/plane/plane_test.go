@@ -91,6 +91,12 @@ func (m *stubMeta) ProposeMarkVersionFailedPermanent(_ context.Context, kbID str
 	return nil
 }
 
+// ProposeRetryVersion mirrors the revocation ForceRetryVersion drives (§10.1):
+// this stub is not exercised by it, so there is nothing to record.
+func (m *stubMeta) ProposeRetryVersion(_ context.Context, _ string, _ int64, _ types.FailureSide) error {
+	return nil
+}
+
 func (m *stubMeta) ProposeMarkVersionDataDurable(_ context.Context, versionID int64) error {
 	m.dataDurableCalls = append(m.dataDurableCalls, versionID)
 	return nil

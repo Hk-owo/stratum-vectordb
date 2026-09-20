@@ -21,6 +21,10 @@ func (r clusterStatusRaftNode) GetClusterStatus(context.Context) (types.ClusterS
 	return r.status, nil
 }
 
+func (r clusterStatusRaftNode) ProposeRetryVersion(context.Context, string, int64, types.FailureSide) error {
+	return nil
+}
+
 // A control node must be able to answer GetClusterStatus. It is the only node
 // that has the Raft view, and every storage node's cursor reporter resolves the
 // leader through exactly this call. Leaving AdminService unregistered on control

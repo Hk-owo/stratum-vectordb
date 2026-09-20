@@ -2,10 +2,16 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"time"
+
+	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/chunkstore"
+	"stratum/internal/coordinator"
 	"stratum/internal/docstore"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
@@ -42,6 +48,17 @@ type AdminServiceImpl struct {
 	// Optional, and nil means "unknown" — which reports nothing rather than
 	// vouching for a storage layer it cannot see.
 	storageGate StorageDegradationSource
+
+	// deleteVersionCoord runs the asynchronous cleanup ForceAbandonVersion starts.
+	// Optional: without it that RPC refuses rather than marking a version Deleting
+	// and leaving the reclamation to whoever happens to call DeleteVersion next.
+	deleteVersionCoord coordinator.DeleteVersionCoordinator
+
+	// logger records what an operator-facing action did. An abandoned version's
+	// cleanup failing must not be silent — the version stays DELETING, and this
+	// line is what connects that state to the decision that put it there. Never
+	// nil; see NewAdminService.
+	logger *zap.Logger
 }
 
 // GCPressureReporter reports the versions whose §8.6(d) dead-weight collection is
@@ -57,6 +74,19 @@ type GCPressureReporter interface {
 // SetGCPressureReporter wires the §8.6(d) blocked-collection report.
 func (s *AdminServiceImpl) SetGCPressureReporter(r GCPressureReporter) {
 	s.gcPressure = r
+}
+
+// SetLogger wires the logger the operator-facing actions write to. Optional:
+// without it those lines go nowhere, which is the pre-existing behaviour.
+func (s *AdminServiceImpl) SetLogger(l *zap.Logger) {
+	if l != nil {
+		s.logger = l
+	}
+}
+
+// SetDeleteVersionCoordinator wires the cleanup flow ForceAbandonVersion drives.
+func (s *AdminServiceImpl) SetDeleteVersionCoordinator(c coordinator.DeleteVersionCoordinator) {
+	s.deleteVersionCoord = c
 }
 
 // SetStorageDegradationSource wires the storage-redundancy verdict that
@@ -97,6 +127,7 @@ func NewAdminService(
 		wal:          w,
 		replicas:     replicas,
 		presence:     presence,
+		logger:       zap.NewNop(),
 	}
 }
 
@@ -212,30 +243,11 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 				if v.IndexStatus == types.IndexStatusPending {
 					pendingVersions = append(pendingVersions, v)
 				}
-				// FAILED_PERMANENT is the control layer's terminal verdict
-				// (Stratum_设计文档v13.md §10.1): it is reported separately from
-				// the retryable FAILED above, and carries the cause chain an
-				// operator needs.
-				//
-				// Either SIDE's verdict counts: a version whose data will never
-				// arrive is just as dead as one whose index never built, and
-				// leaving the data side out would hide exactly the failures the
-				// storage layer reports most often (§10.1b).
-				if v.IndexStatus == types.IndexStatusFailedPermanent ||
-					v.DataStatus == types.DataStatusFailedPermanent {
-					failedPermanent = append(failedPermanent, &pb.FailedVersion{
-						KbId:         v.KBID,
-						VersionId:    v.VersionID,
-						Reason:       v.FailureReason,
-						FailureCount: v.FailureCount,
-						// The side the verdict settled, recorded at apply time
-						// rather than inferred from the two statuses: a version
-						// can end up terminal on BOTH sides, and then only the
-						// stored side says which one the cause chain describes.
-						Side: pb.FailureSide(v.FailureSide),
-					})
-				}
 			}
+			// The terminal verdicts of this knowledge base, collected by the same
+			// function ListFailedVersions answers from — so the two cannot drift
+			// apart about what "waiting for a human" means.
+			failedPermanent = append(failedPermanent, failedVersionsOf(versions)...)
 		}
 	}
 
@@ -399,6 +411,201 @@ func (s *AdminServiceImpl) WarmupVersion(ctx context.Context, req *pb.WarmupVers
 	}
 
 	return &pb.WarmupVersionResponse{Success: true}, nil
+}
+
+// failedVersionsOf collects the versions the control layer declared
+// FAILED_PERMANENT on either side (Stratum_设计文档v13.md §10.1, §10.1b).
+//
+// Either side's verdict counts: a version whose data will never arrive is just as
+// dead as one whose index never built, and leaving the data side out would hide
+// exactly the failures the storage layer reports most often (§10.1b). A version
+// already marked Deleting is excluded — it is on its way out and is reported as such
+// by deleting_versions, so listing it as "waiting for an operator" would ask someone
+// to act on something already being removed.
+//
+// One function for both callers (GetSystemStatus and ListFailedVersions), so the two
+// cannot drift apart about what "waiting for a human" means.
+func failedVersionsOf(versions []types.VersionMeta) []*pb.FailedVersion {
+	var out []*pb.FailedVersion
+	for _, v := range versions {
+		if v.Deleting {
+			continue
+		}
+		if v.IndexStatus != types.IndexStatusFailedPermanent &&
+			v.DataStatus != types.DataStatusFailedPermanent {
+			continue
+		}
+		out = append(out, &pb.FailedVersion{
+			KbId:         v.KBID,
+			VersionId:    v.VersionID,
+			Reason:       v.FailureReason,
+			FailureCount: v.FailureCount,
+			// The side the verdict settled, recorded at apply time rather than
+			// inferred from the two statuses: a version can end up terminal on BOTH
+			// sides, and then only the stored side says which one the cause chain
+			// describes.
+			Side: pb.FailureSide(v.FailureSide),
+		})
+	}
+	return out
+}
+
+// ListFailedVersions implements AdminServiceServer: the queue of versions waiting
+// for a human (Stratum_设计文档v13.md §10.1). Nothing retries them automatically, so
+// this list IS the work — an operator should not have to read it out of
+// GetSystemStatus's much larger payload.
+//
+// A read of the replicated metadata, which is why any node holding it can answer.
+// The knowledge base is optional because the two questions are different ones:
+// "this knowledge base has a version stuck" (kb_id set) and "is anything else
+// stuck?" (kb_id empty).
+func (s *AdminServiceImpl) ListFailedVersions(ctx context.Context, req *pb.ListFailedVersionsRequest) (*pb.ListFailedVersionsResponse, error) {
+	if kbID := req.GetKnowledgeBaseId(); kbID != "" {
+		versions, err := s.raftNode.ListVersions(ctx, kbID)
+		if err != nil {
+			return nil, stratumerrors.ToGRPCStatus(err)
+		}
+		return &pb.ListFailedVersionsResponse{Versions: failedVersionsOf(versions)}, nil
+	}
+
+	kbs, err := s.raftNode.ListKnowledgeBases(ctx)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	var out []*pb.FailedVersion
+	for _, kb := range kbs {
+		versions, err := s.raftNode.ListVersions(ctx, kb.KBID)
+		if err != nil {
+			// One unreadable knowledge base must not hide the others: this call is
+			// made when something is already wrong, and a partial answer beats an
+			// error that names nothing.
+			continue
+		}
+		out = append(out, failedVersionsOf(versions)...)
+	}
+	return &pb.ListFailedVersionsResponse{Versions: out}, nil
+}
+
+// ForceRetryVersion implements AdminServiceServer: an operator revoking the index
+// side's terminal verdict and asking for another build
+// (Stratum_设计文档v13.md §10.1).
+//
+// The DATA side is not retried here, and that refusal is explicit rather than quiet:
+// its verdict says the version's data will never arrive, so a rebuild would have
+// nothing to build from. The operator's answer there is ForceAbandonVersion, and a
+// caller who asks anyway is told exactly that instead of getting a success that
+// means nothing.
+//
+// A version that is not index-terminal is refused by the state machine
+// (ErrVersionNotFailedPermanent), which is where that rule belongs: every replica
+// reaches the same verdict there, while a proposer that decided it could disagree
+// with the state it is writing into.
+func (s *AdminServiceImpl) ForceRetryVersion(ctx context.Context, req *pb.ForceRetryVersionRequest) (*pb.ForceRetryVersionResponse, error) {
+	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
+	if kbID == "" || versionID == 0 {
+		return nil, stratumerrors.ToGRPCStatus(fmt.Errorf("%w: knowledge_base_id and version_id are required", stratumerrors.ErrInvalidArgument))
+	}
+	if s.indexManager == nil {
+		return nil, status.Error(codes.Unimplemented, "this node holds no index, so it cannot rebuild a version")
+	}
+
+	versions, err := s.raftNode.ListVersions(ctx, kbID)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	found := false
+	for _, v := range versions {
+		if v.VersionID != versionID {
+			continue
+		}
+		found = true
+		if v.DataStatus == types.DataStatusFailedPermanent {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"version %d's data side is FAILED_PERMANENT: its data will never arrive, so its index cannot be rebuilt — abandon the version instead (ForceAbandonVersion)", versionID)
+		}
+		break
+	}
+	if !found {
+		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionNotFound)
+	}
+
+	if err := s.raftNode.ProposeRetryVersion(ctx, kbID, versionID, types.FailureSideIndex); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+
+	// Register the request with the retention policy BEFORE triggering the build,
+	// exactly as RebuildIndex does and for the same reason: a version someone had to
+	// retry is normally outside the newest-N window — that is why a human was needed —
+	// and the build is asynchronous, so a small one could finish (running the
+	// post-build retention pass) before a later registration would have protected its
+	// artifact.
+	s.indexManager.RecordInterest(kbID, versionID)
+	if err := s.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	return &pb.ForceRetryVersionResponse{Success: true, Side: pb.FailureSide(types.FailureSideIndex)}, nil
+}
+
+// ForceAbandonVersion implements AdminServiceServer: the other answer to a terminal
+// verdict — the version leaves the chain (Stratum_设计文档v13.md §10.1).
+//
+// It is DeleteVersion under SINGLE semantics plus one admission rule: the version
+// must actually carry a FAILED_PERMANENT verdict. That rule is why this is its own
+// RPC rather than documentation telling people to call DeleteVersion — "abandon" is
+// an operation on a failure, and a name that also removes healthy versions invites
+// the wrong call.
+//
+// SINGLE rather than SUBTREE because the operator named ONE version: a child, if
+// there is one, is spliced onto its parent rather than removed with it.
+func (s *AdminServiceImpl) ForceAbandonVersion(ctx context.Context, req *pb.ForceAbandonVersionRequest) (*pb.ForceAbandonVersionResponse, error) {
+	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
+	if kbID == "" || versionID == 0 {
+		return nil, stratumerrors.ToGRPCStatus(fmt.Errorf("%w: knowledge_base_id and version_id are required", stratumerrors.ErrInvalidArgument))
+	}
+	if s.deleteVersionCoord == nil {
+		return nil, status.Error(codes.Unimplemented, "this node cannot run the delete-version cleanup, so it cannot abandon a version")
+	}
+
+	versions, err := s.raftNode.ListVersions(ctx, kbID)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	found := false
+	for _, v := range versions {
+		if v.VersionID != versionID {
+			continue
+		}
+		found = true
+		if v.IndexStatus != types.IndexStatusFailedPermanent &&
+			v.DataStatus != types.DataStatusFailedPermanent {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"version %d carries no FAILED_PERMANENT verdict (index=%s, data=%s): a healthy version is DeleteVersion's business",
+				versionID, v.IndexStatus, v.DataStatus)
+		}
+		break
+	}
+	if !found {
+		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionNotFound)
+	}
+
+	deleted, err := s.raftNode.ProposeMarkVersionDeleting(ctx, kbID, versionID, types.VersionDeleteSingle)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+
+	// The same asynchronous handoff as DeleteVersion, and the same reason for logging
+	// a failure rather than returning it: the caller has already been told the version
+	// is on its way out, and Execute's contract leaves it Deleting (visible in
+	// GetSystemStatus) once retries are exhausted. Because Execute re-discovers every
+	// Deleting version, the next call on this knowledge base finishes the job.
+	go func() {
+		if err := s.deleteVersionCoord.Execute(context.Background(), kbID); err != nil {
+			s.logger.Warn("force abandon: background cleanup did not finish; the version stays in DELETING",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		}
+	}()
+
+	return &pb.ForceAbandonVersionResponse{Success: true, DeletedVersionIds: deleted}, nil
 }
 
 var _ pb.AdminServiceServer = (*AdminServiceImpl)(nil)

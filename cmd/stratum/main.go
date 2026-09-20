@@ -1144,6 +1144,12 @@ func main() {
 		// remedy is a larger replica count — so it goes out with the other
 		// needs-a-human signals rather than only into the node's log.
 		adminSvc.SetGCPressureReporter(indexMgr)
+		// The operator's three verbs for a FAILED_PERMANENT version (§10.1):
+		// retrying one needs the index manager, abandoning one needs the
+		// delete-version cleanup, and both are storage-side facts — so this is the
+		// node that can serve them.
+		adminSvc.SetLogger(logger)
+		adminSvc.SetDeleteVersionCoordinator(deleteVersionCoord)
 		// §4.5: report storage redundancy through health details. It stays out of
 		// the health STATUS on purpose — a probe that reported UNHEALTHY here
 		// would pull traffic off a node whose reads are still being served. The

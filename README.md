@@ -129,7 +129,7 @@ scripts/cluster.sh --topology two-tier status  # 每容器状态与控制组 lea
 - **垃圾回收**:`ChunkGarbageCollector` 周期性(默认 5 分钟,`gc.sweep_interval_s`)清扫不再被任何版本引用的 chunk。sweep 两遍:先无锁枚举孤儿候选,再持写锁按 Raft **当前**版本复查后删除,与并发写入互斥、不依赖过期快照(stale-snapshot race 免疫),锁粒度为一个 chunk,阻塞毫秒级。
 - **写幂等**:`CreateVersion.client_request_id` 是可选幂等键——同一知识库上重发同一 key 会复用首次分配的版本,而不是再分配一个。这是"数据没落地的版本"能被客户端救回的**唯一**途径(§7.12);省略则保持历史语义,每次调用分配新版本。
 - **任何节点都能写**:非 leader 节点把已编码的提案经内部 `InternalService.Propose` 交给 leader 执行;接收方不是 leader 时回传 `leader_id` 让调用方改问,转发不会成链。错误以稳定 wire name(`internal/errors.Name` / `ByName`)跨进程传递,认不出某个名字的一方只保留 message,不臆造 sentinel。
-- **卡住的版本有明确归宿**:PENDING 的版本若没有任何候选副本持有其数据,即为 **DATA_MISSING**(写入方在分配版本后、数据落盘前死亡,或每次都推送失败),客户端可以 `AwaitVersion` 看到 `data_missing` 后按同一 `client_request_id` 重发,或用 **`DiscardVersion`** 放弃;失败尝试耗尽重试预算或撞上不可恢复错误时,控制面判定 **FAILED_PERMANENT**,不再自动重试,只有运维能重试或放弃——放弃会向**所有**候选副本广播物理回收,因为控制面并不知道数据实际落在哪几个副本上(§10.1 / §10.6)。
+- **卡住的版本有明确归宿**:PENDING 的版本若没有任何候选副本持有其数据,即为 **DATA_MISSING**(写入方在分配版本后、数据落盘前死亡,或每次都推送失败),客户端可以 `AwaitVersion` 看到 `data_missing` 后按同一 `client_request_id` 重发,或用 **`DiscardVersion`** 放弃;失败尝试耗尽重试预算或撞上不可恢复错误时,控制面判定 **FAILED_PERMANENT**,不再自动重试,只有运维能重试或放弃——重试是 `ForceRetryVersion`(只针对索引侧:数据侧的终态没有可重试的写入),放弃是 `ForceAbandonVersion`(只接受判死版本,走 `DeleteVersion` 的 SINGLE 语义);要看清队列里的全部判死版本用 `ListFailedVersions`。放弃会向**所有**候选副本广播物理回收,因为控制面并不知道数据实际落在哪几个副本上(§10.1 / §10.6)。
 - **数据侧与索引侧各有终态**(§10.1b):`DataStatus`(PENDING / DURABLE / FAILED_PERMANENT)与 `IndexStatus`(PENDING / READY / FAILED / FAILED_PERMANENT)互相独立——一个有持久数据却没有可用索引的版本,与一个索引从未构建的版本,是两件不同的事;判死时 `FailureSide` 说明原因链描述的是哪一侧,运维据此决定"重发写入"还是"重建索引"。版本元数据还携带文档集摘要 `doc_id_set_hash`(§7.9),让存储层能区分"空版本"与"摘要从未提交"。
 
 ## 文档切分与向量检索
@@ -319,6 +319,9 @@ Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部�
 | `GetSystemStatus` | 卡住版本、**数据缺失版本**(DATA_MISSING)、**永久失败版本**(FAILED_PERMANENT,带 `side` 说明哪一侧)、**GC 受阻版本**(`gc_blocked_versions`)、删除失败的知识库、删除中的版本、WAL 告警、资源占用 |
 | `GetClusterStatus` | 节点 Raft 视图(node_id / leader_id / member_count),供服务站发现 leader |
 | `RebuildIndex` / `WarmupVersion` | 重试失败版本的索引构建 / 预热版本索引入内存(不切换活跃版本);两者都会登记"被需要",产物受保留策略保护 |
+| `ListFailedVersions` | **运维的工作队列**:列出被判定 FAILED_PERMANENT 的版本(两侧任一,带原因链与 `side`),可按知识库或全集群(`knowledge_base_id` 留空)。与 `GetSystemStatus.failed_permanent_versions` 同一个收集函数,两者不会各说各话 |
+| `ForceRetryVersion` | **运维撤销索引侧的终态**:清掉终态与原因链、触发重建(登记"被需要")。只接受索引侧——数据侧的终态意味着数据永远不会到,没有可重试的写入,那种版本要 `ForceAbandonVersion`;拒绝时明说这一点,不假装成功 |
+| `ForceAbandonVersion` | **放弃一个判死版本**:走 `DeleteVersion` 的 SINGLE 语义(版本离链,子版本改挂其父),清理异步执行。只接受带终态裁决的版本——"放弃"是对失败的操作,名字里带 `DeleteVersion` 的别名会招来误用 |
 
 **InternalService**(节点间控制面流量,不对外)
 

@@ -377,6 +377,12 @@ func (r *testRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ st
 	return nil
 }
 
+// ProposeRetryVersion mirrors the revocation ForceRetryVersion drives (§10.1):
+// this stub is not exercised by it, so there is nothing to record.
+func (r *testRaftNode) ProposeRetryVersion(_ context.Context, _ string, _ int64, _ types.FailureSide) error {
+	return nil
+}
+
 func (r *testRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, _ int64) error {
 	return nil
 }

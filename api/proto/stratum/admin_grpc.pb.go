@@ -35,11 +35,14 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	AdminService_HealthCheck_FullMethodName      = "/stratum.AdminService/HealthCheck"
-	AdminService_GetSystemStatus_FullMethodName  = "/stratum.AdminService/GetSystemStatus"
-	AdminService_GetClusterStatus_FullMethodName = "/stratum.AdminService/GetClusterStatus"
-	AdminService_RebuildIndex_FullMethodName     = "/stratum.AdminService/RebuildIndex"
-	AdminService_WarmupVersion_FullMethodName    = "/stratum.AdminService/WarmupVersion"
+	AdminService_HealthCheck_FullMethodName         = "/stratum.AdminService/HealthCheck"
+	AdminService_GetSystemStatus_FullMethodName     = "/stratum.AdminService/GetSystemStatus"
+	AdminService_GetClusterStatus_FullMethodName    = "/stratum.AdminService/GetClusterStatus"
+	AdminService_RebuildIndex_FullMethodName        = "/stratum.AdminService/RebuildIndex"
+	AdminService_WarmupVersion_FullMethodName       = "/stratum.AdminService/WarmupVersion"
+	AdminService_ListFailedVersions_FullMethodName  = "/stratum.AdminService/ListFailedVersions"
+	AdminService_ForceRetryVersion_FullMethodName   = "/stratum.AdminService/ForceRetryVersion"
+	AdminService_ForceAbandonVersion_FullMethodName = "/stratum.AdminService/ForceAbandonVersion"
 )
 
 // AdminServiceClient is the client API for AdminService service.
@@ -51,6 +54,16 @@ type AdminServiceClient interface {
 	GetClusterStatus(ctx context.Context, in *GetClusterStatusRequest, opts ...grpc.CallOption) (*GetClusterStatusResponse, error)
 	RebuildIndex(ctx context.Context, in *RebuildIndexRequest, opts ...grpc.CallOption) (*RebuildIndexResponse, error)
 	WarmupVersion(ctx context.Context, in *WarmupVersionRequest, opts ...grpc.CallOption) (*WarmupVersionResponse, error)
+	// The operator's three verbs for a version the control layer declared
+	// FAILED_PERMANENT (Stratum_设计文档v13.md §10.1): see it, retry it, abandon it.
+	//
+	// They live here rather than on KnowledgeBaseService because the caller is an
+	// operator acting on a verdict, not an application working with a version — and
+	// because a deployment that never needs them can leave them unused without that
+	// showing up in the application's contract.
+	ListFailedVersions(ctx context.Context, in *ListFailedVersionsRequest, opts ...grpc.CallOption) (*ListFailedVersionsResponse, error)
+	ForceRetryVersion(ctx context.Context, in *ForceRetryVersionRequest, opts ...grpc.CallOption) (*ForceRetryVersionResponse, error)
+	ForceAbandonVersion(ctx context.Context, in *ForceAbandonVersionRequest, opts ...grpc.CallOption) (*ForceAbandonVersionResponse, error)
 }
 
 type adminServiceClient struct {
@@ -111,6 +124,36 @@ func (c *adminServiceClient) WarmupVersion(ctx context.Context, in *WarmupVersio
 	return out, nil
 }
 
+func (c *adminServiceClient) ListFailedVersions(ctx context.Context, in *ListFailedVersionsRequest, opts ...grpc.CallOption) (*ListFailedVersionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListFailedVersionsResponse)
+	err := c.cc.Invoke(ctx, AdminService_ListFailedVersions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminServiceClient) ForceRetryVersion(ctx context.Context, in *ForceRetryVersionRequest, opts ...grpc.CallOption) (*ForceRetryVersionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForceRetryVersionResponse)
+	err := c.cc.Invoke(ctx, AdminService_ForceRetryVersion_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminServiceClient) ForceAbandonVersion(ctx context.Context, in *ForceAbandonVersionRequest, opts ...grpc.CallOption) (*ForceAbandonVersionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForceAbandonVersionResponse)
+	err := c.cc.Invoke(ctx, AdminService_ForceAbandonVersion_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AdminServiceServer is the server API for AdminService service.
 // All implementations must embed UnimplementedAdminServiceServer
 // for forward compatibility.
@@ -120,6 +163,16 @@ type AdminServiceServer interface {
 	GetClusterStatus(context.Context, *GetClusterStatusRequest) (*GetClusterStatusResponse, error)
 	RebuildIndex(context.Context, *RebuildIndexRequest) (*RebuildIndexResponse, error)
 	WarmupVersion(context.Context, *WarmupVersionRequest) (*WarmupVersionResponse, error)
+	// The operator's three verbs for a version the control layer declared
+	// FAILED_PERMANENT (Stratum_设计文档v13.md §10.1): see it, retry it, abandon it.
+	//
+	// They live here rather than on KnowledgeBaseService because the caller is an
+	// operator acting on a verdict, not an application working with a version — and
+	// because a deployment that never needs them can leave them unused without that
+	// showing up in the application's contract.
+	ListFailedVersions(context.Context, *ListFailedVersionsRequest) (*ListFailedVersionsResponse, error)
+	ForceRetryVersion(context.Context, *ForceRetryVersionRequest) (*ForceRetryVersionResponse, error)
+	ForceAbandonVersion(context.Context, *ForceAbandonVersionRequest) (*ForceAbandonVersionResponse, error)
 	mustEmbedUnimplementedAdminServiceServer()
 }
 
@@ -144,6 +197,15 @@ func (UnimplementedAdminServiceServer) RebuildIndex(context.Context, *RebuildInd
 }
 func (UnimplementedAdminServiceServer) WarmupVersion(context.Context, *WarmupVersionRequest) (*WarmupVersionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method WarmupVersion not implemented")
+}
+func (UnimplementedAdminServiceServer) ListFailedVersions(context.Context, *ListFailedVersionsRequest) (*ListFailedVersionsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListFailedVersions not implemented")
+}
+func (UnimplementedAdminServiceServer) ForceRetryVersion(context.Context, *ForceRetryVersionRequest) (*ForceRetryVersionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ForceRetryVersion not implemented")
+}
+func (UnimplementedAdminServiceServer) ForceAbandonVersion(context.Context, *ForceAbandonVersionRequest) (*ForceAbandonVersionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ForceAbandonVersion not implemented")
 }
 func (UnimplementedAdminServiceServer) mustEmbedUnimplementedAdminServiceServer() {}
 func (UnimplementedAdminServiceServer) testEmbeddedByValue()                      {}
@@ -256,6 +318,60 @@ func _AdminService_WarmupVersion_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AdminService_ListFailedVersions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListFailedVersionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).ListFailedVersions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_ListFailedVersions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).ListFailedVersions(ctx, req.(*ListFailedVersionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AdminService_ForceRetryVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForceRetryVersionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).ForceRetryVersion(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_ForceRetryVersion_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).ForceRetryVersion(ctx, req.(*ForceRetryVersionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AdminService_ForceAbandonVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForceAbandonVersionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServiceServer).ForceAbandonVersion(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AdminService_ForceAbandonVersion_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServiceServer).ForceAbandonVersion(ctx, req.(*ForceAbandonVersionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AdminService_ServiceDesc is the grpc.ServiceDesc for AdminService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -282,6 +398,18 @@ var AdminService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "WarmupVersion",
 			Handler:    _AdminService_WarmupVersion_Handler,
+		},
+		{
+			MethodName: "ListFailedVersions",
+			Handler:    _AdminService_ListFailedVersions_Handler,
+		},
+		{
+			MethodName: "ForceRetryVersion",
+			Handler:    _AdminService_ForceRetryVersion_Handler,
+		},
+		{
+			MethodName: "ForceAbandonVersion",
+			Handler:    _AdminService_ForceAbandonVersion_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

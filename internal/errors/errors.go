@@ -51,6 +51,14 @@ var (
 	// version whose data side has already settled is DeleteVersion's business
 	// (docs/await-version-plan.md §5 contract 7, §7 Step 6).
 	ErrVersionNotPending = errors.New("version is not pending")
+	// ErrVersionNotFailedPermanent rejects a ForceRetryVersion (or
+	// ForceAbandonVersion) for a side that is not FAILED_PERMANENT. Retrying is an
+	// operator's answer to a terminal verdict (Stratum_设计文档v13.md §10.1): a side
+	// that is merely FAILED is already retried by the ordinary paths, and one that
+	// is PENDING or READY has nothing to retry at all. Refusing loudly is the point
+	// — silently "succeeding" at retrying a healthy version would tell an operator
+	// the state changed when it did not.
+	ErrVersionNotFailedPermanent = errors.New("version is not failed permanently")
 	// ErrKBStorageDegraded refuses a WRITE to a knowledge base whose live
 	// replicas are below quorum (docs/storage-degradation-signal-plan.md §4.1).
 	//
@@ -90,6 +98,7 @@ var sentinelNames = []struct {
 	{"version_deleting", ErrVersionDeleting},
 	{"version_is_active", ErrVersionIsActive},
 	{"version_not_pending", ErrVersionNotPending},
+	{"version_not_failed_permanent", ErrVersionNotFailedPermanent},
 	{"knowledge_base_not_found", ErrKnowledgeBaseNotFound},
 	{"knowledge_base_deleted", ErrKnowledgeBaseDeleted},
 	{"index_not_ready", ErrIndexNotReady},
@@ -131,20 +140,21 @@ func ByName(name string) error {
 // grpcCodeMap is the single source of truth for business-error -> gRPC
 // status code translation. Errors not present here map to codes.Internal.
 var grpcCodeMap = map[error]codes.Code{
-	ErrVersionNotFound:       codes.NotFound,
-	ErrVersionPending:        codes.FailedPrecondition,
-	ErrVersionFailed:         codes.FailedPrecondition,
-	ErrVersionDeleting:       codes.FailedPrecondition,
-	ErrVersionIsActive:       codes.FailedPrecondition,
-	ErrVersionNotPending:     codes.FailedPrecondition,
-	ErrKnowledgeBaseNotFound: codes.NotFound,
-	ErrKnowledgeBaseDeleted:  codes.FailedPrecondition,
-	ErrIndexNotReady:         codes.FailedPrecondition,
-	ErrIndexMaintenance:      codes.FailedPrecondition,
-	ErrInvalidArgument:       codes.InvalidArgument,
-	ErrEmptyChanges:          codes.InvalidArgument,
-	ErrIndexLoadTimeout:      codes.DeadlineExceeded,
-	ErrInvalidParentVersion:  codes.InvalidArgument,
+	ErrVersionNotFound:           codes.NotFound,
+	ErrVersionPending:            codes.FailedPrecondition,
+	ErrVersionFailed:             codes.FailedPrecondition,
+	ErrVersionDeleting:           codes.FailedPrecondition,
+	ErrVersionIsActive:           codes.FailedPrecondition,
+	ErrVersionNotPending:         codes.FailedPrecondition,
+	ErrVersionNotFailedPermanent: codes.FailedPrecondition,
+	ErrKnowledgeBaseNotFound:     codes.NotFound,
+	ErrKnowledgeBaseDeleted:      codes.FailedPrecondition,
+	ErrIndexNotReady:             codes.FailedPrecondition,
+	ErrIndexMaintenance:          codes.FailedPrecondition,
+	ErrInvalidArgument:           codes.InvalidArgument,
+	ErrEmptyChanges:              codes.InvalidArgument,
+	ErrIndexLoadTimeout:          codes.DeadlineExceeded,
+	ErrInvalidParentVersion:      codes.InvalidArgument,
 	// Unavailable, not FailedPrecondition: below quorum the storage layer is
 	// temporarily unable to accept this write — the storage layer is coming back
 	// or a failover is in flight, and the caller should retry rather than treat

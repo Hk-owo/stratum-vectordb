@@ -288,6 +288,42 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 		},
 	))
 
+	// The operator's three verbs for a version the control layer declared
+	// FAILED_PERMANENT (§10.1): see it, retry its index, or abandon it. The list is a
+	// read and is exposed per knowledge base AND cluster-wide, because the two
+	// questions are different ones ("this one has a version stuck" / "is anything
+	// else stuck?").
+	mux.HandleFunc("GET /api/failed-versions", func(w http.ResponseWriter, r *http.Request) {
+		resp, err := g.admin.ListFailedVersions(r.Context(), &pb.ListFailedVersionsRequest{})
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, resp)
+	})
+	mux.HandleFunc("GET /api/knowledge-bases/{id}/failed-versions", func(w http.ResponseWriter, r *http.Request) {
+		resp, err := g.admin.ListFailedVersions(r.Context(), &pb.ListFailedVersionsRequest{KnowledgeBaseId: r.PathValue("id")})
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, resp)
+	})
+	mux.HandleFunc("POST /api/knowledge-bases/{id}/force-retry-version", handleWithID(
+		func() *pb.ForceRetryVersionRequest { return &pb.ForceRetryVersionRequest{} },
+		func(r *pb.ForceRetryVersionRequest, id string) { r.KnowledgeBaseId = id },
+		func(ctx context.Context, r *pb.ForceRetryVersionRequest) (*pb.ForceRetryVersionResponse, error) {
+			return g.admin.ForceRetryVersion(ctx, r)
+		},
+	))
+	mux.HandleFunc("POST /api/knowledge-bases/{id}/force-abandon-version", handleWithID(
+		func() *pb.ForceAbandonVersionRequest { return &pb.ForceAbandonVersionRequest{} },
+		func(r *pb.ForceAbandonVersionRequest, id string) { r.KnowledgeBaseId = id },
+		func(ctx context.Context, r *pb.ForceAbandonVersionRequest) (*pb.ForceAbandonVersionResponse, error) {
+			return g.admin.ForceAbandonVersion(ctx, r)
+		},
+	))
+
 	// --- QueryService ---
 	mux.HandleFunc("POST /api/query", handle(
 		func() *pb.QueryRequest { return &pb.QueryRequest{} },

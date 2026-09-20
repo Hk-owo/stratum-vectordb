@@ -126,6 +126,17 @@ func (r *RemoteRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, 
 	return res.VersionID, nil
 }
 
+// ProposeRetryVersion forwards the operator's retry of one side's terminal verdict
+// to the leader (Stratum_设计文档v13.md §10.1): it is a write to replicated state, and
+// the verdict itself belongs to the state machine's apply.
+func (r *RemoteRaftNode) ProposeRetryVersion(ctx context.Context, kbID string, versionID int64, side types.FailureSide) error {
+	res, err := r.propose(ctx, newRetryVersionCommand(kbID, versionID, side))
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
 func (r *RemoteRaftNode) ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
 	res, err := r.propose(ctx, newUpdateVersionStatusCommand(versionID, status, nodeID))
 	if err != nil {

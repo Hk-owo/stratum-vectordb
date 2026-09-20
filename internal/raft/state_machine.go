@@ -201,6 +201,9 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		sm.kbs[cmd.KBID] = kb
 		return applyResult{}
 
+	case cmdRetryVersion:
+		return sm.applyRetryVersion(cmd)
+
 	case cmdMarkVersionDeleting:
 		return sm.applyMarkVersionDeleting(cmd)
 
@@ -273,6 +276,73 @@ func (sm *stateMachine) applyMarkVersionFailedPermanent(cmd command) applyResult
 	// then only this field says which one the cause chain above describes
 	// (Stratum_设计文档v13.md §10.1b).
 	v.FailureSide = cmd.FailureSide
+	sm.versions[cmd.VersionID] = v
+	return applyResult{}
+}
+
+// applyRetryVersion handles cmdRetryVersion: an operator revoking the control
+// layer's terminal verdict for ONE side of a version (Stratum_设计文档v13.md §10.1).
+//
+// It is deliberately narrow in three ways, each of which encodes a decision rather
+// than an omission:
+//
+//   - It accepts only a side that IS terminal. Anything else is refused with
+//     ErrVersionNotFailedPermanent rather than quietly accepted: a version that is
+//     merely FAILED is already retried by the ordinary paths, one that is PENDING or
+//     READY has nothing to retry, and reporting success for either would tell the
+//     operator a state changed when nothing did.
+//
+//   - It refuses the DATA side outright. An index-side verdict is a statement about a
+//     BUILD, and a build can be revoked by rebuilding; the data side's verdict says
+//     the version's data will never arrive, so there is no write to re-attempt from
+//     here. The operator's answer to that verdict is to abandon the version
+//     (ForceAbandonVersion → DeleteVersion), and this refusal says so instead of
+//     pretending to retry.
+//
+//   - It drops the recorded cause chain only once NEITHER side is terminal. The chain
+//     describes the failure an operator is looking at; clearing it while the other
+//     side is still dead would erase the diagnosis of a verdict still in force.
+//
+// Re-applying is refused by the first rule (the side is PENDING by then) rather than
+// silently succeeding — the honest answer for a replay, since the state is already
+// what the caller asked for. A retry that fails again goes through
+// ReportVersionFailure and lands back in the terminal state with a fresh count.
+func (sm *stateMachine) applyRetryVersion(cmd command) applyResult {
+	v, ok := sm.versions[cmd.VersionID]
+	if !ok {
+		return applyResult{Err: stratumerrors.ErrVersionNotFound}
+	}
+	if v.KBID != cmd.KBID {
+		return applyResult{Err: fmt.Errorf("version %d belongs to a different knowledge base: %w", cmd.VersionID, stratumerrors.ErrVersionNotFound)}
+	}
+	if v.Deleting {
+		// A version already on its way out has no state left to revive: its data is
+		// being reclaimed and its metadata is about to be removed.
+		return applyResult{Err: fmt.Errorf("version %d is being deleted: %w", cmd.VersionID, stratumerrors.ErrVersionDeleting)}
+	}
+	switch cmd.FailureSide {
+	case types.FailureSideIndex:
+		if v.IndexStatus != types.IndexStatusFailedPermanent {
+			return applyResult{Err: fmt.Errorf("version %d's index side is %s, not FAILED_PERMANENT: %w",
+				cmd.VersionID, v.IndexStatus.String(), stratumerrors.ErrVersionNotFailedPermanent)}
+		}
+		v.IndexStatus = types.IndexStatusPending
+	default:
+		// Two different refusals in one branch, and the message has to say which:
+		// either the caller asked to retry the DATA side, which is never retryable,
+		// or the data side was not terminal to begin with.
+		if v.DataStatus == types.DataStatusFailedPermanent {
+			return applyResult{Err: fmt.Errorf("version %d's data side is FAILED_PERMANENT: a data-side verdict cannot be retried, abandon the version instead: %w",
+				cmd.VersionID, stratumerrors.ErrVersionNotFailedPermanent)}
+		}
+		return applyResult{Err: fmt.Errorf("version %d's data side is %s, not FAILED_PERMANENT: %w",
+			cmd.VersionID, v.DataStatus.String(), stratumerrors.ErrVersionNotFailedPermanent)}
+	}
+	if v.IndexStatus != types.IndexStatusFailedPermanent && v.DataStatus != types.DataStatusFailedPermanent {
+		v.FailureReason = ""
+		v.FailureCount = 0
+		v.FailureSide = types.FailureSideData
+	}
 	sm.versions[cmd.VersionID] = v
 	return applyResult{}
 }

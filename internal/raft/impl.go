@@ -643,6 +643,19 @@ func (impl *RaftNodeImpl) ProposeMarkVersionFailedPermanent(ctx context.Context,
 	return res.Err
 }
 
+// ProposeRetryVersion implements RaftNode: an operator's revocation of one side's
+// terminal verdict (Stratum_设计文档v13.md §10.1). The narrow rules (index side only,
+// terminal side only, cause chain dropped only once nothing is terminal any more)
+// live in the state machine's apply, where every replica reaches the same verdict,
+// rather than here: a proposer that decided them would let two callers disagree.
+func (impl *RaftNodeImpl) ProposeRetryVersion(ctx context.Context, kbID string, versionID int64, side types.FailureSide) error {
+	res, err := impl.proposeAndWait(ctx, newRetryVersionCommand(kbID, versionID, side))
+	if err != nil {
+		return err
+	}
+	return res.Err
+}
+
 func (impl *RaftNodeImpl) ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
 	res, err := impl.proposeAndWait(ctx, newUpdateVersionStatusCommand(versionID, status, nodeID))
 	if err != nil {

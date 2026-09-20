@@ -28,6 +28,18 @@ const (
 	// (Stratum_设计文档v13.md §10.1).
 	cmdMarkVersionFailedPermanent commandType = "MarkVersionFailedPermanent"
 
+	// cmdRetryVersion is an OPERATOR's revocation of one side's terminal verdict
+	// (Stratum_设计文档v13.md §10.1): it puts that side back to PENDING and drops the
+	// recorded cause chain once neither side is terminal any more.
+	//
+	// It exists because "nothing re-triggers it automatically" is a statement about
+	// automatic paths, not a prohibition on humans: an operator who decides the
+	// verdict was wrong has to be able to say so. Before this the only way to act on
+	// such a decision was RebuildIndex's bare status overwrite, which left the old
+	// cause chain (`FailureReason` / `FailureCount` / `FailureSide`) in place — so
+	// GetSystemStatus kept describing a failure that had just been revoked.
+	cmdRetryVersion commandType = "RetryVersion"
+
 	// cmdMarkDataDurable records the DATA side as durable on the control layer's
 	// own authority rather than a writer's report: the startup reconcile knows a
 	// version's data sits on a quorum's worth of disks, and this is how that fact
@@ -89,9 +101,12 @@ type command struct {
 	// cmdMarkVersionFailedPermanent: the cause chain an operator needs.
 	FailureReason string `json:"failure_reason,omitempty"`
 	FailureCount  int32  `json:"failure_count,omitempty"`
-	// cmdMarkVersionFailedPermanent: which side the verdict lands on
-	// (Stratum_设计文档v13.md §10.1b). Omitted means the data side, which is
-	// what every command written before the two sides were separated meant.
+	// cmdMarkVersionFailedPermanent / cmdRetryVersion: which side the command
+	// settles (Stratum_设计文档v13.md §10.1b). Omitted means the data side, which is
+	// what every command written before the two sides were separated meant — and for
+	// the retry command the same zero value keeps that reading rather than falling
+	// through to a convenient default: the state machine refuses a data-side retry
+	// outright instead of treating an unset field as "the index side, then".
 	FailureSide types.FailureSide `json:"failure_side,omitempty"`
 
 	// cmdRollback
@@ -185,6 +200,12 @@ func newMarkVersionFailedPermanentCommand(kbID string, versionID int64, side typ
 		FailureReason: reason,
 		FailureCount:  count,
 	}
+}
+
+// newRetryVersionCommand builds the operator's revocation of one side's terminal
+// verdict (see cmdRetryVersion).
+func newRetryVersionCommand(kbID string, versionID int64, side types.FailureSide) command {
+	return command{Type: cmdRetryVersion, KBID: kbID, VersionID: versionID, FailureSide: side}
 }
 
 // newMarkDataDurableCommand is the control layer's own data-side promotion

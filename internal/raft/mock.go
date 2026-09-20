@@ -228,6 +228,33 @@ func (r *MockRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, kbID
 	return nil
 }
 
+// ProposeRetryVersion mirrors the real state machine's revocation of one side's
+// terminal verdict (Stratum_设计文档v13.md §10.1), refusals included: only a terminal
+// index side is accepted, and a data-side verdict is never retryable — so a test
+// driving the mock sees the behaviour it would get from a real cluster.
+func (r *MockRaftNode) ProposeRetryVersion(_ context.Context, kbID string, versionID int64, side types.FailureSide) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.versions[versionID]
+	if !ok || v.KBID != kbID {
+		return stratumerrors.ErrVersionNotFound
+	}
+	if v.Deleting {
+		return stratumerrors.ErrVersionDeleting
+	}
+	if side != types.FailureSideIndex || v.IndexStatus != types.IndexStatusFailedPermanent {
+		return stratumerrors.ErrVersionNotFailedPermanent
+	}
+	v.IndexStatus = types.IndexStatusPending
+	if v.DataStatus != types.DataStatusFailedPermanent {
+		v.FailureReason = ""
+		v.FailureCount = 0
+		v.FailureSide = types.FailureSideData
+	}
+	r.versions[versionID] = v
+	return nil
+}
+
 func (r *MockRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

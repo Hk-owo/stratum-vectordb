@@ -212,3 +212,29 @@ func (s *AdminServer) WarmupVersion(ctx context.Context, req *pb.WarmupVersionRe
 		return s.r.admins[idx].WarmupVersion(ctx, req)
 	})
 }
+
+// ListFailedVersions proxies the operator's work queue (§10.1). The knowledge base
+// is optional and travels as the routing key, so a cluster-wide query is
+// load-balanced like any other metadata read; an empty key is what Forward already
+// does for GetSystemStatus.
+func (s *AdminServer) ListFailedVersions(ctx context.Context, req *pb.ListFailedVersionsRequest) (*pb.ListFailedVersionsResponse, error) {
+	return Forward(s.r, ctx, pb.AdminService_ListFailedVersions_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ListFailedVersionsResponse, error) {
+		return s.r.admins[idx].ListFailedVersions(ctx, req)
+	})
+}
+
+// ForceRetryVersion proxies an operator's retry of an index-side verdict. It is a
+// write to replicated metadata, so it goes through the same Forward as the other
+// operator RPCs and inherits their retry semantics.
+func (s *AdminServer) ForceRetryVersion(ctx context.Context, req *pb.ForceRetryVersionRequest) (*pb.ForceRetryVersionResponse, error) {
+	return Forward(s.r, ctx, pb.AdminService_ForceRetryVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ForceRetryVersionResponse, error) {
+		return s.r.admins[idx].ForceRetryVersion(ctx, req)
+	})
+}
+
+// ForceAbandonVersion proxies an operator's abandonment of a terminated version.
+func (s *AdminServer) ForceAbandonVersion(ctx context.Context, req *pb.ForceAbandonVersionRequest) (*pb.ForceAbandonVersionResponse, error) {
+	return Forward(s.r, ctx, pb.AdminService_ForceAbandonVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ForceAbandonVersionResponse, error) {
+		return s.r.admins[idx].ForceAbandonVersion(ctx, req)
+	})
+}

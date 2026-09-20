@@ -87,6 +87,17 @@ type RaftNode interface {
 	// count form the auditable cause chain an operator needs.
 	ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error
 
+	// ProposeRetryVersion revokes one side's terminal verdict
+	// (Stratum_设计文档v13.md §10.1). It is an OPERATOR's action, never an automatic
+	// one: "nothing re-triggers it" keeps holding for every machine in the system.
+	//
+	// Only the index side is accepted — the state machine refuses a data-side retry,
+	// because that verdict says the version's data will never arrive and there is no
+	// write left to re-attempt. On success the side is PENDING again (the caller
+	// rebuilds the index), and the recorded cause chain is dropped once neither side
+	// is terminal. A side that is not terminal is refused rather than accepted.
+	ProposeRetryVersion(ctx context.Context, kbID string, versionID int64, side types.FailureSide) error
+
 	// ProposeUpdateVersionSummary records the version's full document-ID
 	// set hash (VersionMeta.DocIDSetHash). The leader calls this after its
 	// storage-layer writes for the version have completed; followers use
