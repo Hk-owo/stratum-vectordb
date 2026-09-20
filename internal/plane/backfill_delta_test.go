@@ -259,6 +259,11 @@ func TestLocalDataPlane_BackfillReadsTheVersionSetOnce(t *testing.T) {
 	if existence.calls != 1 {
 		t.Errorf("existing-version reads = %d, want 1: both paths share one read", existence.calls)
 	}
+	// And the one read asks about the GAP (1,3], not the whole chain — that is what
+	// keeps the cost proportional to the gap instead of to the version count.
+	if existence.gotFrom != 1 || existence.gotTo != 3 {
+		t.Errorf("asked about (%d,%d], want (1,3]", existence.gotFrom, existence.gotTo)
+	}
 	if puller.calls != 2 {
 		t.Errorf("full-record pulls = %d, want 2 (v2 and v3: the whole gap)", puller.calls)
 	}

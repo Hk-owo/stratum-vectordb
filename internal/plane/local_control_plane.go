@@ -659,10 +659,10 @@ func (c *LocalControlPlane) SetLeaderWatermarks(watermarks map[string]int64) {
 //
 // It reads the local replica of the metadata, not a Raft round trip: the caller
 // runs on the apply path, where any blocking call would stall every later entry.
-func (c *LocalControlPlane) ExistingVersions(ctx context.Context, kbID string) (map[int64]bool, error) {
-	versions, err := c.rn.ListVersions(ctx, kbID)
+func (c *LocalControlPlane) ExistingVersions(ctx context.Context, kbID string, fromExclusive, toInclusive int64) (map[int64]bool, error) {
+	versions, err := c.rn.ListVersionsInRange(ctx, kbID, &fromExclusive, &toInclusive)
 	if err != nil {
-		return nil, fmt.Errorf("plane: list versions of %s: %w", kbID, err)
+		return nil, fmt.Errorf("plane: list versions of %s in (%d,%d]: %w", kbID, fromExclusive, toInclusive, err)
 	}
 	existing := make(map[int64]bool, len(versions))
 	for _, v := range versions {

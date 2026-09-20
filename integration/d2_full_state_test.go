@@ -23,7 +23,7 @@ type d2ExistenceStub struct {
 	exists map[int64]bool
 }
 
-func (s *d2ExistenceStub) ExistingVersions(context.Context, string) (map[int64]bool, error) {
+func (s *d2ExistenceStub) ExistingVersions(context.Context, string, int64, int64) (map[int64]bool, error) {
 	return s.exists, nil
 }
 

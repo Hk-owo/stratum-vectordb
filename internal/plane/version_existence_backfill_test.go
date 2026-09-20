@@ -14,14 +14,26 @@ type stubVersionExistence struct {
 	exists map[int64]bool
 	err    error
 	calls  int
+	// gotFrom / gotTo record the range asked about, so a test can pin "it asked about
+	// its gap" rather than merely "it asked".
+	gotFrom, gotTo int64
 }
 
-func (s *stubVersionExistence) ExistingVersions(_ context.Context, _ string) (map[int64]bool, error) {
+func (s *stubVersionExistence) ExistingVersions(_ context.Context, _ string, fromExclusive, toInclusive int64) (map[int64]bool, error) {
 	s.calls++
+	s.gotFrom, s.gotTo = fromExclusive, toInclusive
 	if s.err != nil {
 		return nil, s.err
 	}
-	return s.exists, nil
+	// Narrowed like the real one: a stub answering the whole map would let a caller
+	// read outside its gap without any test noticing.
+	out := make(map[int64]bool, len(s.exists))
+	for id, ok := range s.exists {
+		if id > fromExclusive && id <= toInclusive {
+			out[id] = ok
+		}
+	}
+	return out, nil
 }
 
 // snapshotPuller records the two transfer paths separately, so a test can tell

@@ -47,7 +47,14 @@ type VersionChangesFetcher interface {
 // backfill runs on the Raft apply path, so a probe here would stall every later
 // log entry.
 type VersionExistenceChecker interface {
-	ExistingVersions(ctx context.Context, kbID string) (map[int64]bool, error)
+	// ExistingVersions answers, for the versions in (fromExclusive, toInclusive], which
+	// of them still exist.
+	//
+	// The range is not a convenience: the caller is a backfill asking about ONE gap, and
+	// a whole-chain answer is paid for in full on the wire — about 89 B per version,
+	// mostly the document-set digest — so a two-version gap must not cost a chain of
+	// thousands (see RaftNode.ListVersionsInRange).
+	ExistingVersions(ctx context.Context, kbID string, fromExclusive, toInclusive int64) (map[int64]bool, error)
 }
 
 // DataVerifier reports whether this node's local stores already hold the
@@ -1027,7 +1034,10 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 	var existing map[int64]bool
 	var existingErr error
 	if d.versionExists != nil {
-		existing, existingErr = d.versionExists.ExistingVersions(ctx, kbID)
+		// The gap is (local, versionID), and that is exactly what is asked for: the
+		// bounds travel to the control layer and narrow the ANSWER, so the cost is
+		// proportional to the gap rather than to the chain (see ListVersionsInRange).
+		existing, existingErr = d.versionExists.ExistingVersions(ctx, kbID, local, versionID-1)
 		if existingErr != nil {
 			d.logger.Warn("plane: backfill cannot check which versions still exist",
 				zap.String("kb_id", kbID), zap.Int64("from_version", local),
@@ -2219,6 +2229,10 @@ type VersionWriteExecutor interface {
 type MetadataLister interface {
 	ListKnowledgeBases(ctx context.Context) ([]types.KnowledgeBaseMeta, error)
 	ListVersions(ctx context.Context, kbID string) ([]types.VersionMeta, error)
+	// ListVersionsInRange is the same read narrowed to (fromExclusive, toInclusive]
+	// (nil = no bound on that side). The plane's readers ask about ranges — a backfill
+	// about one gap — and the range is what keeps a whole-chain answer off the wire.
+	ListVersionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error)
 }
 
 // EnforceRetention applies the disk retention policy once at startup: for
