@@ -101,16 +101,14 @@ func TestRealStack_ThreeNodeCluster_SnapshotPipeline(t *testing.T) {
 	versions := []int64{v1}
 	prev := v1
 	for i := 2; ; i++ {
-		resp, err := leader.KB.CreateVersion(ctx, &pb.CreateVersionRequest{
-			KnowledgeBaseId: kbID,
-			ParentVersionId: prev,
-			Changes: []*pb.DocChange{
-				{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: fmt.Sprintf("doc-%d", i), Content: fmt.Sprintf("content-%d", i)},
-			},
-		})
-		if err != nil {
-			t.Fatalf("CreateVersion v%d: %v", i, err)
-		}
+		resp := createVersionViaCurrentLeader(t, ctx, nodes[:],
+			fmt.Sprintf("CreateVersion v%d", i), &pb.CreateVersionRequest{
+				KnowledgeBaseId: kbID,
+				ParentVersionId: prev,
+				Changes: []*pb.DocChange{
+					{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: fmt.Sprintf("doc-%d", i), Content: fmt.Sprintf("content-%d", i)},
+				},
+			})
 		v := resp.VersionId
 		leader.waitVersionReady(ctx, kbID, v)
 		versions = append(versions, v)
@@ -212,25 +210,14 @@ func TestRealStack_ThreeNodeCluster_SnapshotPipeline(t *testing.T) {
 	// Internal + "not leader", and internal/kvraft produces exactly that for a request
 	// that reaches a non-leader), so the fixture retries it instead of failing a
 	// cluster that is merely mid-election.
-	var vNext int64
-	for attempt := 0; ; attempt++ {
-		cur := waitForLeader(t, nodes[0], nodes[1], nodes[2])
-		resp, err := cur.KB.CreateVersion(ctx, &pb.CreateVersionRequest{
+	vNext := createVersionViaCurrentLeader(t, ctx, nodes[:], "CreateVersion after recovery",
+		&pb.CreateVersionRequest{
 			KnowledgeBaseId: kbID,
 			ParentVersionId: prev,
 			Changes: []*pb.DocChange{
 				{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-after-recovery", Content: "recovered"},
 			},
-		})
-		if err == nil {
-			vNext = resp.VersionId
-			break
-		}
-		if attempt >= 10 || !strings.Contains(err.Error(), "not leader") {
-			t.Fatalf("CreateVersion after recovery: %v", err)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+		}).VersionId
 	for _, n := range nodes {
 		n.waitVersionReady(ctx, kbID, vNext)
 	}
@@ -248,4 +235,29 @@ func TestRealStack_ThreeNodeCluster_SnapshotPipeline(t *testing.T) {
 
 	t.Logf("snapshot pipeline OK: %d versions, leader node %d, recovered node %d",
 		len(versions), leader.nodeID, restarted.nodeID)
+}
+
+// createVersionViaCurrentLeader issues a write through the CURRENT leader, retrying while
+// the answer is "not leader".
+//
+// Why not a cached handle: this test takes replicas offline and restarts them, and either
+// can move leadership — under load it regularly does. A write that reaches a non-leader is
+// answered with Internal + "kvraft: not leader", which is retryable BY CONTRACT
+// (internal/router's isRetryableErr matches it, and internal/kvraft produces exactly that
+// for a request that lands on a non-leader), so a fixture that fails on it is failing on a
+// cluster that is merely mid-election. Resolving the leader INSIDE the retry is also what
+// keeps the two call sites from each growing their own version of this.
+func createVersionViaCurrentLeader(t *testing.T, ctx context.Context, nodes []*realNode, label string, req *pb.CreateVersionRequest) *pb.CreateVersionResponse {
+	t.Helper()
+	for attempt := 0; ; attempt++ {
+		cur := waitForLeader(t, nodes[0], nodes[1], nodes[2])
+		resp, err := cur.KB.CreateVersion(ctx, req)
+		if err == nil {
+			return resp
+		}
+		if attempt >= 10 || !strings.Contains(err.Error(), "not leader") {
+			t.Fatalf("%s: %v", label, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
