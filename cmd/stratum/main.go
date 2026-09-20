@@ -976,6 +976,17 @@ func main() {
 			logger.Warn("index retention: ListKnowledgeBases failed", zap.Error(err))
 		}
 		epochDurable = reconcileIndexStatus(ctx, logger, dataPlane, controlPlane, rn, cfg.IndexRetentionCount)
+
+		// A terminal verdict does not come back on a restart — once the log is
+		// compacted the entry is only ever restored as snapshot state, so the apply
+		// hook that queues the reclaim never fires again. The verdict's METADATA does
+		// survive, so sweep the state machine once and rebuild the list: no
+		// persistence, and the same set the hook would have queued.
+		if n, err := dataPlane.ReclaimTerminalVersions(ctx, rn); err != nil {
+			logger.Warn("startup: could not rebuild the terminal-version reclaim list", zap.Error(err))
+		} else if n > 0 {
+			logger.Info("startup: queued terminal versions for local reclaim", zap.Int("versions", n))
+		}
 	}
 
 	// §10.6: a cleanup broadcast that failed is retried in the background, so

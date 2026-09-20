@@ -1946,6 +1946,52 @@ func (d *LocalDataPlane) NoteTerminalVersion(kbID string, versionID int64) {
 	d.reclaimTerminalVersionLocally(kbID, versionID)
 }
 
+// ReclaimTerminalVersions rebuilds the apply-driven reclaim list at startup.
+//
+// The list is memory (see NoteTerminalVersion), and a terminal verdict does NOT come
+// back on a restart: a node that was down when the entry was applied only replays it if
+// the entry is still in the log — after compaction the state machine is restored from
+// the snapshot and the entry is never applied individually, so the hook that would have
+// queued the reclaim never fires. Measured on a single node (verdict applied, log
+// compacted, restart): the hook does not fire again, and that version's leftover data
+// is nobody's business again.
+//
+// What DOES survive is the version's metadata: a data-side verdict lives in
+// DataStatusFailedPermanent, which the snapshot carries. So this costs no persistence
+// at all — sweep the state machine once and queue exactly what the apply hook would
+// have queued.
+//
+// The INDEX side is deliberately excluded (§10.1b): that verdict says a build failed,
+// not that the data is gone, so reclaiming storage on its behalf would throw away good
+// data. A version that was DELETED meanwhile is not in the metadata at all; those go
+// through DeleteVersion's own cleanup (which persists its intent and can be
+// re-triggered), so a sweep cannot see them and does not need to.
+func (d *LocalDataPlane) ReclaimTerminalVersions(ctx context.Context, meta MetadataLister) (int, error) {
+	kbs, err := meta.ListKnowledgeBases(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("plane: reclaim terminal versions: list knowledge bases: %w", err)
+	}
+	queued := 0
+	for _, kb := range kbs {
+		versions, err := meta.ListVersions(ctx, kb.KBID)
+		if err != nil {
+			// One unreadable knowledge base must not stop the rest: the sweep is
+			// idempotent, and the next start tries again.
+			d.logger.Warn("plane: reclaim terminal versions: list versions failed",
+				zap.String("kb_id", kb.KBID), zap.Error(err))
+			continue
+		}
+		for _, v := range versions {
+			if v.DataStatus != types.DataStatusFailedPermanent {
+				continue
+			}
+			d.NoteTerminalVersion(kb.KBID, v.VersionID)
+			queued++
+		}
+	}
+	return queued, nil
+}
+
 // terminalReclaimInterval / terminalReclaimAttempts pace the apply-driven reclaim,
 // and they are separate from cleanupRetryInterval / cleanupRetryAttempts on purpose:
 //

@@ -3,6 +3,7 @@ package plane
 import (
 	"context"
 	"errors"
+	"stratum/internal/types"
 	"testing"
 )
 
@@ -146,5 +147,46 @@ func TestLocalDataPlane_FailedTerminalReclaimIsRetriedOnItsOwnCadence(t *testing
 	}
 	if got := dp.LocalVersionOf("kb-1"); got != 7 {
 		t.Errorf("cursor = %d, want 7", got)
+	}
+}
+
+// TestLocalDataPlane_ReclaimTerminalVersionsRebuildsTheListOnStart: a restart must not
+// turn a terminal verdict into "nobody's business". The verdict's metadata survives in
+// the snapshot, so sweeping the state machine once rebuilds exactly the list the apply
+// hook would have built — and only for the DATA side, because an index-side verdict
+// says a build failed, not that the data is gone.
+func TestLocalDataPlane_ReclaimTerminalVersionsRebuildsTheListOnStart(t *testing.T) {
+	meta := &stubMeta{
+		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-1"}},
+		versions: map[string][]types.VersionMeta{
+			"kb-1": {
+				{VersionID: 1, KBID: "kb-1", IndexStatus: types.IndexStatusReady, DataStatus: types.DataStatusDurable},
+				// The one to reclaim: the data side is terminal, the index side was never touched.
+				{VersionID: 2, KBID: "kb-1", IndexStatus: types.IndexStatusPending, DataStatus: types.DataStatusFailedPermanent},
+				// Index-side verdict only: its data may be perfectly good.
+				{VersionID: 3, KBID: "kb-1", IndexStatus: types.IndexStatusFailedPermanent, DataStatus: types.DataStatusDurable},
+				{VersionID: 4, KBID: "kb-1", IndexStatus: types.IndexStatusPending, DataStatus: types.DataStatusPending},
+			},
+		},
+	}
+	dropper := &stubDropper{}
+	cleaner := &stubCleaner{}
+	dp := newCleanupPlane(dropper, cleaner, []string{"peer-1"})
+
+	queued, err := dp.ReclaimTerminalVersions(context.Background(), meta)
+	if err != nil {
+		t.Fatalf("ReclaimTerminalVersions: %v", err)
+	}
+	if queued != 1 {
+		t.Fatalf("queued = %d, want 1 (only the data-side verdict)", queued)
+	}
+	if len(dropper.dropped) != 1 || dropper.dropped[0] != "kb-1/2" {
+		t.Errorf("local drops = %v, want [kb-1/2]", dropper.dropped)
+	}
+	if len(cleaner.targets) != 0 {
+		t.Errorf("broadcast targets = %v, want none: the sweep is local", cleaner.targets)
+	}
+	if got := dp.LocalVersionOf("kb-1"); got != 2 {
+		t.Errorf("cursor = %d, want 2: the swept version must not hold the contiguous cursor back", got)
 	}
 }
