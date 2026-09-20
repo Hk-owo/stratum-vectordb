@@ -148,8 +148,12 @@ func TestLocalDataPlane_TerminalVerdictTriggersCleanup(t *testing.T) {
 	if len(dropper.dropped) != 1 {
 		t.Fatalf("local drop = %v, want the cleanup to fire on the terminal verdict", dropper.dropped)
 	}
-	if len(cleaner.targets) != 1 {
-		t.Errorf("broadcast = %v, want the candidate peer", cleaner.targets)
+	// No broadcast. §10.6 broadcast because the control layer knew nothing about which
+	// replicas had the data; every replica now learns the verdict from its own apply and
+	// reclaims locally (see NoteTerminalVersion). This path exists only to be FASTER on
+	// the node that noticed the failure.
+	if len(cleaner.targets) != 0 {
+		t.Fatalf("broadcast = %v, want none: the verdict reaches every replica through its own apply", cleaner.targets)
 	}
 }
 

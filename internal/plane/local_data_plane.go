@@ -1617,10 +1617,16 @@ func (d *LocalDataPlane) reportFailure(ctx context.Context, kbID string, version
 	if !terminal {
 		return
 	}
-	// The verdict just landed: reclaim whatever physical data made it to disk,
-	// including on replicas whose acknowledgement was lost
-	// (Stratum_设计文档v13.md §10.6).
-	if err := d.DropVersionData(ctx, kbID, versionID); err != nil {
+	// The verdict just landed: reclaim whatever physical data made it to disk HERE —
+	// no broadcast.
+	//
+	// §10.6 broadcast because the control layer never knew which replicas had received
+	// the version. That is no longer the situation: every replica is told by its own
+	// apply of the verdict (see NoteTerminalVersion), so broadcasting again would turn
+	// N nodes into N×N calls and mostly re-reach replicas already doing it. What this
+	// path adds is SPEED — the node that detected the failure cleans up now, instead of
+	// when its apply loop reaches the entry.
+	if err := d.reclaimTerminalVersionLocally(kbID, versionID); err != nil {
 		d.logger.Warn("plane: cleanup after a permanent failure",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
 	}
@@ -1943,7 +1949,10 @@ func (d *LocalDataPlane) scheduleIndexBuild(ctx context.Context, kbID string, ve
 // network) and hands the retry to its own queue — see terminalReclaimInterval for why
 // that cadence is deliberately not §10.6's.
 func (d *LocalDataPlane) NoteTerminalVersion(kbID string, versionID int64) {
-	d.reclaimTerminalVersionLocally(kbID, versionID)
+	if err := d.reclaimTerminalVersionLocally(kbID, versionID); err != nil {
+		d.logger.Warn("plane: local reclaim of a terminal version failed; retrying on its own cadence",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
 }
 
 // ReclaimTerminalVersions rebuilds the apply-driven reclaim list at startup.
@@ -2011,13 +2020,11 @@ const terminalReclaimAttempts = 10
 //
 // No broadcast (see NoteTerminalVersion) and no existence probe: DropVersionStorage is
 // a prefix delete, so "I do not have it" is a no-op rather than a case to detect.
-func (d *LocalDataPlane) reclaimTerminalVersionLocally(kbID string, versionID int64) {
+func (d *LocalDataPlane) reclaimTerminalVersionLocally(kbID string, versionID int64) error {
 	if d.dropper != nil {
 		if err := d.dropper.DropVersionStorage(context.Background(), kbID, versionID); err != nil {
-			d.logger.Warn("plane: local reclaim of a terminal version failed; retrying on its own cadence",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
 			d.scheduleTerminalReclaim(kbID, versionID)
-			return
+			return err
 		}
 	}
 	// The cursor steps over it only once the bytes are gone: a version whose data will
@@ -2026,6 +2033,7 @@ func (d *LocalDataPlane) reclaimTerminalVersionLocally(kbID string, versionID in
 	// same invariant every other advance follows — data first, cursor second.
 	d.advanceLocalVersion(kbID, versionID)
 	d.clearTerminalReclaim(kbID, versionID)
+	return nil
 }
 
 // scheduleTerminalReclaim remembers a local reclaim that did not finish. Keyed per
