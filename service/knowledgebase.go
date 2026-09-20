@@ -445,9 +445,18 @@ func (s *KnowledgeBaseServiceImpl) ListVersions(ctx context.Context, req *pb.Lis
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
-	out := make([]*pb.VersionInfo, len(versions))
-	for i, v := range versions {
-		out[i] = versionInfoToProto(v)
+	// Narrow to the requested range BEFORE converting: the bounds exist to keep a
+	// whole-chain answer off the wire, and conversion + serialization is where that
+	// cost lives (about 89 B per version, mostly the document-set digest).
+	out := make([]*pb.VersionInfo, 0, len(versions))
+	for _, v := range versions {
+		if req.FromExclusive != nil && v.VersionID <= req.GetFromExclusive() {
+			continue
+		}
+		if req.ToInclusive != nil && v.VersionID > req.GetToInclusive() {
+			continue
+		}
+		out = append(out, versionInfoToProto(v))
 	}
 	return &pb.ListVersionsResponse{Versions: out}, nil
 }

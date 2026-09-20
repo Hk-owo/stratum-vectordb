@@ -154,6 +154,15 @@ type RaftNode interface {
 	// ListVersions returns the full version list for kbID.
 	ListVersions(ctx context.Context, kbID string) ([]types.VersionMeta, error)
 
+	// ListVersionsInRange is ListVersions narrowed to (fromExclusive, toInclusive].
+	//
+	// It exists so a caller that needs a few versions does not pay for the whole chain:
+	// the answer carries about 89 B per version (mostly the document-set digest), and
+	// the callers that ask are on the read path — the §7.5 backfill asks which of a
+	// gap's versions still exist, a freshness check asks about one. A nil bound means
+	// "no bound on that side", so both nil is exactly ListVersions.
+	ListVersionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error)
+
 	// GetVersion returns ONE version's metadata within kbID, so a caller can
 	// ask about a single version without pulling the whole chain: ListVersions
 	// is O(versions) in the KB and the await path polls it repeatedly

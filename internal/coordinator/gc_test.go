@@ -26,6 +26,11 @@ func (r *gcTestRaftNode) ListVersions(_ context.Context, kbID string) ([]types.V
 	return r.versions[kbID], nil
 }
 
+// ListVersionsInRange mirrors the interface; this stub is not exercised by it.
+func (r *gcTestRaftNode) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
+	return nil, nil
+}
+
 // GetVersion satisfies raft.RaftNode, answering from the same fixture data.
 func (r *gcTestRaftNode) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
 	for _, v := range r.versions[kbID] {

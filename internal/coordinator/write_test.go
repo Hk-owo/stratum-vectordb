@@ -431,6 +431,11 @@ func (r *testRaftNode) ListVersions(_ context.Context, kbID string) ([]types.Ver
 	return nil, nil
 }
 
+// ListVersionsInRange mirrors the interface; this stub is not exercised by it.
+func (r *testRaftNode) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
+	return nil, nil
+}
+
 // GetVersion satisfies raft.RaftNode; this stub models no versions.
 func (r *testRaftNode) GetVersion(_ context.Context, _ string, _ int64) (types.VersionMeta, error) {
 	return types.VersionMeta{}, nil

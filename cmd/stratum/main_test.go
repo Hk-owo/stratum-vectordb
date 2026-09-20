@@ -369,6 +369,11 @@ func (r *reconcileRaftNode) ListVersions(_ context.Context, kbID string) ([]type
 	return r.versions[kbID], nil
 }
 
+// ListVersionsInRange mirrors the interface; this stub is not exercised by it.
+func (r *reconcileRaftNode) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
+	return nil, nil
+}
+
 // GetVersion satisfies raft.RaftNode, answering from the same fixture data.
 func (r *reconcileRaftNode) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
 	for _, v := range r.versions[kbID] {

@@ -30,6 +30,11 @@ func (m *stubMetadata) ListVersions(_ context.Context, kbID string) ([]types.Ver
 	return m.versions[kbID], nil
 }
 
+// ListVersionsInRange mirrors the interface; this stub is not exercised by it.
+func (m *stubMetadata) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
+	return nil, nil
+}
+
 // TestLocalDataPlane_RecoverLocalCursors pins the fix for the restart hole the
 // 3+3 stress run found (TestT4_QueryLatency): the contiguous cursor lives in
 // memory (§7.8), so a restarted storage node answers "0" for every knowledge

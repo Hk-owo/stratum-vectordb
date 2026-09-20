@@ -332,6 +332,26 @@ func (r *RemoteRaftNode) GetKB(ctx context.Context, kbID string) (types.Knowledg
 }
 
 // ListVersions implements RaftNode.
+// ListVersionsInRange implements RaftNode on the SAME RPC as ListVersions: the bounds
+// are request fields, so a narrow ask is a narrow ANSWER on the wire — which is the
+// whole point of having them (see the RaftNode interface).
+func (r *RemoteRaftNode) ListVersionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error) {
+	var out []types.VersionMeta
+	err := r.readAtAnyControl(ctx, func(ctx context.Context, conn *grpc.ClientConn) error {
+		resp, err := pb.NewKnowledgeBaseServiceClient(conn).ListVersions(ctx, &pb.ListVersionsRequest{
+			KnowledgeBaseId: kbID,
+			FromExclusive:   fromExclusive,
+			ToInclusive:     toInclusive,
+		})
+		if err != nil {
+			return err
+		}
+		out = wire.VersionsFromInfos(kbID, resp.GetVersions())
+		return nil
+	})
+	return out, kbScopedError(err)
+}
+
 func (r *RemoteRaftNode) ListVersions(ctx context.Context, kbID string) ([]types.VersionMeta, error) {
 	var out []types.VersionMeta
 	err := r.readAtAnyControl(ctx, func(ctx context.Context, conn *grpc.ClientConn) error {

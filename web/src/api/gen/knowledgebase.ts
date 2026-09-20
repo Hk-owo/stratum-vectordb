@@ -317,6 +317,20 @@ export interface CreateVersionResponse {
 
 export interface ListVersionsRequest {
   knowledge_base_id: string;
+  /**
+   * from_exclusive / to_inclusive narrow the answer to a version range.
+   *
+   * They exist because the control layer's only version read primitive returns the
+   * WHOLE chain. Callers routinely want a handful of versions out of it — the backfill
+   * asks "which of these gap versions still exist", a freshness check asks about one —
+   * and the transport cost is per version (about 89 B, mostly the doc_id_set_hash), so
+   * a whole-chain answer is paid on every ask no matter how little the caller needs.
+   *
+   * Unset on a side means "no bound on that side", so a request that sets neither is
+   * exactly the pre-existing behaviour.
+   */
+  from_exclusive?: string | undefined;
+  to_inclusive?: string | undefined;
 }
 
 export interface ListVersionsResponse {

@@ -760,6 +760,30 @@ func (impl *RaftNodeImpl) GetKB(_ context.Context, kbID string) (types.Knowledge
 	return kb, nil
 }
 
+// ListVersionsInRange implements RaftNode: the same set, narrowed.
+//
+// A linear walk with two comparisons per version, and that is deliberate — the cost
+// worth saving here is the WIRE (89 B per version), not this. The version set is a
+// slice in allocation order that deletions splice, so a binary search would be buying
+// microseconds with a new invariant to keep.
+func (impl *RaftNodeImpl) ListVersionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error) {
+	all, err := impl.ListVersions(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]types.VersionMeta, 0, len(all))
+	for _, v := range all {
+		if fromExclusive != nil && v.VersionID <= *fromExclusive {
+			continue
+		}
+		if toInclusive != nil && v.VersionID > *toInclusive {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 func (impl *RaftNodeImpl) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
 	impl.sm.mu.RLock()
 	defer impl.sm.mu.RUnlock()

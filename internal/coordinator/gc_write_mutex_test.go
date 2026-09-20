@@ -112,6 +112,11 @@ func (r *gcWriteRaftNode) ListVersions(_ context.Context, kbID string) ([]types.
 	return append([]types.VersionMeta(nil), r.versions[kbID]...), nil
 }
 
+// ListVersionsInRange mirrors the interface; this stub is not exercised by it.
+func (r *gcWriteRaftNode) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
+	return nil, nil
+}
+
 // GetVersion satisfies raft.RaftNode, answering from the same fixture data.
 func (r *gcWriteRaftNode) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
 	r.mu.Lock()

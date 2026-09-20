@@ -76,6 +76,11 @@ func (m *stubMeta) ListVersions(_ context.Context, kbID string) ([]types.Version
 	return m.versions[kbID], nil
 }
 
+// ListVersionsInRange mirrors the interface; this stub is not exercised by it.
+func (m *stubMeta) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
+	return nil, nil
+}
+
 func (m *stubMeta) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
 	m.statusCalls = append(m.statusCalls, statusCall{versionID: versionID, status: status, nodeID: nodeID})
 	return nil

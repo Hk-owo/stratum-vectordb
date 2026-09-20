@@ -584,6 +584,27 @@ func (r *MockRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBas
 	return kb, nil
 }
 
+// ListVersionsInRange mirrors the real node's narrowing (see the RaftNode interface).
+func (r *MockRaftNode) ListVersionsInRange(_ context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]types.VersionMeta, 0)
+	for _, id := range r.versionsByKB[kbID] {
+		v, ok := r.versions[id]
+		if !ok {
+			continue
+		}
+		if fromExclusive != nil && v.VersionID <= *fromExclusive {
+			continue
+		}
+		if toInclusive != nil && v.VersionID > *toInclusive {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 func (r *MockRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
