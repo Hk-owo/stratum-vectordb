@@ -65,6 +65,14 @@ index_manager:
   # 建完整 HNSW 图。形态变化后的产物走 §8.4 的副本分发，与新建索引同路。
   cold_threshold_ms: 0
   cold_sweep_interval_ms: 0
+  # §8.6(c) 的增量复用门槛与 §8.6(d) 的回收报告门槛。两个默认值当前相同
+  # （0.2），这是已知的待改进点而非有意决策：同值时 §8.6(c) 恰好会在
+  # §8.6(d) 开始关心的那一刻重建，于是 (d) 永远看不到候选。定值需要真实
+  # 部署数据（docs/known-gaps.md §G 记了论证），所以先把旋钮交出来：这里
+  # 调大 gc_ratio_threshold（相对 append_max_dead_ratio）就能让回收路径
+  # 在有墓碑的活跃版本上真正看到候选。0 = 用 IndexManager 默认值。
+  append_max_dead_ratio: 0.2
+  gc_ratio_threshold: 0
   # 磁盘保留策略的「访问保护」。retention 默认只按版本号保新
   # （gc.version_retention_count 个），于是一个还在被读的老版本（客户比对历史版本、
   # 客户端钉在旧版本上）会被当成死版本删掉，下次查询再重建一次——它从来都不冷。

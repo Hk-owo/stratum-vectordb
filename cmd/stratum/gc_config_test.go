@@ -18,6 +18,7 @@ func TestLoadConfig_GCCollectionKnobs(t *testing.T) {
 		"  gc_enabled: true\n" +
 		"  serving_replica_min: 3\n" +
 		"  graph_rebuild_ratio: 0.6\n" +
+		"  gc_ratio_threshold: 0.35\n" +
 		"  gc_sweep_interval_ms: 2500\n" +
 		"  build_concurrency: 3\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -37,6 +38,13 @@ func TestLoadConfig_GCCollectionKnobs(t *testing.T) {
 	}
 	if cfg.IndexGCGraphRebuildRatio != 0.6 {
 		t.Errorf("IndexGCGraphRebuildRatio = %v, want 0.6", cfg.IndexGCGraphRebuildRatio)
+	}
+	// The §8.6(d) scanner threshold is the one knob of the three that had no yaml
+	// surface at all: it was reachable from IndexManagerConfig but not from a config
+	// file, so a deployment could not separate it from append_max_dead_ratio — the
+	// exact separation §G says is needed before §8.6(d) can observe anything.
+	if cfg.IndexGCRatioThreshold != 0.35 {
+		t.Errorf("IndexGCRatioThreshold = %v, want 0.35", cfg.IndexGCRatioThreshold)
 	}
 	if cfg.IndexGCSweepInterval != 2500*time.Millisecond {
 		t.Errorf("IndexGCSweepInterval = %v, want 2.5s", cfg.IndexGCSweepInterval)

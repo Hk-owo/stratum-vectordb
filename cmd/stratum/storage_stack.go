@@ -135,6 +135,7 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		ColdThreshold:      cfg.IndexColdThreshold,
 		ColdSweepInterval:  cfg.IndexColdSweepInterval,
 		AppendMaxDeadRatio: cfg.IndexAppendMaxDeadRatio,
+		GCRatioThreshold:   cfg.IndexGCRatioThreshold,
 		// §3 codebook refresh (docs/codebook-refresh-plan.md §3). Firing either
 		// trigger rebuilds the version from scratch, which is the only way to
 		// retrain the quantizer. Gated by the KB's quantizer inside the

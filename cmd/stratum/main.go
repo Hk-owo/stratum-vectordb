@@ -1888,6 +1888,20 @@ type appConfig struct {
 	// IndexManager's default, 1.0 disables the check.
 	IndexAppendMaxDeadRatio float64
 
+	// IndexGCRatioThreshold is the dead-vector share above which a §8.6(d)
+	// SCANNER reports an active version as a collection candidate
+	// (index_manager.gc_ratio_threshold); <= 0 means the IndexManager's default.
+	//
+	// Separate knob from IndexAppendMaxDeadRatio on purpose — one decides whether a
+	// BUILD may start from an artifact, the other whether a SEALED artifact is worth
+	// reopening (which takes the version out of service here for a moment). Their
+	// defaults happen to be equal today, and that is a known wart rather than a
+	// decision: with both at the same value §8.6(c) rebuilds exactly when §8.6(d)
+	// starts caring, so (d) never observes a candidate. Exposing the knob is what
+	// lets a deployment separate them without a code change; the value itself waits
+	// for deployment data (docs/known-gaps.md §G).
+	IndexGCRatioThreshold float64
+
 	// IndexMaxCodebookDriftRatio / IndexMaxCodebookAppends are §3's two triggers
 	// for retiring a stale quantizer codebook
 	// (index_manager.max_codebook_drift_ratio / max_codebook_appends): either one
@@ -2063,6 +2077,9 @@ type fileConfig struct {
 		BuildAbandonTimeoutMS int     `yaml:"build_abandon_timeout_ms"`
 		ColdSweepIntervalMS   int     `yaml:"cold_sweep_interval_ms"`
 		AppendMaxDeadRatio    float64 `yaml:"append_max_dead_ratio"`
+		// §8.6(d) scanner threshold. 0 = unset, which leaves the IndexManager's
+		// own default in place (the same reading as append_max_dead_ratio above).
+		GCRatioThreshold float64 `yaml:"gc_ratio_threshold"`
 		// §3 codebook refresh. Either trigger fires and the build rebuilds from
 		// scratch instead of appending, which is the only way to retrain the
 		// quantizer. Both are inert for KBs whose quantizer does not learn a
@@ -2259,6 +2276,9 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	if fc.IndexManager.AppendMaxDeadRatio != 0 {
 		cfg.IndexAppendMaxDeadRatio = fc.IndexManager.AppendMaxDeadRatio
+	}
+	if fc.IndexManager.GCRatioThreshold != 0 {
+		cfg.IndexGCRatioThreshold = fc.IndexManager.GCRatioThreshold
 	}
 	// §3 codebook refresh. 0 means "unset" for both (neither default is 0), so
 	// the != 0 guard reads correctly here too.
