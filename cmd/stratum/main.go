@@ -989,10 +989,6 @@ func main() {
 		}
 	}
 
-	// §10.6: a cleanup broadcast that failed is retried in the background, so
-	// orphaned data does not depend on someone noticing a log line.
-	dataPlane.StartCleanupRetries(ctx)
-
 	// This callback is the apply loop's, so only a node with an apply loop has
 	// it: a storage node is never told "a version was created", it is handed the
 	// version's data directly (ExecuteVersionWrite).

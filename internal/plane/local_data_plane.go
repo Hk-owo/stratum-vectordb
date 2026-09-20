@@ -281,9 +281,6 @@ type LocalDataPlane struct {
 
 	// cleanupMu guards cleanupQueue: the §10.6 cleanups that did not reach
 	// every replica and are waiting for another pass.
-	cleanupMu    sync.Mutex
-	cleanupQueue map[string]*cleanupTask
-
 	// terminalReclaim holds the apply-driven local reclaims that did not finish. Its
 	// cadence is its own (terminalReclaimInterval): see NoteTerminalVersion for why it
 	// is not §10.6's broadcast queue.
@@ -2011,16 +2008,31 @@ func (d *LocalDataPlane) ReclaimTerminalVersions(ctx context.Context, meta Metad
 	return queued, nil
 }
 
-// terminalReclaimInterval / terminalReclaimAttempts pace the apply-driven reclaim,
-// and they are separate from cleanupRetryInterval / cleanupRetryAttempts on purpose:
+// ReclaimVersionDataLocally implements DataPlane: the local half of DropVersionData,
+// with no broadcast. See the interface comment for who is allowed to call it.
+func (d *LocalDataPlane) ReclaimVersionDataLocally(_ context.Context, kbID string, versionID int64) error {
+	return d.reclaimTerminalVersionLocally(kbID, versionID)
+}
+
+// cleanupTask is one version whose cleanup did not finish — an entry in the
+// apply-driven reclaim queue (see NoteTerminalVersion). The broadcast queue it used to
+// belong to is gone: its only producer was a failed broadcast, and that case is now
+// covered by the apply path and by the deletion flow's own persistence.
+type cleanupTask struct {
+	kbID      string
+	versionID int64
+	attempts  int
+}
+
+// terminalReclaimInterval / terminalReclaimAttempts pace the reclaim queue, which is
+// now the ONLY cleanup-retry channel: §10.6's broadcast queue is gone, because every
+// node learns a terminal verdict from its own apply and reclaims locally
+// (NoteTerminalVersion).
 //
-//   - §10.6's queue retries a BROADCAST, so its interval is a network-retry budget
-//     and its attempt count bounds how long a replica may stay silent before a human
-//     is told. Running out is a real loss.
-//   - this queue only ever touches THIS node's storage, and every node received the
-//     same verdict from its own apply. A failed local prefix delete is disk hygiene
-//     that will succeed on a later pass, so the cadence can be slower and the patience
-//     longer: nothing is waiting on it, and nothing else will do it.
+// The cadence follows from what this queue touches — only THIS node's storage, for a
+// version whose data will never arrive. A failed local prefix delete is disk hygiene
+// that a later pass fixes, so the interval can be generous (a minute) and the patience
+// long (ten attempts): nothing is waiting on it, and nothing else will do it.
 var terminalReclaimInterval = time.Minute
 
 const terminalReclaimAttempts = 10
@@ -2163,11 +2175,15 @@ func (d *LocalDataPlane) DropVersionData(ctx context.Context, kbID string, versi
 		return fmt.Errorf("plane: DropVersionData: not wired (no local dropper and no broadcaster)")
 	}
 	d.advanceLocalVersion(kbID, versionID)
+	// A broadcast that did not reach everyone is no longer retried here. It used to be:
+	// §10.6's only way to reclaim a version on a replica that missed the message was to
+	// tell it again. Every replica now learns a terminal verdict from its own apply and
+	// reclaims locally (NoteTerminalVersion), and the DELETION path keeps its own
+	// persisted intent (the Deleting marker plus its coordinator's retries) — so this
+	// channel had no work left, only a queue, a background loop and a set of parameters.
 	if firstErr != nil {
-		// §10.6: a cleanup that did not reach everyone deserves another pass.
-		// The version is terminal either way, but its physical data is not
-		// reclaimed yet.
-		d.scheduleCleanupRetry(kbID, versionID)
+		d.logger.Warn("plane: version cleanup broadcast did not reach every candidate",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(firstErr))
 	}
 	return firstErr
 }

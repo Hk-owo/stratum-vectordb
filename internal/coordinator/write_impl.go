@@ -513,13 +513,18 @@ func (c *WriteCoordinatorImpl) AbandonDispatch(ctx context.Context, kbID string,
 	if !terminal {
 		return // still inside the retry budget: §10.1 will try again
 	}
-	// The terminal verdict just landed: reclaim whatever physical data made it to
-	// disk, on every candidate replica — the control layer never knew which ones
-	// received it (§10.6).
+	// The terminal verdict just landed: reclaim whatever physical data made it to disk
+	// HERE.
+	//
+	// No broadcast. §10.6 broadcast because the control layer never knew which replicas
+	// had received the version; every replica now learns the verdict from its own apply
+	// and reclaims locally (plane.LocalDataPlane.NoteTerminalVersion), so broadcasting
+	// again would mainly re-reach replicas already doing it. What this path adds is
+	// SPEED on the node that detected the failure.
 	if c.cfg.DataPlane == nil {
 		return
 	}
-	if err := c.cfg.DataPlane.DropVersionData(ctx, kbID, versionID); err != nil {
+	if err := c.cfg.DataPlane.ReclaimVersionDataLocally(ctx, kbID, versionID); err != nil {
 		log.Warn("coordinator: cleanup after a permanent failure",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
 	}

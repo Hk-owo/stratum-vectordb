@@ -122,6 +122,15 @@ type DataPlane interface {
 	// chunk that no surviving version references, and its index files.
 	DropVersionData(ctx context.Context, kbID string, versionID int64) error
 
+	// ReclaimVersionDataLocally is the local half of DropVersionData: it removes what
+	// THIS node holds and steps its cursor past the version, without telling anyone.
+	//
+	// Callers that already know every replica got the news use it — the terminal-failure
+	// cleanup after a DATA-side verdict, because each replica learns that from its own
+	// apply (see LocalDataPlane.NoteTerminalVersion). Broadcasting from there re-reached
+	// replicas that were already doing it, and turned N nodes into N×N calls.
+	ReclaimVersionDataLocally(ctx context.Context, kbID string, versionID int64) error
+
 	// Search runs a vector query against versionID's index.
 	Search(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error)
 
