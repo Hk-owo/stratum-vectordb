@@ -276,6 +276,12 @@ type LocalDataPlane struct {
 	// every replica and are waiting for another pass.
 	cleanupMu    sync.Mutex
 	cleanupQueue map[string]*cleanupTask
+
+	// terminalReclaim holds the apply-driven local reclaims that did not finish. Its
+	// cadence is its own (terminalReclaimInterval): see NoteTerminalVersion for why it
+	// is not §10.6's broadcast queue.
+	terminalReclaimMu sync.Mutex
+	terminalReclaim   map[string]*cleanupTask
 }
 
 // LocalDataPlaneConfig wires a LocalDataPlane.
@@ -1914,6 +1920,141 @@ func (d *LocalDataPlane) scheduleIndexBuild(ctx context.Context, kbID string, ve
 	if d.indexMgr != nil {
 		_ = d.indexMgr.TriggerBuild(ctx, kbID, versionID)
 	}
+}
+
+// NoteTerminalVersion records that the control layer settled versionID's DATA side
+// as terminal — learned from THIS node's own apply of the Raft entry, not from
+// §10.6's broadcast.
+//
+// That difference is the point. The broadcast goes to the candidate replicas and is
+// best-effort: a replica that is partitioned, or that is restarting while it fires,
+// never hears it, and its copy of the version stays behind with nothing left to
+// notice it (the metadata that would have named it is gone). Every node applies the
+// same Raft entry, so this path reaches exactly the nodes that have to reclaim.
+//
+// It reclaims LOCALLY, and that is not an optimisation — it is what the apply path
+// changes. §10.6's DropVersionData broadcasts because the node issuing it does not
+// know which replicas hold the version; here every replica is told by its own apply,
+// so broadcasting again would turn N nodes into N×N calls (the same reasoning §B's
+// reconciliation uses). A node that never held the version runs a prefix delete over
+// nothing and moves on.
+//
+// Called from the apply loop, so it does the cheap part inline (one local delete, no
+// network) and hands the retry to its own queue — see terminalReclaimInterval for why
+// that cadence is deliberately not §10.6's.
+func (d *LocalDataPlane) NoteTerminalVersion(kbID string, versionID int64) {
+	d.reclaimTerminalVersionLocally(kbID, versionID)
+}
+
+// terminalReclaimInterval / terminalReclaimAttempts pace the apply-driven reclaim,
+// and they are separate from cleanupRetryInterval / cleanupRetryAttempts on purpose:
+//
+//   - §10.6's queue retries a BROADCAST, so its interval is a network-retry budget
+//     and its attempt count bounds how long a replica may stay silent before a human
+//     is told. Running out is a real loss.
+//   - this queue only ever touches THIS node's storage, and every node received the
+//     same verdict from its own apply. A failed local prefix delete is disk hygiene
+//     that will succeed on a later pass, so the cadence can be slower and the patience
+//     longer: nothing is waiting on it, and nothing else will do it.
+var terminalReclaimInterval = time.Minute
+
+const terminalReclaimAttempts = 10
+
+// reclaimTerminalVersionLocally removes whatever this node still holds for a version
+// the control layer retired, and steps the cursor past it.
+//
+// No broadcast (see NoteTerminalVersion) and no existence probe: DropVersionStorage is
+// a prefix delete, so "I do not have it" is a no-op rather than a case to detect.
+func (d *LocalDataPlane) reclaimTerminalVersionLocally(kbID string, versionID int64) {
+	if d.dropper != nil {
+		if err := d.dropper.DropVersionStorage(context.Background(), kbID, versionID); err != nil {
+			d.logger.Warn("plane: local reclaim of a terminal version failed; retrying on its own cadence",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			d.scheduleTerminalReclaim(kbID, versionID)
+			return
+		}
+	}
+	// The cursor steps over it only once the bytes are gone: a version whose data will
+	// never arrive must not hold the contiguous cursor back (that would read as "this
+	// node is behind" and start a catch-up that can never finish), and the order is the
+	// same invariant every other advance follows — data first, cursor second.
+	d.advanceLocalVersion(kbID, versionID)
+	d.clearTerminalReclaim(kbID, versionID)
+}
+
+// scheduleTerminalReclaim remembers a local reclaim that did not finish. Keyed per
+// version (repeats collapse) and bounded by terminalReclaimAttempts, so it cannot
+// become a leak of its own.
+func (d *LocalDataPlane) scheduleTerminalReclaim(kbID string, versionID int64) {
+	key := failureKey(kbID, versionID)
+	d.terminalReclaimMu.Lock()
+	if d.terminalReclaim == nil {
+		d.terminalReclaim = make(map[string]*cleanupTask)
+	}
+	if _, ok := d.terminalReclaim[key]; !ok {
+		d.terminalReclaim[key] = &cleanupTask{kbID: kbID, versionID: versionID}
+	}
+	d.terminalReclaimMu.Unlock()
+}
+
+func (d *LocalDataPlane) clearTerminalReclaim(kbID string, versionID int64) {
+	key := failureKey(kbID, versionID)
+	d.terminalReclaimMu.Lock()
+	delete(d.terminalReclaim, key)
+	d.terminalReclaimMu.Unlock()
+}
+
+// StartTerminalReclaims runs the reclaim retry loop until ctx ends.
+func (d *LocalDataPlane) StartTerminalReclaims(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(terminalReclaimInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				d.retryTerminalReclaims(ctx)
+			}
+		}
+	}()
+}
+
+// retryTerminalReclaims makes one pass: each unfinished reclaim is retried, and the
+// ones that have run out of attempts are dropped with an error.
+func (d *LocalDataPlane) retryTerminalReclaims(ctx context.Context) {
+	d.terminalReclaimMu.Lock()
+	pending := make([]*cleanupTask, 0, len(d.terminalReclaim))
+	for _, task := range d.terminalReclaim {
+		pending = append(pending, task)
+	}
+	d.terminalReclaimMu.Unlock()
+
+	for _, task := range pending {
+		if d.dropper != nil {
+			if err := d.dropper.DropVersionStorage(ctx, task.kbID, task.versionID); err != nil {
+				task.attempts++
+				if task.attempts >= terminalReclaimAttempts {
+					d.clearTerminalReclaim(task.kbID, task.versionID)
+					d.logger.Error("plane: giving up on a local terminal-version reclaim; leftover bytes need an operator",
+						zap.String("kb_id", task.kbID), zap.Int64("version_id", task.versionID),
+						zap.Int("attempts", task.attempts), zap.Error(err))
+					continue
+				}
+				continue
+			}
+		}
+		d.advanceLocalVersion(task.kbID, task.versionID)
+		d.clearTerminalReclaim(task.kbID, task.versionID)
+	}
+}
+
+// PendingTerminalReclaims reports how many local reclaims are waiting to be retried,
+// for diagnostics and tests.
+func (d *LocalDataPlane) PendingTerminalReclaims() int {
+	d.terminalReclaimMu.Lock()
+	defer d.terminalReclaimMu.Unlock()
+	return len(d.terminalReclaim)
 }
 
 // DropVersionData: see WriteVersionData.

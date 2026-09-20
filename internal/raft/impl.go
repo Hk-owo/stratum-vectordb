@@ -118,6 +118,17 @@ type RaftNodeImpl struct {
 	// to trigger data sync (internal/sync.FollowerSync.PullVersion).
 	onVersionCreated func(kbID string, versionID int64)
 
+	// onVersionFailedPermanent is an optional callback invoked after a
+	// cmdMarkVersionFailedPermanent is applied on this node — on EVERY applier, and
+	// for a different reason than onVersionCreated: §10.6's reclaim is a broadcast to
+	// the candidate replicas and is best-effort, so a replica that is partitioned (or
+	// restarting) when it fires never hears it, and its data stays behind with nothing
+	// left to notice it. Every node applies the same Raft entry, so the apply path is
+	// how a verdict reaches the nodes that have to act on it. The reclaim itself is
+	// idempotent — a node that never held the version runs a prefix delete over
+	// nothing — and it runs off the apply loop, because it broadcasts.
+	onVersionFailedPermanent func(kbID string, versionID int64)
+
 	// onVersionCommittedAsLeader is an optional callback invoked after a
 	// cmdCreateVersion is applied on a node that, AT APPLY TIME, believes it is
 	// the leader. Unlike onVersionCreated it must fire on exactly one node: it
@@ -254,6 +265,14 @@ func (impl *RaftNodeImpl) Stop() {
 // the apply loop has started.
 func (impl *RaftNodeImpl) SetOnVersionCreated(fn func(kbID string, versionID int64)) {
 	impl.onVersionCreated = fn
+}
+
+// SetOnVersionFailedPermanent registers the callback invoked when a version's
+// terminal DATA-side verdict is applied on this node — every applier, not only the
+// one that reported the failure. Call before the first propose; not safe for
+// concurrent use after the apply loop has started.
+func (impl *RaftNodeImpl) SetOnVersionFailedPermanent(fn func(kbID string, versionID int64)) {
+	impl.onVersionFailedPermanent = fn
 }
 
 // SetOnVersionCommittedAsLeader registers the §7.13.2 dispatch hook: invoked
@@ -428,6 +447,17 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 		go func() {
 			defer impl.callbackWG.Done()
 			impl.onVersionCreated(cmd.KBID, result.VersionID)
+		}()
+	}
+
+	if err == nil && cmd.Type == cmdMarkVersionFailedPermanent && impl.onVersionFailedPermanent != nil {
+		// Asynchronous for the same reason as the notification above: reclaiming a
+		// version's data broadcasts to the other candidates, and a blocked apply loop
+		// would stall every later committed entry.
+		impl.callbackWG.Add(1)
+		go func() {
+			defer impl.callbackWG.Done()
+			impl.onVersionFailedPermanent(cmd.KBID, cmd.VersionID)
 		}()
 	}
 

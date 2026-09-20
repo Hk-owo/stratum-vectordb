@@ -259,3 +259,43 @@ func TestRaftNodeImpl_ProposeUpdateVersionSummary(t *testing.T) {
 		t.Errorf("expected error for unknown version, got %v", err)
 	}
 }
+
+// TestRaftNodeImpl_SetOnVersionFailedPermanent_FiresOnApply: the reclaim of a
+// permanently failed version must not depend on §10.6's broadcast alone — that
+// broadcast goes to the candidate replicas and a partitioned or restarting replica
+// never hears it. Every node applies the same Raft entry, so the verdict has to
+// travel the apply path too, and this is where it does.
+func TestRaftNodeImpl_SetOnVersionFailedPermanent_FiresOnApply(t *testing.T) {
+	impl, _ := newTestRaftNodeImpl(t)
+	ctx := context.Background()
+
+	type event struct {
+		kbID      string
+		versionID int64
+	}
+	called := make(chan event, 1)
+	impl.SetOnVersionFailedPermanent(func(kbID string, versionID int64) {
+		called <- event{kbID, versionID}
+	})
+
+	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	versionID, err := impl.ProposeCreateVersion(ctx, "kb-1", 0)
+	if err != nil {
+		t.Fatalf("ProposeCreateVersion: %v", err)
+	}
+	if err := impl.ProposeMarkVersionFailedPermanent(ctx, "kb-1", versionID,
+		types.FailureSideData, "replication fell short", 5); err != nil {
+		t.Fatalf("ProposeMarkVersionFailedPermanent: %v", err)
+	}
+
+	select {
+	case e := <-called:
+		if e.kbID != "kb-1" || e.versionID != versionID {
+			t.Errorf("got %s/v%d, want kb-1/v%d", e.kbID, e.versionID, versionID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the terminal verdict must reach the data plane through the apply path")
+	}
+}

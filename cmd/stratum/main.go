@@ -989,6 +989,15 @@ func main() {
 	// version's records here and builds its index. A control node's versions
 	// live in the storage group, and it has no stores to pull them into.
 	if storageLocal && raftNode != nil {
+		// §10.6's reclaim is a best-effort broadcast: a partitioned or restarting
+		// replica never hears it, and the metadata that would have named the leftover
+		// is gone by then, so nothing else notices it either. The verdict, unlike the
+		// broadcast, travels the Raft log — so let every node learn it from its own
+		// apply and join the same bounded, idempotent reclaim queue.
+		raftNode.SetOnVersionFailedPermanent(dataPlane.NoteTerminalVersion)
+		// Its own cadence, not §10.6's: this one only ever touches local storage.
+		dataPlane.StartTerminalReclaims(ctx)
+
 		raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
 			// §7.5: as of this apply the version EXISTS, whether or not this node
 			// ends up holding it. Telling the plane is what keeps its cursor
