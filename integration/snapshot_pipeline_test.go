@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,17 +204,33 @@ func TestRealStack_ThreeNodeCluster_SnapshotPipeline(t *testing.T) {
 	}
 
 	// New writes after recovery replicate to all three nodes.
-	vNextResp, err := leader.KB.CreateVersion(ctx, &pb.CreateVersionRequest{
-		KnowledgeBaseId: kbID,
-		ParentVersionId: prev,
-		Changes: []*pb.DocChange{
-			{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-after-recovery", Content: "recovered"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("CreateVersion after recovery: %v", err)
+	//
+	// The leader is RE-RESOLVED here rather than reusing the handle from the start of
+	// the test. Node 2 restarted, and a restart can move leadership — under load it
+	// regularly does — so the node that led back then may answer "not leader" now.
+	// That answer is retryable by contract (internal/router's isRetryableErr matches
+	// Internal + "not leader", and internal/kvraft produces exactly that for a request
+	// that reaches a non-leader), so the fixture retries it instead of failing a
+	// cluster that is merely mid-election.
+	var vNext int64
+	for attempt := 0; ; attempt++ {
+		cur := waitForLeader(t, nodes[0], nodes[1], nodes[2])
+		resp, err := cur.KB.CreateVersion(ctx, &pb.CreateVersionRequest{
+			KnowledgeBaseId: kbID,
+			ParentVersionId: prev,
+			Changes: []*pb.DocChange{
+				{Op: pb.ChangeOp_CHANGE_OP_ADD, DocId: "doc-after-recovery", Content: "recovered"},
+			},
+		})
+		if err == nil {
+			vNext = resp.VersionId
+			break
+		}
+		if attempt >= 10 || !strings.Contains(err.Error(), "not leader") {
+			t.Fatalf("CreateVersion after recovery: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	vNext := vNextResp.VersionId
 	for _, n := range nodes {
 		n.waitVersionReady(ctx, kbID, vNext)
 	}
