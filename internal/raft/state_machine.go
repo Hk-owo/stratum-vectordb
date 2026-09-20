@@ -327,7 +327,7 @@ func (sm *stateMachine) applyMarkVersionDeleting(cmd command) applyResult {
 		if sm.kbs[cmd.KBID].ActiveVersionID == versionID {
 			return applyResult{Err: fmt.Errorf("version %d is the active version of %s: %w", versionID, cmd.KBID, stratumerrors.ErrVersionIsActive)}
 		}
-		if v.IndexStatus == types.IndexStatusPending {
+		if deleteBlockedByPending(v) {
 			return applyResult{Err: fmt.Errorf("version %d is PENDING: %w", versionID, stratumerrors.ErrVersionPending)}
 		}
 	}
@@ -373,13 +373,17 @@ func (sm *stateMachine) applyMarkVersionDeleting(cmd command) applyResult {
 // and ANCESTORS deliberately keep descendants alive, so the survivors get
 // their own check.
 //
-// PENDING is a conservative proxy for "storage writes not finished": a
+// "Still PENDING" is a conservative proxy for "storage writes not finished": a
 // version reaches READY only when its index build callback fires, which is
 // strictly later than WriteCoordinator writing its full doc set. The guard
 // therefore rejects a superset of the truly unsafe window, never a subset of
 // it; FAILED versions are not a problem either, since their writes completed
 // before the build was even triggered. Under SUBTREE the check is a no-op —
 // that set is closed downwards, so no survivor's parent is in it.
+//
+// Which statuses count as PENDING is decided by deleteBlockedByPending, shared
+// with the removed-set rule above so the two cannot drift apart: a data-side
+// terminal verdict is not "still writing" on either side of the check.
 func (sm *stateMachine) validateSurvivorsNotPending(kbID string, removed []int64) error {
 	if len(removed) == 0 {
 		return nil
@@ -396,11 +400,39 @@ func (sm *stateMachine) validateSurvivorsNotPending(kbID string, removed []int64
 		if !removedSet[v.ParentVersionID] {
 			continue
 		}
-		if v.IndexStatus == types.IndexStatusPending {
+		if deleteBlockedByPending(v) {
 			return fmt.Errorf("version %d is PENDING and still depends on its to-be-deleted parent %d: %w", id, v.ParentVersionID, stratumerrors.ErrVersionPending)
 		}
 	}
 	return nil
+}
+
+// deleteBlockedByPending reports whether v still counts as PENDING for
+// DeleteVersion's admission rules — the question those rules are really asking is
+// "may this version's storage writes still be in flight?" (see
+// validateSurvivorsNotPending for why that matters).
+//
+// The rules were written when ONE status field carried both halves of a version's
+// Saga, and they read that field as a proxy for "writes not finished"
+// (Stratum_设计文档v13.md §10.1b). Now that the halves are separate, the proxy has to be
+// read off the DATA side, and the one status that must NOT be read as "still
+// writing" is the data side's terminal verdict: a version whose data will never
+// arrive has no write left to wait for, and §10.6 has already reclaimed whatever had
+// landed on some replica. Reading it as PENDING is not a conservative default, it is
+// a dead end — neither DeleteVersion (this rule) nor DiscardVersion (which admits
+// only a version whose data side is PENDING) will take such a version, so a verdict
+// on the data side would strand it in the chain forever.
+//
+// IndexStatus still decides the rest, deliberately: PENDING with durable data means
+// the index build is what is outstanding, and that window is exactly when dropping
+// the version's VersionDocList would hurt a survivor. The same reasoning explains
+// what is NOT changed: applyCreateVersion's parent check keeps refusing a PENDING
+// parent even when that PENDING is a data-side verdict, because a new version
+// derives its document set from the parent's, and a parent whose data will never
+// arrive cannot contribute one — "you cannot build on it" is the right answer there,
+// not an oversight.
+func deleteBlockedByPending(v types.VersionMeta) bool {
+	return v.IndexStatus == types.IndexStatusPending && v.DataStatus != types.DataStatusFailedPermanent
 }
 
 // versionDeleteTargets computes, deterministically from the current state

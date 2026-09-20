@@ -323,7 +323,11 @@ func (r *MockRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string
 		if r.kbs[kbID].ActiveVersionID == id {
 			return nil, stratumerrors.ErrVersionIsActive
 		}
-		if r.versions[id].IndexStatus == types.IndexStatusPending {
+		// Same rule as the real state machine's admission check — read through
+		// deleteBlockedByPending rather than re-deriving it here, so the mock cannot
+		// accept (or refuse) a set the real apply would treat differently: a
+		// data-side terminal verdict is not "still writing" on either side.
+		if deleteBlockedByPending(r.versions[id]) {
 			return nil, stratumerrors.ErrVersionPending
 		}
 	}
@@ -339,7 +343,7 @@ func (r *MockRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string
 			continue
 		}
 		v := r.versions[id]
-		if removedSet[v.ParentVersionID] && v.IndexStatus == types.IndexStatusPending {
+		if removedSet[v.ParentVersionID] && deleteBlockedByPending(v) {
 			return nil, stratumerrors.ErrVersionPending
 		}
 	}
