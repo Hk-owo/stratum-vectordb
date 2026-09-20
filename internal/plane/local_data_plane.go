@@ -1103,23 +1103,74 @@ func (d *LocalDataPlane) transferFullState(ctx context.Context, sourceAddr, kbID
 	return nil
 }
 
-// errBackfillGapIncomplete reports that the source has no recorded changes for at
-// least one version in the gap, so the delta path cannot be used at all.
-var errBackfillGapIncomplete = errors.New("backfill: the source has no record for part of the gap")
+// errBackfillGapIncomplete reports that the delta path cannot serve this gap at
+// all. It has two causes, and the caller deliberately does not have to tell them
+// apart: the source has no recorded changes for some version in the gap, or the
+// replicated metadata no longer has that version. Both mean the same thing —
+// "replay the source's deltas" is not an option for this range — and both have the
+// same remedy, which already exists: the full-state transfer, the path written
+// precisely for a gap that holds a deleted version (§6.4).
+var errBackfillGapIncomplete = errors.New("backfill: the gap cannot be replayed from the source's recorded changes")
 
 // backfillByChanges replays the source's recorded deltas for (local, versionID-1],
-// in ascending order. It refuses the WHOLE range when any version is missing: a
-// partial replay would leave a hole in this node's history while advancing its
-// cursor over it, and the cursor is what makes "version number comparison implies
-// completeness" true (§7.5).
+// in ascending order. It refuses the WHOLE range when any version cannot be
+// replayed: a partial replay would leave a hole in this node's history while
+// advancing its cursor over it, and the cursor is what makes "version number
+// comparison implies completeness" true (§7.5).
+//
+// A version cannot be replayed for either of two reasons, and BOTH are checked
+// here rather than only the first:
+//
+//   - the source has no delta for it. The source is honest about this by
+//     construction: ChangesInRange reports a version it holds no BEGIN record for
+//     as ABSENT rather than as "nothing changed" (internal/wal/file.go), so the gap
+//     is visible instead of silent.
+//
+//   - the metadata says the version no longer exists. This is the case the delta
+//     path alone cannot see, and it is not hypothetical: a version's BEGIN record
+//     leaves the source's WAL only once every replica that should hold it has
+//     reported a cursor past it (ReclaimableChangesThrough), so for as long as some
+//     replica is behind — the very situation a backfill runs in — a DELETED
+//     version's delta is still served. Replaying it would write that version's data
+//     on a node whose metadata says the version is gone, and nothing would later
+//     detect it: the judgement that names such data is exactly the metadata row
+//     that is missing. transferFullState exists for a gap holding a deleted
+//     version; the delta path has to hand the gap over instead of reconstructing it.
+//
+// "I could not read the metadata" is NOT "the version is gone", so a failed read
+// leaves this check OFF and the gap is replayed exactly as it was before the check
+// existed. That is the conservative direction available here: treating an
+// unreadable answer as a verdict would turn a transient metadata read failure on
+// this node into a full-state transfer — a transfer decision coupled to a local
+// read it does not belong to.
 func (d *LocalDataPlane) backfillByChanges(ctx context.Context, sourceAddr, kbID string, local, versionID int64) error {
 	deltas, err := d.changesFetcher.ChangesInRange(ctx, sourceAddr, kbID, local, versionID-1)
 	if err != nil {
 		return fmt.Errorf("plane: delta backfill %s (%d,%d] from %s: %w", kbID, local, versionID-1, sourceAddr, err)
 	}
+
+	// One read for the whole gap, and only when there is a checker to consult:
+	// with no metadata wired there is no second opinion to have, and this
+	// function's job stays what it was.
+	var existing map[int64]bool
+	if d.versionExists != nil {
+		known, err := d.versionExists.ExistingVersions(ctx, kbID)
+		if err != nil {
+			d.logger.Warn("plane: delta backfill cannot check which versions still exist; replaying the gap as before",
+				zap.String("kb_id", kbID), zap.Int64("from_version", local),
+				zap.Int64("to_version", versionID-1), zap.Error(err))
+		} else {
+			existing = known
+		}
+	}
+
 	for v := local + 1; v < versionID; v++ {
 		if _, ok := deltas[v]; !ok {
 			return fmt.Errorf("plane: delta backfill %s (%d,%d] from %s: no record for v%d: %w",
+				kbID, local, versionID-1, sourceAddr, v, errBackfillGapIncomplete)
+		}
+		if existing != nil && !existing[v] {
+			return fmt.Errorf("plane: delta backfill %s (%d,%d] from %s: v%d no longer exists: %w",
 				kbID, local, versionID-1, sourceAddr, v, errBackfillGapIncomplete)
 		}
 	}
