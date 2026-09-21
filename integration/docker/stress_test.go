@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -293,24 +294,95 @@ func awaitReplicaArtifact(t *testing.T, kbID string, versionID int64, timeout ti
 	}
 }
 
-// nodeLogsSince returns a storage node's container logs.
+// nodeLogTailLines is how many of a node's most recent log lines the log helpers
+// read. It is a WINDOW, not the whole file: every assertion that uses it asks what a
+// node did in the last few seconds, and the file grows without bound across a suite.
+const nodeLogTailLines = 5000
+
+// nodeLogReaderImage runs `tail` against the host's docker log directory. It cannot
+// be a node image (the storage image is built from scratch) and it is never used for
+// anything but reading a file from a read-only mount.
+const nodeLogReaderImage = "alpine:latest"
+
+// nodeLogsSince returns a storage node's recent container logs.
 //
-// `--tail` is not cosmetic here. `docker logs <name>` without it stops at the first
-// malformed line in the container's json log, and a container killed with SIGKILL —
-// which is exactly what these fault-injection tests do — can leave one behind.
-// Measured on the 3+3 cluster (docker 29.1.3): the storage node's log file held 6255
-// lines while `docker logs` returned 641 of them, cutting off the very
-// "caught up with the chain tail" line the caller was looking for; one truncated
-// record at line 642 (written when the container was killed mid-startup) was the
-// whole cause. `--tail` reads backwards from the end, so a bad record earlier in the
-// file cannot hide the recent lines that these assertions are about.
+// It reads the container's json log FILE instead of shelling out to `docker logs`,
+// because the daemon's reader stops at the separator a container restart leaves in
+// that file, and everything after it disappears from `docker logs`.
+//
+// Measured on the 3+3 cluster (docker 29.1.3, 2026-09-21): stratum-node-storage1's log
+// file held 26815 lines and its last line was written seconds earlier, while
+// `docker logs --tail 5000 <node>` returned 22634 lines — ending exactly at the blank
+// line a SIGKILL+start had put there, 30 minutes in the past. The
+// "caught up with the chain tail" line the caller was looking for was in the file the
+// whole time: a run this suite reported as "never caught up" had in fact logged the
+// catch-up 15 s after the node came back, with exactly the chain tail the case
+// printed. Smaller `--tail` values happened to work (the daemon reads those backwards
+// from the end), which is what makes the shell-out version a trap — it fails exactly
+// when a node has been restarted often enough to matter, and no window size the
+// caller picks is safe from it.
+//
+// Reading the file also disposes of the sibling problem: a SIGKILLed container leaves
+// a torn record, and the daemon treats that as end-of-log too. Below, each line is
+// parsed on its own, so a torn line costs one line rather than the tail of the file.
+//
+// The log directory is root-only on the host, so a throwaway container reads the file
+// (read-only) and hands back the last nodeLogTailLines lines. If that cannot be done
+// — no LogPath, no reader image, a docker that keeps its logs elsewhere — it falls
+// back to `docker logs`: second best, but never a hard failure.
 func nodeLogsSince(t *testing.T, service string) string {
 	t.Helper()
-	out, err := exec.Command("docker", "logs", "--tail", "5000", service).CombinedOutput()
+	if out, ok := nodeLogFileTail(service, nodeLogTailLines); ok {
+		return out
+	}
+	out, err := exec.Command("docker", "logs", "--tail", strconv.Itoa(nodeLogTailLines), service).CombinedOutput()
 	if err != nil {
 		return ""
 	}
 	return string(out)
+}
+
+// nodeLogFileTail reads the last `lines` records of a container's json log file and
+// returns them as the plain text `docker logs` would have printed. ok is false when
+// the path could not be resolved or read, so the caller can fall back.
+func nodeLogFileTail(service string, lines int) (string, bool) {
+	pathOut, err := exec.Command("docker", "inspect", "--format", "{{.LogPath}}", service).Output()
+	if err != nil {
+		return "", false
+	}
+	path := strings.TrimSpace(string(pathOut))
+	if path == "" {
+		return "", false
+	}
+	out, err := exec.Command("docker", "run", "--rm",
+		"-v", filepath.Dir(path)+":/log:ro",
+		nodeLogReaderImage,
+		"tail", "-n", strconv.Itoa(lines), "/log/"+filepath.Base(path)).Output()
+	if err != nil || len(out) == 0 {
+		return "", false
+	}
+	return decodeContainerJSONLog(out), true
+}
+
+// decodeContainerJSONLog turns the docker json-file format back into log text: one
+// record per line, the payload under "log". Lines that do not parse are DROPPED
+// rather than read as the end of the log — the whole point of reading the file
+// ourselves (see nodeLogsSince).
+func decodeContainerJSONLog(raw []byte) string {
+	var b strings.Builder
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec struct {
+			Log string `json:"log"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		b.WriteString(rec.Log)
+	}
+	return b.String()
 }
 
 // anyStorageLogHas reports whether any storage node's log contains needle. Logs are
