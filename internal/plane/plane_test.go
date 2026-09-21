@@ -76,9 +76,39 @@ func (m *stubMeta) ListVersions(_ context.Context, kbID string) ([]types.Version
 	return m.versions[kbID], nil
 }
 
-// ListVersionsInRange mirrors the interface; this stub is not exercised by it.
-func (m *stubMeta) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
-	return nil, nil
+// LastVersionID mirrors the interface: the extreme value, from the same set.
+func (m *stubMeta) LastVersionID(_ context.Context, kbID string) (int64, error) {
+	if m.listErr != nil {
+		return 0, m.listErr
+	}
+	var tail int64
+	for _, v := range m.versions[kbID] {
+		if v.VersionID > tail {
+			tail = v.VersionID
+		}
+	}
+	return tail, nil
+}
+
+// ListVersionsInRange narrows ListVersions the way the real node does. It is NOT a
+// formality: callers now ask by range (IndexReadyReplicaCount asks for one version),
+// and a stub that answered nothing — or the whole set — would let a caller's bounds
+// go unexercised.
+func (m *stubMeta) ListVersionsInRange(_ context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error) {
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	out := make([]types.VersionMeta, 0, len(m.versions[kbID]))
+	for _, v := range m.versions[kbID] {
+		if fromExclusive != nil && v.VersionID <= *fromExclusive {
+			continue
+		}
+		if toInclusive != nil && v.VersionID > *toInclusive {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }
 
 func (m *stubMeta) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {

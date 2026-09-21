@@ -665,6 +665,20 @@ func (r *MockRaftNode) GetVersion(_ context.Context, kbID string, versionID int6
 	return v, nil
 }
 
+// LastVersionID mirrors the real node's O(1) answer (same slice discipline).
+func (r *MockRaftNode) LastVersionID(_ context.Context, kbID string) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.kbs[kbID]; !ok {
+		return 0, stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	ids := r.versionsByKB[kbID]
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	return ids[len(ids)-1], nil
+}
+
 // Reset clears all stored state. Convenience for tests; not part of the
 // RaftNode interface.
 func (r *MockRaftNode) Reset() {

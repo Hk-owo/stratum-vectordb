@@ -2249,6 +2249,11 @@ type MetadataLister interface {
 	// (nil = no bound on that side). The plane's readers ask about ranges — a backfill
 	// about one gap — and the range is what keeps a whole-chain answer off the wire.
 	ListVersionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error)
+	// LastVersionID is the extreme-value read: the highest version id still in
+	// kbID's metadata (0 when it has none). ChainTail needs exactly this, once per
+	// knowledge base on every cursor report, so it must not be a whole-chain read on
+	// the shape that serves it most (see RaftNode.LastVersionID).
+	LastVersionID(ctx context.Context, kbID string) (int64, error)
 }
 
 // EnforceRetention applies the disk retention policy once at startup: for

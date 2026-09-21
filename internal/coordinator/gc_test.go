@@ -26,6 +26,17 @@ func (r *gcTestRaftNode) ListVersions(_ context.Context, kbID string) ([]types.V
 	return r.versions[kbID], nil
 }
 
+// LastVersionID mirrors the interface: the extreme value, from the same set.
+func (r *gcTestRaftNode) LastVersionID(_ context.Context, kbID string) (int64, error) {
+	var tail int64
+	for _, v := range r.versions[kbID] {
+		if v.VersionID > tail {
+			tail = v.VersionID
+		}
+	}
+	return tail, nil
+}
+
 // ListVersionsInRange mirrors the interface; this stub is not exercised by it.
 func (r *gcTestRaftNode) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
 	return nil, nil

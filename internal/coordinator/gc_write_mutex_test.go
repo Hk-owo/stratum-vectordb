@@ -112,6 +112,19 @@ func (r *gcWriteRaftNode) ListVersions(_ context.Context, kbID string) ([]types.
 	return append([]types.VersionMeta(nil), r.versions[kbID]...), nil
 }
 
+// LastVersionID mirrors the interface: the extreme value, from the same set.
+func (r *gcWriteRaftNode) LastVersionID(_ context.Context, kbID string) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var tail int64
+	for _, v := range r.versions[kbID] {
+		if v.VersionID > tail {
+			tail = v.VersionID
+		}
+	}
+	return tail, nil
+}
+
 // ListVersionsInRange mirrors the interface; this stub is not exercised by it.
 func (r *gcWriteRaftNode) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
 	return nil, nil

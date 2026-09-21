@@ -903,6 +903,24 @@ func (impl *RaftNodeImpl) GetVersion(_ context.Context, kbID string, versionID i
 	return v, nil
 }
 
+// LastVersionID implements RaftNode: O(1), because the version set is kept in
+// allocation order (see the interface comment).
+func (impl *RaftNodeImpl) LastVersionID(_ context.Context, kbID string) (int64, error) {
+	impl.sm.mu.RLock()
+	defer impl.sm.mu.RUnlock()
+	if _, ok := impl.sm.kbs[kbID]; !ok {
+		return 0, stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	ids := impl.sm.versionsByKB[kbID]
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	// Append-ordered, and deletions splice the slice in place, so the last element
+	// IS the highest surviving id — no scan, and no second invariant to keep in
+	// step with anything else.
+	return ids[len(ids)-1], nil
+}
+
 // ListKnowledgeBases returns metadata for every knowledge base in the
 // state machine. Order is not specified (map iteration).
 func (impl *RaftNodeImpl) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {

@@ -291,7 +291,16 @@ func (c *LocalControlPlane) ReportIndexReady(ctx context.Context, kbID string, v
 // zero: "this version is gone" and "nobody is serving it" call for opposite
 // actions, and only the caller knows which it meant to ask about.
 func (c *LocalControlPlane) IndexReadyReplicaCount(ctx context.Context, kbID string, versionID int64, except int64) (int, error) {
-	versions, err := c.rn.ListVersions(ctx, kbID)
+	if versionID <= 0 {
+		// Version ids start at 1; a non-positive ask would make the lower bound a
+		// no-op for the range filter and pull the whole chain back.
+		return 0, fmt.Errorf("plane: IndexReadyReplicaCount: version %d of %s not found: %w",
+			versionID, kbID, stratumerrors.ErrVersionNotFound)
+	}
+	// §F: the one version the question is about — (versionID-1, versionID] — rather
+	// than the whole chain filtered here. The index GC asks this per candidate.
+	from, to := versionID-1, versionID
+	versions, err := c.rn.ListVersionsInRange(ctx, kbID, &from, &to)
 	if err != nil {
 		return 0, fmt.Errorf("plane: IndexReadyReplicaCount: list versions of %s: %w", kbID, err)
 	}
@@ -580,20 +589,17 @@ func (c *LocalControlPlane) ChainTail(kbID string) (int64, bool) {
 		c.logger.Debug("plane: chain tail: no metadata source wired", zap.String("kb_id", kbID))
 		return 0, false
 	}
-	versions, err := c.rn.ListVersions(context.Background(), kbID)
-	if err != nil || len(versions) == 0 {
+	// The EXTREME VALUE, not the chain: this runs once per knowledge base on EVERY
+	// cursor report, so a whole-chain read here was paid per report for one number.
+	// The control node answers in O(1) (see RaftNode.LastVersionID).
+	tail, err := c.rn.LastVersionID(context.Background(), kbID)
+	if err != nil || tail <= 0 {
 		c.logger.Debug("plane: chain tail unavailable",
-			zap.String("kb_id", kbID), zap.Error(err), zap.Int("versions", len(versions)))
+			zap.String("kb_id", kbID), zap.Int64("tail", tail), zap.Error(err))
 		return 0, false
 	}
-	tail := int64(0)
-	for _, v := range versions {
-		if v.VersionID > tail {
-			tail = v.VersionID
-		}
-	}
 	c.logger.Debug("plane: chain tail", zap.String("kb_id", kbID), zap.Int64("tail", tail))
-	return tail, tail > 0
+	return tail, true
 }
 
 // localReclaimable computes the watermark from this node's own authoritative view.

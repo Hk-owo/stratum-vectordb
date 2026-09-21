@@ -369,6 +369,18 @@ func (r *reconcileRaftNode) ListVersions(_ context.Context, kbID string) ([]type
 	return r.versions[kbID], nil
 }
 
+// LastVersionID mirrors the interface: the extreme value, from the same set.
+// clusterStatusRaftNode embeds this stub, so it inherits the method too.
+func (r *reconcileRaftNode) LastVersionID(_ context.Context, kbID string) (int64, error) {
+	var tail int64
+	for _, v := range r.versions[kbID] {
+		if v.VersionID > tail {
+			tail = v.VersionID
+		}
+	}
+	return tail, nil
+}
+
 // ListVersionsInRange mirrors the interface; this stub is not exercised by it.
 func (r *reconcileRaftNode) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
 	return nil, nil

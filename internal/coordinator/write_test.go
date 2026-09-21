@@ -431,6 +431,9 @@ func (r *testRaftNode) ListVersions(_ context.Context, kbID string) ([]types.Ver
 	return nil, nil
 }
 
+// LastVersionID mirrors the interface; this stub holds no versions.
+func (r *testRaftNode) LastVersionID(context.Context, string) (int64, error) { return 0, nil }
+
 // ListVersionsInRange mirrors the interface; this stub is not exercised by it.
 func (r *testRaftNode) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
 	return nil, nil

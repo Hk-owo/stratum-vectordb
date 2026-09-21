@@ -400,6 +400,25 @@ func (r *RemoteRaftNode) GetVersion(ctx context.Context, kbID string, versionID 
 	return types.VersionMeta{}, stratumerrors.ErrVersionNotFound
 }
 
+// LastVersionID implements RaftNode. A storage node has no local state machine, and
+// "the highest id" has no narrow form (there is no bound to push down), so this walks
+// the chain. That is acceptable because of WHO calls it: ChainTail answers the leader's
+// cursor report, so the caller is a control node — whose own shape answers O(1). A
+// storage node never takes this path.
+func (r *RemoteRaftNode) LastVersionID(ctx context.Context, kbID string) (int64, error) {
+	versions, err := r.ListVersions(ctx, kbID)
+	if err != nil {
+		return 0, err
+	}
+	var tail int64
+	for _, v := range versions {
+		if v.VersionID > tail {
+			tail = v.VersionID
+		}
+	}
+	return tail, nil
+}
+
 // ListKnowledgeBases implements RaftNode.
 func (r *RemoteRaftNode) ListKnowledgeBases(ctx context.Context) ([]types.KnowledgeBaseMeta, error) {
 	var out []types.KnowledgeBaseMeta

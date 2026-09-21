@@ -30,9 +30,38 @@ func (m *stubMetadata) ListVersions(_ context.Context, kbID string) ([]types.Ver
 	return m.versions[kbID], nil
 }
 
-// ListVersionsInRange mirrors the interface; this stub is not exercised by it.
-func (m *stubMetadata) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
-	return nil, nil
+// LastVersionID mirrors the interface: the extreme value, taken from the same set
+// ListVersions answers with, so a case that reaches ChainTail through this stub sees
+// what production would.
+func (m *stubMetadata) LastVersionID(_ context.Context, kbID string) (int64, error) {
+	if m.err != nil {
+		return 0, m.err
+	}
+	var tail int64
+	for _, v := range m.versions[kbID] {
+		if v.VersionID > tail {
+			tail = v.VersionID
+		}
+	}
+	return tail, nil
+}
+
+// ListVersionsInRange narrows ListVersions the way the real node does.
+func (m *stubMetadata) ListVersionsInRange(_ context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	out := make([]types.VersionMeta, 0, len(m.versions[kbID]))
+	for _, v := range m.versions[kbID] {
+		if fromExclusive != nil && v.VersionID <= *fromExclusive {
+			continue
+		}
+		if toInclusive != nil && v.VersionID > *toInclusive {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out, nil
 }
 
 // TestLocalDataPlane_RecoverLocalCursors pins the fix for the restart hole the

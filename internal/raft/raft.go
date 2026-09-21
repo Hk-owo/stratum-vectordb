@@ -173,6 +173,18 @@ type RaftNode interface {
 	// id, or one belonging to another knowledge base → ErrVersionNotFound.
 	GetVersion(ctx context.Context, kbID string, versionID int64) (types.VersionMeta, error)
 
+	// LastVersionID returns the highest version id still in kbID's metadata, or 0
+	// when the knowledge base has no versions. Unknown kbID → ErrKnowledgeBaseNotFound.
+	//
+	// It is the EXTREME-VALUE read, and it exists because a caller that only needs
+	// the chain's tail must not pull the whole chain to find its maximum: the §7.5
+	// lag signal asks for the tail once per knowledge base on EVERY cursor report.
+	// The control node answers in O(1) — the version set is kept in allocation order,
+	// so its last element is the highest surviving id — and the remote shape falls
+	// back to a whole-chain read, which is correct but not cheap (only a leader asks,
+	// so a storage node never takes that path).
+	LastVersionID(ctx context.Context, kbID string) (int64, error)
+
 	// ListKnowledgeBases returns metadata for every knowledge base known to
 	// the Raft state machine. Used by the console (ListKnowledgeBases RPC)
 	// and by GetSystemStatus to scan for stuck versions / delete-failed KBs.
