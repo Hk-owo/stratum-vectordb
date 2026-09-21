@@ -509,24 +509,14 @@ func (s *AdminServiceImpl) ForceRetryVersion(ctx context.Context, req *pb.ForceR
 		return nil, status.Error(codes.Unimplemented, "this node holds no index, so it cannot rebuild a version")
 	}
 
-	versions, err := s.raftNode.ListVersions(ctx, kbID)
+	// §F: one version, one read — see RaftNode.GetVersion.
+	v, err := s.raftNode.GetVersion(ctx, kbID, versionID)
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
-	found := false
-	for _, v := range versions {
-		if v.VersionID != versionID {
-			continue
-		}
-		found = true
-		if v.DataStatus == types.DataStatusFailedPermanent {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"version %d's data side is FAILED_PERMANENT: its data will never arrive, so its index cannot be rebuilt — abandon the version instead (ForceAbandonVersion)", versionID)
-		}
-		break
-	}
-	if !found {
-		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionNotFound)
+	if v.DataStatus == types.DataStatusFailedPermanent {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"version %d's data side is FAILED_PERMANENT: its data will never arrive, so its index cannot be rebuilt — abandon the version instead (ForceAbandonVersion)", versionID)
 	}
 
 	if err := s.raftNode.ProposeRetryVersion(ctx, kbID, versionID, types.FailureSideIndex); err != nil {
@@ -566,26 +556,16 @@ func (s *AdminServiceImpl) ForceAbandonVersion(ctx context.Context, req *pb.Forc
 		return nil, status.Error(codes.Unimplemented, "this node cannot run the delete-version cleanup, so it cannot abandon a version")
 	}
 
-	versions, err := s.raftNode.ListVersions(ctx, kbID)
+	// §F: one version, one read — see RaftNode.GetVersion.
+	v, err := s.raftNode.GetVersion(ctx, kbID, versionID)
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
-	found := false
-	for _, v := range versions {
-		if v.VersionID != versionID {
-			continue
-		}
-		found = true
-		if v.IndexStatus != types.IndexStatusFailedPermanent &&
-			v.DataStatus != types.DataStatusFailedPermanent {
-			return nil, status.Errorf(codes.FailedPrecondition,
-				"version %d carries no FAILED_PERMANENT verdict (index=%s, data=%s): a healthy version is DeleteVersion's business",
-				versionID, v.IndexStatus, v.DataStatus)
-		}
-		break
-	}
-	if !found {
-		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionNotFound)
+	if v.IndexStatus != types.IndexStatusFailedPermanent &&
+		v.DataStatus != types.DataStatusFailedPermanent {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"version %d carries no FAILED_PERMANENT verdict (index=%s, data=%s): a healthy version is DeleteVersion's business",
+			versionID, v.IndexStatus, v.DataStatus)
 	}
 
 	deleted, err := markVersionDeletingThenCleanUp(ctx, s.raftNode, s.deleteVersionCoord, s.logger,

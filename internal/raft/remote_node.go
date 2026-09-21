@@ -368,17 +368,27 @@ func (r *RemoteRaftNode) ListVersions(ctx context.Context, kbID string) ([]types
 
 // GetVersion implements RaftNode.
 //
-// A storage node has no local state machine, so this goes through the same
-// ListVersions RPC and filters — it is NOT the O(1) read the control node
-// offers, and that is deliberate rather than overlooked. GetVersion exists for
-// the await path, and await only ever runs where the state machine lives: a
-// storage node does not register the knowledge-base service at all
-// (docs/await-version-plan.md §6.1). Filtering here keeps the two RaftNode
-// shapes honest — a storage node answers correctly, just not cheaply — while a
-// control-plane RPC for a single version would be new protocol surface with no
-// caller (recorded as future work in that plan's §12).
+// A storage node has no local state machine, so this is a control-plane read —
+// but a NARROW one: it asks the SAME ListVersions RPC for (versionID-1, versionID],
+// so the wire carries one version instead of the whole chain (about 89 B per
+// version, mostly the document-set digest — see RaftNode.ListVersionsInRange).
+//
+// That narrowing is not an optimisation for its own sake. This shape is what a
+// STORAGE node answers with, and a storage node serves the query path: §F's meta
+// stage runs on every query, so a whole-chain read here was paid per query, per
+// storage node, no matter how little the caller needed. The await path
+// (docs/await-version-plan.md §7 Step 2) reads this too, for the same reason.
+//
+// The control node's shape of the same call is the O(1) map lookup in
+// RaftNodeImpl.GetVersion; both answer the same question at their own cost.
 func (r *RemoteRaftNode) GetVersion(ctx context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
-	versions, err := r.ListVersions(ctx, kbID)
+	if versionID <= 0 {
+		// Version IDs start at 1. A non-positive ask would make the lower bound
+		// (-1) a no-op for the server's filter and pull the whole chain back.
+		return types.VersionMeta{}, stratumerrors.ErrVersionNotFound
+	}
+	from, to := versionID-1, versionID
+	versions, err := r.ListVersionsInRange(ctx, kbID, &from, &to)
 	if err != nil {
 		return types.VersionMeta{}, err
 	}

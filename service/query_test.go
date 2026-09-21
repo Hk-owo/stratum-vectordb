@@ -27,6 +27,7 @@ import (
 type querySvcHarness struct {
 	svc         *QueryServiceImpl
 	raftNode    *raft.MockRaftNode
+	counting    *countingRaftNode
 	indexMgr    *index.MockIndexManager
 	chunkMapper *chunkdoc.MockChunkDocMapper
 	versionDocs *versiondoc.MockVersionDocList
@@ -53,15 +54,100 @@ func newQuerySvcHarness(t *testing.T) *querySvcHarness {
 	// rebuilt lazily from the version doc list.
 	vBloomStore := bloom.NewVersionBloomStore(t.TempDir(), 1000, 0.01, vd)
 
-	svc := NewQueryService(rn, im, cdm, vd, ds, vBloomStore)
+	// The service gets a counting wrapper so a test can assert the ONE thing §F is
+	// about: that a single-version question does not become a whole-chain read.
+	counting := &countingRaftNode{MockRaftNode: rn}
+	svc := NewQueryService(counting, im, cdm, vd, ds, vBloomStore)
 	return &querySvcHarness{
 		svc:         svc,
 		raftNode:    rn,
+		counting:    counting,
 		indexMgr:    im,
 		chunkMapper: cdm,
 		versionDocs: vd,
 		docStore:    ds,
 		vBloomStore: vBloomStore,
+	}
+}
+
+// countingRaftNode counts the reads a service makes, and which shape it used.
+// §F's second half is "look at one version, read one version"; the meta stage of a
+// query is where the opposite showed up most expensively — every query, on every
+// storage node, over gRPC.
+type countingRaftNode struct {
+	*raft.MockRaftNode
+
+	mu            sync.Mutex
+	listVersionsN int
+	getVersionN   int
+}
+
+func (c *countingRaftNode) ListVersions(ctx context.Context, kbID string) ([]types.VersionMeta, error) {
+	c.mu.Lock()
+	c.listVersionsN++
+	c.mu.Unlock()
+	return c.MockRaftNode.ListVersions(ctx, kbID)
+}
+
+func (c *countingRaftNode) GetVersion(ctx context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
+	c.mu.Lock()
+	c.getVersionN++
+	c.mu.Unlock()
+	return c.MockRaftNode.GetVersion(ctx, kbID, versionID)
+}
+
+func (c *countingRaftNode) wholeChainReads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.listVersionsN
+}
+
+func (c *countingRaftNode) singleVersionReads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.getVersionN
+}
+
+// TestQueryService_MetaStageReadsOnlyTheVersionItNames: §F's second half, seen
+// from the service that paid for it on every request. The meta stage must ask for
+// the version the query names — not the whole chain, which on a storage node is a
+// control-plane RPC whose cost grows with the chain (see the meta_us note in
+// query.go). Asserting the GetVersion call too keeps this from passing for the
+// wrong reason (e.g. a query that returned before the meta stage).
+func TestQueryService_MetaStageReadsOnlyTheVersionItNames(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	const kbID = "kb-one-version-read"
+	if err := h.raftNode.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID:             kbID,
+		Name:             "one-version",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig:      types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
+	}); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	versionID, err := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
+	if err != nil {
+		t.Fatalf("ProposeCreateVersion: %v", err)
+	}
+
+	// Whether this query answers or reports missing data is not what is being
+	// pinned — the READ is. (A version created here carries no document-set digest,
+	// so the data-missing branch may fire; it must fire without a chain read.)
+	_, _ = h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &versionID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+
+	if got := h.counting.wholeChainReads(); got != 0 {
+		t.Errorf("ListVersions calls = %d, want 0: the meta stage must read the one version it names (§F)", got)
+	}
+	if got := h.counting.singleVersionReads(); got < 1 {
+		t.Errorf("GetVersion calls = %d, want at least 1: the meta stage must use the single-version read", got)
 	}
 }
 

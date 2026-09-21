@@ -259,22 +259,14 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// total_us was ~10.9 ms, so the missing time is exactly this kind of
 	// per-query plumbing — measure it instead of assuming.
 	metaStart := time.Now()
-	versions, err := s.raftNode.ListVersions(ctx, kbID)
+	// §F: ask for the one version this query is about — (versionID-1, versionID] —
+	// rather than pulling the whole chain and filtering it here. On a storage node
+	// this read goes to the control tier and runs on EVERY query (see meta_us
+	// above), so a chain-sized answer was paid per query for one version's status.
+	targetVersion, err := s.raftNode.GetVersion(ctx, kbID, versionID)
 	stageMeta = time.Since(metaStart)
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
-	}
-	var targetVersion types.VersionMeta
-	found := false
-	for _, v := range versions {
-		if v.VersionID == versionID {
-			targetVersion = v
-			found = true
-			break
-		}
-	}
-	if !found {
-		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionNotFound)
 	}
 	if targetVersion.IndexStatus == types.IndexStatusPending {
 		// A PENDING version is not a dead end: §8.6b builds its index lazily, and

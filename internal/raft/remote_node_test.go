@@ -38,6 +38,18 @@ type fakeControlNode struct {
 	versions    []*pb.VersionInfo
 	versionsErr error
 	clusterResp *pb.GetClusterStatusResponse
+
+	// listReq is the last request that arrived through the ListVersions RPC, so a
+	// caller's narrowing can be asserted on the wire: the ranged reads travel that
+	// same RPC, which is the whole point of the bounds being request fields.
+	listReq *pb.ListVersionsRequest
+}
+
+// listVersionsRequest returns the last ListVersions request, if any.
+func (f *fakeControlNode) listVersionsRequest() *pb.ListVersionsRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.listReq
 }
 
 func (f *fakeControlNode) Propose(_ context.Context, req *pb.ProposeRequest) (*pb.ProposeResponse, error) {
@@ -58,7 +70,10 @@ func (f *fakeControlNode) GetKnowledgeBase(context.Context, *pb.GetKnowledgeBase
 	return &pb.GetKnowledgeBaseResponse{KnowledgeBase: f.kbInfo}, nil
 }
 
-func (f *fakeControlNode) ListVersions(context.Context, *pb.ListVersionsRequest) (*pb.ListVersionsResponse, error) {
+func (f *fakeControlNode) ListVersions(_ context.Context, req *pb.ListVersionsRequest) (*pb.ListVersionsResponse, error) {
+	f.mu.Lock()
+	f.listReq = req
+	f.mu.Unlock()
 	if f.versionsErr != nil {
 		return nil, f.versionsErr
 	}
@@ -436,11 +451,12 @@ func TestRemoteRaftNode_SkipsAFailingReadNode(t *testing.T) {
 }
 
 // TestRemoteRaftNode_GetVersionReadsOneVersionAndReportsMissing covers the
-// storage node's shape of the read the await path makes
-// (docs/await-version-plan.md §7 Step 2). A storage node has no state machine,
-// so it answers by filtering the ListVersions RPC: correct, just not the O(1)
-// read a control node offers — and correct is what matters, because await only
-// ever runs where the state machine lives.
+// storage node's shape of a single-version read: the await path
+// (docs/await-version-plan.md §7 Step 2), and — since a storage node serves the
+// query path — the meta stage of EVERY query. A storage node has no state
+// machine, so this goes to the control tier; what it must not do is drag the
+// whole chain along (§F's second half: "look at one version, read one version").
+// The bounds ride the same ListVersions RPC, so the wire carries one version.
 func TestRemoteRaftNode_GetVersionReadsOneVersionAndReportsMissing(t *testing.T) {
 	control := &fakeControlNode{versions: []*pb.VersionInfo{
 		{VersionId: 1, ParentVersionId: 0, CreatedAt: 100, IndexStatus: pb.IndexStatus_INDEX_STATUS_READY},
@@ -464,8 +480,20 @@ func TestRemoteRaftNode_GetVersionReadsOneVersionAndReportsMissing(t *testing.T)
 		t.Errorf("index status = %v, want Pending", got.IndexStatus)
 	}
 
+	// The read is NARROW: (versionID-1, versionID] carried by the same RPC.
+	if req := control.listVersionsRequest(); req == nil ||
+		req.GetFromExclusive() != 1 || req.GetToInclusive() != 2 {
+		t.Errorf("ListVersions request = %+v, want the narrow bounds (1,2]", req)
+	}
+
 	if _, err := node.GetVersion(ctx, "kb-1", 99); !errors.Is(err, stratumerrors.ErrVersionNotFound) {
 		t.Errorf("GetVersion(99) = %v, want ErrVersionNotFound", err)
+	}
+
+	// A non-positive id must not make the lower bound a no-op that pulls the whole
+	// chain back: version IDs start at 1.
+	if _, err := node.GetVersion(ctx, "kb-1", 0); !errors.Is(err, stratumerrors.ErrVersionNotFound) {
+		t.Errorf("GetVersion(0) = %v, want ErrVersionNotFound", err)
 	}
 
 	// An unreachable control tier is an ERROR, not an empty answer: "I could not

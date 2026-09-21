@@ -440,22 +440,18 @@ func (s *KnowledgeBaseServiceImpl) CreateVersion(ctx context.Context, req *pb.Cr
 
 // ListVersions implements KnowledgeBaseServiceServer.
 func (s *KnowledgeBaseServiceImpl) ListVersions(ctx context.Context, req *pb.ListVersionsRequest) (*pb.ListVersionsResponse, error) {
-	versions, err := s.raftNode.ListVersions(ctx, req.KnowledgeBaseId)
+	// §F: push the bounds into the read itself instead of reading the whole chain
+	// and filtering it here. Conversion + serialization is where the cost lives
+	// (about 89 B per version, mostly the document-set digest) — and a node that
+	// answers this call with a remote RaftNode would otherwise relay a whole-chain
+	// answer from the control tier only to throw most of it away.
+	versions, err := s.raftNode.ListVersionsInRange(ctx, req.KnowledgeBaseId, req.FromExclusive, req.ToInclusive)
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
-	// Narrow to the requested range BEFORE converting: the bounds exist to keep a
-	// whole-chain answer off the wire, and conversion + serialization is where that
-	// cost lives (about 89 B per version, mostly the document-set digest).
 	out := make([]*pb.VersionInfo, 0, len(versions))
 	for _, v := range versions {
-		if req.FromExclusive != nil && v.VersionID <= req.GetFromExclusive() {
-			continue
-		}
-		if req.ToInclusive != nil && v.VersionID > req.GetToInclusive() {
-			continue
-		}
 		out = append(out, versionInfoToProto(v))
 	}
 	return &pb.ListVersionsResponse{Versions: out}, nil
@@ -463,27 +459,18 @@ func (s *KnowledgeBaseServiceImpl) ListVersions(ctx context.Context, req *pb.Lis
 
 // RollbackVersion implements KnowledgeBaseServiceServer.
 func (s *KnowledgeBaseServiceImpl) RollbackVersion(ctx context.Context, req *pb.RollbackVersionRequest) (*pb.RollbackVersionResponse, error) {
-	// Validate target version exists and is READY.
-	versions, err := s.raftNode.ListVersions(ctx, req.KnowledgeBaseId)
+	// Validate the target version exists and is READY. §F: read the one version the
+	// request names instead of the whole chain — the same question, answered at the
+	// shape's own cost (O(1) on a control node, a narrow read elsewhere).
+	v, err := s.raftNode.GetVersion(ctx, req.KnowledgeBaseId, req.GetTargetVersionId())
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
-
-	found := false
-	for _, v := range versions {
-		if v.VersionID == req.TargetVersionId {
-			found = true
-			if v.IndexStatus == types.IndexStatusPending {
-				return nil, status.Error(codes.FailedPrecondition, "target version is PENDING")
-			}
-			if v.IndexStatus.IsFailed() {
-				return nil, status.Error(codes.FailedPrecondition, "target version index is FAILED")
-			}
-			break
-		}
+	if v.IndexStatus == types.IndexStatusPending {
+		return nil, status.Error(codes.FailedPrecondition, "target version is PENDING")
 	}
-	if !found {
-		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionNotFound)
+	if v.IndexStatus.IsFailed() {
+		return nil, status.Error(codes.FailedPrecondition, "target version index is FAILED")
 	}
 
 	if err := s.raftNode.ProposeRollback(ctx, req.KnowledgeBaseId, req.TargetVersionId); err != nil {
