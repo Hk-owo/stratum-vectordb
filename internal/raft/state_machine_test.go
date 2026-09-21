@@ -89,7 +89,7 @@ func TestStateMachine_Apply_MarkKBDeleteFailed(t *testing.T) {
 
 func TestStateMachine_Apply_RemoveKBMeta(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: 0}, w, zap.NewNop())
 	if v1.Err != nil {
@@ -116,7 +116,7 @@ func TestStateMachine_Apply_RemoveKBMeta(t *testing.T) {
 
 func TestStateMachine_Apply_CreateVersion_Constraints(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	// KB must exist.
 	res := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "nope"}, w, zap.NewNop())
@@ -171,7 +171,7 @@ func TestStateMachine_Apply_CreateVersion_Constraints(t *testing.T) {
 
 func TestStateMachine_Apply_CreateVersion_AllocatesAndWritesWAL(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	// Mark parent READY so a child can be forked.
@@ -213,7 +213,7 @@ func TestStateMachine_Apply_CreateVersion_AllocatesAndWritesWAL(t *testing.T) {
 
 func TestStateMachine_Apply_UpdateVersionStatus(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 
@@ -233,7 +233,7 @@ func TestStateMachine_Apply_UpdateVersionStatus(t *testing.T) {
 
 func TestStateMachine_Apply_Rollback(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 
@@ -268,7 +268,7 @@ func TestStateMachine_Apply_UnknownCommand(t *testing.T) {
 
 func TestStateMachine_SerializeRestore_RoundTrip(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
@@ -373,7 +373,7 @@ func kbPtr(kb types.KnowledgeBaseMeta) *types.KnowledgeBaseMeta {
 // version's document-ID set digest.
 func TestStateMachine_Apply_UpdateVersionSummary(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 
@@ -397,7 +397,7 @@ func TestStateMachine_Apply_UpdateVersionSummary(t *testing.T) {
 // recursive subtree) are rejected.
 func TestStateMachine_Apply_MarkVersionDeleting(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	// v1: active (set via Rollback below), READY.
@@ -454,7 +454,7 @@ func TestStateMachine_Apply_MarkVersionDeleting(t *testing.T) {
 // deletion.
 func TestStateMachine_Apply_MarkVersionDeleting_Recursive(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	// Chain v1 -> v2 -> v3, all READY; v1 active.
@@ -519,7 +519,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_Recursive(t *testing.T) {
 // removal and its idempotency.
 func TestStateMachine_Apply_RemoveVersionMeta(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
@@ -559,7 +559,7 @@ func TestStateMachine_Apply_RemoveVersionMeta(t *testing.T) {
 // cannot become active again.
 func TestStateMachine_Apply_Rollback_RejectsDeleting(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
@@ -581,7 +581,7 @@ func TestStateMachine_Apply_Rollback_RejectsDeleting(t *testing.T) {
 // Deleting version cannot become a parent.
 func TestStateMachine_Apply_CreateVersion_RejectsDeletingParent(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
@@ -602,7 +602,7 @@ func TestStateMachine_Apply_CreateVersion_RejectsDeletingParent(t *testing.T) {
 // version. Chain v1 -> v2 -> v3 with v3 active.
 func TestStateMachine_Apply_MarkVersionDeleting_AncestorOfActive(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
@@ -639,7 +639,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorOfActive(t *testing.T) {
 // can be dropped without losing the branch structure below it.
 func TestStateMachine_Apply_MarkVersionDeleting_SingleSplicesChildren(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	// v1 -> v2 -> v3 -> v4 (strictly linear). v1 is active.
@@ -694,7 +694,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_SingleSplicesChildren(t *testing
 // version of the KB survive.
 func TestStateMachine_Apply_MarkVersionDeleting_Ancestors(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	// v1 -> v2 -> v3 (strictly linear, so no sibling branches exist).
@@ -758,7 +758,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_Ancestors(t *testing.T) {
 // rejects an unknown delete mode.
 func TestStateMachine_Apply_MarkVersionDeleting_AncestorsIsNoopOnBase(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
@@ -791,7 +791,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorsIsNoopOnBase(t *testing
 // PENDING rejection when a swept-up sibling branch is still building.
 func TestStateMachine_Apply_MarkVersionDeleting_AncestorsReplayAndPending(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	// v1 -> v2 -> v3, all READY; v3 active.
@@ -854,7 +854,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorsReplayAndPending(t *tes
 // (children become roots instead of dangling off a vanishing version).
 func TestStateMachine_Apply_MarkVersionDeleting_SingleSpliceEdgeCases(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	// v1 is the base; v2 is active so v1 can be removed.
@@ -904,7 +904,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_SingleSpliceEdgeCases(t *testing
 // proper root instead of a permanent orphan.
 func TestStateMachine_Apply_MarkVersionDeleting_AncestorsHealsBrokenChain(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
@@ -942,7 +942,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorsHealsBrokenChain(t *tes
 // for the coordinator/service packages), so without this the two copies can
 // drift apart silently.
 func TestMockAndStateMachine_VersionDeleteModesAgree(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	// build wires one identical fixture — the strictly linear chain
 	// v1 -> v2 -> v3 -> v4, all READY (unless pendingLeaf keeps v3 PENDING,

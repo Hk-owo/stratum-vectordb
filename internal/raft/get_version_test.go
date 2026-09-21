@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -15,7 +14,7 @@ import (
 // version, and that "not in this knowledge base" is one answer rather than two.
 
 func TestGetVersion_AgreesWithListVersions(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 
@@ -57,7 +56,7 @@ func TestGetVersion_AgreesWithListVersions(t *testing.T) {
 }
 
 func TestGetVersion_ErrorPaths(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 	v1, err := r.ProposeCreateVersion(ctx, "kb1", 0)

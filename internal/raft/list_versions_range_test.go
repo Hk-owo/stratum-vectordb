@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"testing"
 
 	"stratum/internal/types"
@@ -13,7 +12,7 @@ import (
 // rest of the system asks, and a range that changed that answer would be a trap.
 func TestRaftNodeImpl_ListVersionsInRange_NarrowsTheChain(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
 	}

@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -47,7 +46,7 @@ func TestDeleteBlockedByPending_DecisionTable(t *testing.T) {
 // data-side verdict stranded the version in the chain with no API able to remove it.
 func TestStateMachine_Apply_MarkVersionDeleting_DataTerminalVersionIsDeletable(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	// v1 is the active version, so the delete below cannot be refused for that.
@@ -91,7 +90,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_DataTerminalVersionIsDeletable(t
 // delete would still fail with ErrVersionPending.
 func TestStateMachine_Apply_MarkVersionDeleting_DataTerminalSurvivorIsAllowed(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	// Chain A: root -> a1 (READY, to be deleted) -> a2 (data-side verdict).
@@ -140,7 +139,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_DataTerminalSurvivorIsAllowed(t 
 // contribute one. Pinned here so the two rules are not "unified" by accident.
 func TestStateMachine_Apply_CreateVersion_RefusesADataTerminalParent(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())

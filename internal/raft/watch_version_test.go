@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -15,7 +14,7 @@ import (
 
 func TestWatchVersion_FiresOnStateChanges(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	versionID := newVersionForWatchTest(t, impl)
 
 	changed, stop := impl.WatchVersion(versionID)
@@ -35,7 +34,7 @@ func TestWatchVersion_FiresOnStateChanges(t *testing.T) {
 // await learns that what it is watching went away.
 func TestWatchVersion_FiresWhenTheVersionIsRemoved(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	versionID := newVersionForWatchTest(t, impl)
 
 	changed, stop := impl.WatchVersion(versionID)
@@ -53,7 +52,7 @@ func TestWatchVersion_FiresWhenTheVersionIsRemoved(t *testing.T) {
 
 func TestWatchVersion_StopsAfterStop(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	versionID := newVersionForWatchTest(t, impl)
 
 	changed, stop := impl.WatchVersion(versionID)
@@ -82,7 +81,7 @@ func TestWatchVersion_StopsAfterStop(t *testing.T) {
 // newVersionForWatchTest creates a knowledge base and one version in it.
 func newVersionForWatchTest(t *testing.T, impl *RaftNodeImpl) int64 {
 	t.Helper()
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	if err := impl.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{KBID: "kb-1", Name: "kb-1"}); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
 	}

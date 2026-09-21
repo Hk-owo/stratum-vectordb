@@ -61,7 +61,7 @@ func newTestForwarder(t *testing.T, addrs map[int64]string) *GRPCProposeForwarde
 // The command must arrive byte-for-byte: the leader has to apply exactly what
 // the caller encoded, not a re-encoded copy of its own.
 func TestGRPCProposeForwarder_SendsTheCommandAndReturnsTheOutcome(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	svc := &fakeInternalService{resp: &pb.ProposeResponse{
 		VersionId:         42,
 		DeletedVersionIds: []int64{7, 8},
@@ -91,7 +91,7 @@ func TestGRPCProposeForwarder_SendsTheCommandAndReturnsTheOutcome(t *testing.T) 
 // An apply error travels as its sentinel name and is rebuilt on this side, so
 // the caller's errors.Is still matches (Stratum_设计文档v13.md §7.3).
 func TestGRPCProposeForwarder_RebuildsSentinelErrors(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	svc := &fakeInternalService{resp: &pb.ProposeResponse{
 		ErrorName:    "version_not_found",
 		ErrorMessage: "version not found",
@@ -110,7 +110,7 @@ func TestGRPCProposeForwarder_RebuildsSentinelErrors(t *testing.T) {
 
 // An unrecognised name degrades to the message rather than a wrong category.
 func TestGRPCProposeForwarder_UnknownSentinelFallsBackToMessage(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	svc := &fakeInternalService{resp: &pb.ProposeResponse{
 		ErrorName:    "some_error_from_the_future",
 		ErrorMessage: "quota exceeded",
@@ -130,7 +130,7 @@ func TestGRPCProposeForwarder_UnknownSentinelFallsBackToMessage(t *testing.T) {
 // A redirect means leadership moved mid-flight. It is reported so the caller
 // can decide whether its deadline still allows another try.
 func TestGRPCProposeForwarder_ReportsARedirect(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	svc := &fakeInternalService{resp: &pb.ProposeResponse{LeaderId: 9}}
 	addr := startForwardTarget(t, svc)
 	f := newTestForwarder(t, map[int64]string{3: addr})
@@ -147,7 +147,7 @@ func TestGRPCProposeForwarder_ReportsARedirect(t *testing.T) {
 // An unknown address is an explicit failure, not a silent no-op.
 func TestGRPCProposeForwarder_UnknownLeaderAddress(t *testing.T) {
 	f := newTestForwarder(t, map[int64]string{})
-	if _, err := f.ForwardPropose(context.Background(), 3, []byte("{}")); err == nil {
+	if _, err := f.ForwardPropose(proposeCtx(t), 3, []byte("{}")); err == nil {
 		t.Fatal("want an error when the leader's address is unknown")
 	}
 }
@@ -155,7 +155,7 @@ func TestGRPCProposeForwarder_UnknownLeaderAddress(t *testing.T) {
 // Without an address table the forwarder refuses rather than panicking.
 func TestGRPCProposeForwarder_WithoutAddressTable(t *testing.T) {
 	f := &GRPCProposeForwarder{}
-	if _, err := f.ForwardPropose(context.Background(), 3, []byte("{}")); err == nil {
+	if _, err := f.ForwardPropose(proposeCtx(t), 3, []byte("{}")); err == nil {
 		t.Fatal("want an error when no address table is wired")
 	}
 }

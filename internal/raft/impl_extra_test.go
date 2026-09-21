@@ -14,7 +14,7 @@ import (
 // transition to DELETING and its error path for unknown KBs.
 func TestRaftNodeImpl_ProposeMarkKBDeleting(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
@@ -39,7 +39,7 @@ func TestRaftNodeImpl_ProposeMarkKBDeleting(t *testing.T) {
 // DELETE_FAILED surfaced by GetSystemStatus.
 func TestRaftNodeImpl_ProposeMarkKBDeleteFailed(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
@@ -61,7 +61,7 @@ func TestRaftNodeImpl_ProposeMarkKBDeleteFailed(t *testing.T) {
 // the console and GetSystemStatus, including the empty case.
 func TestRaftNodeImpl_ListKnowledgeBases(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	kbs, err := impl.ListKnowledgeBases(ctx)
 	if err != nil {
@@ -100,7 +100,7 @@ func TestRaftNodeImpl_ListKnowledgeBases(t *testing.T) {
 // reads fail with the documented errors.
 func TestRaftNodeImpl_ProposeRemoveKBMeta_And_ListVersions(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
@@ -139,7 +139,7 @@ func TestRaftNodeImpl_ProposeRemoveKBMeta_And_ListVersions(t *testing.T) {
 // nobody else knows about. Deciding who pulls is the data plane's job.
 func TestRaftNodeImpl_SetOnVersionCreated_FiresForProposerToo(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	called := make(chan struct{}, 1)
 	impl.SetOnVersionCreated(func(kbID string, versionID int64) {
@@ -191,7 +191,7 @@ func TestRaftNodeImpl_LocalSnapshotCompaction(t *testing.T) {
 		t.Fatalf("single-node RaftNodeImpl never became leader")
 	}
 
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	const n = 40 // comfortably past MaxLogLength=8 (each KB = 1 log entry)
 	for i := 0; i < n; i++ {
 		kb := testKB(kbIDFor(i))
@@ -235,7 +235,7 @@ func kbIDFor(i int) string {
 // version's document-ID set digest and the error path for unknown versions.
 func TestRaftNodeImpl_ProposeUpdateVersionSummary(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestRaftNodeImpl_ProposeUpdateVersionSummary(t *testing.T) {
 // travel the apply path too, and this is where it does.
 func TestRaftNodeImpl_SetOnVersionFailedPermanent_FiresOnApply(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	type event struct {
 		kbID      string
@@ -309,7 +309,7 @@ func TestRaftNodeImpl_SetOnVersionFailedPermanent_FiresOnApply(t *testing.T) {
 // with it: otherwise the side is decided in two places with two answers.
 func TestRaftNodeImpl_SetOnVersionFailedPermanent_SkipsTheIndexSide(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	called := make(chan int64, 1)
 	impl.SetOnVersionFailedPermanent(func(_ string, versionID int64) {

@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"testing"
 
 	"go.uber.org/zap"
@@ -20,7 +19,7 @@ import (
 // the only case the state machine has to get right here is the ordinary one.
 func TestCreateVersion_WithChangesStartsPending(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())

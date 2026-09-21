@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -33,7 +32,7 @@ func TestStateMachine_Apply_MarkVersionFailedPermanent(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sm, w := newTestSM(t)
-			ctx := context.Background()
+			ctx := proposeCtx(t)
 			sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 			v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 			if v.Err != nil {
@@ -73,7 +72,7 @@ func TestStateMachine_Apply_MarkVersionFailedPermanent(t *testing.T) {
 // entry must converge.
 func TestStateMachine_MarkVersionFailedPermanent_IsIdempotent(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 
@@ -96,7 +95,7 @@ func TestStateMachine_MarkVersionFailedPermanent_IsIdempotent(t *testing.T) {
 // silently creating a phantom entry.
 func TestStateMachine_MarkVersionFailedPermanent_RejectsUnknown(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-2"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
@@ -123,7 +122,7 @@ func TestStateMachine_MarkVersionFailedPermanent_RejectsUnknown(t *testing.T) {
 // after a restart.
 func TestStateMachine_FailedPermanentSurvivesSnapshot(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{

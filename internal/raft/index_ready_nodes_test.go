@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"reflect"
 	"testing"
 
@@ -15,7 +14,7 @@ import (
 // id the state machine allocated.
 func seedOneVersion(t *testing.T, sm *stateMachine, w *wal.MockWAL, kbID string) int64 {
 	t.Helper()
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	if res := sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB(kbID))}, w, zap.NewNop()); res.Err != nil {
 		t.Fatalf("create KB: %v", res.Err)
 	}
@@ -48,7 +47,7 @@ func indexReadyNodesOf(t *testing.T, sm *stateMachine, versionID int64) []int64 
 // because the rolling cleanup asks "if I step out for a moment, how many remain?"
 // — a question a bare status ("READY somewhere") cannot answer.
 func TestStateMachine_RecordsWhichReplicasReportedIndexReady(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm, w := newTestSM(t)
 	versionID := seedOneVersion(t, sm, w, "kb-1")
 
@@ -82,7 +81,7 @@ func TestStateMachine_RecordsWhichReplicasReportedIndexReady(t *testing.T) {
 // count that decides whether a replica may step out would then be a lie in the
 // direction that permits unsafe cleanup.
 func TestStateMachine_ControlLayerVerdictsRecordNoReplica(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm, w := newTestSM(t)
 	versionID := seedOneVersion(t, sm, w, "kb-1")
 
@@ -107,7 +106,7 @@ func TestStateMachine_ControlLayerVerdictsRecordNoReplica(t *testing.T) {
 // travel with a snapshot. (gob carries exported fields automatically; this pins
 // that the field is exported and copied, which is what the round trip needs.)
 func TestStateMachine_IndexReadyNodesSurviveADeepCopy(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm, w := newTestSM(t)
 	versionID := seedOneVersion(t, sm, w, "kb-1")
 

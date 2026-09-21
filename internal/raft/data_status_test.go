@@ -19,7 +19,7 @@ import (
 // TestStateMachine_MarkDataDurablePromotesPending covers the ordinary case.
 func TestStateMachine_MarkDataDurablePromotesPending(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 
@@ -42,7 +42,7 @@ func TestStateMachine_MarkDataDurablePromotesPending(t *testing.T) {
 // control layer's decision.
 func TestStateMachine_MarkDataDurableDoesNotUndoATerminalVerdict(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{
@@ -65,7 +65,7 @@ func TestStateMachine_MarkDataDurableDoesNotUndoATerminalVerdict(t *testing.T) {
 // Re-applying is a no-op rather than a failure: a replayed log entry converges.
 func TestStateMachine_MarkDataDurableIsIdempotent(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 
@@ -93,7 +93,7 @@ func TestStateMachine_MarkDataDurableRejectsUnknownVersion(t *testing.T) {
 // picture than the one it had.
 func TestStateMachine_DataDurableSurvivesSnapshot(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdMarkDataDurable, VersionID: v.VersionID}, w, zap.NewNop())
@@ -124,7 +124,7 @@ func TestStateMachine_DataDurableSurvivesSnapshot(t *testing.T) {
 // accepted, yet not one version reached DATA_DURABLE.
 func TestStateMachine_DigestArrivingAfterIndexReadyStillCommits(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
@@ -144,7 +144,7 @@ func TestStateMachine_DigestArrivingAfterIndexReadyStillCommits(t *testing.T) {
 // after DATA_FAILED_PERMANENT must not quietly make it durable again.
 func TestStateMachine_DigestAfterDataFailedPermanentIsDropped(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	sm.apply(ctx, command{

@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -15,7 +14,7 @@ import (
 // who gets refused and why.
 
 func TestDiscardVersion_RemovesAPendingVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 	v, err := r.ProposeCreateVersion(ctx, "kb1", 0)
@@ -46,7 +45,7 @@ func TestDiscardVersion_RemovesAPendingVersion(t *testing.T) {
 }
 
 func TestDiscardVersion_RefusesASettledVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 	v, err := r.ProposeCreateVersion(ctx, "kb1", 0)
@@ -69,7 +68,7 @@ func TestDiscardVersion_RefusesASettledVersion(t *testing.T) {
 }
 
 func TestDiscardVersion_RefusesTheActiveVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 	v, err := r.ProposeCreateVersion(ctx, "kb1", 0)
@@ -87,7 +86,7 @@ func TestDiscardVersion_RefusesTheActiveVersion(t *testing.T) {
 }
 
 func TestDiscardVersion_RefusesAVersionWithAChild(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 	parent, err := r.ProposeCreateVersion(ctx, "kb1", 0)
@@ -118,7 +117,7 @@ func TestDiscardVersion_RefusesAVersionWithAChild(t *testing.T) {
 }
 
 func TestDiscardVersion_ReportsAnUnknownVersion(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 
@@ -131,7 +130,7 @@ func TestDiscardVersion_ReportsAnUnknownVersion(t *testing.T) {
 }
 
 func TestDiscardVersion_FreesTheIdempotencyKey(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 

@@ -165,7 +165,7 @@ func TestRemoteRaftNode_ForwardsProposalsToTheControlNode(t *testing.T) {
 	node, cleanup := newRemoteNode(t, map[int64]*fakeControlNode{1: control})
 	defer cleanup()
 
-	if err := node.ProposeUpdateVersionStatus(context.Background(), 7, types.IndexStatusReady, 0); err != nil {
+	if err := node.ProposeUpdateVersionStatus(proposeCtx(t), 7, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus: %v", err)
 	}
 
@@ -191,7 +191,7 @@ func TestRemoteRaftNode_FollowsARedirectToTheRealLeader(t *testing.T) {
 	node, cleanup := newRemoteNode(t, map[int64]*fakeControlNode{1: follower, 2: leader})
 	defer cleanup()
 
-	versionID, err := node.ProposeCreateVersion(context.Background(), "kb-1", 3, WithClientRequestID("req-9"))
+	versionID, err := node.ProposeCreateVersion(proposeCtx(t), "kb-1", 3, WithClientRequestID("req-9"))
 	if err != nil {
 		t.Fatalf("ProposeCreateVersion: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestRemoteRaftNode_FollowsARedirectToTheRealLeader(t *testing.T) {
 	}
 
 	// The redirect is remembered: a second proposal goes straight to node 2.
-	if err := node.ProposeRollback(context.Background(), "kb-1", 1); err != nil {
+	if err := node.ProposeRollback(proposeCtx(t), "kb-1", 1); err != nil {
 		t.Fatalf("ProposeRollback: %v", err)
 	}
 	if got := len(follower.proposedCommands(t)); got != 1 {
@@ -231,7 +231,7 @@ func TestRemoteRaftNode_RebuildsSentinelErrors(t *testing.T) {
 	node, cleanup := newRemoteNode(t, map[int64]*fakeControlNode{1: control})
 	defer cleanup()
 
-	_, err := node.ProposeMarkVersionDeleting(context.Background(), "kb-1", 4, types.VersionDeleteSubtree)
+	_, err := node.ProposeMarkVersionDeleting(proposeCtx(t), "kb-1", 4, types.VersionDeleteSubtree)
 	if !errors.Is(err, stratumerrors.ErrVersionIsActive) {
 		t.Fatalf("error = %v, want ErrVersionIsActive (the wire name must rebuild the sentinel)", err)
 	}
@@ -242,7 +242,7 @@ func TestRemoteRaftNode_RebuildsSentinelErrors(t *testing.T) {
 // silent success that would look like "the metadata says nothing".
 func TestRemoteRaftNode_ReportsWhenNoControlNodeIsReachable(t *testing.T) {
 	node := &RemoteRaftNode{ControlAddrs: map[int64]string{1: "control-1"}}
-	if err := node.ProposeUpdateVersionStatus(context.Background(), 1, types.IndexStatusReady, 0); err == nil {
+	if err := node.ProposeUpdateVersionStatus(proposeCtx(t), 1, types.IndexStatusReady, 0); err == nil {
 		t.Fatal("expected an error when no control node is reachable")
 	}
 	if _, err := node.GetKB(context.Background(), "kb-1"); err == nil {
@@ -258,7 +258,7 @@ func TestRemoteRaftNode_ProposalOutcomeCarriesVersionIDs(t *testing.T) {
 	node, cleanup := newRemoteNode(t, map[int64]*fakeControlNode{1: control})
 	defer cleanup()
 
-	ids, err := node.ProposeMarkVersionDeleting(context.Background(), "kb-1", 6, types.VersionDeleteAncestors)
+	ids, err := node.ProposeMarkVersionDeleting(proposeCtx(t), "kb-1", 6, types.VersionDeleteAncestors)
 	if err != nil {
 		t.Fatalf("ProposeMarkVersionDeleting: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestRemoteRaftNode_GetVersionReadsOneVersionAndReportsMissing(t *testing.T)
 	}}
 	node, cleanup := newRemoteNode(t, map[int64]*fakeControlNode{1: control})
 	defer cleanup()
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	got, err := node.GetVersion(ctx, "kb-1", 2)
 	if err != nil {

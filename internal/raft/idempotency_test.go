@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"testing"
 
 	"go.uber.org/zap"
@@ -16,7 +15,7 @@ import (
 // whose data never landed (Stratum_设计文档v13.md §7.12).
 func TestStateMachine_Apply_CreateVersion_IdempotentRetry(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	first := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ClientRequestID: "req-1"}, w, zap.NewNop())
@@ -60,7 +59,7 @@ func TestStateMachine_Apply_CreateVersion_IdempotentRetry(t *testing.T) {
 // idempotency check deliberately runs before the parent constraints.
 func TestStateMachine_Apply_CreateVersion_IdempotentRetryBeatsParentChecks(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	root := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
@@ -89,7 +88,7 @@ func TestStateMachine_Apply_CreateVersion_IdempotentRetryBeatsParentChecks(t *te
 // after a restart would fork a second version.
 func TestStateMachine_IdempotencyMapSurvivesSnapshot(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	first := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ClientRequestID: "req-1"}, w, zap.NewNop())
@@ -116,7 +115,7 @@ func TestStateMachine_IdempotencyMapSurvivesSnapshot(t *testing.T) {
 // key can never resolve to a version that no longer exists.
 func TestStateMachine_RequestMappingDroppedWithVersion(t *testing.T) {
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	first := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ClientRequestID: "req-1"}, w, zap.NewNop())
@@ -141,7 +140,7 @@ func TestStateMachine_RequestMappingDroppedWithVersion(t *testing.T) {
 // TestMockRaftNode_CreateVersion_IdempotentRetry keeps the test double in step
 // with the real state machine (the two must agree on retry semantics).
 func TestMockRaftNode_CreateVersion_IdempotentRetry(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 

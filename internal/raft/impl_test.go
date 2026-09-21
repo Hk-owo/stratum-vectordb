@@ -39,6 +39,23 @@ func newTestRaftNodeImpl(t *testing.T) (*RaftNodeImpl, *wal.MockWAL) {
 	return impl, w
 }
 
+// proposeCtx is the context these tests propose with: a DEADLINE rather than
+// context.Background(), so a proposal whose result goes missing fails with the
+// awaiting test named instead of hanging the package.
+//
+// That is not hypothetical. The suite used Background() everywhere, and a dropped
+// apply result — see rememberSettledLocked: Propose returns an index before its
+// caller can register a waiter for it — blocked one test forever. CI reported
+// `FAIL stratum/internal/raft 180.007s`, the package's own timeout, with every
+// other test's outcome lost in the dump. The product-side fix removes that window;
+// this keeps any future one diagnosable as a failure rather than a hang.
+func proposeCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 func freeLoopbackAddrForTest(t *testing.T) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -63,7 +80,7 @@ func waitForCond(t *testing.T, timeout time.Duration, cond func() bool) bool {
 }
 
 func TestRaftNodeImpl_CreateKBAndGetKB(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	impl, _ := newTestRaftNodeImpl(t)
 
 	kb := types.KnowledgeBaseMeta{KBID: "kb1", Name: "test-kb"}
@@ -92,7 +109,7 @@ func TestRaftNodeImpl_GetKB_NotFound(t *testing.T) {
 }
 
 func TestRaftNodeImpl_VersionIDMonotonic(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	impl, _ := newTestRaftNodeImpl(t)
 	mustCreateKBImpl(t, impl, "kb1")
 
@@ -112,7 +129,7 @@ func TestRaftNodeImpl_VersionIDMonotonic(t *testing.T) {
 }
 
 func TestRaftNodeImpl_ParentMustBeSameKB(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	impl, _ := newTestRaftNodeImpl(t)
 	mustCreateKBImpl(t, impl, "kb1")
 	mustCreateKBImpl(t, impl, "kb2")
@@ -130,7 +147,7 @@ func TestRaftNodeImpl_ParentMustBeSameKB(t *testing.T) {
 }
 
 func TestRaftNodeImpl_ParentMustNotBePending(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	impl, _ := newTestRaftNodeImpl(t)
 	mustCreateKBImpl(t, impl, "kb1")
 
@@ -150,7 +167,7 @@ func TestRaftNodeImpl_ParentMustNotBePending(t *testing.T) {
 // because docstore.ReadAt resolves a document by numeric version order, which
 // is only equivalent to the ancestor chain when there are no forks.
 func TestRaftNodeImpl_ForkRejected(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	impl, _ := newTestRaftNodeImpl(t)
 	mustCreateKBImpl(t, impl, "kb1")
 
@@ -191,7 +208,7 @@ func TestRaftNodeImpl_ForkRejected(t *testing.T) {
 }
 
 func TestRaftNodeImpl_ProposeRemoveKBMeta_Idempotent(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	impl, _ := newTestRaftNodeImpl(t)
 
 	if err := impl.ProposeRemoveKBMeta(ctx, "ghost"); err != nil {
@@ -208,7 +225,7 @@ func TestRaftNodeImpl_ProposeRemoveKBMeta_Idempotent(t *testing.T) {
 }
 
 func TestRaftNodeImpl_ProposeCreateVersion_WritesWALBeforeReturning(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	impl, w := newTestRaftNodeImpl(t)
 	mustCreateKBImpl(t, impl, "kb1")
 
@@ -230,7 +247,7 @@ func TestRaftNodeImpl_ProposeCreateVersion_WritesWALBeforeReturning(t *testing.T
 }
 
 func TestRaftNodeImpl_Rollback(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	impl, _ := newTestRaftNodeImpl(t)
 	mustCreateKBImpl(t, impl, "kb1")
 
@@ -268,7 +285,7 @@ func TestRaftNodeImpl_GetClusterStatus(t *testing.T) {
 // new incarnation taking over leadership (simulated here as a full
 // process restart against the same data directory).
 func TestRaftNodeImpl_SingleNodeSurvivesRestart(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	dataDir := t.TempDir()
 	w := wal.NewMockWAL()
 
@@ -361,14 +378,14 @@ func TestRaftNodeImpl_SingleNodeSurvivesRestart(t *testing.T) {
 
 func mustCreateKBImpl(t *testing.T, impl *RaftNodeImpl, kbID string) {
 	t.Helper()
-	if err := impl.ProposeCreateKB(context.Background(), types.KnowledgeBaseMeta{KBID: kbID}); err != nil {
+	if err := impl.ProposeCreateKB(proposeCtx(t), types.KnowledgeBaseMeta{KBID: kbID}); err != nil {
 		t.Fatalf("ProposeCreateKB(%s): %v", kbID, err)
 	}
 }
 
 func mustUpdateStatusImpl(t *testing.T, impl *RaftNodeImpl, versionID int64, status types.IndexStatus) {
 	t.Helper()
-	if err := impl.ProposeUpdateVersionStatus(context.Background(), versionID, status, 0); err != nil {
+	if err := impl.ProposeUpdateVersionStatus(proposeCtx(t), versionID, status, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus(%d, %v): %v", versionID, status, err)
 	}
 }

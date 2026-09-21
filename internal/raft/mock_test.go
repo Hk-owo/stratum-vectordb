@@ -16,7 +16,7 @@ func newTestRaftNode() (*MockRaftNode, *wal.MockWAL) {
 }
 
 func TestMockRaftNode_CreateKBAndGetKB(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 
 	kb := types.KnowledgeBaseMeta{KBID: "kb1", Name: "test"}
@@ -41,7 +41,7 @@ func TestMockRaftNode_GetKB_NotFound(t *testing.T) {
 }
 
 func TestMockRaftNode_VersionIDMonotonic(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 
@@ -62,7 +62,7 @@ func TestMockRaftNode_VersionIDMonotonic(t *testing.T) {
 }
 
 func TestMockRaftNode_ParentMustBeSameKB(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 	mustCreateKB(t, r, "kb2")
@@ -80,7 +80,7 @@ func TestMockRaftNode_ParentMustBeSameKB(t *testing.T) {
 }
 
 func TestMockRaftNode_ParentMustNotBePending(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 
@@ -98,7 +98,7 @@ func TestMockRaftNode_ParentMustNotBePending(t *testing.T) {
 
 // MockRaftNode must mirror the state machine's strictly linear version chain.
 func TestMockRaftNode_ForkRejected(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 
@@ -137,7 +137,7 @@ func TestMockRaftNode_ForkRejected(t *testing.T) {
 }
 
 func TestMockRaftNode_ProposeCreateVersion_WritesWALBeforeStateMachine(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, w := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 
@@ -163,7 +163,7 @@ func TestMockRaftNode_ProposeCreateVersion_WritesWALBeforeStateMachine(t *testin
 }
 
 func TestMockRaftNode_ProposeRemoveKBMeta_Idempotent(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 
 	// Knowledge base never existed: must still return success.
@@ -182,7 +182,7 @@ func TestMockRaftNode_ProposeRemoveKBMeta_Idempotent(t *testing.T) {
 }
 
 func TestMockRaftNode_Rollback(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	r, _ := newTestRaftNode()
 	mustCreateKB(t, r, "kb1")
 
@@ -216,14 +216,14 @@ func TestMockRaftNode_GetClusterStatus(t *testing.T) {
 
 func mustCreateKB(t *testing.T, r *MockRaftNode, kbID string) {
 	t.Helper()
-	if err := r.ProposeCreateKB(context.Background(), types.KnowledgeBaseMeta{KBID: kbID}); err != nil {
+	if err := r.ProposeCreateKB(proposeCtx(t), types.KnowledgeBaseMeta{KBID: kbID}); err != nil {
 		t.Fatalf("ProposeCreateKB(%s): %v", kbID, err)
 	}
 }
 
 func mustUpdateStatus(t *testing.T, r *MockRaftNode, versionID int64, status types.IndexStatus) {
 	t.Helper()
-	if err := r.ProposeUpdateVersionStatus(context.Background(), versionID, status, 0); err != nil {
+	if err := r.ProposeUpdateVersionStatus(proposeCtx(t), versionID, status, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus(%d, %v): %v", versionID, status, err)
 	}
 }
@@ -233,7 +233,7 @@ func mustUpdateStatus(t *testing.T, r *MockRaftNode, versionID int64, status typ
 func TestMockRaftNode_MarkKBDeleting_And_DeleteFailed(t *testing.T) {
 	w := wal.NewMockWAL()
 	r := NewMockRaftNode(w)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	if err := r.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatal(err)
@@ -267,7 +267,7 @@ func TestMockRaftNode_MarkKBDeleting_And_DeleteFailed(t *testing.T) {
 func TestMockRaftNode_ListKnowledgeBases_And_Reset(t *testing.T) {
 	w := wal.NewMockWAL()
 	r := NewMockRaftNode(w)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	if err := r.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatal(err)
@@ -292,7 +292,7 @@ func TestMockRaftNode_ListKnowledgeBases_And_Reset(t *testing.T) {
 func TestMockRaftNode_ProposeUpdateVersionSummary(t *testing.T) {
 	w := wal.NewMockWAL()
 	r := NewMockRaftNode(w)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	if err := r.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatal(err)
 	}

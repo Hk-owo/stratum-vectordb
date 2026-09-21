@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -18,7 +17,7 @@ import (
 func retryFixture(t *testing.T, sides ...types.FailureSide) (*stateMachine, *wal.MockWAL, int64) {
 	t.Helper()
 	sm, w := newTestSM(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	if v.Err != nil {
@@ -43,7 +42,7 @@ func retryFixture(t *testing.T, sides ...types.FailureSide) (*stateMachine, *wal
 // and kept GetSystemStatus describing a verdict that no longer held.
 func TestStateMachine_Apply_RetryVersion_ClearsTheVerdictAndItsCauseChain(t *testing.T) {
 	sm, w, versionID := retryFixture(t, types.FailureSideIndex)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	res := sm.apply(ctx, command{Type: cmdRetryVersion, KBID: "kb-1", VersionID: versionID, FailureSide: types.FailureSideIndex}, w, zap.NewNop())
 	if res.Err != nil {
@@ -66,7 +65,7 @@ func TestStateMachine_Apply_RetryVersion_ClearsTheVerdictAndItsCauseChain(t *tes
 // is reading the version for.
 func TestStateMachine_Apply_RetryVersion_KeepsTheCauseChainWhileTheOtherSideIsDead(t *testing.T) {
 	sm, w, versionID := retryFixture(t, types.FailureSideData, types.FailureSideIndex)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	res := sm.apply(ctx, command{Type: cmdRetryVersion, KBID: "kb-1", VersionID: versionID, FailureSide: types.FailureSideIndex}, w, zap.NewNop())
 	if res.Err != nil {
@@ -88,7 +87,7 @@ func TestStateMachine_Apply_RetryVersion_KeepsTheCauseChainWhileTheOtherSideIsDe
 // has nothing to retry, the data side is never retryable (its verdict says the data
 // will never arrive), and a version already on its way out has no state to revive.
 func TestStateMachine_Apply_RetryVersion_Refusals(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	t.Run("index side is not terminal", func(t *testing.T) {
 		sm, w, versionID := retryFixture(t)

@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -20,7 +19,7 @@ import (
 // claimed the compacted entries were applied — all pre-snapshot state was
 // silently lost.
 func TestRaftNodeImpl_RestartAfterSnapshotRestoresStateMachine(t *testing.T) {
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 	dir := t.TempDir()
 	addr := freeLoopbackAddrForTest(t)
 	w := wal.NewMockWAL()
@@ -149,7 +148,7 @@ func TestRaftNodeImpl_InstalledSnapshotIsPersisted(t *testing.T) {
 // READY-mark a version whose data is still being written.
 func TestRaftNodeImpl_InstalledSnapshotTriggersVersionSync(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
-	ctx := context.Background()
+	ctx := proposeCtx(t)
 
 	// Build a KB with two READY versions plus one PENDING version (whose
 	// storage write has not completed) — the PENDING one must NOT be
