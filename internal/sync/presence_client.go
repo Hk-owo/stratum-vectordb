@@ -91,6 +91,14 @@ func NewVersionDataCleaner(cfg PresenceCheckerConfig) *VersionDataCleaner {
 // A dial or RPC failure is returned as an error so the caller can log which
 // replica could not be reached — the cleanup is best effort by design, but a
 // replica that keeps refusing to answer is worth knowing about.
+//
+// dropped=false is treated as a FAILURE rather than as "nothing to do". A peer
+// that holds nothing answers true — the reclaim is an idempotent prefix delete —
+// so false means the reclaim did not run, and the caller has to hear it BEFORE
+// the version's metadata is removed: once that row is gone, nothing can name this
+// node's leftover bytes again (docs/known-gaps.md §B/§C). A peer answering it
+// without an error is an older build of the receiving side, which reported
+// "no dropper wired" that way.
 func (c *VersionDataCleaner) DeleteVersionData(ctx context.Context, peerAddr, kbID string, versionID int64, reason string) error {
 	conn, err := c.dial(ctx, peerAddr)
 	if err != nil {
@@ -98,12 +106,16 @@ func (c *VersionDataCleaner) DeleteVersionData(ctx context.Context, peerAddr, kb
 	}
 	defer func() { _ = conn.Close() }()
 
-	if _, err := pb.NewDataSyncServiceClient(conn).DeleteVersionData(ctx, &pb.DeleteVersionDataRequest{
+	resp, err := pb.NewDataSyncServiceClient(conn).DeleteVersionData(ctx, &pb.DeleteVersionDataRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       versionID,
 		Reason:          reason,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("sync: DeleteVersionData(%s v%d) at %s: %w", kbID, versionID, peerAddr, err)
+	}
+	if !resp.GetDropped() {
+		return fmt.Errorf("sync: DeleteVersionData(%s v%d) at %s: the peer answered dropped=false, so its reclaim did not run", kbID, versionID, peerAddr)
 	}
 	return nil
 }

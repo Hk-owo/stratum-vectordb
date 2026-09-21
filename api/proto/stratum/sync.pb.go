@@ -411,7 +411,14 @@ type DeleteVersionDataResponse struct {
 	sizeCache     protoimpl.SizeCache
 	unknownFields protoimpl.UnknownFields
 
-	Dropped bool  `protobuf:"varint,1,opt,name=dropped,proto3" json:"dropped,omitempty"` // whether this node actually held data for the version
+	// dropped reports that the reclaim RAN here. It does not mean "this node held
+	// data for the version": the reclaim is an idempotent prefix delete, so a node
+	// that held nothing answers true as well. A node that cannot run it at all
+	// fails the call instead of answering false — reporting success there would let
+	// the control layer remove the version's metadata while the bytes stay behind,
+	// and once that row is gone nothing can name them again
+	// (docs/known-gaps.md §B/§C).
+	Dropped bool  `protobuf:"varint,1,opt,name=dropped,proto3" json:"dropped,omitempty"`
 	NodeId  int64 `protobuf:"varint,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
 }
 

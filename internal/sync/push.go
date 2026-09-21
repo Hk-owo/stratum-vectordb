@@ -776,14 +776,26 @@ func (h *PushHandler) PushIndexData(stream pb.DataSyncService_PushIndexDataServe
 
 // DeleteVersionData implements DataSyncService.DeleteVersionData: it reclaims
 // the version's physical data here, on the control layer's instruction
-// (Stratum_设计文档v13.md §10.6). Without a wired dropper it answers
-// dropped=false instead of failing: a node with nothing to drop is a normal
-// case, not an error.
+// (Stratum_设计文档v13.md §10.6).
+//
+// A node with NO dropper wired is an ERROR, not a "nothing to drop" answer. The
+// two are indistinguishable on the wire otherwise, and that is exactly how the
+// window in docs/known-gaps.md §B/§C opens: the broadcaster reads "success", the
+// control layer goes on to remove the version's metadata, and whatever bytes this
+// node still holds lose the last row that could name them — the terminal-reclaim
+// queue, the delete flow's re-discovery and the startup reconcile all key off
+// metadata. §10.6 states the principle for the local path ("一个悄悄什么都不做的
+// 清理，正是孤儿数据活下来的方式"); this is the same rule on the receiving end.
+//
+// A node that simply never received the version stays a SUCCESS: DropVersionStorage
+// is an idempotent prefix delete, so "I hold nothing" is an ordinary outcome and
+// must not be reported as a failure.
 func (h *PushHandler) DeleteVersionData(ctx context.Context, req *pb.DeleteVersionDataRequest) (*pb.DeleteVersionDataResponse, error) {
-	if h.dropper == nil {
-		return &pb.DeleteVersionDataResponse{NodeId: h.nodeID}, nil
-	}
 	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
+	if h.dropper == nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"sync: DeleteVersionData(%s v%d): no version-data dropper is wired on this node, so it cannot reclaim the version and must not be reported as cleaned up", kbID, versionID)
+	}
 	if err := h.dropper.DropVersionStorage(ctx, kbID, versionID); err != nil {
 		return nil, status.Errorf(codes.Internal, "sync: DeleteVersionData(%s v%d): %v", kbID, versionID, err)
 	}
