@@ -451,6 +451,33 @@ func (rf *Raft) advanceCommitIndex() {
 	}
 }
 
+// ReplicatedThrough returns the highest log index EVERY peer has acknowledged,
+// and whether that answer is known at all.
+//
+// It is the "no replica can still be missing an entry at or below this" bound: a
+// peer's matchIndex is the highest index it is known to hold, so the minimum over
+// peers is exactly the point up to which nothing can still be in flight. What it
+// does NOT say is whether the peers have APPLIED those entries — but that is
+// enough for the callers here, because anything acting on this bound is itself an
+// entry that lands behind it in the log, so the peers apply in order.
+//
+// Leader-only: followers do not track other nodes' progress, and a guessed or
+// stale answer would be worse than none. ok=false means "do not use this number".
+func (rf *Raft) ReplicatedThrough() (uint64, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != Leader {
+		return 0, false
+	}
+	through := rf.lastLogIndex()
+	for _, match := range rf.matchIndex {
+		if match < through {
+			through = match
+		}
+	}
+	return through, true
+}
+
 // logIndex converts a global log index to an offset into rf.log (which is
 // trimmed by snapshotting, so index 0 of the slice does not necessarily
 // correspond to global index 0).

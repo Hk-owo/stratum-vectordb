@@ -132,7 +132,7 @@ func TestRaftNodeImpl_TombstonesSurviveASnapshotRoundTrip(t *testing.T) {
 	if err := restored.restore(data); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
-	if got := restored.tombstones["kb-1"]; len(got) != 1 || got[0] != ids[0] {
+	if got := restored.tombstones["kb-1"]; len(got) != 1 || got[0].VersionID != ids[0] {
 		t.Errorf("tombstones after a round trip = %v, want [%d]", got, ids[0])
 	}
 
@@ -152,7 +152,7 @@ func TestRaftNodeImpl_TombstonesSurviveASnapshotRoundTrip(t *testing.T) {
 	if fresh.tombstones == nil {
 		t.Fatal("restoring a pre-tombstone snapshot left tombstones nil")
 	}
-	fresh.tombstones["kb-1"] = append(fresh.tombstones["kb-1"], 1) // must not panic
+	fresh.tombstones["kb-1"] = append(fresh.tombstones["kb-1"], VersionTombstone{VersionID: 1}) // must not panic
 }
 
 // TestRaftNodeImpl_TombstonesAreDroppedWithTheKnowledgeBase: a tombstone exists so
@@ -182,5 +182,94 @@ func TestRaftNodeImpl_TombstonesAreDroppedWithTheKnowledgeBase(t *testing.T) {
 	}
 	if got := impl.sm.tombstones["kb-1"]; len(got) != 0 {
 		t.Errorf("tombstones after removing the knowledge base = %v, want none", got)
+	}
+}
+
+// TestRaftNodeImpl_PruneTombstones_DropsOnlyWhatEveryReplicaHasSeen pins the
+// watermark rule. A tombstone carries the LOG POSITION it was applied at (not a
+// version number: tombstones are not created in version order), and pruning drops
+// only those at or below a watermark the caller has justified — never a clock,
+// because every replica has to reach the same conclusion from the same state.
+func TestRaftNodeImpl_PruneTombstones_DropsOnlyWhatEveryReplicaHasSeen(t *testing.T) {
+	impl, _ := newTestRaftNodeImpl(t)
+	ctx := context.Background()
+
+	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	ids := createReadyChain(t, impl, ctx, "kb-1", 3)
+
+	deleteOne := func(versionID int64) {
+		t.Helper()
+		if _, err := impl.ProposeMarkVersionDeleting(ctx, "kb-1", versionID, types.VersionDeleteSingle); err != nil {
+			t.Fatalf("delete %d: %v", versionID, err)
+		}
+		if err := impl.ProposeRemoveVersionMeta(ctx, "kb-1", versionID); err != nil {
+			t.Fatalf("remove %d: %v", versionID, err)
+		}
+	}
+
+	deleteOne(ids[0])
+	// Everything applied up to here is "seen": this node waits for each proposal to
+	// land, so LastApplied covers the first tombstone's entry.
+	watermark := impl.raft.LastApplied()
+	deleteOne(ids[2])
+
+	tombstones := impl.sm.tombstones["kb-1"]
+	if len(tombstones) != 2 {
+		t.Fatalf("tombstones = %v, want two rows", tombstones)
+	}
+	for _, tb := range tombstones {
+		if tb.Index == 0 {
+			t.Errorf("tombstone %d carries no log position, so pruning could never decide", tb.VersionID)
+		}
+	}
+
+	// Pruning at the watermark drops the first tombstone and keeps the second.
+	if err := impl.ProposePruneTombstones(ctx, watermark); err != nil {
+		t.Fatalf("ProposePruneTombstones: %v", err)
+	}
+	got, err := impl.DeletionsInRange(ctx, "kb-1", 0, 1<<40)
+	if err != nil {
+		t.Fatalf("DeletionsInRange: %v", err)
+	}
+	if len(got) != 1 || got[0] != ids[2] {
+		t.Fatalf("after pruning: DeletionsInRange = %v, want only [%d]", got, ids[2])
+	}
+
+	// Idempotent: the same watermark again changes nothing.
+	if err := impl.ProposePruneTombstones(ctx, watermark); err != nil {
+		t.Fatalf("replay ProposePruneTombstones: %v", err)
+	}
+	if got, _ := impl.DeletionsInRange(ctx, "kb-1", 0, 1<<40); len(got) != 1 {
+		t.Errorf("after a replayed prune: DeletionsInRange = %v, want one row", got)
+	}
+}
+
+// TestRaftNodeImpl_PruneTombstonesOnce_DropsWhatTheClusterHasSeen covers the loop's
+// DECISION (not its cadence): on a single-node cluster nothing can be in flight, so
+// the bound covers every entry and the tombstone may go.
+func TestRaftNodeImpl_PruneTombstonesOnce_DropsWhatTheClusterHasSeen(t *testing.T) {
+	impl, _ := newTestRaftNodeImpl(t)
+	ctx := context.Background()
+
+	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	ids := createReadyChain(t, impl, ctx, "kb-1", 2)
+	if _, err := impl.ProposeMarkVersionDeleting(ctx, "kb-1", ids[0], types.VersionDeleteSingle); err != nil {
+		t.Fatalf("ProposeMarkVersionDeleting: %v", err)
+	}
+	if err := impl.ProposeRemoveVersionMeta(ctx, "kb-1", ids[0]); err != nil {
+		t.Fatalf("ProposeRemoveVersionMeta: %v", err)
+	}
+	if got := impl.sm.tombstones["kb-1"]; len(got) != 1 {
+		t.Fatalf("precondition: tombstones = %v, want one row", got)
+	}
+
+	impl.pruneTombstonesOnce(ctx)
+
+	if got := impl.sm.tombstones["kb-1"]; len(got) != 0 {
+		t.Errorf("after one prune pass on a single-node cluster: tombstones = %v, want none", got)
 	}
 }

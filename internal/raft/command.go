@@ -22,6 +22,7 @@ const (
 	cmdRollback             commandType = "Rollback"
 	cmdMarkVersionDeleting  commandType = "MarkVersionDeleting"
 	cmdRemoveVersionMeta    commandType = "RemoveVersionMeta"
+	cmdPruneTombstones      commandType = "PruneTombstones"
 
 	// cmdMarkVersionFailedPermanent records the control layer's verdict that a
 	// version has spent its retry budget and will not be retried again
@@ -89,6 +90,20 @@ type command struct {
 	// (a reconcile promotion, an availability verdict). Recording a node for
 	// those would make the §8.6(d) service-capacity count lie.
 	NodeID int64 `json:"node_id,omitempty"`
+
+	// cmdPruneTombstones: tombstones recorded at or below this log index may be
+	// dropped (see applyPruneTombstones). It is a LOG POSITION rather than a
+	// version number because tombstones are not created in version order — a
+	// middle version can be deleted long after a later one — so only the log
+	// order can say "every replica has certainly seen this one".
+	ThroughIndex uint64 `json:"through_index,omitempty"`
+
+	// Index is the log position this entry was applied at, filled by the apply
+	// loop from the ApplyMsg. It is never encoded and never proposed: a command
+	// cannot know its own future position. A tombstone records it so pruning can
+	// wait until every replica holds that position. Zero means "unknown", which
+	// only ever keeps a tombstone LONGER — the safe direction.
+	Index uint64 `json:"-"`
 
 	// cmdMarkVersionDeleting: which versions to remove relative to
 	// VersionID (subtree / single-with-splice / ancestors). Zero value
@@ -181,6 +196,10 @@ func newRollbackCommand(kbID string, targetVersionID int64) command {
 
 func newMarkVersionDeletingCommand(kbID string, versionID int64, mode types.VersionDeleteMode) command {
 	return command{Type: cmdMarkVersionDeleting, KBID: kbID, VersionID: versionID, Mode: mode}
+}
+
+func newPruneTombstonesCommand(throughIndex uint64) command {
+	return command{Type: cmdPruneTombstones, ThroughIndex: throughIndex}
 }
 
 func newRemoveVersionMetaCommand(kbID string, versionID int64) command {

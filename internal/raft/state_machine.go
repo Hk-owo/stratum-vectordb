@@ -65,7 +65,19 @@ type stateMachine struct {
 	// position-watermark design in docs/known-gaps.md §F), and a pruned tombstone
 	// silently turns "confirmed deleted" back into "not found". Version deletion is
 	// an operator action, so the rows grow slowly.
-	tombstones map[string][]int64
+	tombstones map[string][]VersionTombstone
+}
+
+// VersionTombstone is one removal the metadata recorded: which version, and the
+// log position it was applied at.
+//
+// The position is what makes pruning decidable. Tombstones are NOT created in
+// version order (a middle version can be deleted after a later one), so no
+// version-number watermark can express "every replica has seen this one" — the
+// log index can, because replicas apply the log in order (see applyPruneTombstones).
+type VersionTombstone struct {
+	VersionID int64
+	Index     uint64
 }
 
 func newStateMachine() *stateMachine {
@@ -75,7 +87,7 @@ func newStateMachine() *stateMachine {
 		versionsByKB:      make(map[string][]int64),
 		nextVersionID:     1,
 		versionsByRequest: make(map[string]int64),
-		tombstones:        make(map[string][]int64),
+		tombstones:        make(map[string][]VersionTombstone),
 	}
 }
 
@@ -205,6 +217,9 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 
 	case cmdMarkVersionFailedPermanent:
 		return sm.applyMarkVersionFailedPermanent(cmd)
+
+	case cmdPruneTombstones:
+		return sm.applyPruneTombstones(cmd)
 
 	case cmdRollback:
 		kb, ok := sm.kbs[cmd.KBID]
@@ -675,9 +690,55 @@ func (sm *stateMachine) applyRemoveVersionMeta(cmd command) applyResult {
 	// Record the tombstone: this is the apply that makes "the metadata no longer
 	// has this version" a fact a reader can query later (DeletionsInRange). A
 	// replayed entry returns at the `!ok` check above, so it cannot record a
-	// second row.
-	sm.tombstones[cmd.KBID] = append(sm.tombstones[cmd.KBID], cmd.VersionID)
+	// second row. cmd.Index is this entry's log position (filled by the apply
+	// loop), which is what pruning later waits on.
+	sm.tombstones[cmd.KBID] = append(sm.tombstones[cmd.KBID], VersionTombstone{
+		VersionID: cmd.VersionID,
+		Index:     cmd.Index,
+	})
 	sm.dropRequestMappings(cmd.KBID, cmd.VersionID)
+	return applyResult{}
+}
+
+// hasTombstonesAtOrBelow reports whether pruning at through would drop anything,
+// so the leader does not propose a no-op command on every tick.
+func (sm *stateMachine) hasTombstonesAtOrBelow(through uint64) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for _, list := range sm.tombstones {
+		for _, t := range list {
+			if t.Index <= through {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// applyPruneTombstones drops the tombstones at or below cmd.ThroughIndex.
+//
+// Why this is safe to do at all: every replica applies the same log in the same
+// order, so once a replica has applied the entry at index I, it has also applied
+// every removal recorded at or below I. The caller (the leader's pruner) picks
+// ThroughIndex from what the replicas have acknowledged, never from a clock —
+// which is also why this apply reads nothing but its own state: a timestamp or a
+// peer lookup here would make two replicas disagree.
+//
+// Idempotent: a second run at the same watermark drops nothing.
+func (sm *stateMachine) applyPruneTombstones(cmd command) applyResult {
+	for kbID, list := range sm.tombstones {
+		kept := make([]VersionTombstone, 0, len(list))
+		for _, t := range list {
+			if t.Index > cmd.ThroughIndex {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(sm.tombstones, kbID)
+			continue
+		}
+		sm.tombstones[kbID] = kept
+	}
 	return applyResult{}
 }
 
@@ -867,7 +928,7 @@ type snapshotState struct {
 	// Tombstones rides the snapshot so a node that was down when a removal was
 	// applied still learns the version is gone: without it, a tombstone would
 	// vanish for exactly the reader that has no other way to find out.
-	Tombstones map[string][]int64
+	Tombstones map[string][]VersionTombstone
 }
 
 // deepCopy returns a stable copy of the current state machine under RLock.
@@ -895,9 +956,9 @@ func (sm *stateMachine) deepCopy() snapshotState {
 	for k, v := range sm.versionsByRequest {
 		versionsByRequest[k] = v
 	}
-	tombstones := make(map[string][]int64, len(sm.tombstones))
+	tombstones := make(map[string][]VersionTombstone, len(sm.tombstones))
 	for k, v := range sm.tombstones {
-		tombstones[k] = append([]int64(nil), v...)
+		tombstones[k] = append([]VersionTombstone(nil), v...)
 	}
 	return snapshotState{
 		KBs:               kbs,
@@ -956,7 +1017,7 @@ func (sm *stateMachine) restore(data []byte) error {
 	// Same for tombstones: a snapshot from before they existed must still leave a
 	// usable map, or the first removal after a restore would write into nil.
 	if sm.tombstones == nil {
-		sm.tombstones = make(map[string][]int64)
+		sm.tombstones = make(map[string][]VersionTombstone)
 	}
 	return nil
 }
