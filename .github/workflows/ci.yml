@@ -94,7 +94,16 @@ jobs:
 
       - name: 构建 vecstore_server
         run: |
-          cmake -S . -B run/cmake
+          # 这两个路径必须显式传：vecstore/CMakeLists.txt 的默认值假设 Faiss 是
+          # **仓库的兄弟目录**（${CMAKE_CURRENT_SOURCE_DIR}/../../faiss），而上面把
+          # 它 clone 到了 $HOME/faiss。runner 的 checkout 在
+          # /home/runner/work/<repo>/<repo> 下，兄弟目录是 /home/runner/work/stratum/faiss
+          # ——与 $HOME/faiss 不是同一个位置，且 find_path/find_library 都用
+          # NO_DEFAULT_PATH，不传就会 FATAL_ERROR "Faiss not found"。
+          # vecstore-cpp.yml 一直传着这两个参数，这个 job 加的时候漏了。
+          cmake -S . -B run/cmake \
+            -DFAISS_SOURCE_DIR="$HOME/faiss" \
+            -DFAISS_BUILD_DIR="$HOME/faiss/build"
           cmake --build run/cmake --target vecstore_server -j"$(nproc)"
           mkdir -p run/bin
           cp run/cmake/vecstore/vecstore_server run/bin/vecstore_server
