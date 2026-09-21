@@ -34,29 +34,6 @@ type VersionChangesFetcher interface {
 	ChangesInRange(ctx context.Context, peerAddr, kbID string, fromExclusive, toInclusive int64) (map[int64]wal.VersionDelta, error)
 }
 
-// VersionExistenceChecker answers "which versions still exist for this knowledge
-// base?", from the replicated metadata. It exists because the storage layer cannot
-// answer it: absent rows mean "never written", "empty" and "deleted" all at once.
-//
-// It returns the WHOLE set rather than one version at a time because its caller is
-// a backfill that may walk a long gap: asking per version would re-read the version
-// list once per step, making one gap O(gap × versions). The set is read once and
-// consulted in memory.
-//
-// A cheap, local lookup by contract, for the same reason SourceResolver is: the
-// backfill runs on the Raft apply path, so a probe here would stall every later
-// log entry.
-type VersionExistenceChecker interface {
-	// ExistingVersions answers, for the versions in (fromExclusive, toInclusive], which
-	// of them still exist.
-	//
-	// The range is not a convenience: the caller is a backfill asking about ONE gap, and
-	// a whole-chain answer is paid for in full on the wire — about 89 B per version,
-	// mostly the document-set digest — so a two-version gap must not cost a chain of
-	// thousands (see RaftNode.ListVersionsInRange).
-	ExistingVersions(ctx context.Context, kbID string, fromExclusive, toInclusive int64) (map[int64]bool, error)
-}
-
 // DataVerifier reports whether this node's local stores already hold the
 // complete data for (kbID, versionID). The write path commits a document-set
 // digest for the version, and this is how the storage layer checks a pull
@@ -181,7 +158,6 @@ type LocalDataPlane struct {
 	indexMgr        IndexStore
 	puller          VersionPuller
 	changesFetcher  VersionChangesFetcher
-	versionExists   VersionExistenceChecker
 	localVersions   LocalVersionLister
 	deletions       DeletionLister
 	verify          DataVerifier
@@ -334,24 +310,13 @@ type LocalDataPlaneConfig struct {
 	// a backfill can replay the delta instead of pulling every version in full
 	// (v13 §7.5). Optional: without it backfill always transfers full records.
 	ChangesFetcher VersionChangesFetcher
-	// VersionExistence answers whether a version still exists in the replicated
-	// metadata. The data plane cannot tell on its own: a version that was never
-	// written, an empty version, and a deleted version all look identical at the
-	// storage layer (no rows). Without this, a backfill that receives "success,
-	// no records" cannot tell an empty version from a vanished one and would
-	// advance its cursor over history it never received (§7.5). Optional: absent
-	// means the plane keeps its old behaviour and never concludes "deleted".
-	VersionExistence VersionExistenceChecker
 	// LocalVersions enumerates the versions this node holds documents for, and
-	// Tombstones says which ones the control layer has recorded as deleted. Both
-	// are what ReconcileDeletedVersions needs to reclaim the "local leftovers"
-	// of §10.6/§B. They are separate from VersionExistence because they answer a
-	// different question: existence is asked about ONE candidate during a
-	// backfill, while these two are scanned per knowledge base.
+	// Tombstones says which ones the control layer has recorded as deleted. Both are
+	// what the deleted-version reconciliation needs (§10.6/§B); the tombstones are
+	// also the judgement the backfill asks for above.
 	//
-	// Tombstones is nil on a node whose RaftNode has no state machine (a storage
-	// node): the verdict lives in the control layer, and the reconciler then
-	// reports that it cannot run instead of guessing.
+	// Tombstones is nil only where no state machine is reachable; the backfill and the
+	// reconciler then report that they cannot judge, rather than guessing.
 	LocalVersions LocalVersionLister
 	Tombstones    DeletionLister
 	// ResolveReplicas lists the *other* replicas that should hold a written
@@ -423,7 +388,6 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		indexMgr:         cfg.IndexManager,
 		puller:           cfg.Puller,
 		changesFetcher:   cfg.ChangesFetcher,
-		versionExists:    cfg.VersionExistence,
 		localVersions:    cfg.LocalVersions,
 		deletions:        cfg.Tombstones,
 		verify:           cfg.Verify,
@@ -1044,17 +1008,31 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 	// the check existed, while the full-record path STOPS (it cannot decide what to
 	// pull without knowing what exists). The warning is emitted here so that a failure
 	// is logged once instead of once per path.
-	var existing map[int64]bool
-	var existingErr error
-	if d.versionExists != nil {
+	var deleted map[int64]bool
+	var deletedErr error
+	if d.deletions != nil {
+		// The judgement is "which of these versions was REMOVED" — asked of the
+		// metadata tombstones and of nothing else. The older shape of this check asked
+		// which versions still exist and inferred the rest: it answers the same thing
+		// inside a gap, but it pays for every version it enumerates and cannot say WHY
+		// one is absent — a distinction §7.5 needs, and only a removal record makes it
+		// (docs/known-gaps.md §B).
+		//
 		// The gap is (local, versionID), and that is exactly what is asked for: the
-		// bounds travel to the control layer and narrow the ANSWER, so the cost is
-		// proportional to the gap rather than to the chain (see ListVersionsInRange).
-		existing, existingErr = d.versionExists.ExistingVersions(ctx, kbID, local, versionID-1)
-		if existingErr != nil {
-			d.logger.Warn("plane: backfill cannot check which versions still exist",
+		// bounds travel to the control layer and narrow the ANSWER. A failed read is
+		// carried rather than resolved here, because the two paths answer it
+		// differently (see below).
+		var ids []int64
+		ids, deletedErr = d.deletions.DeletionsInRange(ctx, kbID, local, versionID-1)
+		if deletedErr == nil {
+			deleted = make(map[int64]bool, len(ids))
+			for _, id := range ids {
+				deleted[id] = true
+			}
+		} else {
+			d.logger.Warn("plane: backfill cannot read which versions were deleted",
 				zap.String("kb_id", kbID), zap.Int64("from_version", local),
-				zap.Int64("to_version", versionID-1), zap.Error(existingErr))
+				zap.Int64("to_version", versionID-1), zap.Error(deletedErr))
 		}
 	}
 
@@ -1064,7 +1042,7 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 	// that changed nothing, and replaying the rest would leave a hole behind the
 	// cursor.
 	if d.changesFetcher != nil {
-		err := d.backfillByChanges(ctx, source, kbID, local, versionID, existing)
+		err := d.backfillByChanges(ctx, source, kbID, local, versionID, deleted)
 		if err == nil {
 			return nil
 		}
@@ -1077,12 +1055,12 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 		}
 	}
 
-	if existingErr != nil {
+	if deletedErr != nil {
 		// "I could not find out" is not "it is gone" — but unlike the delta path, this
 		// path has no conservative default to fall back on: it has to know which
-		// versions exist before it decides what to pull, so an unreadable answer stops
-		// the backfill here, exactly as it did before the read moved up.
-		return fmt.Errorf("plane: backfill %s: read existing versions: %w", kbID, existingErr)
+		// versions were removed before it decides what to pull, so an unreadable answer
+		// stops the backfill here.
+		return fmt.Errorf("plane: backfill %s: read deleted versions: %w", kbID, deletedErr)
 	}
 
 	for v := local + 1; v < versionID; v++ {
@@ -1096,7 +1074,7 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 		// fallback actually ran. Advancing the cursor over a vanished version would
 		// claim history this node never received, and the cursor's whole meaning is
 		// "contiguous up to here" (§7.5).
-		if existing != nil && !existing[v] {
+		if deleted[v] {
 			// §6.4: the version is confirmed gone (a middle version may be
 			// deleted), so its records exist nowhere and the gap cannot be filled
 			// version by version. Fall back to a full-state transfer.
@@ -1114,7 +1092,7 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 // It runs only when a version in the gap is CONFIRMED deleted by the metadata, never
 // on a transport failure or an unreadable topology: those are "I could not find
 // out", and the answer to them stays "abort the apply" rather than "silently skip".
-// That distinction is the whole reason VersionExistenceChecker exists.
+// That distinction is the whole reason the metadata records removals.
 //
 // The node transfers ONE whole version's state and moves its cursor straight to it.
 // The version it transfers is versionID — the version being applied — and NOT
@@ -1174,7 +1152,7 @@ var errBackfillGapIncomplete = errors.New("backfill: the gap cannot be replayed 
 //     as ABSENT rather than as "nothing changed" (internal/wal/file.go), so the gap
 //     is visible instead of silent.
 //
-//   - the metadata says the version no longer exists. This is the case the delta
+//   - the metadata records the version as REMOVED. This is the case the delta
 //     path alone cannot see, and it is not hypothetical: a version's BEGIN record
 //     leaves the source's WAL only once every replica that should hold it has
 //     reported a cursor past it (ReclaimableChangesThrough), so for as long as some
@@ -1193,10 +1171,10 @@ var errBackfillGapIncomplete = errors.New("backfill: the gap cannot be replayed 
 // a full-state transfer, a transfer decision coupled to a local read it does not
 // belong to.
 //
-// existing is the CALLER's read (see backfillTo), not one of this function's own: the
-// full-record path needs the same set, and reading it per path paid for one answer
-// twice on every gap that fell back.
-func (d *LocalDataPlane) backfillByChanges(ctx context.Context, sourceAddr, kbID string, local, versionID int64, existing map[int64]bool) error {
+// deleted is the CALLER's read (see backfillTo), not one of this function's own: the
+// full-record path needs the same answer, and reading it per path paid for it twice on
+// every gap that fell back.
+func (d *LocalDataPlane) backfillByChanges(ctx context.Context, sourceAddr, kbID string, local, versionID int64, deleted map[int64]bool) error {
 	deltas, err := d.changesFetcher.ChangesInRange(ctx, sourceAddr, kbID, local, versionID-1)
 	if err != nil {
 		return fmt.Errorf("plane: delta backfill %s (%d,%d] from %s: %w", kbID, local, versionID-1, sourceAddr, err)
@@ -1207,7 +1185,7 @@ func (d *LocalDataPlane) backfillByChanges(ctx context.Context, sourceAddr, kbID
 			return fmt.Errorf("plane: delta backfill %s (%d,%d] from %s: no record for v%d: %w",
 				kbID, local, versionID-1, sourceAddr, v, errBackfillGapIncomplete)
 		}
-		if existing != nil && !existing[v] {
+		if deleted[v] {
 			return fmt.Errorf("plane: delta backfill %s (%d,%d] from %s: v%d no longer exists: %w",
 				kbID, local, versionID-1, sourceAddr, v, errBackfillGapIncomplete)
 		}

@@ -16,15 +16,15 @@ import (
 	"stratum/internal/types"
 )
 
-// d2ExistenceStub answers "which versions exist" from a fixed set. It stands in for
-// the replicated metadata: the versions it omits are the ones the cluster considers
-// deleted, which is the signal that makes a gap unfillable.
-type d2ExistenceStub struct {
-	exists map[int64]bool
+// d2DeletedStub answers "which versions were REMOVED" from a fixed list. It stands in
+// for the metadata's removal record (docs/known-gaps.md §B): that record — not an
+// existence set the caller has to interpret — is what makes a gap unfillable.
+type d2DeletedStub struct {
+	deleted []int64
 }
 
-func (s *d2ExistenceStub) ExistingVersions(context.Context, string, int64, int64) (map[int64]bool, error) {
-	return s.exists, nil
+func (s *d2DeletedStub) DeletionsInRange(context.Context, string, int64, int64) ([]int64, error) {
+	return s.deleted, nil
 }
 
 // d2Executor flags it if the incremental replay path ever runs. This case is about
@@ -171,9 +171,9 @@ func TestRealStack_BackfillFallsBackToFullStateTransfer(t *testing.T) {
 		// is committed by the writer, and asserting on it here would test the write
 		// path rather than the fallback.
 		Verify: func(context.Context, string, int64) bool { return true },
-		// The metadata says v3 is gone.
-		VersionExistence: &d2ExistenceStub{exists: map[int64]bool{v1: true, v2: true, v4: true}},
-		Logger:           zap.NewNop(),
+		// The metadata records v3 as removed.
+		Tombstones: &d2DeletedStub{deleted: []int64{v3}},
+		Logger:     zap.NewNop(),
 	})
 
 	// Step 1: bring the follower's cursor to v2 so the gap that follows is a real

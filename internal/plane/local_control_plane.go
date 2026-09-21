@@ -657,22 +657,3 @@ func (c *LocalControlPlane) SetLeaderWatermarks(watermarks map[string]int64) {
 	defer c.mu.Unlock()
 	c.leaderWatermarks = next
 }
-
-// VersionExists reports whether a version is still present in the replicated
-// metadata. The backfill asks this before advancing its cursor over a version whose
-// pull returned no records: "empty" and "deleted" look identical at the storage
-// layer, and only the metadata can tell them apart (§7.5).
-//
-// It reads the local replica of the metadata, not a Raft round trip: the caller
-// runs on the apply path, where any blocking call would stall every later entry.
-func (c *LocalControlPlane) ExistingVersions(ctx context.Context, kbID string, fromExclusive, toInclusive int64) (map[int64]bool, error) {
-	versions, err := c.rn.ListVersionsInRange(ctx, kbID, &fromExclusive, &toInclusive)
-	if err != nil {
-		return nil, fmt.Errorf("plane: list versions of %s in (%d,%d]: %w", kbID, fromExclusive, toInclusive, err)
-	}
-	existing := make(map[int64]bool, len(versions))
-	for _, v := range versions {
-		existing[v.VersionID] = true
-	}
-	return existing, nil
-}

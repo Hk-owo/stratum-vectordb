@@ -10,27 +10,28 @@ import (
 // stubVersionExistence stands in for the replicated metadata. It counts LIST CALLS,
 // not per-version lookups: the whole point of the set-returning shape is that a long
 // gap costs one read.
-type stubVersionExistence struct {
-	exists map[int64]bool
-	err    error
-	calls  int
+type stubDeletedVersions struct {
+	// deleted lists the version ids the metadata has recorded as REMOVED.
+	deleted []int64
+	err     error
+	calls   int
 	// gotFrom / gotTo record the range asked about, so a test can pin "it asked about
 	// its gap" rather than merely "it asked".
 	gotFrom, gotTo int64
 }
 
-func (s *stubVersionExistence) ExistingVersions(_ context.Context, _ string, fromExclusive, toInclusive int64) (map[int64]bool, error) {
+func (s *stubDeletedVersions) DeletionsInRange(_ context.Context, _ string, fromExclusive, toInclusive int64) ([]int64, error) {
 	s.calls++
 	s.gotFrom, s.gotTo = fromExclusive, toInclusive
 	if s.err != nil {
 		return nil, s.err
 	}
-	// Narrowed like the real one: a stub answering the whole map would let a caller
+	// Narrowed like the real one: a stub answering everything would let a caller
 	// read outside its gap without any test noticing.
-	out := make(map[int64]bool, len(s.exists))
-	for id, ok := range s.exists {
+	out := make([]int64, 0, len(s.deleted))
+	for _, id := range s.deleted {
 		if id > fromExclusive && id <= toInclusive {
-			out[id] = ok
+			out = append(out, id)
 		}
 	}
 	return out, nil
@@ -56,9 +57,9 @@ func (p *snapshotPuller) PullVersionData(_ context.Context, _, _ string, version
 }
 
 // existenceBackfillPlane wires a cursor plane with a metadata stub.
-func existenceBackfillPlane(puller VersionPuller, existence VersionExistenceChecker) *LocalDataPlane {
+func deletedBackfillPlane(puller VersionPuller, deleted DeletionLister) *LocalDataPlane {
 	dp := newCursorPlane(puller)
-	dp.versionExists = existence
+	dp.deletions = deleted
 	return dp
 }
 
@@ -68,8 +69,8 @@ func TestLocalDataPlane_DeletedVersionTriggersFullStateTransfer(t *testing.T) {
 	puller := &snapshotPuller{}
 	// v3 is gone. The snapshot is versionID (5), NOT versionID-1 (4) — see the
 	// deleted-version test below for why that distinction matters.
-	existence := &stubVersionExistence{exists: map[int64]bool{3: false, 5: true}}
-	dp := existenceBackfillPlane(puller, existence)
+	deleted := &stubDeletedVersions{deleted: []int64{3}}
+	dp := deletedBackfillPlane(puller, deleted)
 	dp.advanceLocalVersion("kb-1", 2)
 
 	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 5); err != nil {
@@ -89,8 +90,8 @@ func TestLocalDataPlane_DeletedVersionTriggersFullStateTransfer(t *testing.T) {
 		t.Errorf("localVersion = %d, want 5 (the cursor moves to the snapshot)", got)
 	}
 	// One metadata read for the whole gap, not one per version.
-	if existence.calls != 1 {
-		t.Errorf("metadata reads = %d, want 1 (the set is read once, not per version)", existence.calls)
+	if deleted.calls != 1 {
+		t.Errorf("metadata reads = %d, want 1 (the set is read once, not per version)", deleted.calls)
 	}
 }
 
@@ -100,8 +101,8 @@ func TestLocalDataPlane_DeletedVersionTriggersFullStateTransfer(t *testing.T) {
 func TestLocalDataPlane_SnapshotIsTheAppliedVersionNotTheDeletedOne(t *testing.T) {
 	puller := &snapshotPuller{}
 	// v4 — the last version in the gap — is the deleted one.
-	existence := &stubVersionExistence{exists: map[int64]bool{4: false, 5: true}}
-	dp := existenceBackfillPlane(puller, existence)
+	deleted := &stubDeletedVersions{deleted: []int64{4}}
+	dp := deletedBackfillPlane(puller, deleted)
 	dp.advanceLocalVersion("kb-1", 3)
 
 	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 5); err != nil {
@@ -119,8 +120,8 @@ func TestLocalDataPlane_SnapshotIsTheAppliedVersionNotTheDeletedOne(t *testing.T
 // version — that is what an operator needs to see.
 func TestLocalDataPlane_DeletedVersionAndFailedSnapshotReportsBoth(t *testing.T) {
 	puller := &snapshotPuller{dataErr: errors.New("peer refused the full-state transfer")}
-	existence := &stubVersionExistence{exists: map[int64]bool{2: false}}
-	dp := existenceBackfillPlane(puller, existence)
+	deleted := &stubDeletedVersions{deleted: []int64{2}}
+	dp := deletedBackfillPlane(puller, deleted)
 	dp.advanceLocalVersion("kb-1", 1)
 
 	err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 3)
@@ -143,8 +144,8 @@ func TestLocalDataPlane_DeletedVersionAndFailedSnapshotReportsBoth(t *testing.T)
 // would turn every empty version into a deleted one.
 func TestLocalDataPlane_EmptyButExistingVersionStillAdvances(t *testing.T) {
 	puller := &snapshotPuller{}
-	existence := &stubVersionExistence{exists: map[int64]bool{3: true, 4: true}}
-	dp := existenceBackfillPlane(puller, existence)
+	deleted := &stubDeletedVersions{deleted: []int64{}}
+	dp := deletedBackfillPlane(puller, deleted)
 	dp.advanceLocalVersion("kb-1", 2)
 
 	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 5); err != nil {
@@ -157,8 +158,8 @@ func TestLocalDataPlane_EmptyButExistingVersionStillAdvances(t *testing.T) {
 		t.Errorf("localVersion = %d, want 4", got)
 	}
 	// Two versions in the gap, still ONE metadata read.
-	if existence.calls != 1 {
-		t.Errorf("metadata reads = %d, want 1", existence.calls)
+	if deleted.calls != 1 {
+		t.Errorf("metadata reads = %d, want 1", deleted.calls)
 	}
 }
 
@@ -166,8 +167,8 @@ func TestLocalDataPlane_EmptyButExistingVersionStillAdvances(t *testing.T) {
 // the backfill, it does not trigger a skip.
 func TestLocalDataPlane_ExistenceCheckFailureStopsTheBackfill(t *testing.T) {
 	puller := &snapshotPuller{}
-	existence := &stubVersionExistence{err: errors.New("metadata unavailable")}
-	dp := existenceBackfillPlane(puller, existence)
+	deleted := &stubDeletedVersions{err: errors.New("metadata unavailable")}
+	dp := deletedBackfillPlane(puller, deleted)
 	dp.advanceLocalVersion("kb-1", 2)
 
 	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 4); err == nil {
@@ -185,8 +186,8 @@ func TestLocalDataPlane_ExistenceCheckFailureStopsTheBackfill(t *testing.T) {
 // apply rather than skip silently) stays intact.
 func TestLocalDataPlane_PullFailureStillAbortsRatherThanSkipping(t *testing.T) {
 	puller := &snapshotPuller{versionErr: map[int64]error{2: errors.New("pull failed")}}
-	existence := &stubVersionExistence{exists: map[int64]bool{2: true, 3: true}}
-	dp := existenceBackfillPlane(puller, existence)
+	deleted := &stubDeletedVersions{deleted: []int64{}}
+	dp := deletedBackfillPlane(puller, deleted)
 	dp.advanceLocalVersion("kb-1", 1)
 
 	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 3); err == nil {

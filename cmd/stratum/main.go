@@ -809,11 +809,6 @@ func main() {
 		// pulling each version in full. Same dialer config as the other
 		// peer-facing helpers.
 		ChangesFetcher: stratumsync.NewVersionChangesPuller(stratumsync.PresenceCheckerConfig{}),
-		// §7.5/§6.4: the backfill asks the metadata whether a version still exists
-		// before advancing its cursor over one whose pull returned no records.
-		// "empty" and "deleted" are indistinguishable at the storage layer, and the
-		// control plane is the side that knows.
-		VersionExistence: controlPlane,
 		Verify: func(ctx context.Context, kbID string, versionID int64) bool {
 			return verifyVersionPull(ctx, rn, vd, kbID, versionID)
 		},
@@ -1027,14 +1022,20 @@ func main() {
 	// Only a node that holds data answers this: it is the hook that pulls a
 	// version's records here and builds its index. A control node's versions
 	// live in the storage group, and it has no stores to pull them into.
-	// Tombstone pruning: the row only needs to live until every replica has seen
-	// it, and the loop itself checks leadership and the cluster's replication
-	// bound before proposing a prune (see RaftNodeImpl.StartTombstonePruning). It
-	// is NOT gated on storageLocal: a control node is usually the leader, and it
-	// holds the state machine the tombstones live in.
-	if raftNode != nil {
-		raftNode.StartTombstonePruning(ctx, 0)
-	}
+	// Tombstone pruning is deliberately NOT started here yet.
+	//
+	// The backfill now asks the tombstones which gap versions were deleted (§7.5),
+	// and the pruner's watermark is min over the RAFT MEMBERS' positions — which
+	// does not cover a LAGGING node, let alone a storage node that is not a Raft
+	// member at all. Pruning on that watermark would drop a removal record before
+	// the very node that needs it has read it, and the backfill would fall back to
+	// pulling a deleted version: exactly the "success with no records, cursor steps
+	// over history it never received" hazard §7.5 fixed.
+	//
+	// Enabling it needs the watermark to cover every consumer (the data cursor of
+	// each required replica, i.e. what ReclaimableChangesThrough already computes),
+	// not the log position of the voters. RaftNodeImpl.StartTombstonePruning is
+	// implemented and tested for that day; see docs/known-gaps.md §B.
 
 	if storageLocal && raftNode != nil {
 		// §10.6's reclaim is a best-effort broadcast: a partitioned or restarting

@@ -161,15 +161,15 @@ func TestLocalDataPlane_BackfillDoesNotReplayADeltaForADeletedVersion(t *testing
 		2: deltaFor(2, 1),
 		3: deltaFor(3, 2),
 	}}
-	// v2 has been deleted: the metadata no longer has it, while the source's WAL
+	// v2 has been deleted: the metadata records the removal, while the source's WAL
 	// still serves its delta.
-	existence := &stubVersionExistence{exists: map[int64]bool{1: true, 3: true, 4: true}}
+	deleted := &stubDeletedVersions{deleted: []int64{2}}
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
-		WAL:              &stubWAL{t: tr},
-		Executor:         &stubExecutor{t: tr},
-		Puller:           puller,
-		ChangesFetcher:   fetcher,
-		VersionExistence: existence,
+		WAL:            &stubWAL{t: tr},
+		Executor:       &stubExecutor{t: tr},
+		Puller:         puller,
+		ChangesFetcher: fetcher,
+		Tombstones:     deleted,
 	})
 	dp.advanceLocalVersion("kb-1", 1)
 
@@ -177,7 +177,7 @@ func TestLocalDataPlane_BackfillDoesNotReplayADeltaForADeletedVersion(t *testing
 		t.Fatalf("backfillTo: %v", err)
 	}
 
-	if existence.calls == 0 {
+	if deleted.calls == 0 {
 		t.Error("the existing-version set was never read; the gap was replayed blind")
 	}
 	// The replay is what must NOT have happened. It is observable through the
@@ -206,13 +206,13 @@ func TestLocalDataPlane_BackfillReplaysWhenExistenceCannotBeRead(t *testing.T) {
 		2: deltaFor(2, 1),
 		3: deltaFor(3, 2),
 	}}
-	existence := &stubVersionExistence{err: errors.New("metadata unavailable")}
+	deleted := &stubDeletedVersions{err: errors.New("metadata unavailable")}
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
-		WAL:              &stubWAL{t: tr},
-		Executor:         &stubExecutor{t: tr},
-		Puller:           puller,
-		ChangesFetcher:   fetcher,
-		VersionExistence: existence,
+		WAL:            &stubWAL{t: tr},
+		Executor:       &stubExecutor{t: tr},
+		Puller:         puller,
+		ChangesFetcher: fetcher,
+		Tombstones:     deleted,
 	})
 	dp.advanceLocalVersion("kb-1", 1)
 
@@ -220,7 +220,7 @@ func TestLocalDataPlane_BackfillReplaysWhenExistenceCannotBeRead(t *testing.T) {
 		t.Fatalf("backfillTo: %v", err)
 	}
 
-	if existence.calls == 0 {
+	if deleted.calls == 0 {
 		t.Error("the existing-version set was never read; the check this test is about did not run")
 	}
 	if puller.calls != 0 {
@@ -242,13 +242,13 @@ func TestLocalDataPlane_BackfillReadsTheVersionSetOnce(t *testing.T) {
 		2: deltaFor(2, 1),
 		// v3 deliberately absent: the delta path gives up and the full-record path runs.
 	}}
-	existence := &stubVersionExistence{exists: map[int64]bool{1: true, 2: true, 3: true}}
+	deleted := &stubDeletedVersions{deleted: []int64{}}
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
-		WAL:              &stubWAL{t: tr},
-		Executor:         &stubExecutor{t: tr},
-		Puller:           puller,
-		ChangesFetcher:   fetcher,
-		VersionExistence: existence,
+		WAL:            &stubWAL{t: tr},
+		Executor:       &stubExecutor{t: tr},
+		Puller:         puller,
+		ChangesFetcher: fetcher,
+		Tombstones:     deleted,
 	})
 	dp.advanceLocalVersion("kb-1", 1)
 
@@ -256,13 +256,13 @@ func TestLocalDataPlane_BackfillReadsTheVersionSetOnce(t *testing.T) {
 		t.Fatalf("backfillTo: %v", err)
 	}
 
-	if existence.calls != 1 {
-		t.Errorf("existing-version reads = %d, want 1: both paths share one read", existence.calls)
+	if deleted.calls != 1 {
+		t.Errorf("existing-version reads = %d, want 1: both paths share one read", deleted.calls)
 	}
 	// And the one read asks about the GAP (1,3], not the whole chain — that is what
 	// keeps the cost proportional to the gap instead of to the version count.
-	if existence.gotFrom != 1 || existence.gotTo != 3 {
-		t.Errorf("asked about (%d,%d], want (1,3]", existence.gotFrom, existence.gotTo)
+	if deleted.gotFrom != 1 || deleted.gotTo != 3 {
+		t.Errorf("asked about (%d,%d], want (1,3]", deleted.gotFrom, deleted.gotTo)
 	}
 	if puller.calls != 2 {
 		t.Errorf("full-record pulls = %d, want 2 (v2 and v3: the whole gap)", puller.calls)
@@ -279,14 +279,14 @@ func TestLocalDataPlane_BackfillReadsTheVersionSetOnce(t *testing.T) {
 func TestLocalDataPlane_BackfillStopsWhenTheVersionSetIsUnreadable(t *testing.T) {
 	tr := &tracer{}
 	puller := &stubPuller{}
-	existence := &stubVersionExistence{err: errors.New("metadata unavailable")}
+	deleted := &stubDeletedVersions{err: errors.New("metadata unavailable")}
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
 		WAL:      &stubWAL{t: tr},
 		Executor: &stubExecutor{t: tr},
 		Puller:   puller,
 		// No ChangesFetcher: the delta path is not available, so the full-record path
 		// is the one that has to answer for the failed read.
-		VersionExistence: existence,
+		Tombstones: deleted,
 	})
 	dp.advanceLocalVersion("kb-1", 1)
 
