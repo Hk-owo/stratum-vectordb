@@ -32,7 +32,7 @@ jobs:
             librocksdb-dev \
             libblas-dev liblapack-dev \
             libgtest-dev \
-            libprometheus-cpp-dev
+            prometheus-cpp-dev
 
       # Ubuntu 的 libgtest-dev 只带源码与 CMake 配置，需本地编译一次，
       # 否则 find_package(GTest) 找不到目标，ctest 无测试可跑。

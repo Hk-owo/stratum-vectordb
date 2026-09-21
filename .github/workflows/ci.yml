@@ -80,7 +80,7 @@ jobs:
             build-essential cmake \
             libprotobuf-dev protobuf-compiler protobuf-compiler-grpc \
             libgrpc++-dev librocksdb-dev \
-            libblas-dev liblapack-dev libgtest-dev libprometheus-cpp-dev
+            libblas-dev liblapack-dev libgtest-dev prometheus-cpp-dev
 
       - name: 构建 Faiss (v1.9.0, HNSW, 静态)
         run: |
