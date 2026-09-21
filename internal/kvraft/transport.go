@@ -129,6 +129,18 @@ func (t *Transport) peerIDs() []int64 {
 // heartbeat when there are none). Called with rf.mu held; releases it
 // before making the network call and does not require it held on return.
 func (t *Transport) replicateToPeer(rf *Raft, id int64, peer *peerConn) {
+	// Only a leader replicates. This is not tidiness — it is the panic this guard
+	// was written for: ReplicateLog spawns one goroutine per peer, and such a
+	// goroutine can acquire rf.mu AFTER this node stopped leading. By then the node
+	// may have followed a new leader and truncated its own log (the conflicting-entry
+	// path in rpc_handlers.go), so the nextIndex it recorded while it WAS leader can
+	// point past the end of the log it now holds — and logEntry indexes rf.log
+	// directly, so that is `index out of range [6] with length 3` rather than a
+	// retry. Measured on CI, from exactly this path.
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
 	if rf.nextIndex[id] <= rf.log[0].Index {
 		if rf.snapshotPending[id] {
 			// A snapshot transfer is already in flight for this peer;
@@ -159,6 +171,7 @@ func (t *Transport) replicateToPeer(rf *Raft, id int64, peer *peerConn) {
 	if nextIndex == 0 {
 		nextIndex = 1
 	}
+	nextIndex = rf.clampNextIndex(id, nextIndex)
 	prev := rf.logEntry(nextIndex - 1)
 	entries := rf.log[rf.logIndex(nextIndex):]
 	req := &kvraftpb.AppendEntriesRequest{
@@ -181,7 +194,42 @@ func (t *Transport) replicateToPeer(rf *Raft, id int64, peer *peerConn) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	t.applyAppendResponse(rf, id, req, resp)
+}
 
+// clampNextIndex returns the replication index to use for id, clamped into what
+// this node's log can actually serve.
+//
+// It exists because logEntry(nextIndex-1) indexes rf.log directly, and a nextIndex
+// past the end of the log is a PANIC there — not a retry. CI saw exactly that:
+// `index out of range [6] with length 3` from logEntry, reached via replicateToPeer.
+//
+// The writer this was reproduced from: ReplicateLog spawns one goroutine per peer,
+// and such a goroutine can acquire rf.mu long after this node stopped leading. By
+// then the node may have followed a new leader and truncated its own log (the
+// conflicting-entry path in rpc_handlers.go), so a nextIndex recorded while it WAS
+// leader can point past the end of the log it now holds. replicateToPeer guards
+// against that directly (only a leader replicates); this clamp is the backstop for
+// the ones we have not found, and it is logged rather than absorbed because a clamp
+// that fires is a fact about a writer.
+func (rf *Raft) clampNextIndex(id int64, nextIndex uint64) uint64 {
+	max := rf.lastLogIndex() + 1
+	if nextIndex <= max {
+		return nextIndex
+	}
+	rf.logger.Warn("clamped a replication index past the end of the log",
+		zap.Int64("node_id", rf.me), zap.Int64("peer_id", id),
+		zap.Uint64("next_index", nextIndex), zap.Uint64("clamped_to", max),
+		zap.Uint64("log_base", rf.log[0].Index), zap.Uint64("last_log_index", rf.lastLogIndex()))
+	return max
+}
+
+// applyAppendResponse folds a peer's AppendEntries response into the leader's
+// bookkeeping for it. Split out of replicateToPeer so the index arithmetic — the
+// part that runs on values the PEER supplied — is testable without a network.
+//
+// The caller must hold rf.mu.
+func (t *Transport) applyAppendResponse(rf *Raft, id int64, req *kvraftpb.AppendEntriesRequest, resp *kvraftpb.AppendEntriesResponse) {
 	if resp.Term > rf.term {
 		t.logger.Info("stepping down: discovered higher term from AppendEntries response",
 			zap.Int64("node_id", rf.me), zap.Uint64("old_term", rf.term), zap.Uint64("new_term", resp.Term))
@@ -206,21 +254,28 @@ func (t *Transport) replicateToPeer(rf *Raft, id int64, peer *peerConn) {
 			// behind again.
 			rf.snapshotPending[id] = false
 		}
-	} else {
-		nextIndex := resp.ConflictIndex
-		if resp.ConflictTerm != 0 {
-			for i := uint64(len(rf.log)) - 1; i >= 1; i-- {
-				if rf.log[i].Term == resp.ConflictTerm {
-					nextIndex = i + 1
-					break
-				}
+		return
+	}
+
+	nextIndex := resp.ConflictIndex
+	if resp.ConflictTerm != 0 {
+		for i := uint64(len(rf.log)) - 1; i >= 1; i-- {
+			if rf.log[i].Term == resp.ConflictTerm {
+				// rf.log[i].Index, not i: i is an offset into a log that snapshotting
+				// trims, so once the base is above zero i+1 points at the wrong entry
+				// (too far back — a wasted round, or a spurious snapshot).
+				nextIndex = rf.log[i].Index + 1
+				break
 			}
 		}
-		if nextIndex == 0 {
-			nextIndex = 1
-		}
-		rf.nextIndex[id] = nextIndex
 	}
+	if nextIndex == 0 {
+		nextIndex = 1
+	}
+	// A follower's ConflictIndex is ITS lastLogIndex+1, and a follower may hold
+	// entries this log does not (an old term's uncommitted tail) — so the value can
+	// point past the end of THIS log. Clamp, for the same reason clampNextIndex does.
+	rf.nextIndex[id] = rf.clampNextIndex(id, nextIndex)
 }
 
 // SendHeartBeat fans out an empty AppendEntries (or whatever replication
