@@ -711,7 +711,55 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 	for i, r := range resp.Results {
 		results[i] = types.SearchResult{ChunkID: r.ChunkId, Score: r.Score}
 	}
+	if len(results) == 0 {
+		if err := im.emptySearchMeansTheDataIsStillLanding(ctx, kbID, versionID); err != nil {
+			return nil, err
+		}
+	}
 	return results, nil
+}
+
+// emptySearchMeansTheDataIsStillLanding reports an error when a search that found
+// nothing is explained by this replica not having the version's chunks yet.
+//
+// Three ways a replica can answer a version's query with an EMPTY result while being
+// unable to serve it at all are now all named: the document set is missing
+// (service/query.go), every chunk vector is unreadable (§8.6b's scan), and — this one
+// — the documents are here but the chunks that carry them are not, so the index this
+// replica holds is empty and a search over it SUCCEEDS with nothing.
+//
+// Measured on the 3+3 cluster (2026-09-21, debug level), one replica 5 s before it
+// finished catching up:
+//
+//	query: stage timings {candidates: 0, matched_docs: 0, chunkmap_calls: 0,
+//	                      filter_us: 0, meta_us: 490, bloom_us: 2472, search_us: 493}
+//	index: built from scratch … version 195, total_chunks: 11, status: READY   (t+5 s)
+//
+// The document set read fine AND non-empty, so the service layer's "document set is
+// missing" test did not fire; the search returned successfully, so nothing upstream
+// saw a retryable error; and the caller got `results=0, err=nil` — the one answer a
+// caller cannot act on, because the replicas that DID hold the version were never
+// asked (the station reads an empty result as an answer, by design).
+//
+// Only "documents here, chunks not" is reported. A version whose chunks are all
+// present and simply do not match is a legitimate empty answer, and stays one.
+func (im *IndexManagerImpl) emptySearchMeansTheDataIsStillLanding(ctx context.Context, kbID string, versionID int64) error {
+	if im.listDocIDs == nil || im.listChunkIDsByDocs == nil {
+		return nil
+	}
+	docIDs, err := im.listDocIDs(ctx, kbID, versionID)
+	if err != nil || len(docIDs) == 0 {
+		// Not this function's to name: "this replica has no document set" is already
+		// its own retryable refusal in the service layer, and a version that really has
+		// no documents is a legitimate empty answer.
+		return nil
+	}
+	chunkIDs, err := im.listChunkIDsByDocs(ctx, kbID, docIDs)
+	if err != nil || len(chunkIDs) > 0 {
+		return nil
+	}
+	return fmt.Errorf("index: vector search (%s/%d): %d documents are here but none of their chunks are, so this replica's index for the version is empty: %w",
+		kbID, versionID, len(docIDs), stratumerrors.ErrIndexNotReady)
 }
 
 // TriggerBuild implements IndexManager.
