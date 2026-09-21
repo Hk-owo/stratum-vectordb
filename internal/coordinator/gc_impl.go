@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-
-	"stratum/internal/types"
 )
 
 // defaultGCSweepIntervalSec is used when the config leaves the interval
@@ -76,11 +74,15 @@ func (g *ChunkGarbageCollectorImpl) Sweep(ctx context.Context) error {
 
 // sweepKB reclaims every orphan chunk of a single knowledge base.
 func (g *ChunkGarbageCollectorImpl) sweepKB(ctx context.Context, kbID string) error {
-	versions, err := g.cfg.RaftNode.ListVersions(ctx, kbID)
+	// The EXTREME VALUE, not the chain: a sweep runs per knowledge base every
+	// interval, on a storage node whose RaftNode is REMOTE — a whole-chain read here
+	// was a chain-sized RPC per KB per sweep, for one number
+	// (see RaftNode.LastVersionID). Zero means "no live version".
+	snapshotMaxVersion, err := g.cfg.RaftNode.LastVersionID(ctx, kbID)
 	if err != nil {
-		return fmt.Errorf("chunk-gc: ListVersions(%s): %w", kbID, err)
+		return fmt.Errorf("chunk-gc: LastVersionID(%s): %w", kbID, err)
 	}
-	if len(versions) == 0 {
+	if snapshotMaxVersion == 0 {
 		return nil // no live version: nothing reachable, nothing to scan
 	}
 
@@ -91,7 +93,6 @@ func (g *ChunkGarbageCollectorImpl) sweepKB(ctx context.Context, kbID string) er
 	// produces reclaim CANDIDATES. The reclaim itself (reclaimOrphan)
 	// re-checks orphanhood against the raft CURRENT version under the
 	// shared write mutex — see its doc comment for the race rationale.
-	snapshotMaxVersion := maxVersionID(versions)
 
 	chunkIDs, err := g.cfg.ChunkDocMapper.ListChunkIDs(ctx, kbID)
 	if err != nil {
@@ -148,16 +149,16 @@ func (g *ChunkGarbageCollectorImpl) reclaimOrphan(ctx context.Context, kbID, chu
 
 	// Re-check against the CURRENT raft version list, not the
 	// start-of-sweep snapshot.
-	versions, err := g.cfg.RaftNode.ListVersions(ctx, kbID)
+	tail, err := g.cfg.RaftNode.LastVersionID(ctx, kbID)
 	if err != nil {
-		return fmt.Errorf("chunk-gc: reclaim re-check ListVersions(%s): %w", kbID, err)
+		return fmt.Errorf("chunk-gc: reclaim re-check LastVersionID(%s): %w", kbID, err)
 	}
-	if len(versions) == 0 {
+	if tail == 0 {
 		// No live version at reclaim time (concurrent KB deletion): leave
 		// the data to the KB-deletion path's full cleanup.
 		return nil
 	}
-	orphan, err := g.isOrphanChunk(ctx, kbID, chunkID, maxVersionID(versions))
+	orphan, err := g.isOrphanChunk(ctx, kbID, chunkID, tail)
 	if err != nil {
 		return fmt.Errorf("chunk-gc: reclaim re-check (%s,%s): %w", kbID, chunkID, err)
 	}
@@ -187,18 +188,6 @@ func (g *ChunkGarbageCollectorImpl) reclaimOrphan(ctx context.Context, kbID, chu
 			zap.String("kb_id", kbID), zap.String("chunk_id", chunkID))
 	}
 	return nil
-}
-
-// maxVersionID returns the largest VersionID in versions. versions must
-// be non-empty.
-func maxVersionID(versions []types.VersionMeta) int64 {
-	var max int64
-	for _, v := range versions {
-		if v.VersionID > max {
-			max = v.VersionID
-		}
-	}
-	return max
 }
 
 // isOrphanChunk reports whether every document mapped to chunkID is
