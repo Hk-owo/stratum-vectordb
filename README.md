@@ -130,7 +130,7 @@ scripts/cluster.sh --topology two-tier status  # 每容器状态与控制组 lea
 - **写幂等**:`CreateVersion.client_request_id` 是可选幂等键——同一知识库上重发同一 key 会复用首次分配的版本,而不是再分配一个。这是"数据没落地的版本"能被客户端救回的**唯一**途径(§7.12);省略则保持历史语义,每次调用分配新版本。
 - **任何节点都能写**:非 leader 节点把已编码的提案经内部 `InternalService.Propose` 交给 leader 执行;接收方不是 leader 时回传 `leader_id` 让调用方改问,转发不会成链。错误以稳定 wire name(`internal/errors.Name` / `ByName`)跨进程传递,认不出某个名字的一方只保留 message,不臆造 sentinel。
 - **卡住的版本有明确归宿**:PENDING 的版本若没有任何候选副本持有其数据,即为 **DATA_MISSING**(写入方在分配版本后、数据落盘前死亡,或每次都推送失败),客户端可以 `AwaitVersion` 看到 `data_missing` 后按同一 `client_request_id` 重发,或用 **`DiscardVersion`** 放弃;失败尝试耗尽重试预算或撞上不可恢复错误时,控制面判定 **FAILED_PERMANENT**,不再自动重试,只有运维能重试或放弃——重试是 `ForceRetryVersion`(只针对索引侧:数据侧的终态没有可重试的写入),放弃是 `ForceAbandonVersion`(只接受判死版本,走 `DeleteVersion` 的 SINGLE 语义);要看清队列里的全部判死版本用 `ListFailedVersions`。放弃会向**所有**候选副本广播物理回收,因为控制面并不知道数据实际落在哪几个副本上(§10.1 / §10.6)。
-- **判死后的自动回收不靠广播**:每个副本从**自己的 apply** 得知终态后**本地**清(广播是尽力而为的一次性通知,分区或正在重启的副本收不到,而它恰恰最可能留着残留;启动时再扫一次状态机补回),检测到失败的那个节点还会提前清一次。**只有数据侧终态触发回收**——索引侧判死只说明构建失败,数据是好的,删掉它等于把 `ForceRetryVersion` 之后重建要读的东西毁掉(§10.1b)。
+- **判死后的自动回收不靠广播**:每个 **Raft 成员**(leader 与全部 follower)从自己的 apply 得知终态后**本地**清(广播是尽力而为的一次性通知,分区或正在重启的副本收不到,而它恰恰最可能留着残留;启动时再扫一次状态机补回),检测到失败的那个节点还会提前清一次。**只有数据侧终态触发回收**——索引侧判死只说明构建失败,数据是好的,删掉它等于把 `ForceRetryVersion` 之后重建要读的东西毁掉(§10.1b)。**两层部署下的纯存储节点(`role=storage`)不参与 Raft**,所以它拿不到这条 apply 通知:只有"自己是检测者时就地清"与"重启时扫一次元数据"两条,残留只占空间而不影响正确性(幽灵数据不可达,可见性由控制层状态决定)。
 - **数据侧与索引侧各有终态**(§10.1b):`DataStatus`(PENDING / DURABLE / FAILED_PERMANENT)与 `IndexStatus`(PENDING / READY / FAILED / FAILED_PERMANENT)互相独立——一个有持久数据却没有可用索引的版本,与一个索引从未构建的版本,是两件不同的事;判死时 `FailureSide` 说明原因链描述的是哪一侧,运维据此决定"重发写入"还是"重建索引"。版本元数据还携带文档集摘要 `doc_id_set_hash`(§7.9),让存储层能区分"空版本"与"摘要从未提交"。
 
 ## 文档切分与向量检索
@@ -340,7 +340,7 @@ Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部�
 | `LocalVersion` | 本节点对某知识库的连续数据游标(完全持有的最高版本),供落后节点找 peer 补齐 |
 | `VersionPresence` | 本节点是否持有 (kb, version) 的数据——控制面据此把"数据从未落地"与"只是索引没建"区分开 |
 | `ReportDataVersions` | 存储层周期性向控制 leader 上报数据游标(默认每 5 秒);响应里带回可回收的 changes 水位、每 KB 的**链尾**(落后据此开始追赶),以及 leader 的 **holders 聚合**镜像(数据源解析的第四层) |
-| `DeleteVersionData` | 回收本节点上某版本的物理数据(**删除版本**时向所有候选副本广播:控制面不知道字节在哪几个节点上;判死后不再走这条广播,改为每个副本从自己的 apply 得知后本地回收) |
+| `DeleteVersionData` | 回收本节点上某版本的物理数据(**删除版本**时向所有候选副本广播:控制面不知道字节在哪几个节点上;判死后不再走这条广播,改为每个 Raft 成员从自己的 apply 得知后本地回收(不参与 Raft 的存储节点只有"检测者就地清"与"重启扫一次"两条)) |
 | `ConfirmVersionWrite` | 告知副本它收到的版本已达 quorum,stand down 其接管计时器 |
 | `PushIndexData` | 流式**推送已构建的索引**,副本直接加载而不再各自重建("建一次、分发 N 份");发送端先探测对端是否已持有,端到端受 `push_concurrency` 限流 |
 
