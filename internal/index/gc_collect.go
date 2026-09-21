@@ -132,9 +132,11 @@ func (im *IndexManagerImpl) collectCandidates(ctx context.Context, candidates []
 		// graphed one can only be rebuilt. The graphed path also needs a higher bar
 		// (see GCGraphRebuildRatio) — rebuilding a grid costs the whole graph, so it
 		// is only worth it for a version that is clearly not about to be replaced.
-		im.mu.Lock()
-		graphFree, shapeKnown := im.builtGraphFree[indexKey{c.KBID, c.VersionID}]
-		im.mu.Unlock()
+		//
+		// Through shapeGraphFree: the shape line in the artifact's sidecar describes a
+		// version this node received as well as one it built, and refusing to collect
+		// the former is how handed-off artifacts kept their tombstones forever.
+		graphFree, shapeKnown := im.shapeGraphFree(c.KBID, c.VersionID)
 		if !shapeKnown {
 			// Neither path can be chosen safely. collectGraphFree would refuse and
 			// rebuildGraphed would too; saying so here makes the reason visible
@@ -193,9 +195,7 @@ func (im *IndexManagerImpl) graphRebuildRatio() float64 {
 func (im *IndexManagerImpl) rebuildGraphed(ctx context.Context, kbID string, versionID int64) error {
 	key := indexKey{kbID, versionID}
 
-	im.mu.Lock()
-	graphFree, known := im.builtGraphFree[key]
-	im.mu.Unlock()
+	graphFree, known := im.shapeGraphFree(kbID, versionID)
 	if !known {
 		return fmt.Errorf("%w: version %d's index shape is unknown on this node",
 			stratumerrors.ErrInvalidArgument, versionID)
@@ -323,10 +323,8 @@ func (im *IndexManagerImpl) BlockedCollections() []GCPressure {
 func (im *IndexManagerImpl) collectGraphFree(ctx context.Context, kbID string, versionID int64, dead []string) error {
 	key := indexKey{kbID, versionID}
 
-	im.mu.Lock()
-	graphFree := im.builtGraphFree[key]
-	im.mu.Unlock()
-	if !graphFree {
+	graphFree, known := im.shapeGraphFree(kbID, versionID)
+	if !known || !graphFree {
 		return fmt.Errorf("%w: version %d is not known to be graph-free on this node, refusing to reopen it",
 			stratumerrors.ErrInvalidArgument, versionID)
 	}

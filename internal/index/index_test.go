@@ -1688,6 +1688,108 @@ func buildParentThenChildWith(t *testing.T, im *IndexManagerImpl, graphFree bool
 	build(2)
 }
 
+// §8.6(c) 的复用判据过去只认内存记录（`builtGraphFree`），而那个映射只有
+// **自己构建过**父产物的节点才写过 —— 于是 §8.4 分发来的父产物在 3 副本里有
+// 2 份永远不复用、静默整份重建。形状行本来就随产物一起走（vecstore 的 Save 写进
+// `.index.ids`，加载时还会与文件实际形状交叉校验），所以判据改为"内存优先、
+// sidecar 回退"。这条测试构造的正是以前测不到的场景：产物在磁盘上，而本进程
+// 从未构建过它。
+func TestIndexManager_BuildReusesAParentThisNodeNeverBuilt(t *testing.T) {
+	ds := newDocSource()
+	ds.addDoc(1, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-b", []string{"chunk-b"}, map[string][]float32{"chunk-b": {0.5, 0.5}})
+
+	vc, im := appendTestCase(t, ds)
+	// v1 的产物在磁盘上（含形状行），但这个进程从未构建它 —— §8.4 交接后的样子。
+	gcArtifact(t, im.cfg.IndexDataDir, "kb-1", 1,
+		append(gcHeader(), "graph_free 0"), []string{"chunk-a"})
+	im.mu.Lock()
+	_, known := im.builtGraphFree[indexKey{"kb-1", 1}]
+	im.mu.Unlock()
+	if known {
+		t.Fatal("precondition: this manager must have no in-memory record for v1")
+	}
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 1 // v1 holds chunk-a
+	vc.mu.Unlock()
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 2); err != nil {
+		t.Fatalf("TriggerBuild v2: %v", err)
+	}
+	waitIndexLoaded(t, im, "kb-1", 2)
+
+	vc.mu.Lock()
+	loadCalls, buildCalls, basePath := vc.loadForAppendCalls, vc.buildCalls, vc.lastLoadForAppendPath
+	vc.mu.Unlock()
+
+	if loadCalls != 1 {
+		t.Fatalf("LoadForAppend calls = %d, want 1: the parent's artifact is on disk AND its sidecar "+
+			"records the shape, so §8.6(c) must reuse it even though this node never built it", loadCalls)
+	}
+	if want := im.indexPath("kb-1", 1); basePath != want {
+		t.Fatalf("base path = %q, want the parent's artifact %q", basePath, want)
+	}
+	if buildCalls != 0 {
+		t.Fatalf("Build calls = %d, want 0 — a full rebuild here is exactly the silent cost this "+
+			"case exists to keep out", buildCalls)
+	}
+}
+
+// 反面：sidecar 没有形状行（§8.6a 之前的产物）→ 形状仍然未知 → 保持保守，
+// 整份重建。放宽的只是"从哪里读形状"，不是"读不到也要复用"。
+func TestIndexManager_BuildRebuildsWhenTheParentSidecarHasNoShapeLine(t *testing.T) {
+	ds := newDocSource()
+	ds.addDoc(1, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-a", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.5, 0.5}})
+	ds.addDoc(2, "doc-b", []string{"chunk-b"}, map[string][]float32{"chunk-b": {0.5, 0.5}})
+
+	vc, im := appendTestCase(t, ds)
+	gcArtifact(t, im.cfg.IndexDataDir, "kb-1", 1, gcHeader(), []string{"chunk-a"}) // 无 graph_free 行
+	vc.mu.Lock()
+	vc.loadForAppendBaseNtotal = 1
+	vc.mu.Unlock()
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 2); err != nil {
+		t.Fatalf("TriggerBuild v2: %v", err)
+	}
+	waitIndexLoaded(t, im, "kb-1", 2)
+
+	vc.mu.Lock()
+	loadCalls, buildCalls := vc.loadForAppendCalls, vc.buildCalls
+	vc.mu.Unlock()
+	if loadCalls != 0 {
+		t.Fatalf("LoadForAppend calls = %d, want 0: an unrecorded shape must not be reused", loadCalls)
+	}
+	if buildCalls != 1 {
+		t.Fatalf("Build calls = %d, want 1 (the conservative full rebuild)", buildCalls)
+	}
+}
+
+// shapeGraphFree 两个来源的优先级：内存记录只由本节点自己的构建写入，那里必然
+// 正确，优先；sidecar 是"本节点没构建过"时的回退；两者都没有即未知（保守）。
+func TestShapeGraphFree_MemoryFirstThenSidecarThenUnknown(t *testing.T) {
+	ds := newDocSource()
+	_, im := appendTestCase(t, ds)
+
+	// 只有 sidecar，且它说 graph_free=1 → 回退读盘。
+	gcArtifact(t, im.cfg.IndexDataDir, "kb-1", 5, append(gcHeader(), "graph_free 1"), []string{"chunk-a"})
+	if gf, known := im.shapeGraphFree("kb-1", 5); !known || !gf {
+		t.Fatalf("sidecar fallback: got (graphFree=%v, known=%v), want (true, true)", gf, known)
+	}
+	// 内存记录在时以它为准，即使与 sidecar 相反。
+	im.mu.Lock()
+	im.builtGraphFree[indexKey{"kb-1", 5}] = false // graphed
+	im.mu.Unlock()
+	if gf, known := im.shapeGraphFree("kb-1", 5); !known || gf {
+		t.Fatalf("in-memory record must win: got (graphFree=%v, known=%v), want (false, true)", gf, known)
+	}
+	// 两者都没有（如 §8.6a 之前的产物）→ 未知。
+	if gf, known := im.shapeGraphFree("kb-1", 6); known {
+		t.Fatalf("no record and no sidecar: got (graphFree=%v, known=%v), want known=false", gf, known)
+	}
+}
+
 // §8.6(c)：v2 = v1 + 新增 chunk，且 v1 的产物还在本节点 —— 这时 v2 应当以
 // v1 的产物为起点，只对 delta 追加，而不是整份重建。
 func TestIndexManager_BuildReusesParentArtifactOnPureAppend(t *testing.T) {

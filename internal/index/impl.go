@@ -1154,6 +1154,39 @@ func (im *IndexManagerImpl) shapeGraphFreeLocked(key indexKey) (graphFree bool, 
 	return im.artifactGraphFree(key.kbID, key.versionID)
 }
 
+// shapeGraphFree is shapeGraphFreeLocked for callers that do not hold im.mu.
+//
+// It exists because §8.6(c)'s reuse and §8.6(d)'s two collections used to read
+// the in-memory record ALONE, while §8.6(a)'s cold/hot decision read the sidecar
+// as well (shapeGraphFreeLocked above). Those two answers differ exactly where it
+// matters: `builtGraphFree` is written only by this node's own successful build
+// (doBuild), so a version §8.4 handed this node has no entry — and "no entry" was
+// being read as "shape unknown", which sent such a version down the silent
+// full-rebuild path in appendBase and off both collection paths entirely. Measured
+// on the 3+3 cluster: 2 of 3 replicas rebuilt every child from scratch while
+// holding the parent's artifact, and their tombstones were never collected.
+//
+// The disk read is the point, not a fallback of convenience (see artifactGraphFree):
+// the shape line is written by vecstore's Save right next to the artifact, so it
+// survives a restart, travels with a §8.4 handoff, and is cross-checked against
+// the file's actual shape when the artifact is loaded — a mismatched pair refuses
+// to load rather than being served as the other shape. A sidecar predating the
+// line (§8.6a) reports known=false, which every caller must keep treating as the
+// conservative answer.
+func (im *IndexManagerImpl) shapeGraphFree(kbID string, versionID int64) (graphFree bool, known bool) {
+	key := indexKey{kbID, versionID}
+	im.mu.Lock()
+	graphFree, known = im.builtGraphFree[key]
+	im.mu.Unlock()
+	if known {
+		return graphFree, true
+	}
+	if im.cfg.IndexDataDir == "" {
+		return false, false
+	}
+	return im.artifactGraphFree(kbID, versionID)
+}
+
 func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree bool, priority BuildPriority) error {
 	key := indexKey{kbID, versionID}
 
@@ -1548,6 +1581,16 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
 					zap.Int64("parent_version_id", parentID), zap.Error(appendErr))
 			}
+		} else {
+			// No reuse AND no line about it: the silent full rebuild. A version this
+			// node received from a peer had no in-memory shape to check, so appendBase
+			// declined and this path left no trace at all — which is why "only the
+			// parent's builder ever reuses" was invisible in production logs. One line
+			// per version, the same volume as "built by appending" below, so the two
+			// can be counted against each other (§8.6c reuse rate).
+			im.logger.Info("index: built from scratch — no reusable parent artifact on this node (§8.6c)",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Int("total_chunks", len(chunkIDs)), zap.Bool("graph_free", graphFree))
 		}
 	}
 
@@ -1820,10 +1863,21 @@ func (im *IndexManagerImpl) appendBase(
 		return 0, nil, nil, false
 	}
 	// The base's shape must be known here and match what this build wants.
-	im.mu.Lock()
-	parentGraphFree, known := im.builtGraphFree[indexKey{kbID, parent}]
-	im.mu.Unlock()
+	//
+	// Through shapeGraphFree, not the in-memory record alone: a parent this node
+	// received by §8.4 distribution has no builtGraphFree entry, and reading that
+	// as "unknown shape" is what made every replica but the parent's builder
+	// rebuild each child from scratch — the reuse existed on paper (the shape line
+	// travels in the sidecar) but never triggered there. A shape that still cannot
+	// be read (a sidecar written before §8.6a) stays unknown, and this returns
+	// false: the old conservative rebuild.
+	parentGraphFree, known := im.shapeGraphFree(kbID, parent)
 	if !known || parentGraphFree != graphFree {
+		im.buildLogger().Debug("index: §8.6c reuse skipped — the parent's shape is not usable here",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+			zap.Int64("parent_version_id", parent),
+			zap.Bool("parent_graph_free", parentGraphFree), zap.Bool("parent_shape_known", known),
+			zap.Bool("wanted_graph_free", graphFree))
 		return 0, nil, nil, false
 	}
 

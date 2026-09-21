@@ -331,6 +331,36 @@ func anyStorageLogHas(t *testing.T, needle string) bool {
 // stopped being usable).
 const appendLogMessage = "index: built by appending to the parent version's artifact (§8.6c)"
 
+// builtFromScratchMessage is the other half of the reuse rate: the line a full
+// rebuild leaves behind when §8.6(c)'s reuse did not apply (build → appendBase
+// declined). Until this change that path logged NOTHING, which is why "only the
+// node that built a parent ever reuses it" was invisible in production logs.
+const builtFromScratchMessage = "index: built from scratch — no reusable parent artifact on this node (§8.6c)"
+
+// messageNeedle scopes a log message to one (kb, version): the cluster runs dozens
+// of versions at once, and a bare message search would let any node's build of any
+// version stand in for this one.
+func messageNeedle(message, kbID string, versionID int64) string {
+	return fmt.Sprintf(`%s","kb_id":"%s","version_id":%d,`, message, kbID, versionID)
+}
+
+// versionLogLines returns, per storage service, the line carrying this message for
+// this (kb, version) — absent from the map for a node that did not log one.
+func versionLogLines(t *testing.T, message, kbID string, versionID int64) map[string]string {
+	t.Helper()
+	needle := messageNeedle(message, kbID, versionID)
+	out := make(map[string]string, len(storageServices))
+	for _, svc := range storageServices {
+		for _, line := range strings.Split(nodeLogsSince(t, svc), "\n") {
+			if strings.Contains(line, needle) {
+				out[svc] = line
+				break
+			}
+		}
+	}
+	return out
+}
+
 // versionBuildLog returns a storage node's log line recording §8.6(c)'s reuse of
 // the parent artifact for this version, or "" when no node logged one.
 //
@@ -345,13 +375,8 @@ const appendLogMessage = "index: built by appending to the parent version's arti
 // only asks that a reuse happened with something deleted.
 func versionBuildLog(t *testing.T, kbID string, versionID int64) string {
 	t.Helper()
-	needle := fmt.Sprintf(`%s","kb_id":"%s","version_id":%d,`, appendLogMessage, kbID, versionID)
-	for _, svc := range storageServices {
-		for _, line := range strings.Split(nodeLogsSince(t, svc), "\n") {
-			if strings.Contains(line, needle) {
-				return line
-			}
-		}
+	for _, line := range versionLogLines(t, appendLogMessage, kbID, versionID) {
+		return line
 	}
 	return ""
 }
@@ -618,18 +643,17 @@ func TestT4_GCPressure(t *testing.T) {
 	// tombstones §8.6(d) then reclaims).
 	reuseLine := awaitVersionBuildLog(t, kbID, trimmed, reuseWait())
 	if reuseLine == "" {
-		// Skip, not fail. Whether §8.6(c) reuses anything is decided by which node
-		// builds this version and whether THAT node built the parent itself, so
-		// "no reuse" is this case's precondition missing, not a defect — the same
-		// honest-skip outcome the original size-based assertion described ("without
-		// them the case below skips").
+		// Skip, not fail. Whether §8.6(c) reuses anything is this case's precondition
+		// (no reuse ⇒ no tombstones ⇒ nothing for §8.6(d) to reclaim), not a defect —
+		// the same honest-skip outcome the original size-based assertion described
+		// ("without them the case below skips"). The shape judge is now the sidecar
+		// as well as the in-memory record (appendBase → shapeGraphFree), so this
+		// should only fire on a sidecar predating §8.6a or a cluster whose parent
+		// artifact never landed here at all.
 		t.Skipf("no storage node logged %q for %s v%d within %v, so the version carries no tombstones "+
 			"for §8.6(d) to reclaim. The artifact is %d bytes against the parent's clean %d. §8.6(c) "+
-			"reuses a parent artifact only on a node that KNOWS the parent's shape, and only a node "+
-			"that built the parent itself records it (internal/index/impl.go appendBase: "+
-			"im.builtGraphFree) — a replica whose parent arrived by §8.4 distribution rebuilds the "+
-			"child silently instead. To make this case run, widen STRATUM_STRESS_REUSE_WAIT or arrange "+
-			"for the parent to be built where the child is.",
+			"needs the parent's artifact on this node AND its shape (in-memory for a version this "+
+			"node built, otherwise the shape line in its sidecar).",
 			appendLogMessage, kbID, trimmed, reuseWait(), afterDelete, baseBytes)
 	}
 	deletedChunks := logIntField(t, reuseLine, "deleted_chunks")
@@ -641,6 +665,24 @@ func TestT4_GCPressure(t *testing.T) {
 		t.Skipf("§8.6(c) reused the parent with deleted_chunks=%d, so the artifact carries no tombstones "+
 			"for §8.6(d) to reclaim: %s", deletedChunks, reuseLine)
 	}
+
+	// Every replica that BUILT this version itself must have reused the parent.
+	//
+	// §8.4 has already put the parent's artifact — and with it the shape line — on
+	// every replica, so a replica logging "built from scratch" is a full rebuild
+	// §8.6(c) was supposed to save, i.e. the silent one: before the shape judge
+	// read the sidecar, 2 of 3 replicas took that path on every version (see
+	// shapeGraphFree). A replica that never builds the version logs neither line —
+	// it serves what distribution handed it — so this is asserted per replica, not
+	// as a count.
+	reuseOn := versionLogLines(t, appendLogMessage, kbID, trimmed)
+	scratchOn := versionLogLines(t, builtFromScratchMessage, kbID, trimmed)
+	for svc, line := range scratchOn {
+		t.Errorf("%s rebuilt %s v%d from scratch while holding the parent's artifact (and its sidecar): "+
+			"the reuse §8.6(c) exists for did not trigger here: %s", svc, kbID, trimmed, line)
+	}
+	t.Logf("§8.6(c) reused the parent on %d/%d storage replicas, built from scratch on %d/%d",
+		len(reuseOn), len(storageServices), len(scratchOn), len(storageServices))
 
 	// Make the tombstoned version the ACTIVE one. §8.6(d) scans two sources: the
 	// active version, and the knowledge base's chain tail — the tail source exists
