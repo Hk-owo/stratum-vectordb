@@ -1022,20 +1022,13 @@ func main() {
 	// Only a node that holds data answers this: it is the hook that pulls a
 	// version's records here and builds its index. A control node's versions
 	// live in the storage group, and it has no stores to pull them into.
-	// Tombstone pruning is deliberately NOT started here yet.
-	//
-	// The backfill now asks the tombstones which gap versions were deleted (§7.5),
-	// and the pruner's watermark is min over the RAFT MEMBERS' positions — which
-	// does not cover a LAGGING node, let alone a storage node that is not a Raft
-	// member at all. Pruning on that watermark would drop a removal record before
-	// the very node that needs it has read it, and the backfill would fall back to
-	// pulling a deleted version: exactly the "success with no records, cursor steps
-	// over history it never received" hazard §7.5 fixed.
-	//
-	// Enabling it needs the watermark to cover every consumer (the data cursor of
-	// each required replica, i.e. what ReclaimableChangesThrough already computes),
-	// not the log position of the voters. RaftNodeImpl.StartTombstonePruning is
-	// implemented and tested for that day; see docs/known-gaps.md §B.
+	// Removal records nobody will ask about again may be dropped (docs/known-gaps.md
+	// §B). The watermark is the slowest REQUIRED replica's data cursor — see
+	// runTombstonePruning — not a log position, because the consumers of a tombstone
+	// are the nodes that are BEHIND it.
+	if raftNode != nil && controlPlane != nil {
+		go runTombstonePruning(ctx, logger, raftNode, controlPlane, rn)
+	}
 
 	if storageLocal && raftNode != nil {
 		// §10.6's reclaim is a best-effort broadcast: a partitioned or restarting
@@ -2637,4 +2630,69 @@ func totalVersionIDs(leftovers map[string][]int64) int {
 		n += len(ids)
 	}
 	return n
+}
+
+// tombstonePruneInterval is how often the leader asks whether any removal record may
+// be dropped. Slow on purpose: pruning is hygiene, and a row kept a little longer
+// costs a few dozen bytes.
+const tombstonePruneInterval = 5 * time.Minute
+
+// tombstonePruner is the slice of the raft node this loop needs, so the loop reads
+// without dragging the whole node (and can be stubbed).
+type tombstonePruner interface {
+	IsLeader() bool
+	HasTombstonesAtOrBelow(kbID string, version int64) bool
+	ProposePruneTombstones(ctx context.Context, kbID string, throughVersion int64) error
+}
+
+// runTombstonePruning drops removal records that no node will ask about again (§B).
+//
+// The watermark is ControlPlane.ReclaimableChangesThrough: the slowest REQUIRED
+// replica's DATA cursor, i.e. "every node supposed to hold this knowledge base has
+// moved past that version". That is the right yardstick and a log position is not,
+// because a tombstone's consumers are the nodes that are BEHIND — including storage
+// nodes, which are not Raft members at all. Pruning on voter positions could drop a
+// record just before a recovering node asks for it, and that node would then pull a
+// deleted version: the "success with no records, cursor steps over history it never
+// received" hazard §7.5 fixed.
+//
+// It is idempotent and best-effort: an unreporting replica keeps the watermark where
+// it was, which only ever keeps rows longer.
+func runTombstonePruning(ctx context.Context, logger *zap.Logger, pruner tombstonePruner, cp plane.ControlPlane, meta plane.MetadataLister) {
+	ticker := time.NewTicker(tombstonePruneInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Only the leader can propose, and only it can judge the watermark
+			// (ReclaimableChangesThrough falls back to a carried-back value elsewhere,
+			// which is fine to skip here: this loop would just run again).
+			if !pruner.IsLeader() {
+				continue
+			}
+			kbs, err := meta.ListKnowledgeBases(ctx)
+			if err != nil {
+				logger.Warn("tombstone pruning: list knowledge bases", zap.Error(err))
+				continue
+			}
+			for _, kb := range kbs {
+				through, ok := cp.ReclaimableChangesThrough(kb.KBID)
+				if !ok || through <= 0 {
+					continue
+				}
+				// Ask before proposing: a no-op command on every tick would grow the
+				// log for nothing on a cluster that deletes rarely.
+				if !pruner.HasTombstonesAtOrBelow(kb.KBID, through) {
+					continue
+				}
+				if err := pruner.ProposePruneTombstones(ctx, kb.KBID, through); err != nil {
+					logger.Warn("tombstone pruning",
+						zap.String("kb_id", kb.KBID), zap.Int64("through_version", through),
+						zap.Error(err))
+				}
+			}
+		}
+	}
 }

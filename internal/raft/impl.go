@@ -415,11 +415,6 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 			zap.Uint64("index", msg.Index), zap.Error(err))
 		result = applyResult{Err: fmt.Errorf("raft: corrupt command at index %d: %w", msg.Index, err)}
 	} else {
-		// Tell the command where it sits in the log. Commands cannot know their own
-		// position (it is assigned after they are built), and a tombstone needs it:
-		// pruning waits until every replica has applied that position
-		// (see applyPruneTombstones). Zero would only keep a tombstone longer.
-		cmd.Index = msg.Index
 		result = impl.sm.apply(context.Background(), cmd, impl.wal, impl.logger)
 	}
 
@@ -926,55 +921,10 @@ func (impl *RaftNodeImpl) LastVersionID(_ context.Context, kbID string) (int64, 
 	return ids[len(ids)-1], nil
 }
 
-// DefaultTombstonePruneInterval is how often the leader looks for tombstones it
-// may drop. Slow on purpose: pruning is hygiene, and a tombstone kept a little
-// longer costs a few dozen bytes.
-const DefaultTombstonePruneInterval = 5 * time.Minute
-
-// StartTombstonePruning periodically drops tombstones the whole cluster has
-// certainly seen (see ProposePruneTombstones). Safe to start on any node with a
-// state machine: the loop checks leadership and the cluster's replication
-// position before proposing anything, and does nothing when either is unknown.
-func (impl *RaftNodeImpl) StartTombstonePruning(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		interval = DefaultTombstonePruneInterval
-	}
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				impl.pruneTombstonesOnce(ctx)
-			}
-		}
-	}()
-}
-
-// pruneTombstonesOnce proposes one prune at the cluster's replication bound.
-//
-// The watermark is min over the peers' acknowledged positions — "no replica can
-// still be missing an entry at or below this" — which is exactly what makes
-// dropping a tombstone safe: a replica that receives entries in order has applied
-// the removal before it applies the prune itself. A node that is not the leader,
-// or whose bound is unknown, proposes nothing: pruning is never urgent, and the
-// safe direction is to keep a row (see the tombstone field for why).
-func (impl *RaftNodeImpl) pruneTombstonesOnce(ctx context.Context) {
-	if !impl.IsLeader() {
-		return
-	}
-	through, ok := impl.raft.ReplicatedThrough()
-	if !ok {
-		return
-	}
-	if !impl.sm.hasTombstonesAtOrBelow(through) {
-		return
-	}
-	if err := impl.ProposePruneTombstones(ctx, through); err != nil {
-		impl.logger.Warn("raft: pruning tombstones", zap.Uint64("through_index", through), zap.Error(err))
-	}
+// HasTombstonesAtOrBelow reports whether pruning kbID at version would drop anything,
+// so the assembly can skip a no-op proposal each tick.
+func (impl *RaftNodeImpl) HasTombstonesAtOrBelow(kbID string, version int64) bool {
+	return impl.sm.hasTombstoneAtOrBelowVersion(kbID, version)
 }
 
 // ProposePruneTombstones drops tombstones at or below throughIndex.
@@ -983,8 +933,8 @@ func (impl *RaftNodeImpl) pruneTombstonesOnce(ctx context.Context) {
 // pruner (and, in tests, the same method), and a storage node has no tombstones
 // to prune — widening the interface would oblige every shape to answer a
 // question only a state machine can.
-func (impl *RaftNodeImpl) ProposePruneTombstones(ctx context.Context, throughIndex uint64) error {
-	res, err := impl.proposeAndWait(ctx, newPruneTombstonesCommand(throughIndex))
+func (impl *RaftNodeImpl) ProposePruneTombstones(ctx context.Context, kbID string, throughVersion int64) error {
+	res, err := impl.proposeAndWait(ctx, newPruneTombstonesCommand(kbID, throughVersion))
 	if err != nil {
 		return err
 	}
@@ -1016,9 +966,9 @@ func (impl *RaftNodeImpl) DeletionsInRange(_ context.Context, kbID string, fromE
 		return nil, stratumerrors.ErrKnowledgeBaseNotFound
 	}
 	out := make([]int64, 0, len(impl.sm.tombstones[kbID]))
-	for _, t := range impl.sm.tombstones[kbID] {
-		if t.VersionID > fromExclusive && t.VersionID <= toInclusive {
-			out = append(out, t.VersionID)
+	for _, id := range impl.sm.tombstones[kbID] {
+		if id > fromExclusive && id <= toInclusive {
+			out = append(out, id)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
