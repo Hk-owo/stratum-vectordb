@@ -1218,18 +1218,6 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 	// therefore includes any retries it needed.
 	buildStart := time.Now()
 	var buildUs time.Duration
-	defer func() {
-		if !req.enqueuedAt.IsZero() {
-			im.buildLogger().Debug("index: build timings",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
-				zap.Bool("graph_free", graphFree), zap.String("priority", buildPriorityName(req.priority)),
-				zap.Int64("queue_us", buildStart.Sub(req.enqueuedAt).Microseconds()),
-				zap.Int64("build_us", buildUs.Microseconds()),
-				zap.Int64("total_us", time.Since(req.enqueuedAt).Microseconds()),
-				zap.String("status", status.String()),
-				zap.Int64("size_bytes", sizeBytes))
-		}
-	}()
 
 	// Deferred cleanup guarantees that loading is ALWAYS cleared and
 	// waiters are ALWAYS woken, even if build()/makeRoomLocked/panics
@@ -1243,6 +1231,31 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 				zap.Any("panic", r))
 			status = types.IndexStatusFailed
 		}
+
+		// Emitted HERE, and not from a defer of its own, for two reasons.
+		//
+		// Ordering: this line must be in the log before anything downstream of
+		// the build can act on its outcome — the waiters woken by the broadcast
+		// below and the completion callbacks that carry the status to the
+		// control layer. A separate defer registered above this one would run
+		// after them (defers are LIFO), so a reader woken by the outcome would
+		// race the line's arrival and could not rely on it to explain what it
+		// just saw.
+		//
+		// Completeness: status is only final once the panic recovery above has
+		// run, so a panicking build gets its line too, with the FAILED status
+		// this build actually reported.
+		if !req.enqueuedAt.IsZero() {
+			im.buildLogger().Debug("index: build timings",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.Bool("graph_free", graphFree), zap.String("priority", buildPriorityName(req.priority)),
+				zap.Int64("queue_us", buildStart.Sub(req.enqueuedAt).Microseconds()),
+				zap.Int64("build_us", buildUs.Microseconds()),
+				zap.Int64("total_us", time.Since(req.enqueuedAt).Microseconds()),
+				zap.String("status", status.String()),
+				zap.Int64("size_bytes", sizeBytes))
+		}
+
 		im.mu.Lock()
 		delete(im.loading, key)
 		if status != types.IndexStatusReady {
