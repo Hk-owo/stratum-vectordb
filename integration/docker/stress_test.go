@@ -14,6 +14,7 @@ package docker_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -303,6 +304,50 @@ func anyStorageLogHas(t *testing.T, needle string) bool {
 	return false
 }
 
+// appendLogMessage is §8.6(c)'s reuse line — the evidence the collection case
+// asserts on, instead of the artifact's size (see the assertion for why size
+// stopped being usable).
+const appendLogMessage = "index: built by appending to the parent version's artifact (§8.6c)"
+
+// versionBuildLog returns a storage node's log line recording §8.6(c)'s reuse of
+// the parent artifact for this version, or "" when no node logged one.
+//
+// The needle is scoped to the message and this (kb, version) — the cluster runs
+// dozens of other versions, and a bare message search would let any node's build
+// of any version stand in for this one.
+//
+// Whichever replica answers first is enough, because they can legitimately
+// disagree: each one reuses ITS OWN local artifact, so a replica that holds a
+// different shape of the parent (measured: deleted_chunks 1153 against the other
+// two's 7322 for one and the same version) reports its own numbers. The assertion
+// only asks that a reuse happened with something deleted.
+func versionBuildLog(t *testing.T, kbID string, versionID int64) string {
+	t.Helper()
+	needle := fmt.Sprintf(`%s","kb_id":"%s","version_id":%d,`, appendLogMessage, kbID, versionID)
+	for _, svc := range storageServices {
+		for _, line := range strings.Split(nodeLogsSince(t, svc), "\n") {
+			if strings.Contains(line, needle) {
+				return line
+			}
+		}
+	}
+	return ""
+}
+
+// logIntField reads one numeric field out of a JSON log line.
+func logIntField(t *testing.T, line, field string) int64 {
+	t.Helper()
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+		t.Fatalf("parsing log line %q: %v", line, err)
+	}
+	v, ok := rec[field].(float64)
+	if !ok {
+		t.Fatalf("log line carries no numeric %q field: %s", field, line)
+	}
+	return int64(v)
+}
+
 // percentiles sorts d in place and returns p50, p95, p99 and the mean.
 //
 // The tail is the point. A retrieval service is judged by its slowest queries, and
@@ -500,25 +545,54 @@ func TestT4_GCPressure(t *testing.T) {
 	t.Logf("version %d READY after deleting %d/%d docs; artifact bytes: %d (parent's clean artifact: %d)",
 		trimmed, deleteCount, docCount, afterDelete, baseBytes)
 
-	// The artifact must be BIGGER than its parent's clean one. The version's live
-	// set is 501 of the parent's 2,000 documents, so a rebuild of just those would
-	// be a fraction of the parent's size; anything above it is the parent's vectors
-	// still sitting there as TOMBSTONES — which is the dead weight §8.6(d) exists
-	// to reclaim. Without them the case below skips, and that is the honest
-	// outcome: there is nothing to collect.
-	if afterDelete <= baseBytes {
-		t.Fatalf("§8.6(c) did not reuse the parent: the version's artifact is %d bytes against the parent's clean %d, "+
-			"so it was rebuilt and carries no tombstones for §8.6(d) to reclaim", afterDelete, baseBytes)
+	// §8.6(c)'s reuse is asserted from the LOG LINE, not from the artifact's size.
+	//
+	// Size was the evidence until this line's tombstones turned out to be reclaimable
+	// before it was read. The reasoning was sound: the live set is 501 of the
+	// parent's 2,000 documents, so a rebuild of just those is a fraction of the
+	// parent, while a reuse keeps the parent's vectors as TOMBSTONES and is
+	// therefore BIGGER than the parent's clean artifact (measured: 99,194,878
+	// against 98,060,247). What invalidates the inference is §8.6(d)'s SECOND target
+	// source — the chain tail — which was added after this case was written: the
+	// version under test IS the knowledge base's tail the moment it is READY, so the
+	// scanner (every 5 s) collects its tombstones within seconds, long before the
+	// waits above (READY, then every replica's artifact) and three `du`s are done.
+	// The size then reads the POST-collection artifact (74,238,890) and the case
+	// concluded "rebuilt, carries no tombstones" from a version whose tombstones had
+	// just been reclaimed — 3 of 8 runs, a coin flip.
+	//
+	// The line is the direct evidence, and the stronger one: it names the parent it
+	// appended to and how many chunks it deleted (deleted_chunks = exactly the
+	// tombstones §8.6(d) then reclaims). Whichever way the race lands, this holds.
+	reuseLine := versionBuildLog(t, kbID, trimmed)
+	if reuseLine == "" {
+		t.Fatalf("§8.6(c) did not reuse the parent: no storage node logged %q for %s v%d, and the artifact "+
+			"is %d bytes against the parent's clean %d (a rebuild of the 501 live documents, no tombstones "+
+			"for §8.6(d) to reclaim)", appendLogMessage, kbID, trimmed, afterDelete, baseBytes)
+	}
+	deletedChunks := logIntField(t, reuseLine, "deleted_chunks")
+	if deletedChunks <= 0 {
+		// Not a defect: a reuse with nothing deleted leaves no tombstones, so there
+		// is nothing for §8.6(d) to reclaim and the case cannot run. That is the same
+		// honest-skip outcome the original size-based assertion described ("without
+		// them the case below skips").
+		t.Skipf("§8.6(c) reused the parent with deleted_chunks=%d, so the artifact carries no tombstones "+
+			"for §8.6(d) to reclaim: %s", deletedChunks, reuseLine)
 	}
 
-	// Make the tombstoned version the ACTIVE one — §8.6(d) collects active versions
-	// only. The design's target is "long-lived, continuously queried, no successor
-	// in sight", and activeness is how the control layer expresses exactly that.
+	// Make the tombstoned version the ACTIVE one. §8.6(d) scans two sources: the
+	// active version, and the knowledge base's chain tail — the tail source exists
+	// precisely so a KB that was never rolled back is not left unscanned, and it is
+	// how the tombstones above got collected before this point in some runs.
+	// Setting the version active names it as a target by the other route as well,
+	// which is the design's own description of the case it exists for: "long-lived,
+	// continuously queried, no successor in sight".
 	//
 	// CreateVersion does NOT move the active pointer (only the set-active command
-	// does), so without this step the knowledge base has no active version at all
-	// and the scanner has nothing to look at. This missing step — not a faulty
-	// candidate judgement — is why this case used to skip.
+	// does), so without this step the version would be a target only while nothing
+	// follows it in the chain — the next version written would drop it from the
+	// scan. This missing step — not a faulty candidate judgement — is why this case
+	// used to skip.
 	if err := rollbackTo(ctx, leaderAddr, kbID, trimmed); err != nil {
 		t.Fatalf("RollbackVersion(%d) failed: %v", trimmed, err)
 	}
@@ -544,9 +618,16 @@ func TestT4_GCPressure(t *testing.T) {
 			// artifact BEFORE the rewrite and reported 0.0% reclaimed on a collection
 			// that had just dropped 7,322 chunks (verified by hand: 24.7 MB → 19 MB
 			// per replica).
+			//
+			// Two references, because the collection may have landed BEFORE the
+			// reading above: afterDelete is then already post-collection and can never
+			// shrink, which would park this loop for the whole settle window. The
+			// parent's clean artifact still works — the reused one carried its vectors
+			// plus tombstones, so it is ≥ the parent, and a collection that reclaimed
+			// anything ends up under it.
 			settleBy := time.Now().Add(45 * time.Second)
 			afterCollect = versionIndexBytes(t, kbID, trimmed)
-			for afterCollect >= afterDelete && time.Now().Before(settleBy) {
+			for afterCollect >= afterDelete && afterCollect >= baseBytes && time.Now().Before(settleBy) {
 				time.Sleep(time.Second)
 				afterCollect = versionIndexBytes(t, kbID, trimmed)
 			}
@@ -557,17 +638,15 @@ func TestT4_GCPressure(t *testing.T) {
 
 	if !collected {
 		switch {
-		case !anyStorageLogHas(t, "gc scan read the active versions"):
+		case !anyStorageLogHas(t, "index: gc scan read its targets"):
 			t.Skip("the §8.6(d) scanner is not running on any storage node — " +
 				"check index_manager.gc_sweep_interval_ms (negative disables it) and the data dir")
 		case !anyStorageLogHas(t, "cleanup candidate"):
 			t.Skipf("the scanner ran but found NO candidate, with the artifact at %d bytes "+
-				"against the parent's clean %d. The judgement needs the artifact to carry "+
-				"tombstones AND a dead share above GCRatioThreshold; the assertion above "+
-				"already established the tombstones are there, so this points at the "+
-				"threshold (AppendMaxDeadRatio must exceed the share §8.6(c) rebuilds at) "+
-				"or at the estimate itself.",
-				afterDelete, baseBytes)
+				"against the parent's clean %d. The reuse line above recorded deleted_chunks=%d, so the "+
+				"tombstones are there; this points at the threshold (GCRatioThreshold, against the dead "+
+				"share §8.6(c) left behind) or at the estimate itself.",
+				afterDelete, baseBytes, deletedChunks)
 		default:
 			t.Skipf("a candidate was found but nothing was collected within %v — check "+
 				"index_manager.serving_replica_min (with %d storage replicas, collection "+
@@ -577,13 +656,19 @@ func TestT4_GCPressure(t *testing.T) {
 		}
 	}
 
-	t.Logf("COLLECTED: artifact bytes %d → %d (%.1f%% of the post-delete artifact reclaimed)",
-		afterDelete, afterCollect, 100*float64(afterDelete-afterCollect)/float64(afterDelete))
-	if afterCollect >= afterDelete {
-		t.Errorf("a collection was logged but the version's artifact did not shrink (%d → %d); "+
+	t.Logf("COLLECTED: artifact bytes %d → %d, against the parent's clean %d (%d chunks were deleted at reuse, i.e. the tombstones this collection was about)",
+		afterDelete, afterCollect, baseBytes, deletedChunks)
+	// The artifact must end up smaller than the REUSED one: that is the space coming
+	// back. Two references, for the same reason as the settle loop — afterDelete when
+	// this run's reading preceded the collection, and the parent's clean artifact when
+	// it did not (a reuse is ≥ the parent, so anything under the parent has dropped
+	// tombstones). Reading only afterDelete made this assertion fail in exactly the
+	// runs where the scanner had already won the race.
+	if afterCollect >= afterDelete && afterCollect >= baseBytes {
+		t.Errorf("a collection was logged but the version's artifact did not shrink (%d → %d, parent's clean %d); "+
 			"the bytes are the version's own .index and .index.ids, so either the log is lying "+
 			"or the rewrite did not drop the tombstones",
-			afterDelete, afterCollect)
+			afterDelete, afterCollect, baseBytes)
 	}
 
 	// The point is reclaiming SPACE, not breaking reads: the surviving documents must
