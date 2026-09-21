@@ -21,7 +21,12 @@ func (m *mockVdl) ListDocIDs(_ context.Context, _ string, versionID int64) ([]st
 }
 
 func (m *mockVdl) DeleteByVersion(_ context.Context, _ string, _ int64) error { return nil }
-func (m *mockVdl) DeleteByKB(_ context.Context, _ string) error               { return nil }
+
+// ListVersions mirrors the interface; this stub does not model the local
+// version list (the reconciler's own cases use purpose-built fakes).
+func (m *mockVdl) ListVersions(context.Context, string) ([]int64, error) { return nil, nil }
+
+func (m *mockVdl) DeleteByKB(_ context.Context, _ string) error { return nil }
 
 func TestVersionBloomStore(t *testing.T) {
 	ctx := context.Background()

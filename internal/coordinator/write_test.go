@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -205,6 +207,31 @@ func (v *testVersionDocList) ListDocIDs(_ context.Context, kbID string, versionI
 
 func (v *testVersionDocList) DeleteByVersion(_ context.Context, kbID string, versionID int64) error {
 	return nil
+}
+
+// ListVersions mirrors the interface: the distinct version ids held for kbID,
+// ascending (that is what a reconciler enumerates with).
+func (v *testVersionDocList) ListVersions(_ context.Context, kbID string) ([]int64, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	prefix := kbID + "|"
+	seen := make(map[int64]bool)
+	for key := range v.data {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		id, err := strconv.ParseInt(key[len(prefix):], 10, 64)
+		if err != nil {
+			continue
+		}
+		seen[id] = true
+	}
+	out := make([]int64, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 func (v *testVersionDocList) DeleteByKB(_ context.Context, kbID string) error { return nil }
 

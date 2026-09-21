@@ -93,6 +93,41 @@ func (v *PebbleVersionDocList) ListDocIDs(_ context.Context, kbID string, versio
 	return docIDs, nil
 }
 
+// ListVersions implements VersionDocList: prefix-scans by kbID and returns the
+// DISTINCT version ids that still hold at least one document, ascending.
+//
+// Ordering needs no sort: version ids are big-endian encoded, so Pebble's byte
+// order is numeric order and all entries of one version are contiguous — which
+// is why comparing each decoded id with the previous one is enough to dedupe.
+func (v *PebbleVersionDocList) ListVersions(_ context.Context, kbID string) ([]int64, error) {
+	prefix := encodeVDLKBPrefix(kbID)
+	upperBound := pebbleutil.PrefixSuccessor(prefix)
+
+	iter, err := v.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound})
+	if err != nil {
+		return nil, fmt.Errorf("versiondoc: ListVersions(%s): new iterator: %w", kbID, err)
+	}
+	defer iter.Close()
+
+	afterPrefix := len(prefix)
+	var out []int64
+	last := int64(-1)
+	for iter.First(); iter.Valid(); iter.Next() {
+		versionID, ok := pebbleutil.DecodeVersionID(iter.Key()[afterPrefix:])
+		if !ok {
+			return nil, fmt.Errorf("versiondoc: ListVersions(%s): malformed key %q", kbID, iter.Key())
+		}
+		if versionID != last {
+			out = append(out, versionID)
+			last = versionID
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("versiondoc: ListVersions(%s): iterator error: %w", kbID, err)
+	}
+	return out, nil
+}
+
 // DeleteByVersion implements VersionDocList: range-deletes every entry for
 // a single (kbID, versionID).
 func (v *PebbleVersionDocList) DeleteByVersion(_ context.Context, kbID string, versionID int64) error {

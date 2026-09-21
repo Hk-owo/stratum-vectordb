@@ -182,6 +182,8 @@ type LocalDataPlane struct {
 	puller          VersionPuller
 	changesFetcher  VersionChangesFetcher
 	versionExists   VersionExistenceChecker
+	localVersions   LocalVersionLister
+	deletions       DeletionLister
 	verify          DataVerifier
 	resolve         SourceResolver
 	wal             TransactionWAL
@@ -340,6 +342,18 @@ type LocalDataPlaneConfig struct {
 	// advance its cursor over history it never received (§7.5). Optional: absent
 	// means the plane keeps its old behaviour and never concludes "deleted".
 	VersionExistence VersionExistenceChecker
+	// LocalVersions enumerates the versions this node holds documents for, and
+	// Tombstones says which ones the control layer has recorded as deleted. Both
+	// are what ReconcileDeletedVersions needs to reclaim the "local leftovers"
+	// of §10.6/§B. They are separate from VersionExistence because they answer a
+	// different question: existence is asked about ONE candidate during a
+	// backfill, while these two are scanned per knowledge base.
+	//
+	// Tombstones is nil on a node whose RaftNode has no state machine (a storage
+	// node): the verdict lives in the control layer, and the reconciler then
+	// reports that it cannot run instead of guessing.
+	LocalVersions LocalVersionLister
+	Tombstones    DeletionLister
 	// ResolveReplicas lists the *other* replicas that should hold a written
 	// version. Nil (or an empty list) means "no replication": the local write
 	// is the whole quorum — the single-node and test default. It doubles as
@@ -410,6 +424,8 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		puller:           cfg.Puller,
 		changesFetcher:   cfg.ChangesFetcher,
 		versionExists:    cfg.VersionExistence,
+		localVersions:    cfg.LocalVersions,
+		deletions:        cfg.Tombstones,
 		verify:           cfg.Verify,
 		resolve:          cfg.Resolve,
 		wal:              cfg.WAL,

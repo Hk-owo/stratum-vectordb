@@ -752,10 +752,21 @@ func main() {
 		Logger: logger,
 	})
 
+	// §B/§C: the tombstones live in the state machine, so only a node that HAS one
+	// can judge "this version was deleted". A storage node's RaftNode is remote and
+	// does not provide them; the reconciler then reports that it cannot run rather
+	// than guessing — a guessed verdict is what kept §B unbuilt.
+	var tombstones plane.DeletionLister
+	if dl, ok := rn.(plane.DeletionLister); ok {
+		tombstones = dl
+	}
+
 	dataPlane = plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
-		IndexManager: indexMgr,
-		Puller:       syncFollower,
-		WAL:          walImpl,
+		IndexManager:  indexMgr,
+		LocalVersions: vd,
+		Tombstones:    tombstones,
+		Puller:        syncFollower,
+		WAL:           walImpl,
 		// §7.8/docs/cursor-persistence-plan.md §3: the cursor is persisted in the
 		// WAL this node already fsyncs, so a restart reads it back instead of
 		// inferring it from index artifacts the retention policy may have
@@ -986,6 +997,27 @@ func main() {
 			logger.Warn("startup: could not rebuild the terminal-version reclaim list", zap.Error(err))
 		} else if n > 0 {
 			logger.Info("startup: queued terminal versions for local reclaim", zap.Int("versions", n))
+		}
+
+		// §B/§C: a version whose metadata is gone while its bytes are still here —
+		// the leftover that no metadata-keyed path can name. The scan is read-only
+		// and always runs, so the problem becomes VISIBLE; reclaiming is opt-in
+		// because it is irreversible and runs once per start-up.
+		if tombstones != nil {
+			if cfg.ReconcileDeletedVersions {
+				reclaimed, err := dataPlane.ReconcileDeletedVersions(ctx, rn)
+				if err != nil {
+					logger.Warn("startup: reclaiming local leftovers of deleted versions did not finish", zap.Error(err))
+				}
+				if reclaimed > 0 {
+					logger.Info("startup: reclaimed local leftovers of deleted versions", zap.Int("versions", reclaimed))
+				}
+			} else if leftovers, err := dataPlane.DeletedVersionLeftovers(ctx, rn); err != nil {
+				logger.Warn("startup: could not scan for local leftovers of deleted versions", zap.Error(err))
+			} else if n := totalVersionIDs(leftovers); n > 0 {
+				logger.Info("startup: local leftovers of deleted versions found; set reconcile.deleted_versions to reclaim them",
+					zap.Int("versions", n))
+			}
 		}
 	}
 
@@ -1925,6 +1957,14 @@ type appConfig struct {
 	// signals that it is worth making.
 	IndexGCEnabled bool
 
+	// ReconcileDeletedVersions reclaims this node's leftovers of DELETED versions
+	// (reconcile.deleted_versions) — the half of docs/known-gaps.md §B that the
+	// metadata tombstones made safe to act on. Off by default for the same reason
+	// gc_enabled is: the scan always runs and REPORTS, while reclaiming bytes is
+	// an operator's decision — it is irreversible, and it happens once per
+	// start-up, so a mistaken judgement would be replayed on every restart.
+	ReconcileDeletedVersions bool
+
 	// IndexServingReplicaMin is how many OTHER replicas must be serving a version
 	// before this node takes itself out of service to collect it
 	// (index_manager.serving_replica_min); <= 0 means the IndexManager's default.
@@ -2055,6 +2095,14 @@ type fileConfig struct {
 	Embed struct {
 		ServiceAddr string `yaml:"service_addr"`
 	} `yaml:"embed"`
+
+	// Reconcile is the start-up reconciliation's opt-ins.
+	Reconcile struct {
+		// DeletedVersions reclaims local leftovers of deleted versions
+		// (docs/known-gaps.md §B). The scan itself always runs and reports; this
+		// only decides whether the bytes are reclaimed.
+		DeletedVersions bool `yaml:"deleted_versions"`
+	} `yaml:"reconcile"`
 
 	IndexManager struct {
 		LRUCapacity       int `yaml:"lru_capacity"`
@@ -2295,6 +2343,7 @@ func loadConfig(path string) (appConfig, error) {
 	// nothing", which is the only safe reading of a config file that predates the
 	// feature.
 	cfg.IndexGCEnabled = fc.IndexManager.GCEnabled
+	cfg.ReconcileDeletedVersions = fc.Reconcile.DeletedVersions
 	if fc.IndexManager.ServingReplicaMin != 0 {
 		cfg.IndexServingReplicaMin = fc.IndexManager.ServingReplicaMin
 	}
@@ -2413,6 +2462,7 @@ func defaultConfig() appConfig {
 		// scanner still runs and reports, so a node that has never been configured
 		// for collection will still say when collection would have been worth it.
 		IndexGCEnabled:           false,
+		ReconcileDeletedVersions: false,
 		IndexServingReplicaMin:   0,
 		IndexGCGraphRebuildRatio: 0,
 		IndexGCSweepInterval:     0,
@@ -2567,4 +2617,14 @@ func dispatchCommittedVersion(
 		logger.Warn("write dispatch failed; the client's retry or the retry budget takes over",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
 	}
+}
+
+// totalVersionIDs counts the version ids across a leftovers map, for a log line
+// (the reconciler's maps are per knowledge base).
+func totalVersionIDs(leftovers map[string][]int64) int {
+	n := 0
+	for _, ids := range leftovers {
+		n += len(ids)
+	}
+	return n
 }

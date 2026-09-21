@@ -234,6 +234,13 @@ func (v *deleteTestVersionDocList) ListDocIDs(_ context.Context, kbID string, ve
 func (v *deleteTestVersionDocList) DeleteByVersion(_ context.Context, kbID string, versionID int64) error {
 	return nil
 }
+
+// ListVersions mirrors the interface; this stub records deletions and models no
+// version list of its own.
+func (v *deleteTestVersionDocList) ListVersions(context.Context, string) ([]int64, error) {
+	return nil, nil
+}
+
 func (v *deleteTestVersionDocList) DeleteByKB(_ context.Context, kbID string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()

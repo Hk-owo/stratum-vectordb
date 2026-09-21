@@ -2,6 +2,7 @@ package versiondoc
 
 import (
 	"context"
+	"sort"
 	"sync"
 )
 
@@ -49,6 +50,24 @@ func (v *MockVersionDocList) ListDocIDs(_ context.Context, kbID string, versionI
 	for docID := range set {
 		out = append(out, docID)
 	}
+	return out, nil
+}
+
+func (v *MockVersionDocList) ListVersions(_ context.Context, kbID string) ([]int64, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	seen := make(map[int64]struct{})
+	for key := range v.docs {
+		if key.kbID == kbID {
+			seen[key.versionID] = struct{}{}
+		}
+	}
+	out := make([]int64, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
 }
 

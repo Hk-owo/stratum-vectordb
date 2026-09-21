@@ -68,6 +68,17 @@ func DecodeString(b []byte) string {
 	return string(b[4 : 4+n])
 }
 
+// DecodeVersionID reverses EncodeVersionID: it reads the 8-byte big-endian
+// version id at the start of b. ok is false when b is too short to hold one
+// (e.g. a malformed or truncated key), so a caller scanning the keyspace can
+// report it instead of decoding garbage.
+func DecodeVersionID(b []byte) (versionID int64, ok bool) {
+	if len(b) < 8 {
+		return 0, false
+	}
+	return int64(binary.BigEndian.Uint64(b[:8])), true
+}
+
 // PrefixSuccessor returns the smallest byte slice that is strictly greater
 // than every key with the given prefix, suitable as an exclusive upper
 // bound for a prefix scan or range delete covering exactly the keys

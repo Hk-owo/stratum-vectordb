@@ -42,6 +42,14 @@ delete_coordinator:
   max_retries: 5
   retry_base_interval_ms: 500
 
+# 启动对账（reconcile）—— 目前只有一个开关：把"元数据里已经删除、但本节点还留着字节"
+# 的残留版本清掉（docs/known-gaps.md §B/§C 那个窗口）。扫描本身是只读的、默认就会跑，
+# 并在启动日志里报告发现了多少（让问题可见）；下面的开关只决定要不要真的回收。
+# 默认 false：回收不可逆，而且每次启动都会执行一次——判错会在每次重启时重放。
+reconcile:
+  # deleted_versions: true 时，启动时按元数据墓碑清理本地残留。
+  deleted_versions: false
+
 index_manager:
   lru_capacity: 16
   # 内存字节阈值。记账口径见 Stratum_设计文档v12.md 3.3：OFF(全精度)KB

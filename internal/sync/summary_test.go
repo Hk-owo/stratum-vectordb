@@ -149,7 +149,13 @@ func (f *failingVersionDocList) ListDocIDs(context.Context, string, int64) ([]st
 	return nil, errors.New("store down")
 }
 func (f *failingVersionDocList) DeleteByVersion(context.Context, string, int64) error { return nil }
-func (f *failingVersionDocList) DeleteByKB(context.Context, string) error             { return nil }
+
+// ListVersions fails the same way the other read does: this stub exists to model
+// a store that is down.
+func (f *failingVersionDocList) ListVersions(context.Context, string) ([]int64, error) {
+	return nil, errors.New("store down")
+}
+func (f *failingVersionDocList) DeleteByKB(context.Context, string) error { return nil }
 
 // referenceDocIDSetHash is a straightforward reference implementation used
 // to cross-check ComputeDocIDSetHash (guards against refactor drift).

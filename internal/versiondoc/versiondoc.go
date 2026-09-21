@@ -32,6 +32,17 @@ type VersionDocList interface {
 	// versionID within kbID, via a kbID+versionID prefix scan.
 	ListDocIDs(ctx context.Context, kbID string, versionID int64) ([]string, error)
 
+	// ListVersions returns, in ascending order and without duplicates, the
+	// version ids this store currently holds documents for within kbID.
+	//
+	// It exists for reconciliation (docs/known-gaps.md §B): a node comparing what
+	// it locally holds against the control layer needs to enumerate its own
+	// versions, and this store is what knows them. A version disappears from this
+	// list the moment its last document does, which is exactly the "local
+	// leftovers" shape a reconciler is looking for — pair it with the metadata's
+	// tombstones to tell "deleted" apart from "never had it".
+	ListVersions(ctx context.Context, kbID string) ([]int64, error)
+
 	// DeleteByVersion removes all entries for a single version. Used by GC
 	// when retiring old versions.
 	DeleteByVersion(ctx context.Context, kbID string, versionID int64) error
