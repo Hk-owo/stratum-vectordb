@@ -921,6 +921,40 @@ func (impl *RaftNodeImpl) LastVersionID(_ context.Context, kbID string) (int64, 
 	return ids[len(ids)-1], nil
 }
 
+// DeletionsInRange returns kbID's version ids in (fromExclusive, toInclusive]
+// whose metadata has been REMOVED — the tombstones this node recorded when it
+// applied the removal.
+//
+// It exists because "not in the metadata" and "confirmed deleted" are different
+// answers, and only the second is safe to act on: a reconciler comparing local
+// leftovers against the control layer must tell "this version is gone, reclaim
+// it" apart from "I could not find out" (docs/known-gaps.md §B/§C). Like
+// ListVersions it reads this node's own state-machine replica, so it costs no
+// Raft round trip.
+//
+// NOT on the RaftNode interface, on purpose: its consumers are control-side
+// readers (the reconciliation §B describes), and a remote shape would have to
+// carry tombstones over the wire — new protocol surface for a reader that does
+// not exist yet. Add it there when a caller actually needs it.
+//
+// The result is sorted so two callers comparing answers see the same order;
+// tombstones are kept in deletion order, which is not id order.
+func (impl *RaftNodeImpl) DeletionsInRange(_ context.Context, kbID string, fromExclusive, toInclusive int64) ([]int64, error) {
+	impl.sm.mu.RLock()
+	defer impl.sm.mu.RUnlock()
+	if _, ok := impl.sm.kbs[kbID]; !ok {
+		return nil, stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	out := make([]int64, 0, len(impl.sm.tombstones[kbID]))
+	for _, id := range impl.sm.tombstones[kbID] {
+		if id > fromExclusive && id <= toInclusive {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
 // ListKnowledgeBases returns metadata for every knowledge base in the
 // state machine. Order is not specified (map iteration).
 func (impl *RaftNodeImpl) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {

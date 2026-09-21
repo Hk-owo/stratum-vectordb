@@ -39,6 +39,10 @@ type MockRaftNode struct {
 	// (Stratum_设计文档v13.md §7.12). Tests are short-lived, so unlike the
 	// real state machine this map is not pruned on version/KB removal.
 	versionsByRequest map[string]int64
+	// tombstones mirrors the real state machine's deletion record, so the two
+	// implementations agree on what "confirmed deleted" means (see the real
+	// state machine's field for why it is kept in deletion order and never pruned).
+	tombstones map[string][]int64
 
 	// leader mirrors the real node's view of itself. It defaults to true: every
 	// existing test drives a single-node stack, where the node is its own leader,
@@ -60,6 +64,7 @@ func NewMockRaftNode(w wal.WAL) *MockRaftNode {
 		versionsByKB:      make(map[string][]int64),
 		nextVersionID:     1,
 		versionsByRequest: make(map[string]int64),
+		tombstones:        make(map[string][]int64),
 		leader:            true,
 	}
 }
@@ -125,6 +130,7 @@ func (r *MockRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error
 		delete(r.versions, vID)
 	}
 	delete(r.versionsByKB, kbID)
+	delete(r.tombstones, kbID)
 	return nil
 }
 
@@ -496,7 +502,26 @@ func (r *MockRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, 
 			break
 		}
 	}
+	r.tombstones[kbID] = append(r.tombstones[kbID], versionID)
 	return nil
+}
+
+// DeletionsInRange mirrors the real node's answer: sorted, and an unknown
+// knowledge base is an error rather than an empty list.
+func (r *MockRaftNode) DeletionsInRange(_ context.Context, kbID string, fromExclusive, toInclusive int64) ([]int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.kbs[kbID]; !ok {
+		return nil, stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	out := make([]int64, 0, len(r.tombstones[kbID]))
+	for _, id := range r.tombstones[kbID] {
+		if id > fromExclusive && id <= toInclusive {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 // ProposeDiscardVersion implements RaftNode.
