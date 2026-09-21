@@ -1400,6 +1400,27 @@ func isTransientBuildErr(err error) bool {
 	return false
 }
 
+// chunkVectorReadErr 给"读 chunk 向量失败"一个可判别的名字：vecstore 对尚未落盘的
+// 向量答 NOT FOUND，而那是**数据侧的一个过渡态**，不是关于这次构建的判据。
+//
+// 写入路径先让文档与 chunk 映射可见、向量随后才落盘，所以构建恰好在这两者之间起跑
+// 时，"要一个还在路上的向量"是合法的。isTransientBuildErr 把裸的 NOT FOUND 读成
+// 确定性失败，一次竞态就退掉整个版本 —— 3+3 集群实测：一个副本的数据还在落盘，它用
+// 暴力扫描回答了查询（§7.4 有意保留的容忍），同一次查询触发了 lazy build，其中一个
+// chunk 的向量读回 NOT FOUND，于是版本被标 FAILED_PERMANENT：包括两个已经建好索引的
+// 副本在内，**任何副本上都不再可查**，直到运维重建。
+//
+// 换成 FailedPrecondition（并保留原文）就把这一例交给 buildWithRetry —— 它在
+// buildRetryTimeout 内等数据落齐，构造函数内注释里"抢在同步前面的构建，重试即可收敛"
+// 说的正是这件事。其余错误码原样保留，确定性失败照旧立刻上报。
+func chunkVectorReadErr(chunkID string, err error) error {
+	if status.Code(err) == codes.NotFound {
+		return fmt.Errorf("index: read chunk vector %s: not stored yet (the data is still landing): %w",
+			chunkID, status.Errorf(codes.FailedPrecondition, "%v", err))
+	}
+	return fmt.Errorf("index: read chunk vector %s: %w", chunkID, err)
+}
+
 func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64, graphFree bool) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), buildRetryTimeout)
 	defer cancel()
@@ -2177,7 +2198,7 @@ func (im *IndexManagerImpl) collectChunkBatches(ctx context.Context, kbID string
 	for _, chunkID := range chunkIDs {
 		v, err := im.readChunkVector(ctx, kbID, chunkID)
 		if err != nil {
-			return nil, 0, fmt.Errorf("index: read chunk vector %s: %w", chunkID, err)
+			return nil, 0, chunkVectorReadErr(chunkID, err)
 		}
 		// 估算该 chunk 在请求中的字节开销：向量(float32) + chunk_id + 字段头。
 		est := 4*len(v) + len(chunkID) + 64

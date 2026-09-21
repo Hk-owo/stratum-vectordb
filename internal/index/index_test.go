@@ -218,6 +218,11 @@ type docSource struct {
 	docs    map[int64][]string   // versionID -> []docID
 	chunks  map[string][]string  // docID -> []chunkID
 	vectors map[string][]float32 // chunkID -> vector
+	// missing counts down the reads of a chunk whose vector has not landed yet:
+	// each read while the counter is positive answers NOT FOUND, the way vecstore
+	// does for a key it does not have yet. Zero (the default) means the vector is
+	// there — this is how a test builds "the build raced the data sync".
+	missing map[string]int
 }
 
 func newDocSource() *docSource {
@@ -225,6 +230,7 @@ func newDocSource() *docSource {
 		docs:    make(map[int64][]string),
 		chunks:  make(map[string][]string),
 		vectors: make(map[string][]float32),
+		missing: make(map[string]int),
 	}
 }
 
@@ -253,6 +259,10 @@ func (d *docSource) ListChunkIDsByDocs(_ context.Context, kbID string, docIDs []
 func (d *docSource) ReadChunkVector(_ context.Context, kbID, chunkID string) ([]float32, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if n := d.missing[chunkID]; n > 0 {
+		d.missing[chunkID] = n - 1
+		return nil, status.Error(codes.NotFound, "NotFound: ")
+	}
 	v, ok := d.vectors[chunkID]
 	if !ok {
 		return nil, fmt.Errorf("chunk %s not found", chunkID)
