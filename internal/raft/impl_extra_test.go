@@ -299,3 +299,51 @@ func TestRaftNodeImpl_SetOnVersionFailedPermanent_FiresOnApply(t *testing.T) {
 		t.Fatal("the terminal verdict must reach the data plane through the apply path")
 	}
 }
+
+// TestRaftNodeImpl_SetOnVersionFailedPermanent_SkipsTheIndexSide: the hook
+// reclaims the version's PHYSICAL data, so an index-side verdict must not reach
+// it. A version with durable data and a dead index is a state §10.1b keeps
+// apart — the data is fine, only a rebuild is missing — and reclaiming its
+// records would destroy what ForceRetryVersion needs. ReclaimTerminalVersions
+// applies the same filter to its startup sweep, and the apply path has to agree
+// with it: otherwise the side is decided in two places with two answers.
+func TestRaftNodeImpl_SetOnVersionFailedPermanent_SkipsTheIndexSide(t *testing.T) {
+	impl, _ := newTestRaftNodeImpl(t)
+	ctx := context.Background()
+
+	called := make(chan int64, 1)
+	impl.SetOnVersionFailedPermanent(func(_ string, versionID int64) {
+		called <- versionID
+	})
+
+	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	versionID, err := impl.ProposeCreateVersion(ctx, "kb-1", 0)
+	if err != nil {
+		t.Fatalf("ProposeCreateVersion: %v", err)
+	}
+	if err := impl.ProposeMarkVersionFailedPermanent(ctx, "kb-1", versionID,
+		types.FailureSideIndex, "every build attempt failed", 5); err != nil {
+		t.Fatalf("ProposeMarkVersionFailedPermanent: %v", err)
+	}
+
+	// The verdict must actually have landed, or "no callback" would pass for the
+	// wrong reason (e.g. nothing was applied at all).
+	v, err := impl.GetVersion(ctx, "kb-1", versionID)
+	if err != nil {
+		t.Fatalf("GetVersion: %v", err)
+	}
+	if v.IndexStatus != types.IndexStatusFailedPermanent {
+		t.Fatalf("index status = %s, want FAILED_PERMANENT: the setup did not land", v.IndexStatus)
+	}
+	if v.DataStatus == types.DataStatusFailedPermanent {
+		t.Fatalf("data status = %s: this case needs a live data side", v.DataStatus)
+	}
+
+	select {
+	case got := <-called:
+		t.Fatalf("index-side verdict fired the data-reclaim hook for v%d", got)
+	case <-time.After(500 * time.Millisecond):
+	}
+}

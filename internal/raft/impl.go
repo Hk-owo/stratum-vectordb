@@ -450,10 +450,19 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 		}()
 	}
 
-	if err == nil && cmd.Type == cmdMarkVersionFailedPermanent && impl.onVersionFailedPermanent != nil {
+	if err == nil && cmd.Type == cmdMarkVersionFailedPermanent &&
+		cmd.FailureSide == types.FailureSideData && impl.onVersionFailedPermanent != nil {
+		// Only the DATA side reaches this hook. Its consumers reclaim the version's
+		// PHYSICAL data, and an index-side verdict says a BUILD failed, not that the
+		// data is gone — a version with durable data and a dead index is exactly the
+		// state §10.1b keeps apart, and reclaiming storage on its behalf would delete
+		// good records that ForceRetryVersion may yet need. This is the same filter
+		// ReclaimTerminalVersions applies to its startup sweep; leaving it out here
+		// made the apply path the one place that ignored the side.
+		//
 		// Asynchronous for the same reason as the notification above: reclaiming a
-		// version's data broadcasts to the other candidates, and a blocked apply loop
-		// would stall every later committed entry.
+		// version's data can block (a local prefix delete, and on a control node a
+		// broadcast), and a blocked apply loop would stall every later committed entry.
 		impl.callbackWG.Add(1)
 		go func() {
 			defer impl.callbackWG.Done()
