@@ -26,6 +26,21 @@ func NewInternalServiceServer(node *RaftNodeImpl) *InternalServiceServer {
 
 var _ pb.InternalServiceServer = (*InternalServiceServer)(nil)
 
+// ListDeletedVersions answers the tombstones this node's state machine holds for
+// one knowledge base — the read a storage node needs to tell "deleted" from
+// "absent" (§7.5, docs/known-gaps.md §B).
+//
+// No leader requirement, unlike Propose: the verdict is replicated state, so any
+// node holding it answers the same thing, and making the caller find the leader
+// would add a redirect hop to a read.
+func (s *InternalServiceServer) ListDeletedVersions(ctx context.Context, req *pb.ListDeletedVersionsRequest) (*pb.ListDeletedVersionsResponse, error) {
+	ids, err := s.node.DeletionsInRange(ctx, req.GetKnowledgeBaseId(), req.GetFromExclusive(), req.GetToInclusive())
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	return &pb.ListDeletedVersionsResponse{VersionIds: ids}, nil
+}
+
 // Propose decodes a forwarded command and runs it through this node's Raft.
 //
 // A node that is not the leader answers with a redirect (leader_id) instead of

@@ -32,7 +32,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	InternalService_Propose_FullMethodName = "/stratum.InternalService/Propose"
+	InternalService_Propose_FullMethodName             = "/stratum.InternalService/Propose"
+	InternalService_ListDeletedVersions_FullMethodName = "/stratum.InternalService/ListDeletedVersions"
 )
 
 // InternalServiceClient is the client API for InternalService service.
@@ -43,6 +44,18 @@ type InternalServiceClient interface {
 	// receiving node must be the leader; a node that is not answers with a
 	// redirect instead of forwarding again, so a forward never chains.
 	Propose(ctx context.Context, in *ProposeRequest, opts ...grpc.CallOption) (*ProposeResponse, error)
+	// ListDeletedVersions answers which versions the replicated metadata has
+	// recorded as REMOVED in a version range — the tombstones of
+	// docs/known-gaps.md §B. Unlike Propose this is a READ: the verdict is
+	// replicated state, so any node holding it answers the same thing, and asking
+	// the caller to find the leader would only add a redirect hop.
+	//
+	// It lives here rather than on a client-facing service because tombstones are
+	// an internal notion: they name versions the public API no longer exposes.
+	// A storage node has no state machine of its own, so this is how it learns
+	// "confirmed deleted" — the fact that separates "reclaim it" from "could not
+	// find out" when it reconciles its own leftovers.
+	ListDeletedVersions(ctx context.Context, in *ListDeletedVersionsRequest, opts ...grpc.CallOption) (*ListDeletedVersionsResponse, error)
 }
 
 type internalServiceClient struct {
@@ -63,6 +76,16 @@ func (c *internalServiceClient) Propose(ctx context.Context, in *ProposeRequest,
 	return out, nil
 }
 
+func (c *internalServiceClient) ListDeletedVersions(ctx context.Context, in *ListDeletedVersionsRequest, opts ...grpc.CallOption) (*ListDeletedVersionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListDeletedVersionsResponse)
+	err := c.cc.Invoke(ctx, InternalService_ListDeletedVersions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternalServiceServer is the server API for InternalService service.
 // All implementations must embed UnimplementedInternalServiceServer
 // for forward compatibility.
@@ -71,6 +94,18 @@ type InternalServiceServer interface {
 	// receiving node must be the leader; a node that is not answers with a
 	// redirect instead of forwarding again, so a forward never chains.
 	Propose(context.Context, *ProposeRequest) (*ProposeResponse, error)
+	// ListDeletedVersions answers which versions the replicated metadata has
+	// recorded as REMOVED in a version range — the tombstones of
+	// docs/known-gaps.md §B. Unlike Propose this is a READ: the verdict is
+	// replicated state, so any node holding it answers the same thing, and asking
+	// the caller to find the leader would only add a redirect hop.
+	//
+	// It lives here rather than on a client-facing service because tombstones are
+	// an internal notion: they name versions the public API no longer exposes.
+	// A storage node has no state machine of its own, so this is how it learns
+	// "confirmed deleted" — the fact that separates "reclaim it" from "could not
+	// find out" when it reconciles its own leftovers.
+	ListDeletedVersions(context.Context, *ListDeletedVersionsRequest) (*ListDeletedVersionsResponse, error)
 	mustEmbedUnimplementedInternalServiceServer()
 }
 
@@ -83,6 +118,9 @@ type UnimplementedInternalServiceServer struct{}
 
 func (UnimplementedInternalServiceServer) Propose(context.Context, *ProposeRequest) (*ProposeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Propose not implemented")
+}
+func (UnimplementedInternalServiceServer) ListDeletedVersions(context.Context, *ListDeletedVersionsRequest) (*ListDeletedVersionsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListDeletedVersions not implemented")
 }
 func (UnimplementedInternalServiceServer) mustEmbedUnimplementedInternalServiceServer() {}
 func (UnimplementedInternalServiceServer) testEmbeddedByValue()                         {}
@@ -123,6 +161,24 @@ func _InternalService_Propose_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _InternalService_ListDeletedVersions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListDeletedVersionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServiceServer).ListDeletedVersions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InternalService_ListDeletedVersions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServiceServer).ListDeletedVersions(ctx, req.(*ListDeletedVersionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // InternalService_ServiceDesc is the grpc.ServiceDesc for InternalService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -133,6 +189,10 @@ var InternalService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Propose",
 			Handler:    _InternalService_Propose_Handler,
+		},
+		{
+			MethodName: "ListDeletedVersions",
+			Handler:    _InternalService_ListDeletedVersions_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

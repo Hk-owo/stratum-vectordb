@@ -20,6 +20,32 @@ service InternalService {
   // receiving node must be the leader; a node that is not answers with a
   // redirect instead of forwarding again, so a forward never chains.
   rpc Propose(ProposeRequest) returns (ProposeResponse);
+
+  // ListDeletedVersions answers which versions the replicated metadata has
+  // recorded as REMOVED in a version range — the tombstones of
+  // docs/known-gaps.md §B. Unlike Propose this is a READ: the verdict is
+  // replicated state, so any node holding it answers the same thing, and asking
+  // the caller to find the leader would only add a redirect hop.
+  //
+  // It lives here rather than on a client-facing service because tombstones are
+  // an internal notion: they name versions the public API no longer exposes.
+  // A storage node has no state machine of its own, so this is how it learns
+  // "confirmed deleted" — the fact that separates "reclaim it" from "could not
+  // find out" when it reconciles its own leftovers.
+  rpc ListDeletedVersions(ListDeletedVersionsRequest) returns (ListDeletedVersionsResponse);
+}
+
+message ListDeletedVersionsRequest {
+  string knowledge_base_id = 1;
+  // The version range to ask about, exclusive on the low side like every other
+  // version read in this system.
+  int64 from_exclusive = 2;
+  int64 to_inclusive = 3;
+}
+
+message ListDeletedVersionsResponse {
+  // version_ids are the removed versions in the requested range, ascending.
+  repeated int64 version_ids = 1;
 }
 
 message ProposeRequest {

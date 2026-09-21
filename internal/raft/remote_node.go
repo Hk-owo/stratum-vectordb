@@ -400,6 +400,32 @@ func (r *RemoteRaftNode) GetVersion(ctx context.Context, kbID string, versionID 
 	return types.VersionMeta{}, stratumerrors.ErrVersionNotFound
 }
 
+// DeletionsInRange implements RaftNode through the internal service (see
+// InternalService.ListDeletedVersions).
+//
+// A storage node has no state machine, so the "confirmed deleted" verdict has to
+// come from the control tier — and without it the reconciler on the node that
+// actually HOLDS the leftovers cannot run at all (docs/known-gaps.md §B). Note
+// this travels the INTERNAL service while the version reads above travel the
+// client-facing one: tombstones name versions the public API no longer exposes,
+// so they must not ride an RPC a client can call.
+func (r *RemoteRaftNode) DeletionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive int64) ([]int64, error) {
+	var out []int64
+	err := r.readAtAnyControl(ctx, func(ctx context.Context, conn *grpc.ClientConn) error {
+		resp, err := pb.NewInternalServiceClient(conn).ListDeletedVersions(ctx, &pb.ListDeletedVersionsRequest{
+			KnowledgeBaseId: kbID,
+			FromExclusive:   fromExclusive,
+			ToInclusive:     toInclusive,
+		})
+		if err != nil {
+			return err
+		}
+		out = resp.GetVersionIds()
+		return nil
+	})
+	return out, kbScopedError(err)
+}
+
 // LastVersionID implements RaftNode. A storage node has no local state machine, and
 // "the highest id" has no narrow form (there is no bound to push down), so this walks
 // the chain. That is acceptable because of WHO calls it: ChainTail answers the leader's
