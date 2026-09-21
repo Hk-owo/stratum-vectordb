@@ -99,6 +99,12 @@ type RaftNodeImpl struct {
 	pendingMu sync.Mutex
 	pending   map[uint64]*pendingProposal
 
+	// settled carries applied entries whose proposer had not registered a waiter
+	// yet — see rememberSettledLocked. Guarded by pendingMu and bounded by
+	// settledResultsLimit (apply indexes are monotonic, so the bound trims by index).
+	settled     map[uint64]settledResult
+	settledSeen uint64 // highest index ever settled (trim watermark)
+
 	// nodeID is this node's own ID, needed to tell "the leader is me" from
 	// "the leader is elsewhere" before forwarding.
 	nodeID int64
@@ -197,6 +203,7 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 		persister:     persister,
 		applyCh:       applyCh,
 		pending:       make(map[uint64]*pendingProposal),
+		settled:       make(map[uint64]settledResult),
 		applyLoopDone: make(chan struct{}),
 	}
 
@@ -422,6 +429,12 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	waiter, ok := impl.pending[msg.Index]
 	if ok {
 		delete(impl.pending, msg.Index)
+	} else {
+		// Nobody is waiting *yet*, and that is normal rather than suspicious:
+		// Propose returns an index before its caller can register a waiter for it,
+		// so the entry can be applied first. Dropping the result here is what made
+		// such a proposal wait for its context (see rememberSettledLocked).
+		impl.rememberSettledLocked(msg.Index, msg.Term, result)
 	}
 	impl.pendingMu.Unlock()
 
@@ -600,6 +613,19 @@ func (impl *RaftNodeImpl) proposeAndWait(ctx context.Context, cmd command) (appl
 
 	resultCh := make(chan applyResult, 1)
 	impl.pendingMu.Lock()
+	// A result may already be waiting here: the entry can be applied before this
+	// goroutine gets as far as registering (see settleApply). Without this check the
+	// apply side would have found no waiter, dropped the result, and this call would
+	// block until ctx — for a caller with no deadline, forever.
+	if s, done := impl.takeSettledLocked(index); done {
+		impl.pendingMu.Unlock()
+		if s.term != term {
+			// Same verdict a registered waiter gets in handleEntryMsg: the entry
+			// committed at this index is a different leader's, not the one proposed.
+			return applyResult{Err: errSuperseded}, nil
+		}
+		return s.res, nil
+	}
 	impl.pending[index] = &pendingProposal{term: term, resultCh: resultCh}
 	impl.pendingMu.Unlock()
 
@@ -612,6 +638,57 @@ func (impl *RaftNodeImpl) proposeAndWait(ctx context.Context, cmd command) (appl
 		impl.pendingMu.Unlock()
 		return applyResult{}, ctx.Err()
 	}
+}
+
+// settledResult is an applied entry's outcome kept for a proposer that has not
+// registered a waiter yet (see rememberSettledLocked). The term travels with it so
+// that registration can apply the same "this index holds another leader's entry"
+// check a registered waiter gets in handleEntryMsg.
+type settledResult struct {
+	term uint64
+	res  applyResult
+}
+
+// settledResultsLimit bounds the settled table. Apply indexes are monotonic, so the
+// table can always be trimmed from the bottom.
+const settledResultsLimit = 1024
+
+// rememberSettledLocked keeps an applied entry for a proposer that is not waiting
+// yet. The caller must hold pendingMu.
+//
+// Why this exists: a proposal's index is known only after Propose returns, and the
+// entry can be applied before the proposer gets back to register its waiter — on a
+// loaded machine that window is wide enough to hit (a 200 ms artificial delay in
+// front of the registration reproduces it every time). Dropping the result there
+// makes the proposal wait for its context instead: it reports a timeout for an
+// entry that WAS committed and applied, i.e. the state changed and the caller was
+// told it did not. On CI this surfaced as internal/raft hitting the package's 180 s
+// timeout, because the suite proposes with context.Background().
+//
+// Also covers the snapshot window: kvraft snapshots at lastApplied, so an index a
+// snapshot just covered was applied before it.
+func (impl *RaftNodeImpl) rememberSettledLocked(index, term uint64, res applyResult) {
+	impl.settled[index] = settledResult{term: term, res: res}
+	if index > impl.settledSeen {
+		impl.settledSeen = index
+	}
+	if len(impl.settled) > settledResultsLimit {
+		cutoff := impl.settledSeen - settledResultsLimit
+		for i := range impl.settled {
+			if i <= cutoff {
+				delete(impl.settled, i)
+			}
+		}
+	}
+}
+
+// takeSettledLocked consumes a settled entry. The caller must hold pendingMu.
+func (impl *RaftNodeImpl) takeSettledLocked(index uint64) (settledResult, bool) {
+	s, ok := impl.settled[index]
+	if ok {
+		delete(impl.settled, index)
+	}
+	return s, ok
 }
 
 func (impl *RaftNodeImpl) ProposeCreateKB(ctx context.Context, kb types.KnowledgeBaseMeta) error {
