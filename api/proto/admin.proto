@@ -113,6 +113,16 @@ message GetSystemStatusResponse {
   // keeps its dead weight forever. The remedy is configuration, which is exactly
   // why it has to be visible rather than silently endured.
   repeated GCBlockedVersion gc_blocked_versions = 9;
+  // reclaim diagnoses the §7.5 reclaim watermark — "which recorded changes may this node
+  // drop" — when it cannot be established at all.
+  //
+  // It exists because that failure is otherwise silent in the other direction: tombstone
+  // pruning and WAL reclamation both simply stop for the knowledge base, and nothing else
+  // reports it. The state is not a fault — the watermark is deliberately conservative, and
+  // a required replica that is merely away holds it still — but it is also not visible
+  // anywhere else, and its remedy (dropping the node from storage.nodes) is a decision an
+  // operator has to make deliberately.
+  ReclaimDiagnostics reclaim = 10;
 }
 
 // GCBlockedVersion is one version whose dead-weight collection is stuck behind
@@ -134,6 +144,46 @@ message GCBlockedVersion {
   // deployment's call, and an operator looking at the age of a stuck version
   // knows better than a constant chosen in this repository.
   int64 blocked_since = 6;
+}
+
+// ReclaimDiagnostics answers "why is the §7.5 reclaim watermark not moving", which the
+// bare absence of a watermark cannot: reclaiming simply stops, and the only other trace
+// is a warning line in the node's log.
+message ReclaimDiagnostics {
+  // judgement_available=false means THIS NODE cannot answer (it is not the control
+  // leader, or no replica topology/aggregate is wired). blocked is then empty because it
+  // is UNKNOWN, not because nothing is blocked — the two fields have to be read together,
+  // or a follower's answer reads as a clean bill of health.
+  bool judgement_available = 1;
+  repeated ReclaimBlockedKB blocked = 2;
+}
+
+// ReclaimBlockedKB is one knowledge base whose watermark cannot be established, with the
+// required replicas that are keeping it that way.
+message ReclaimBlockedKB {
+  string kb_id = 1;
+  repeated ReclaimBlocker blockers = 2;
+}
+
+// ReclaimBlocker is one required replica whose report keeps a knowledge base's watermark
+// unavailable.
+message ReclaimBlocker {
+  int64 node_id = 1;
+  // reason is one of three stable wire names:
+  //   "never_reported"  — it has told the leader nothing at all;
+  //   "no_cursor_for_kb" — it reports, but said nothing about this knowledge base; that
+  //                        is not the same as reporting zero;
+  //   "stale"           — its last report is older than the storage silence window, so its
+  //                        cursor is no longer evidence of what it holds now.
+  string reason = 2;
+  // reached_version is its last reported cursor for the knowledge base; 0 wherever there
+  // is no cursor to quote (never_reported / no_cursor_for_kb).
+  int64 reached_version = 3;
+  // last_report_age_ms is how long ago its last report arrived, in milliseconds, against
+  // the answering node's own clock. Negative means it has never reported. An AGE rather
+  // than a timestamp: the reader wants "how stale", and the two clocks are not guaranteed
+  // to agree.
+  int64 last_report_age_ms = 4;
 }
 
 // GetClusterStatusRequest is empty: the node reports its own view of the

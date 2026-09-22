@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -1207,6 +1208,10 @@ func main() {
 		// verdict is unknown on a node that does not lead, and unknown reports
 		// nothing rather than vouching for storage it cannot see.
 		adminSvc.SetStorageDegradationSource(versionHolderSource{controlPlane})
+		// §7.5: "which required replica is holding this knowledge base's reclaim watermark
+		// still" — the one thing the watermark's own answer cannot carry, and the state
+		// that otherwise stops both pruning and WAL reclamation silently.
+		adminSvc.SetReclaimDiagnosticsSource(reclaimDiagnosticsSource{controlPlane})
 		pb.RegisterQueryServiceServer(grpcServer, querySvc)
 		pb.RegisterAdminServiceServer(grpcServer, adminSvc)
 	} else {
@@ -2485,6 +2490,42 @@ func defaultConfig() appConfig {
 	}
 }
 
+// reclaimDiagnosticsSource adapts the control plane's watermark diagnosis
+// (plane.ReclaimBlocker) to the shape the admin service consumes
+// (service.ReclaimBlockedReplica). It is bridged here for the same reason
+// versionHolderSource bridges the holder types: service does not import plane, so the two
+// type systems meet in this one place.
+//
+// The diagnosis is what turns "the reclaim watermark is unknown" into "node 4 has not
+// reported since…", which is the difference between a stuck knowledge base an operator can
+// act on and one they can only wonder about.
+type reclaimDiagnosticsSource struct {
+	cp *plane.LocalControlPlane
+}
+
+// ReclaimBlockedReplicas reports which required replicas keep kbID's reclaim watermark
+// unavailable, and why.
+//
+// ok=false means this node cannot answer at all (it does not lead): the admin service
+// reports that as "judgement unavailable", never as "nothing is blocked", because those
+// two lead an operator to opposite conclusions.
+func (s reclaimDiagnosticsSource) ReclaimBlockedReplicas(kbID string) ([]service.ReclaimBlockedReplica, bool) {
+	blockers, ok := s.cp.ReclaimBlockers(kbID)
+	if !ok {
+		return nil, false
+	}
+	out := make([]service.ReclaimBlockedReplica, 0, len(blockers))
+	for _, b := range blockers {
+		out = append(out, service.ReclaimBlockedReplica{
+			NodeID:     b.NodeID,
+			Reason:     b.Reason,
+			Reached:    b.Reached,
+			ReportedAt: b.ReportedAt,
+		})
+	}
+	return out, true
+}
+
 // versionHolderSource adapts the control plane's data-version aggregate to the
 // two things the service layer asks of it: which nodes hold a version (§3.1), and
 // whether the storage layer can still meet a write's durability contract (§4.3).
@@ -2645,6 +2686,35 @@ type tombstonePruner interface {
 	ProposePruneTombstones(ctx context.Context, kbID string, throughVersion int64) error
 }
 
+// reclaimDiagnoser is the optional slice of the control plane this loop logs FROM. The
+// parameter's declared type carries only the watermark, so the diagnosis is used where it
+// exists (the real plane) and silently skipped where it does not (a test stub, or a plane
+// assembled without an aggregate) — an operator loses a detail, not the loop.
+type reclaimDiagnoser interface {
+	ReclaimBlockers(kbID string) ([]plane.ReclaimBlocker, bool)
+}
+
+// describeReclaimBlockers renders one knowledge base's blockers for a log line, in the
+// terms an operator acts on: which node, and how long it has been quiet.
+func describeReclaimBlockers(kbID string, blockers []plane.ReclaimBlocker) string {
+	parts := make([]string, 0, len(blockers))
+	for _, b := range blockers {
+		switch b.Reason {
+		case plane.ReclaimBlockerStale:
+			parts = append(parts, fmt.Sprintf("node %d: last report %s ago (cursor %d)",
+				b.NodeID, time.Since(b.ReportedAt).Truncate(time.Second), b.Reached))
+		case plane.ReclaimBlockerNoCursor:
+			parts = append(parts, fmt.Sprintf(
+				"node %d: reports, but never reported a cursor for this knowledge base", b.NodeID))
+		case plane.ReclaimBlockerNeverReported:
+			parts = append(parts, fmt.Sprintf("node %d: has never reported", b.NodeID))
+		default:
+			parts = append(parts, fmt.Sprintf("node %d: %s", b.NodeID, b.Reason))
+		}
+	}
+	return fmt.Sprintf("%s blocked by %s", kbID, strings.Join(parts, "; "))
+}
+
 // runTombstonePruning drops removal records that no node will ask about again (§B).
 //
 // The watermark is ControlPlane.ReclaimableChangesThrough: the slowest REQUIRED
@@ -2677,9 +2747,27 @@ func runTombstonePruning(ctx context.Context, logger *zap.Logger, pruner tombsto
 				logger.Warn("tombstone pruning: list knowledge bases", zap.Error(err))
 				continue
 			}
+			var blocked []string
+			var blockedBy []string
 			for _, kb := range kbs {
 				through, ok := cp.ReclaimableChangesThrough(kb.KBID)
-				if !ok || through <= 0 {
+				if !ok {
+					// The watermark is unavailable, which is the state an operator cannot
+					// otherwise see: pruning AND WAL reclamation are both stuck for this
+					// knowledge base, and nothing else says so. Collected and reported ONCE
+					// per tick — one line per knowledge base per five minutes is how a log
+					// stops being read.
+					blocked = append(blocked, kb.KBID)
+					if d, canDiagnose := cp.(reclaimDiagnoser); canDiagnose {
+						if blockers, ok := d.ReclaimBlockers(kb.KBID); ok {
+							blockedBy = append(blockedBy, describeReclaimBlockers(kb.KBID, blockers))
+						}
+					}
+					continue
+				}
+				// Zero is not "unknown": it is a replica set that holds nothing yet, which is
+				// ordinary on a young cluster and leaves nothing to prune.
+				if through <= 0 {
 					continue
 				}
 				// Ask before proposing: a no-op command on every tick would grow the
@@ -2692,6 +2780,13 @@ func runTombstonePruning(ctx context.Context, logger *zap.Logger, pruner tombsto
 						zap.String("kb_id", kb.KBID), zap.Int64("through_version", through),
 						zap.Error(err))
 				}
+			}
+			if len(blocked) > 0 {
+				logger.Warn("tombstone pruning: reclaim watermark unavailable, so nothing was pruned for these knowledge bases",
+					zap.Int("knowledge_bases", len(blocked)),
+					zap.Strings("kb_ids", blocked),
+					zap.Strings("blocked_by", blockedBy),
+					zap.String("remedy", "drop the node from storage.nodes, or bring it back"))
 			}
 		}
 	}
