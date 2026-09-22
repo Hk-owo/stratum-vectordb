@@ -37,7 +37,6 @@ type fakeControlNode struct {
 	kbErr       error
 	versions    []*pb.VersionInfo
 	versionsErr error
-	deleted     []int64
 	deletedErr  error
 	clusterResp *pb.GetClusterStatusResponse
 
@@ -70,14 +69,6 @@ func (f *fakeControlNode) GetKnowledgeBase(context.Context, *pb.GetKnowledgeBase
 		return nil, f.kbErr
 	}
 	return &pb.GetKnowledgeBaseResponse{KnowledgeBase: f.kbInfo}, nil
-}
-
-// ListDeletedVersions backs RemoteRaftNode.DeletionsInRange.
-func (f *fakeControlNode) ListDeletedVersions(context.Context, *pb.ListDeletedVersionsRequest) (*pb.ListDeletedVersionsResponse, error) {
-	if f.deletedErr != nil {
-		return nil, f.deletedErr
-	}
-	return &pb.ListDeletedVersionsResponse{VersionIds: f.deleted}, nil
 }
 
 func (f *fakeControlNode) ListVersions(_ context.Context, req *pb.ListVersionsRequest) (*pb.ListVersionsResponse, error) {
@@ -511,24 +502,5 @@ func TestRemoteRaftNode_GetVersionReadsOneVersionAndReportsMissing(t *testing.T)
 	control.versionsErr = errors.New("control tier down")
 	if _, err := node.GetVersion(ctx, "kb-1", 2); err == nil {
 		t.Error("GetVersion with an unreachable control tier = nil error, want a failure")
-	}
-}
-
-// TestRemoteRaftNode_DeletionsInRange_AsksTheControlTier pins that a storage node
-// can obtain the "confirmed deleted" verdict at all. Without it the reconciler runs
-// on the node that holds no leftovers (the control node keeps no stores) while the
-// node that holds them has no state machine — the hole docs/known-gaps.md §B
-// describes.
-func TestRemoteRaftNode_DeletionsInRange_AsksTheControlTier(t *testing.T) {
-	control := &fakeControlNode{deleted: []int64{4, 9}}
-	node, cleanup := newRemoteNode(t, map[int64]*fakeControlNode{1: control})
-	defer cleanup()
-
-	got, err := node.DeletionsInRange(proposeCtx(t), "kb-1", 0, 100)
-	if err != nil {
-		t.Fatalf("DeletionsInRange: %v", err)
-	}
-	if len(got) != 2 || got[0] != 4 || got[1] != 9 {
-		t.Errorf("DeletionsInRange = %v, want [4 9]", got)
 	}
 }

@@ -924,8 +924,8 @@ func (impl *RaftNodeImpl) LastVersionID(_ context.Context, kbID string) (int64, 
 // VersionLiveness answers "which of these versions are still alive, and how far has
 // allocation got" for one knowledge base.
 //
-// Not on the RaftNode interface, for the same reason DeletionsInRange is not: its
-// consumers are the readers that judge leftovers, and widening the interface would oblige
+// Not on the RaftNode interface: its consumers are the readers that judge leftovers,
+// and widening the interface would oblige
 // every shape (including a storage node that has no state machine) to answer a question
 // only a state machine can.
 //
@@ -951,60 +951,6 @@ func (impl *RaftNodeImpl) VersionLiveness(_ context.Context, kbID string, fromEx
 		alive = append(alive, id)
 	}
 	return alive, impl.sm.nextVersionID - 1, nil
-}
-
-// HasTombstonesAtOrBelow reports whether pruning kbID at version would drop anything,
-// so the assembly can skip a no-op proposal each tick.
-func (impl *RaftNodeImpl) HasTombstonesAtOrBelow(kbID string, version int64) bool {
-	return impl.sm.hasTombstoneAtOrBelowVersion(kbID, version)
-}
-
-// ProposePruneTombstones drops tombstones at or below throughIndex.
-//
-// Deliberately NOT on the RaftNode interface: the caller is this node's own
-// pruner (and, in tests, the same method), and a storage node has no tombstones
-// to prune — widening the interface would oblige every shape to answer a
-// question only a state machine can.
-func (impl *RaftNodeImpl) ProposePruneTombstones(ctx context.Context, kbID string, throughVersion int64) error {
-	res, err := impl.proposeAndWait(ctx, newPruneTombstonesCommand(kbID, throughVersion))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-// DeletionsInRange returns kbID's version ids in (fromExclusive, toInclusive]
-// whose metadata has been REMOVED — the tombstones this node recorded when it
-// applied the removal.
-//
-// It exists because "not in the metadata" and "confirmed deleted" are different
-// answers, and only the second is safe to act on: a reconciler comparing local
-// leftovers against the control layer must tell "this version is gone, reclaim
-// it" apart from "I could not find out" (docs/known-gaps.md §B/§C). Like
-// ListVersions it reads this node's own state-machine replica, so it costs no
-// Raft round trip.
-//
-// NOT on the RaftNode interface, on purpose: its consumers are control-side
-// readers (the reconciliation §B describes), and a remote shape would have to
-// carry tombstones over the wire — new protocol surface for a reader that does
-// not exist yet. Add it there when a caller actually needs it.
-//
-// The result is sorted so two callers comparing answers see the same order;
-// tombstones are kept in deletion order, which is not id order.
-func (impl *RaftNodeImpl) DeletionsInRange(_ context.Context, kbID string, fromExclusive, toInclusive int64) ([]int64, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	if _, ok := impl.sm.kbs[kbID]; !ok {
-		return nil, stratumerrors.ErrKnowledgeBaseNotFound
-	}
-	out := make([]int64, 0, len(impl.sm.tombstones[kbID]))
-	for _, id := range impl.sm.tombstones[kbID] {
-		if id > fromExclusive && id <= toInclusive {
-			out = append(out, id)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out, nil
 }
 
 // ListKnowledgeBases returns metadata for every knowledge base in the

@@ -32,9 +32,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	InternalService_Propose_FullMethodName             = "/stratum.InternalService/Propose"
-	InternalService_ListDeletedVersions_FullMethodName = "/stratum.InternalService/ListDeletedVersions"
-	InternalService_VersionLiveness_FullMethodName     = "/stratum.InternalService/VersionLiveness"
+	InternalService_Propose_FullMethodName         = "/stratum.InternalService/Propose"
+	InternalService_VersionLiveness_FullMethodName = "/stratum.InternalService/VersionLiveness"
 )
 
 // InternalServiceClient is the client API for InternalService service.
@@ -45,18 +44,6 @@ type InternalServiceClient interface {
 	// receiving node must be the leader; a node that is not answers with a
 	// redirect instead of forwarding again, so a forward never chains.
 	Propose(ctx context.Context, in *ProposeRequest, opts ...grpc.CallOption) (*ProposeResponse, error)
-	// ListDeletedVersions answers which versions the replicated metadata has
-	// recorded as REMOVED in a version range — the tombstones of
-	// docs/known-gaps.md §B. Unlike Propose this is a READ: the verdict is
-	// replicated state, so any node holding it answers the same thing, and asking
-	// the caller to find the leader would only add a redirect hop.
-	//
-	// It lives here rather than on a client-facing service because tombstones are
-	// an internal notion: they name versions the public API no longer exposes.
-	// A storage node has no state machine of its own, so this is how it learns
-	// "confirmed deleted" — the fact that separates "reclaim it" from "could not
-	// find out" when it reconciles its own leftovers.
-	ListDeletedVersions(ctx context.Context, in *ListDeletedVersionsRequest, opts ...grpc.CallOption) (*ListDeletedVersionsResponse, error)
 	// VersionLiveness answers the two facts a "was this version removed?" judgement needs,
 	// from ONE view of the replicated metadata: which versions in a range are still alive,
 	// and the highest id ever allocated.
@@ -67,11 +54,11 @@ type InternalServiceClient interface {
 	// mean REMOVED rather than "I have not got there yet". Reading the two separately could
 	// combine a newer list with an older bound and call a live version gone.
 	//
-	// Neither fact has a lifetime, and that is the difference from ListDeletedVersions
-	// above: a removal record is history that pruning can drop (docs/known-gaps.md §B),
-	// while these are properties of the current state — nothing to keep, nothing to prune,
-	// and no window in which the evidence can disappear. A storage node has no state
-	// machine of its own, so this is how it judges its own leftovers once tombs are gone.
+	// Neither fact has a lifetime, and that is what replaced the removal records this RPC
+	// took the place of: a removal record is history that pruning could drop
+	// (docs/known-gaps.md §B), while these are properties of the current state — nothing to
+	// keep, nothing to prune, and no window in which the evidence can disappear. A storage
+	// node has no state machine of its own, so this is how it judges its own leftovers.
 	VersionLiveness(ctx context.Context, in *VersionLivenessRequest, opts ...grpc.CallOption) (*VersionLivenessResponse, error)
 }
 
@@ -87,16 +74,6 @@ func (c *internalServiceClient) Propose(ctx context.Context, in *ProposeRequest,
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ProposeResponse)
 	err := c.cc.Invoke(ctx, InternalService_Propose_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *internalServiceClient) ListDeletedVersions(ctx context.Context, in *ListDeletedVersionsRequest, opts ...grpc.CallOption) (*ListDeletedVersionsResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ListDeletedVersionsResponse)
-	err := c.cc.Invoke(ctx, InternalService_ListDeletedVersions_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -121,18 +98,6 @@ type InternalServiceServer interface {
 	// receiving node must be the leader; a node that is not answers with a
 	// redirect instead of forwarding again, so a forward never chains.
 	Propose(context.Context, *ProposeRequest) (*ProposeResponse, error)
-	// ListDeletedVersions answers which versions the replicated metadata has
-	// recorded as REMOVED in a version range — the tombstones of
-	// docs/known-gaps.md §B. Unlike Propose this is a READ: the verdict is
-	// replicated state, so any node holding it answers the same thing, and asking
-	// the caller to find the leader would only add a redirect hop.
-	//
-	// It lives here rather than on a client-facing service because tombstones are
-	// an internal notion: they name versions the public API no longer exposes.
-	// A storage node has no state machine of its own, so this is how it learns
-	// "confirmed deleted" — the fact that separates "reclaim it" from "could not
-	// find out" when it reconciles its own leftovers.
-	ListDeletedVersions(context.Context, *ListDeletedVersionsRequest) (*ListDeletedVersionsResponse, error)
 	// VersionLiveness answers the two facts a "was this version removed?" judgement needs,
 	// from ONE view of the replicated metadata: which versions in a range are still alive,
 	// and the highest id ever allocated.
@@ -143,11 +108,11 @@ type InternalServiceServer interface {
 	// mean REMOVED rather than "I have not got there yet". Reading the two separately could
 	// combine a newer list with an older bound and call a live version gone.
 	//
-	// Neither fact has a lifetime, and that is the difference from ListDeletedVersions
-	// above: a removal record is history that pruning can drop (docs/known-gaps.md §B),
-	// while these are properties of the current state — nothing to keep, nothing to prune,
-	// and no window in which the evidence can disappear. A storage node has no state
-	// machine of its own, so this is how it judges its own leftovers once tombs are gone.
+	// Neither fact has a lifetime, and that is what replaced the removal records this RPC
+	// took the place of: a removal record is history that pruning could drop
+	// (docs/known-gaps.md §B), while these are properties of the current state — nothing to
+	// keep, nothing to prune, and no window in which the evidence can disappear. A storage
+	// node has no state machine of its own, so this is how it judges its own leftovers.
 	VersionLiveness(context.Context, *VersionLivenessRequest) (*VersionLivenessResponse, error)
 	mustEmbedUnimplementedInternalServiceServer()
 }
@@ -161,9 +126,6 @@ type UnimplementedInternalServiceServer struct{}
 
 func (UnimplementedInternalServiceServer) Propose(context.Context, *ProposeRequest) (*ProposeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Propose not implemented")
-}
-func (UnimplementedInternalServiceServer) ListDeletedVersions(context.Context, *ListDeletedVersionsRequest) (*ListDeletedVersionsResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ListDeletedVersions not implemented")
 }
 func (UnimplementedInternalServiceServer) VersionLiveness(context.Context, *VersionLivenessRequest) (*VersionLivenessResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method VersionLiveness not implemented")
@@ -207,24 +169,6 @@ func _InternalService_Propose_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
-func _InternalService_ListDeletedVersions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ListDeletedVersionsRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(InternalServiceServer).ListDeletedVersions(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: InternalService_ListDeletedVersions_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(InternalServiceServer).ListDeletedVersions(ctx, req.(*ListDeletedVersionsRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _InternalService_VersionLiveness_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(VersionLivenessRequest)
 	if err := dec(in); err != nil {
@@ -253,10 +197,6 @@ var InternalService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Propose",
 			Handler:    _InternalService_Propose_Handler,
-		},
-		{
-			MethodName: "ListDeletedVersions",
-			Handler:    _InternalService_ListDeletedVersions_Handler,
 		},
 		{
 			MethodName: "VersionLiveness",

@@ -26,28 +26,13 @@ func NewInternalServiceServer(node *RaftNodeImpl) *InternalServiceServer {
 
 var _ pb.InternalServiceServer = (*InternalServiceServer)(nil)
 
-// ListDeletedVersions answers the tombstones this node's state machine holds for
-// one knowledge base — the read a storage node needs to tell "deleted" from
-// "absent" (§7.5, docs/known-gaps.md §B).
-//
-// No leader requirement, unlike Propose: the verdict is replicated state, so any
-// node holding it answers the same thing, and making the caller find the leader
-// would add a redirect hop to a read.
-func (s *InternalServiceServer) ListDeletedVersions(ctx context.Context, req *pb.ListDeletedVersionsRequest) (*pb.ListDeletedVersionsResponse, error) {
-	ids, err := s.node.DeletionsInRange(ctx, req.GetKnowledgeBaseId(), req.GetFromExclusive(), req.GetToInclusive())
-	if err != nil {
-		return nil, stratumerrors.ToGRPCStatus(err)
-	}
-	return &pb.ListDeletedVersionsResponse{VersionIds: ids}, nil
-}
-
 // VersionLiveness answers "which of these versions are still alive, and how far has
 // allocation got" — the liveness read that does not decay. Unlike the tombstones above,
 // neither fact has a lifetime, so pruning cannot take the evidence away
 // (docs/known-gaps.md §B).
 //
-// No leader requirement, for the same reason ListDeletedVersions has none: the fact is
-// replicated state, so any node holding it answers the same thing.
+// No leader requirement, unlike Propose: the fact is replicated state, so any node
+// holding it answers the same thing, and finding the leader would add a redirect hop.
 func (s *InternalServiceServer) VersionLiveness(ctx context.Context, req *pb.VersionLivenessRequest) (*pb.VersionLivenessResponse, error) {
 	alive, lastAllocated, err := s.node.VersionLiveness(ctx, req.GetKnowledgeBaseId(), req.FromExclusive, req.ToInclusive)
 	if err != nil {

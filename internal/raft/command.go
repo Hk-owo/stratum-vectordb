@@ -22,7 +22,6 @@ const (
 	cmdRollback             commandType = "Rollback"
 	cmdMarkVersionDeleting  commandType = "MarkVersionDeleting"
 	cmdRemoveVersionMeta    commandType = "RemoveVersionMeta"
-	cmdPruneTombstones      commandType = "PruneTombstones"
 
 	// cmdMarkVersionFailedPermanent records the control layer's verdict that a
 	// version has spent its retry budget and will not be retried again
@@ -90,18 +89,6 @@ type command struct {
 	// (a reconcile promotion, an availability verdict). Recording a node for
 	// those would make the §8.6(d) service-capacity count lie.
 	NodeID int64 `json:"node_id,omitempty"`
-
-	// cmdPruneTombstones: tombstones for cmd.KBID whose version is at or below
-	// this watermark may be dropped (see applyPruneTombstones).
-	//
-	// The watermark is a VERSION, not a log position, and that is the whole point:
-	// what makes dropping a tombstone safe is that nobody will ask about that
-	// version again — every required replica's DATA cursor has moved past it — not
-	// that the voters have replicated some log entry. A lagging replica, and a
-	// storage node (which is not a Raft member at all), needs the record precisely
-	// while it is behind, so voter positions are the wrong yardstick
-	// (docs/known-gaps.md §B).
-	ThroughVersion int64 `json:"through_version,omitempty"`
 
 	// cmdMarkVersionDeleting: which versions to remove relative to
 	// VersionID (subtree / single-with-splice / ancestors). Zero value
@@ -194,10 +181,6 @@ func newRollbackCommand(kbID string, targetVersionID int64) command {
 
 func newMarkVersionDeletingCommand(kbID string, versionID int64, mode types.VersionDeleteMode) command {
 	return command{Type: cmdMarkVersionDeleting, KBID: kbID, VersionID: versionID, Mode: mode}
-}
-
-func newPruneTombstonesCommand(kbID string, throughVersion int64) command {
-	return command{Type: cmdPruneTombstones, KBID: kbID, ThroughVersion: throughVersion}
 }
 
 func newRemoveVersionMetaCommand(kbID string, versionID int64) command {

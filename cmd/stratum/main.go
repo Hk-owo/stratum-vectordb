@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/signal"
 	"sort"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -1036,9 +1035,8 @@ func main() {
 	// version) and ride the snapshot, so keeping them is the cheap direction — and it is
 	// what makes "delete a version below the watermark" uninteresting rather than a window.
 	//
-	// The mechanism below is kept for now: PruneTombstones still works, it simply has no
-	// caller. Retiring it — the command, the state-machine field, the snapshot field, the
-	// internal read and the tests that drive them — is a separate, purely subtractive change.
+	// The mechanism has since been retired outright: the command, the state-machine field,
+	// the snapshot field, the internal read and the loop that drove them are gone.
 
 	if storageLocal && raftNode != nil {
 		// §10.6's reclaim is a best-effort broadcast: a partitioned or restarting
@@ -2680,123 +2678,4 @@ func totalVersionIDs(leftovers map[string][]int64) int {
 		n += len(ids)
 	}
 	return n
-}
-
-// tombstonePruneInterval is how often the leader asks whether any removal record may
-// be dropped. Slow on purpose: pruning is hygiene, and a row kept a little longer
-// costs a few dozen bytes.
-const tombstonePruneInterval = 5 * time.Minute
-
-// tombstonePruner is the slice of the raft node this loop needs, so the loop reads
-// without dragging the whole node (and can be stubbed).
-type tombstonePruner interface {
-	IsLeader() bool
-	HasTombstonesAtOrBelow(kbID string, version int64) bool
-	ProposePruneTombstones(ctx context.Context, kbID string, throughVersion int64) error
-}
-
-// reclaimDiagnoser is the optional slice of the control plane this loop logs FROM. The
-// parameter's declared type carries only the watermark, so the diagnosis is used where it
-// exists (the real plane) and silently skipped where it does not (a test stub, or a plane
-// assembled without an aggregate) — an operator loses a detail, not the loop.
-type reclaimDiagnoser interface {
-	ReclaimBlockers(kbID string) ([]plane.ReclaimBlocker, bool)
-}
-
-// describeReclaimBlockers renders one knowledge base's blockers for a log line, in the
-// terms an operator acts on: which node, and how long it has been quiet.
-func describeReclaimBlockers(kbID string, blockers []plane.ReclaimBlocker) string {
-	parts := make([]string, 0, len(blockers))
-	for _, b := range blockers {
-		switch b.Reason {
-		case plane.ReclaimBlockerStale:
-			parts = append(parts, fmt.Sprintf("node %d: last report %s ago (cursor %d)",
-				b.NodeID, time.Since(b.ReportedAt).Truncate(time.Second), b.Reached))
-		case plane.ReclaimBlockerNoCursor:
-			parts = append(parts, fmt.Sprintf(
-				"node %d: reports, but never reported a cursor for this knowledge base", b.NodeID))
-		case plane.ReclaimBlockerNeverReported:
-			parts = append(parts, fmt.Sprintf("node %d: has never reported", b.NodeID))
-		default:
-			parts = append(parts, fmt.Sprintf("node %d: %s", b.NodeID, b.Reason))
-		}
-	}
-	return fmt.Sprintf("%s blocked by %s", kbID, strings.Join(parts, "; "))
-}
-
-// runTombstonePruning drops removal records that no node will ask about again (§B).
-//
-// The watermark is ControlPlane.ReclaimableChangesThrough: the slowest REQUIRED
-// replica's DATA cursor, i.e. "every node supposed to hold this knowledge base has
-// moved past that version". That is the right yardstick and a log position is not,
-// because a tombstone's consumers are the nodes that are BEHIND — including storage
-// nodes, which are not Raft members at all. Pruning on voter positions could drop a
-// record just before a recovering node asks for it, and that node would then pull a
-// deleted version: the "success with no records, cursor steps over history it never
-// received" hazard §7.5 fixed.
-//
-// It is idempotent and best-effort: an unreporting replica keeps the watermark where
-// it was, which only ever keeps rows longer.
-func runTombstonePruning(ctx context.Context, logger *zap.Logger, pruner tombstonePruner, cp plane.ControlPlane, meta plane.MetadataLister) {
-	ticker := time.NewTicker(tombstonePruneInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// Only the leader can propose, and only it can judge the watermark
-			// (ReclaimableChangesThrough falls back to a carried-back value elsewhere,
-			// which is fine to skip here: this loop would just run again).
-			if !pruner.IsLeader() {
-				continue
-			}
-			kbs, err := meta.ListKnowledgeBases(ctx)
-			if err != nil {
-				logger.Warn("tombstone pruning: list knowledge bases", zap.Error(err))
-				continue
-			}
-			var blocked []string
-			var blockedBy []string
-			for _, kb := range kbs {
-				through, ok := cp.ReclaimableChangesThrough(kb.KBID)
-				if !ok {
-					// The watermark is unavailable, which is the state an operator cannot
-					// otherwise see: pruning AND WAL reclamation are both stuck for this
-					// knowledge base, and nothing else says so. Collected and reported ONCE
-					// per tick — one line per knowledge base per five minutes is how a log
-					// stops being read.
-					blocked = append(blocked, kb.KBID)
-					if d, canDiagnose := cp.(reclaimDiagnoser); canDiagnose {
-						if blockers, ok := d.ReclaimBlockers(kb.KBID); ok {
-							blockedBy = append(blockedBy, describeReclaimBlockers(kb.KBID, blockers))
-						}
-					}
-					continue
-				}
-				// Zero is not "unknown": it is a replica set that holds nothing yet, which is
-				// ordinary on a young cluster and leaves nothing to prune.
-				if through <= 0 {
-					continue
-				}
-				// Ask before proposing: a no-op command on every tick would grow the
-				// log for nothing on a cluster that deletes rarely.
-				if !pruner.HasTombstonesAtOrBelow(kb.KBID, through) {
-					continue
-				}
-				if err := pruner.ProposePruneTombstones(ctx, kb.KBID, through); err != nil {
-					logger.Warn("tombstone pruning",
-						zap.String("kb_id", kb.KBID), zap.Int64("through_version", through),
-						zap.Error(err))
-				}
-			}
-			if len(blocked) > 0 {
-				logger.Warn("tombstone pruning: reclaim watermark unavailable, so nothing was pruned for these knowledge bases",
-					zap.Int("knowledge_bases", len(blocked)),
-					zap.Strings("kb_ids", blocked),
-					zap.Strings("blocked_by", blockedBy),
-					zap.String("remedy", "drop the node from storage.nodes, or bring it back"))
-			}
-		}
-	}
 }

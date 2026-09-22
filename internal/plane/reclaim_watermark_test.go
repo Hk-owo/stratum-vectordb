@@ -140,8 +140,8 @@ func TestLocalControlPlane_ReclaimWatermarkSingleReplica(t *testing.T) {
 // replica stays away (a swapped disk being rebuilt, a storage node that has not started).
 //
 // What getting this wrong costs is not a stale read but a FROZEN one: tombstone pruning
-// would keep advancing through versions that replica may still ask about, and
-// ReclaimChanges would discard the deltas it needs to catch up.
+// (then still running) would keep advancing through versions that replica may still ask
+// about, and ReclaimChanges would discard the deltas it needs to catch up.
 func TestLocalControlPlane_ReclaimWatermarkLeaderDoesNotFallBackToACarriedBackValue(t *testing.T) {
 	c, reg := reclaimFixture(t, 1, 2)
 	// What a report's response carried back while this node was still a follower: stored,

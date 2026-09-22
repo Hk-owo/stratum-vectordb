@@ -50,22 +50,6 @@ type stateMachine struct {
 	// landed (Stratum_设计文档v13.md §7.12). Entries live exactly as long as
 	// the version metadata they point at.
 	versionsByRequest map[string]int64
-
-	// tombstones records, per knowledge base and in deletion order, the version
-	// ids whose metadata has been removed. It answers the half of §7.5's question
-	// that version numbers cannot: at the storage layer an absent row means BOTH
-	// "empty" and "gone", so only the metadata can tell them apart — and after the
-	// row is gone, only this list can say "confirmed deleted" instead of "not
-	// found" (docs/known-gaps.md §B).
-	//
-	// Deletion order is deterministic across replicas (the same reason versionsByKB
-	// keeps its order), so the state stays byte-identical between nodes and snapshot
-	// comparison stays meaningful. It is never pruned yet, deliberately: pruning only
-	// becomes safe once every node that might need the answer has seen it (the
-	// position-watermark design in docs/known-gaps.md §F), and a pruned tombstone
-	// silently turns "confirmed deleted" back into "not found". Version deletion is
-	// an operator action, so the rows grow slowly.
-	tombstones map[string][]int64
 }
 
 func newStateMachine() *stateMachine {
@@ -75,7 +59,6 @@ func newStateMachine() *stateMachine {
 		versionsByKB:      make(map[string][]int64),
 		nextVersionID:     1,
 		versionsByRequest: make(map[string]int64),
-		tombstones:        make(map[string][]int64),
 	}
 }
 
@@ -125,10 +108,6 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 			delete(sm.versions, versionID)
 		}
 		delete(sm.versionsByKB, cmd.KBID)
-		// The tombstones go with the knowledge base: they exist so a reader can
-		// distinguish "deleted" from "absent" WITHIN a KB, and once the KB itself is
-		// gone there is nothing left to reconcile against (nor anything to leak).
-		delete(sm.tombstones, cmd.KBID)
 		sm.dropRequestMappings(cmd.KBID, 0)
 		return applyResult{}
 
@@ -205,9 +184,6 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 
 	case cmdMarkVersionFailedPermanent:
 		return sm.applyMarkVersionFailedPermanent(cmd)
-
-	case cmdPruneTombstones:
-		return sm.applyPruneTombstones(cmd)
 
 	case cmdRollback:
 		kb, ok := sm.kbs[cmd.KBID]
@@ -675,56 +651,7 @@ func (sm *stateMachine) applyRemoveVersionMeta(cmd command) applyResult {
 			break
 		}
 	}
-	// Record the tombstone: this is the apply that makes "the metadata no longer
-	// has this version" a fact a reader can query later (DeletionsInRange). A
-	// replayed entry returns at the `!ok` check above, so it cannot record a
-	// second row.
-	sm.tombstones[cmd.KBID] = append(sm.tombstones[cmd.KBID], cmd.VersionID)
 	sm.dropRequestMappings(cmd.KBID, cmd.VersionID)
-	return applyResult{}
-}
-
-// hasTombstoneAtOrBelowVersion reports whether pruning kbID at version would drop
-// anything, so the caller does not propose a no-op command on every tick.
-func (sm *stateMachine) hasTombstoneAtOrBelowVersion(kbID string, version int64) bool {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	for _, id := range sm.tombstones[kbID] {
-		if id <= version {
-			return true
-		}
-	}
-	return false
-}
-
-// applyPruneTombstones drops kbID's tombstones at or below cmd.ThroughVersion.
-//
-// Why this is safe to do at all: the caller picks the watermark from the required
-// replicas' DATA cursors — every one of them has reported a contiguous cursor past
-// that version (see ControlPlane.ReclaimableChangesThrough) — so no node that is
-// supposed to hold this knowledge base will ask about it again. A replica that
-// merely could not report keeps the watermark where it was, which only ever keeps a
-// row longer.
-//
-// Determinism: the watermark travels IN the command and this apply reads nothing
-// else; a clock or a peer lookup here would make two replicas disagree.
-// Idempotent: a second run at the same watermark drops nothing.
-func (sm *stateMachine) applyPruneTombstones(cmd command) applyResult {
-	list := sm.tombstones[cmd.KBID]
-	if len(list) == 0 {
-		return applyResult{}
-	}
-	kept := make([]int64, 0, len(list))
-	for _, id := range list {
-		if id > cmd.ThroughVersion {
-			kept = append(kept, id)
-		}
-	}
-	if len(kept) == 0 {
-		delete(sm.tombstones, cmd.KBID)
-		return applyResult{}
-	}
-	sm.tombstones[cmd.KBID] = kept
 	return applyResult{}
 }
 
@@ -911,10 +838,6 @@ type snapshotState struct {
 	VersionsByKB      map[string][]int64
 	NextVersionID     int64
 	VersionsByRequest map[string]int64
-	// Tombstones rides the snapshot so a node that was down when a removal was
-	// applied still learns the version is gone: without it, a tombstone would
-	// vanish for exactly the reader that has no other way to find out.
-	Tombstones map[string][]int64
 }
 
 // deepCopy returns a stable copy of the current state machine under RLock.
@@ -942,17 +865,12 @@ func (sm *stateMachine) deepCopy() snapshotState {
 	for k, v := range sm.versionsByRequest {
 		versionsByRequest[k] = v
 	}
-	tombstones := make(map[string][]int64, len(sm.tombstones))
-	for k, v := range sm.tombstones {
-		tombstones[k] = append([]int64(nil), v...)
-	}
 	return snapshotState{
 		KBs:               kbs,
 		Versions:          versions,
 		VersionsByKB:      versionsByKB,
 		NextVersionID:     sm.nextVersionID,
 		VersionsByRequest: versionsByRequest,
-		Tombstones:        tombstones,
 	}
 }
 
@@ -986,7 +904,6 @@ func (sm *stateMachine) restore(data []byte) error {
 	sm.versionsByKB = snap.VersionsByKB
 	sm.nextVersionID = snap.NextVersionID
 	sm.versionsByRequest = snap.VersionsByRequest
-	sm.tombstones = snap.Tombstones
 	if sm.kbs == nil {
 		sm.kbs = make(map[string]types.KnowledgeBaseMeta)
 	}
@@ -999,11 +916,6 @@ func (sm *stateMachine) restore(data []byte) error {
 	// A snapshot written before the idempotency map existed decodes to nil.
 	if sm.versionsByRequest == nil {
 		sm.versionsByRequest = make(map[string]int64)
-	}
-	// Same for tombstones: a snapshot from before they existed must still leave a
-	// usable map, or the first removal after a restore would write into nil.
-	if sm.tombstones == nil {
-		sm.tombstones = make(map[string][]int64)
 	}
 	return nil
 }
