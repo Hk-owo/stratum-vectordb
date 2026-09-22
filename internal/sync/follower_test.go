@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
+	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 )
 
@@ -569,5 +571,122 @@ func TestFollower_PullVersion_HandshakeBoundDoesNotBoundTheTransfer(t *testing.T
 	docs, err := vd.ListDocIDs(ctx, "kb-slow", 3)
 	if err != nil || len(docs) != 8 {
 		t.Fatalf("version doc list = %v, %v, want the 8 streamed entries", docs, err)
+	}
+}
+
+// stubDocIDSetHash stands in for the replicated metadata's answer to "does this version
+// have documents?".
+type stubDocIDSetHash struct {
+	hash string
+	err  error
+}
+
+func (s stubDocIDSetHash) DocIDSetHash(context.Context, string, int64) (string, error) {
+	return s.hash, s.err
+}
+
+// An empty transfer is ambiguous: a source with no data for a version and a version with
+// no documents are the same stream, reported the same way. It is confirmed against the
+// metadata before the cursor may claim the version, and the failure direction is the one
+// that matters — a cursor moved onto a version this node does not hold is never asked
+// about again (EnsureIndex/FetchVersionData short-circuit on it).
+func TestFollower_PullVersion_EmptyTransferIsConfirmedAgainstTheMetadata(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// The leader holds nothing at all for this version, so what it streams is empty.
+	_, _, addr := startLeaderServer(t, newFakeVecstore())
+
+	newFollower := func(reader VersionDocIDSetHash) (*Follower, *recordingAdvancer) {
+		ds, err := docstore.NewPebbleDocStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ds.Close() })
+		f := NewFollower(ds, chunkdoc.NewMockChunkDocMapper(), versiondoc.NewMockVersionDocList(),
+			chunkstore.NewMockChunkStore(), nil)
+		adv := &recordingAdvancer{}
+		f.SetLocalVersionAdvancer(adv)
+		f.SetVersionDocIDSetHash(reader)
+		return f, adv
+	}
+
+	// The metadata says this version HAS documents: the empty stream is a miss.
+	f, adv := newFollower(stubDocIDSetHash{hash: "not-the-empty-digest"})
+	if err := f.PullVersionData(ctx, addr, "kb-1", 3); err == nil {
+		t.Fatal("an empty transfer for a version the metadata says has documents must fail")
+	}
+	if got := adv.got(); len(got) != 0 {
+		t.Errorf("cursor marked %v from a transfer that delivered nothing", got)
+	}
+
+	// The metadata says it has NONE: the empty set IS its content, and a replica that
+	// pulled it has to report holding it (§9.3(2) refuses one that does not).
+	f2, adv2 := newFollower(stubDocIDSetHash{hash: types.EmptyDocIDSetHash})
+	if err := f2.PullVersionData(ctx, addr, "kb-1", 3); err != nil {
+		t.Fatalf("an empty transfer for an empty version must succeed: %v", err)
+	}
+	if got := adv2.got(); len(got) != 1 || got[0] != "kb-1/3" {
+		t.Errorf("cursor marks = %v, want [kb-1/3]", got)
+	}
+}
+
+// A digest that cannot be read is not a verdict that the version is empty: that would turn
+// the metadata being away into an assertion about the data. The pull fails, so the caller
+// retries.
+func TestFollower_PullVersion_UnreadableDigestFailsTheEmptyTransfer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, _, addr := startLeaderServer(t, newFakeVecstore())
+	ds, err := docstore.NewPebbleDocStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ds.Close() })
+	f := NewFollower(ds, chunkdoc.NewMockChunkDocMapper(), versiondoc.NewMockVersionDocList(),
+		chunkstore.NewMockChunkStore(), nil)
+	adv := &recordingAdvancer{}
+	f.SetLocalVersionAdvancer(adv)
+	f.SetVersionDocIDSetHash(stubDocIDSetHash{err: errors.New("metadata unavailable")})
+
+	if err := f.PullVersionData(ctx, addr, "kb-1", 3); err == nil {
+		t.Fatal("an empty transfer must not be accepted when the digest cannot be read")
+	}
+	if got := adv.got(); len(got) != 0 {
+		t.Errorf("cursor marked %v from an unconfirmed transfer", got)
+	}
+}
+
+// A transfer that DID deliver records asks the metadata nothing: the ambiguity exists only
+// in the empty case, and a reader that would fail the pull if consulted proves it.
+func TestFollower_PullVersion_NonEmptyTransferNeedsNoConfirmation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	leader, _, addr := startLeaderServer(t, newFakeVecstore())
+	if err := leader.versionDoc.Write(ctx, "kb-1", 3, "doc-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.docStore.Write(ctx, "kb-1", "doc-1", 3, []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+
+	ds, err := docstore.NewPebbleDocStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ds.Close() })
+	f := NewFollower(ds, chunkdoc.NewMockChunkDocMapper(), versiondoc.NewMockVersionDocList(),
+		chunkstore.NewMockChunkStore(), nil)
+	adv := &recordingAdvancer{}
+	f.SetLocalVersionAdvancer(adv)
+	f.SetVersionDocIDSetHash(stubDocIDSetHash{err: errors.New("must not be consulted")})
+
+	if err := f.PullVersionData(ctx, addr, "kb-1", 3); err != nil {
+		t.Fatalf("a transfer that delivered records must not be confirmed against the metadata: %v", err)
+	}
+	if got := adv.got(); len(got) != 1 || got[0] != "kb-1/3" {
+		t.Errorf("cursor marks = %v, want [kb-1/3]", got)
 	}
 }

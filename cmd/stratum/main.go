@@ -877,6 +877,10 @@ func main() {
 	// after the plane exists because the follower is built well before it.
 	if syncFollower != nil {
 		syncFollower.SetLocalVersionAdvancer(dataPlane)
+		// An empty transfer is ambiguous — a version with no documents and a source
+		// with no data for it look identical on the wire — and the writer's committed
+		// digest is what tells them apart (see sync.Follower.confirmVersionIsEmpty).
+		syncFollower.SetVersionDocIDSetHash(raft.DocIDSetHashReader{Node: rn})
 	}
 
 	// §7.13.2: the dispatcher picks a write's coordinator and hands it the work.

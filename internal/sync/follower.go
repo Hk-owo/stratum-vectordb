@@ -14,6 +14,8 @@ import (
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
+	stratumerrors "stratum/internal/errors"
+	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 )
 
@@ -40,6 +42,13 @@ type Follower struct {
 	// first — and a filter built before the data arrived is empty, which drops every
 	// search hit (see SetVersionBloom).
 	versionBloom VersionBloomStore
+
+	// docIDSetHash answers the writer's committed document-set digest for a version.
+	// It is the only fact that tells "this version has no documents" apart from "the
+	// source sent nothing for it" — see confirmVersionIsEmpty. Optional, like the
+	// others: without it an empty receive is taken at face value, which is the
+	// behaviour every deployment had before this existed.
+	docIDSetHash VersionDocIDSetHash
 
 	// pullDialTimeout bounds the connection handshake of a pull, and ONLY the
 	// handshake. Zero means DefaultPullDialTimeout. Tests set it to prove the
@@ -86,6 +95,24 @@ func (f *Follower) SetVersionBloom(b VersionBloomStore) {
 	f.versionBloom = b
 }
 
+// VersionDocIDSetHash answers the document-set digest the writer committed for a version
+// (Stratum_设计文档v13.md §7.12). Declared here because it is the one fact the sync paths need
+// from the replicated metadata: an empty receive is only a version with no documents if
+// the writer said so.
+//
+// raft.DocIDSetHashReader adapts any raft.RaftNode onto it — the remote shape included, so
+// a storage node judges its own pulls the same way a voter does.
+type VersionDocIDSetHash interface {
+	DocIDSetHash(ctx context.Context, kbID string, versionID int64) (string, error)
+}
+
+// SetVersionDocIDSetHash wires the metadata read that an empty receive is confirmed
+// against. A setter, following SetLocalVersionAdvancer: the metadata channel is assembled
+// alongside the stores, not before them.
+func (f *Follower) SetVersionDocIDSetHash(r VersionDocIDSetHash) {
+	f.docIDSetHash = r
+}
+
 // rebuildVersionBloom re-derives the version's document filter from the document set
 // that just landed. Best effort: the filter is an accelerator, so a failure costs
 // precision and never correctness — the query path confirms every hit against the
@@ -108,6 +135,37 @@ func (f *Follower) markVersionContiguous(kbID string, versionID int64) {
 	if f.advanceVersion != nil {
 		f.advanceVersion.MarkVersionContiguous(kbID, versionID)
 	}
+}
+
+// confirmVersionIsEmpty checks an EMPTY receive against the replicated metadata: the
+// version counts as empty only if the writer's committed document-set digest says it has
+// no documents.
+//
+// Nothing on the wire separates the two cases — a version with no documents and a source
+// with no data for the version both arrive as an empty stream that reports success — and
+// guessing wrong is one-directional. The cursor would move onto a version this node does
+// not hold, and EnsureIndex/FetchVersionData open with "the cursor is already there,
+// nothing to fetch", so the miss is never retried.
+//
+// A digest that cannot be READ is not read as "empty": that would turn the metadata being
+// away into an assertion about the data, the same mistake one level up. The pull fails
+// instead, so the caller retries — the version is not known to be here either way.
+//
+// No reader wired keeps the previous behaviour: an empty receive is taken at face value.
+func (f *Follower) confirmVersionIsEmpty(ctx context.Context, kbID string, versionID int64) error {
+	if f.docIDSetHash == nil {
+		return nil
+	}
+	hash, err := f.docIDSetHash.DocIDSetHash(ctx, kbID, versionID)
+	if err != nil {
+		return fmt.Errorf("sync: PullVersionData(%s, %d): an empty transfer must be confirmed against the writer's document-set digest, and it could not be read: %w",
+			kbID, versionID, err)
+	}
+	if hash == types.EmptyDocIDSetHash {
+		return nil
+	}
+	return fmt.Errorf("sync: PullVersionData(%s, %d): the source sent no records, but the version's document set is not empty: %w",
+		kbID, versionID, stratumerrors.ErrIndexNotReady)
 }
 
 // DigestOf computes the document-set digest of (kbID, versionID) from this
@@ -205,6 +263,7 @@ func (f *Follower) PullVersionWith(ctx context.Context, leaderAddr string, kbID 
 		return fmt.Errorf("sync: PullVersionData(%s, %d): %w", kbID, versionID, err)
 	}
 
+	received := 0
 	for {
 		entry, err := stream.Recv()
 		if err == io.EOF {
@@ -214,8 +273,19 @@ func (f *Follower) PullVersionWith(ctx context.Context, leaderAddr string, kbID 
 			return fmt.Errorf("sync: recv SyncEntry: %w", err)
 		}
 
+		received++
 		if err := f.applyEntry(ctx, entry); err != nil {
 			return fmt.Errorf("sync: apply %s entry: %w", entry.GetEntryType(), err)
+		}
+	}
+
+	// "The receive completed" is not "this version's records are here". A source that
+	// holds no data for the version answers with an empty stream and reports success —
+	// byte for byte what a version with no documents looks like — so an empty receive
+	// has to be confirmed before the cursor may claim the version.
+	if received == 0 {
+		if err := f.confirmVersionIsEmpty(ctx, kbID, versionID); err != nil {
+			return err
 		}
 	}
 

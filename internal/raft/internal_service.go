@@ -73,6 +73,25 @@ func (s *InternalServiceServer) Propose(ctx context.Context, req *pb.ProposeRequ
 	}, nil
 }
 
+// DocIDSetHashReader adapts any RaftNode's per-version view onto the one fact the sync
+// paths need from the replicated metadata: the document-set digest its writer committed.
+//
+// It exists because an empty data transfer is ambiguous — a version with no documents and
+// a source with no data for the version both arrive as an empty stream that reports
+// success — and the writer's digest is the only thing that separates them (see
+// sync.Follower.confirmVersionIsEmpty). Any RaftNode answers it: a voter reads its own
+// state machine, and a storage node asks the control tier through GetVersion.
+type DocIDSetHashReader struct{ Node RaftNode }
+
+// DocIDSetHash implements sync.VersionDocIDSetHash.
+func (r DocIDSetHashReader) DocIDSetHash(ctx context.Context, kbID string, versionID int64) (string, error) {
+	v, err := r.Node.GetVersion(ctx, kbID, versionID)
+	if err != nil {
+		return "", err
+	}
+	return v.DocIDSetHash, nil
+}
+
 // errorMessage renders err for the wire, or "" when there is nothing to say.
 func errorMessage(err error) string {
 	if err == nil {
