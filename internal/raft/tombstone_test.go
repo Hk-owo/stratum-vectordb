@@ -262,3 +262,76 @@ func TestRaftNodeImpl_PruneTombstones_UsesTheVersionWatermark(t *testing.T) {
 		t.Errorf("HasTombstonesAtOrBelow(kb-1, %d) = true after the rows went", ids[2])
 	}
 }
+
+// TestRaftNodeImpl_PruneTombstones_NewLowRowIsDroppedImmediately pins what pruning
+// does to a tombstone that is BRAND NEW while its version is OLD — the ordinary shape
+// of "delete a historical version after the chain has moved on".
+//
+// It is pinned because the pruning rule has no notion of a row's AGE: the watermark is
+// a version, the rule is "id <= watermark", so a row recorded a moment ago is dropped
+// by the next pass just like one recorded a month ago. That is not by itself a defect —
+// a watermark that high means every required replica has moved past that version, and
+// the row is the answer to a question none of them will ask again.
+//
+// What is easy to assume closed, and is not, is the other side: the judgement "this
+// version was deleted" dies with the row. The readers of that judgement which are NOT
+// required replicas are exactly the ones the watermark never spoke for — a leftover a
+// late push wrote back on a slow replica (push_after_cleanup_test.go), or a node that
+// was offline when the cleanup broadcast went out — and once the row is gone nothing
+// can name their leftovers until the knowledge base itself is dropped
+// (docs/known-gaps.md §B: "the window is the bound").
+//
+// Whoever adds a protection period for rows younger than the watermark should make
+// this case keep the row, and say so here, rather than delete the case.
+func TestRaftNodeImpl_PruneTombstones_NewLowRowIsDroppedImmediately(t *testing.T) {
+	impl, _ := newTestRaftNodeImpl(t)
+	ctx := context.Background()
+
+	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	// Four linked versions: the tail stands for "every required replica's cursor has
+	// reached at least here", which is what the pruning watermark is derived from.
+	ids := createReadyChain(t, impl, ctx, "kb-1", 4)
+	historic := ids[1]
+	tail := ids[len(ids)-1]
+	if !(historic < tail) {
+		t.Fatalf("fixture is wrong: the version to remove (%d) is not below the tail (%d)", historic, tail)
+	}
+
+	// Record the removal: the row is NEW, its version is far below the tail.
+	if _, err := impl.ProposeMarkVersionDeleting(ctx, "kb-1", historic, types.VersionDeleteSingle); err != nil {
+		t.Fatalf("ProposeMarkVersionDeleting: %v", err)
+	}
+	if err := impl.ProposeRemoveVersionMeta(ctx, "kb-1", historic); err != nil {
+		t.Fatalf("ProposeRemoveVersionMeta: %v", err)
+	}
+
+	// While the row is there, "gone" is distinguishable from "never existed" — this is
+	// the pair DeletedVersionLeftovers and the backfill judge from.
+	got, err := impl.DeletionsInRange(ctx, "kb-1", historic-1, historic)
+	if err != nil {
+		t.Fatalf("DeletionsInRange: %v", err)
+	}
+	if len(got) != 1 || got[0] != historic {
+		t.Fatalf("DeletionsInRange = %v, want [%d]: the removal must be recorded", got, historic)
+	}
+
+	// One pruning pass at the watermark the replicas have already reached — what the
+	// next tick of runTombstonePruning proposes — takes the brand-new row with it, and
+	// the pre-check is what makes that pass happen rather than being skipped as a no-op.
+	if !impl.HasTombstonesAtOrBelow("kb-1", tail) {
+		t.Fatalf("HasTombstonesAtOrBelow(kb-1, %d) = false; the row for %d is right there", tail, historic)
+	}
+	if err := impl.ProposePruneTombstones(ctx, "kb-1", tail); err != nil {
+		t.Fatalf("ProposePruneTombstones: %v", err)
+	}
+	got, err = impl.DeletionsInRange(ctx, "kb-1", historic-1, historic)
+	if err != nil {
+		t.Fatalf("DeletionsInRange after pruning: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("DeletionsInRange after pruning = %v, want none: the row had no protection period — "+
+			"if this now keeps the row, pruning grew an age rule and this assertion should be flipped", got)
+	}
+}

@@ -231,6 +231,69 @@ func TestLocalDataPlane_BackfillReplaysWhenExistenceCannotBeRead(t *testing.T) {
 	}
 }
 
+// The mirror image of the case above, and the reason it is worth pinning: an empty
+// answer does not mean "nothing in this gap was removed" — it is also exactly what the
+// caller sees once the removal row is GONE. Pruning drops rows by VERSION with no notion
+// of their age, so a row recorded a moment ago goes as soon as the watermark covers it
+// (internal/raft/tombstone_test.go pins that drop). This node is behind — that is why it
+// is backfilling at all; every REQUIRED replica has moved past v2 — that is why the row
+// was prunable; and the source still serves v2's delta, because a BEGIN record leaves its
+// WAL only once every required replica has reported a cursor past that version.
+//
+// So the deleted version's data is written back onto this node, and nothing is left to
+// name it as removable: the row that would have is exactly what pruning dropped. That is
+// the §B window at its far end — the cost is storage rather than correctness, since the
+// version stays unreachable through the control layer.
+//
+// ⚠️ Pinned as CURRENT behaviour. Whoever gives pruning an age rule, or gives the write
+// path its own existence check, should flip this assertion rather than delete the case.
+func TestLocalDataPlane_BackfillReplaysADeltaOnceTheTombstoneIsPruned(t *testing.T) {
+	tr := &tracer{}
+	puller := &stubPuller{}
+	fetcher := &recordingChangesFetcher{deltas: map[int64]wal.VersionDelta{
+		2: deltaFor(2, 1),
+		3: deltaFor(3, 2),
+	}}
+	// The row for v2 is gone: pruning took it, and the metadata now has nothing to say
+	// about that version.
+	pruned := &stubDeletedVersions{}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		WAL:            &stubWAL{t: tr},
+		Executor:       &stubExecutor{t: tr},
+		Puller:         puller,
+		ChangesFetcher: fetcher,
+		Tombstones:     pruned,
+	})
+	dp.advanceLocalVersion("kb-1", 1)
+
+	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 4); err != nil {
+		t.Fatalf("backfillTo: %v", err)
+	}
+
+	if pruned.calls == 0 {
+		t.Error("the tombstones were never read; this case would then pin nothing about the judgement")
+	}
+	// The deleted version's delta WAS replayed — observable through the transaction
+	// framing every replayed version goes through.
+	replayed := false
+	for _, step := range tr.trace {
+		if step == "commit:2" {
+			replayed = true
+			break
+		}
+	}
+	if !replayed {
+		t.Fatalf("v2 was not replayed (trace %v); if the gap now goes to the full-state path, "+
+			"an absent row grew a meaning and this assertion should be flipped", tr.trace)
+	}
+	if puller.calls != 0 {
+		t.Errorf("full-state transfers = %d, want 0: nothing in the gap was named as removed", puller.calls)
+	}
+	if got := dp.LocalVersionOf("kb-1"); got != 3 {
+		t.Errorf("localVersion = %d, want 3: the cursor stepped over the version that was deleted", got)
+	}
+}
+
 // One read serves both paths. A gap that gives up on deltas and falls back to full
 // records needs the same version set the delta path just consulted, so reading it per
 // path paid for one answer twice — on the path that runs precisely when a version is
