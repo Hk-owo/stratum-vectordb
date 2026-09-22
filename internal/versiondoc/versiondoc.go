@@ -28,6 +28,17 @@ type VersionDocList interface {
 	// than once does not produce duplicate entries on read.
 	Write(ctx context.Context, kbID string, versionID int64, docID string) error
 
+	// WriteMany records that every one of docIDs belongs to versionID within
+	// kbID, in a single durable commit. Same semantics as Write, N times.
+	//
+	// It exists because the write path's version document set is written whole:
+	// one version's full docID set arrives at once, and writing it one Write per
+	// docID meant one durable commit per document. On the 3+3 cluster that made
+	// that step 29% of a version's entire storage write (423 ms of 1.44 s for a
+	// 1,000-document batch), paid twice over because every replica runs the same
+	// transaction.
+	WriteMany(ctx context.Context, kbID string, versionID int64, docIDs []string) error
+
 	// ListDocIDs returns the full set of document IDs belonging to
 	// versionID within kbID, via a kbID+versionID prefix scan.
 	ListDocIDs(ctx context.Context, kbID string, versionID int64) ([]string, error)

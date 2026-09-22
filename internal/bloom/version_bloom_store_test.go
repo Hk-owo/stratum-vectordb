@@ -16,6 +16,11 @@ func (m *mockVdl) Write(_ context.Context, _ string, versionID int64, docID stri
 	return nil
 }
 
+func (m *mockVdl) WriteMany(_ context.Context, _ string, versionID int64, docIDs []string) error {
+	m.docs[versionID] = append(m.docs[versionID], docIDs...)
+	return nil
+}
+
 func (m *mockVdl) ListDocIDs(_ context.Context, _ string, versionID int64) ([]string, error) {
 	return m.docs[versionID], nil
 }

@@ -561,6 +561,18 @@ func buildPriorityName(p BuildPriority) string {
 	return "interactive"
 }
 
+// loggerOrNop returns the configured logger, or a no-op one.
+//
+// Same contract as buildLogger below, for the same reason: a manager built
+// directly (tests do) has no logger, and a nil *zap.Logger panics instead of
+// staying quiet.
+func (im *IndexManagerImpl) loggerOrNop() *zap.Logger {
+	if im.logger == nil {
+		return zap.NewNop()
+	}
+	return im.logger
+}
+
 // buildLogger returns the configured logger, or a no-op one.
 //
 // The same accessor router.Router has, for the same reason: NewIndexManager
@@ -569,10 +581,7 @@ func buildPriorityName(p BuildPriority) string {
 // are emitted on EVERY build, success or failure, so they must not be the thing
 // that turns a logger-less manager into a crash.
 func (im *IndexManagerImpl) buildLogger() *zap.Logger {
-	if im.logger == nil {
-		return zap.NewNop()
-	}
-	return im.logger
+	return im.loggerOrNop()
 }
 
 // SetBuildDataSources wires the three data-source callbacks to real
@@ -630,6 +639,30 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 
 	key := indexKey{kbID, versionID}
 
+	// Per-stage timings of one search, at debug level — the read-path counterpart
+	// of "index: build timings". The service layer's search_us wraps this whole
+	// call; these fields say what it was made of, and where the process boundary
+	// to vecstore sits:
+	//
+	//	load_us        — reopening the artifact from disk (only when not loaded)
+	//	bruteforce_us  — the graph-free scan that answers a small unloaded version
+	//	vecstore_us    — the gRPC round trip to the C++ HNSW search
+	//	empty_check_us — the "documents are here but their chunks are not" probe,
+	//	                 which runs ONLY on an empty result and costs two local reads
+	searchStart := time.Now()
+	var loadDur, bruteforceDur, vecstoreDur, emptyCheckDur time.Duration
+	defer func() {
+		im.loggerOrNop().Debug("index: search timings",
+			zap.String("kb_id", kbID),
+			zap.Int64("version_id", versionID),
+			zap.Int("top_k", topK),
+			zap.Int64("load_us", loadDur.Microseconds()),
+			zap.Int64("bruteforce_us", bruteforceDur.Microseconds()),
+			zap.Int64("vecstore_us", vecstoreDur.Microseconds()),
+			zap.Int64("empty_check_us", emptyCheckDur.Microseconds()),
+			zap.Int64("total_us", time.Since(searchStart).Microseconds()))
+	}()
+
 	// §8.6(d): while this node is collecting the version's artifact — it is
 	// reopened, so it is BUILDING, so the vecstore cannot answer from it — say so
 	// explicitly instead of letting the call fall through to a load that would
@@ -653,12 +686,17 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 	_, loading := im.loading[key]
 	im.mu.Unlock()
 	if !loaded && !loading {
-		if err := im.loadFromDisk(ctx, kbID, versionID); err != nil {
+		loadStart := time.Now()
+		loadErr := im.loadFromDisk(ctx, kbID, versionID)
+		loadDur = time.Since(loadStart)
+		if loadErr != nil {
 			// §8.6b: indexes are built lazily now, so "no index on disk" is a
 			// normal state rather than a failure. A small version is answered
 			// by scanning; a large one falls through to the build below, which
 			// acquire() then waits for.
+			bruteStart := time.Now()
 			answered, results, terr := im.tryBruteForce(ctx, kbID, versionID, vector, topK)
+			bruteforceDur = time.Since(bruteStart)
 			if terr != nil {
 				return nil, terr
 			}
@@ -678,7 +716,9 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 	}
 	defer im.release(key)
 
+	vecstoreStart := time.Now()
 	resp, err := im.vectorIndexClient.Search(ctx, im.searchRequest(kbID, versionID, vector, topK))
+	vecstoreDur = time.Since(vecstoreStart)
 	if err != nil {
 		// Translate the vector store's own classification rather than re-inventing it.
 		// The C++ side already answers a search on a still-building index with
@@ -712,8 +752,11 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 		results[i] = types.SearchResult{ChunkID: r.ChunkId, Score: r.Score}
 	}
 	if len(results) == 0 {
-		if err := im.emptySearchMeansTheDataIsStillLanding(ctx, kbID, versionID); err != nil {
-			return nil, err
+		emptyCheckStart := time.Now()
+		emptyErr := im.emptySearchMeansTheDataIsStillLanding(ctx, kbID, versionID)
+		emptyCheckDur = time.Since(emptyCheckStart)
+		if emptyErr != nil {
+			return nil, emptyErr
 		}
 	}
 	return results, nil

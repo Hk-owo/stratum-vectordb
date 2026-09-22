@@ -41,6 +41,21 @@ func (v *MockVersionDocList) Write(_ context.Context, kbID string, versionID int
 	return nil
 }
 
+func (v *MockVersionDocList) WriteMany(_ context.Context, kbID string, versionID int64, docIDs []string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	set := v.docs[versionKey{kbID, versionID}]
+	if set == nil {
+		set = make(map[string]struct{})
+		v.docs[versionKey{kbID, versionID}] = set
+	}
+	for _, docID := range docIDs {
+		set[docID] = struct{}{}
+	}
+	return nil
+}
+
 func (v *MockVersionDocList) ListDocIDs(_ context.Context, kbID string, versionID int64) ([]string, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()

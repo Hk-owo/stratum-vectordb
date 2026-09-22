@@ -145,6 +145,9 @@ func TestVerifyDocIDSet_StoreError(t *testing.T) {
 type failingVersionDocList struct{}
 
 func (f *failingVersionDocList) Write(context.Context, string, int64, string) error { return nil }
+func (f *failingVersionDocList) WriteMany(context.Context, string, int64, []string) error {
+	return nil
+}
 func (f *failingVersionDocList) ListDocIDs(context.Context, string, int64) ([]string, error) {
 	return nil, errors.New("store down")
 }

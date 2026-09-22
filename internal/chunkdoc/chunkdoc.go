@@ -31,6 +31,16 @@ type ChunkDocMapper interface {
 	// kbID, via a forward-prefix scan. Used by the Query read path.
 	ListDocIDs(ctx context.Context, kbID, chunkID string) ([]string, error)
 
+	// WriteMany records that docID belongs to every one of chunkIDs within kbID,
+	// in a single durable commit. Same semantics as Write, once per chunkID.
+	//
+	// It exists because one document maps to several chunks and the write path
+	// recorded those mappings one at a time — one durable commit per chunk. A
+	// document is the natural batch here: its mapping rows arrive together and are
+	// idempotent, so grouping them is both the smallest safe unit and the one that
+	// removes the per-chunk commit.
+	WriteMany(ctx context.Context, kbID, docID string, chunkIDs []string) error
+
 	// ListChunkIDs returns every chunk ID that has at least one mapping
 	// entry within kbID, via a forward-prefix scan, de-duplicated. Used by
 	// the chunk-existence bloom filter's crash-recovery rebuild and by the

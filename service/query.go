@@ -33,6 +33,12 @@ type QueryServiceImpl struct {
 	docStore       docstore.DocStore
 	vBloomStore    *bloom.VersionBloomStore
 
+	// docSets memoizes version document-ID sets this replica has verified against
+	// the control layer's committed digest, so the O(documents) read behind
+	// doclist_us is paid once per version rather than once per query. See
+	// docSetCache for why a verified set is safe to reuse.
+	docSets docSetCache
+
 	// logger carries the per-stage timings of a query. Debug level and silent by
 	// default: one line per query at info would be noise, while the point is that
 	// this path had no observability at all — localizing the O(candidates ×
@@ -125,7 +131,19 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	qStart := time.Now()
 	var stageSearch, stageFilter, stageRead time.Duration
 	var stageMeta, stageBloom, stageChunkMap time.Duration
-	var candidateCount, matched, chunkMapCalls int
+	// Sub-stages added so every boundary on this path is attributable rather
+	// than inferred by subtraction:
+	//
+	//	active_us      — resolving the active version when the caller names none
+	//	                 (its own control-plane read, which used to run before
+	//	                 metaStart and so was in NO stage)
+	//	doclist_us      — reading the version's document-ID set (inside bloom_us)
+	//	bloom_build_us  — rebuilding/caching the version filter (inside bloom_us)
+	//	filter_cpu_us   — the filtering loop minus chunkmap_us: pure CPU
+	//	agg_us          — aggregation + ranking between filter and read
+	//	read_calls      — how many documents read_us paid for (its denominator)
+	var stageActive, stageDocList, stageBloomBuild, stageAgg time.Duration
+	var candidateCount, matched, chunkMapCalls, readCalls int
 	defer func() {
 		s.logger.Debug("query: stage timings",
 			zap.String("kb_id", kbID),
@@ -133,10 +151,16 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 			zap.Int("candidates", candidateCount),
 			zap.Int("matched_docs", matched),
 			zap.Int("chunkmap_calls", chunkMapCalls),
+			zap.Int("read_calls", readCalls),
+			zap.Int64("active_us", stageActive.Microseconds()),
 			zap.Int64("meta_us", stageMeta.Microseconds()),
 			zap.Int64("bloom_us", stageBloom.Microseconds()),
+			zap.Int64("doclist_us", stageDocList.Microseconds()),
+			zap.Int64("bloom_build_us", stageBloomBuild.Microseconds()),
 			zap.Int64("chunkmap_us", stageChunkMap.Microseconds()),
+			zap.Int64("filter_cpu_us", (stageFilter-stageChunkMap).Microseconds()),
 			zap.Int64("search_us", stageSearch.Microseconds()),
+			zap.Int64("agg_us", stageAgg.Microseconds()),
 			zap.Int64("filter_us", stageFilter.Microseconds()),
 			zap.Int64("read_us", stageRead.Microseconds()),
 			zap.Int64("total_us", time.Since(qStart).Microseconds()))
@@ -231,7 +255,14 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	if req.VersionId != nil {
 		versionID = *req.VersionId
 	} else {
+		// active_us: this is a SECOND control-plane read, taken before meta_us
+		// below and previously inside no stage at all. It only runs when the
+		// caller does not pin a version — which is what the stress suite does —
+		// so on that path the per-query control-plane cost is active_us + meta_us,
+		// not meta_us alone.
+		activeStart := time.Now()
 		kb, err := s.raftNode.GetKB(ctx, kbID)
+		stageActive = time.Since(activeStart)
 		if err != nil {
 			return nil, stratumerrors.ToGRPCStatus(err)
 		}
@@ -365,9 +396,15 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// with an empty set: "the set is unavailable" must not read as "no document is in
 	// this version", which would drop every hit and answer empty.
 	bloomStart := time.Now()
-	ids, idsErr := s.versionDocList.ListDocIDs(ctx, kbID, versionID)
+	// The read behind doclist_us is O(documents) and used to run on every query.
+	// A version's set is immutable once written, so it is memoized — but only
+	// after it hashes to the digest the control layer committed for the version
+	// (targetVersion.DocIDSetHash, already in hand from meta_us). A cache hit is
+	// then equivalent to re-reading the store and verifying it, and a replica
+	// whose data has not arrived is never cached. See docSetCache.
+	ids, vDocs, idsErr := s.docSets.lookup(ctx, s.versionDocList, kbID, versionID, targetVersion.DocIDSetHash)
+	stageDocList = time.Since(bloomStart)
 	var (
-		vDocs     map[string]struct{}
 		vBloom    bloom.BloomFilter
 		vBloomErr error
 	)
@@ -416,11 +453,15 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// the same conservative "cannot confirm, so skip" the per-candidate fetch
 	// had when its own call errored.
 	if idsErr == nil {
-		vDocs = make(map[string]struct{}, len(ids))
-		for _, id := range ids {
-			vDocs[id] = struct{}{}
-		}
+		// bloom_build_us is inside bloom_us: the store's GetForDocuments, which
+		// rebuilds and caches the version filter when the set has changed.
+		// Separated from doclist_us because one is a read of our own storage and
+		// the other is CPU plus its own bookkeeping. The membership map is no
+		// longer built here — docSets.lookup returns it, from the cache when the
+		// set has already been verified.
+		bloomBuildStart := time.Now()
 		vBloom = s.vBloomStore.GetForDocuments(kbID, versionID, ids)
+		stageBloomBuild = time.Since(bloomBuildStart)
 	}
 	stageBloom = time.Since(bloomStart)
 
@@ -429,6 +470,18 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		if r.Score < threshold {
 			continue
 		}
+		// Two passes, and the first one is deliberate.
+		//
+		// This loop was rewritten to consume the mapping as it is decoded — an
+		// IterateDocIDs callback instead of ListDocIDs plus a second walk — on the
+		// theory that the slice and the extra pass were pure overhead. Measured on
+		// the 3+3 cluster at 2,000 and 8,000 documents, it bought nothing: the
+		// closure's captured variables are reached through an indirect load on
+		// every one of the (candidates × documents) iterations, which cost as much
+		// as the allocation it removed. The measurement could not even reproduce a
+		// direction across runs — the same case's p50 moved ±40% between runs, far
+		// more than the effect — so the version that is simpler and has no extra
+		// interface surface is the one that stayed.
 		chunkMapStart := time.Now()
 		docIDs, err := s.chunkDocMapper.ListDocIDs(ctx, kbID, r.ChunkID)
 		stageChunkMap += time.Since(chunkMapStart)
@@ -481,11 +534,15 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// out of `total_us: 22909` on a 2,000-document version, against
 	// `search_us: 389`. Ranking first costs nothing (the scores are already in
 	// memory) and turns O(matched) document reads into O(top_k).
+	// agg_us: aggregation + ranking, between the filter loop and the reads. It was
+	// inside no stage, so it silently inflated total_us − (all named stages).
+	aggStart := time.Now()
 	candidates := make([]scoredDoc, 0, len(docMap))
 	for docID, ds := range docMap {
 		candidates = append(candidates, scoredDoc{docID: docID, score: aggregate(ds.scores, agg)})
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].score > candidates[j].score })
+	stageAgg = time.Since(aggStart)
 
 	// Read content for the winners, stopping as soon as top_k readable documents
 	// are found. A candidate whose content cannot be read is skipped and the next
@@ -497,6 +554,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		if len(results) >= int(req.TopK) {
 			break
 		}
+		readCalls++
 		content, err := s.docStore.ReadAt(ctx, kbID, cand.docID, versionID)
 		if err != nil {
 			continue

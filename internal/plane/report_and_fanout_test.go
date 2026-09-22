@@ -80,7 +80,7 @@ func TestFanOut_EmptyTargetsDependsOnTheReplicaCount(t *testing.T) {
 				logger:          zap.New(core),
 			}
 
-			if err := dp.fanOut(context.Background(), "kb-1", 7, 1); err != nil {
+			if err := dp.fanOut(context.Background(), "kb-1", 7, 1, nil); err != nil {
 				t.Fatalf("fanOut: %v", err)
 			}
 			if n := logs.FilterLevelExact(zap.WarnLevel).Len(); n != tc.wantWarns {

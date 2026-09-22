@@ -122,6 +122,15 @@ func (m *testChunkDocMapper) Write(_ context.Context, kbID, chunkID, docID strin
 	return nil
 }
 
+func (m *testChunkDocMapper) WriteMany(ctx context.Context, kbID, docID string, chunkIDs []string) error {
+	for _, chunkID := range chunkIDs {
+		if err := m.Write(ctx, kbID, chunkID, docID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *testChunkDocMapper) ListDocIDs(_ context.Context, kbID, chunkID string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -189,6 +198,19 @@ func (v *testVersionDocList) Write(_ context.Context, kbID string, versionID int
 		v.data[key] = make(map[string]bool)
 	}
 	v.data[key][docID] = true
+	return nil
+}
+
+func (v *testVersionDocList) WriteMany(_ context.Context, kbID string, versionID int64, docIDs []string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	key := fmt.Sprintf("%s|%d", kbID, versionID)
+	if v.data[key] == nil {
+		v.data[key] = make(map[string]bool)
+	}
+	for _, docID := range docIDs {
+		v.data[key][docID] = true
+	}
 	return nil
 }
 
@@ -279,6 +301,21 @@ func (s *testChunkStore) writtenCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.data)
+}
+
+// existsCallsFor counts how many times the store was asked about chunkID. It is
+// what pins the write path's chunk-presence caching: without it, "how often did
+// we ask the vecstore about this chunk" is not observable.
+func (s *testChunkStore) existsCallsFor(chunkID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, c := range s.existsCalls {
+		if c == chunkID {
+			n++
+		}
+	}
+	return n
 }
 
 // testEmbedClient is a simple deterministic embed client.

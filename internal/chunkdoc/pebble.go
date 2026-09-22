@@ -132,6 +132,34 @@ func (m *PebbleChunkDocMapper) ListDocIDs(_ context.Context, kbID, chunkID strin
 	return docIDs, nil
 }
 
+// WriteMany implements ChunkDocMapper: the forward and reverse entries for one
+// document and all of its chunks, in one batch and one durable commit.
+//
+// Why: a document maps to several chunks, and the write path recorded those
+// mappings one Write per chunk — one durable commit each. The rows for one
+// document arrive together and are idempotent, so batching them is the smallest
+// safe unit, and it is what removes the per-chunk commit.
+func (m *PebbleChunkDocMapper) WriteMany(_ context.Context, kbID, docID string, chunkIDs []string) error {
+	if len(chunkIDs) == 0 {
+		return nil
+	}
+	batch := m.db.NewBatch()
+	defer batch.Close()
+
+	for _, chunkID := range chunkIDs {
+		if err := batch.Set(encodeForwardKey(kbID, chunkID, docID), nil, nil); err != nil {
+			return fmt.Errorf("chunkdoc: WriteMany(%s,%s): forward Set %s: %w", kbID, docID, chunkID, err)
+		}
+		if err := batch.Set(encodeReverseKey(kbID, docID, chunkID), nil, nil); err != nil {
+			return fmt.Errorf("chunkdoc: WriteMany(%s,%s): reverse Set %s: %w", kbID, docID, chunkID, err)
+		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("chunkdoc: WriteMany(%s,%s): commit: %w", kbID, docID, err)
+	}
+	return nil
+}
+
 // ListChunkIDs implements ChunkDocMapper: forward-prefix-scans kbID's
 // entire keyspace (dirForward + kbID) and returns every distinct chunkID,
 // de-duplicated. Consecutive keys sharing a chunkID (same chunk mapped to

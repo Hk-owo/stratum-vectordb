@@ -12,6 +12,7 @@
 | `gateway.sh` | 本地入口：服务站 + 控制台（+ 可选数据库三件套） | `scripts/gateway.sh --with-db` |
 | `update-all.sh` | 全量更新：Go 二进制 + 前端 + 可选 docker 集群 + 重启 | `scripts/update-all.sh --two-tier 3` |
 | `t4-integration.sh` | 跑 T4 Docker 集群集成套件 | `scripts/t4-integration.sh -r 'TestT4_Await'` |
+| `latency-baseline.sh` | 重复测量建基线：查询延迟跑 N 轮，报告分布与「多少轮才分得开」 | `scripts/latency-baseline.sh -n 20` |
 | `ops/*.sh` | 运维 CLI（走控制台的 REST API） | `scripts/ops/kb-list.sh` |
 | `ops/gen-config.py` | 生成/调整节点 YAML 配置（含两层拓扑） | `scripts/ops/gen-config.py --role storage …` |
 

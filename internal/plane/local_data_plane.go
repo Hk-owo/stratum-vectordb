@@ -1265,12 +1265,25 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 	// replicaPushTimeout).
 	writeStart := time.Now()
 	var tAcquire, tLocal, tFanOut, tReport, tConfirm time.Duration
+	// The inside of local_us and fanout_us, reported alongside them. Both are
+	// large enough to dominate a batch write's wall clock — together they were
+	// 98% of a 2,000-document transaction (local p50 1.34 s + fanout p50 1.75 s of
+	// a 3.15 s total) — and both were single opaque numbers. See localStages and
+	// fanoutStages for what each sub-stage is.
+	var local localStages
+	var fan fanoutStages
 	defer func() {
 		d.logger.Debug("write: stage timings",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("changes", len(changes)),
 			zap.Int64("acquire_us", tAcquire.Microseconds()),
 			zap.Int64("local_us", tLocal.Microseconds()),
+			zap.Int64("wal_begin_us", local.walBegin.Microseconds()),
+			zap.Int64("storage_us", local.storage.Microseconds()),
+			zap.Int64("wal_commit_us", local.walCommit.Microseconds()),
 			zap.Int64("fanout_us", tFanOut.Microseconds()),
+			zap.Int64("resolve_us", fan.resolve.Microseconds()),
+			zap.Int64("push_us", fan.push.Microseconds()),
+			zap.Int("fanout_targets", fan.targets),
 			zap.Int64("report_us", tReport.Microseconds()),
 			zap.Int64("confirm_us", tConfirm.Microseconds()),
 			zap.Int64("total_us", time.Since(writeStart).Microseconds()))
@@ -1288,7 +1301,7 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 	defer d.limiter.Release(kbID)
 
 	stepStart = time.Now()
-	docIDs, err := d.writeLocalTransaction(ctx, kbID, versionID, parentVersionID, changes)
+	docIDs, err := d.writeLocalTransaction(ctx, kbID, versionID, parentVersionID, changes, &local)
 	tLocal = time.Since(stepStart)
 	if err != nil {
 		// The storage layer reports that an attempt failed; the control layer
@@ -1300,7 +1313,7 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 	// the version durable (v13 §7.1/§7.2). The version is only "durable" once
 	// enough replicas hold it — the writer's own copy is one acknowledgement.
 	stepStart = time.Now()
-	fanErr := d.fanOut(ctx, kbID, versionID, len(changes))
+	fanErr := d.fanOut(ctx, kbID, versionID, len(changes), &fan)
 	tFanOut = time.Since(stepStart)
 	if fanErr != nil {
 		// The local transaction above already committed: this node holds the
@@ -1642,21 +1655,61 @@ func (d *LocalDataPlane) reportFailure(ctx context.Context, kbID string, version
 	}
 }
 
+// localStages is where one local write transaction's time went, split out of
+// plane's `write: stage timings` local_us.
+//
+// Why it is split: local_us is the second largest stage of a write transaction
+// (p50 1.34 s for a 2,000-document batch, 2.68 s for 8,000) and was a single
+// opaque number covering three unrelated things — write-ahead-log framing on both
+// sides of the storage write, and the storage write itself. Which of them
+// dominates decides what is worth optimising, so they are reported apart.
+type localStages struct {
+	walBegin  time.Duration
+	storage   time.Duration
+	walCommit time.Duration
+}
+
+// fanoutStages is where one fan-out's time went, split out of `write: stage
+// timings` fanout_us: resolving the replica set, then waiting for quorum.
+//
+// targets is the number of replicas asked (this node's own copy excluded), which
+// is what turns "fan-out was slow" into "fan-out waited on N replicas".
+type fanoutStages struct {
+	resolve time.Duration
+	push    time.Duration
+	targets int
+}
+
 // writeLocalTransaction frames and runs this node's half of the write:
 // BEGIN (persisting the replay input) → the per-change storage writes →
-// COMMIT. Returns the version's document-ID set.
-func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) ([]string, error) {
+// COMMIT. Returns the version's document-ID set. st, when non-nil, receives the
+// per-stage split; callers that are not measuring pass nil.
+func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange, st *localStages) ([]string, error) {
 	if d.wal == nil || d.executor == nil {
 		return nil, fmt.Errorf("plane: WriteVersionData: the storage write transaction is not configured")
 	}
-	if err := d.wal.WriteBegin(ctx, kbID, parentVersionID, changes); err != nil {
+	beginStart := time.Now()
+	err := d.wal.WriteBegin(ctx, kbID, parentVersionID, changes)
+	if st != nil {
+		st.walBegin = time.Since(beginStart)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("plane: WriteVersionData: WAL.WriteBegin: %w", err)
 	}
+	storageStart := time.Now()
 	docIDs, err := d.executor.WriteVersionStorage(ctx, kbID, parentVersionID, versionID, changes)
+	if st != nil {
+		st.storage = time.Since(storageStart)
+	}
 	if err != nil {
 		return nil, err
 	}
-	if err := d.wal.WriteCommit(ctx, versionID); err != nil {
+	commitStart := time.Now()
+	err = d.wal.WriteCommit(ctx, versionID)
+	if st != nil {
+		st.walCommit = time.Since(commitStart)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("plane: WriteVersionData: WAL.WriteCommit: %w", err)
 	}
 	d.advanceLocalVersion(kbID, versionID)
@@ -1694,7 +1747,7 @@ func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string,
 func (d *LocalDataPlane) ApplyBackfillChanges(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error {
 	// writeLocalTransaction advances the cursor itself, so there is nothing else to
 	// do here: the version counts as held once its data is in the stores.
-	if _, err := d.writeLocalTransaction(ctx, kbID, versionID, parentVersionID, changes); err != nil {
+	if _, err := d.writeLocalTransaction(ctx, kbID, versionID, parentVersionID, changes, nil); err != nil {
 		return fmt.Errorf("plane: backfill apply %s v%d: %w", kbID, versionID, err)
 	}
 	return nil
@@ -1725,11 +1778,16 @@ const replicaPushTimeout = 3 * time.Second
 // times out on a replica that is doing exactly what it was asked to.
 const pushTimeoutPerDoc = 20 * time.Millisecond
 
-func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int64, docs int) error {
+func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int64, docs int, st *fanoutStages) error {
 	if d.pusher == nil || d.resolveReplicas == nil {
 		return nil // replication not configured: the local write is the quorum
 	}
+	resolveStart := time.Now()
 	targets, err := d.resolveReplicas(ctx)
+	if st != nil {
+		st.resolve = time.Since(resolveStart)
+		st.targets = len(targets)
+	}
 	if err != nil {
 		return fmt.Errorf("plane: fan-out for version %d: resolve replicas: %w", versionID, err)
 	}
@@ -1788,6 +1846,7 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 			pushBudget = left
 		}
 	}
+	pushStart := time.Now()
 	for _, target := range targets {
 		wg.Add(1)
 		go func(target string) {
@@ -1821,6 +1880,9 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 	case <-allDone:
 	case <-ctx.Done():
 		// The caller's own bound expired: report what we have below.
+	}
+	if st != nil {
+		st.push = time.Since(pushStart)
 	}
 
 	mu.Lock()

@@ -195,6 +195,9 @@ func newDeleteTestChunkDocMapper() *deleteTestChunkDocMapper { return &deleteTes
 func (m *deleteTestChunkDocMapper) Write(_ context.Context, kbID, chunkID, docID string) error {
 	return nil
 }
+func (m *deleteTestChunkDocMapper) WriteMany(_ context.Context, kbID, docID string, chunkIDs []string) error {
+	return nil
+}
 func (m *deleteTestChunkDocMapper) ListDocIDs(_ context.Context, kbID, chunkID string) ([]string, error) {
 	return nil, nil
 }
@@ -226,6 +229,9 @@ type deleteTestVersionDocList struct {
 
 func newDeleteTestVersionDocList() *deleteTestVersionDocList { return &deleteTestVersionDocList{} }
 func (v *deleteTestVersionDocList) Write(_ context.Context, kbID string, versionID int64, docID string) error {
+	return nil
+}
+func (v *deleteTestVersionDocList) WriteMany(_ context.Context, kbID string, versionID int64, docIDs []string) error {
 	return nil
 }
 func (v *deleteTestVersionDocList) ListDocIDs(_ context.Context, kbID string, versionID int64) ([]string, error) {

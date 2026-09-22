@@ -67,6 +67,31 @@ func (v *PebbleVersionDocList) Write(_ context.Context, kbID string, versionID i
 	return nil
 }
 
+// WriteMany implements VersionDocList: the whole set in one batch, one commit.
+//
+// Why it exists: writeVersionDocList writes a version's FULL document-ID set, and
+// it used to go in one Write per docID — one durable commit each. On the 3+3
+// cluster that was 0.42 ms per document, 423 ms for a 1,000-document batch, 29% of
+// the version's whole storage write, and every replica pays it because every
+// replica runs the same transaction. The writes are idempotent, so committing the
+// batch again after a partial failure is safe.
+func (v *PebbleVersionDocList) WriteMany(_ context.Context, kbID string, versionID int64, docIDs []string) error {
+	if len(docIDs) == 0 {
+		return nil
+	}
+	batch := v.db.NewBatch()
+	defer batch.Close()
+	for _, docID := range docIDs {
+		if err := batch.Set(encodeVersionDocKey(kbID, versionID, docID), nil, nil); err != nil {
+			return fmt.Errorf("versiondoc: WriteMany(%s,%d): set %s: %w", kbID, versionID, docID, err)
+		}
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("versiondoc: WriteMany(%s,%d): commit: %w", kbID, versionID, err)
+	}
+	return nil
+}
+
 // ListDocIDs implements VersionDocList: prefix-scans by kbID + versionID
 // and returns every document ID belonging to that version.
 func (v *PebbleVersionDocList) ListDocIDs(_ context.Context, kbID string, versionID int64) ([]string, error) {

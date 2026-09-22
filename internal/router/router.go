@@ -447,7 +447,8 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 		// then every node qualifies — routing degrades to round-robin rather
 		// than to refusal.
 		expected, _ := r.ExpectedVersion(kbID)
-		return forwardRead(r, ctx, r.candidates(kbID, expected, n), r.storageBreakers, fn)
+		return forwardRead(r, ctx, readTrace{kbID: kbID, layer: "storage", admission: time.Since(stationStart)},
+			r.candidates(kbID, expected, n), r.storageBreakers, fn)
 	}
 	if isWriteMethod(fullMethod) {
 		// §4.3(1): refuse a write this station already knows cannot reach quorum,
@@ -460,7 +461,8 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 		// forwardWrite reports it alongside its own stages.
 		return forwardWrite(r, ctx, kbID, time.Since(stationStart), fn)
 	}
-	return forwardRead(r, ctx, allIndexes(len(r.controlAddrs)), r.controlBreakers, fn)
+	return forwardRead(r, ctx, readTrace{kbID: kbID, layer: "control", admission: time.Since(stationStart)},
+		allIndexes(len(r.controlAddrs)), r.controlBreakers, fn)
 }
 
 // writeGate refuses a write the routing cache already knows cannot reach quorum
@@ -692,6 +694,15 @@ func (r *Router) observeControl(idx int, err error) {
 	r.controlBreakers[idx].observe(err)
 }
 
+// readTrace carries what forwardRead reports about the station's own share of a
+// read. Grouped rather than passed as three loose parameters so the tests that
+// call forwardRead directly can pass the zero value.
+type readTrace struct {
+	kbID      string
+	layer     string // "storage" or "control"
+	admission time.Duration
+}
+
 // forwardRead runs fn across n nodes of one layer in round-robin order,
 // skipping to the next node when one is unreachable. The first successful
 // response wins.
@@ -699,24 +710,53 @@ func (r *Router) observeControl(idx int, err error) {
 // n is the layer's node count rather than a length read off the Router, because
 // the same helper serves both layers and their client slices are indexed by
 // their own node lists.
-func forwardRead[T any](r *Router, ctx context.Context, candidates []int, breakers []*breaker, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
+func forwardRead[T any](r *Router, ctx context.Context, trace readTrace, candidates []int, breakers []*breaker, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
 	var zero T
+
+	// Per-stage timings of one forwarded read, at debug level — the read-side
+	// counterpart of "router: write forward timings", for the same reason: from
+	// the client's side, a station hop and a slow node look identical, so only
+	// the station can say what it added. admission_us is what the station decided
+	// on its own before asking anyone (credential check + §4.3(1)'s storage gate);
+	// attempt_us is a forwarded RPC and contains the storage node's whole handling
+	// (service/query.go's "query: stage timings", index/impl.go's
+	// "index: search timings") plus the wire. layer says which tier was asked, and
+	// node_index which member of it answered — a read that retried elsewhere is
+	// invisible everywhere but here.
+	start := time.Now()
+	var tAttempt time.Duration
+	attempts, nodeIdx := 0, -1
+	defer func() {
+		r.loggerOrNop().Debug("router: read forward timings",
+			zap.String("kb_id", trace.kbID),
+			zap.String("layer", trace.layer),
+			zap.Int("node_index", nodeIdx),
+			zap.Int("attempts", attempts),
+			zap.Int64("admission_us", trace.admission.Microseconds()),
+			zap.Int64("attempt_us", tAttempt.Microseconds()),
+			zap.Int64("total_us", time.Since(start).Microseconds()))
+	}()
+
 	if len(candidates) == 0 {
 		return zero, errors.New("router: no node can serve this request")
 	}
 	n := len(candidates)
-	start := int(r.rr.Add(1)-1) % n
+	rrStart := int(r.rr.Add(1)-1) % n
 	now := time.Now()
 	admitted := 0
 	for i := 0; i < n; i++ {
-		idx := candidates[(start+i)%n]
+		idx := candidates[(rrStart+i)%n]
 		if idx < len(breakers) && !breakers[idx].allow(now) {
 			continue // sick node: skip it instead of paying its timeout
 		}
 		admitted++
 		attemptCtx, cancel := budgetSlice(ctx, n-i)
+		attemptStart := time.Now()
 		resp, err := fn(idx, attemptCtx)
+		tAttempt += time.Since(attemptStart)
 		cancel()
+		attempts++
+		nodeIdx = idx
 		if idx < len(breakers) {
 			breakers[idx].observe(err)
 		}

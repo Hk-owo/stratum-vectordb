@@ -60,6 +60,15 @@ func (m *MockChunkDocMapper) ListDocIDs(_ context.Context, kbID, chunkID string)
 	return out, nil
 }
 
+func (m *MockChunkDocMapper) WriteMany(ctx context.Context, kbID, docID string, chunkIDs []string) error {
+	for _, chunkID := range chunkIDs {
+		if err := m.Write(ctx, kbID, chunkID, docID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *MockChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
