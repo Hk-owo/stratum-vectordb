@@ -335,3 +335,66 @@ func TestRaftNodeImpl_PruneTombstones_NewLowRowIsDroppedImmediately(t *testing.T
 			"if this now keeps the row, pruning grew an age rule and this assertion should be flipped", got)
 	}
 }
+
+// TestRaftNodeImpl_PruneTombstones_RecordOrderDoesNotProtectALowRow pins that the pruning
+// rule reads ONE dimension: the version number. Where a removal sits in the record order
+// plays no part, so a row recorded a moment ago is treated exactly like one recorded long
+// before it — including when its version is BELOW the watermark, which is the ordinary
+// shape of "delete a historical version after the chain has moved on".
+//
+// The fixture makes the two orders disagree on purpose: the row with the HIGH version is
+// recorded FIRST, the row with the LOW version SECOND. Pruning at the low version's own
+// value therefore keeps the older (higher) row and drops the newer (lower) one — the
+// opposite of what any order-aware rule would do.
+//
+// This is the case a positional guard changes, and it changes it only for a while. "Keep
+// the last N rows and prune only the head of the queue" postpones this outcome: once N more
+// removals push the low row out of that window, the version test decides again and the row
+// goes. Position pins a WINDOW; it does not protect a ROW — which is why the case is pinned
+// rather than assumed closed. Whoever implements a positional rule (a tail window, or an id
+// with per-replica progress) should FLIP this assertion — the low row must then survive —
+// rather than delete the case.
+func TestRaftNodeImpl_PruneTombstones_RecordOrderDoesNotProtectALowRow(t *testing.T) {
+	impl, _ := newTestRaftNodeImpl(t)
+	ctx := context.Background()
+
+	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	ids := createReadyChain(t, impl, ctx, "kb-1", 10)
+	vHigh, vLow := ids[8], ids[2]
+
+	remove := func(versionID int64) {
+		t.Helper()
+		if _, err := impl.ProposeMarkVersionDeleting(ctx, "kb-1", versionID, types.VersionDeleteSingle); err != nil {
+			t.Fatalf("ProposeMarkVersionDeleting(%d): %v", versionID, err)
+		}
+		if err := impl.ProposeRemoveVersionMeta(ctx, "kb-1", versionID); err != nil {
+			t.Fatalf("ProposeRemoveVersionMeta(%d): %v", versionID, err)
+		}
+	}
+
+	// Recorded in the opposite order to their versions.
+	remove(vHigh)
+	remove(vLow)
+	if got := impl.sm.tombstones["kb-1"]; len(got) != 2 || got[0] != vHigh || got[1] != vLow {
+		t.Fatalf("tombstones = %v, want [%d %d]: the later removal must be the later entry",
+			got, vHigh, vLow)
+	}
+
+	// Prune at the LOW version's own value: the version test keeps everything above it and
+	// drops everything at or below it.
+	if err := impl.ProposePruneTombstones(ctx, "kb-1", vLow); err != nil {
+		t.Fatalf("ProposePruneTombstones: %v", err)
+	}
+	got, err := impl.DeletionsInRange(ctx, "kb-1", 0, 1<<40)
+	if err != nil {
+		t.Fatalf("DeletionsInRange: %v", err)
+	}
+	if len(got) != 1 || got[0] != vHigh {
+		t.Fatalf("DeletionsInRange = %v, want only [%d]: the row recorded FIRST (version %d, above "+
+			"the watermark) must survive while the one recorded LAST (version %d, at the "+
+			"watermark) goes — under the current rule, record order decides nothing",
+			got, vHigh, vHigh, vLow)
+	}
+}
