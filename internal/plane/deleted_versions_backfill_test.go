@@ -242,3 +242,104 @@ func TestLocalDataPlane_NoExistenceCheckerKeepsOldBehaviour(t *testing.T) {
 		t.Errorf("full-state pulls = %v, want none", puller.dataPulls)
 	}
 }
+
+// A full-state transfer that delivers NOTHING is still reported as success, and this
+// pins what that costs.
+//
+// Nothing on the way down can tell "the source has no data for this version" from
+// "this version is empty": the sync layer streams no entries for either and returns
+// nil (TestLeaderHandler_EmptyVersion in internal/sync pins the empty case), and
+// PullVersionData is not asked to distinguish them. transferFullState then registers
+// the whole range as accounted and moves the cursor onto versionID — a version this
+// node does not hold.
+//
+// The second half is what makes it stick: FetchVersionData opens with "cursor >=
+// versionID → nothing to fetch", so a node whose cursor was moved this way never goes
+// back for the version it is missing.
+//
+// This is the UNWIRED path. With a cursorQuerier wired, pickTransferSource refuses a
+// source that does not hold versionID before the transfer is attempted (see
+// TestLocalDataPlane_FullStateTransferRequiresASourceHoldingTheSnapshot), so the empty
+// transfer below is unreachable that way. What stays pinned here is the case where there
+// is nobody to ask: the caller's default source is then the only one there is, and the
+// cursor check is still what would hide the miss.
+func TestLocalDataPlane_FullStateTransferThatDeliversNothingStillAdvancesTheCursor(t *testing.T) {
+	// The puller records the pull and writes nothing — what a source with no data for
+	// that version produces.
+	puller := &snapshotPuller{}
+	deleted := &stubDeletedVersions{deleted: []int64{3}}
+	dp := deletedBackfillPlane(puller, deleted)
+	dp.advanceLocalVersion("kb-1", 2)
+
+	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 5); err != nil {
+		t.Fatalf("backfillTo: %v", err)
+	}
+	if len(puller.dataPulls) != 1 || puller.dataPulls[0] != 5 {
+		t.Fatalf("full-state pulls = %v, want [5]", puller.dataPulls)
+	}
+
+	// Nothing was delivered, yet the cursor claims v5.
+	if got := dp.LocalVersionOf("kb-1"); got != 5 {
+		t.Fatalf("localVersion = %d, want 5 (the transfer counts as accounted for)", got)
+	}
+
+	// And the node will not ask for v5 again: the cursor check returns first.
+	puller.dataPulls = nil
+	if err := dp.FetchVersionData(context.Background(), "kb-1", 5); err != nil {
+		t.Fatalf("FetchVersionData: %v", err)
+	}
+	if len(puller.dataPulls) != 0 {
+		t.Errorf("full-state pulls after the cursor moved = %v, want none: "+
+			"FetchVersionData short-circuits on the cursor, so nothing goes back for v5",
+			puller.dataPulls)
+	}
+}
+
+// A full-state transfer hands over versionID itself, so its source must HOLD versionID.
+// The gap's own source selection (need = versionID-1) deliberately admits a replica that
+// stops one version short — and that replica is precisely the one with no data for it.
+// Letting the wire answer is not an option: an empty stream reports success and is
+// indistinguishable from an empty version, so the node would move its cursor onto a
+// version it does not hold and never ask again.
+func TestLocalDataPlane_FullStateTransferRequiresASourceHoldingTheSnapshot(t *testing.T) {
+	puller := &sourceRecordingPuller{}
+	// peer-b reaches the gap (v4) but not the version being applied (v5).
+	querier := &stubQuerier{cursors: map[string]int64{"peer-b": 4}}
+	dp := newSourcePlane(puller, []string{"peer-b"}, querier)
+	dp.liveness = &stubDeletedVersions{deleted: []int64{3}}
+	dp.advanceLocalVersion("kb-1", 2)
+
+	err := dp.backfillTo(context.Background(), "leader", "kb-1", 5)
+	if err == nil {
+		t.Fatal("the transfer must fail: no replica holds v5")
+	}
+	if len(puller.versions) != 0 {
+		t.Errorf("pulls = %v from %v, want none: a source with no data for v5 answers with an empty stream",
+			puller.versions, puller.sources)
+	}
+	// The point of failing rather than transferring anyway: the cursor stays put, so the
+	// retry this node will need once v5's data lands somewhere is still available.
+	if got := dp.localVersionOf("kb-1"); got != 2 {
+		t.Errorf("cursor = %d, want 2 (unchanged: nothing was obtained)", got)
+	}
+}
+
+// And when a replica DOES hold the snapshot version, the transfer goes to that replica
+// rather than to the default source.
+func TestLocalDataPlane_FullStateTransferUsesAReplicaHoldingTheSnapshot(t *testing.T) {
+	puller := &sourceRecordingPuller{}
+	querier := &stubQuerier{cursors: map[string]int64{"peer-b": 5}}
+	dp := newSourcePlane(puller, []string{"peer-b"}, querier)
+	dp.liveness = &stubDeletedVersions{deleted: []int64{3}}
+	dp.advanceLocalVersion("kb-1", 2)
+
+	if err := dp.backfillTo(context.Background(), "leader", "kb-1", 5); err != nil {
+		t.Fatalf("backfillTo: %v", err)
+	}
+	if len(puller.versions) != 1 || puller.versions[0] != 5 {
+		t.Fatalf("pulled versions = %v, want [5] (the snapshot)", puller.versions)
+	}
+	if len(puller.sources) != 1 || puller.sources[0] != "peer-b" {
+		t.Errorf("pull sources = %v, want [peer-b] (the replica holding v5)", puller.sources)
+	}
+}

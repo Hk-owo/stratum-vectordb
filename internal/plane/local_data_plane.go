@@ -1087,7 +1087,23 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 			// §6.4: the version is confirmed gone (a middle version may be
 			// deleted), so its records exist nowhere and the gap cannot be filled
 			// version by version. Fall back to a full-state transfer.
-			return d.transferFullState(ctx, source, kbID, local, versionID, v)
+			//
+			// Its source is chosen for versionID and NOT for the gap. The transfer
+			// hands over the version being APPLIED, and a replica whose cursor stops
+			// at versionID-1 — exactly what the gap's own need admits — holds no data
+			// for it. Such a replica answers with an empty stream, which the sync
+			// layer reports as success and cannot tell apart from a version that is
+			// genuinely empty (Follower.PullVersionWith advances the cursor on any
+			// completed receive, including one that carried nothing), so transferring
+			// from it would move this node's cursor onto a version it does not hold —
+			// and "the cursor says the data landed" is what every later fetch is
+			// short-circuited by. Failing here instead keeps the retry available.
+			holder, ok := d.pickTransferSource(ctx, kbID, versionID, source)
+			if !ok {
+				return fmt.Errorf("plane: backfill %s: v%d was deleted and no replica holds v%d to transfer its state from: %w",
+					kbID, v, versionID, stratumerrors.ErrIndexNotReady)
+			}
+			return d.transferFullState(ctx, holder, kbID, local, versionID, v)
 		}
 		if err := d.puller.PullVersion(ctx, source, kbID, v); err != nil {
 			return fmt.Errorf("plane: backfill %s v%d from %s (local cursor %d): %w", kbID, v, source, local, err)
@@ -1101,7 +1117,13 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 // It runs only when a version in the gap is CONFIRMED deleted by the metadata, never
 // on a transport failure or an unreadable topology: those are "I could not find
 // out", and the answer to them stays "abort the apply" rather than "silently skip".
-// That distinction is the whole reason the metadata records removals.
+// That distinction is the whole reason the gap's versions are judged from the
+// replicated state instead of from the storage layer's absent rows.
+//
+// Its source must HOLD the snapshot version — the caller picks it with pickTransferSource
+// for exactly that reason. An empty answer is reported as a successful transfer and looks
+// identical to a version that is genuinely empty, so a source that merely reaches the gap
+// would move this node's cursor onto a version it does not have.
 //
 // The node transfers ONE whole version's state and moves its cursor straight to it.
 // The version it transfers is versionID — the version being applied — and NOT
@@ -1242,6 +1264,60 @@ func (d *LocalDataPlane) pickBackfillSource(ctx context.Context, kbID string, ne
 		}
 	}
 	return fallback
+}
+
+// pickTransferSource returns a replica whose contiguous cursor already reaches need, and
+// whether one exists. Candidates are the resolved replicas plus the caller's own default
+// source, which may be a replica resolveReplicas does not list.
+//
+// It deliberately has NO fallback, unlike pickBackfillSource: a full-state transfer asks
+// for the version being applied, and "the default source" is not evidence that anyone
+// holds it. When nothing does, the caller must fail rather than transfer from a replica
+// that will answer with an empty stream — on the wire, "this source has no data for that
+// version" and "that version has no data" are the same thing.
+//
+// An unwired cursorQuerier leaves the caller's source as the only one there is. That is
+// the pre-existing behaviour for a plane assembled without one, and it keeps those
+// deployments and tests working unchanged.
+func (d *LocalDataPlane) pickTransferSource(ctx context.Context, kbID string, need int64, also string) (string, bool) {
+	if d.cursorQuerier == nil {
+		if also == "" {
+			return "", false
+		}
+		return also, true
+	}
+	candidates := make([]string, 0, 4)
+	if d.resolveReplicas != nil {
+		if peers, err := d.resolveReplicas(ctx); err == nil {
+			candidates = append(candidates, peers...)
+		}
+	}
+	if also != "" {
+		candidates = append(candidates, also)
+	}
+	seen := make(map[string]bool, len(candidates))
+	for _, peer := range candidates {
+		if peer == "" || seen[peer] {
+			continue
+		}
+		seen[peer] = true
+		// Bounded for the same reason as pickBackfillSource's query: this can run
+		// while a peer is not serving yet, and an unbounded wait would turn a source
+		// choice into a hang.
+		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
+		cancel()
+		if err != nil {
+			continue
+		}
+		if cursor >= need {
+			d.logger.Info("plane: full-state transfer source selected",
+				zap.String("peer", peer), zap.String("kb_id", kbID),
+				zap.Int64("need_version", need), zap.Int64("peer_cursor", cursor))
+			return peer, true
+		}
+	}
+	return "", false
 }
 
 // Search runs a vector query against versionID's index.
