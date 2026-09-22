@@ -753,19 +753,19 @@ func main() {
 		Logger: logger,
 	})
 
-	// §B/§C: the tombstones live in the state machine, so only a node that HAS one
-	// can judge "this version was deleted". A storage node's RaftNode is remote and
-	// does not provide them; the reconciler then reports that it cannot run rather
-	// than guessing — a guessed verdict is what kept §B unbuilt.
-	var tombstones plane.DeletionLister
-	if dl, ok := rn.(plane.DeletionLister); ok {
-		tombstones = dl
+	// §B/§C: the "is this version gone?" judgement reads CURRENT state from wherever the
+	// metadata lives — the state machine on a node that has one, the control tier through
+	// the internal service on a storage node — so both shapes judge the same way, and
+	// neither depends on a removal record that pruning can drop.
+	var liveness plane.VersionLivenessLister
+	if lv, ok := rn.(plane.VersionLivenessLister); ok {
+		liveness = lv
 	}
 
 	dataPlane = plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
 		IndexManager:  indexMgr,
 		LocalVersions: vd,
-		Tombstones:    tombstones,
+		Liveness:      liveness,
 		Puller:        syncFollower,
 		WAL:           walImpl,
 		// §7.8/docs/cursor-persistence-plan.md §3: the cursor is persisted in the
@@ -999,7 +999,7 @@ func main() {
 		// the leftover that no metadata-keyed path can name. The scan is read-only
 		// and always runs, so the problem becomes VISIBLE; reclaiming is opt-in
 		// because it is irreversible and runs once per start-up.
-		if tombstones != nil {
+		if liveness != nil {
 			if cfg.ReconcileDeletedVersions {
 				reclaimed, err := dataPlane.ReconcileDeletedVersions(ctx, rn)
 				if err != nil {

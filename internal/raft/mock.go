@@ -524,6 +524,29 @@ func (r *MockRaftNode) DeletionsInRange(_ context.Context, kbID string, fromExcl
 	return out, nil
 }
 
+// VersionLiveness mirrors the real node's answer: the versions in the range that are
+// still alive, plus the allocation counter — both from one lock hold, since the two must
+// agree (see RaftNodeImpl.VersionLiveness).
+func (r *MockRaftNode) VersionLiveness(_ context.Context, kbID string, fromExclusive, toInclusive *int64) ([]int64, int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.kbs[kbID]; !ok {
+		return nil, 0, stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	ids := r.versionsByKB[kbID]
+	alive := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if fromExclusive != nil && id <= *fromExclusive {
+			continue
+		}
+		if toInclusive != nil && id > *toInclusive {
+			break
+		}
+		alive = append(alive, id)
+	}
+	return alive, r.nextVersionID - 1, nil
+}
+
 // ProposeDiscardVersion implements RaftNode.
 //
 // The mock mirrors the state machine's compare-and-set so service-level tests

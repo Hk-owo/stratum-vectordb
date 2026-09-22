@@ -24,8 +24,10 @@ func (s *stubLocalVersions) ListVersions(_ context.Context, kbID string) ([]int6
 
 var _ LocalVersionLister = (*stubLocalVersions)(nil)
 
-// stubDeletions serves the tombstones and records the range it was asked about,
-// so a case can pin that the question is narrowed to what this node holds.
+// stubDeletions answers the current-state liveness read: `deleted` is the set of ids the
+// metadata handed out and no longer has, so everything else up to the bound is alive. It
+// records the range it was asked about, so a case can pin that the question is narrowed to
+// what this node holds.
 type stubDeletions struct {
 	deleted map[string][]int64
 	err     error
@@ -33,22 +35,45 @@ type stubDeletions struct {
 	to      []int64
 }
 
-func (s *stubDeletions) DeletionsInRange(_ context.Context, kbID string, fromExclusive, toInclusive int64) ([]int64, error) {
-	s.from = append(s.from, fromExclusive)
-	s.to = append(s.to, toInclusive)
-	if s.err != nil {
-		return nil, s.err
+func (s *stubDeletions) VersionLiveness(_ context.Context, kbID string, fromExclusive, toInclusive *int64) ([]int64, int64, error) {
+	if fromExclusive != nil {
+		s.from = append(s.from, *fromExclusive)
 	}
-	var out []int64
+	if toInclusive != nil {
+		s.to = append(s.to, *toInclusive)
+	}
+	if s.err != nil {
+		return nil, 0, s.err
+	}
+	bound := int64(0)
 	for _, id := range s.deleted[kbID] {
-		if id > fromExclusive && id <= toInclusive {
-			out = append(out, id)
+		if id > bound {
+			bound = id
 		}
 	}
-	return out, nil
+	if toInclusive != nil && *toInclusive > bound {
+		bound = *toInclusive
+	}
+	removed := make(map[int64]bool, len(s.deleted[kbID]))
+	for _, id := range s.deleted[kbID] {
+		removed[id] = true
+	}
+	alive := make([]int64, 0, bound)
+	for id := int64(1); id <= bound; id++ {
+		if fromExclusive != nil && id <= *fromExclusive {
+			continue
+		}
+		if toInclusive != nil && id > *toInclusive {
+			break
+		}
+		if !removed[id] {
+			alive = append(alive, id)
+		}
+	}
+	return alive, bound, nil
 }
 
-var _ DeletionLister = (*stubDeletions)(nil)
+var _ VersionLivenessLister = (*stubDeletions)(nil)
 
 // failingOnceDropper fails its first call and succeeds afterwards, so a case can
 // pin that one stuck reclaim does not stop the rest.
@@ -69,7 +94,7 @@ func (d *failingOnceDropper) DropVersionStorage(_ context.Context, kbID string, 
 func reconcileFixture(local *stubLocalVersions, del *stubDeletions, dropper VersionDataDropper) *LocalDataPlane {
 	return NewLocalDataPlane(LocalDataPlaneConfig{
 		LocalVersions: local,
-		Tombstones:    del,
+		Liveness:      del,
 		DataDropper:   dropper,
 	})
 }
@@ -84,7 +109,7 @@ func kbList(ids ...string) *stubMeta {
 
 // TestLocalDataPlane_ReconcileDeletedVersions_ReclaimsWhatTheTombstonesName is the
 // happy path: a version this node still holds, which the control layer has recorded
-// as deleted, gets reclaimed — and the question put to the tombstones is narrowed
+// as deleted, gets reclaimed — and the question put to the liveness read is narrowed
 // to the range this node actually covers.
 func TestLocalDataPlane_ReconcileDeletedVersions_ReclaimsWhatTheTombstonesName(t *testing.T) {
 	local := &stubLocalVersions{versions: map[string][]int64{"kb-1": {1, 2, 3, 9}}}
@@ -103,12 +128,12 @@ func TestLocalDataPlane_ReconcileDeletedVersions_ReclaimsWhatTheTombstonesName(t
 		t.Errorf("drops = %v, want [kb-1/2]", dropper.dropped)
 	}
 	if len(del.from) != 1 || del.from[0] != 0 || del.to[0] != 9 {
-		t.Errorf("tombstone range = (%v, %v], want (0, 9] (this node's own coverage)", del.from, del.to)
+		t.Errorf("liveness range = (%v, %v], want (0, 9] (this node's own coverage)", del.from, del.to)
 	}
 }
 
 // A knowledge base this node holds nothing for is skipped without even asking for
-// tombstones: there is nothing to reclaim, and the question would be wasted.
+// the liveness read: there is nothing to reclaim, and the question would be wasted.
 func TestLocalDataPlane_ReconcileDeletedVersions_SkipsKnowledgeBasesItHoldsNothingFor(t *testing.T) {
 	local := &stubLocalVersions{versions: map[string][]int64{}}
 	del := &stubDeletions{deleted: map[string][]int64{"kb-1": {2}}}
@@ -119,7 +144,7 @@ func TestLocalDataPlane_ReconcileDeletedVersions_SkipsKnowledgeBasesItHoldsNothi
 		t.Fatalf("ReconcileDeletedVersions: %v", err)
 	}
 	if len(del.from) != 0 {
-		t.Errorf("tombstones were asked about a knowledge base this node holds nothing for: %v", del.from)
+		t.Errorf("the liveness read was asked about a knowledge base this node holds nothing for: %v", del.from)
 	}
 	if len(dropper.dropped) != 0 {
 		t.Errorf("drops = %v, want none", dropper.dropped)
@@ -144,11 +169,11 @@ func TestLocalDataPlane_ReconcileDeletedVersions_SkipsWhenTheLocalListFails(t *t
 		t.Errorf("reclaimed = %d, drops = %v, want nothing reclaimed", reclaimed, dropper.dropped)
 	}
 	if len(del.from) != 0 {
-		t.Errorf("tombstones should not be consulted for a knowledge base whose local list failed")
+		t.Errorf("the liveness read should not be consulted for a knowledge base whose local list failed")
 	}
 }
 
-// The same for the tombstones: a verdict that could not be read is not a verdict.
+// The same for the liveness read: a verdict that could not be read is not a verdict.
 // This is the distinction §B exists for, so the case is pinned explicitly.
 func TestLocalDataPlane_ReconcileDeletedVersions_SkipsWhenTheTombstonesFail(t *testing.T) {
 	local := &stubLocalVersions{versions: map[string][]int64{"kb-1": {1, 2}}}
@@ -158,7 +183,7 @@ func TestLocalDataPlane_ReconcileDeletedVersions_SkipsWhenTheTombstonesFail(t *t
 
 	reclaimed, err := dp.ReconcileDeletedVersions(context.Background(), kbList("kb-1"))
 	if err == nil {
-		t.Fatal("unreadable tombstones must be reported, not treated as an empty verdict")
+		t.Fatal("an unreadable liveness answer must be reported, not treated as an empty verdict")
 	}
 	if reclaimed != 0 || len(dropper.dropped) != 0 {
 		t.Errorf("reclaimed = %d, drops = %v, want nothing reclaimed", reclaimed, dropper.dropped)
@@ -194,7 +219,7 @@ func TestLocalDataPlane_ReconcileDeletedVersions_ReportsWhenNotWired(t *testing.
 		DataDropper: &stubDropper{},
 	})
 	if _, err := dp.ReconcileDeletedVersions(context.Background(), kbList("kb-1")); err == nil {
-		t.Fatal("a reconciler with no tombstone source must report that it cannot run")
+		t.Fatal("a reconciler with no liveness source must report that it cannot run")
 	}
 }
 
@@ -229,7 +254,7 @@ func TestLocalDataPlane_DeletedVersionLeftovers_SurfacesReadFailures(t *testing.
 
 	leftovers, err := dp.DeletedVersionLeftovers(context.Background(), kbList("kb-1"))
 	if err == nil {
-		t.Fatal("an unreadable tombstone source must be reported")
+		t.Fatal("an an unreadable liveness source must be reported")
 	}
 	if len(leftovers) != 0 {
 		t.Errorf("leftovers = %v, want none (the verdict could not be read)", leftovers)

@@ -11,30 +11,57 @@ import (
 // not per-version lookups: the whole point of the set-returning shape is that a long
 // gap costs one read.
 type stubDeletedVersions struct {
-	// deleted lists the version ids the metadata has recorded as REMOVED.
+	// deleted lists the version ids the metadata handed out and no longer has.
 	deleted []int64
-	err     error
-	calls   int
+	// lastAllocated overrides the allocation bound; 0 means "derive it from the range and
+	// the removed ids".
+	lastAllocated int64
+	err           error
+	calls         int
 	// gotFrom / gotTo record the range asked about, so a test can pin "it asked about
 	// its gap" rather than merely "it asked".
 	gotFrom, gotTo int64
 }
 
-func (s *stubDeletedVersions) DeletionsInRange(_ context.Context, _ string, fromExclusive, toInclusive int64) ([]int64, error) {
+func (s *stubDeletedVersions) VersionLiveness(_ context.Context, _ string, fromExclusive, toInclusive *int64) ([]int64, int64, error) {
 	s.calls++
-	s.gotFrom, s.gotTo = fromExclusive, toInclusive
+	if fromExclusive != nil {
+		s.gotFrom = *fromExclusive
+	}
+	if toInclusive != nil {
+		s.gotTo = *toInclusive
+	}
 	if s.err != nil {
-		return nil, s.err
+		return nil, 0, s.err
+	}
+	bound := s.lastAllocated
+	for _, id := range s.deleted {
+		if id > bound {
+			bound = id
+		}
+	}
+	if toInclusive != nil && *toInclusive > bound {
+		bound = *toInclusive
+	}
+	removed := make(map[int64]bool, len(s.deleted))
+	for _, id := range s.deleted {
+		removed[id] = true
 	}
 	// Narrowed like the real one: a stub answering everything would let a caller
 	// read outside its gap without any test noticing.
-	out := make([]int64, 0, len(s.deleted))
-	for _, id := range s.deleted {
-		if id > fromExclusive && id <= toInclusive {
-			out = append(out, id)
+	alive := make([]int64, 0, bound)
+	for id := int64(1); id <= bound; id++ {
+		if fromExclusive != nil && id <= *fromExclusive {
+			continue
+		}
+		if toInclusive != nil && id > *toInclusive {
+			break
+		}
+		if !removed[id] {
+			alive = append(alive, id)
 		}
 	}
-	return out, nil
+	return alive, bound, nil
 }
 
 // snapshotPuller records the two transfer paths separately, so a test can tell
@@ -57,9 +84,9 @@ func (p *snapshotPuller) PullVersionData(_ context.Context, _, _ string, version
 }
 
 // existenceBackfillPlane wires a cursor plane with a metadata stub.
-func deletedBackfillPlane(puller VersionPuller, deleted DeletionLister) *LocalDataPlane {
+func deletedBackfillPlane(puller VersionPuller, deleted VersionLivenessLister) *LocalDataPlane {
 	dp := newCursorPlane(puller)
-	dp.deletions = deleted
+	dp.liveness = deleted
 	return dp
 }
 

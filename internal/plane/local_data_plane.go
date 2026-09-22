@@ -159,7 +159,7 @@ type LocalDataPlane struct {
 	puller          VersionPuller
 	changesFetcher  VersionChangesFetcher
 	localVersions   LocalVersionLister
-	deletions       DeletionLister
+	liveness        VersionLivenessLister
 	verify          DataVerifier
 	resolve         SourceResolver
 	wal             TransactionWAL
@@ -310,15 +310,16 @@ type LocalDataPlaneConfig struct {
 	// a backfill can replay the delta instead of pulling every version in full
 	// (v13 §7.5). Optional: without it backfill always transfers full records.
 	ChangesFetcher VersionChangesFetcher
-	// LocalVersions enumerates the versions this node holds documents for, and
-	// Tombstones says which ones the control layer has recorded as deleted. Both are
-	// what the deleted-version reconciliation needs (§10.6/§B); the tombstones are
-	// also the judgement the backfill asks for above.
+	// LocalVersions enumerates the versions this node holds documents for, and Liveness
+	// answers which of them are still alive (plus how far allocation got). Both are what
+	// the deleted-version reconciliation needs (§10.6/§B), and the liveness read is also
+	// the judgement the backfill asks for above.
 	//
-	// Tombstones is nil only where no state machine is reachable; the backfill and the
-	// reconciler then report that they cannot judge, rather than guessing.
+	// Liveness is nil only where no state machine is reachable (and no control tier to ask
+	// it questions); the backfill and the reconciler then report that they cannot judge,
+	// rather than guessing.
 	LocalVersions LocalVersionLister
-	Tombstones    DeletionLister
+	Liveness      VersionLivenessLister
 	// ResolveReplicas lists the *other* replicas that should hold a written
 	// version. Nil (or an empty list) means "no replication": the local write
 	// is the whole quorum — the single-node and test default. It doubles as
@@ -389,7 +390,7 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		puller:           cfg.Puller,
 		changesFetcher:   cfg.ChangesFetcher,
 		localVersions:    cfg.LocalVersions,
-		deletions:        cfg.Tombstones,
+		liveness:         cfg.Liveness,
 		verify:           cfg.Verify,
 		resolve:          cfg.Resolve,
 		wal:              cfg.WAL,
@@ -1010,27 +1011,35 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 	// is logged once instead of once per path.
 	var deleted map[int64]bool
 	var deletedErr error
-	if d.deletions != nil {
-		// The judgement is "which of these versions was REMOVED" — asked of the
-		// metadata tombstones and of nothing else. The older shape of this check asked
-		// which versions still exist and inferred the rest: it answers the same thing
-		// inside a gap, but it pays for every version it enumerates and cannot say WHY
-		// one is absent — a distinction §7.5 needs, and only a removal record makes it
-		// (docs/known-gaps.md §B).
+	if d.liveness != nil {
+		// The judgement is "which of these versions is GONE" — asked of the CURRENT state:
+		// alive-in-range plus how far allocation got. An id at or below lastAllocated that
+		// is not alive was handed out and is gone, and THAT answer cannot be pruned away
+		// (docs/known-gaps.md §B). The older shape asked for a removal record instead, and
+		// a removal record has a lifetime: once pruning drops it, the gap reads as "nothing
+		// was removed" and the deleted version is replayed.
 		//
-		// The gap is (local, versionID), and that is exactly what is asked for: the
-		// bounds travel to the control layer and narrow the ANSWER. A failed read is
-		// carried rather than resolved here, because the two paths answer it
-		// differently (see below).
-		var ids []int64
-		ids, deletedErr = d.deletions.DeletionsInRange(ctx, kbID, local, versionID-1)
+		// The gap is (local, versionID), and that is exactly what is asked for: the bounds
+		// travel to the control layer and narrow both the answer and the cost. A failed read
+		// is carried rather than resolved here, because the two paths answer it differently
+		// (see below).
+		from, to := local, versionID-1
+		var alive []int64
+		var lastAllocated int64
+		alive, lastAllocated, deletedErr = d.liveness.VersionLiveness(ctx, kbID, &from, &to)
 		if deletedErr == nil {
-			deleted = make(map[int64]bool, len(ids))
-			for _, id := range ids {
-				deleted[id] = true
+			aliveSet := make(map[int64]bool, len(alive))
+			for _, id := range alive {
+				aliveSet[id] = true
+			}
+			deleted = make(map[int64]bool)
+			for v := local + 1; v < versionID; v++ {
+				if v <= lastAllocated && !aliveSet[v] {
+					deleted[v] = true
+				}
 			}
 		} else {
-			d.logger.Warn("plane: backfill cannot read which versions were deleted",
+			d.logger.Warn("plane: backfill cannot read the liveness of the versions in the gap",
 				zap.String("kb_id", kbID), zap.Int64("from_version", local),
 				zap.Int64("to_version", versionID-1), zap.Error(deletedErr))
 		}

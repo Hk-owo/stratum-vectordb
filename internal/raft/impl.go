@@ -921,6 +921,38 @@ func (impl *RaftNodeImpl) LastVersionID(_ context.Context, kbID string) (int64, 
 	return ids[len(ids)-1], nil
 }
 
+// VersionLiveness answers "which of these versions are still alive, and how far has
+// allocation got" for one knowledge base.
+//
+// Not on the RaftNode interface, for the same reason DeletionsInRange is not: its
+// consumers are the readers that judge leftovers, and widening the interface would oblige
+// every shape (including a storage node that has no state machine) to answer a question
+// only a state machine can.
+//
+// Both facts come from ONE lock hold, because they must agree: "id <= lastAllocated" is
+// what proves this view has already applied that id's allocation, so only then does "and
+// it is not alive" mean removed rather than "not seen yet".
+func (impl *RaftNodeImpl) VersionLiveness(_ context.Context, kbID string, fromExclusive, toInclusive *int64) ([]int64, int64, error) {
+	impl.sm.mu.RLock()
+	defer impl.sm.mu.RUnlock()
+	if _, ok := impl.sm.kbs[kbID]; !ok {
+		return nil, 0, stratumerrors.ErrKnowledgeBaseNotFound
+	}
+	// versionsByKB is in allocation order, so the range can be walked once and cut short.
+	ids := impl.sm.versionsByKB[kbID]
+	alive := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if fromExclusive != nil && id <= *fromExclusive {
+			continue
+		}
+		if toInclusive != nil && id > *toInclusive {
+			break
+		}
+		alive = append(alive, id)
+	}
+	return alive, impl.sm.nextVersionID - 1, nil
+}
+
 // HasTombstonesAtOrBelow reports whether pruning kbID at version would drop anything,
 // so the assembly can skip a no-op proposal each tick.
 func (impl *RaftNodeImpl) HasTombstonesAtOrBelow(kbID string, version int64) bool {

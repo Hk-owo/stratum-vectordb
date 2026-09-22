@@ -41,6 +41,24 @@ func (s *InternalServiceServer) ListDeletedVersions(ctx context.Context, req *pb
 	return &pb.ListDeletedVersionsResponse{VersionIds: ids}, nil
 }
 
+// VersionLiveness answers "which of these versions are still alive, and how far has
+// allocation got" — the liveness read that does not decay. Unlike the tombstones above,
+// neither fact has a lifetime, so pruning cannot take the evidence away
+// (docs/known-gaps.md §B).
+//
+// No leader requirement, for the same reason ListDeletedVersions has none: the fact is
+// replicated state, so any node holding it answers the same thing.
+func (s *InternalServiceServer) VersionLiveness(ctx context.Context, req *pb.VersionLivenessRequest) (*pb.VersionLivenessResponse, error) {
+	alive, lastAllocated, err := s.node.VersionLiveness(ctx, req.GetKnowledgeBaseId(), req.FromExclusive, req.ToInclusive)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	return &pb.VersionLivenessResponse{
+		AliveVersionIds:      alive,
+		LastAllocatedVersion: lastAllocated,
+	}, nil
+}
+
 // Propose decodes a forwarded command and runs it through this node's Raft.
 //
 // A node that is not the leader answers with a redirect (leader_id) instead of

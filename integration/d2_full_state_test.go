@@ -16,15 +16,38 @@ import (
 	"stratum/internal/types"
 )
 
-// d2DeletedStub answers "which versions were REMOVED" from a fixed list. It stands in
-// for the metadata's removal record (docs/known-gaps.md §B): that record — not an
-// existence set the caller has to interpret — is what makes a gap unfillable.
+// d2DeletedStub answers the liveness read from a fixed "these ids are gone" list — the
+// metadata's CURRENT state (docs/known-gaps.md §B). "Gone" is what makes a gap unfillable,
+// and unlike the removal record this replaced, nothing can prune it away.
 type d2DeletedStub struct {
 	deleted []int64
 }
 
-func (s *d2DeletedStub) DeletionsInRange(context.Context, string, int64, int64) ([]int64, error) {
-	return s.deleted, nil
+func (s *d2DeletedStub) VersionLiveness(_ context.Context, _ string, fromExclusive, toInclusive *int64) ([]int64, int64, error) {
+	bound := int64(0)
+	removed := make(map[int64]bool, len(s.deleted))
+	for _, id := range s.deleted {
+		removed[id] = true
+		if id > bound {
+			bound = id
+		}
+	}
+	if toInclusive != nil && *toInclusive > bound {
+		bound = *toInclusive
+	}
+	alive := make([]int64, 0, bound)
+	for id := int64(1); id <= bound; id++ {
+		if fromExclusive != nil && id <= *fromExclusive {
+			continue
+		}
+		if toInclusive != nil && id > *toInclusive {
+			break
+		}
+		if !removed[id] {
+			alive = append(alive, id)
+		}
+	}
+	return alive, bound, nil
 }
 
 // d2Executor flags it if the incremental replay path ever runs. This case is about
@@ -172,8 +195,8 @@ func TestRealStack_BackfillFallsBackToFullStateTransfer(t *testing.T) {
 		// path rather than the fallback.
 		Verify: func(context.Context, string, int64) bool { return true },
 		// The metadata records v3 as removed.
-		Tombstones: &d2DeletedStub{deleted: []int64{v3}},
-		Logger:     zap.NewNop(),
+		Liveness: &d2DeletedStub{deleted: []int64{v3}},
+		Logger:   zap.NewNop(),
 	})
 
 	// Step 1: bring the follower's cursor to v2 so the gap that follows is a real

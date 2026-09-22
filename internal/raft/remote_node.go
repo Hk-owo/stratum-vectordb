@@ -426,6 +426,32 @@ func (r *RemoteRaftNode) DeletionsInRange(ctx context.Context, kbID string, from
 	return out, kbScopedError(err)
 }
 
+// VersionLiveness implements the liveness read through the internal service (see
+// InternalService.VersionLiveness).
+//
+// It travels the INTERNAL service for the same reason DeletionsInRange does: it names
+// versions the public API no longer exposes, and what it replaces is exactly a tombstone
+// read. One call answers both facts, so a storage node cannot combine a newer live list
+// with an older allocation bound and mistake a live version for a removed one.
+func (r *RemoteRaftNode) VersionLiveness(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]int64, int64, error) {
+	var alive []int64
+	var lastAllocated int64
+	err := r.readAtAnyControl(ctx, func(ctx context.Context, conn *grpc.ClientConn) error {
+		resp, err := pb.NewInternalServiceClient(conn).VersionLiveness(ctx, &pb.VersionLivenessRequest{
+			KnowledgeBaseId: kbID,
+			FromExclusive:   fromExclusive,
+			ToInclusive:     toInclusive,
+		})
+		if err != nil {
+			return err
+		}
+		alive = resp.GetAliveVersionIds()
+		lastAllocated = resp.GetLastAllocatedVersion()
+		return nil
+	})
+	return alive, lastAllocated, kbScopedError(err)
+}
+
 // LastVersionID implements RaftNode. A storage node has no local state machine, and
 // "the highest id" has no narrow form (there is no bound to push down), so this walks
 // the chain. That is acceptable because of WHO calls it: ChainTail answers the leader's
