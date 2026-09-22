@@ -1049,8 +1049,6 @@ func main() {
 		// broadcast, travels the Raft log — so let every node learn it from its own
 		// apply and join the same bounded, idempotent reclaim queue.
 		raftNode.SetOnVersionFailedPermanent(dataPlane.NoteTerminalVersion)
-		// Its own cadence, not §10.6's: this one only ever touches local storage.
-		dataPlane.StartTerminalReclaims(ctx)
 
 		raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
 			// §7.5: as of this apply the version EXISTS, whether or not this node
@@ -1089,6 +1087,18 @@ func main() {
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
 			}
 		})
+	}
+
+	// The reclaim retry loop is deliberately NOT inside the block above. It only
+	// ever touches this node's own storage, so it belongs wherever there IS local
+	// storage — and a storage node is exactly where reclaims get queued: with no
+	// Raft it never runs the block above, yet `ReclaimTerminalVersions` queues its
+	// startup sweep and being the failure detector queues reclaims in flight.
+	// Leaving the loop on the raftNode condition gave that shape a queue with
+	// producers and no consumer: a failed local reclaim was never retried until
+	// the next restart.
+	if storageLocal {
+		dataPlane.StartTerminalReclaims(ctx)
 	}
 
 	// §7.13.2: only a node that leads AT APPLY TIME dispatches (see
