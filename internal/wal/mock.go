@@ -140,6 +140,55 @@ func (w *MockWAL) WriteDeleteComplete(_ context.Context, kbID string) error {
 	return nil
 }
 
+// DeleteByKB implements WAL: it drops kbID's records from the in-memory log and trims
+// the matching idempotency state, mirroring FileWAL's rewrite (see that method for why
+// the deletion flow needs this at all).
+func (w *MockWAL) DeleteByKB(_ context.Context, kbID string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	owned := make(map[int64]bool)
+	for versionID, bd := range w.beginDataByVersion {
+		if bd.kbID == kbID {
+			owned[versionID] = true
+		}
+	}
+
+	kept := make([]record, 0, len(w.records))
+	for _, rec := range w.records {
+		if rec.kbID == kbID {
+			continue
+		}
+		if rec.versionID != 0 && owned[rec.versionID] {
+			continue
+		}
+		kept = append(kept, rec)
+	}
+	w.records = kept
+
+	for versionID := range owned {
+		delete(w.beginDataByVersion, versionID)
+		delete(w.versionIDsWritten, versionID)
+		delete(w.committedVersions, versionID)
+		delete(w.versionDeleteMarked, versionID)
+		delete(w.versionDeleteDone, versionID)
+	}
+	for versionID, kb := range w.versionDeleteMarked {
+		if kb == kbID {
+			delete(w.versionDeleteMarked, versionID)
+		}
+	}
+	delete(w.deleteMarked, kbID)
+	delete(w.deleteCompleted, kbID)
+	delete(w.cursors, kbID)
+	for key := range w.replayCounters {
+		if key.kbID == kbID {
+			delete(w.replayCounters, key)
+		}
+	}
+	return nil
+}
+
 // WriteVersionDeleteMark records the start of a DeleteVersion flow.
 func (w *MockWAL) WriteVersionDeleteMark(_ context.Context, kbID string, versionID int64) error {
 	w.mu.Lock()

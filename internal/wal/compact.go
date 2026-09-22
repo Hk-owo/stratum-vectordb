@@ -225,6 +225,168 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	return nil
 }
 
+// DeleteByKB rewrites the log without kbID's records — the layer a knowledge-base
+// deletion never used to touch.
+//
+// Why the WAL needs a step of its own: every other layer (documents, chunks, chunk→doc
+// mappings, version doc lists, index and bloom files) is reclaimed by
+// DeleteCoordinator, and the WAL is the one it left out. That is invisible while a
+// knowledge base is alive, because its recorded changes are reclaimed by watermark —
+// but the watermark is computed from replicas reporting a cursor, and a DELETED
+// knowledge base has no replicas reporting one, so `ReclaimableChangesThrough` answers
+// "unknown" forever and every BEGIN record it left behind (each carrying the full text
+// of the documents it changed) stays on disk for good.
+//
+// Shape follows Compact: rewrite beside the original, sync, swap in with one atomic
+// rename, then trim the in-memory index to match. The judgement differs — Compact drops
+// what every replica already holds, this drops everything ONE knowledge base owns,
+// regardless of watermarks. Like Compact it holds w.mu for the whole rewrite, so it
+// costs one pass over the log; that is why it belongs to a deletion (a deliberate, rare
+// operation) and not to any periodic path.
+//
+// A record is matched by knowledge base where it carries one (BEGIN, the delete
+// markers, CURSOR), and by the version ids collected from BEGIN records otherwise —
+// VERSION_ID and COMMIT carry only a version id. An orphan VERSION_ID, written by a node
+// that applied the entry without running the transaction, belongs to no BEGIN and is
+// left in place: it is one bool of idempotency state, and version ids are never reused,
+// so keeping it cannot collide with anything.
+func (w *FileWAL) DeleteByKB(ctx context.Context, kbID string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if w.path == "" {
+		return fmt.Errorf("wal: delete by knowledge base: the log was opened without a path")
+	}
+
+	// Collected BEFORE the rewrite: once the file has been rewritten there is nothing
+	// left to tell which version ids belonged to this knowledge base.
+	owned := make(map[int64]bool)
+	for versionID, bd := range w.beginDataByVersion {
+		if bd.kbID == kbID {
+			owned[versionID] = true
+		}
+	}
+
+	tmpPath := w.path + ".dropkb"
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("wal: delete by knowledge base: create %s: %w", tmpPath, err)
+	}
+	// Any failure below must leave the original log in place; only the temporary file
+	// is discarded.
+	committed := false
+	defer func() {
+		if !committed {
+			out.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	buf := bufio.NewWriter(out)
+	in, err := os.Open(w.path)
+	if err != nil {
+		return fmt.Errorf("wal: delete by knowledge base: open %s: %w", w.path, err)
+	}
+	defer in.Close()
+	reader := bufio.NewReader(in)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rec, raw, err := readRawRecord(reader)
+		if err != nil {
+			// A truncated or corrupt tail is where the log ends; everything read so
+			// far is the valid log.
+			break
+		}
+		// raw.kbID is filled for BEGIN (its payload carries one); rec.kbID for every
+		// other type that has a knowledge base at all.
+		if raw.kbID == kbID || rec.kbID == kbID {
+			continue
+		}
+		if rec.versionID != 0 && owned[rec.versionID] {
+			continue
+		}
+		if _, err := buf.Write(raw.raw); err != nil {
+			return fmt.Errorf("wal: delete by knowledge base: write %s: %w", tmpPath, err)
+		}
+	}
+
+	if err := buf.Flush(); err != nil {
+		return fmt.Errorf("wal: delete by knowledge base: flush %s: %w", tmpPath, err)
+	}
+	if err := out.Sync(); err != nil {
+		return fmt.Errorf("wal: delete by knowledge base: sync %s: %w", tmpPath, err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("wal: delete by knowledge base: close %s: %w", tmpPath, err)
+	}
+
+	// The swap. Reopening the original handle first would only add a window; the
+	// rename replaces the name atomically while the old file object keeps working for
+	// anyone mid-read.
+	if err := w.file.Close(); err != nil {
+		return fmt.Errorf("wal: delete by knowledge base: close log: %w", err)
+	}
+	if err := os.Rename(tmpPath, w.path); err != nil {
+		// The original is untouched; reopen it and report.
+		if f, rerr := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR, 0o644); rerr == nil {
+			w.file = f
+		}
+		return fmt.Errorf("wal: delete by knowledge base: swap in %s: %w", w.path, err)
+	}
+	committed = true
+
+	// Make the rename itself durable, so a crash cannot resurrect the old log.
+	if dir, err := os.Open(filepath.Dir(w.path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("wal: delete by knowledge base: reopen %s: %w", w.path, err)
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		f.Close()
+		return fmt.Errorf("wal: delete by knowledge base: seek %s: %w", w.path, err)
+	}
+	w.file = f
+
+	// Trim the in-memory index to what the file now holds, so the next Recover,
+	// ChangesInRange and PendingRecords all agree with it.
+	for versionID := range owned {
+		delete(w.beginDataByVersion, versionID)
+		delete(w.versionIDsWritten, versionID)
+		delete(w.committedVersions, versionID)
+		delete(w.versionDeleteMarked, versionID)
+		delete(w.versionDeleteDone, versionID)
+	}
+	// A version flagged for deletion whose BEGIN never reached this node is not in
+	// `owned`; its marker carries the knowledge base, so it can be matched directly.
+	for versionID, kb := range w.versionDeleteMarked {
+		if kb == kbID {
+			delete(w.versionDeleteMarked, versionID)
+		}
+	}
+	delete(w.deleteMarked, kbID)
+	delete(w.deleteCompleted, kbID)
+	delete(w.cursors, kbID)
+	if w.pendingBegin != nil && w.pendingBegin.kbID == kbID {
+		w.pendingBegin = nil
+	}
+	for key := range w.replayCounters {
+		if key.kbID == kbID {
+			delete(w.replayCounters, key)
+		}
+	}
+	return nil
+}
+
 // reclaimable reports whether versionID's BEGIN record may be dropped for kbID.
 // Every "no" answer is the safe direction, so the reasons are deliberately not
 // distinguished.

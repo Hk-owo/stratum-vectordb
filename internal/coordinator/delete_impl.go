@@ -141,6 +141,25 @@ func (c *DeleteCoordinatorImpl) Execute(ctx context.Context, kbID string) error 
 		return fmt.Errorf("WAL.WriteDeleteComplete: %w", err)
 	}
 
+	// Step 9: drop the knowledge base's records from the WAL — the one layer steps
+	// 1-6 never touched. It cannot be reclaimed later by the ordinary path:
+	// reclamation is driven by the watermark, the watermark comes from replicas
+	// reporting a cursor, and a deleted knowledge base has no replicas reporting one
+	// — so `ReclaimableChangesThrough` answers "unknown" forever and the BEGIN
+	// records (each carrying the full text of the documents it changed) stay on disk
+	// for good.
+	//
+	// Last, because the mark/complete pair it removes is what a restart would
+	// otherwise resume this flow from: removing it after the flow finished leaves
+	// nothing to resume. A failure is reported but does NOT abort — the data and the
+	// metadata are already gone, so the knowledge base IS deleted and a
+	// ProposeMarkKBDeleteFailed would have nothing to act on. What is left is disk
+	// hygiene on this node, and calling DeleteKnowledgeBase again retries it
+	// (Execute is idempotent end to end).
+	if err := c.cfg.WAL.DeleteByKB(ctx, kbID); err != nil {
+		return fmt.Errorf("WAL.DeleteByKB: %w", err)
+	}
+
 	return nil
 }
 

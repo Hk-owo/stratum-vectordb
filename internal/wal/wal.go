@@ -96,6 +96,13 @@ type WAL interface {
 	// kbID has finished.
 	WriteDeleteComplete(ctx context.Context, kbID string) error
 
+	// DeleteByKB rewrites the log without kbID's records — the last step of a
+	// DeleteKnowledgeBase flow, run once the cleanup above has finished and the
+	// metadata that named the knowledge base is gone. Unlike the Write* calls it is
+	// a rewrite, not an append; see FileWAL.DeleteByKB for why the deletion flow has
+	// to ask for it at all.
+	DeleteByKB(ctx context.Context, kbID string) error
+
 	// WriteVersionDeleteMark records that a DeleteVersion flow has started
 	// for versionID within kbID. Idempotent per versionID.
 	WriteVersionDeleteMark(ctx context.Context, kbID string, versionID int64) error

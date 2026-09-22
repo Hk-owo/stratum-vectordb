@@ -372,11 +372,15 @@ func TestDeleteCoordinator_FullCleanup(t *testing.T) {
 	if len(im.deletedFilesKB) != 1 || im.deletedFilesKB[0] != "kb-1" {
 		t.Error("IndexManager.DeleteFilesByKB should have been called for kb-1")
 	}
-	if !w.IsDeleteMarked("kb-1") {
-		t.Error("WAL delete mark should have been written for kb-1")
+	// Step 9 clears the knowledge base's records from the log, so the delete mark
+	// Step 0 wrote is gone by the time Execute returns. The final state is what the
+	// flow promises — a log with no trace of the knowledge base — and it is also why
+	// nothing is left to resume.
+	if w.IsDeleteMarked("kb-1") {
+		t.Error("the knowledge base's WAL records should be cleared once the flow completes")
 	}
 
-	// WAL should have DeleteComplete record.
+	// Nothing pending either: the mark and its completion record both went with it.
 	records, err := w.Recover(context.Background())
 	if err != nil {
 		t.Fatalf("Recover failed: %v", err)
@@ -611,6 +615,65 @@ func TestDeleteCoordinator_RetryExhaustedMarksFailed(t *testing.T) {
 	// RaftNode should have been told to mark the KB as delete-failed.
 	if len(rn.deleteFailed) != 1 || rn.deleteFailed[0] != "kb-1" {
 		t.Errorf("expected ProposeMarkKBDeleteFailed to be called, got %v", rn.deleteFailed)
+	}
+}
+
+// Step 9: the flow has to take the knowledge base's WAL records with it. Nothing else
+// would — reclamation is driven by the watermark, the watermark comes from replicas
+// reporting a cursor, and a deleted knowledge base has no replicas reporting one, so
+// its records would never qualify.
+func TestDeleteCoordinator_ClearsTheDeletedKnowledgeBasesWAL(t *testing.T) {
+	ctx := context.Background()
+	w := wal.NewMockWAL()
+
+	// What an earlier CreateVersion left behind for this knowledge base: the replay
+	// input a lagging peer would still ask for.
+	if err := w.WriteBegin(ctx, "kb-1", 0, []types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "body"}}); err != nil {
+		t.Fatalf("WriteBegin: %v", err)
+	}
+	if err := w.WriteVersionID(ctx, 1); err != nil {
+		t.Fatalf("WriteVersionID: %v", err)
+	}
+	if err := w.WriteCommit(ctx, 1); err != nil {
+		t.Fatalf("WriteCommit: %v", err)
+	}
+	if err := w.WriteCursor(ctx, "kb-1", 1); err != nil {
+		t.Fatalf("WriteCursor: %v", err)
+	}
+
+	coord := NewDeleteCoordinatorImpl(DeleteCoordinatorConfig{
+		MaxRetries:          2,
+		RetryBaseIntervalMS: 10,
+		WAL:                 w,
+		RaftNode:            newDeleteTestRaftNode(),
+		IndexManager:        newDeleteTestIndexManager(),
+		DocStore:            newDeleteTestDocStore(),
+		ChunkStore:          newDeleteTestChunkStore(),
+		ChunkDocMapper:      newDeleteTestChunkDocMapper(),
+		VersionDocList:      newDeleteTestVersionDocList(),
+	})
+	if err := coord.Execute(ctx, "kb-1"); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if deltas, err := w.ChangesInRange(ctx, "kb-1", 0, 100); err != nil {
+		t.Fatalf("ChangesInRange: %v", err)
+	} else if len(deltas) != 0 {
+		t.Errorf("the deleted knowledge base's replay input survived: %v", deltas)
+	}
+	if cursors, err := w.RecoverCursors(ctx); err != nil {
+		t.Fatalf("RecoverCursors: %v", err)
+	} else if _, ok := cursors["kb-1"]; ok {
+		t.Errorf("the deleted knowledge base's cursor survived: %v", cursors)
+	}
+	recs, err := w.Recover(ctx)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	for _, rec := range recs {
+		if rec.KBID == "kb-1" {
+			t.Errorf("a pending record survived for the deleted knowledge base: %+v", rec)
+		}
 	}
 }
 
