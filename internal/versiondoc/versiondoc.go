@@ -50,8 +50,8 @@ type VersionDocList interface {
 	// it locally holds against the control layer needs to enumerate its own
 	// versions, and this store is what knows them. A version disappears from this
 	// list the moment its last document does, which is exactly the "local
-	// leftovers" shape a reconciler is looking for — pair it with the metadata's
-	// tombstones to tell "deleted" apart from "never had it".
+	// leftovers" shape a reconciler is looking for — pair it with the control layer's
+	// allocation bound and live version list to tell "deleted" apart from "never had it".
 	ListVersions(ctx context.Context, kbID string) ([]int64, error)
 
 	// DeleteByVersion removes all entries for a single version. Used by GC

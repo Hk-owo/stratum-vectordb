@@ -27,9 +27,8 @@ func NewInternalServiceServer(node *RaftNodeImpl) *InternalServiceServer {
 var _ pb.InternalServiceServer = (*InternalServiceServer)(nil)
 
 // VersionLiveness answers "which of these versions are still alive, and how far has
-// allocation got" — the liveness read that does not decay. Unlike the tombstones above,
-// neither fact has a lifetime, so pruning cannot take the evidence away
-// (docs/known-gaps.md §B).
+// allocation got" — the liveness read that does not decay: neither fact has a
+// lifetime, so nothing can take the evidence away (docs/known-gaps.md §B).
 //
 // No leader requirement, unlike Propose: the fact is replicated state, so any node
 // holding it answers the same thing, and finding the leader would add a redirect hop.

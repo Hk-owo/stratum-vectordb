@@ -1974,7 +1974,7 @@ type appConfig struct {
 
 	// ReconcileDeletedVersions reclaims this node's leftovers of DELETED versions
 	// (reconcile.deleted_versions) — the half of docs/known-gaps.md §B that the
-	// metadata tombstones made safe to act on. Off by default for the same reason
+	// control layer's current state makes safe to act on. Off by default for the same reason
 	// gc_enabled is: the scan always runs and REPORTS, while reclaiming bytes is
 	// an operator's decision — it is irreversible, and it happens once per
 	// start-up, so a mistaken judgement would be replayed on every restart.

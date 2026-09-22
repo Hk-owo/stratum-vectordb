@@ -347,8 +347,8 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 		// "needs a human" signals rather than in a log nobody tails.
 		GcBlockedVersions: s.gcBlockedVersions(),
 		// §7.5: the reclaim watermark is deliberately conservative, so a required replica
-		// that is merely away holds it still — which stops BOTH tombstone pruning and WAL
-		// reclamation for that knowledge base, and stops them silently. The remedy
+		// that is merely away holds it still — which stops WAL reclamation for that
+		// knowledge base, and stops it silently. The remedy
 		// (dropping the node from storage.nodes) is an operator's decision, so the
 		// diagnosis belongs beside the other "needs a human" signals rather than only in a
 		// log line.

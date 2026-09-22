@@ -526,9 +526,9 @@ type GetSystemStatusResponse struct {
 	// reclaim diagnoses the §7.5 reclaim watermark — "which recorded changes may this node
 	// drop" — when it cannot be established at all.
 	//
-	// It exists because that failure is otherwise silent in the other direction: tombstone
-	// pruning and WAL reclamation both simply stop for the knowledge base, and nothing else
-	// reports it. The state is not a fault — the watermark is deliberately conservative, and
+	// It exists because that failure is otherwise silent in the other direction: WAL
+	// reclamation simply stops for the knowledge base, and nothing else reports it. The
+	// state is not a fault — the watermark is deliberately conservative, and
 	// a required replica that is merely away holds it still — but it is also not visible
 	// anywhere else, and its remedy (dropping the node from storage.nodes) is a decision an
 	// operator has to make deliberately.

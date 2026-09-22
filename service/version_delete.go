@@ -16,7 +16,7 @@ type markVersionDeletingProposer interface {
 	ProposeMarkVersionDeleting(ctx context.Context, kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error)
 }
 
-// markVersionDeletingThenCleanUp proposes the tombstone and hands the actual cleanup to the
+// markVersionDeletingThenCleanUp proposes the marking and hands the actual cleanup to the
 // coordinator in the background.
 //
 // DeleteVersion (a healthy version) and ForceAbandonVersion (one carrying a FAILED_PERMANENT
