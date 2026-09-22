@@ -1023,13 +1023,22 @@ func main() {
 	// Only a node that holds data answers this: it is the hook that pulls a
 	// version's records here and builds its index. A control node's versions
 	// live in the storage group, and it has no stores to pull them into.
-	// Removal records nobody will ask about again may be dropped (docs/known-gaps.md
-	// §B). The watermark is the slowest REQUIRED replica's data cursor — see
-	// runTombstonePruning — not a log position, because the consumers of a tombstone
-	// are the nodes that are BEHIND it.
-	if raftNode != nil && controlPlane != nil {
-		go runTombstonePruning(ctx, logger, raftNode, controlPlane, rn)
-	}
+	// Tombstone pruning is deliberately NOT started.
+	//
+	// It existed to bound the removal records, because every judgement about "was this
+	// version removed?" read them — and a record that pruning had dropped took the evidence
+	// with it (docs/known-gaps.md §B: "delete a version below the watermark" and the row is
+	// gone on the next tick). That judgement no longer reads them (see
+	// plane.VersionLivenessLister): it reads the CURRENT state — an allocation counter that
+	// only grows and the live version list. So a pruned row now costs an operator a
+	// diagnostic and nothing else, while an unpruned row is one more reason a reader that
+	// arrives late can still be answered. The records are tiny (one int64 per removed
+	// version) and ride the snapshot, so keeping them is the cheap direction — and it is
+	// what makes "delete a version below the watermark" uninteresting rather than a window.
+	//
+	// The mechanism below is kept for now: PruneTombstones still works, it simply has no
+	// caller. Retiring it — the command, the state-machine field, the snapshot field, the
+	// internal read and the tests that drive them — is a separate, purely subtractive change.
 
 	if storageLocal && raftNode != nil {
 		// §10.6's reclaim is a best-effort broadcast: a partitioned or restarting
