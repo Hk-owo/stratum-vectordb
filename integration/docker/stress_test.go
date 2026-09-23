@@ -27,6 +27,7 @@ import (
 	"time"
 
 	pb "stratum/api/proto/stratum"
+	stratumerrors "stratum/internal/errors"
 )
 
 // Stress cases. These fill the two holes §阶段⑤ names ("单版本大 n 构建/查询延迟
@@ -122,6 +123,23 @@ func indexDirOf(i int) string { return storageDataDir(i) + "/index" }
 
 // writeChanges commits one CreateVersion on top of parent and returns the new
 // version id.
+//
+// A storage-gate refusal is waited out rather than fatal. That verdict is soft
+// state built from the storage nodes' periodic cursor reports (the window is
+// plane.DefaultStorageSilenceWindow, 15s, and the gate documents its own refusal
+// as retryable for exactly that reason). The window it covers is real, not
+// theoretical: a control leader that has just taken over starts from an empty
+// aggregate, and until the storage nodes' reports land, ANY node that has reported
+// makes the verdict a KNOWABLE "nobody required is answering" rather than §3.3's
+// fail-open "unknown" — the control nodes report too, and they hold no data. A
+// write attempted inside that window is refused with storage_unavailable although
+// every storage node is up, which is what TestT4_HoldersFallbackPullsTheVersionItMissed
+// hit on CI: it kills one storage node and writes immediately, and the refusal is
+// an artifact of where the reports had got to, not of the fault under test.
+//
+// Waiting does not weaken these callers: they write setup data, they do not assert
+// on the gate. A cluster that is genuinely degraded still fails, because the reports
+// never arrive and the deadline below expires.
 func writeChanges(t *testing.T, ctx context.Context, addr, kbID string, parent int64, changes []*pb.DocChange) int64 {
 	t.Helper()
 	kb, _, _, conn, err := dialNode(addr)
@@ -130,15 +148,45 @@ func writeChanges(t *testing.T, ctx context.Context, addr, kbID string, parent i
 	}
 	defer conn.Close()
 
-	resp, err := kb.CreateVersion(ctx, &pb.CreateVersionRequest{
-		KnowledgeBaseId: kbID,
-		ParentVersionId: parent,
-		Changes:         changes,
-	})
-	if err != nil {
-		t.Fatalf("CreateVersion(%d changes) failed: %v", len(changes), err)
+	deadline := time.Now().Add(storageGateSettleWait)
+	for {
+		resp, err := kb.CreateVersion(ctx, &pb.CreateVersionRequest{
+			KnowledgeBaseId: kbID,
+			ParentVersionId: parent,
+			Changes:         changes,
+		})
+		if err == nil {
+			return resp.VersionId
+		}
+		if !storageGateRefusal(err) || !time.Now().Before(deadline) {
+			t.Fatalf("CreateVersion(%d changes) failed: %v", len(changes), err)
+		}
+		t.Logf("CreateVersion(%d changes) refused as %q; the gate's verdict is rebuilt from "+
+			"periodic reports, waiting it out", len(changes), stratumerrors.ReasonOf(err))
+		select {
+		case <-ctx.Done():
+			t.Fatalf("CreateVersion(%d changes) kept being refused until the context expired: %v (last error: %v)",
+				len(changes), ctx.Err(), err)
+		case <-time.After(2 * time.Second):
+		}
 	}
-	return resp.VersionId
+}
+
+// storageGateSettleWait bounds how long writeChanges waits out a storage-gate
+// refusal. The verdict goes stale after a silence window (15s by default) and is
+// rebuilt by a full round of reports, so this covers a window plus the reports that
+// end it, with room for the election that produces a new leader in the first place.
+const storageGateSettleWait = 90 * time.Second
+
+// storageGateRefusal reports whether err is the storage gate declining a write
+// because it cannot see a quorum of the required replicas — the retryable verdict
+// writeChanges waits out, as opposed to any other failure.
+func storageGateRefusal(err error) bool {
+	switch stratumerrors.ReasonOf(err) {
+	case reasonStorageUnavailable, reasonKBStorageDegraded:
+		return true
+	}
+	return false
 }
 
 // rollbackTo points the knowledge base's active version at versionID.
