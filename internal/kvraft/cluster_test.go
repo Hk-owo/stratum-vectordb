@@ -22,6 +22,35 @@ type testNode struct {
 	persister *kvstorage.Persister
 }
 
+// Timing every multi-node test node is built with. The election timeout
+// must sit well above the heartbeat interval — Raft's rule of thumb is an
+// order of magnitude, not merely "greater than" — because a follower that
+// does not hear a heartbeat inside its timeout campaigns and topples a
+// perfectly healthy leader. The margin is not academic: these nodes share
+// a loaded CI runner where one goroutine can be descheduled for tens of
+// milliseconds, which is why the earlier 20ms/50-100ms pair (a 1:2.5
+// ratio) made TestCluster_SnapshotCatchesUpLaggingFollower fail on CI with
+// "Propose: kvraft: not leader" — the leader had been voted out by a
+// follower that simply missed a heartbeat. Reproduced on a single core:
+// 13 of 15 runs failed with that same error.
+//
+// newTestCluster and restartTestNode both build from these, so a
+// restarted node can never end up on a different timer than its peers.
+const (
+	testHeartbeatInterval  = 25 * time.Millisecond
+	testElectionTimeoutMin = 250 * time.Millisecond
+	testElectionTimeoutMax = 500 * time.Millisecond
+)
+
+// testClusterTiming returns the base options for a multi-node test node;
+// callers append their own on top.
+func testClusterTiming() []Option {
+	return []Option{
+		WithElectionTimeoutRange(testElectionTimeoutMin, testElectionTimeoutMax),
+		WithHeartbeatInterval(testHeartbeatInterval),
+	}
+}
+
 // newTestCluster starts n Raft nodes, fully cross-connected, each
 // listening on a free loopback port and running its background loops.
 // Extra opts (e.g. WithMaxLogLength) are applied to every node. Returns
@@ -40,10 +69,7 @@ func newTestCluster(t *testing.T, n int, opts ...Option) []*testNode {
 		transport := NewTransport(nil)
 		applyCh := make(chan ApplyMsg, 256)
 		persister := kvstorage.NewPersister(filepath.Join(t.TempDir(), fmt.Sprintf("raft-%d", id)))
-		allOpts := append([]Option{
-			WithElectionTimeoutRange(50*time.Millisecond, 100*time.Millisecond),
-			WithHeartbeatInterval(20 * time.Millisecond),
-		}, opts...)
+		allOpts := append(testClusterTiming(), opts...)
 		rf := NewRaft(id, transport, applyCh, persister, allOpts...)
 		nodes[i] = &testNode{id: id, addr: addrs[i], rf: rf, applyCh: applyCh, transport: transport, persister: persister}
 	}
@@ -90,6 +116,59 @@ func freeLoopbackAddr(t *testing.T) string {
 	return addr
 }
 
+// soleLeader returns the one node that currently believes itself to be
+// leader, or nil when that is not exactly one node (an election in flight
+// can briefly leave none, or two rivals).
+//
+// A multi-node test must not hold on to the *testNode it saw leading in an
+// earlier phase and keep proposing against it. A follower that misses a
+// heartbeat inside its election timeout campaigns and wins — routine on a
+// loaded CI runner and under the race detector's slowdown, which is how
+// TestCluster_SnapshotCatchesUpLaggingFollower failed on CI with
+// "Propose: kvraft: not leader". Proposing against a node that has since
+// been deposed returns ErrNotLeader, an artifact of the environment rather
+// than of the behavior under test, so the tests resolve the leader afresh
+// instead of assuming it is theirs to keep.
+func soleLeader(nodes []*testNode) *testNode {
+	var leader *testNode
+	for _, n := range nodes {
+		if !n.rf.IsLeader() {
+			continue
+		}
+		if leader != nil {
+			return nil // mid-election: more than one claimant
+		}
+		leader = n
+	}
+	return leader
+}
+
+// proposeToLeader proposes data on whichever node currently leads, waiting
+// up to timeout for a leader to emerge and retrying when leadership moves
+// between resolving it and proposing. Returns the assigned index and the
+// node that accepted it. See soleLeader for why the returned leader must
+// not be assumed to still lead later.
+func proposeToLeader(t *testing.T, nodes []*testNode, data []byte, timeout time.Duration) (uint64, *testNode) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if leader := soleLeader(nodes); leader != nil {
+			index, _, err := leader.rf.Propose(context.Background(), data)
+			switch {
+			case err == nil:
+				return index, leader
+			case err == ErrNotLeader:
+				// Deposed between resolving it and proposing; retry.
+			default:
+				t.Fatalf("Propose: %v", err)
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no leader accepted a proposal within %v", timeout)
+	return 0, nil
+}
+
 // waitForSingleLeader waits until exactly one node in nodes reports
 // itself as leader and returns it, failing the test if that doesn't
 // happen within timeout.
@@ -97,14 +176,8 @@ func waitForSingleLeader(t *testing.T, nodes []*testNode, timeout time.Duration)
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		var leaders []*testNode
-		for _, n := range nodes {
-			if n.rf.IsLeader() {
-				leaders = append(leaders, n)
-			}
-		}
-		if len(leaders) == 1 {
-			return leaders[0]
+		if leader := soleLeader(nodes); leader != nil {
+			return leader
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

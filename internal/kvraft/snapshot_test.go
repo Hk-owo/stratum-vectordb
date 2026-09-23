@@ -229,10 +229,7 @@ func restartTestNode(t *testing.T, old *testNode, peers []*testNode) *testNode {
 		}
 	}
 	applyCh := make(chan ApplyMsg, 256)
-	rf := NewRaft(old.id, transport, applyCh, old.persister,
-		WithElectionTimeoutRange(50*time.Millisecond, 100*time.Millisecond),
-		WithHeartbeatInterval(20*time.Millisecond),
-	)
+	rf := NewRaft(old.id, transport, applyCh, old.persister, testClusterTiming()...)
 	nd := &testNode{id: old.id, addr: old.addr, rf: rf, applyCh: applyCh, transport: transport, persister: old.persister}
 	if err := rf.StartGRPC(old.addr); err != nil {
 		t.Fatalf("restart StartGRPC(%d): %v", old.id, err)
@@ -279,21 +276,27 @@ func TestCluster_SnapshotCatchesUpLaggingFollower(t *testing.T) {
 		t.Fatal("failed to pick a laggard")
 	}
 	laggard := nodes[laggardIdx]
-	ctx := context.Background()
 
 	// Phase 1: replicate a common baseline to all three nodes, then
-	// disconnect the laggard.
-	var baseIndex uint64
-	for i := 0; i < 5; i++ {
-		idx, _, err := leader.rf.Propose(ctx, []byte(fmt.Sprintf("pre-partition-%d", i)))
-		if err != nil {
-			t.Fatalf("Propose: %v", err)
+	// disconnect the laggard. Keep proposing until every node has actually
+	// applied the baseline: Propose does not wait for commitment, and if
+	// leadership moved mid-loop the index an earlier leader assigned may
+	// never commit.
+	baselineDeadline := time.Now().Add(15 * time.Second)
+	for i := 0; ; i++ {
+		idx, _ := proposeToLeader(t, nodes, []byte(fmt.Sprintf("pre-partition-%d", i)), 5*time.Second)
+		if waitFor(t, 2*time.Second, func() bool {
+			for _, nd := range nodes {
+				if nd.rf.LastApplied() < idx {
+					return false
+				}
+			}
+			return true
+		}) {
+			break
 		}
-		baseIndex = idx
-	}
-	for _, nd := range nodes {
-		if !waitFor(t, 3*time.Second, func() bool { return nd.rf.LastApplied() >= baseIndex }) {
-			t.Fatalf("node %d never applied baseline index %d", nd.id, baseIndex)
+		if time.Now().After(baselineDeadline) {
+			t.Fatalf("baseline never got applied on every node")
 		}
 	}
 	laggardLastApplied := laggard.rf.LastApplied()
@@ -306,12 +309,10 @@ func TestCluster_SnapshotCatchesUpLaggingFollower(t *testing.T) {
 	var leaderBase uint64
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, _, err := leader.rf.Propose(ctx, []byte("post-partition")); err != nil {
-			t.Fatalf("Propose: %v", err)
-		}
-		leader.rf.mu.Lock()
-		leaderBase = leader.rf.log[0].Index
-		leader.rf.mu.Unlock()
+		_, lead := proposeToLeader(t, nodes, []byte("post-partition"), 5*time.Second)
+		lead.rf.mu.Lock()
+		leaderBase = lead.rf.log[0].Index
+		lead.rf.mu.Unlock()
 		if leaderBase > laggardLastApplied {
 			break
 		}
@@ -343,10 +344,7 @@ func TestCluster_SnapshotCatchesUpLaggingFollower(t *testing.T) {
 
 	// Phase 5: normal incremental replication resumes on top of the
 	// installed snapshot.
-	idx, _, err := leader.rf.Propose(ctx, []byte("after-catchup"))
-	if err != nil {
-		t.Fatalf("Propose after catch-up: %v", err)
-	}
+	idx, _ := proposeToLeader(t, nodes, []byte("after-catchup"), 5*time.Second)
 	if !waitFor(t, 5*time.Second, func() bool { return restarted.rf.LastApplied() >= idx }) {
 		t.Fatalf("laggard never applied post-snapshot index %d (LastApplied=%d)", idx, restarted.rf.LastApplied())
 	}
