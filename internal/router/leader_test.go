@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -192,5 +193,76 @@ func TestLeaderDiscoverer_ProbeRespectsTighterCallerDeadline(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("LeaderNow took %v, want it bounded by the caller's 150ms deadline", elapsed)
+	}
+}
+
+// fakeAdminServer answers GetClusterStatus the way one node of a given layer
+// does: node_id and leader_id are both reported in that layer's own ID space.
+type fakeAdminServer struct {
+	pb.UnimplementedAdminServiceServer
+	nodeID   int64
+	leaderID int64
+}
+
+func (s *fakeAdminServer) GetClusterStatus(context.Context, *pb.GetClusterStatusRequest) (*pb.GetClusterStatusResponse, error) {
+	return statusResp(s.nodeID, s.leaderID, true), nil
+}
+
+func serveFakeAdmin(t *testing.T, nodeID, leaderID int64) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterAdminServiceServer(srv, &fakeAdminServer{nodeID: nodeID, leaderID: leaderID})
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+	return lis.Addr().String()
+}
+
+// Leader discovery must ask the CONTROL layer, because the answer is read in the
+// ID space of whichever layer answers.
+//
+// GetClusterStatus reports {node_id: the answering node's own ID, leader_id: the
+// ID it believes leads}, and LeaderNow resolves leader_id to a position in the
+// list of clients it was handed. A control node reports 1..N; a storage node in
+// the split topology reports 11..1N (Stratum_设计文档v13.md §11). Handing LeaderNow
+// the storage layer's clients — which the station did, under a comment claiming a
+// control node builds no AdminService, untrue since cmd/stratum/control_admin.go
+// taught it to answer the Raft view — put the votes in a space no node_id in its
+// map belonged to: ok was false for every write, on every cluster, forever.
+//
+// What that cost was not idleness. Every write fell through to tryAll's broadcast
+// to every control node; the two that do not lead forwarded the proposal to the
+// leader, and when the leader was the node that had just been killed they came
+// back Unavailable — which the breaker charged to THEM, the healthy ones. Killing
+// one node thus tripped all three breakers, and the station refused writes for the
+// rest of its retry budget with "every control node is circuit-broken". That is
+// the shape CI kept failing TestT4_MinorityFaultTolerance in; this test is the
+// cheap half of pinning it, and it fails on the wiring alone.
+func TestNewRouter_LeaderDiscoveryAsksTheControlLayer(t *testing.T) {
+	// The same leader_id from both layers, and different node_ids: index 0 can
+	// come back only if the control client was the one asked.
+	controlAddr := serveFakeAdmin(t, 1, 1)
+	storageAddr := serveFakeAdmin(t, 11, 1)
+
+	r, err := NewRouter(Config{
+		Addrs:        []string{controlAddr},
+		StorageAddrs: []string{storageAddr},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter: %v", err)
+	}
+	defer r.Close()
+
+	idx, ok := r.discoverer.LeaderNow(context.Background())
+	if !ok {
+		t.Fatal("leader discovery could not resolve leader_id 1 to a node index: the " +
+			"discoverer is reading the answering layer's IDs, and the storage layer's (11) " +
+			"do not contain the control layer's vote (1)")
+	}
+	if idx != 0 {
+		t.Fatalf("leader index = %d, want 0 (the only configured control node)", idx)
 	}
 }

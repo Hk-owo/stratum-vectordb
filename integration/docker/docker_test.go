@@ -41,6 +41,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/authmeta"
 )
 
 // nodeAddrs are the gRPC addresses of the control-tier nodes under test.
@@ -89,6 +90,65 @@ func dialNode(addr string) (pb.KnowledgeBaseServiceClient, pb.QueryServiceClient
 		pb.NewQueryServiceClient(conn),
 		pb.NewAdminServiceClient(conn),
 		conn, nil
+}
+
+// controlLeaderIndex returns the position, in controlAddrs, of the node the
+// control tier itself believes leads.
+//
+// It asks the control nodes directly rather than the station, for the reason
+// given on controlAddrs: through a station every answer comes back bearing the
+// station's address, so "the leader" is whichever station entry the round-robin
+// happened to land on. Majority vote, like the station's own discovery, so one
+// stale view cannot decide it.
+//
+// Direct calls carry the station's trust mark, the same harness detail
+// await_direct_test.go documents: a node configured with require_authenticated
+// refuses client-facing calls that did not arrive through a station, and this
+// question is one of them. A real client cannot ask it — that is what the gate is
+// for — but fault injection is not a client; it has to name the node it kills.
+func controlLeaderIndex(t *testing.T, ctx context.Context) int {
+	t.Helper()
+	trusted := authmeta.WithVerifiedMark(ctx)
+	votes := map[int64]int{}
+	// lastErr travels with the failure: "nobody reported a leader" has two very
+	// different causes (nodes answering has_leader=false versus nodes not
+	// answering at all — a wrong address, or a gate that refused the call), and
+	// without it the message sends the reader to the wrong one.
+	var lastErr error
+	for _, addr := range controlAddrs {
+		_, _, admin, conn, err := dialNode(addr)
+		if err != nil {
+			lastErr = fmt.Errorf("%s: dial: %w", addr, err)
+			continue
+		}
+		resp, err := admin.GetClusterStatus(trusted, &pb.GetClusterStatusRequest{})
+		_ = conn.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("%s: GetClusterStatus: %w", addr, err)
+			continue
+		}
+		if !resp.GetHasLeader() {
+			continue
+		}
+		votes[resp.GetLeaderId()]++
+	}
+	best, bestVotes := int64(0), 0
+	for id, n := range votes {
+		if n > bestVotes {
+			best, bestVotes = id, n
+		}
+	}
+	if bestVotes == 0 {
+		t.Fatalf("no control node reported a leader (asked %v; last error: %v)", controlAddrs, lastErr)
+	}
+	// Control nodes are 1..N in the order they are configured, which is the order
+	// of controlAddrs (Stratum_设计文档v13.md §11).
+	idx := int(best) - 1
+	if idx < 0 || idx >= len(controlAddrs) {
+		t.Fatalf("leader id %d is outside the %d control nodes (%v)",
+			best, len(controlAddrs), controlAddrs)
+	}
+	return idx
 }
 
 // === docker fault-injection helpers ===
@@ -427,16 +487,25 @@ func TestT4_MultiNode_Consistency(t *testing.T) {
 
 // TestT4_MinorityFaultTolerance kills one follower: with 2 of 3 nodes up the
 // cluster still has a quorum and must keep accepting writes.
+//
+// Which node is "a follower" is asked of the control tier (controlLeaderIndex),
+// not derived from the index waitForLeader returns: that index names a STATION —
+// TestMain points every client address at one — so deriving the victim from it
+// killed a fixed container, and on a cluster where that container happened to
+// lead the case took the leader down while claiming to spare it. Killing the
+// leader is TestT4_LeaderFailover's job; doing it here by accident is how this
+// case stopped measuring minority faults at all.
 func TestT4_MinorityFaultTolerance(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	leaderIdx, kbID := waitForLeader(t, ctx, "minority", 30*time.Second)
-	t.Logf("leader is node %d (%s)", leaderIdx, nodeAddrs[leaderIdx])
+	_, kbID := waitForLeader(t, ctx, "minority", 30*time.Second)
+	leaderIdx := controlLeaderIndex(t, ctx)
 
 	// Kill a follower (any node other than the leader).
-	followerIdx := (leaderIdx + 1) % 3
+	followerIdx := (leaderIdx + 1) % len(nodeServices)
 	followerSvc := nodeServices[followerIdx]
+	t.Logf("control node %d leads; killing follower %s", leaderIdx, followerSvc)
 	killNode(t, followerSvc)
 	defer func() {
 		startNode(t, followerSvc)

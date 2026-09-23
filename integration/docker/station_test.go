@@ -80,7 +80,10 @@ func startStation() (addr string, cleanup func(), err error) {
 		return existing, func() {}, nil
 	}
 
-	controlAddrs := splitEnv("STRATUM_T4_CONTROL_ADDRS", "localhost:17000,localhost:17001,localhost:17002")
+	// controlAddrs is the package-level list await_direct_test.go declares — the
+	// nodes themselves, not the station. The station dials exactly the addresses
+	// the fault-injection helpers reason about, and one variable is what keeps the
+	// two from drifting apart.
 	storageNodeAddrs := splitEnv("STRATUM_T4_STORAGE_NODE_ADDRS", "localhost:17100,localhost:17101,localhost:17102")
 
 	// Pick a free port for the station so a locally running one does not clash.

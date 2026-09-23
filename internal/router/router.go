@@ -160,24 +160,42 @@ func NewRouter(cfg Config) (*Router, error) {
 	}
 	// Connections are appended in the same order the client slices are built
 	// below, so the two stay aligned.
+	//
+	// discoveryAdmins is built here, beside kbs, because it is the CONTROL
+	// layer's AdminService — not the same list as r.admins below it.
+	discoveryAdmins := make([]statusClient, 0, len(cfg.Addrs))
 	for i := 0; i < len(cfg.Addrs); i++ {
 		r.kbs = append(r.kbs, pb.NewKnowledgeBaseServiceClient(r.conns[i]))
+		discoveryAdmins = append(discoveryAdmins, pb.NewAdminServiceClient(r.conns[i]))
 	}
 	for i := len(cfg.Addrs); i < len(r.conns); i++ {
 		r.querys = append(r.querys, pb.NewQueryServiceClient(r.conns[i]))
 		r.admins = append(r.admins, pb.NewAdminServiceClient(r.conns[i]))
 		r.syncs = append(r.syncs, pb.NewDataSyncServiceClient(r.conns[i]))
 	}
-	// Leader discovery goes through the storage layer's AdminService: a control
-	// node builds no AdminService (it has no stores to report on), while a
-	// storage node answers GetClusterStatus by asking the control cluster
-	// through its remote metadata channel — one extra hop, and the only place
-	// the answer exists.
-	admins := make([]statusClient, len(r.admins))
-	for i, a := range r.admins {
-		admins[i] = a
-	}
-	r.discoverer = NewLeaderDiscoverer(admins)
+	// Leader discovery asks the CONTROL nodes, and which node answers decides
+	// what the answer means.
+	//
+	// GetClusterStatus reports {node_id: the answering node's own ID, leader_id:
+	// the ID it believes leads}, and LeaderNow resolves leader_id to a position
+	// in the list it was handed. Both IDs are therefore read in the ID space of
+	// whoever answers, and the two layers do not share one: a control node
+	// reports 1..N, a storage node in the split topology reports 11..1N
+	// (Stratum_设计文档v13.md §11). Pointing this at the storage layer — which the
+	// station did, under a comment claiming a control node builds no
+	// AdminService, untrue since cmd/stratum/control_admin.go taught it to answer
+	// the Raft view — keyed nodeByID on storage IDs while the votes named control
+	// IDs. No vote could ever resolve: ok was false for every write.
+	//
+	// The cost was not "discovery is a no-op". Every write fell through to
+	// tryAll, which broadcasts to every control node; the two that do not lead
+	// forward the proposal to whoever does, and when that node is the one that
+	// just died they come back Unavailable. The breaker counts that against THEM
+	// — the healthy nodes — so killing one node tripped all three breakers, and
+	// the station then refused for the rest of its retry budget with "every
+	// control node is circuit-broken". That is the shape CI kept failing
+	// TestT4_MinorityFaultTolerance in.
+	r.discoverer = NewLeaderDiscoverer(discoveryAdmins)
 
 	for range r.controlAddrs {
 		r.controlBreakers = append(r.controlBreakers, newBreaker(defaultBreakerConfig))
