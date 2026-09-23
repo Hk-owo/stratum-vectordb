@@ -603,6 +603,19 @@ func (c *WriteCoordinatorImpl) DropVersionStorage(ctx context.Context, kbID stri
 			return fmt.Errorf("coordinator: DropVersionStorage: index %s v%d: %w", kbID, versionID, err)
 		}
 	}
+	// And the version's document filter. The DeleteVersion flow has always removed it
+	// (LocalVersionDropper), but THIS path did not — so a version retired by a terminal
+	// verdict left one behind, for good. Nothing else would collect it: the version was
+	// never queryable (visibility is the control layer's judgement, not a disk fact) and
+	// the reverse reconciliation looks for versions the node holds whose metadata is
+	// GONE, while this one is still in the metadata — marked terminal. Idempotent like
+	// the layers above, and a replica that never built a filter for the version removes
+	// nothing.
+	if c.cfg.VersionBloom != nil {
+		if err := c.cfg.VersionBloom.DeleteByVersion(kbID, versionID); err != nil {
+			return fmt.Errorf("coordinator: DropVersionStorage: bloom %s v%d: %w", kbID, versionID, err)
+		}
+	}
 	return nil
 }
 
