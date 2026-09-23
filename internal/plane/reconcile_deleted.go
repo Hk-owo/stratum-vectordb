@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -166,4 +167,72 @@ func (d *LocalDataPlane) ReconcileDeletedVersions(ctx context.Context, meta Meta
 		}
 	}
 	return reclaimed, firstErr
+}
+
+// DefaultDeletedReconcileInterval is how often the periodic reverse reconciliation
+// looks for local leftovers of deleted versions.
+//
+// Five minutes, following the other disk-hygiene passes (chunk GC, WAL reclamation,
+// build-residue sweep). What this pass leaks is SPACE and nothing else — a leftover is
+// unreachable phantom data, because every query goes through the control layer's
+// judgement — so it belongs to the housekeeping cadence rather than to the
+// terminal-reclaim queue's minute.
+const DefaultDeletedReconcileInterval = 5 * time.Minute
+
+// StartDeletedVersionReconcile runs the reverse reconciliation on a cadence until ctx
+// ends, skipping every pass in which nothing local has changed.
+//
+// Why a cadence: the startup pass only sees leftovers that exist at boot, and the ones
+// that matter are created at RUNTIME — the late push that outlived the delete meant to
+// remove it (§B's source ③) needs no failure at all, so "restart the node and see" is
+// not a discovery mechanism.
+//
+// Why only after a change: the judgement compares what this node HOLDS against what the
+// control layer has, and the local side cannot move without advanceLocalVersion running
+// (every landing path — write, pull, push, backfill, drop — goes through it, including
+// the early return, which is the late-push case). An idle node therefore has nothing new
+// to find and pays nothing; a node being written to pays one pass per interval, which is
+// the honest price of not having to decide WHICH landing could have left a leftover.
+// That price is bounded by what this node holds — the pass reads its own version list
+// and asks one range per knowledge base — not by what the knowledge base ever had.
+//
+// The action and its opt-in are the startup pass's, unchanged: ReconcileDeletedVersions
+// is idempotent end to end, and the caller decides whether this runs at all
+// (reconcile.deleted_versions — the same switch as the startup pass, because it is the
+// same judgement and the same irreversible action).
+func (d *LocalDataPlane) StartDeletedVersionReconcile(ctx context.Context, meta MetadataLister) {
+	go func() {
+		ticker := time.NewTicker(DefaultDeletedReconcileInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !d.takeDeletedReconcileDirty() {
+					continue
+				}
+				reclaimed, err := d.ReconcileDeletedVersions(ctx, meta)
+				if err != nil {
+					d.logger.Warn("plane: periodic reconcile of deleted versions did not finish; the next pass retries it",
+						zap.Error(err))
+				}
+				if reclaimed > 0 {
+					d.logger.Info("plane: periodic reconcile reclaimed local leftovers of deleted versions",
+						zap.Int("versions", reclaimed))
+				}
+			}
+		}
+	}()
+}
+
+// takeDeletedReconcileDirty consumes the dirty flag. Read-and-clear in one hold: two
+// passes must not both act on the same change — harmless, since the action is
+// idempotent, but it would double the work for nothing.
+func (d *LocalDataPlane) takeDeletedReconcileDirty() bool {
+	d.versionMu.Lock()
+	defer d.versionMu.Unlock()
+	dirty := d.deletedReconcileDirty
+	d.deletedReconcileDirty = false
+	return dirty
 }

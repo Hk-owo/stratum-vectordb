@@ -1011,6 +1011,12 @@ func main() {
 				if reclaimed > 0 {
 					logger.Info("startup: reclaimed local leftovers of deleted versions", zap.Int("versions", reclaimed))
 				}
+				// The same judgement on a cadence, because the startup pass only sees
+				// leftovers that exist at boot — and the ones that matter are created
+				// at runtime (a push that outlived the delete meant to remove it needs
+				// no failure at all, §B). It skips every pass in which nothing local
+				// changed, so this costs nothing on a node at rest.
+				dataPlane.StartDeletedVersionReconcile(ctx, rn)
 			} else if leftovers, err := dataPlane.DeletedVersionLeftovers(ctx, rn); err != nil {
 				logger.Warn("startup: could not scan for local leftovers of deleted versions", zap.Error(err))
 			} else if n := totalVersionIDs(leftovers); n > 0 {

@@ -217,6 +217,18 @@ type LocalDataPlane struct {
 	versionMu    sync.RWMutex
 	localVersion map[string]int64
 
+	// deletedReconcileDirty records that what this node HOLDS has changed since the
+	// last reverse reconciliation — a version landed, or the cursor moved. The
+	// periodic pass skips its work while it is clear, so an IDLE node pays nothing for
+	// a scan that could only rediscover what the previous pass already found. A node
+	// being written to sets it on every landing, which is the conservative direction
+	// on purpose: marking only the landings that can actually leave a leftover (a
+	// version arriving below the cursor — §B's late push) would miss the ones left by
+	// a reclaim that did not finish, and "did that cleanup land" is a much harder fact
+	// to observe here than "something landed". Guarded by versionMu: every change
+	// comes through advanceLocalVersion, which already holds it.
+	deletedReconcileDirty bool
+
 	// handledAbove records versions ABOVE the cursor whose data this node has
 	// accounted for: written here, pulled from a peer, pushed by the
 	// coordinator, dropped as deleted, or covered by a full-state transfer.
@@ -257,11 +269,10 @@ type LocalDataPlane struct {
 	takeoverMu       sync.Mutex
 	pendingTakeovers map[string]*takeoverWatch
 
-	// cleanupMu guards cleanupQueue: the §10.6 cleanups that did not reach
-	// every replica and are waiting for another pass.
-	// terminalReclaim holds the apply-driven local reclaims that did not finish. Its
-	// cadence is its own (terminalReclaimInterval): see NoteTerminalVersion for why it
-	// is not §10.6's broadcast queue.
+	// terminalReclaim holds the apply-driven local reclaims that did not finish: one
+	// task per version, retried on its own cadence (terminalReclaimInterval). See
+	// NoteTerminalVersion for why it is not §10.6's broadcast queue — that queue is
+	// gone, because every node learns a terminal verdict from its own apply instead.
 	terminalReclaimMu sync.Mutex
 	terminalReclaim   map[string]*cleanupTask
 }
@@ -693,6 +704,12 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 // for the future, not a retroactive correction.
 func (d *LocalDataPlane) advanceLocalVersion(kbID string, versionID int64) {
 	d.versionMu.Lock()
+	// Whatever brought us here changed what this node holds — including the early
+	// return right below, which is exactly the late-push case (a version landing under
+	// a cursor that has already moved past it, §B's no-failure-needed leftover). The
+	// reverse reconciliation only has to run again after such a change, so mark it
+	// before deciding anything.
+	d.deletedReconcileDirty = true
 	if versionID <= d.localVersion[kbID] {
 		d.versionMu.Unlock()
 		return
@@ -2403,6 +2420,19 @@ type MetadataLister interface {
 // retention is unconfigured (the manager decides that). The same policy also
 // runs after every successful build; this is the startup pass, and it must
 // precede ReconcileIndexes so the reconcile sees post-retention disk facts.
+//
+// ONLY the index layer is bounded here, and that is a contract rather than an
+// omission: a version is kept forever. `RollbackVersion` accepts any surviving
+// version, so "nobody will read this one again" is not a fact the control layer can
+// ever establish — retiring an old version would turn a legal rollback into an empty
+// knowledge base. What IS rebuildable is the index: drop the artifact and the next
+// query rebuilds it (`ErrIndexNotReady`, then `RebuildIndex`), which is exactly why
+// that is the layer with a window. A version's doc-id list and its documents have no
+// such window, so a node's footprint for a knowledge base grows with its version
+// count. That is the price of "you may roll back to any version", and it is the
+// reason the maintenance paths that enumerate a knowledge base's versions
+// (DeletedVersionLeftovers, reconcile) are written to cost what the node HOLDS
+// rather than what the knowledge base ever had.
 func (d *LocalDataPlane) EnforceRetention(ctx context.Context, meta MetadataLister) error {
 	kbs, err := meta.ListKnowledgeBases(ctx)
 	if err != nil {
