@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="800" viewBox="0 0 1040 800" role="img" aria-label="Stratum 架构：客户端 → 服务站 → 控制面 / 存储面 → C++ vecstore">
+  <title>Stratum 架构</title>
+  <desc>服务站只做路由与鉴权；控制面只拥有 Raft 复制的元数据；存储面拥有全部物理事实；向量计算下沉到 C++ vecstore，存储分 L0 内存 / L1 磁盘 / L2 永久三层。</desc>
+
+  <defs>
+    <marker id="arw" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 z" fill="#64748b"/>
+    </marker>
+    <marker id="arwStart" markerWidth="8" markerHeight="8" refX="0" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M7,0 L0,3 L7,6 z" fill="#64748b"/>
+    </marker>
+    <style>
+      .box-title { font-size: 14px; font-weight: 700; fill: #1f2937; }
+      .box-sub   { font-size: 11.5px; fill: #6b7280; }
+      .body      { font-size: 12px; fill: #374151; }
+      .note      { font-size: 11px; fill: #6b7280; }
+      .edge      { stroke: #64748b; stroke-width: 1.6; fill: none; }
+      .edge-label{ font-size: 10.5px; fill: #64748b; }
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1040" height="800" fill="#ffffff"/>
+
+  <!-- 标题 -->
+  <text x="520" y="36" text-anchor="middle" font-size="20" font-weight="700" fill="#111827">Stratum 架构：服务站 / 控制面 / 存储面 / C++ vecstore</text>
+  <text x="520" y="58" text-anchor="middle" font-size="12.5" fill="#6b7280">元数据由 Raft 强一致；文档、chunk 与向量索引是存储面独有的物理事实；向量计算全部下沉到 C++ vecstore</text>
+
+  <!-- 客户端 -->
+  <rect x="40" y="84" width="960" height="46" rx="10" fill="#eef3fa" stroke="#5b7ba6" stroke-width="1.6"/>
+  <text x="520" y="112" text-anchor="middle" class="body">外部客户端：gRPC SDK · HTTP 网关 / Web 控制台</text>
+
+  <path class="edge" d="M520,130 L520,158" marker-end="url(#arw)"/>
+
+  <!-- 服务站 -->
+  <rect x="140" y="162" width="760" height="78" rx="10" fill="#fdf4e4" stroke="#d9a441" stroke-width="1.6"/>
+  <text x="520" y="186" text-anchor="middle" class="box-title">服务站 station（stratum-router）—— 集群唯一对外检索入口 + 鉴权闸门</text>
+  <text x="520" y="208" text-anchor="middle" class="body">按 min_version 取副本 · 副本不健康换候选 · 索引维护中可重试 · 存储层退化时拒绝写入（读照常服务）</text>
+  <text x="520" y="228" text-anchor="middle" class="note">不持有任何状态：它坏掉只影响路由，不影响正确性</text>
+
+  <!-- 分叉 -->
+  <path class="edge" d="M520,240 L520,262"/>
+  <path class="edge" d="M250,262 L790,262"/>
+  <path class="edge" d="M250,262 L250,282" marker-end="url(#arw)"/>
+  <path class="edge" d="M790,262 L790,282" marker-end="url(#arw)"/>
+  <text x="330" y="256" class="edge-label">gRPC（控制面）</text>
+  <text x="670" y="256" class="edge-label">gRPC（存储面）</text>
+
+  <!-- 控制面 -->
+  <rect x="40" y="284" width="420" height="212" rx="10" fill="#e9f3ea" stroke="#4c8b5f" stroke-width="1.6"/>
+  <text x="60" y="310" class="box-title">控制面节点（role=control）</text>
+  <text x="60" y="330" class="box-sub">只拥有 Raft 复制的元数据 · 不写本地存储（只有日志与快照）</text>
+  <text x="60" y="356" class="body">知识库 · 版本链 · 活跃版本（子版本至多一个）</text>
+  <text x="60" y="378" class="body">抽象可用性 · READY 副本计数</text>
+  <text x="60" y="400" class="body">数据侧 / 索引侧各自独立的状态与终态</text>
+  <text x="60" y="422" class="body">Raft 共识：日志复制 · 快照 · 选举</text>
+  <text x="60" y="444" class="body">非 leader 也能发起写：经 InternalService.Propose 转发</text>
+  <text x="60" y="466" class="body">退化判据来自周期上报的聚合，未知一律放行</text>
+
+  <!-- 存储面 -->
+  <rect x="580" y="284" width="420" height="212" rx="10" fill="#eae8f8" stroke="#6a5acd" stroke-width="1.6"/>
+  <text x="600" y="310" class="box-title">存储面节点（role=storage）</text>
+  <text x="600" y="330" class="box-sub">拥有全部物理事实 · 不参与选举（元数据读自控制面）</text>
+  <text x="600" y="356" class="body">文档（MVCC）· chunk（内容寻址）· 向量索引</text>
+  <text x="600" y="378" class="body">IndexManager：每版本索引 LRU + 引用计数</text>
+  <text x="600" y="400" class="body"> + 异步构建池 + 保留 / 回收策略 + 索引分发</text>
+  <text x="600" y="422" class="body">PebbleDB：DocStore · ChunkDoc 映射 · VersionDoc</text>
+  <text x="600" y="444" class="body">落后副本自愈：周期上报游标 → 追链补齐</text>
+  <text x="600" y="466" class="body">周期 chunk GC · 每版本布隆过滤器 · 墓碑回收</text>
+
+  <!-- 两层契约 -->
+  <path class="edge" d="M466,394 L574,394" marker-end="url(#arw)" marker-start="url(#arwStart)"/>
+  <text x="520" y="384" text-anchor="middle" class="edge-label" font-weight="700">internal/plane</text>
+  <text x="520" y="412" text-anchor="middle" class="edge-label">只传逻辑对象</text>
+  <text x="520" y="426" text-anchor="middle" class="edge-label">不传放置细节</text>
+
+  <!-- 存储面 → vecstore -->
+  <path class="edge" d="M790,496 L790,536" marker-end="url(#arw)"/>
+  <text x="800" y="520" class="edge-label">内部 gRPC</text>
+
+  <!-- vecstore -->
+  <rect x="40" y="538" width="960" height="196" rx="10" fill="#f8e9ee" stroke="#b5546f" stroke-width="1.6"/>
+  <text x="60" y="564" class="box-title">C++ vecstore —— 向量存储与检索（Faiss HNSW + RocksDB）</text>
+  <text x="60" y="590" class="body">L0 内存：每 (kb, version) 一份 HNSW 索引 / 量化粗筛器 —— 生命周期状态机 EMPTY → BUILDING → READY + 每实例读写锁</text>
+  <text x="60" y="612" class="body">量化两段式：① 粗筛 top-N（SQ8 / PQ）→ ② 按候选回读 L2 全精度向量 → ③ 精确 rerank（精度由 rerank 决定，量化只影响候选覆盖）</text>
+  <text x="60" y="634" class="body">L1 磁盘：&lt;versionID&gt;.index（.ids / .mem 边车）；冷版本可免图分层，Load 即恢复</text>
+  <text x="60" y="656" class="body">L2 永久：RocksDB 全精度向量（内容寻址、不压缩，权威数据）</text>
+  <text x="60" y="686" class="body" fill="#6b7280">Search 持读锁贯穿（含 rerank 磁盘 IO），写锁保护构建 / 加载 / 重置 —— 杜绝 use-after-free 与错位结果</text>
+  <text x="60" y="712" class="body" fill="#6b7280">量化把内存载荷压到 1 B/维，代价是粗筛省下的时间被 rerank 吃掉：它买的是内存，不是延迟</text>
+
+  <text x="40" y="768" class="note">图形化版本对应 README「架构」段；三层职责边界与两段检索语义见 local docs《Stratum_设计文档v13》§2.5 / §2.6 与 §7.0。数据与口径见 docs/stress-test-report.md。</text>
+</svg>

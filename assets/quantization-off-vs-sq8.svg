@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="540" viewBox="0 0 900 540" role="img" aria-label="量化两段式买到的是内存，不是延迟">
+  <title>量化两段式买到的是内存，不是延迟</title>
+  <desc>折线图：全精度 OFF（实线）与 SQ8（虚线）的 p50 / p95 / p99 查询延迟（ms，对数纵轴）对比。</desc>
+  <defs>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+      .axis-t { font-size: 11.5px; fill: #6b7280; }
+      .tick   { font-size: 11px; fill: #6b7280; }
+      .pt     { font-size: 11px; font-weight: 600; }
+      .legend { font-size: 12px; fill: #374151; }
+      .note   { font-size: 10.5px; fill: #6b7280; }
+      .grid   { stroke: #e5e7eb; stroke-width: 1; }
+      .axline { stroke: #9ca3af; stroke-width: 1.2; }
+    </style>
+  </defs>
+  <rect x="0" y="0" width="900" height="540" fill="#ffffff"/>
+  <text x="450.0" y="28" text-anchor="middle" font-size="16" font-weight="700" fill="#111827">量化两段式买到的是内存，不是延迟</text>
+  <text x="450.0" y="48" text-anchor="middle" font-size="11.5" fill="#6b7280">同一个用例、同一台机器，只把知识库创建时的量化类型换成 SQ8（创建后不可变）</text>
+
+<line class="grid" x1="86" y1="466.0" x2="860" y2="466.0"/>
+<text class="tick" x="76" y="470.0" text-anchor="end">3 ms</text>
+<line class="grid" x1="86" y1="408.9" x2="860" y2="408.9"/>
+<text class="tick" x="76" y="412.9" text-anchor="end">5 ms</text>
+<line class="grid" x1="86" y1="331.4" x2="860" y2="331.4"/>
+<text class="tick" x="76" y="335.4" text-anchor="end">10 ms</text>
+<line class="grid" x1="86" y1="253.9" x2="860" y2="253.9"/>
+<text class="tick" x="76" y="257.9" text-anchor="end">20 ms</text>
+<line class="grid" x1="86" y1="151.5" x2="860" y2="151.5"/>
+<text class="tick" x="76" y="155.5" text-anchor="end">50 ms</text>
+<line class="grid" x1="86" y1="74.0" x2="860" y2="74.0"/>
+<text class="tick" x="76" y="78.0" text-anchor="end">100 ms</text>
+<line class="axline" x1="86" y1="74" x2="86" y2="466"/>
+<line class="axline" x1="86" y1="466" x2="860" y2="466"/>
+<text class="axis-t" x="76" y="64" text-anchor="end">延迟（对数轴）</text>
+<line class="axline" x1="186.6" y1="466" x2="186.6" y2="471"/>
+<text class="tick" x="186.6" y="487" text-anchor="middle">2,000</text>
+<line class="axline" x1="473.0" y1="466" x2="473.0" y2="471"/>
+<text class="tick" x="473.0" y="487" text-anchor="middle">8,000</text>
+<line class="axline" x1="759.4" y1="466" x2="759.4" y2="471"/>
+<text class="tick" x="759.4" y="487" text-anchor="middle">20,000</text>
+<text class="axis-t" x="450.0" y="506" text-anchor="middle">知识库文档规模</text>
+<polyline points="186.6,323.8 473.0,262.3 759.4,101.6" fill="none" stroke="#dc2626" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="186.6" cy="323.8" r="3.6" fill="#ffffff" stroke="#dc2626" stroke-width="2"/>
+<text class="pt" x="195.6" y="327.8" text-anchor="start" fill="#dc2626">10.70</text>
+<circle cx="473.0" cy="262.3" r="3.6" fill="#ffffff" stroke="#dc2626" stroke-width="2"/>
+<text class="pt" x="482.0" y="266.3" text-anchor="start" fill="#dc2626">18.55</text>
+<circle cx="759.4" cy="101.6" r="3.6" fill="#ffffff" stroke="#dc2626" stroke-width="2"/>
+<text class="pt" x="750.4" y="105.6" text-anchor="end" fill="#dc2626">78.12</text>
+<polyline points="186.6,320.0 473.0,289.0 759.4,174.3" fill="none" stroke="#dc2626" stroke-width="1.8" stroke-dasharray="6 5" stroke-linejoin="round"/>
+<circle cx="186.6" cy="320.0" r="3.6" fill="#ffffff" stroke="#dc2626" stroke-width="2"/>
+<text class="pt" x="195.6" y="335.0" text-anchor="start" fill="#dc2626">11.07</text>
+<circle cx="473.0" cy="289.0" r="3.6" fill="#ffffff" stroke="#dc2626" stroke-width="2"/>
+<text class="pt" x="482.0" y="304.0" text-anchor="start" fill="#dc2626">14.61</text>
+<circle cx="759.4" cy="174.3" r="3.6" fill="#ffffff" stroke="#dc2626" stroke-width="2"/>
+<text class="pt" x="750.4" y="189.3" text-anchor="end" fill="#dc2626">40.78</text>
+<polyline points="186.6,369.7 473.0,299.7 759.4,161.5" fill="none" stroke="#d97706" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="186.6" cy="369.7" r="3.6" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+<text class="pt" x="195.6" y="373.7" text-anchor="start" fill="#d97706">7.10</text>
+<circle cx="473.0" cy="299.7" r="3.6" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+<text class="pt" x="482.0" y="303.7" text-anchor="start" fill="#d97706">13.28</text>
+<circle cx="759.4" cy="161.5" r="3.6" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+<text class="pt" x="750.4" y="165.5" text-anchor="end" fill="#d97706">45.71</text>
+<polyline points="186.6,362.1 473.0,302.2 759.4,194.4" fill="none" stroke="#d97706" stroke-width="1.8" stroke-dasharray="6 5" stroke-linejoin="round"/>
+<circle cx="186.6" cy="362.1" r="3.6" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+<text class="pt" x="195.6" y="377.1" text-anchor="start" fill="#d97706">7.60</text>
+<circle cx="473.0" cy="302.2" r="3.6" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+<text class="pt" x="482.0" y="317.2" text-anchor="start" fill="#d97706">12.98</text>
+<circle cx="759.4" cy="194.4" r="3.6" fill="#ffffff" stroke="#d97706" stroke-width="2"/>
+<text class="pt" x="750.4" y="209.4" text-anchor="end" fill="#d97706">34.06</text>
+<polyline points="186.6,416.0 473.0,326.0 759.4,226.4" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="186.6" cy="416.0" r="3.6" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text class="pt" x="195.6" y="420.0" text-anchor="start" fill="#2563eb">4.69</text>
+<circle cx="473.0" cy="326.0" r="3.6" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text class="pt" x="482.0" y="330.0" text-anchor="start" fill="#2563eb">10.50</text>
+<circle cx="759.4" cy="226.4" r="3.6" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text class="pt" x="750.4" y="230.4" text-anchor="end" fill="#2563eb">25.58</text>
+<polyline points="186.6,404.3 473.0,347.1 759.4,234.9" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="6 5" stroke-linejoin="round"/>
+<circle cx="186.6" cy="404.3" r="3.6" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text class="pt" x="195.6" y="419.3" text-anchor="start" fill="#2563eb">5.21</text>
+<circle cx="473.0" cy="347.1" r="3.6" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text class="pt" x="482.0" y="362.1" text-anchor="start" fill="#2563eb">8.69</text>
+<circle cx="759.4" cy="234.9" r="3.6" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+<text class="pt" x="750.4" y="249.9" text-anchor="end" fill="#2563eb">23.71</text>
+<line x1="100" y1="86" x2="126" y2="86" stroke="#dc2626" stroke-width="2.4"/>
+<text class="legend" x="132" y="90">p99 全精度 OFF</text>
+<line x1="100" y1="106" x2="126" y2="106" stroke="#dc2626" stroke-width="2.4" stroke-dasharray="6 5"/>
+<text class="legend" x="132" y="110">p99 SQ8</text>
+<line x1="100" y1="126" x2="126" y2="126" stroke="#d97706" stroke-width="2.4"/>
+<text class="legend" x="132" y="130">p95 全精度 OFF</text>
+<line x1="100" y1="146" x2="126" y2="146" stroke="#d97706" stroke-width="2.4" stroke-dasharray="6 5"/>
+<text class="legend" x="132" y="150">p95 SQ8</text>
+<line x1="100" y1="166" x2="126" y2="166" stroke="#2563eb" stroke-width="2.4"/>
+<text class="legend" x="132" y="170">p50 全精度 OFF</text>
+<line x1="100" y1="186" x2="126" y2="186" stroke="#2563eb" stroke-width="2.4" stroke-dasharray="6 5"/>
+<text class="legend" x="132" y="190">p50 SQ8</text>
+<text class="note" x="86" y="514">三个规模上的差都落在轮间噪声里；能确定的是「量化不给这条路径带来延迟收益」——粗筛省下的时间被 rerank 吃掉了。</text>
+<text class="note" x="86" y="526">量化买到的：单版本索引产物 1,000 篇时 OFF 33,792 B → SQ8 11,440 B（34%），以及 1 B/维的内存载荷。</text>
+<text class="note" x="86" y="537.5">数据：README「性能实测」2026-09-22 轮实测。20,000 篇 SQ8 的冷查询 277.72 ms 是一次异常样本，未入图。</text>
+</svg>

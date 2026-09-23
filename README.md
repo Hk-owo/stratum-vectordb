@@ -1,5 +1,11 @@
 # Stratum
 
+[![CI](https://github.com/Hk-owo/stratum-vectordb/actions/workflows/ci.yml/badge.svg)](https://github.com/Hk-owo/stratum-vectordb/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Hk-owo/stratum-vectordb/branch/main/graph/badge.svg)](https://codecov.io/gh/Hk-owo/stratum-vectordb)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Hk-owo/stratum-vectordb)](https://goreportcard.com/report/github.com/Hk-owo/stratum-vectordb)
+[![Go 1.24](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.24)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **分布式版本化向量检索引擎 —— 为 RAG 构建的可回滚、可审计知识库存储层。**
 
 文档经 embed 服务向量化后，以 **MVCC 版本** 为单位组织、索引与查询：一次写入产出独立新版本，查询永远落在明确的版本上，回滚 / 版本对比 / 审计都是一等公民。文档按**内容定义分块**切成语义完整的 chunk，元数据由 **Raft** 在节点间强一致，向量由 **C++ Faiss HNSW** 索引；存储按 **L0 内存热层 / L1 磁盘冷层 / L2 永久层** 分层，大知识库可选**量化两段式检索**，内存载荷压缩 4–32× 而精度不变。
@@ -73,6 +79,10 @@ scripts/cluster.sh --topology two-tier status  # 每容器状态与控制组 lea
 ```
 
 ## 架构
+
+![Stratum 架构:客户端 → 服务站 → 控制面 / 存储面 → C++ vecstore](assets/architecture.svg)
+
+同一拓扑的文字版(关键信息在下面这份 ASCII 图里重复一遍,渲染 SVG 的环境缺中文字体时以它为准):
 
 ```
                     外部客户端:gRPC SDK · HTTP 网关 / Web 控制台
@@ -393,6 +403,8 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 
 ### 查询延迟
 
+![查询延迟随文档规模的变化:p50 / p95 / p99 与冷查询(全精度 OFF)](assets/latency-vs-scale.svg)
+
 `TestT4_QueryLatency` —— 2,000 / 8,000 / 20,000 篇文档,各 200 次查询,**冷热分开**报:
 
 | 指标 | 2,000 篇 / 200 次查询 | 8,000 篇 / 200 次查询 | 20,000 篇 / 200 次查询 |
@@ -407,6 +419,8 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 查询向量与 embedder 同卦限(`queryVector(768)`,固定种子、分量非负),所以 HNSW 的剪枝强度与真实调用方一致;全零向量那行是同一次运行内的对照——它与所有文档等距,贪心遍历无从剪枝,是"测了一个没人会发的请求"的代价。热 p50 与文档数**比线性更陡**(4.69 → 10.50 → 25.58;文档数比 1:4:10,延迟比 1:2.24:5.46):本套语料经内容定义分块去重后唯一 chunk 极少,`matched_docs` 恒等于全部文档数,所以这条路径量的是"候选映射到多少个文档",而这一段的工作量随文档数放大后,尾部分位(p95/p99)比 p50 涨得更快——20,000 篇的 p99/p50 已到 3.05(2,000 篇 2.28)。
 
 **量化对照** —— 同一个用例、同一台机器,只把知识库创建时的量化类型换成 `SQ8`(创建后不可变):
+
+![量化两段式 OFF 与 SQ8 的延迟对比:买到的是内存,不是延迟](assets/quantization-off-vs-sq8.svg)
 
 | 指标 | 2,000 篇 `OFF` | 2,000 篇 `SQ8` | 8,000 篇 `OFF` | 8,000 篇 `SQ8` | 20,000 篇 `OFF` | 20,000 篇 `SQ8` |
 |---|---|---|---|---|---|---|
@@ -624,3 +638,7 @@ configs/             # 示例配置文件
 - **Go 1.24**(依赖 `restic/chunker` 做滚动指纹分块)
 - **C++17**(vecstore):Faiss ≥ 1.9.0、RocksDB、gRPC、Protobuf、BLAS/LAPACK、OpenMP
 - C++ 构建仅在需要 Faiss HNSW 后端时必需;Go 单测使用进程内 mock。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 Hk-owo —— 可自由使用、修改、分发与商用,需保留版权声明与许可声明。

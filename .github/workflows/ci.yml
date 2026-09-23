@@ -49,8 +49,31 @@ jobs:
       - name: 构建
         run: go build ./...
 
-      - name: 单元测试
-        run: go test ./... -timeout 180s -count=1
+      - name: 单元测试(含覆盖率)
+        run: go test ./... -timeout 180s -count=1 -covermode=atomic -coverprofile=coverage.out
+
+      # 覆盖率同时写进 job summary(免登录可读)与 Codecov(徽章 + 逐行视图)。
+      # 上传失败不判 CI 红:未配 CODECOV_TOKEN 时会退化成 tokenless 上传,
+      # 公共仓库可用,但也不该因此拖垮构建。
+      - name: 覆盖率摘要
+        run: |
+          go tool cover -func=coverage.out | tail -1
+          {
+            echo '## Go 单元测试覆盖率'
+            echo
+            echo '```'
+            go tool cover -func=coverage.out | tail -1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传覆盖率到 Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          flags: unit
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       - name: 竞态检测 (raft / kvraft / index)
         run: go test -race ./internal/kvraft/... ./internal/raft/... ./internal/index/... -timeout 300s -count=1
