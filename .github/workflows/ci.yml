@@ -69,11 +69,10 @@ jobs:
       - name: 上传覆盖率到 Codecov
         uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.out
           flags: unit
           fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
       - name: 竞态检测 (raft / kvraft / index)
         run: go test -race ./internal/kvraft/... ./internal/raft/... ./internal/index/... -timeout 300s -count=1
