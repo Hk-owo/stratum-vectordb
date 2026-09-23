@@ -1131,9 +1131,14 @@ func main() {
 		// first inside the goroutine, and the reverse reconciliation cannot see it
 		// either, because the version is still in the metadata. This pass is the only
 		// thing that repairs it without an operator noticing, and it costs a walk of
-		// this node's own state machine — which is why it can afford to run each
-		// minute, and why it runs where the state machine is.
-		go coordinator.NewDeletingVersionSweeper(rn, deleteVersionCoord, 0, logger).Run(ctx)
+		// this node's own state machine — ids only, and only for the knowledge bases
+		// something has been deleted on, which is what makes a minute affordable.
+		//
+		// It starts with every knowledge base dirty: the dirty set is memory, so a
+		// fresh process has received no marks and could still be carrying stuck ones
+		// from a previous life.
+		raftNode.MarkAllDeletingDirty()
+		go coordinator.NewDeletingVersionSweeper(raftNode, raftNode, deleteVersionCoord, 0, logger).Run(ctx)
 	}
 
 	// --- gRPC services ---

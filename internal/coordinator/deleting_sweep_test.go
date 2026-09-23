@@ -6,152 +6,195 @@ import (
 	"testing"
 	"time"
 
-	"stratum/internal/types"
+	stratumerrors "stratum/internal/errors"
 )
 
-// sweepMeta is the two-call metadata read the sweep depends on — narrow on purpose,
-// so the sweep has nothing else to reach for.
-type sweepMeta struct {
-	kbs        []types.KnowledgeBaseMeta
-	versions   map[string][]types.VersionMeta
-	versionErr map[string]error
-	listErr    error
+// fakeDeleting is the narrow read: ids per knowledge base, optionally failing, and it
+// records which knowledge bases were asked about — which is how the tests below prove
+// that an untouched knowledge base costs nothing.
+type fakeDeleting struct {
+	ids  map[string][]int64
+	errs map[string]error
+	read []string
 }
 
-func (m sweepMeta) ListKnowledgeBases(context.Context) ([]types.KnowledgeBaseMeta, error) {
-	if m.listErr != nil {
-		return nil, m.listErr
-	}
-	return m.kbs, nil
-}
-
-func (m sweepMeta) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
-	if err := m.versionErr[kbID]; err != nil {
+func (f *fakeDeleting) DeletingVersionIDs(_ context.Context, kbID string) ([]int64, error) {
+	f.read = append(f.read, kbID)
+	if err := f.errs[kbID]; err != nil {
 		return nil, err
 	}
-	return m.versions[kbID], nil
+	return f.ids[kbID], nil
 }
 
-func deletingVersion(kbID string, versionID int64) types.VersionMeta {
-	return types.VersionMeta{VersionID: versionID, KBID: kbID, Deleting: true}
+// fakeDirty is the tracker: a set that Take consumes, and a put-back for a pass that
+// could not finish.
+type fakeDirty struct {
+	set map[string]bool
 }
 
-// Only a knowledge base that actually has a version stuck at Deleting is touched: the
-// pass must not re-run cleanup for every knowledge base it can see.
-func TestDeletingVersionSweeper_ResumesOnlyKnowledgeBasesWithDeletingVersions(t *testing.T) {
-	meta := sweepMeta{
-		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-stuck"}, {KBID: "kb-healthy"}},
-		versions: map[string][]types.VersionMeta{
-			"kb-stuck":   {deletingVersion("kb-stuck", 1)},
-			"kb-healthy": {{VersionID: 2, KBID: "kb-healthy"}},
-		},
+func (f *fakeDirty) TakeDirtyDeletingKBs() []string {
+	if len(f.set) == 0 {
+		return nil
 	}
-	coord := NewMockDeleteVersionCoordinator()
+	out := make([]string, 0, len(f.set))
+	for kbID := range f.set {
+		out = append(out, kbID)
+	}
+	f.set = make(map[string]bool)
+	return out
+}
 
-	sweeper := NewDeletingVersionSweeper(meta, coord, time.Minute, nil)
-	resumed, err := sweeper.SweepOnce(context.Background())
-	if err != nil {
-		t.Fatalf("SweepOnce: %v", err)
+func (f *fakeDirty) MarkDeletingDirty(kbID string) {
+	if f.set == nil {
+		f.set = make(map[string]bool)
 	}
-	if resumed != 1 {
-		t.Errorf("resumed = %d, want 1", resumed)
+	f.set[kbID] = true
+}
+
+func sweeping(versions *fakeDeleting, dirty *fakeDirty, cleanup *MockDeleteVersionCoordinator) *DeletingVersionSweeper {
+	return NewDeletingVersionSweeper(versions, dirty, cleanup, time.Minute, nil)
+}
+
+// The whole point of the dirty set: a knowledge base nothing has happened to is never
+// asked about. Without it the pass walks every knowledge base of the node each minute.
+func TestDeletingVersionSweeper_ScansOnlyDirtyKnowledgeBases(t *testing.T) {
+	versions := &fakeDeleting{ids: map[string][]int64{"kb-a": {1}, "kb-b": {2}}}
+	cleanup := NewMockDeleteVersionCoordinator()
+
+	// Nothing dirty: no read at all, and no Execute.
+	resumed, err := sweeping(versions, &fakeDirty{}, cleanup).SweepOnce(context.Background())
+	if err != nil || resumed != 0 {
+		t.Fatalf("idle pass: resumed=%d err=%v, want 0 and nil", resumed, err)
 	}
-	if calls := coord.Calls(); len(calls) != 1 || calls[0] != "kb-stuck" {
-		t.Errorf("Execute calls = %v, want [kb-stuck]", calls)
+	if len(versions.read) != 0 {
+		t.Errorf("an idle pass read %v; it must read nothing", versions.read)
+	}
+	if len(cleanup.Calls()) != 0 {
+		t.Errorf("an idle pass executed %v", cleanup.Calls())
+	}
+
+	// One dirty knowledge base: exactly that one is read.
+	resumed, err = sweeping(versions, &fakeDirty{set: map[string]bool{"kb-b": true}}, cleanup).SweepOnce(context.Background())
+	if err != nil || resumed != 1 {
+		t.Fatalf("resumed=%d err=%v, want 1 and nil", resumed, err)
+	}
+	if len(versions.read) != 1 || versions.read[0] != "kb-b" {
+		t.Errorf("read %v, want exactly [kb-b]", versions.read)
+	}
+	if calls := cleanup.Calls(); len(calls) != 1 || calls[0] != "kb-b" {
+		t.Errorf("Execute calls = %v, want [kb-b]", calls)
 	}
 }
 
 // One Execute per knowledge base is enough — it re-scans that knowledge base's Deleting
-// versions itself — and the count reported is knowledge bases, not versions.
+// versions itself — and what is reported is knowledge bases, not versions.
 func TestDeletingVersionSweeper_OneExecutePerKnowledgeBase(t *testing.T) {
-	meta := sweepMeta{
-		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-stuck"}},
-		versions: map[string][]types.VersionMeta{
-			"kb-stuck": {
-				deletingVersion("kb-stuck", 1),
-				deletingVersion("kb-stuck", 2),
-				deletingVersion("kb-stuck", 3),
-			},
-		},
-	}
-	coord := NewMockDeleteVersionCoordinator()
+	versions := &fakeDeleting{ids: map[string][]int64{"kb-1": {1, 2, 3}}}
+	cleanup := NewMockDeleteVersionCoordinator()
 
-	resumed, err := NewDeletingVersionSweeper(meta, coord, time.Minute, nil).SweepOnce(context.Background())
+	resumed, err := sweeping(versions, &fakeDirty{set: map[string]bool{"kb-1": true}}, cleanup).SweepOnce(context.Background())
 	if err != nil {
 		t.Fatalf("SweepOnce: %v", err)
 	}
 	if resumed != 1 {
 		t.Errorf("resumed = %d, want 1 knowledge base", resumed)
 	}
-	if calls := coord.Calls(); len(calls) != 1 {
-		t.Errorf("Execute calls = %v, want exactly one (Execute re-scans the whole KB)", calls)
+	if calls := cleanup.Calls(); len(calls) != 1 {
+		t.Errorf("Execute calls = %v, want exactly one", calls)
 	}
 }
 
-// "I cannot enumerate this knowledge base" is not "there is nothing to do there": the
-// failure is reported and named, and the readable knowledge bases still run.
-func TestDeletingVersionSweeper_UnreadableKnowledgeBaseIsReportedNotSkipped(t *testing.T) {
-	meta := sweepMeta{
-		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-unreadable"}, {KBID: "kb-stuck"}},
-		versions: map[string][]types.VersionMeta{
-			"kb-stuck": {deletingVersion("kb-stuck", 1)},
-		},
-		versionErr: map[string]error{"kb-unreadable": errors.New("metadata away")},
-	}
-	coord := NewMockDeleteVersionCoordinator()
+// A knowledge base with nothing left to resume must not run the cleanup: between the mark
+// and this pass, the deletion may have finished (or the version been discarded).
+func TestDeletingVersionSweeper_NoDeletingVersionsDoesNotExecute(t *testing.T) {
+	versions := &fakeDeleting{ids: map[string][]int64{"kb-1": nil}}
+	cleanup := NewMockDeleteVersionCoordinator()
 
-	resumed, err := NewDeletingVersionSweeper(meta, coord, time.Minute, nil).SweepOnce(context.Background())
-	if err == nil {
-		t.Error("an unreadable knowledge base must be surfaced, not silently treated as empty")
+	resumed, err := sweeping(versions, &fakeDirty{set: map[string]bool{"kb-1": true}}, cleanup).SweepOnce(context.Background())
+	if err != nil {
+		t.Fatalf("SweepOnce: %v", err)
 	}
-	if resumed != 1 {
-		t.Errorf("resumed = %d, want 1 (the readable knowledge base still runs)", resumed)
-	}
-	if calls := coord.Calls(); len(calls) != 1 || calls[0] != "kb-stuck" {
-		t.Errorf("Execute calls = %v, want [kb-stuck]", calls)
+	if resumed != 0 || len(cleanup.Calls()) != 0 {
+		t.Errorf("resumed=%d calls=%v, want nothing resumed", resumed, cleanup.Calls())
 	}
 }
 
-// A cleanup that fails must not stop the pass: the state it would have repaired is
-// still there for the next tick.
-func TestDeletingVersionSweeper_ExecuteFailureDoesNotStopThePass(t *testing.T) {
-	meta := sweepMeta{
-		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-a"}, {KBID: "kb-b"}},
-		versions: map[string][]types.VersionMeta{
-			"kb-a": {deletingVersion("kb-a", 1)},
-			"kb-b": {deletingVersion("kb-b", 2)},
-		},
-	}
-	coord := NewMockDeleteVersionCoordinator()
-	coord.SetExecuteFunc(func(_ context.Context, kbID string) error {
+// A pass that could not finish with a knowledge base puts it BACK: the next tick has to
+// try again, and without that the deletion would be stranded exactly as it was before this
+// sweep existed.
+func TestDeletingVersionSweeper_FailedCleanupGoesBackIntoTheDirtySet(t *testing.T) {
+	dirty := &fakeDirty{set: map[string]bool{"kb-a": true, "kb-b": true}}
+	versions := &fakeDeleting{ids: map[string][]int64{"kb-a": {1}, "kb-b": {2}}}
+	cleanup := NewMockDeleteVersionCoordinator()
+	cleanup.SetExecuteFunc(func(_ context.Context, kbID string) error {
 		if kbID == "kb-a" {
 			return errors.New("broadcast failed")
 		}
 		return nil
 	})
+	sweeper := sweeping(versions, dirty, cleanup)
 
-	resumed, err := NewDeletingVersionSweeper(meta, coord, time.Minute, nil).SweepOnce(context.Background())
+	resumed, err := sweeper.SweepOnce(context.Background())
 	if err == nil {
 		t.Error("a failed cleanup must be reported")
 	}
 	if resumed != 1 {
 		t.Errorf("resumed = %d, want 1 (only kb-b finished)", resumed)
 	}
-	if calls := coord.Calls(); len(calls) != 2 {
-		t.Errorf("Execute calls = %v, want both knowledge bases attempted", calls)
+	if len(cleanup.Calls()) != 2 {
+		t.Errorf("Execute calls = %v, want both attempted", cleanup.Calls())
+	}
+	if !dirty.set["kb-a"] {
+		t.Error("kb-a must go back into the dirty set after a failed pass")
+	}
+	if dirty.set["kb-b"] {
+		t.Error("kb-b finished and must not be re-queued")
+	}
+
+	// And the next pass picks it up again.
+	cleanup.SetExecuteFunc(func(context.Context, string) error { return nil })
+	if resumed, err := sweeper.SweepOnce(context.Background()); err != nil || resumed != 1 {
+		t.Errorf("second pass: resumed=%d err=%v, want 1 and nil", resumed, err)
 	}
 }
 
-// A metadata list that fails outright is reported, and nothing is attempted.
-func TestDeletingVersionSweeper_ListFailureAttemptsNothing(t *testing.T) {
-	meta := sweepMeta{listErr: errors.New("metadata away")}
-	coord := NewMockDeleteVersionCoordinator()
-
-	resumed, err := NewDeletingVersionSweeper(meta, coord, time.Minute, nil).SweepOnce(context.Background())
-	if err == nil {
-		t.Error("a failed list must be reported")
+// A read that fails is reported and re-queued: "I cannot enumerate" is not "there is
+// nothing there", and it is not the knowledge base's fault either.
+func TestDeletingVersionSweeper_UnreadableKnowledgeBaseIsReportedAndRequeued(t *testing.T) {
+	dirty := &fakeDirty{set: map[string]bool{"kb-unreadable": true, "kb-stuck": true}}
+	versions := &fakeDeleting{
+		ids:  map[string][]int64{"kb-stuck": {1}},
+		errs: map[string]error{"kb-unreadable": errors.New("metadata away")},
 	}
-	if resumed != 0 || len(coord.Calls()) != 0 {
-		t.Errorf("resumed = %d calls = %v, want nothing attempted", resumed, coord.Calls())
+	cleanup := NewMockDeleteVersionCoordinator()
+
+	resumed, err := sweeping(versions, dirty, cleanup).SweepOnce(context.Background())
+	if err == nil {
+		t.Error("an unreadable knowledge base must be surfaced")
+	}
+	if resumed != 1 {
+		t.Errorf("resumed = %d, want 1 (the readable one still runs)", resumed)
+	}
+	if !dirty.set["kb-unreadable"] {
+		t.Error("the unreadable knowledge base must be re-queued")
+	}
+}
+
+// A knowledge base that is simply GONE is a normal end, not a failure: a whole-KB delete
+// finishes by removing it, so a dirty mark can outlive its knowledge base.
+func TestDeletingVersionSweeper_GoneKnowledgeBaseIsQuietAndNotRequeued(t *testing.T) {
+	dirty := &fakeDirty{set: map[string]bool{"kb-gone": true}}
+	versions := &fakeDeleting{errs: map[string]error{"kb-gone": stratumerrors.ErrKnowledgeBaseNotFound}}
+	cleanup := NewMockDeleteVersionCoordinator()
+
+	resumed, err := sweeping(versions, dirty, cleanup).SweepOnce(context.Background())
+	if err != nil {
+		t.Errorf("a knowledge base that no longer exists is not an error, got %v", err)
+	}
+	if resumed != 0 {
+		t.Errorf("resumed = %d, want 0", resumed)
+	}
+	if dirty.set["kb-gone"] {
+		t.Error("a knowledge base that is gone must not be re-queued forever")
 	}
 }
