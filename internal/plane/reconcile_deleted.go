@@ -196,13 +196,19 @@ const DefaultDeletedReconcileInterval = 5 * time.Minute
 // That price is bounded by what this node holds — the pass reads its own version list
 // and asks one range per knowledge base — not by what the knowledge base ever had.
 //
-// The action and its opt-in are the startup pass's, unchanged: ReconcileDeletedVersions
-// is idempotent end to end, and the caller decides whether this runs at all
-// (reconcile.deleted_versions — the same switch as the startup pass, because it is the
-// same judgement and the same irreversible action).
-func (d *LocalDataPlane) StartDeletedVersionReconcile(ctx context.Context, meta MetadataLister) {
+// The action is the startup pass's, unchanged: ReconcileDeletedVersions is idempotent
+// end to end. The opt-in is NOT, and deliberately — `reconcile.deleted_versions`
+// governs the start-up sweep and `reconcile.deleted_versions_periodic` governs this one,
+// because "clean up what is lying around at boot" and "keep recovering what appears
+// while running" are different decisions about the same irreversible action.
+//
+// A non-positive interval takes DefaultDeletedReconcileInterval.
+func (d *LocalDataPlane) StartDeletedVersionReconcile(ctx context.Context, meta MetadataLister, interval time.Duration) {
+	if interval <= 0 {
+		interval = DefaultDeletedReconcileInterval
+	}
 	go func() {
-		ticker := time.NewTicker(DefaultDeletedReconcileInterval)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {

@@ -1011,17 +1011,22 @@ func main() {
 				if reclaimed > 0 {
 					logger.Info("startup: reclaimed local leftovers of deleted versions", zap.Int("versions", reclaimed))
 				}
-				// The same judgement on a cadence, because the startup pass only sees
-				// leftovers that exist at boot — and the ones that matter are created
-				// at runtime (a push that outlived the delete meant to remove it needs
-				// no failure at all, §B). It skips every pass in which nothing local
-				// changed, so this costs nothing on a node at rest.
-				dataPlane.StartDeletedVersionReconcile(ctx, rn)
 			} else if leftovers, err := dataPlane.DeletedVersionLeftovers(ctx, rn); err != nil {
 				logger.Warn("startup: could not scan for local leftovers of deleted versions", zap.Error(err))
 			} else if n := totalVersionIDs(leftovers); n > 0 {
 				logger.Info("startup: local leftovers of deleted versions found; set reconcile.deleted_versions to reclaim them",
 					zap.Int("versions", n))
+			}
+
+			// The runtime pass has its own switch (reconcile.deleted_versions_periodic):
+			// the sweep above answers "what is lying around at boot", this one "what
+			// keeps appearing while running" — and the runtime leftovers are the ones
+			// that matter, because a push that outlived the delete meant to remove it
+			// needs no failure at all (§B). It skips every pass in which nothing local
+			// changed, so an idle node pays nothing.
+			if cfg.ReconcileDeletedVersionsPeriodic {
+				dataPlane.StartDeletedVersionReconcile(ctx, rn,
+					time.Duration(cfg.ReconcileDeletedVersionsIntervalS)*time.Second)
 			}
 		}
 	}
@@ -2012,6 +2017,21 @@ type appConfig struct {
 	// start-up, so a mistaken judgement would be replayed on every restart.
 	ReconcileDeletedVersions bool
 
+	// ReconcileDeletedVersionsPeriodic keeps looking for those leftovers while the node
+	// runs (reconcile.deleted_versions_periodic), instead of only at start-up.
+	//
+	// A switch of its own rather than a second meaning for the one above: the two
+	// answer different questions about the same irreversible action — "clean up what is
+	// lying around at boot" versus "keep recovering what appears while running" — and
+	// an operator may reasonably want either alone (the startup sweep left in reporting
+	// mode while the runtime pass works, or the runtime pass off on a fleet that
+	// restarts often enough for the startup sweep to cover it).
+	ReconcileDeletedVersionsPeriodic bool
+
+	// ReconcileDeletedVersionsIntervalS paces that pass. <= 0 takes the plane's
+	// default (5 minutes). Only read when the periodic pass is on.
+	ReconcileDeletedVersionsIntervalS int
+
 	// IndexServingReplicaMin is how many OTHER replicas must be serving a version
 	// before this node takes itself out of service to collect it
 	// (index_manager.serving_replica_min); <= 0 means the IndexManager's default.
@@ -2143,12 +2163,19 @@ type fileConfig struct {
 		ServiceAddr string `yaml:"service_addr"`
 	} `yaml:"embed"`
 
-	// Reconcile is the start-up reconciliation's opt-ins.
+	// Reconcile is the reconciliation's opt-ins — the start-up sweep and the runtime
+	// pass separately, since they are different decisions about one irreversible action.
 	Reconcile struct {
-		// DeletedVersions reclaims local leftovers of deleted versions
+		// DeletedVersions reclaims local leftovers of deleted versions at start-up
 		// (docs/known-gaps.md §B). The scan itself always runs and reports; this
 		// only decides whether the bytes are reclaimed.
 		DeletedVersions bool `yaml:"deleted_versions"`
+		// DeletedVersionsPeriodic does the same while the node runs. Off by default,
+		// and independent of the start-up switch.
+		DeletedVersionsPeriodic bool `yaml:"deleted_versions_periodic"`
+		// DeletedVersionsIntervalS paces the periodic pass (<= 0 means the plane's
+		// 5 minutes). Ignored unless DeletedVersionsPeriodic is set.
+		DeletedVersionsIntervalS int `yaml:"deleted_versions_interval_s"`
 	} `yaml:"reconcile"`
 
 	IndexManager struct {
@@ -2391,6 +2418,8 @@ func loadConfig(path string) (appConfig, error) {
 	// feature.
 	cfg.IndexGCEnabled = fc.IndexManager.GCEnabled
 	cfg.ReconcileDeletedVersions = fc.Reconcile.DeletedVersions
+	cfg.ReconcileDeletedVersionsPeriodic = fc.Reconcile.DeletedVersionsPeriodic
+	cfg.ReconcileDeletedVersionsIntervalS = fc.Reconcile.DeletedVersionsIntervalS
 	if fc.IndexManager.ServingReplicaMin != 0 {
 		cfg.IndexServingReplicaMin = fc.IndexManager.ServingReplicaMin
 	}
@@ -2510,10 +2539,15 @@ func defaultConfig() appConfig {
 		// for collection will still say when collection would have been worth it.
 		IndexGCEnabled:           false,
 		ReconcileDeletedVersions: false,
-		IndexServingReplicaMin:   0,
-		IndexGCGraphRebuildRatio: 0,
-		IndexGCSweepInterval:     0,
-		IndexBuildConcurrency:    0,
+		// The runtime pass is off unless asked for, for the same reason the start-up
+		// one is: it reclaims, and reclaiming is irreversible.
+		ReconcileDeletedVersionsPeriodic: false,
+		// 0 => the plane's default interval (5 minutes).
+		ReconcileDeletedVersionsIntervalS: 0,
+		IndexServingReplicaMin:            0,
+		IndexGCGraphRebuildRatio:          0,
+		IndexGCSweepInterval:              0,
+		IndexBuildConcurrency:             0,
 
 		WriteMaxRetries:   3,
 		WriteRetryBaseMS:  100,
