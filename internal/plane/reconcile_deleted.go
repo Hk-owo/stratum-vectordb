@@ -3,6 +3,7 @@ package plane
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"time"
 
@@ -208,6 +209,14 @@ func (d *LocalDataPlane) StartDeletedVersionReconcile(ctx context.Context, meta 
 		interval = DefaultDeletedReconcileInterval
 	}
 	go func() {
+		// Phase first, ticker second — see reconcileJitter. The start-up sweep has
+		// already run as a separate call, so delaying the FIRST periodic pass by up to
+		// one interval costs nothing.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reconcileJitter(interval)):
+		}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -230,6 +239,23 @@ func (d *LocalDataPlane) StartDeletedVersionReconcile(ctx context.Context, meta 
 			}
 		}
 	}()
+}
+
+// reconcileJitter is the periodic pass's start-up delay: a draw from [0, interval).
+//
+// Why it exists: every node's ticker is otherwise aligned to its own boot time, so a
+// cluster restarted as one batch — or simply a set of nodes all being written to —
+// asks the control layer for its per-knowledge-base liveness reads in the same
+// instant. That is N nodes × KBs of concurrent reads: harmless in kind (read-only, an
+// in-memory range read, serial within each node) but free to avoid.
+//
+// The phase only has to be scattered ONCE. Every ticker keeps its own offset
+// afterwards, so this shifts each node's first pass rather than wobbling every pass.
+func reconcileJitter(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(interval)))
 }
 
 // takeDeletedReconcileDirty consumes the dirty flag. Read-and-clear in one hold: two
