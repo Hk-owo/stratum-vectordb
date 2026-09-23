@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -122,7 +123,14 @@ type RaftNodeImpl struct {
 	// so each node has to react for itself, and the plane skips the pull when its
 	// own cursor already covers the version. Set by the startup wiring (main.go)
 	// to trigger data sync (internal/sync.FollowerSync.PullVersion).
-	onVersionCreated func(kbID string, versionID int64)
+	//
+	// The three hooks here are read by the apply loop and written by that
+	// startup wiring, which runs AFTER NewRaftNodeImpl has already started the
+	// loop — and on a restart the loop is replaying the log at that moment. So
+	// they are held atomically rather than as plain fields: a plain field was a
+	// real data race (the detector caught SetOnVersionCreated against
+	// handleEntryMsg), not a theoretical one.
+	onVersionCreated atomic.Pointer[func(kbID string, versionID int64)]
 
 	// onVersionFailedPermanent is an optional callback invoked after a
 	// cmdMarkVersionFailedPermanent is applied on this node — on EVERY applier, and
@@ -133,7 +141,7 @@ type RaftNodeImpl struct {
 	// how a verdict reaches the nodes that have to act on it. The reclaim itself is
 	// idempotent — a node that never held the version runs a prefix delete over
 	// nothing — and it runs off the apply loop, because it broadcasts.
-	onVersionFailedPermanent func(kbID string, versionID int64)
+	onVersionFailedPermanent atomic.Pointer[func(kbID string, versionID int64)]
 
 	// onVersionCommittedAsLeader is an optional callback invoked after a
 	// cmdCreateVersion is applied on a node that, AT APPLY TIME, believes it is
@@ -143,7 +151,7 @@ type RaftNodeImpl struct {
 	// attempted once per replica. The leadership check happens in the apply loop
 	// rather than at propose time, because a forwarded proposal is applied by
 	// whoever leads then, and a since-deposed leader must not dispatch.
-	onVersionCommittedAsLeader func(kbID string, versionID, parentVersionID int64, clientRequestID string)
+	onVersionCommittedAsLeader atomic.Pointer[func(kbID string, versionID, parentVersionID int64, clientRequestID string)]
 
 	// versionWatchers are the local waiters registered through WatchVersion,
 	// keyed by version ID. Its own mutex, not sm.mu: notifications come from the
@@ -268,26 +276,25 @@ func (impl *RaftNodeImpl) Stop() {
 // SetOnVersionCreated registers a callback that is invoked when a
 // cmdCreateVersion is applied on a non-proposer node (follower). The
 // leader does its own storage-layer writes inline and does not use this
-// hook. Call before the first propose; not safe for concurrent use after
-// the apply loop has started.
+// hook. Safe to call at any time, including after the apply loop has
+// started — see the field comment for why that matters.
 func (impl *RaftNodeImpl) SetOnVersionCreated(fn func(kbID string, versionID int64)) {
-	impl.onVersionCreated = fn
+	impl.onVersionCreated.Store(&fn)
 }
 
 // SetOnVersionFailedPermanent registers the callback invoked when a version's
 // terminal DATA-side verdict is applied on this node — every applier, not only the
-// one that reported the failure. Call before the first propose; not safe for
-// concurrent use after the apply loop has started.
+// one that reported the failure. Safe to call at any time, including after the
+// apply loop has started.
 func (impl *RaftNodeImpl) SetOnVersionFailedPermanent(fn func(kbID string, versionID int64)) {
-	impl.onVersionFailedPermanent = fn
+	impl.onVersionFailedPermanent.Store(&fn)
 }
 
 // SetOnVersionCommittedAsLeader registers the §7.13.2 dispatch hook: invoked
 // when a cmdCreateVersion is applied on a node that believes it leads at that
-// moment. Call before the first propose; not safe for concurrent use after the
-// apply loop has started.
+// moment. Safe to call at any time, including after the apply loop has started.
 func (impl *RaftNodeImpl) SetOnVersionCommittedAsLeader(fn func(kbID string, versionID, parentVersionID int64, clientRequestID string)) {
-	impl.onVersionCommittedAsLeader = fn
+	impl.onVersionCommittedAsLeader.Store(&fn)
 }
 
 // IsLeader reports whether this node currently believes it leads the cluster.
@@ -451,20 +458,22 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	// anyone else knowing. Who needs to pull is a data-plane question, not a
 	// Raft one: the plane already skips the pull when its own cursor covers the
 	// version, so announcing every apply is both correct and cheap.
-	if err == nil && cmd.Type == cmdCreateVersion && impl.onVersionCreated != nil {
+	if err == nil && cmd.Type == cmdCreateVersion {
 		// Run asynchronously: pulling storage-layer data can block
 		// (dial + stream + retries), and a blocked apply loop would
 		// stall every subsequent committed entry — most visible when
 		// a follower replays its log after a restart.
-		impl.callbackWG.Add(1)
-		go func() {
-			defer impl.callbackWG.Done()
-			impl.onVersionCreated(cmd.KBID, result.VersionID)
-		}()
+		if fn := impl.onVersionCreated.Load(); fn != nil {
+			impl.callbackWG.Add(1)
+			go func() {
+				defer impl.callbackWG.Done()
+				(*fn)(cmd.KBID, result.VersionID)
+			}()
+		}
 	}
 
 	if err == nil && cmd.Type == cmdMarkVersionFailedPermanent &&
-		cmd.FailureSide == types.FailureSideData && impl.onVersionFailedPermanent != nil {
+		cmd.FailureSide == types.FailureSideData {
 		// Only the DATA side reaches this hook. Its consumers reclaim the version's
 		// PHYSICAL data, and an index-side verdict says a BUILD failed, not that the
 		// data is gone — a version with durable data and a dead index is exactly the
@@ -476,11 +485,13 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 		// Asynchronous for the same reason as the notification above: reclaiming a
 		// version's data can block (a local prefix delete, and on a control node a
 		// broadcast), and a blocked apply loop would stall every later committed entry.
-		impl.callbackWG.Add(1)
-		go func() {
-			defer impl.callbackWG.Done()
-			impl.onVersionFailedPermanent(cmd.KBID, cmd.VersionID)
-		}()
+		if fn := impl.onVersionFailedPermanent.Load(); fn != nil {
+			impl.callbackWG.Add(1)
+			go func() {
+				defer impl.callbackWG.Done()
+				(*fn)(cmd.KBID, cmd.VersionID)
+			}()
+		}
 	}
 
 	// The §7.13.2 dispatch hook, unlike the notification above, must fire on
@@ -492,12 +503,14 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	// where two nodes both believe they lead is accepted: writes are
 	// content-addressed and idempotent (§1.4), and the dispatcher's take-once
 	// registration (§7.13.2) makes a repeated dispatch a no-op.
-	if err == nil && cmd.Type == cmdCreateVersion && impl.onVersionCommittedAsLeader != nil && impl.IsLeader() {
-		impl.callbackWG.Add(1)
-		go func() {
-			defer impl.callbackWG.Done()
-			impl.onVersionCommittedAsLeader(cmd.KBID, result.VersionID, cmd.ParentVersionID, cmd.ClientRequestID)
-		}()
+	if err == nil && cmd.Type == cmdCreateVersion && impl.IsLeader() {
+		if fn := impl.onVersionCommittedAsLeader.Load(); fn != nil {
+			impl.callbackWG.Add(1)
+			go func() {
+				defer impl.callbackWG.Done()
+				(*fn)(cmd.KBID, result.VersionID, cmd.ParentVersionID, cmd.ClientRequestID)
+			}()
+		}
 	}
 
 	if !ok {
@@ -570,12 +583,12 @@ func (impl *RaftNodeImpl) handleSnapshotMsg(msg kvraft.ApplyMsg) {
 	// cmdCreateVersion. PullVersion is idempotent (re-pulls are no-ops),
 	// and the callback runs asynchronously so the apply loop is not
 	// blocked; Stop() waits for these goroutines via callbackWG.
-	if impl.onVersionCreated != nil {
+	if fn := impl.onVersionCreated.Load(); fn != nil {
 		for _, v := range impl.sm.listAllVersions() {
 			impl.callbackWG.Add(1)
 			go func(kbID string, versionID int64) {
 				defer impl.callbackWG.Done()
-				impl.onVersionCreated(kbID, versionID)
+				(*fn)(kbID, versionID)
 			}(v.KBID, v.VersionID)
 		}
 	}
