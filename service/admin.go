@@ -633,6 +633,16 @@ func (s *AdminServiceImpl) ForceRetryVersion(ctx context.Context, req *pb.ForceR
 //
 // SINGLE rather than SUBTREE because the operator named ONE version: a child, if
 // there is one, is spliced onto its parent rather than removed with it.
+//
+// It is also the only cleanup path that reaches a STORAGE NODE at runtime for a terminal
+// verdict. The verdict itself travels the Raft log, so every member learns it from its
+// own apply — but a storage node does not participate in Raft, and its own sweep of
+// terminal versions (ReclaimTerminalVersions) runs at start-up only. What does reach it
+// is this flow's delete broadcast, because a version DELETE is broadcast to every
+// candidate replica. So abandoning a dead version is what clears the bytes the verdict
+// alone would have left on that node until its next restart — which is the practical
+// reason "declare dead, then abandon" is the operator's path, and why nothing periodic
+// was added on the verdict's behalf.
 func (s *AdminServiceImpl) ForceAbandonVersion(ctx context.Context, req *pb.ForceAbandonVersionRequest) (*pb.ForceAbandonVersionResponse, error) {
 	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
 	if kbID == "" || versionID == 0 {

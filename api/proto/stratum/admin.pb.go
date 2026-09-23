@@ -511,6 +511,12 @@ type GetSystemStatusResponse struct {
 	// failed_permanent_versions lists versions that will never become READY on
 	// their own: the control layer has declared them dead and only an operator
 	// can retry or abandon them (Stratum_设计文档v13.md §10.1).
+	//
+	// The remedy is ForceRetryVersion (index side, revocable) or
+	// ForceAbandonVersion (removes the version from the chain). Abandoning is also
+	// what clears the verdict's leftovers on STORAGE nodes: a verdict travels the
+	// Raft log and so reaches only members, while a deletion is broadcast to every
+	// candidate replica.
 	FailedPermanentVersions []*FailedVersion `protobuf:"bytes,8,rep,name=failed_permanent_versions,json=failedPermanentVersions,proto3" json:"failed_permanent_versions,omitempty"`
 	// gc_blocked_versions lists ACTIVE versions whose artifact carries more dead
 	// weight than the ratio allows, but which this node cannot collect because too
