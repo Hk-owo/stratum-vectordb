@@ -2011,10 +2011,22 @@ type appConfig struct {
 
 	// ReconcileDeletedVersions reclaims this node's leftovers of DELETED versions
 	// (reconcile.deleted_versions) — the half of docs/known-gaps.md §B that the
-	// control layer's current state makes safe to act on. Off by default for the same reason
-	// gc_enabled is: the scan always runs and REPORTS, while reclaiming bytes is
-	// an operator's decision — it is irreversible, and it happens once per
-	// start-up, so a mistaken judgement would be replayed on every restart.
+	// control layer's current state makes safe to act on. The scan always runs and
+	// REPORTS; this decides whether the bytes are reclaimed.
+	//
+	// ON by default, unlike every other irreversibility switch here (gc_enabled,
+	// index retention), because leaving it off makes a storage node's leftovers
+	// invisible in practice: a version deleted by a BROADCAST is one that node has no
+	// record of — it wrote no WAL mark, it was merely told to drop the data — so the
+	// only thing that can name it again is this comparison against the control layer.
+	// With the switch off, those bytes sit there until an operator happens to read a
+	// startup log line.
+	//
+	// The trade those other switches make — "it is irreversible, and a mistaken
+	// judgement would be replayed on every restart" — is bounded here by the judgement
+	// itself: a prefix delete of versions the control layer no longer has, with §B's
+	// safety rules enforced inside it (an unreadable answer skips the knowledge base
+	// rather than guessing, and "never handed out" is not read as "removed").
 	ReconcileDeletedVersions bool
 
 	// ReconcileDeletedVersionsPeriodic keeps looking for those leftovers while the node
@@ -2022,10 +2034,13 @@ type appConfig struct {
 	//
 	// A switch of its own rather than a second meaning for the one above: the two
 	// answer different questions about the same irreversible action — "clean up what is
-	// lying around at boot" versus "keep recovering what appears while running" — and
-	// an operator may reasonably want either alone (the startup sweep left in reporting
-	// mode while the runtime pass works, or the runtime pass off on a fleet that
-	// restarts often enough for the startup sweep to cover it).
+	// lying around at boot" versus "keep recovering what appears while running" — so an
+	// operator may want either alone.
+	//
+	// ON by default, for the stronger form of the reason above: the leftovers that
+	// actually appear are the RUNTIME ones. A push that outlived the delete meant to
+	// remove it needs no failure at all (§B's source ③), so a node that only looks at
+	// boot carries that data until its next restart.
 	ReconcileDeletedVersionsPeriodic bool
 
 	// ReconcileDeletedVersionsIntervalS paces that pass. <= 0 takes the plane's
@@ -2168,10 +2183,12 @@ type fileConfig struct {
 	Reconcile struct {
 		// DeletedVersions reclaims local leftovers of deleted versions at start-up
 		// (docs/known-gaps.md §B). The scan itself always runs and reports; this
-		// only decides whether the bytes are reclaimed.
+		// only decides whether the bytes are reclaimed. On by default — see the
+		// appConfig field comment for why this one differs from the other
+		// irreversibility switches.
 		DeletedVersions bool `yaml:"deleted_versions"`
-		// DeletedVersionsPeriodic does the same while the node runs. Off by default,
-		// and independent of the start-up switch.
+		// DeletedVersionsPeriodic does the same while the node runs. Independent of
+		// the start-up switch; also on by default.
 		DeletedVersionsPeriodic bool `yaml:"deleted_versions_periodic"`
 		// DeletedVersionsIntervalS paces the periodic pass (<= 0 means the plane's
 		// 5 minutes). Ignored unless DeletedVersionsPeriodic is set.
@@ -2538,10 +2555,10 @@ func defaultConfig() appConfig {
 		// scanner still runs and reports, so a node that has never been configured
 		// for collection will still say when collection would have been worth it.
 		IndexGCEnabled:           false,
-		ReconcileDeletedVersions: false,
-		// The runtime pass is off unless asked for, for the same reason the start-up
-		// one is: it reclaims, and reclaiming is irreversible.
-		ReconcileDeletedVersionsPeriodic: false,
+		ReconcileDeletedVersions: true,
+		// On by default too — see the field comments for why this pair differs from
+		// every other irreversibility switch in this file.
+		ReconcileDeletedVersionsPeriodic: true,
 		// 0 => the plane's default interval (5 minutes).
 		ReconcileDeletedVersionsIntervalS: 0,
 		IndexServingReplicaMin:            0,
