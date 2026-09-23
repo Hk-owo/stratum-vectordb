@@ -1111,6 +1111,18 @@ func main() {
 		raftNode.SetOnVersionCommittedAsLeader(func(kbID string, versionID, parentVersionID int64, clientRequestID string) {
 			dispatchCommittedVersion(writeCoord, writeDispatcher, logger, kbID, versionID, parentVersionID, clientRequestID)
 		})
+
+		// The one state a delete can reach and never leave: DeleteVersion marks the
+		// version set in the state machine (durable, replicated, and where the API
+		// answers the caller) and only THEN hands the cleanup to a goroutine, so a
+		// crash in between leaves it marked Deleting with nothing that would finish
+		// it — the WAL has no record to resume from, because that mark is written
+		// first inside the goroutine, and the reverse reconciliation cannot see it
+		// either, because the version is still in the metadata. This pass is the only
+		// thing that repairs it without an operator noticing, and it costs a walk of
+		// this node's own state machine — which is why it can afford to run each
+		// minute, and why it runs where the state machine is.
+		go coordinator.NewDeletingVersionSweeper(rn, deleteVersionCoord, 0, logger).Run(ctx)
 	}
 
 	// --- gRPC services ---
