@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/Hk-owo/stratum-vectordb/actions/workflows/ci.yml/badge.svg)](https://github.com/Hk-owo/stratum-vectordb/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Hk-owo/stratum-vectordb/branch/main/graph/badge.svg)](https://codecov.io/gh/Hk-owo/stratum-vectordb)
-[![Go Report Card](https://goreportcard.com/badge/github.com/Hk-owo/stratum-vectordb)](https://goreportcard.com/report/github.com/Hk-owo/stratum-vectordb)
 [![Go 1.24](https://img.shields.io/badge/Go-1.24-00ADD8?logo=go&logoColor=white)](https://go.dev/doc/go1.24)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
