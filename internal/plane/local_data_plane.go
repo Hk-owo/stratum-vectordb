@@ -1357,14 +1357,14 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 	// was unreachable and every push inherited the whole budget (see
 	// replicaPushTimeout).
 	writeStart := time.Now()
-	var tAcquire, tLocal, tFanOut, tReport, tConfirm time.Duration
+	var tAcquire, tLocal time.Duration
 	// The inside of local_us and fanout_us, reported alongside them. Both are
 	// large enough to dominate a batch write's wall clock — together they were
 	// 98% of a 2,000-document transaction (local p50 1.34 s + fanout p50 1.75 s of
 	// a 3.15 s total) — and both were single opaque numbers. See localStages and
 	// fanoutStages for what each sub-stage is.
 	var local localStages
-	var fan fanoutStages
+	var fin finishStages
 	defer func() {
 		d.logger.Debug("write: stage timings",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("changes", len(changes)),
@@ -1373,12 +1373,12 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 			zap.Int64("wal_begin_us", local.walBegin.Microseconds()),
 			zap.Int64("storage_us", local.storage.Microseconds()),
 			zap.Int64("wal_commit_us", local.walCommit.Microseconds()),
-			zap.Int64("fanout_us", tFanOut.Microseconds()),
-			zap.Int64("resolve_us", fan.resolve.Microseconds()),
-			zap.Int64("push_us", fan.push.Microseconds()),
-			zap.Int("fanout_targets", fan.targets),
-			zap.Int64("report_us", tReport.Microseconds()),
-			zap.Int64("confirm_us", tConfirm.Microseconds()),
+			zap.Int64("fanout_us", fin.fanTotal.Microseconds()),
+			zap.Int64("resolve_us", fin.fan.resolve.Microseconds()),
+			zap.Int64("push_us", fin.fan.push.Microseconds()),
+			zap.Int("fanout_targets", fin.fan.targets),
+			zap.Int64("report_us", fin.report.Microseconds()),
+			zap.Int64("confirm_us", fin.confirm.Microseconds()),
 			zap.Int64("total_us", time.Since(writeStart).Microseconds()))
 	}()
 
@@ -1402,52 +1402,11 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 		d.reportFailure(ctx, kbID, versionID, classifyLocalWriteFailure(err), fmt.Sprintf("local write failed: %v", err))
 		return err
 	}
-	// Replicate to the other replicas and require a quorum before reporting
-	// the version durable (v13 §7.1/§7.2). The version is only "durable" once
-	// enough replicas hold it — the writer's own copy is one acknowledgement.
-	stepStart = time.Now()
-	fanErr := d.fanOut(ctx, kbID, versionID, len(changes), &fan)
-	tFanOut = time.Since(stepStart)
-	if fanErr != nil {
-		// The local transaction above already committed: this node holds the
-		// version's documents, its document-ID set and its WAL commit record. What
-		// fan-out adds is durability on OTHER replicas — which §7.5 restores by
-		// backfill — not the version's existence, and not its ability to be served
-		// from here.
-		//
-		// So the build is scheduled on this path too. It used to be reachable only
-		// through reportAndSchedule on the success path below, which left a version
-		// whose replication fell short with no index and no report at all: the
-		// control layer kept it PENDING, every query answered "index not ready", and
-		// the documents sat on disk with nobody able to finish or serve them.
-		// Measured on a 1000-document batch: report_us = 0 on all three replicas,
-		// each of which had already spent 14.6 s committing that very version.
-		stepStart = time.Now()
-		d.scheduleIndexBuild(ctx, kbID, versionID)
-		tReport = time.Since(stepStart)
-
-		// Replication still failed, and it is still transient (peers come back), so
-		// it is reported and returned — the caller's Saga owns the retry decision
-		// (§10.1). Note what is deliberately NOT done: no durable report.
-		// Durability is precisely the claim quorum was supposed to establish, and
-		// making it without quorum would be a lie the control layer acts on.
-		d.reportFailure(ctx, kbID, versionID, types.FailureTransient, fmt.Sprintf("replication failed: %v", fanErr))
-		return fanErr
-	}
-
-	stepStart = time.Now()
-	d.reportAndSchedule(ctx, kbID, versionID, docIDs)
-	tReport = time.Since(stepStart)
-
-	// len(docIDs) == 0 is the whole reason the announcement carries a flag: a
-	// version with no documents is never fanned out (fanOut above sends
-	// nothing), so replicas that did NOT coordinate it have no other way to
-	// learn it exists — and their cursors would stay behind it, which the
-	// station reads as "stale" (§9.3(2)).
-	stepStart = time.Now()
-	d.broadcastConfirmation(kbID, versionID)
-	tConfirm = time.Since(stepStart)
-	return nil
+	// Replicate to the other replicas and require a quorum before reporting the
+	// version durable (v13 §7.1/§7.2). finishVersionWrite owns that tail — and the
+	// crash-recovery path shares it, which is the point: a version resumed after a
+	// crash must clear the same quorum bar as one that never crashed.
+	return d.finishVersionWrite(ctx, kbID, versionID, len(changes), docIDs, &fin)
 }
 
 // PushIndexToReplicas ships a locally built index to the candidate replicas, so
@@ -2015,6 +1974,83 @@ func QuorumSize(n int) int {
 	return (n+1)/2 + (n+1)%2
 }
 
+// finishStages is where a completed write's tail went: the fan-out (itself split
+// into resolve/push by fanoutStages), the report, and the confirmation broadcast.
+type finishStages struct {
+	fanTotal time.Duration
+	fan      fanoutStages
+	report   time.Duration
+	confirm  time.Duration
+}
+
+// finishVersionWrite is the tail of every write whose local transaction has
+// already COMMITted: replicate to the candidate replicas, require a quorum, and
+// only then report the version durable.
+//
+// Both the normal path (WriteVersionData) and the crash-recovery path
+// (ResumeVersionWrite) end here. They used to implement this tail separately, and
+// the recovery copy skipped the fan-out — going straight to the durable report for
+// replicas that were never written to. That is the exact claim the failure branch
+// below refuses to make without a quorum ("making it without quorum would be a lie
+// the control layer acts on"), so the two paths had ended up disagreeing about what
+// durability means. Sharing one function is what keeps them from drifting apart
+// again: a step added here reaches both.
+func (d *LocalDataPlane) finishVersionWrite(ctx context.Context, kbID string, versionID int64, docs int, docIDs []string, st *finishStages) error {
+	fanStart := time.Now()
+	var fan fanoutStages
+	fanErr := d.fanOut(ctx, kbID, versionID, docs, &fan)
+	if st != nil {
+		st.fanTotal = time.Since(fanStart)
+		st.fan = fan
+	}
+	if fanErr != nil {
+		// The local transaction above already committed: this node holds the
+		// version's documents, its document-ID set and its WAL commit record. What
+		// fan-out adds is durability on OTHER replicas — which §7.5 restores by
+		// backfill — not the version's existence, and not its ability to be served
+		// from here.
+		//
+		// So the build is scheduled on this path too. It used to be reachable only
+		// through reportAndSchedule on the success path, which left a version whose
+		// replication fell short with no index and no report at all: the control
+		// layer kept it PENDING, every query answered "index not ready", and the
+		// documents sat on disk with nobody able to finish or serve them. Measured
+		// on a 1000-document batch: report_us = 0 on all three replicas, each of
+		// which had already spent 14.6 s committing that very version.
+		reportStart := time.Now()
+		d.scheduleIndexBuild(ctx, kbID, versionID)
+		if st != nil {
+			st.report = time.Since(reportStart)
+		}
+
+		// Replication failed, and it is still transient (peers come back), so it is
+		// reported and returned — the caller's Saga owns the retry decision (§10.1).
+		// Note what is deliberately NOT done: no durable report. Durability is
+		// precisely the claim quorum was supposed to establish, and making it
+		// without quorum would be a lie the control layer acts on.
+		d.reportFailure(ctx, kbID, versionID, types.FailureTransient, fmt.Sprintf("replication failed: %v", fanErr))
+		return fanErr
+	}
+
+	reportStart := time.Now()
+	d.reportAndSchedule(ctx, kbID, versionID, docIDs)
+	if st != nil {
+		st.report = time.Since(reportStart)
+	}
+
+	// len(docIDs) == 0 is the whole reason the announcement carries a flag: a
+	// version with no documents is never fanned out (fanOut above sends nothing),
+	// so replicas that did NOT coordinate it have no other way to learn it exists —
+	// and their cursors would stay behind it, which the station reads as "stale"
+	// (§9.3(2)).
+	confirmStart := time.Now()
+	d.broadcastConfirmation(kbID, versionID)
+	if st != nil {
+		st.confirm = time.Since(confirmStart)
+	}
+	return nil
+}
+
 // ResumeVersionWrite re-runs the storage writes and commits without writing a
 // second BEGIN: the transaction's BEGIN record is already durable (crash
 // recovery drove this path).
@@ -2030,8 +2066,10 @@ func (d *LocalDataPlane) ResumeVersionWrite(ctx context.Context, kbID string, ve
 		return fmt.Errorf("plane: ResumeVersionWrite: WAL.WriteCommit: %w", err)
 	}
 	d.advanceLocalVersion(kbID, versionID)
-	d.reportAndSchedule(ctx, kbID, versionID, docIDs)
-	return nil
+	// The same tail the normal path runs, fan-out included. Recovery used to skip
+	// straight to the durable report, so a crash during the local write produced a
+	// version the control layer called durable while no other replica held it.
+	return d.finishVersionWrite(ctx, kbID, versionID, len(docIDs), docIDs, nil)
 }
 
 // reportAndSchedule finishes a completed write transaction: it reports the

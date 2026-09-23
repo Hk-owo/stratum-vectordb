@@ -13,6 +13,10 @@ import (
 type stubControl struct {
 	failures []failureReport
 
+	// durables records every ReportDataDurable, so a test can assert whether a
+	// path claimed durability at all — not just whether it failed.
+	durables []durableReport
+
 	// terminal is what ReportVersionFailure answers, so a test can drive the
 	// §10.6 cleanup trigger.
 	terminal bool
@@ -33,7 +37,8 @@ type failureReport struct {
 	class     types.FailureClass
 }
 
-func (c *stubControl) ReportDataDurable(context.Context, string, int64, string) error {
+func (c *stubControl) ReportDataDurable(_ context.Context, kbID string, versionID int64, digest string) error {
+	c.durables = append(c.durables, durableReport{kbID: kbID, versionID: versionID, digest: digest})
 	return c.durableErr
 }
 func (c *stubControl) ReportIndexReady(context.Context, string, int64) error { return nil }
