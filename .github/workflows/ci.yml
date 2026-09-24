@@ -147,6 +147,20 @@ jobs:
       # （TestT4_PerformanceBaseline / TestT4_StorageEfficiency）内部自行 skip。
       # timeout 900s：整套实测 685s，其中含一条故意停掉 embedder、等过
       # dataMissingMinAgeSec（120s）再断言 data_missing 的用例。
+      # 直连节点的用例（await_direct / stale_replica / controlLeaderIndex）要自己签
+      # 服务站的信任标记，而它是 HMAC，密钥由 cluster.sh 生成在
+      # run/docker-both/station-secret。测试自己也会去找那个文件（以及单层的
+      # run/docker/station-secret），这里导出一次是双保险：run 目录布局再变时，用例
+      # 不至于退化成"节点拒绝一切调用"。
+      - name: 导出服务站信任标记密钥
+        run: |
+          secret_file=run/docker-both/station-secret
+          if [[ -f "$secret_file" ]]; then
+            echo "STRATUM_STATION_SECRET=$(cat "$secret_file")" >> "$GITHUB_ENV"
+          else
+            echo "没有 $secret_file —— 集群没起或没生成凭据，直连节点的用例会以 unauthenticated 失败" >&2
+          fi
+
       - name: 运行 T4 集群容错测试
         env:
           STRATUM_T4_NODE_SERVICES: stratum-node-control1,stratum-node-control2,stratum-node-control3

@@ -65,6 +65,20 @@ if [[ $DO_UP -eq 1 ]]; then
   "${UP_CMD[@]}"
 fi
 
+# 直连节点的用例要自己签服务站的信任标记（HMAC，H4 of
+# docs/code-review-2026-09-24.md），密钥由 cluster.sh 生成在所属 run 目录下。测试
+# 自己也会去找这几个路径，这里导出是双保险。
+case "$TOPOLOGY" in
+  both)       SECRET_FILE="$ROOT/run/docker-both/station-secret" ;;
+  all-in-one) SECRET_FILE="$ROOT/run/docker/station-secret" ;;
+esac
+if [[ -f "$SECRET_FILE" ]]; then
+  STRATUM_STATION_SECRET="$(cat "$SECRET_FILE")"
+  export STRATUM_STATION_SECRET
+else
+  echo "[t4] 警告：没有 $SECRET_FILE —— 直连节点的用例会以 unauthenticated 失败" >&2
+fi
+
 args=(go test ./integration/docker/... -tags=docker -count=1 -timeout "$TIMEOUT" -v)
 [[ -n "$RUN_FILTER" ]] && args+=(-run "$RUN_FILTER")
 [[ ${#EXTRA[@]} -gt 0 ]] && args+=("${EXTRA[@]}")

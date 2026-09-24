@@ -10,7 +10,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 
 	pb "stratum/api/proto/stratum"
 	"stratum/service"
@@ -44,7 +43,10 @@ func TestT4_AwaitVersion_EveryControlNodeAnswersOnItsOwn(t *testing.T) {
 		t.Fatalf("fixture: version %d = %s, want READY", versionID, settled.GetStage())
 	}
 
-	trusted := metadata.AppendToOutgoingContext(context.Background(), "x-stratum-authenticated", "1")
+	// 直连控制节点（不经服务站）的调用必须自己带服务站的信任标记。它是 HMAC 签名的
+	// （H4 of docs/code-review-2026-09-24.md），所以不能像以前那样手写一个 "1"：
+	// 那是旧格式，现在节点会直接拒绝。
+	trusted := asStation(context.Background())
 	for _, addr := range controlAddrs {
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {

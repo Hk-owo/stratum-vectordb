@@ -179,7 +179,10 @@ func pickProbeKB(t *testing.T, ctx context.Context) string {
 		t.Fatal("no knowledge bases exist; set STRATUM_PROBE_KB or write one first")
 	}
 	for _, kb := range kbs {
-		if strings.HasPrefix(kb.GetKnowledgeBaseId(), "datavolume-") {
+		// 按 NAME 挑：它才是 fixture 给的标签（newKBRequest 用 "<label>-<纳秒>"）。
+		// kbID 自 H1 起是服务端生成的不透明 handle（kb-<32 hex>），名字不再参与其中，
+		// 所以按 id 前缀匹配永远不中，只会静默退化成"列表第一个"。
+		if strings.HasPrefix(kb.GetName(), "datavolume-") {
 			return kb.GetKnowledgeBaseId()
 		}
 	}

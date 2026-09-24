@@ -57,15 +57,28 @@ import (
 // produced: the tests that need it fail with the node's Unauthenticated, which
 // names the real cause (a cluster started without the secret) rather than a
 // mystery.
+//
+// Where it looks: the secret is written beside the configs of the run it belongs to,
+// and that directory depends on the topology — run/docker-both for the two-tier
+// cluster CI starts, run/docker for the all-in-one one, run/ for the console's own
+// (scripts/gateway.sh). Searching all three, rather than hard-coding the one this
+// machine happened to use, is what keeps a topology change from silently producing
+// "no secret": the symptom of that is every direct call being refused, which reads
+// like a broken gate instead of a missing file.
 func stationSecret() []byte {
 	if v := os.Getenv("STRATUM_STATION_SECRET"); v != "" {
 		return []byte(v)
 	}
-	raw, err := os.ReadFile(filepath.Join("..", "..", "run", "station-secret"))
-	if err != nil {
-		return nil
+	for _, dir := range []string{"docker-both", "docker", ""} {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "run", dir, "station-secret"))
+		if err != nil {
+			continue
+		}
+		if secret := strings.TrimSpace(string(raw)); secret != "" {
+			return []byte(secret)
+		}
 	}
-	return []byte(strings.TrimSpace(string(raw)))
+	return nil
 }
 
 // asStation stamps ctx the way the service station would, so a node configured

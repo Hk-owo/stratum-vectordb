@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
@@ -56,7 +55,9 @@ func TestT4_UnconvergedReplicaDoesNotAnswerEmpty(t *testing.T) {
 		t.Skip("needs at least two storage replicas")
 	}
 	const down = 1 // storage2
-	trusted := metadata.AppendToOutgoingContext(ctx, "x-stratum-authenticated", "1")
+	// 直连存储副本（不经服务站）的调用必须自己带服务站的信任标记，且它现在是 HMAC
+	// 签名的（H4 of docs/code-review-2026-09-24.md）——手写一个 "1" 会被节点直接拒绝。
+	trusted := asStation(ctx)
 
 	// --- Make one replica miss a write ---
 	killNode(t, storageServices[down])
