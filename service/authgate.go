@@ -54,9 +54,15 @@ var ErrUnverifiedClientCall = status.Error(codes.Unauthenticated,
 // require=false leaves every call accepted, which is what a deployment with no
 // station needs. It is a deliberate default and not a safe one: the setting
 // should be on wherever a station is in front of the cluster.
-func UnaryAuthGate(require bool) grpc.UnaryServerInterceptor {
+//
+// verifier is what makes the mark a claim rather than a formality: it checks the
+// HMAC the station stamped (internal/authmeta.Signer). A nil verifier — no shared
+// secret configured — verifies NOTHING, so with require=true the node refuses
+// every client-facing call. That direction is on purpose: an operator who turned
+// the gate on wants it on, and "no key" must not quietly mean "no gate".
+func UnaryAuthGate(require bool, verifier authmeta.Verifier) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if require && ClientFacing(info.FullMethod) && !authmeta.IsVerified(ctx) {
+		if require && ClientFacing(info.FullMethod) && !verified(verifier, ctx) {
 			return nil, ErrUnverifiedClientCall
 		}
 		return handler(ctx, req)
@@ -66,11 +72,18 @@ func UnaryAuthGate(require bool) grpc.UnaryServerInterceptor {
 // StreamAuthGate is UnaryAuthGate for streaming calls. Every client-facing RPC
 // is unary today, so this exists so the gate cannot be half-installed by adding
 // a streaming method later and forgetting the stream side.
-func StreamAuthGate(require bool) grpc.StreamServerInterceptor {
+func StreamAuthGate(require bool, verifier authmeta.Verifier) grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if require && ClientFacing(info.FullMethod) && !authmeta.IsVerified(ss.Context()) {
+		if require && ClientFacing(info.FullMethod) && !verified(verifier, ss.Context()) {
 			return ErrUnverifiedClientCall
 		}
 		return handler(srv, ss)
 	}
+}
+
+// verified reports whether ctx carries a mark this node can vouch for. The nil
+// check is not redundant with the interface: a typed-nil *Signer also answers
+// false, and both mean the same thing here.
+func verified(verifier authmeta.Verifier, ctx context.Context) bool {
+	return verifier != nil && verifier.Verify(ctx)
 }

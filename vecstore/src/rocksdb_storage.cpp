@@ -12,6 +12,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/write_batch.h"
+#include "vecstore/include/key_codec.h"
 
 namespace stratum {
 namespace vecstore {
@@ -168,6 +169,18 @@ absl::Status RocksDBChunkStorage::Delete(const std::string& key) {
 }
 
 absl::Status RocksDBChunkStorage::DeleteByPrefix(const std::string& prefix) {
+  // Refuse any prefix that does not name exactly one knowledge base. This is
+  // the whole difference between "drop this KB's chunks" and "drop every
+  // chunk in the store": PrefixUpperBound has no byte to bump on an empty
+  // prefix, so the iterator below would run from Seek("") to the end of the
+  // keyspace and batch-delete everything it passes.
+  if (!IsKBPrefix(prefix)) {
+    return absl::InvalidArgumentError(
+        "rocksdb_storage: DeleteByPrefix: prefix must be the length-prefixed "
+        "encoding of a non-empty kb_id; got " +
+        std::to_string(prefix.size()) + " byte(s)");
+  }
+
   std::string upper_bound;
   bool has_upper_bound = PrefixUpperBound(prefix, &upper_bound);
 

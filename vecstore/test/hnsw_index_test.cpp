@@ -1209,6 +1209,29 @@ TEST_F(HNSWVectorIndexTest, RemoveChunksDropsEveryCopyOfAChunk) {
   EXPECT_EQ(index.TotalVectors(), 0);
 }
 
+// 空向量不是"没有数据"，而是**零维**：proto3 未设置的 repeated 字段到了这里
+// 就是一个空 vector。零维索引的构建路径里有一次 `flat.size() / dim`，除零是
+// UB，x86 上是 SIGFPE —— 信号不是 C++ 异常，Build/AddChunks 外面的 catch
+// 拦不住，进程直接死。这里钉住"拒绝，而不是崩溃"。
+TEST_F(HNSWVectorIndexTest, BuildRejectsZeroDimensionChunks) {
+  HNSWVectorIndex index;
+  std::vector<ChunkVector> chunks = {ChunkVector{"c1", std::vector<float>{}},
+                                     ChunkVector{"c2", std::vector<float>{}}};
+  const absl::Status status = index.Build(chunks, MetricType::COSINE);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(index.TotalVectors(), 0);
+}
+
+TEST_F(HNSWVectorIndexTest, AddChunksRejectsZeroDimensionChunks) {
+  HNSWVectorIndex index;
+  std::vector<ChunkVector> chunks = {ChunkVector{"c1", std::vector<float>{}}};
+  const absl::Status status = index.AddChunks(chunks);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(index.TotalVectors(), 0);
+}
+
 }  // namespace
 }  // namespace vecstore
 }  // namespace stratum

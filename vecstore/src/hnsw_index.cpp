@@ -239,6 +239,18 @@ absl::Status HNSWVectorIndex::AddChunksLocked(
   }
 
   const int dim = static_cast<int>(chunks[0].vector.size());
+  if (dim <= 0) {
+    // proto3 leaves an unset repeated field empty, so a chunk whose vector was
+    // never filled in arrives here as a zero-length vector rather than as a
+    // missing field. Refusing is not politeness: further down this function
+    // flattens the batch and divides by dim, and `flat.size() / 0` is a
+    // division by zero — UB, and on x86 a SIGFPE. A signal is not a
+    // std::exception, so the catch(...) wrapping the faiss calls cannot stop
+    // the vecstore process from dying.
+    return absl::InvalidArgumentError(
+        "hnsw_index: AddChunks: chunk vectors must be non-empty (an index "
+        "with dimension 0 cannot be built)");
+  }
   for (const auto& c : chunks) {
     if (static_cast<int>(c.vector.size()) != dim) {
       return absl::InvalidArgumentError(

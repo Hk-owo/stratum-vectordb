@@ -11,6 +11,7 @@
 #include "absl/status/statusor.h"
 #include "grpcpp/grpcpp.h"
 #include "vecstore.grpc.pb.h"
+#include "vecstore/include/key_codec.h"
 #include "vecstore/include/types.h"
 #include "vecstore/src/hnsw_index.h"
 
@@ -155,6 +156,16 @@ grpc::Status ChunkStorageServiceImpl::Delete(grpc::ServerContext* /*context*/,
 grpc::Status ChunkStorageServiceImpl::DeleteByPrefix(
     grpc::ServerContext* /*context*/, const ::vecstore::DeleteByPrefixRequest* request,
     ::vecstore::DeleteByPrefixResponse* /*response*/) {
+  // The boundary check is stated here as well as inside the storage
+  // implementation, because this handler is what an unauthenticated caller
+  // actually reaches, and the failure mode is total: an empty prefix leaves
+  // the scan unbounded and empties the store. The duplicate is deliberate —
+  // the storage copy also protects a caller that talks to the store directly.
+  if (!IsKBPrefix(request->prefix())) {
+    return ToGrpcStatus(absl::InvalidArgumentError(
+        "vecstore: DeleteByPrefix: prefix must be the length-prefixed encoding "
+        "of a non-empty kb_id"));
+  }
   return ToGrpcStatus(storage_->DeleteByPrefix(request->prefix()));
 }
 
@@ -173,34 +184,65 @@ grpc::Status ChunkStorageServiceImpl::DiskUsage(
 // VectorIndexServiceImpl
 // ---------------------------------------------------------------------------
 
-VectorIndex* VectorIndexServiceImpl::GetOrCreateLocked(
+namespace {
+
+// ValidateChunkVectors rejects a Build/AddChunks batch that contains a
+// zero-length vector.
+//
+// proto3 does not distinguish "unset" from "empty" for a repeated field, so a
+// chunk whose vector was never filled in arrives as a zero-dimension vector
+// rather than as a missing field. Zero dimensions cannot be indexed, and the
+// damage is not "an empty index": downstream, the batch is flattened into one
+// contiguous buffer and divided by the dimension, and `flat.size() / 0` is a
+// division by zero — undefined behaviour, and on x86 a SIGFPE. That is a
+// signal, not a std::exception, so the try/catch that guards the faiss calls
+// cannot intercept it and the process dies.
+absl::Status ValidateChunkVectors(const std::vector<ChunkVector>& chunks,
+                                  const char* rpc) {
+  for (const auto& c : chunks) {
+    if (c.vector.empty()) {
+      return absl::InvalidArgumentError(
+          std::string("vecstore: ") + rpc + ": chunk " + c.chunk_id +
+          " carries an empty vector; indexes must have dimension > 0");
+    }
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace
+
+std::shared_ptr<VectorIndex> VectorIndexServiceImpl::GetOrCreateLocked(
     const IndexKey& key, const QuantizerConfig& config) {
   auto it = indexes_.find(key);
   if (it != indexes_.end()) {
-    return it->second.get();
+    return it->second;
   }
   auto inserted =
-      indexes_.emplace(key, std::make_unique<HNSWVectorIndex>(config));
-  return inserted.first->second.get();
+      indexes_.emplace(key, std::make_shared<HNSWVectorIndex>(config));
+  return inserted.first->second;
 }
 
-VectorIndex* VectorIndexServiceImpl::GetOrCreateForShapeLocked(
+std::shared_ptr<VectorIndex> VectorIndexServiceImpl::GetOrCreateForShapeLocked(
     const IndexKey& key, const QuantizerConfig& config) {
   auto it = indexes_.find(key);
   if (it != indexes_.end()) {
     if (it->second->MatchesConfig(config)) {
-      return it->second.get();
+      return it->second;
     }
     // The resident index has a different shape (a §8.6a cold reshape
     // swapping graphed for graph-free, or a KB quantizer change). The
     // shape is fixed when the object is constructed, so replace it
     // rather than silently rebuilding the old shape.
-    it->second = std::make_unique<HNSWVectorIndex>(config);
-    return it->second.get();
+    //
+    // The replacement drops this map's reference, not the object: a Search
+    // that resolved the old index and released mu_ still holds its own
+    // shared_ptr, so the reshape cannot free memory out from under it.
+    it->second = std::make_shared<HNSWVectorIndex>(config);
+    return it->second;
   }
   auto inserted =
-      indexes_.emplace(key, std::make_unique<HNSWVectorIndex>(config));
-  return inserted.first->second.get();
+      indexes_.emplace(key, std::make_shared<HNSWVectorIndex>(config));
+  return inserted.first->second;
 }
 
 grpc::Status VectorIndexServiceImpl::Build(grpc::ServerContext* /*context*/,
@@ -218,10 +260,13 @@ grpc::Status VectorIndexServiceImpl::Build(grpc::ServerContext* /*context*/,
   IndexKey key{request->kb_id(), request->version_id()};
   const QuantizerConfig config = FromProtoQuantizer(
       request->quantizer(), request->pq_m(), request->pq_nbits());
+  if (const absl::Status bad = ValidateChunkVectors(chunks, "Build"); !bad.ok()) {
+    return ToGrpcStatus(bad);
+  }
   std::lock_guard<std::mutex> lock(mu_);
   // Build names the shape it wants, so a reshape (§8.6a) replaces the
   // resident index rather than rebuilding the shape it already had.
-  VectorIndex* index = GetOrCreateForShapeLocked(key, config);
+  std::shared_ptr<VectorIndex> index = GetOrCreateForShapeLocked(key, config);
   absl::Status status = index->Build(chunks, FromProtoMetric(request->metric()));
   if (!status.ok()) {
     return ToGrpcStatus(status);
@@ -243,8 +288,11 @@ grpc::Status VectorIndexServiceImpl::AddChunks(grpc::ServerContext* /*context*/,
   }
 
   IndexKey key{request->kb_id(), request->version_id()};
+  if (const absl::Status bad = ValidateChunkVectors(chunks, "AddChunks"); !bad.ok()) {
+    return ToGrpcStatus(bad);
+  }
   std::lock_guard<std::mutex> lock(mu_);
-  VectorIndex* index = GetOrCreateLocked(key);
+  std::shared_ptr<VectorIndex> index = GetOrCreateLocked(key);
   absl::Status status = index->AddChunks(chunks);
   if (!status.ok()) {
     return ToGrpcStatus(status);
@@ -258,7 +306,7 @@ grpc::Status VectorIndexServiceImpl::Search(grpc::ServerContext* /*context*/,
                                              ::vecstore::SearchIndexResponse* response) {
   IndexKey key{request->kb_id(), request->version_id()};
 
-  VectorIndex* index = nullptr;
+  std::shared_ptr<VectorIndex> index;
   {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = indexes_.find(key);
@@ -267,7 +315,12 @@ grpc::Status VectorIndexServiceImpl::Search(grpc::ServerContext* /*context*/,
                            "no index built or loaded for kb_id=" + request->kb_id() +
                                " version_id=" + std::to_string(request->version_id()));
     }
-    index = it->second.get();
+    // A copy, not the map's entry: the search below runs with mu_ released
+    // (the rerank reads the chunk store), and a concurrent Build may swap the
+    // entry for this key in that window. The shared_ptr keeps THIS index
+    // alive until the search is done, which is the whole point of storing
+    // them as shared_ptr (see indexes_ in grpc_service.h).
+    index = it->second;
   }
 
   std::vector<float> query(request->vector().begin(), request->vector().end());
@@ -311,7 +364,7 @@ grpc::Status VectorIndexServiceImpl::Load(grpc::ServerContext* /*context*/,
                                            ::vecstore::LoadIndexResponse* /*response*/) {
   IndexKey key{request->kb_id(), request->version_id()};
   std::lock_guard<std::mutex> lock(mu_);
-  VectorIndex* index = GetOrCreateLocked(key);
+  std::shared_ptr<VectorIndex> index = GetOrCreateLocked(key);
   return ToGrpcStatus(index->Load(request->path()));
 }
 
@@ -327,7 +380,7 @@ grpc::Status VectorIndexServiceImpl::LoadForAppend(
   // which does replace the object (see GetOrCreateForShapeLocked).
   IndexKey key{request->kb_id(), request->version_id()};
   std::lock_guard<std::mutex> lock(mu_);
-  VectorIndex* index = GetOrCreateLocked(key);
+  std::shared_ptr<VectorIndex> index = GetOrCreateLocked(key);
   const absl::Status status = index->LoadForAppend(request->path());
   if (status.ok()) {
     // How big the base artifact is: the caller compares it with the chunk set
@@ -392,6 +445,27 @@ grpc::Status VectorIndexServiceImpl::Reset(grpc::ServerContext* /*context*/,
     return grpc::Status::OK;  // resetting a never-built index is a no-op, not an error
   }
   return ToGrpcStatus(it->second->Reset());
+}
+
+grpc::Status VectorIndexServiceImpl::Drop(grpc::ServerContext* /*context*/,
+                                           const ::vecstore::DropIndexRequest* request,
+                                           ::vecstore::DropIndexResponse* /*response*/) {
+  IndexKey key{request->kb_id(), request->version_id()};
+  std::lock_guard<std::mutex> lock(mu_);
+  // erase() is what actually frees the object — and with it the Faiss index and
+  // the id table, the two things that make an index big. Reset (called by the Go
+  // side's Discard before this existed) empties an index but keeps the object, so
+  // the map only ever grew: a process's RSS tracked how many versions had been
+  // touched, not how many it was holding (H5 of docs/code-review-2026-09-24.md).
+  //
+  // A shared_ptr keeps a concurrent Search's copy alive until that search
+  // returns, so this cannot pull the object out from under a reader (see
+  // indexes_ in grpc_service.h).
+  //
+  // Idempotent: erasing a missing key leaves the store in exactly the state the
+  // caller asked for. The on-disk artifact is untouched — this reclaims memory.
+  indexes_.erase(key);
+  return grpc::Status::OK;
 }
 
 // ---------------------------------------------------------------------------

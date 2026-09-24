@@ -15,6 +15,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "gtest/gtest.h"
+#include "vecstore/include/key_codec.h"
 #include "vecstore/src/rocksdb_storage.h"
 
 namespace stratum {
@@ -86,23 +87,53 @@ TEST_F(RocksDBChunkStorageTest, DeletingNonexistentKeyIsNotAnError) {
 }
 
 TEST_F(RocksDBChunkStorageTest, DeleteByPrefixClearsMatchingKeysOnly) {
-  ASSERT_TRUE(storage_->Write("kb1#chunk1", {1.0f}).ok());
-  ASSERT_TRUE(storage_->Write("kb1#chunk2", {2.0f}).ok());
-  ASSERT_TRUE(storage_->Write("kb2#chunk1", {3.0f}).ok());
+  const std::string kb1 = EncodeKBPrefix("kb1");
+  const std::string kb2 = EncodeKBPrefix("kb2");
+  ASSERT_TRUE(storage_->Write(EncodeKey("kb1", "chunk1"), {1.0f}).ok());
+  ASSERT_TRUE(storage_->Write(EncodeKey("kb1", "chunk2"), {2.0f}).ok());
+  ASSERT_TRUE(storage_->Write(EncodeKey("kb2", "chunk1"), {3.0f}).ok());
 
-  ASSERT_TRUE(storage_->DeleteByPrefix("kb1#").ok());
+  ASSERT_TRUE(storage_->DeleteByPrefix(kb1).ok());
 
-  auto e1 = storage_->Exists("kb1#chunk1");
-  auto e2 = storage_->Exists("kb1#chunk2");
-  auto e3 = storage_->Exists("kb2#chunk1");
+  auto e1 = storage_->Exists(EncodeKey("kb1", "chunk1"));
+  auto e2 = storage_->Exists(EncodeKey("kb1", "chunk2"));
+  auto e3 = storage_->Exists(EncodeKey("kb2", "chunk1"));
   ASSERT_TRUE(e1.ok() && e2.ok() && e3.ok());
   EXPECT_FALSE(e1.value());
   EXPECT_FALSE(e2.value());
-  EXPECT_TRUE(e3.value()) << "DeleteByPrefix(kb1#) must not remove kb2's keys";
+  EXPECT_TRUE(e3.value()) << "DeleteByPrefix(kb1) must not remove kb2's keys";
 }
 
 TEST_F(RocksDBChunkStorageTest, DeleteByPrefixOnEmptyStoreIsNotAnError) {
-  EXPECT_TRUE(storage_->DeleteByPrefix("anything#").ok());
+  EXPECT_TRUE(storage_->DeleteByPrefix(EncodeKBPrefix("anything")).ok());
+}
+
+// The prefix is the whole of a DeleteByPrefix's scope, and the one prefix that
+// names nothing is the one that would otherwise name EVERYTHING: an empty
+// prefix has no byte for PrefixUpperBound to bump, so the scan runs to the end
+// of the keyspace and batch-deletes every chunk vector in the store. Refusing
+// it is the difference between a per-KB cleanup and a wipe, so the test pins
+// both halves: the call fails, and the data it would have taken is still there.
+TEST_F(RocksDBChunkStorageTest, DeleteByPrefixRefusesPrefixThatNamesNoKnowledgeBase) {
+  ASSERT_TRUE(storage_->Write(EncodeKey("kb1", "chunk1"), {1.0f}).ok());
+  ASSERT_TRUE(storage_->Write(EncodeKey("kb2", "chunk1"), {2.0f}).ok());
+
+  // Declared kb_id length (9) disagrees with the 3 bytes that follow it: a
+  // truncated kb_id would leave the upper bound pointing past other knowledge
+  // bases, so the scan would not stop where the caller meant it to.
+  const std::string wrong_length = std::string("\x00\x00\x00\x09", 4) + "kb1";
+  for (const std::string& bad :
+       {std::string(), std::string("kb1"), EncodeKBPrefix(""), wrong_length}) {
+    auto refused = storage_->DeleteByPrefix(bad);
+    ASSERT_FALSE(refused.ok()) << "a " << bad.size() << "-byte prefix must be refused";
+    EXPECT_EQ(refused.code(), absl::StatusCode::kInvalidArgument);
+  }
+
+  for (const char* kb : {"kb1", "kb2"}) {
+    auto exists = storage_->Exists(EncodeKey(kb, "chunk1"));
+    ASSERT_TRUE(exists.ok());
+    EXPECT_TRUE(exists.value()) << "the refused calls must not have deleted kb=" << kb;
+  }
 }
 
 TEST_F(RocksDBChunkStorageTest, WriteOverwritesExistingValue) {

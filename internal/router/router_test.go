@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/authmeta"
 )
 
 func notLeaderErr() error {
@@ -535,10 +536,17 @@ func TestForward_RefusesAnUnauthorizedCallBeforeReachingANode(t *testing.T) {
 
 // TestForward_StampsTheInternalMarkWithoutTheCredential pins §9.3(5)\u2019s split:
 // the node learns "the station vouched for this", never who the caller is.
+//
+// Since H4 the mark is an HMAC over a timestamp (internal/authmeta), so the test
+// supplies the key a station would hold and checks the stamp verifies — a mark
+// that merely EXISTS is what the old constant was, and would pass this test while
+// being forgeable by anyone.
 func TestForward_StampsTheInternalMarkWithoutTheCredential(t *testing.T) {
+	stationKey := []byte("station-key-for-tests")
 	r := &Router{
 		storageAddrs: []string{"s1"},
 		auth:         NewAuthenticator(testTenantTable()),
+		mark:         authmeta.NewSigner(stationKey, 0),
 	}
 
 	var sawMark, sawCredential bool

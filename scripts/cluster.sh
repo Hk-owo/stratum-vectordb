@@ -78,6 +78,10 @@ WITH_EMBED=""           # 空 = 按拓扑取默认（单层不启动，两层启
 WITH_STATION=0
 FORCE=0
 JSON_MODE=0
+# 由 ensure_station_credentials 填充（见「服务站凭据与信任标记」）。在此预置是为了
+# `set -u` 下的安全：生成配置的函数读它们。
+STATION_SECRET=""
+STATION_TOKENS=""
 ONLY=all
 STORAGE_ID_BASE=10
 VECSTORE_BASE_PORT=7101
@@ -289,6 +293,10 @@ node:
   grpc_addr: "0.0.0.0:7000"
   raft_addr: "0.0.0.0:8000"
   metrics_addr: "0.0.0.0:9000"
+  # 与服务站共享的信任标记密钥（run/station-secret）。有它时 require_authenticated
+  # 默认打开（cmd/stratum 的 appConfig），所以这里两者一起出现才有意义。
+  station_secret: "$STATION_SECRET"
+  require_authenticated: ${STRATUM_REQUIRE_AUTH:-true}
 
 raft:
   heartbeat_interval_ms: 200
@@ -371,6 +379,8 @@ node:
   node_id: $i
   role: control
   require_authenticated: ${STRATUM_REQUIRE_AUTH:-true}
+  # 与服务站共享的信任标记密钥（run/station-secret）；见 gen_single_config。
+  station_secret: "$STATION_SECRET"
   grpc_addr: "0.0.0.0:7000"
   raft_addr: "0.0.0.0:8000"
   metrics_addr: "0.0.0.0:9000"
@@ -414,6 +424,8 @@ node:
   node_id: $id
   role: storage
   require_authenticated: ${STRATUM_REQUIRE_AUTH:-true}
+  # 与服务站共享的信任标记密钥（run/station-secret）；见 gen_single_config。
+  station_secret: "$STATION_SECRET"
   grpc_addr: "0.0.0.0:7000"
   raft_addr: "0.0.0.0:8000"
   metrics_addr: "0.0.0.0:9000"
@@ -469,6 +481,7 @@ EOF
 }
 
 cmd_init() {
+  ensure_station_credentials
   ensure_network
   local i count
   if is_two_tier; then
@@ -978,6 +991,59 @@ vecstore_status() {
 STATION_BIN="$ROOT/run/bin/stratum-router"
 STATION_ADDR="${STRATUM_STATION_ADDR:-0.0.0.0:7009}"
 
+# ---------- 服务站凭据与信任标记（H3/H4） ----------
+# 两个文件，一个目的：让"经服务站进来"这件事既可执行又可验证。
+#
+#   run/station-secret  服务站与所有节点共享的密钥。节点用它校验转发来的调用
+#                       （node.station_secret），服务站用它签名（-station-secret）。
+#                       缺省自动生成 —— 默认值必须"安全且能用"，否则运维只会把它
+#                       关掉，回到"开箱即无鉴权"。
+#   run/tokens.yaml     服务站凭据表（-tokens），外加 run/console-token：控制台自己
+#                       的凭据，由网关以 -station-token 注入（页面不可能自带 API key）。
+#
+# 表的 kb_ids 用 ["*"]：kbID 由服务端随机生成（service.generateKBID），静态表无法
+# 预先枚举出以后才会创建的知识库。
+station_secret_file() { echo "$(run_dir)/station-secret"; }
+tokens_file()         { echo "$(run_dir)/tokens.yaml"; }
+console_token_file()  { echo "$(run_dir)/console-token"; }
+
+random_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+ensure_station_credentials() {
+  local sf tf cf
+  sf="$(station_secret_file)"; tf="$(tokens_file)"; cf="$(console_token_file)"
+  mkdir -p "$(dirname "$sf")"
+
+  if [[ -n "${STRATUM_STATION_SECRET:-}" ]]; then
+    printf '%s' "$STRATUM_STATION_SECRET" >"$sf"
+  elif [[ ! -s "$sf" ]]; then
+    (umask 077; random_hex 32 >"$sf")
+    log "已生成服务站共享密钥：$sf（节点与服务站的信任标记用它签名；勿外传、勿提交）"
+  fi
+  STATION_SECRET="$(<"$sf")"
+
+  # 运维自带的凭据表优先：脚本不该覆盖别人写好的授权。
+  STATION_TOKENS="${STRATUM_STATION_TOKENS:-$tf}"
+  if [[ -n "${STRATUM_STATION_TOKENS:-}" ]]; then
+    return 0
+  fi
+  if [[ ! -s "$cf" ]]; then
+    (umask 077; printf 'console-%s' "$(random_hex 16)" >"$cf")
+  fi
+  cat >"$tf" <<EOF
+# 服务站凭据表 — 由 scripts/cluster.sh 生成（H3 of docs/code-review-2026-09-24.md）。
+#
+# kb_ids: ["*"] 表示"所有知识库，包括以后创建的"：kbID 由服务端随机生成
+# （service.generateKBID），所以静态表列不出将来的 id。
+#
+# 客户端调用经服务站时带上 Authorization: Bearer <token>；控制台用
+# $(console_token_file) 里那一个（由 scripts/gateway.sh 注入给网关）。
+tokens:
+  - token: "$(<"$cf")"
+    kb_ids: ["*"]
+EOF
+}
+
 station_pid_file() { echo "$(run_dir)/station.pid"; }
 station_log()     { echo "$(log_dir)/station.log"; }
 
@@ -1026,12 +1092,24 @@ cmd_station_up() {
   else
     nodes="$(node_addr_list "$BASE_PORT" "$SINGLE_NODES")"
   fi
+
+  # 凭据与共享密钥：节点配置里已经写了同一个 station_secret，服务站必须拿同一份
+  # 才能让转发被接受；凭据表则是"谁能调用"的那一半（H3）。两者缺一，要么集群
+  # 全拒（无密钥），要么任何人可读写（无凭据表）。
+  ensure_station_credentials
+  local auth=(-station-secret "$STATION_SECRET")
+  if [[ -s "$STATION_TOKENS" ]]; then
+    auth+=(-tokens "$STATION_TOKENS")
+  else
+    warn "没有凭据表（$STATION_TOKENS）：服务站不校验调用方凭据"
+  fi
+
   log "启动服务站（$STATION_ADDR｜控制组/节点 $nodes${storage:+｜存储组 $storage}）…"
   mkdir -p "$(dirname "$(station_log)")"
   : > "$(station_log)"
   if [[ -n "$storage" ]]; then
     nohup "$STATION_BIN" -listen "$STATION_ADDR" -nodes "$nodes" -storage-nodes "$storage" \
-      >>"$(station_log)" 2>&1 &
+      "${auth[@]}" >>"$(station_log)" 2>&1 &
   else
     nohup "$STATION_BIN" -listen "$STATION_ADDR" -nodes "$nodes" >>"$(station_log)" 2>&1 &
   fi
@@ -1049,6 +1127,7 @@ cmd_station_up() {
     sleep 0.1
   done
   log "服务站已就绪：$STATION_ADDR（日志 $(station_log)）"
+  log "客户端凭据：Authorization: Bearer \$(cat $(console_token_file))（凭据表 $(STATION_TOKENS)）"
 }
 
 cmd_station_down() {

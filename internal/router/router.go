@@ -49,6 +49,15 @@ type Config struct {
 	// free on every forwarded call.
 	Auth *Authenticator
 
+	// Mark is the shared secret forwarded calls are stamped with, so a node can
+	// tell "the station sent this" from "something reached my port directly"
+	// (internal/authmeta.Signer). nil, or a signer whose key is empty, stamps
+	// nothing — fine for a cluster whose nodes do not require the mark, fatal
+	// for one that does: a node requiring it rejects an unmarked forward, and
+	// the station has no other way to reach it. The two ends are configured
+	// together, from the same secret.
+	Mark *authmeta.Signer
+
 	// RouteRefreshInterval is how often the routing cache re-observes the
 	// storage layer's cursors and the control layer's expected versions
 	// (§9.3(1)). Zero means the default (5s). Negative disables the table,
@@ -103,6 +112,11 @@ type Router struct {
 
 	auth *Authenticator
 
+	// mark stamps each forwarded call so a node can tell it came through this
+	// station (see Config.Mark). Never nil after NewRouter — an unconfigured
+	// deployment gets a disabled signer, which stamps nothing.
+	mark *authmeta.Signer
+
 	// syncs are the storage layer's data-plane clients: the station asks them
 	// for cursors to build the routing table (§9.3(1)), using the §7.6 query
 	// rather than a new interface.
@@ -129,6 +143,7 @@ func NewRouter(cfg Config) (*Router, error) {
 		storageAddrs:       append([]string(nil), storage...),
 		storageIndexByAddr: make(map[string]int, len(storage)),
 		auth:               cfg.Auth,
+		mark:               cfg.Mark,
 		logger:             cfg.Logger,
 	}
 	if r.logger == nil {
@@ -237,7 +252,7 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 	// the table simply never narrows and every query still "works" by going
 	// everywhere. That is exactly the kind of silent degradation this design keeps
 	// trying to avoid, and it was live until this mark was added.
-	ctx = authmeta.WithVerifiedMark(ctx)
+	ctx = r.mark.Stamp(ctx)
 
 	snap := routeSnapshot{
 		servable:    map[string]map[int]bool{},
@@ -442,14 +457,19 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 			return zero, err
 		}
 	}
-	// The mark is stamped unconditionally, and that is not the same decision as
-	// whether the station authenticates anyone. It says "this call arrived
-	// through a station"; a node requiring it is asking for exactly that and
-	// nothing more. Stamping it only when a token table is configured would
+	// The mark is stamped unconditionally (given a key), and that is not the same
+	// decision as whether the station authenticates anyone. It says "this call
+	// arrived through a station"; a node requiring it is asking for exactly that
+	// and nothing more. Stamping it only when a token table is configured would
 	// deadlock the cluster this feature exists to protect: nodes requiring the
 	// mark would reject the station's own forwarding the moment an operator ran
 	// without a token table.
-	ctx = authmeta.WithVerifiedMark(ctx)
+	//
+	// What changed with H4 (docs/code-review-2026-09-24.md): the stamp is an HMAC
+	// over a timestamp under a key shared with the nodes, not the constant "1".
+	// A node can now actually tell whether the station sent the call, which is
+	// what the gate above always claimed.
+	ctx = r.mark.Stamp(ctx)
 	if isStorageMethod(fullMethod) {
 		// No separate storage layer means the all-in-one shape, where the control
 		// nodes are the storage nodes too — the same fallback NewRouter applies

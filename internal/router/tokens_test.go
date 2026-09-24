@@ -76,3 +76,41 @@ func TestTokenTable_MissingFileIsFatal(t *testing.T) {
 		t.Error("expected a missing token table to fail the load")
 	}
 }
+
+// kb_ids: ["*"] is the "all knowledge bases, including the ones that do not exist
+// yet" entry. It exists because the server mints knowledge base ids
+// (service.generateKBID: a random handle), so a static table cannot enumerate the
+// ids of knowledge bases created after it was written — which is what the console
+// needs.
+func TestTokenTable_WildcardReachesEveryKnowledgeBase(t *testing.T) {
+	table, err := LoadTokenTable(writeTokens(t, `
+tokens:
+  - token: "console-token"
+    kb_ids: ["*"]
+`))
+	if err != nil {
+		t.Fatalf("LoadTokenTable: %v", err)
+	}
+	p, ok := table.Lookup("console-token")
+	if !ok {
+		t.Fatal("the wildcard credential did not resolve")
+	}
+	for _, kb := range []string{"kb-1", "kb-that-did-not-exist-when-the-table-was-written"} {
+		if !p.Allows(kb, false) || !p.Allows(kb, true) {
+			t.Errorf("a wildcard credential must reach %s for both verbs", kb)
+		}
+	}
+}
+
+// Mixing "*" with named ids is refused rather than interpreted: the two say
+// different things, and an entry whose meaning depends on which list the reader
+// is looking at is how a table stops being auditable.
+func TestTokenTable_RejectsWildcardMixedWithNamedIDs(t *testing.T) {
+	if _, err := LoadTokenTable(writeTokens(t, `
+tokens:
+  - token: "sk-a"
+    kb_ids: ["*", "kb-1"]
+`)); err == nil {
+		t.Error("expected \"*\" mixed with named kb_ids to fail the load")
+	}
+}

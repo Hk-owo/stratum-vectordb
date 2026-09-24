@@ -257,7 +257,9 @@ storage:
 ```
 
 - **服务站 `cmd/stratum-router`**:集群**唯一**的对外入口。七项职责:① 路由表缓存(`KB + version → 可服务节点`,从控制层聚合**异步刷新**,不是自己逐节点探测);② **新鲜度凭证**(转发前附上"当前应看到的版本号",存储节点核对本地连续游标,不够就拒——把"悄悄返回过时结果"变成显式失败,服务站再换一个达标候选);③ 读负载均衡;④ 故障转移(同一客户端连接内换候选,客户端无感);⑤ 鉴权(token 表 → 租户/权限,数据面完全不必对外);⑥ 健康检查/熔断(closed / open / half-open 三态,状态是服务站**本地**态、实例间不同步,这是它能无状态水平扩展的前提);⑦ **写入门控**(存储层退化时直接拒绝写入,不必等到 fan-out 才失败)。另有 **超时预算传播**(按剩余候选数切分,避免一个慢节点吃掉整个预算)、背压,以及 leader 发现时**给每个节点的探测单独设预算**——`GetClusterStatus` 问的是"你认为谁是 leader",节点从自己的 Raft 状态就能答,答不出来更可能是它没了而不是它慢,于是一个不响应的节点不会把整次发现钉死到调用方 deadline。
-  - 节点侧还有一道闸门:`service/authgate.go` 要求三个**客户端可见**的 service 必须带服务站的信任标记(开关 `require_authenticated`);节点间协作(`DataSyncService` / `InternalService`)不受影响、也不得要求。信任标记刻意不携带身份——接收方只需知道"有权限提问的东西替这次调用背了书",安全性建立在"集群从外部不可达"之上。
+  - 节点侧还有一道闸门:`service/authgate.go` 要求三个**客户端可见**的 service 必须带服务站的信任标记(开关 `require_authenticated`);节点间协作(`DataSyncService` / `InternalService`)不受影响、也不得要求。信任标记刻意不携带身份——接收方只需知道"有权限提问的东西替这次调用背了书"。标记本身是 **HMAC-SHA256(时间戳)**(`internal/authmeta`),密钥由服务站与节点共享(`-station-secret` / `node.station_secret`,脚本写在 `run/station-secret`),所以它**不可伪造**、且观察到的标记过了 TTL 就失效;`require_authenticated` 在配置了共享密钥时**默认开启**,显式写 `false` 才关。注意这两件事必须**成对配置**:只有一边有密钥时,节点会一律拒绝而不是退化成"接受任何标记"。详见 `docs/code-review-2026-09-24.md` 的 H4。
+  - 网关自身的 `/ops` 运维台只绑回环(`-http-addr`,默认 `127.0.0.1:8081`),并对写请求做同源/Sec-Fetch-Site 校验;`bin_dir`、`cluster`、`docker.script`、`station_secret` 这些**决定执行什么**的字段不接受 HTTP 改写,服务二进制必须落在 `bin_dir` 内、编排脚本必须落在 `scripts/` 内(H2)。
+  - 客户端凭据只在服务站一处校验(`-tokens`);`kb_ids: ["*"]` 表示"所有知识库,含将来创建的"(知识库 ID 由服务端随机生成,静态表列不出来)。控制台自己的凭据由网关以 `-station-token` 注入(`run/console-token`)。
 - **网关 `cmd/stratum-gateway`**:把三个外部 gRPC 服务暴露为 REST/JSON,并从同源提供 Web 控制台静态资源(`web/`),因此无需 CORS。内部服务(`DataSyncService`、`InternalService`)有意不对外。
 
 ```
@@ -291,7 +293,7 @@ scripts/cluster.sh [--topology single|two-tier] <命令>      # Docker 集群编
 ./run/bin/stratum-gateway -grpc-addr 127.0.0.1:7009
 ```
 
-环境变量可覆盖默认:`STRATUM_HTTP_ADDR`(网关监听,默认 `0.0.0.0:8081`)、`STRATUM_ROUTER_ADDR`(默认 `127.0.0.1:7009`)、`STRATUM_GRPC_ADDR`(单机模式下服务站应连的节点,默认 `127.0.0.1:7000`)。
+环境变量可覆盖默认:`STRATUM_HTTP_ADDR`(网关监听,默认 `127.0.0.1:8081`——只绑回环,因为 `/ops` 能启停服务;要对外提供控制台就显式改它,并想清楚谁能访问)、`STRATUM_ROUTER_ADDR`(默认 `127.0.0.1:7009`)、`STRATUM_GRPC_ADDR`(单机模式下服务站应连的节点,默认 `127.0.0.1:7000`)、`STRATUM_STATION_SECRET`(覆盖 `run/station-secret`)、`STRATUM_STATION_TOKENS`(覆盖 `run/tokens.yaml`)。
 
 `scripts/gateway.sh --with-db` 一键构建并启动完整链路:服务站与控制台先行,数据库服务经控制台 `/ops/start` 端点拉起——Web UI(默认 `http://localhost:8081`,含「运维」页)在数据库未运行时也可用;Ctrl+C 干净停止,日志在 `run/log/`。仅需运维:直接运行 `./run/bin/stratum-gateway`,在「运维」页编辑 `run/console.yaml` 的启动参数并启停服务。
 

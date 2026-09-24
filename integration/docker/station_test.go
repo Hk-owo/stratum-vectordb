@@ -105,6 +105,14 @@ func startStation() (addr string, cleanup func(), err error) {
 		"-nodes", joinAddrs(controlAddrs),
 		"-storage-nodes", joinAddrs(storageNodeAddrs),
 	}
+	// The nodes require the station's trust mark (scripts/cluster.sh writes
+	// require_authenticated: true and a station_secret into every node config),
+	// and since H4 that mark is an HMAC only the holder of the key can produce.
+	// A station started without the key forwards unmarked calls, which every node
+	// refuses — so the station has to be given the same secret the nodes check.
+	if secret := stationSecret(); len(secret) > 0 {
+		args = append(args, "-station-secret", string(secret))
+	}
 	// The station writes to its own file rather than to this process's stderr.
 	//
 	// That is not tidiness: go test waits for the stdout/stderr it handed the

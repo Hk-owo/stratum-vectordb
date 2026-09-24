@@ -114,9 +114,36 @@ func (s *QueryServiceImpl) SetLogger(l *zap.Logger) {
 	}
 }
 
+// MaxQueryTopK bounds the caller-supplied top_k on Query.
+//
+// It is a request-size bound, not a product opinion: top_k arrives as an int32
+// straight off the wire and is used to size allocations on this path
+// (`make([]scoredDoc, 0, topK)` and the search's candidate count), so an
+// unbounded value is a remote OOM — top_k = 2e9 asks for tens of GB in one
+// make(), which panics and, past the runtime's patience, aborts the process.
+// The ceiling sits far above anything the system can serve anyway: the search
+// headroom is top_k × 3 clamped at 1000, so past ~333 the extra results cannot
+// come from anywhere.
+const MaxQueryTopK = 1024
+
 // Query implements QueryServiceServer.
 func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb.QueryResponse, error) {
 	kbID := req.KnowledgeBaseId
+
+	// Bound the caller's top_k before anything is sized from it. This is the
+	// entry to a client-facing call, and every client-supplied number below is
+	// either an allocation size or a loop bound, so the check belongs here and
+	// not at the point of use: a value that is refused costs one error, a value
+	// that reaches make() costs the node.
+	//
+	// top_k = 0 is refused rather than treated as "default": it is what a caller
+	// that forgot the field sends, and answering it with an empty result — which
+	// is what the old code did — hides the mistake instead of naming it.
+	topK := int(req.GetTopK())
+	if topK < 1 || topK > MaxQueryTopK {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"query: top_k must be in [1, %d], got %d", MaxQueryTopK, topK)
+	}
 
 	// Per-stage timings, emitted at debug level by the deferred function below.
 	//
@@ -338,7 +365,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	}
 
 	// Search: get multi × topK chunk results for aggregation headroom.
-	searchTopK := int(req.TopK) * 3
+	searchTopK := topK * 3
 	if searchTopK < 10 {
 		searchTopK = 10
 	}
@@ -549,9 +576,9 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// one takes its place, which is what the previous "read everything, then
 	// truncate" ordering did as well.
 	readStart := time.Now()
-	results := make([]scoredDoc, 0, int(req.TopK))
+	results := make([]scoredDoc, 0, topK)
 	for _, cand := range candidates {
-		if len(results) >= int(req.TopK) {
+		if len(results) >= topK {
 			break
 		}
 		readCalls++

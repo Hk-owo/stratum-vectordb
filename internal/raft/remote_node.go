@@ -49,6 +49,13 @@ type RemoteRaftNode struct {
 	// Dial is injectable for tests; nil means a plain insecure dial.
 	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 
+	// Mark stamps the calls this node makes to the control layer, so a control
+	// node with require_authenticated accepts them (internal/authmeta.Signer).
+	// Nil or keyless stamps nothing, which is correct for a cluster that does not
+	// require the mark, and fatal for one that does — in the same way and for the
+	// same reason as router.Config.Mark.
+	Mark *authmeta.Signer
+
 	mu       sync.Mutex
 	leaderID int64 // 0 = not yet learned
 
@@ -290,7 +297,7 @@ func (r *RemoteRaftNode) proposeAt(ctx context.Context, id int64, addr string, d
 	// Same reason as the reads: a proposal travels control-plane traffic, and
 	// the receiving control node treats a mark-less call as one that reached its
 	// port directly.
-	resp, err := pb.NewInternalServiceClient(conn).Propose(authmeta.WithVerifiedMark(ctx), &pb.ProposeRequest{Command: data})
+	resp, err := pb.NewInternalServiceClient(conn).Propose(r.Mark.Stamp(ctx), &pb.ProposeRequest{Command: data})
 	if err != nil {
 		return ForwardedResult{}, 0, fmt.Errorf("raft: remote: propose at control node %d (%s): %w", id, addr, err)
 	}
@@ -520,7 +527,7 @@ func (r *RemoteRaftNode) readAtAnyControl(ctx context.Context, op func(ctx conte
 		// in path. Without it a gated cluster's storage tier cannot read
 		// metadata at all: the reads come back Unauthenticated and every query
 		// fails. That is how this was found.
-		err = op(authmeta.WithVerifiedMark(ctx), conn)
+		err = op(r.Mark.Stamp(ctx), conn)
 		if err == nil {
 			return nil
 		}

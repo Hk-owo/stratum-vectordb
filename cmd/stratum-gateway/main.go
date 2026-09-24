@@ -39,11 +39,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/authmeta"
 	"stratum/internal/embed"
 	"stratum/internal/types"
 )
@@ -92,13 +94,25 @@ func main() {
 	// -grpc-addr 指向路由层（stratum-router，默认 0.0.0.0:7009），由 router
 	// 负责 leader 发现、写转发与读负载均衡；gateway 只维护一条 gRPC 连接。
 	grpcAddr := flag.String("grpc-addr", "127.0.0.1:7009", "routing layer (stratum-router) gRPC address")
-	httpAddr := flag.String("http-addr", "0.0.0.0:8081", "gateway HTTP listen address")
+	// 默认只绑回环：/ops 能改启动参数、重启服务、按配置里的路径执行程序，配上
+	// 一个默认可达的监听地址就是一个远程执行入口（H2 of
+	// docs/code-review-2026-09-24.md）。要对外提供控制台就显式 -http-addr
+	// 0.0.0.0:8081，并且想清楚谁能访问。
+	httpAddr := flag.String("http-addr", "127.0.0.1:8081", "gateway HTTP listen address (default: loopback only)")
 	// web/dist is the Vite build output: web/ is now a Vite project whose
 	// sources live in web/src/ (`npm --prefix web run build` produces dist/).
 	// Pointing at web/ itself would serve the un-transpiled entry index.html.
 	staticDir := flag.String("static", "./web/dist", "frontend static asset directory")
 	opsConfigPath := flag.String("ops-config", "", "console ops config YAML (default ./run/console.yaml)")
 	nodeID := flag.Int("node-id", 1, "this node's ID for the ops console")
+	// -station-token 是控制台自己的凭据：控制台是网关的同源前端，网关就是它的
+	// 调用方，而服务站的鉴权要的是一个"调用方是谁"的凭据 —— 一个页面本身没有。
+	// 入站请求自带 Authorization 时优先用调用方的（API 用法），否则用这个兜底
+	// （控制台用法）。留空意味着控制台会收到服务站的 Unauthenticated，这正是
+	// 没配凭据时该有的样子。
+	stationToken := flag.String("station-token", "",
+		"credential this gateway presents to the service station when the incoming request has none "+
+			"(the console's own credential); empty means requests without an Authorization header are sent unauthenticated")
 	flag.Parse()
 
 	// Non-blocking dial: the gateway starts even if the backend is down,
@@ -142,7 +156,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	g.registerRoutes(mux)
-	mux.Handle("/ops/", opsMgr.opsMux)
+	mux.Handle("/ops/", opsMgr.handler())
 
 	// Same-origin static assets; /api/ routes are matched above.
 	// noCacheStatic forces revalidation on every load so a rebuilt frontend
@@ -158,7 +172,7 @@ func main() {
 	// gateway (scripts/gateway.sh's Ctrl+C path relies on this). main() waits for
 	// the shutdown goroutine to finish before exiting, otherwise the
 	// managed child processes would be orphaned.
-	srv := &http.Server{Addr: *httpAddr, Handler: logRequests(mux)}
+	srv := &http.Server{Addr: *httpAddr, Handler: logRequests(withCredential(*stationToken)(mux))}
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	shutdownDone := make(chan struct{})
@@ -440,6 +454,38 @@ func logRequests(next http.Handler) http.Handler {
 			log.Printf("%s %s", r.Method, r.URL.Path)
 		}
 	})
+}
+
+// withCredential carries the caller's credential across the HTTP → gRPC
+// boundary.
+//
+// The gateway is the client-facing door for the console, but it performs no
+// authentication of its own: the service station does (§9.3(5)), and it can only
+// decide anything if the credential reaches it. Without this the station sees
+// every console request as anonymous — so a deployment that turned authentication
+// on either refuses the whole console, or, worse, is configured to accept
+// anonymous calls, which is the state H3 of docs/code-review-2026-09-24.md
+// describes: a gate that never sees the credential cannot be a gate.
+//
+// fallback is the console's own credential (-station-token). A page cannot carry
+// an API key of its own, and the console is trusted to the same degree the
+// gateway process is — it can already start and stop services through /ops.
+// A request that DOES carry an Authorization header (the API path, and any
+// integration that uses the gateway as a plain HTTP front end) keeps its own
+// credential: the fallback must never upgrade a caller.
+func withCredential(fallback string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token := strings.TrimSpace(r.Header.Get("Authorization"))
+			if token == "" {
+				token = fallback
+			}
+			if token != "" {
+				r = r.WithContext(metadata.AppendToOutgoingContext(r.Context(), authmeta.CredentialMetadataKey, token))
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // noCacheStatic disables browser caching for the frontend assets, so that

@@ -82,14 +82,25 @@ station up|down|status|logs  服务站（宿主进程）
 
 环境变量：`STRATUM_CONTROL_COUNT`、`STRATUM_STORAGE_COUNT`、`STRATUM_CONTROL_BASE_PORT`、
 `STRATUM_STORAGE_BASE_PORT`、`STRATUM_STATION_ADDR`、`STRATUM_REQUIRE_AUTH`、
-`STRATUM_RAFT_MAX_LOG_LENGTH`、`LAG_CATCHUP_MIN_LAG` / `LAG_CATCHUP_JITTER_MS` /
-`LAG_CATCHUP_MAX_KBS`、`LOG_LEVEL`。
+`STRATUM_STATION_SECRET`、`STRATUM_STATION_TOKENS`、`STRATUM_RAFT_MAX_LOG_LENGTH`、
+`LAG_CATCHUP_MIN_LAG` / `LAG_CATCHUP_JITTER_MS` / `LAG_CATCHUP_MAX_KBS`、`LOG_LEVEL`。
 
 ### 两层拓扑的几个要点
 
 - **`require_authenticated: true` 是默认**：节点只服务带服务站信任标记的调用，
   也就是说客户端只能经服务站进来（§9.3(5)）。要直连节点端口（例如自带的测试 harness），
   用 `STRATUM_REQUIRE_AUTH=false`。
+- **信任标记现在是签名的**：`init`/`up` 会在 `run/station-secret` 生成（或复用）一个共享密钥，
+  写进每个节点配置的 `node.station_secret`，服务站以 `-station-secret` 用同一份签名。
+  节点校验的是 HMAC，所以「带一个 `1`」不再能冒充服务站（`docs/code-review-2026-09-24.md` H4）。
+  直连节点端口的工具/测试要拿到同一份密钥（`STRATUM_STATION_SECRET`，或读那个文件）。
+  **两半必须一起配**：只有节点有密钥、服务站没有时，节点会拒掉全部转发——这是安全失败，
+  但集群会不可用，日志里是 `unauthenticated`。
+- **凭据表默认生成并启用**：`run/tokens.yaml` 里有一条 `kb_ids: ["*"]` 的凭据（明文在
+  `run/console-token`），服务站以 `-tokens` 加载它。所以经服务站的调用要带
+  `Authorization: Bearer $(cat run/console-token)`；控制台不用带——网关启动时用
+  `-station-token` 注入（H3）。不需要鉴权就删掉该文件，或指向自己的表：
+  `STRATUM_STATION_TOKENS=/path/to/tokens.yaml`。
 - **`up` 会一并启动 mock-embed 容器**：生成的配置把 embed 指向
   `http://stratum-embed:8080`，少了它每次写入都会以 `lookup stratum-embed` 失败——
   这个 DNS 错误只说症状不说原因，所以默认起它（`--no-embed` 用于自带 embed 服务的场景）。
@@ -138,6 +149,15 @@ scripts/gateway.sh router <up|stop|status|logs>     # 只操作服务站
 - **服务站二进制过旧会自动重建**：`run/bin/stratum-router` 不认识 `-storage-nodes` 时
   直接重建——否则要么启动就报 `flag provided but not defined`，要么操作者把两层参数去掉，
   服务站退回「全部节点同址」的单层假设，读请求悄悄走错节点。
+- **控制台默认只绑回环**（`STRATUM_HTTP_ADDR`，默认 `127.0.0.1:8081`）：`/ops` 能改启动参数、
+  启停服务，把它挂到 `0.0.0.0` 就等于把运维接口对全网开放（`docs/code-review-2026-09-24.md` H2）。
+  要远程访问就显式设置该变量，并用网络边界或反向代理的另一层鉴权护住它。容器形态（`--in-docker`）
+  在容器里绑 `0.0.0.0:8081`，由 `-p` 映射决定宿主侧的暴露面。
+- **凭据与信任标记由脚本生成**（`run/station-secret`、`run/tokens.yaml`、`run/console-token`）：
+  服务站以 `-tokens` + `-station-secret` 启动，控制台凭据由网关以 `-station-token` 注入。
+  所以经服务站的调用要带 `Authorization: Bearer $(cat run/console-token)`，直连节点端口
+  （`STRATUM_REQUIRE_AUTH=false` 之外的情况）的脚本要从 `run/station-secret` 取密钥签标记。
+  换自己的凭据表：`STRATUM_STATION_TOKENS=/path/to/tokens.yaml`。
 
 ## 四、`update-all.sh` —— 全量更新
 

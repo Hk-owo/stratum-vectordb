@@ -30,6 +30,19 @@ std::string EncodeKBPrefix(const std::string& kb_id);
 // identical to Go's internal/chunkstore/grpc_client.go encodeKey.
 std::string EncodeKey(const std::string& kb_id, const std::string& chunk_id);
 
+// IsKBPrefix reports whether prefix is exactly the encoding of one
+// non-empty kb_id — i.e. EncodeKBPrefix(kb_id) for some kb_id != "".
+//
+// This is the guard that keeps DeleteByPrefix from meaning "delete
+// everything". An empty prefix names no knowledge base, and the scan it
+// drives (Seek("") with no upper bound) walks the whole keyspace: one RPC
+// away from wiping every chunk vector of every knowledge base, which is
+// all the vecstore's unauthenticated listener needs to be reachable. A
+// prefix whose declared length disagrees with its actual length is not
+// something the Go encoder can produce either, so rejecting it is safe —
+// internal/chunkstore is the only writer of these keys.
+bool IsKBPrefix(const std::string& prefix);
+
 }  // namespace vecstore
 }  // namespace stratum
 

@@ -53,9 +53,47 @@ LOG_DIR="$ROOT/run/log"
 STATION_PID_FILE="$ROOT/run/.station.pid"
 GATEWAY_PID_FILE="$ROOT/run/.gateway.pid"
 
-HTTP_ADDR="${STRATUM_HTTP_ADDR:-0.0.0.0:8081}"
+HTTP_ADDR="${STRATUM_HTTP_ADDR:-127.0.0.1:8081}"
 HTTP_PORT="${HTTP_ADDR##*:}"
 ROUTER_ADDR="${STRATUM_ROUTER_ADDR:-127.0.0.1:7009}"
+
+# ---------- 服务站凭据与信任标记（H3/H4） ----------
+# 与 scripts/cluster.sh 同一套约定，同一个 run/ 目录：run/station-secret 是节点与
+# 服务站共享的信任标记密钥，run/tokens.yaml 是服务站凭据表，run/console-token 是
+# 控制台自己的凭据（网关以 -station-token 注入；页面不可能自带 API key）。
+STATION_SECRET_FILE="$ROOT/run/station-secret"
+STATION_TOKENS_FILE="$ROOT/run/tokens.yaml"
+CONSOLE_TOKEN_FILE="$ROOT/run/console-token"
+
+random_hex() { head -c "$1" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+ensure_station_credentials() {
+  mkdir -p "$ROOT/run"
+  if [[ -n "${STRATUM_STATION_SECRET:-}" ]]; then
+    printf '%s' "$STRATUM_STATION_SECRET" >"$STATION_SECRET_FILE"
+  elif [[ ! -s "$STATION_SECRET_FILE" ]]; then
+    (umask 077; random_hex 32 >"$STATION_SECRET_FILE")
+    log "已生成服务站共享密钥：$STATION_SECRET_FILE（节点与服务站的信任标记；勿外传、勿提交）"
+  fi
+  STATION_SECRET="$(<"$STATION_SECRET_FILE")"
+
+  STATION_TOKENS="${STRATUM_STATION_TOKENS:-$STATION_TOKENS_FILE}"
+  if [[ -n "${STRATUM_STATION_TOKENS:-}" ]]; then
+    return 0
+  fi
+  if [[ ! -s "$CONSOLE_TOKEN_FILE" ]]; then
+    (umask 077; printf 'console-%s' "$(random_hex 16)" >"$CONSOLE_TOKEN_FILE")
+  fi
+  cat >"$STATION_TOKENS_FILE" <<EOF
+# 服务站凭据表 — 由 scripts/gateway.sh 生成（H3 of docs/code-review-2026-09-24.md）。
+#
+# kb_ids: ["*"] 表示"所有知识库，包括以后创建的"：kbID 由服务端随机生成
+# （service.generateKBID），静态表列不出将来的 id。
+tokens:
+  - token: "$(<"$CONSOLE_TOKEN_FILE")"
+    kb_ids: ["*"]
+EOF
+}
 
 MODE_AUTO=1
 MODE=""
@@ -249,13 +287,23 @@ ensure_station() {
     return 0
   fi
   ensure_station_binary
+  # 凭据与共享密钥（H3/H4）：节点配置里写了同一个 station_secret，服务站必须拿同一
+  # 份才能让转发被接受；凭据表则决定谁能调用。
+  ensure_station_credentials
   log "启动服务站（$ROUTER_ADDR｜节点 $CLUSTER_ADDRS${STORAGE_ADDRS:+｜存储组 $STORAGE_ADDRS}）…"
   mkdir -p "$LOG_DIR"
+  local auth=(-station-secret "$STATION_SECRET")
+  if [[ -s "$STATION_TOKENS" ]]; then
+    auth+=(-tokens "$STATION_TOKENS")
+  else
+    warn "没有凭据表（$STATION_TOKENS）：服务站不校验调用方凭据"
+  fi
   if [[ -n "$STORAGE_ADDRS" ]]; then
     nohup "$STATION_BIN" -listen "$ROUTER_ADDR" -nodes "$CLUSTER_ADDRS" -storage-nodes "$STORAGE_ADDRS" \
-      >>"$LOG_DIR/router.log" 2>&1 &
+      "${auth[@]}" >>"$LOG_DIR/router.log" 2>&1 &
   else
-    nohup "$STATION_BIN" -listen "$ROUTER_ADDR" -nodes "$CLUSTER_ADDRS" >>"$LOG_DIR/router.log" 2>&1 &
+    nohup "$STATION_BIN" -listen "$ROUTER_ADDR" -nodes "$CLUSTER_ADDRS" \
+      "${auth[@]}" >>"$LOG_DIR/router.log" 2>&1 &
   fi
   STATION_STARTED=1
   echo $! >"$STATION_PID_FILE"
@@ -269,6 +317,7 @@ ensure_station() {
     sleep 0.1
   done
   log "服务站已就绪：$ROUTER_ADDR（日志 $LOG_DIR/router.log）"
+  log "客户端凭据：Authorization: Bearer \$(cat $CONSOLE_TOKEN_FILE)"
 }
 
 stop_station() {
@@ -317,6 +366,10 @@ services:
         service_addr: "127.0.0.1:$GRPC_PORT"
     vecstore_addr: "$VECSTORE_ADDR"
     embed_addr: "http://localhost:8080"
+    # 信任标记密钥与鉴权开关（H4）。值来自 run/station-secret，与服务站签名用的
+    # 是同一份：少了它，节点在 require_authenticated 下会拒绝服务站转发的一切。
+    station_secret: "$STATION_SECRET"
+    require_authenticated: true
 EOF
 }
 
@@ -328,7 +381,15 @@ start_gateway_host() {
   fi
   log "启动 stratum-gateway（控制台 http://localhost:${HTTP_PORT}）…"
   mkdir -p "$LOG_DIR"
+  # 控制台的凭据（H3）：服务站开了凭据表之后，控制台的每个 /api 调用都要带一个。
+  # 复用已有的 run/console-token；不存在就生成（与 ensure_station 用的是同一段逻辑）。
+  ensure_station_credentials
   local args=(-grpc-addr "$ROUTER_ADDR" -http-addr "$HTTP_ADDR" -static "$STATIC" -ops-config "$OPS_CONFIG")
+  if [[ -s "$CONSOLE_TOKEN_FILE" ]]; then
+    args+=(-station-token "$(<"$CONSOLE_TOKEN_FILE")")
+  else
+    warn "没有控制台凭据（$CONSOLE_TOKEN_FILE）：服务站启用凭据表时控制台调用会被拒绝"
+  fi
   if [[ "$DETACH" -eq 1 ]]; then
     nohup "$GATEWAY_BIN" "${args[@]}" >>"$LOG_DIR/gateway.log" 2>&1 &
     echo $! >"$GATEWAY_PID_FILE"
@@ -368,6 +429,11 @@ start_gateway_docker() {
   docker build -q -t "$IMAGE" -f integration/docker/Dockerfile.gateway . >/dev/null
 
   docker rm -f "$NAME" >/dev/null 2>&1 || true
+  # 容器里的控制台也需要凭据：它与宿主服务站不在同一个进程里，只能靠 -station-token
+  # 带过去（H3）。
+  ensure_station_credentials
+  local token_arg=()
+  [[ -s "$CONSOLE_TOKEN_FILE" ]] && token_arg=(-station-token "$(<"$CONSOLE_TOKEN_FILE")")
   log "启动容器 $NAME（宿主 :$PORT → 容器 :8081，网络 $NETWORK）…"
   # 静态前端与 ops 配置是**挂载**而不是打进镜像：改前端不该需要重建镜像。
   docker run -d --name "$NAME" \
@@ -380,7 +446,8 @@ start_gateway_docker() {
     -grpc-addr host.docker.internal:7009 \
     -http-addr 0.0.0.0:8081 \
     -static /app/web/dist \
-    -ops-config /app/run/console.yaml >/dev/null
+    -ops-config /app/run/console.yaml \
+    "${token_arg[@]}" >/dev/null
   if wait_http_ready "/ops/health" 10; then
     log "就绪：控制台 http://localhost:${PORT}（容器在 $NETWORK 内，容器名形式的 embed 地址可直接访问）"
   else

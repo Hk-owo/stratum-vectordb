@@ -123,6 +123,22 @@ type StratumConfig struct {
 	WriteRetryBaseMS  int `yaml:"write_retry_base_interval_ms,omitempty" json:"write_retry_base_interval_ms,omitempty"`
 	DeleteMaxRetries  int `yaml:"delete_max_retries,omitempty" json:"delete_max_retries,omitempty"`
 	DeleteRetryBaseMS int `yaml:"delete_retry_base_interval_ms,omitempty" json:"delete_retry_base_interval_ms,omitempty"`
+
+	// StationSecret is the node's copy of the station's trust-mark key
+	// (node.station_secret). scripts/gateway.sh fills it from run/station-secret,
+	// the same file the station signs with; without it a node cannot verify the
+	// station's forwards at all, and with require_authenticated on it refuses
+	// every client-facing call (H4 of docs/code-review-2026-09-24.md).
+	//
+	// It travels into the generated node config, so it is a SECRET sitting in
+	// run/console.yaml — which is why /ops refuses to overwrite it over HTTP
+	// (see applyConfigPatch).
+	StationSecret string `yaml:"station_secret,omitempty" json:"station_secret,omitempty"`
+
+	// RequireAuthenticated mirrors node.require_authenticated in the generated
+	// config. Pointer so "unset" (→ the node's own default, which follows
+	// StationSecret) stays distinguishable from an explicit false.
+	RequireAuthenticated *bool `yaml:"require_authenticated,omitempty" json:"require_authenticated,omitempty"`
 }
 
 // PeerEntry is one raft peer (same shape as cmd/stratum's raft.peers).
@@ -413,6 +429,11 @@ func (o *OpsConfig) writeStratumConfig() (string, error) {
 			NodeID   int64  `yaml:"node_id"`
 			GRPCAddr string `yaml:"grpc_addr"`
 			RaftAddr string `yaml:"raft_addr"`
+			// Both are written only when set: an unset RequireAuthenticated must
+			// reach cmd/stratum as "unset" so its default can follow
+			// StationSecret, which is the whole point of the pointer.
+			RequireAuthenticated *bool  `yaml:"require_authenticated,omitempty"`
+			StationSecret        string `yaml:"station_secret,omitempty"`
 		} `yaml:"node"`
 		Raft struct {
 			Peers                []peerFile `yaml:"peers"`
@@ -448,6 +469,8 @@ func (o *OpsConfig) writeStratumConfig() (string, error) {
 	doc.Node.NodeID = s.NodeID
 	doc.Node.GRPCAddr = s.GRPCAddr
 	doc.Node.RaftAddr = s.RaftAddr
+	doc.Node.RequireAuthenticated = s.RequireAuthenticated
+	doc.Node.StationSecret = s.StationSecret
 	for _, p := range s.Peers {
 		doc.Raft.Peers = append(doc.Raft.Peers, peerFile{ID: p.ID, Addr: p.Addr, ServiceAddr: p.ServiceAddr})
 	}

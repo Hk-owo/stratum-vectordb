@@ -25,6 +25,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/authmeta"
 	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
@@ -187,8 +188,19 @@ func main() {
 	// differ in where the metadata lives, not in what it means.
 	var rn raft.RaftNode
 	var raftNode *raft.RaftNodeImpl
+	// The station's trust mark is signed with a key shared with the station
+	// (internal/authmeta.Signer): this node verifies what the station stamped, so
+	// a "1" forged by whoever reached the port directly no longer satisfies the
+	// gate (H4 of docs/code-review-2026-09-24.md). An empty secret disables both
+	// halves — it stamps nothing and verifies nothing — which is what a cluster
+	// that does not require the mark needs.
+	mark := authmeta.NewSigner([]byte(cfg.StationSecret), 0)
+	if cfg.RequireAuthenticated && !mark.Enabled() {
+		logger.Warn("require_authenticated is on but no station_secret is configured: " +
+			"every client-facing call will be refused (set node.station_secret to the station's secret)")
+	}
 	if cfg.Role == NodeRoleStorage {
-		rn = &raft.RemoteRaftNode{ControlAddrs: controlAddrsFromPeers(cfg.Peers)}
+		rn = &raft.RemoteRaftNode{ControlAddrs: controlAddrsFromPeers(cfg.Peers), Mark: mark}
 		logger.Info("starting as a storage node: no Raft log, metadata read through the control cluster",
 			zap.String("role", string(cfg.Role)), zap.Int("control_nodes", len(cfg.Peers)))
 	} else {
@@ -1155,9 +1167,21 @@ func main() {
 	// §9.3(5): the authentication gate covers the client-facing surface only.
 	// Both interceptors are installed together so a streaming method added later
 	// cannot quietly bypass it.
+	//
+	// Recovery sits in FRONT of the gate: it has to be the outermost layer to
+	// catch a panic from anything behind it, and the gate is itself code that
+	// runs on the caller's input. Without it, one handler panic — a request that
+	// drives an allocation off a client-supplied size, say — exits the process
+	// and takes every other client's traffic with it (service/recovery.go).
 	grpcServer := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(service.UnaryAuthGate(cfg.RequireAuthenticated)),
-		grpc.ChainStreamInterceptor(service.StreamAuthGate(cfg.RequireAuthenticated)),
+		grpc.ChainUnaryInterceptor(
+			service.RecoveryUnary(logger.Sugar().Errorf),
+			service.UnaryAuthGate(cfg.RequireAuthenticated, mark),
+		),
+		grpc.ChainStreamInterceptor(
+			service.RecoveryStream(logger.Sugar().Errorf),
+			service.StreamAuthGate(cfg.RequireAuthenticated, mark),
+		),
 	)
 
 	// The candidate replicas that may hold a version's data, as a plain address
@@ -1874,10 +1898,33 @@ type appConfig struct {
 	// the station's authentication — and silently, since a station misconfigured
 	// to omit the mark looks perfectly normal.
 	//
+	// A configured StationSecret switches the default to true: a node that has
+	// the station's shared key is, by that fact, part of a deployment with a
+	// station in front of it, which is exactly the condition the gate exists for
+	// (H4 of docs/code-review-2026-09-24.md). Setting `require_authenticated:
+	// false` explicitly still wins — some deployments front a node with only
+	// proxy-level access control and do not want a second gate.
+	//
 	// Internal collaboration (DataSyncService / InternalService) is never gated:
 	// those calls carry no end user's credential, and requiring one would break
 	// fan-out, catch-up and Raft forwarding outright.
 	RequireAuthenticated bool
+
+	// RequireAuthenticatedSet records whether the config file said anything about
+	// RequireAuthenticated. Without it, "false" cannot be told apart from "unset"
+	// — and the default above is derived from StationSecret rather than being a
+	// constant, so the distinction decides behaviour.
+	RequireAuthenticatedSet bool
+
+	// StationSecret is the shared secret this node checks the service station's
+	// trust mark with (node.station_secret). It must be the same value the
+	// station stamps with (-station-secret).
+	//
+	// Empty means "no key": the node verifies no mark, so it must not require one
+	// (see above) — and with require_authenticated on it would refuse every
+	// client-facing call rather than accept unverified ones, which is the
+	// failure an operator with a half-configured deployment should get.
+	StationSecret string
 
 	// StorageNodes is the storage group (Stratum_设计文档v13.md §11 阶段 ④).
 	//
@@ -2124,12 +2171,23 @@ type fileConfig struct {
 	} `yaml:"logging"`
 
 	Node struct {
-		NodeID               int64  `yaml:"node_id"`
-		Role                 string `yaml:"role"`
-		GRPCAddr             string `yaml:"grpc_addr"`
-		RaftAddr             string `yaml:"raft_addr"`
-		MetricsAddr          string `yaml:"metrics_addr"`
-		RequireAuthenticated bool   `yaml:"require_authenticated"`
+		NodeID   int64  `yaml:"node_id"`
+		Role     string `yaml:"role"`
+		GRPCAddr string `yaml:"grpc_addr"`
+		RaftAddr string `yaml:"raft_addr"`
+		// MetricsAddr is where Prometheus scrapes this node.
+		MetricsAddr string `yaml:"metrics_addr"`
+
+		// RequireAuthenticated is a pointer so "unset" and "false" stay
+		// distinguishable: leaving it out lets the default follow
+		// StationSecret (see appConfig.RequireAuthenticated), while an explicit
+		// `require_authenticated: false` is honoured as written.
+		RequireAuthenticated *bool `yaml:"require_authenticated"`
+
+		// StationSecret is the shared secret the station's trust mark is
+		// signed with (internal/authmeta). Same value as the station's
+		// -station-secret.
+		StationSecret string `yaml:"station_secret"`
 	} `yaml:"node"`
 
 	Raft struct {
@@ -2346,8 +2404,18 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.Raft.MaxLogLength > 0 {
 		cfg.MaxLogLength = uint64(fc.Raft.MaxLogLength)
 	}
-	if fc.Node.RequireAuthenticated {
-		cfg.RequireAuthenticated = true
+	if fc.Node.RequireAuthenticated != nil {
+		cfg.RequireAuthenticated = *fc.Node.RequireAuthenticated
+		cfg.RequireAuthenticatedSet = true
+	}
+	if fc.Node.StationSecret != "" {
+		cfg.StationSecret = fc.Node.StationSecret
+		// A node that holds the station's key is part of a deployment with a
+		// station in front of it, and that is the condition the gate exists
+		// for — so the key turns it on. An explicit setting still wins.
+		if !cfg.RequireAuthenticatedSet {
+			cfg.RequireAuthenticated = true
+		}
 	}
 	if fc.Node.Role != "" {
 		role, err := parseNodeRole(fc.Node.Role)

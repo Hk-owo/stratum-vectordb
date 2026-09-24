@@ -327,6 +327,7 @@ const (
 	VectorIndexService_ExistsIndex_FullMethodName   = "/vecstore.VectorIndexService/ExistsIndex"
 	VectorIndexService_RemoveChunks_FullMethodName  = "/vecstore.VectorIndexService/RemoveChunks"
 	VectorIndexService_Reset_FullMethodName         = "/vecstore.VectorIndexService/Reset"
+	VectorIndexService_Drop_FullMethodName          = "/vecstore.VectorIndexService/Drop"
 )
 
 // VectorIndexServiceClient is the client API for VectorIndexService service.
@@ -371,6 +372,20 @@ type VectorIndexServiceClient interface {
 	// carrying them as tombstones until a rebuild.
 	RemoveChunks(ctx context.Context, in *RemoveChunksRequest, opts ...grpc.CallOption) (*RemoveChunksResponse, error)
 	Reset(ctx context.Context, in *ResetIndexRequest, opts ...grpc.CallOption) (*ResetIndexResponse, error)
+	// Drop releases the in-memory index object for (kb_id, version_id).
+	//
+	// Without it the vecstore's index map only ever grows: the Go side's LRU
+	// eviction and its Discard path both remove the version from their own view,
+	// and nothing told the C++ side to do the same, so a long-running process's
+	// RSS tracked the number of versions ever touched instead of the number it is
+	// holding (H5 of docs/code-review-2026-09-24.md). Reset is not the same thing:
+	// it empties an index but keeps the object alive.
+	//
+	// Idempotent, and best-effort by design: dropping an index that is not
+	// resident — never built here, already dropped, or a process that restarted
+	// since — succeeds, because the caller is reclaiming memory it may or may not
+	// own. The persisted artifact is untouched: this is memory, not disk.
+	Drop(ctx context.Context, in *DropIndexRequest, opts ...grpc.CallOption) (*DropIndexResponse, error)
 }
 
 type vectorIndexServiceClient struct {
@@ -471,6 +486,16 @@ func (c *vectorIndexServiceClient) Reset(ctx context.Context, in *ResetIndexRequ
 	return out, nil
 }
 
+func (c *vectorIndexServiceClient) Drop(ctx context.Context, in *DropIndexRequest, opts ...grpc.CallOption) (*DropIndexResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DropIndexResponse)
+	err := c.cc.Invoke(ctx, VectorIndexService_Drop_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VectorIndexServiceServer is the server API for VectorIndexService service.
 // All implementations must embed UnimplementedVectorIndexServiceServer
 // for forward compatibility.
@@ -513,6 +538,20 @@ type VectorIndexServiceServer interface {
 	// carrying them as tombstones until a rebuild.
 	RemoveChunks(context.Context, *RemoveChunksRequest) (*RemoveChunksResponse, error)
 	Reset(context.Context, *ResetIndexRequest) (*ResetIndexResponse, error)
+	// Drop releases the in-memory index object for (kb_id, version_id).
+	//
+	// Without it the vecstore's index map only ever grows: the Go side's LRU
+	// eviction and its Discard path both remove the version from their own view,
+	// and nothing told the C++ side to do the same, so a long-running process's
+	// RSS tracked the number of versions ever touched instead of the number it is
+	// holding (H5 of docs/code-review-2026-09-24.md). Reset is not the same thing:
+	// it empties an index but keeps the object alive.
+	//
+	// Idempotent, and best-effort by design: dropping an index that is not
+	// resident — never built here, already dropped, or a process that restarted
+	// since — succeeds, because the caller is reclaiming memory it may or may not
+	// own. The persisted artifact is untouched: this is memory, not disk.
+	Drop(context.Context, *DropIndexRequest) (*DropIndexResponse, error)
 	mustEmbedUnimplementedVectorIndexServiceServer()
 }
 
@@ -549,6 +588,9 @@ func (UnimplementedVectorIndexServiceServer) RemoveChunks(context.Context, *Remo
 }
 func (UnimplementedVectorIndexServiceServer) Reset(context.Context, *ResetIndexRequest) (*ResetIndexResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Reset not implemented")
+}
+func (UnimplementedVectorIndexServiceServer) Drop(context.Context, *DropIndexRequest) (*DropIndexResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Drop not implemented")
 }
 func (UnimplementedVectorIndexServiceServer) mustEmbedUnimplementedVectorIndexServiceServer() {}
 func (UnimplementedVectorIndexServiceServer) testEmbeddedByValue()                            {}
@@ -733,6 +775,24 @@ func _VectorIndexService_Reset_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VectorIndexService_Drop_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DropIndexRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VectorIndexServiceServer).Drop(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VectorIndexService_Drop_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VectorIndexServiceServer).Drop(ctx, req.(*DropIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // VectorIndexService_ServiceDesc is the grpc.ServiceDesc for VectorIndexService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -775,6 +835,10 @@ var VectorIndexService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Reset",
 			Handler:    _VectorIndexService_Reset_Handler,
+		},
+		{
+			MethodName: "Drop",
+			Handler:    _VectorIndexService_Drop_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

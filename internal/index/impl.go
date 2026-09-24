@@ -1330,6 +1330,9 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 
 	status := types.IndexStatusReady
 	var sizeBytes int64
+	// evicted collects what makeRoomLocked had to drop to fit this index; it is
+	// handed to the vecstore after the lock is released (dropEvicted).
+	var evicted []indexKey
 
 	// Per-stage timings of one build, at debug level.
 	//
@@ -1390,8 +1393,10 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 			im.coldFailedAt[key] = time.Now()
 		}
 		if status == types.IndexStatusReady {
-			// Make room before inserting the new index.
-			im.makeRoomLocked()
+			// Make room before inserting the new index, then release whatever it
+			// evicted on the vecstore side once the lock is gone (see
+			// dropEvicted).
+			evicted = im.makeRoomLocked()
 			im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
 			im.sizeByKey[key] = sizeBytes
 			im.loadedBytes += sizeBytes
@@ -1408,6 +1413,7 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 		callbacks := append([]BuildCompleteCallback(nil), im.callbacks...)
 		im.cond.Broadcast()
 		im.mu.Unlock()
+		im.dropEvicted(evicted)
 
 		// Persist the size sidecar next to the index file so a later
 		// restart (loadFromDisk) can account for this version's memory
@@ -1906,6 +1912,10 @@ func (im *IndexManagerImpl) loadFromDisk(ctx context.Context, kbID string, versi
 	}
 
 	im.mu.Lock()
+	var dropped []indexKey
+	// Registered before the unlock defer so it runs after it (defers are LIFO):
+	// telling the vecstore is a network call and must not run under im.mu.
+	defer func() { im.dropEvicted(dropped) }()
 	defer im.mu.Unlock()
 	if im.deletedKBs[kbID] || im.deletedVersions[key] {
 		return fmt.Errorf("index: %s/%d was deleted while loading", kbID, versionID)
@@ -1913,7 +1923,7 @@ func (im *IndexManagerImpl) loadFromDisk(ctx context.Context, kbID string, versi
 	if _, ok := im.loaded[key]; ok {
 		return nil // a concurrent load/build already brought it in
 	}
-	im.makeRoomLocked()
+	dropped = im.makeRoomLocked()
 	im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
 	// The file we just read decides the shape; the sidecar beside it is the
 	// authority (§8.6a). A remembered entry could be stale — the artifact may
@@ -2496,15 +2506,20 @@ func (im *IndexManagerImpl) forgetVersionLocked(key indexKey) {
 // makeRoomLocked evicts least-recently-used, ref-count-zero indexes until
 // there is room for one more entry: len(loaded) < LRUCapacity AND (if
 // MemoryThresholdMB is set) loadedBytes <= threshold. If no evictable
-// index remains (everything is pinned), it stops and returns. Must be
-// called with im.mu held; called BEFORE inserting the new entry so the
+// index remains (everything is pinned), it stops and returns what it has. Must
+// be called with im.mu held; called BEFORE inserting the new entry so the
 // brand-new index (refCount 0, nothing has acquired it yet) is never
 // itself chosen as the eviction candidate.
-func (im *IndexManagerImpl) makeRoomLocked() {
+//
+// It RETURNS the keys it dropped instead of reclaiming them itself: the vecstore
+// holds its own copy of every resident index, and the call that releases it is a
+// network round trip, so it belongs outside im.mu (see dropEvicted).
+func (im *IndexManagerImpl) makeRoomLocked() []indexKey {
 	var threshold int64
 	if im.cfg.MemoryThresholdMB > 0 {
 		threshold = im.cfg.MemoryThresholdMB << 20 // MiB → bytes
 	}
+	var evicted []indexKey
 	for (im.cfg.LRUCapacity > 0 && len(im.loaded) >= im.cfg.LRUCapacity) ||
 		(threshold > 0 && im.loadedBytes > threshold) {
 		var oldestKey indexKey
@@ -2521,13 +2536,89 @@ func (im *IndexManagerImpl) makeRoomLocked() {
 			}
 		}
 		if !found {
-			return // everything is pinned
+			return evicted // everything is pinned
 		}
 		delete(im.loaded, oldestKey)
+		evicted = append(evicted, oldestKey)
 		if size, ok := im.sizeByKey[oldestKey]; ok {
 			im.loadedBytes -= size
 			delete(im.sizeByKey, oldestKey)
 		}
+	}
+	return evicted
+}
+
+// dropEvicted tells the vecstore to release the indexes this node has stopped
+// tracking.
+//
+// H5 of docs/code-review-2026-09-24.md: the vecstore's index map only ever grew,
+// because the Go side's view (loaded / sizeByKey) was the only one being pruned
+// and a pruned version's object stayed resident for the life of the process — so
+// RSS tracked how many versions had been touched, not how many were held.
+//
+// Best-effort by construction. What a failure costs is memory, not correctness:
+// the version is already gone from this node's view, its artifact is still on
+// disk, and a later Load rebuilds the object. So a failure is logged and never
+// propagated — failing the caller's build/eviction over a leak would trade a
+// slow leak for an outage. The RPC is idempotent, so the next eviction of the
+// same key retries harmlessly.
+//
+// Eviction and dropping are not atomic with respect to a concurrent load, and
+// that gap is the whole reason for the two checks below. A version evicted here
+// can be loaded again — by a query, or by the catch-up that follows a snapshot
+// install — before this call runs, and dropping it then leaves this node
+// believing it holds an index the vecstore no longer has. The symptom is not an
+// error at the point of the bug: the node's own state says READY and the query
+// answers "index not ready", which is exactly what
+// TestRealStack_ThreeNodeCluster_SnapshotPipeline caught.
+func (im *IndexManagerImpl) dropEvicted(keys []indexKey) {
+	if len(keys) == 0 || im.vectorIndexClient == nil {
+		return
+	}
+	// Its own bounded context: this runs off the back of a build or an eviction,
+	// whose own deadlines may already be gone, and it must not be able to hang
+	// that worker.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, key := range keys {
+		if im.IsLoaded(key.kbID, key.versionID) {
+			// Loaded again since the eviction: that object is the one this node is
+			// using, so it is not garbage.
+			continue
+		}
+		if _, err := im.vectorIndexClient.Drop(ctx, &vecstorepb.DropIndexRequest{
+			KbId:      key.kbID,
+			VersionId: key.versionID,
+		}); err != nil {
+			im.logger.Warn("index: vecstore Drop failed; its memory for this version stays resident",
+				zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID), zap.Error(err))
+			continue
+		}
+		// The load may also have raced the other way: its Load RPC reached the
+		// vecstore BEFORE this Drop, so the object it created is the one just
+		// deleted. Load is idempotent and the artifact is on disk, so asking again
+		// is what makes the two sides agree.
+		if im.IsLoaded(key.kbID, key.versionID) {
+			im.reloadAfterDrop(ctx, key)
+		}
+	}
+}
+
+// reloadAfterDrop re-materialises the vecstore-side object for a version that was
+// loaded again while its Drop was in flight (see dropEvicted). Best-effort: the
+// next query's load path retries it anyway, and the alternative — leaving the
+// node serving from an object the vecstore has dropped — is worse.
+func (im *IndexManagerImpl) reloadAfterDrop(ctx context.Context, key indexKey) {
+	if im.cfg.IndexDataDir == "" {
+		return
+	}
+	if _, err := im.vectorIndexClient.Load(ctx, &vecstorepb.LoadIndexRequest{
+		KbId:      key.kbID,
+		VersionId: key.versionID,
+		Path:      im.indexPath(key.kbID, key.versionID),
+	}); err != nil {
+		im.logger.Warn("index: could not reload an index a concurrent load re-added during a Drop",
+			zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID), zap.Error(err))
 	}
 }
 
@@ -2605,15 +2696,40 @@ func (im *IndexManagerImpl) Evict(_ context.Context, kbID string, versionID int6
 // EvictByKB implements IndexManager.
 func (im *IndexManagerImpl) EvictByKB(_ context.Context, kbID string) error {
 	im.mu.Lock()
-	defer im.mu.Unlock()
+	var dropped []indexKey
 	for k := range im.loaded {
 		if k.kbID == kbID {
 			delete(im.loaded, k)
+			dropped = append(dropped, k)
 			if size, ok := im.sizeByKey[k]; ok {
 				im.loadedBytes -= size
 				delete(im.sizeByKey, k)
 			}
 		}
+	}
+	im.mu.Unlock()
+	// The vecstore keeps its own object per resident index, so pruning only this
+	// node's view left the whole knowledge base resident in the vecstore process
+	// for the rest of its life (H5 of docs/code-review-2026-09-24.md). Done after
+	// the unlock, because it is a network call.
+	im.dropEvicted(dropped)
+	return nil
+}
+
+// checkKBDirName refuses a knowledge base id that is not a single, ordinary
+// path component. Callers use it before turning kbID into a directory that is
+// then created, walked or REMOVED.
+//
+// The control layer mints these ids — a random, opaque handle (see
+// service.generateKBID), never the knowledge base's display name — so an id
+// carrying a separator or ".." should be impossible. This is the second line of
+// defence at the point where the consequence is irreversible: filepath.Join
+// cleans "..", so `filepath.Join(IndexDataDir, "index", kbID)` with an
+// unvalidated id names a directory OUTSIDE IndexDataDir, and the RemoveAll
+// built from it deletes whatever the caller chose.
+func checkKBDirName(kbID string) error {
+	if kbID == "" || kbID == "." || kbID == ".." || filepath.Base(kbID) != kbID {
+		return fmt.Errorf("index: refused kb_id %q: must be a single path component", kbID)
 	}
 	return nil
 }
@@ -2626,6 +2742,9 @@ func (im *IndexManagerImpl) EvictByKB(_ context.Context, kbID string) error {
 // an in-flight Search-triggered Load RPC cannot resurrect the index after
 // the deletion. No-op when disk persistence is unconfigured.
 func (im *IndexManagerImpl) DeleteFilesByKB(_ context.Context, kbID string) error {
+	if err := checkKBDirName(kbID); err != nil {
+		return err
+	}
 	im.mu.Lock()
 	im.deletedKBs[kbID] = true
 	for k := range im.loaded {
@@ -2673,6 +2792,9 @@ func (im *IndexManagerImpl) DeleteFilesByKB(_ context.Context, kbID string) erro
 func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string, protectedIDs []int64) error {
 	if im.cfg.IndexRetentionCount <= 0 || im.cfg.IndexDataDir == "" {
 		return nil
+	}
+	if err := checkKBDirName(kbID); err != nil {
+		return err
 	}
 	dir := filepath.Join(im.cfg.IndexDataDir, "index", kbID)
 	entries, err := os.ReadDir(dir)
@@ -2924,10 +3046,14 @@ func (im *IndexManagerImpl) usedPath(kbID string, versionID int64) string {
 }
 
 // Discard implements IndexManager: evicts the in-memory entry, sets a
-// version tombstone (closing the Load-RPC resurrection race), resets the
-// vecstore-side index, and removes the version's on-disk index files.
-// Resetting a never-built index is a no-op server-side; the local evict,
+// version tombstone (closing the Load-RPC resurrection race), drops the
+// vecstore-side index object, and removes the version's on-disk index files.
+// Dropping a never-built index is a no-op server-side; the local evict,
 // the tombstone, and the file deletions are all idempotent.
+//
+// Drop rather than Reset: Reset empties an index but keeps the object, and the
+// object (Faiss index + id table) is the memory a discarded version must not go
+// on holding (H5 of docs/code-review-2026-09-24.md).
 func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID int64) error {
 	im.mu.Lock()
 	key := indexKey{kbID, versionID}
@@ -2943,11 +3069,11 @@ func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID 
 	if im.vectorIndexClient == nil {
 		return fmt.Errorf("index: Discard(%s,%d): vectorIndexClient not set", kbID, versionID)
 	}
-	if _, err := im.vectorIndexClient.Reset(ctx, &vecstorepb.ResetIndexRequest{
+	if _, err := im.vectorIndexClient.Drop(ctx, &vecstorepb.DropIndexRequest{
 		KbId:      kbID,
 		VersionId: versionID,
 	}); err != nil {
-		return fmt.Errorf("index: Discard(%s,%d): Reset RPC: %w", kbID, versionID, err)
+		return fmt.Errorf("index: Discard(%s,%d): Drop RPC: %w", kbID, versionID, err)
 	}
 
 	// Remove the version's on-disk index files (Faiss file + its .ids

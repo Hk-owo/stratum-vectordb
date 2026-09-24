@@ -92,6 +92,9 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   grpc::Status Reset(grpc::ServerContext* context,
                       const ::vecstore::ResetIndexRequest* request,
                       ::vecstore::ResetIndexResponse* response) override;
+  grpc::Status Drop(grpc::ServerContext* context,
+                     const ::vecstore::DropIndexRequest* request,
+                     ::vecstore::DropIndexResponse* response) override;
 
  private:
   using IndexKey = std::pair<std::string, int64_t>;  // (kb_id, version_id)
@@ -105,8 +108,8 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // index, or a batched build would drop the shape the preceding Build
   // asked for. Callers that know which shape they want use
   // GetOrCreateForShapeLocked instead.
-  VectorIndex* GetOrCreateLocked(const IndexKey& key,
-                                 const QuantizerConfig& config = {});
+  std::shared_ptr<VectorIndex> GetOrCreateLocked(const IndexKey& key,
+                                                 const QuantizerConfig& config = {});
 
   // GetOrCreateForShapeLocked is GetOrCreateLocked for a caller that
   // requires a specific shape (Build). When the resident index was built
@@ -114,15 +117,23 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // is fixed at construction, so reusing the object would silently keep
   // the old shape — which is exactly what §8.6a's cold reshape must not
   // do. Must be called with mu_ held.
-  VectorIndex* GetOrCreateForShapeLocked(const IndexKey& key,
-                                         const QuantizerConfig& config);
+  std::shared_ptr<VectorIndex> GetOrCreateForShapeLocked(const IndexKey& key,
+                                                         const QuantizerConfig& config);
 
   // FileExists reports whether path exists and is a regular file. Used by
   // ExistsIndex's stateless on-disk existence check.
   static bool FileExists(const std::string& path);
 
   std::mutex mu_;
-  std::map<IndexKey, std::unique_ptr<VectorIndex>> indexes_;
+  // shared_ptr, not unique_ptr, and the reason is Search: it resolves its
+  // index under mu_ and then uses it with the lock RELEASED (the rerank
+  // reads the chunk store, which must not happen while holding a lock that
+  // Build and every other index RPC needs). In that window a concurrent
+  // Build for the same key may replace the entry — a cold reshape or a
+  // quantizer change — which destroys the object being searched. Holding a
+  // shared_ptr copy across the unlock keeps the object alive until the
+  // search returns; with unique_ptr it was a use-after-free.
+  std::map<IndexKey, std::shared_ptr<VectorIndex>> indexes_;
   ChunkStorage* storage_;  // not owned; supplied by VecstoreGrpcServer
 };
 

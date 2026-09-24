@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,35 @@ import (
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/authmeta"
 )
+
+// stationSecret is the key the cluster's station stamps its trust mark with,
+// written by scripts/cluster.sh (H3/H4 of docs/code-review-2026-09-24.md).
+//
+// The mark used to be the constant "1", so a test could produce one by writing
+// that string. It is now an HMAC over a timestamp under a key shared with the
+// nodes, and a test that wants to be trusted by a node it dials directly has to
+// hold that key — the same way the station does.
+//
+// Empty means "no key found on this machine", and then the mark cannot be
+// produced: the tests that need it fail with the node's Unauthenticated, which
+// names the real cause (a cluster started without the secret) rather than a
+// mystery.
+func stationSecret() []byte {
+	if v := os.Getenv("STRATUM_STATION_SECRET"); v != "" {
+		return []byte(v)
+	}
+	raw, err := os.ReadFile(filepath.Join("..", "..", "run", "station-secret"))
+	if err != nil {
+		return nil
+	}
+	return []byte(strings.TrimSpace(string(raw)))
+}
+
+// asStation stamps ctx the way the service station would, so a node configured
+// with require_authenticated serves a call that reached it directly.
+func asStation(ctx context.Context) context.Context {
+	return authmeta.NewSigner(stationSecret(), 0).Stamp(ctx)
+}
 
 // nodeAddrs are the gRPC addresses of the control-tier nodes under test.
 //
@@ -108,7 +138,7 @@ func dialNode(addr string) (pb.KnowledgeBaseServiceClient, pb.QueryServiceClient
 // for — but fault injection is not a client; it has to name the node it kills.
 func controlLeaderIndex(t *testing.T, ctx context.Context) int {
 	t.Helper()
-	trusted := authmeta.WithVerifiedMark(ctx)
+	trusted := asStation(ctx)
 	votes := map[int64]int{}
 	// lastErr travels with the failure: "nobody reported a leader" has two very
 	// different causes (nodes answering has_leader=false versus nodes not

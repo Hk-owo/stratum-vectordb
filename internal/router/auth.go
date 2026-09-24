@@ -48,10 +48,29 @@ type Principal struct {
 
 	// Grants is the tenant's access, keyed by knowledge base ID.
 	Grants map[string]Grant
+
+	// AllKBs grants every knowledge base, including the ones that do not exist
+	// yet.
+	//
+	// It exists because knowledge base ids are minted by the server
+	// (service.generateKBID: a random handle, never the display name), so an
+	// operator writing a static table cannot enumerate the ids of knowledge bases
+	// that will be created later — and without this, the console's own credential
+	// could not reach anything created after the table was written. A table entry
+	// says so with `kb_ids: ["*"]`.
+	//
+	// It is deliberately not the default and cannot be combined with a list: a
+	// credential either names the knowledge bases it may touch or it claims all
+	// of them, and a reader must never have to guess which of the two an entry
+	// meant.
+	AllKBs bool
 }
 
 // Allows reports whether the principal may perform (kbID, write).
 func (p Principal) Allows(kbID string, write bool) bool {
+	if p.AllKBs {
+		return true
+	}
 	g, ok := p.Grants[kbID]
 	if !ok {
 		return false

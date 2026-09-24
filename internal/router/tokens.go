@@ -70,10 +70,24 @@ func LoadTokenTable(path string) (*TokenTable, error) {
 		if len(e.KBIDs) == 0 {
 			return nil, fmt.Errorf("router: token table %s: entry %d lists no kb_ids", path, i)
 		}
+		// `kb_ids: ["*"]` grants every knowledge base, including ones that do not
+		// exist yet — the only way to write a credential for knowledge bases whose
+		// ids the server mints (see Principal.AllKBs). Mixed with named ids it is
+		// rejected rather than silently interpreted: the two say different things,
+		// and an entry whose meaning depends on which list the reader is looking at
+		// is how a table stops being auditable.
+		if len(e.KBIDs) == 1 && e.KBIDs[0] == "*" {
+			principals[e.Token] = Principal{AllKBs: true}
+			continue
+		}
 		grants := make(map[string]Grant, len(e.KBIDs))
 		for _, kb := range e.KBIDs {
 			if kb == "" {
 				return nil, fmt.Errorf("router: token table %s: entry %d has an empty kb_id", path, i)
+			}
+			if kb == "*" {
+				return nil, fmt.Errorf("router: token table %s: entry %d mixes \"*\" with named kb_ids; "+
+					"use either `kb_ids: [\"*\"]` or a list of ids", path, i)
 			}
 			grants[kb] = Grant{Read: true, Write: true}
 		}

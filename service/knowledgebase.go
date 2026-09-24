@@ -10,6 +10,8 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -247,7 +249,13 @@ func (s *KnowledgeBaseServiceImpl) SetLogger(l *zap.Logger) {
 
 // CreateKnowledgeBase implements KnowledgeBaseServiceServer.
 func (s *KnowledgeBaseServiceImpl) CreateKnowledgeBase(ctx context.Context, req *pb.CreateKnowledgeBaseRequest) (*pb.CreateKnowledgeBaseResponse, error) {
-	kbID := generateKBID(req.Name)
+	// The id is minted here, never derived from req.Name — see generateKBID.
+	// A failure is INTERNAL, not InvalidArgument: the request may be perfectly
+	// well-formed, and there is nothing the caller could change to fix it.
+	kbID, err := generateKBID()
+	if err != nil {
+		return nil, status.Error(codes.Internal, "knowledgebase: could not mint a knowledge base id")
+	}
 
 	indexType := req.IndexType.String()
 	if req.IndexType == pb.IndexType_INDEX_TYPE_HNSW || indexType == "" || indexType == "INDEX_TYPE_HNSW" {
@@ -680,20 +688,34 @@ func kbStatusToProto(s types.KBStatus) pb.KBStatus {
 	}
 }
 
-// generateKBID produces a unique knowledge base ID. Uses a simple
-// counter-based approach; in production, a UUID library would be used,
-// but the design docs do not specify a particular ID scheme, and a
-// short ID is friendlier for debugging/ops. The name is folded in for
-// human readability.
-var kbIDCounter int
-
-func generateKBID(name string) string {
-	kbIDCounter++
-	short := name
-	if len(short) > 20 {
-		short = short[:20]
+// generateKBID mints a knowledge base id: an opaque handle the server produces
+// from crypto/rand. The knowledge base's NAME plays no part in it.
+//
+// The name used to be folded in (`<name[:20]>-<counter>`), and that made the
+// name a path component: kbID is what names the KB's on-disk directory
+// (filepath.Join(IndexDataDir, "index", kbID, …)), and Go's contract for a
+// client-supplied name is nothing at all — so a name like "../../../../tmp/x"
+// produced an id that escaped IndexDataDir, and DeleteKnowledgeBase's cleanup
+// then RemoveAll'd the directory it pointed at. H1 of
+// docs/code-review-2026-09-24.md.
+//
+// Nothing is lost by dropping the name here: the name is not an identifier, it
+// is a label, and it is already stored beside the id (types.KnowledgeBaseMeta
+// .Name, read back by GetKnowledgeBase/ListKnowledgeBases). Keeping the two
+// apart is also what makes the id unguessable — one tenant can no longer name
+// another's knowledge base — and unguessable ids are what let an id flow into
+// a path, a vecstore key prefix and a WAL record without fear.
+//
+// 128 random bits, hex-encoded: the width of a v4 UUID without taking on a
+// dependency for it. The "kb-" prefix is cosmetic (it makes an id recognisable
+// in a log line or a directory listing). Callers must treat a failure as an
+// internal error: without a fresh id there is nothing to create.
+func generateKBID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("knowledgebase: mint kb_id: %w", err)
 	}
-	return fmt.Sprintf("%s-%d", short, kbIDCounter)
+	return "kb-" + hex.EncodeToString(raw[:]), nil
 }
 
 // Ensure interface compliance.

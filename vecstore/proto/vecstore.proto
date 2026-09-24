@@ -57,6 +57,20 @@ service VectorIndexService {
   // carrying them as tombstones until a rebuild.
   rpc RemoveChunks(RemoveChunksRequest) returns (RemoveChunksResponse);
   rpc Reset(ResetIndexRequest) returns (ResetIndexResponse);
+  // Drop releases the in-memory index object for (kb_id, version_id).
+  //
+  // Without it the vecstore's index map only ever grows: the Go side's LRU
+  // eviction and its Discard path both remove the version from their own view,
+  // and nothing told the C++ side to do the same, so a long-running process's
+  // RSS tracked the number of versions ever touched instead of the number it is
+  // holding (H5 of docs/code-review-2026-09-24.md). Reset is not the same thing:
+  // it empties an index but keeps the object alive.
+  //
+  // Idempotent, and best-effort by design: dropping an index that is not
+  // resident — never built here, already dropped, or a process that restarted
+  // since — succeeds, because the caller is reclaiming memory it may or may not
+  // own. The persisted artifact is untouched: this is memory, not disk.
+  rpc Drop(DropIndexRequest) returns (DropIndexResponse);
 }
 
 message WriteChunkRequest {
@@ -205,3 +219,7 @@ message RemoveChunksResponse {
 
 message ResetIndexRequest { string kb_id = 1; int64 version_id = 2; }
 message ResetIndexResponse {}
+
+// VectorIndexService.Drop.
+message DropIndexRequest { string kb_id = 1; int64 version_id = 2; }
+message DropIndexResponse {}

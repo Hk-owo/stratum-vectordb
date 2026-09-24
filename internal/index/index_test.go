@@ -57,6 +57,10 @@ type mockVectorIndexClient struct {
 	// memToReport, when > 0, is returned as the mem_bytes in Build /
 	// AddChunks responses, simulating the vecstore's memory estimate.
 	memToReport int64
+	// H5: the Drop calls this node made, and an injectable failure for them.
+	dropCalls int
+	dropped   []indexKey
+	dropErr   error
 }
 
 func newMockVectorIndexClient() *mockVectorIndexClient {
@@ -191,6 +195,22 @@ func (m *mockVectorIndexClient) ExistsIndex(_ context.Context, in *vecstorepb.Ex
 
 func (m *mockVectorIndexClient) Reset(_ context.Context, _ *vecstorepb.ResetIndexRequest, _ ...grpc.CallOption) (*vecstorepb.ResetIndexResponse, error) {
 	return &vecstorepb.ResetIndexResponse{}, nil
+}
+
+// Drop mirrors the real vecstore's H5 reclamation: the resident index for the key
+// goes away. It records who was told to drop what, so a test can assert that
+// pruning the manager's own view also frees the vecstore's object.
+func (m *mockVectorIndexClient) Drop(_ context.Context, in *vecstorepb.DropIndexRequest, _ ...grpc.CallOption) (*vecstorepb.DropIndexResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dropCalls++
+	key := indexKey{kbID: in.KbId, versionID: in.VersionId}
+	m.dropped = append(m.dropped, key)
+	delete(m.built, key)
+	if m.dropErr != nil {
+		return nil, m.dropErr
+	}
+	return &vecstorepb.DropIndexResponse{}, nil
 }
 
 // RemoveChunks mirrors the real vecstore's §8.6(c) deletion path: it reports

@@ -29,7 +29,9 @@ import (
 	"google.golang.org/grpc"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/authmeta"
 	"stratum/internal/router"
+	"stratum/service"
 )
 
 // newLogger builds the station's logger at the requested level.
@@ -53,6 +55,7 @@ func main() {
 	nodes := flag.String("nodes", "127.0.0.1:7000", "comma-separated control-layer node gRPC addresses")
 	storageNodes := flag.String("storage-nodes", "", "comma-separated storage-layer node gRPC addresses (default: same as -nodes)")
 	tokensPath := flag.String("tokens", "", "path to the token table YAML; when set, client calls must present a credential from it")
+	stationSecret := flag.String("station-secret", "", "shared secret this station stamps forwarded calls with; must match node.station_secret on every node it forwards to")
 	routeRefresh := flag.Duration("route-refresh", 5*time.Second, "how often to re-observe storage cursors and expected versions (0 disables the routing table)")
 	logLevel := flag.String("log-level", "info", "log level; debug enables the per-stage write timings")
 	flag.Parse()
@@ -87,6 +90,11 @@ func main() {
 		StorageAddrs:         storage,
 		RouteRefreshInterval: *routeRefresh,
 		Logger:               logger,
+		// The mark is what makes "this came through the station" a claim a node
+		// can check (H4 of docs/code-review-2026-09-24.md). Without a secret it
+		// stamps nothing, which is only safe for nodes that do not require the
+		// mark — those nodes have no station_secret either.
+		Mark: authmeta.NewSigner([]byte(*stationSecret), 0),
 	}
 
 	// §9.3(5): the credential table is a static file, loaded once. Loading is
@@ -103,6 +111,10 @@ func main() {
 	} else {
 		log.Printf("authentication disabled: no -tokens given (access is controlled by isolation)")
 	}
+	if *stationSecret == "" {
+		log.Printf("trust mark not signed: no -station-secret given " +
+			"(only valid if the nodes it forwards to do not set node.station_secret)")
+	}
 
 	rt, err := router.NewRouter(cfg)
 	if err != nil {
@@ -116,7 +128,14 @@ func main() {
 	defer stopRoutes()
 	rt.Start(routeCtx)
 
-	gs := grpc.NewServer()
+	gs := grpc.NewServer(
+		// The station forwards to nodes, but it also runs handlers of its own
+		// (translating and grading calls, reading its route table), and it is the
+		// process in front of everything: a panic here is a panic for every client,
+		// so it gets the same recovery the nodes have (service/recovery.go).
+		grpc.ChainUnaryInterceptor(service.RecoveryUnary(logger.Sugar().Errorf)),
+		grpc.ChainStreamInterceptor(service.RecoveryStream(logger.Sugar().Errorf)),
+	)
 	pb.RegisterKnowledgeBaseServiceServer(gs, router.NewKBServer(rt))
 	pb.RegisterQueryServiceServer(gs, router.NewQueryServer(rt))
 	pb.RegisterAdminServiceServer(gs, router.NewAdminServer(rt))

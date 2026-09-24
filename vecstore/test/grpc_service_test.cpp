@@ -106,7 +106,9 @@ TEST_F(GrpcServiceTest, ChunkStorageWriteReadExistsDeleteRoundTrip) {
 }
 
 TEST_F(GrpcServiceTest, ChunkStorageDeleteByPrefix) {
-  for (const std::string& key : {"kbA#c1", "kbA#c2", "kbB#c1"}) {
+  const std::string kb_a = EncodeKBPrefix("kbA");
+  for (const std::string& key :
+       {EncodeKey("kbA", "c1"), EncodeKey("kbA", "c2"), EncodeKey("kbB", "c1")}) {
     grpc::ClientContext ctx;
     ::vecstore::WriteChunkRequest req;
     req.set_key(key);
@@ -117,13 +119,15 @@ TEST_F(GrpcServiceTest, ChunkStorageDeleteByPrefix) {
 
   grpc::ClientContext del_ctx;
   ::vecstore::DeleteByPrefixRequest del_req;
-  del_req.set_prefix("kbA#");
+  del_req.set_prefix(kb_a);
   ::vecstore::DeleteByPrefixResponse del_resp;
   ASSERT_TRUE(chunk_stub_->DeleteByPrefix(&del_ctx, del_req, &del_resp).ok());
 
   for (const auto& [key, want_exists] :
        std::vector<std::pair<std::string, bool>>{
-           {"kbA#c1", false}, {"kbA#c2", false}, {"kbB#c1", true}}) {
+           {EncodeKey("kbA", "c1"), false},
+           {EncodeKey("kbA", "c2"), false},
+           {EncodeKey("kbB", "c1"), true}}) {
     grpc::ClientContext ctx;
     ::vecstore::ExistsChunkRequest req;
     req.set_key(key);
@@ -131,6 +135,64 @@ TEST_F(GrpcServiceTest, ChunkStorageDeleteByPrefix) {
     ASSERT_TRUE(chunk_stub_->Exists(&ctx, req, &resp).ok());
     EXPECT_EQ(resp.exists(), want_exists) << "key=" << key;
   }
+}
+
+// DeleteByPrefix("") is the one request that empties the whole chunk store: no
+// knowledge base is named, so the prefix scan has nothing to stop it. The
+// handler must refuse it — the vecstore listener is unauthenticated and bound
+// to 0.0.0.0 in the documented deployment, so "who can send this" is not a
+// defence.
+TEST_F(GrpcServiceTest, ChunkStorageDeleteByPrefixRefusesEmptyPrefix) {
+  grpc::ClientContext write_ctx;
+  ::vecstore::WriteChunkRequest write_req;
+  write_req.set_key(EncodeKey("kbA", "c1"));
+  write_req.add_vector(1.0f);
+  ::vecstore::WriteChunkResponse write_resp;
+  ASSERT_TRUE(chunk_stub_->Write(&write_ctx, write_req, &write_resp).ok());
+
+  grpc::ClientContext del_ctx;
+  ::vecstore::DeleteByPrefixRequest del_req;
+  del_req.set_prefix("");
+  ::vecstore::DeleteByPrefixResponse del_resp;
+  const grpc::Status status = chunk_stub_->DeleteByPrefix(&del_ctx, del_req, &del_resp);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+
+  grpc::ClientContext ctx;
+  ::vecstore::ExistsChunkRequest req;
+  req.set_key(EncodeKey("kbA", "c1"));
+  ::vecstore::ExistsChunkResponse resp;
+  ASSERT_TRUE(chunk_stub_->Exists(&ctx, req, &resp).ok());
+  EXPECT_TRUE(resp.exists()) << "the refused call must not have deleted anything";
+}
+
+// A zero-dimension vector reaches the handler as "field not set" (proto3 does
+// not distinguish it from "empty"), and a zero-dim index cannot be built: the
+// flatten-and-divide downstream is a division by zero, i.e. a SIGFPE that no
+// catch() block can intercept. Both entry points must refuse it by name.
+TEST_F(GrpcServiceTest, VectorIndexRejectsZeroDimensionChunks) {
+  grpc::ClientContext build_ctx;
+  ::vecstore::BuildIndexRequest build_req;
+  build_req.set_kb_id("kb1");
+  build_req.set_version_id(1);
+  build_req.set_metric(::vecstore::COSINE);
+  auto* empty_chunk = build_req.add_chunks();
+  empty_chunk->set_chunk_id("chunk-empty");  // vector deliberately never set
+  ::vecstore::BuildIndexResponse build_resp;
+  grpc::Status status = index_stub_->Build(&build_ctx, build_req, &build_resp);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+
+  grpc::ClientContext add_ctx;
+  ::vecstore::AddChunksRequest add_req;
+  add_req.set_kb_id("kb1");
+  add_req.set_version_id(1);
+  auto* empty = add_req.add_chunks();
+  empty->set_chunk_id("chunk-empty");
+  ::vecstore::AddChunksResponse add_resp;
+  status = index_stub_->AddChunks(&add_ctx, add_req, &add_resp);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
 }
 
 TEST_F(GrpcServiceTest, VectorIndexBuildThenSearchRoundTrip) {
@@ -227,6 +289,77 @@ TEST_F(GrpcServiceTest, VectorIndexSaveLoadResetRoundTrip) {
   ASSERT_TRUE(status.ok()) << status.error_message();
   ASSERT_GT(search_resp.results_size(), 0);
   EXPECT_EQ(search_resp.results(0).chunk_id(), "chunk-0");
+}
+
+// H5 of docs/code-review-2026-09-24.md: Drop releases the resident index object.
+// Search afterwards is NOT_FOUND — the object is gone, not merely emptied (which
+// is what Reset does) — and the persisted artifact is untouched, so Load brings
+// the version back.
+TEST_F(GrpcServiceTest, VectorIndexDropReleasesTheResidentIndex) {
+  grpc::ClientContext build_ctx;
+  ::vecstore::BuildIndexRequest build_req;
+  build_req.set_kb_id("kb-drop");
+  build_req.set_version_id(1);
+  build_req.set_metric(::vecstore::COSINE);
+  for (int i = 0; i < 10; ++i) {
+    auto* chunk = build_req.add_chunks();
+    chunk->set_chunk_id("chunk-" + std::to_string(i));
+    for (int d = 0; d < 8; ++d) chunk->add_vector(static_cast<float>(i + d));
+  }
+  ::vecstore::BuildIndexResponse build_resp;
+  ASSERT_TRUE(index_stub_->Build(&build_ctx, build_req, &build_resp).ok());
+
+  const std::string save_path = (test_dir_ / "dropped_index.bin").string();
+  grpc::ClientContext save_ctx;
+  ::vecstore::SaveIndexRequest save_req;
+  save_req.set_kb_id("kb-drop");
+  save_req.set_version_id(1);
+  save_req.set_path(save_path);
+  ::vecstore::SaveIndexResponse save_resp;
+  ASSERT_TRUE(index_stub_->Save(&save_ctx, save_req, &save_resp).ok());
+
+  ::vecstore::SearchIndexRequest search_req;
+  search_req.set_kb_id("kb-drop");
+  search_req.set_version_id(1);
+  search_req.set_top_k(3);
+  for (int d = 0; d < 8; ++d) search_req.add_vector(static_cast<float>(d));
+
+  grpc::ClientContext before_ctx;
+  ::vecstore::SearchIndexResponse before_resp;
+  ASSERT_TRUE(index_stub_->Search(&before_ctx, search_req, &before_resp).ok());
+
+  grpc::ClientContext drop_ctx;
+  ::vecstore::DropIndexRequest drop_req;
+  drop_req.set_kb_id("kb-drop");
+  drop_req.set_version_id(1);
+  ::vecstore::DropIndexResponse drop_resp;
+  ASSERT_TRUE(index_stub_->Drop(&drop_ctx, drop_req, &drop_resp).ok());
+
+  grpc::ClientContext after_ctx;
+  ::vecstore::SearchIndexResponse after_resp;
+  const grpc::Status after = index_stub_->Search(&after_ctx, search_req, &after_resp);
+  EXPECT_EQ(after.error_code(), grpc::StatusCode::NOT_FOUND)
+      << "a dropped index must be gone, not merely empty: " << after.error_message();
+
+  // Idempotent: the caller may be reclaiming memory it does not own (another
+  // node dropped it first, or the version was never resident here).
+  grpc::ClientContext again_ctx;
+  ::vecstore::DropIndexResponse again_resp;
+  EXPECT_TRUE(index_stub_->Drop(&again_ctx, drop_req, &again_resp).ok());
+
+  // Memory, not disk: the artifact is still there and Load restores the version.
+  grpc::ClientContext load_ctx;
+  ::vecstore::LoadIndexRequest load_req;
+  load_req.set_kb_id("kb-drop");
+  load_req.set_version_id(1);
+  load_req.set_path(save_path);
+  ::vecstore::LoadIndexResponse load_resp;
+  ASSERT_TRUE(index_stub_->Load(&load_ctx, load_req, &load_resp).ok());
+
+  grpc::ClientContext restored_ctx;
+  ::vecstore::SearchIndexResponse restored_resp;
+  ASSERT_TRUE(index_stub_->Search(&restored_ctx, search_req, &restored_resp).ok());
+  ASSERT_GT(restored_resp.results_size(), 0);
 }
 
 // QuantizedBuildSearchRunsTwoStageRerank exercises the full gRPC path for
