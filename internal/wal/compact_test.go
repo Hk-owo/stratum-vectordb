@@ -21,7 +21,7 @@ func writeCommittedVersion(t *testing.T, w *FileWAL, kbID string, parentVersionI
 	if err := w.WriteBegin(ctx, kbID, parentVersionID, changesFixture("doc")); err != nil {
 		t.Fatalf("WriteBegin(v%d): %v", versionID, err)
 	}
-	if err := w.WriteVersionID(ctx, versionID); err != nil {
+	if err := w.WriteVersionID(ctx, kbID, versionID); err != nil {
 		t.Fatalf("WriteVersionID(v%d): %v", versionID, err)
 	}
 	if err := w.WriteCommit(ctx, versionID); err != nil {
@@ -70,6 +70,59 @@ func TestFileWAL_CompactDropsReclaimedVersions(t *testing.T) {
 	}
 }
 
+// M2 of docs/code-review-2026-09-24.md: compaction must trim the per-version
+// idempotency maps along with the replay input, or a long-running node's memory
+// tracks how many versions it has ever written instead of how many it is holding.
+// Safe because a reclaimed version is by definition COMMITTED and its BEGIN and
+// VERSION_ID records are gone: nothing will replay it, and Recover's pending-write
+// enumeration only looks at versions that are written and NOT committed.
+func TestFileWAL_CompactTrimsThePerVersionIdempotencyMaps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal")
+	w, err := NewFileWAL(path)
+	if err != nil {
+		t.Fatalf("NewFileWAL: %v", err)
+	}
+	defer w.Close()
+
+	ctx := context.Background()
+	writeCommittedVersion(t, w, "kb-1", 0, 1)
+	writeCommittedVersion(t, w, "kb-1", 1, 2)
+	writeCommittedVersion(t, w, "kb-1", 2, 3)
+
+	if len(w.versionIDsWritten) != 3 || len(w.committedVersions) != 3 {
+		t.Fatalf("precondition: maps should hold three versions, got %d and %d",
+			len(w.versionIDsWritten), len(w.committedVersions))
+	}
+
+	if err := w.Compact(ctx, map[string]int64{"kb-1": 2}); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	for _, v := range []int64{1, 2} {
+		if w.versionIDsWritten[v] {
+			t.Errorf("versionIDsWritten still holds reclaimed v%d", v)
+		}
+		if w.committedVersions[v] {
+			t.Errorf("committedVersions still holds reclaimed v%d", v)
+		}
+	}
+	if !w.versionIDsWritten[3] || !w.committedVersions[3] {
+		t.Error("v3 sits above the watermark and its records must survive compaction")
+	}
+
+	// The trimming must not cost idempotency for versions that are still there.
+	if err := w.WriteVersionID(ctx, "kb-1", 3); err != nil {
+		t.Fatalf("WriteVersionID(v3): %v", err)
+	}
+	if err := w.WriteCommit(ctx, 3); err != nil {
+		t.Fatalf("WriteCommit(v3): %v", err)
+	}
+	if len(w.versionIDsWritten) != 1 || len(w.committedVersions) != 1 {
+		t.Fatalf("re-writing v3 must be a no-op, got %d and %d entries",
+			len(w.versionIDsWritten), len(w.committedVersions))
+	}
+}
+
 // An uncommitted flow is never dropped, however far below the watermark it sits:
 // its BEGIN record is the only place Recover can find the replay input.
 func TestFileWAL_CompactKeepsUncommittedFlows(t *testing.T) {
@@ -86,7 +139,7 @@ func TestFileWAL_CompactKeepsUncommittedFlows(t *testing.T) {
 	if err := w.WriteBegin(ctx, "kb-1", 1, changesFixture("doc-v2")); err != nil {
 		t.Fatalf("WriteBegin: %v", err)
 	}
-	if err := w.WriteVersionID(ctx, 2); err != nil {
+	if err := w.WriteVersionID(ctx, "kb-1", 2); err != nil {
 		t.Fatalf("WriteVersionID: %v", err)
 	}
 

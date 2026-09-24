@@ -6,6 +6,7 @@
 #include "vecstore/src/hnsw_index.h"
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <random>
 #include <string>
@@ -150,6 +151,18 @@ TEST_F(LifecycleStateTest, ConcurrentSearchResetLoadSmoke) {
       }
     }
   });
+  // The mutator's ten Reset/Load rounds take milliseconds, so on a loaded machine
+  // they can finish before the searcher thread has been scheduled even once — and
+  // then EXPECT_GT(searches_ok, 0) below fails for a reason that has nothing to do
+  // with the code under test (observed intermittently in CI). Wait for the searcher
+  // to get one search in, with a bound: a genuinely stuck searcher still fails.
+  {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (searches_ok.load(std::memory_order_relaxed) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
   // Mutator: Reset→EMPTY then Load→READY, repeatedly.
   for (int i = 0; i < 10; ++i) {
     ASSERT_TRUE(index.Reset().ok());

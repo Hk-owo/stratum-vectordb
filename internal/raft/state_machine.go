@@ -809,7 +809,7 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 	// machine update on a local WAL failure would make this node's
 	// applied state disagree with every other node that succeeded,
 	// breaking Raft's core replication invariant.
-	if err := w.WriteVersionID(ctx, versionID); err != nil {
+	if err := w.WriteVersionID(ctx, cmd.KBID, versionID); err != nil {
 		logger.Error("WAL.WriteVersionID failed during apply; continuing to avoid replicated-state divergence, but this node's crash recovery for this version is now at risk and needs operator attention",
 			zap.Int64("version_id", versionID), zap.String("kb_id", cmd.KBID), zap.Error(err))
 	}

@@ -108,6 +108,11 @@ station up|down|status|logs  服务站（宿主进程）
   会留下一个服务于「已被重建过的集群」的孤儿。`--with-station` 可让 `up` 顺手拉起它。
 - 存储侧生成的配置里 `gc_enabled: true` + `gc_sweep_interval_ms: 5000` +
   `append_max_dead_ratio: 0.95` 是**测试夹具**取值（见脚本内注释）：生产值需要另行决定。
+- **宿主 vecstore 只被允许碰节点的数据目录**：单层拓扑下它由 `vecstore start` 以
+  `--index_dir="$VECSTORE_INDEX_DIR"`（默认 `/var/lib/stratum`，即节点配置里
+  `storage.data_dir` 的父目录）启动，容器的存储半边同理（`STRATUM_VECSTORE_INDEX_DIR`
+  可覆盖）。vecstore 的 `Save`/`Load` 等 RPC 直接用调用方给的路径，没有这道闸门就是
+  "能连端口就能读写任意文件"（`docs/code-review-2026-09-24.md` M4）。
 
 ## 三、`gateway.sh` —— 本地入口（服务站 + 控制台）
 

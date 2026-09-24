@@ -8,12 +8,16 @@
 // Written before src/grpc_service.cpp exists (TDD): this file does not
 // compile until VecstoreGrpcServer is added.
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "faiss/IndexFlat.h"
+#include "faiss/IndexHNSW.h"
+#include "faiss/index_io.h"
 #include "gtest/gtest.h"
 #include "grpcpp/grpcpp.h"
 #include "vecstore.grpc.pb.h"
@@ -39,7 +43,12 @@ class GrpcServiceTest : public ::testing::Test {
     auto storage_or = RocksDBChunkStorage::Open((test_dir_ / "rocksdb").string());
     ASSERT_TRUE(storage_or.ok()) << storage_or.status();
 
-    server_ = std::make_unique<VecstoreGrpcServer>(std::move(storage_or.value()));
+    // The on-disk index RPCs are confined to this fixture's directory (M4 of
+    // docs/code-review-2026-09-24.md): with no allowed root every Save/Load is
+    // refused — the point of the check, and it would make this fixture test nothing.
+    server_ = std::make_unique<VecstoreGrpcServer>(
+        std::move(storage_or.value()),
+        std::vector<std::string>{test_dir_.string()});
     int port = server_->StartOnLoopbackWithEphemeralPort();
     ASSERT_GT(port, 0) << "server failed to bind to a port";
 
@@ -463,6 +472,166 @@ TEST_F(GrpcServiceTest, SearchWhileBuildingIsRejected) {
   grpc::ClientContext search_ctx;
   auto status = index_stub_->Search(&search_ctx, search_req, &search_resp);
   EXPECT_EQ(status.error_code(), grpc::StatusCode::FAILED_PRECONDITION);
+}
+
+// M3 of docs/code-review-2026-09-24.md: top_k and candidate_n arrive from the wire
+// and size allocations on the vecstore side (the rerank's distance/label buffers,
+// the result set). They used to be taken at face value, so one request with
+// candidate_n = 2^31-1 asked for tens of GB inside a handler whose bad_alloc would
+// reach std::terminate.
+TEST_F(GrpcServiceTest, VectorIndexClampsHugeSearchBudgets) {
+  grpc::ClientContext build_ctx;
+  ::vecstore::BuildIndexRequest build_req;
+  build_req.set_kb_id("kb-clamp");
+  build_req.set_version_id(1);
+  build_req.set_metric(::vecstore::COSINE);
+  for (int i = 0; i < 20; ++i) {
+    auto* chunk = build_req.add_chunks();
+    chunk->set_chunk_id("chunk-" + std::to_string(i));
+    for (int d = 0; d < 8; ++d) chunk->add_vector(static_cast<float>(i + d));
+  }
+  ::vecstore::BuildIndexResponse build_resp;
+  ASSERT_TRUE(index_stub_->Build(&build_ctx, build_req, &build_resp).ok());
+
+  grpc::ClientContext save_ctx;
+  ::vecstore::SaveIndexRequest save_req;
+  save_req.set_kb_id("kb-clamp");
+  save_req.set_version_id(1);
+  save_req.set_path((test_dir_ / "clamp.bin").string());
+  ::vecstore::SaveIndexResponse save_resp;
+  ASSERT_TRUE(index_stub_->Save(&save_ctx, save_req, &save_resp).ok());
+
+  for (int32_t top_k : {1000000000, 1024}) {
+    grpc::ClientContext ctx;
+    ::vecstore::SearchIndexRequest req;
+    req.set_kb_id("kb-clamp");
+    req.set_version_id(1);
+    req.set_top_k(top_k);
+    req.set_candidate_n(2147483647);  // INT32_MAX: the allocation that used to be fatal
+    for (int d = 0; d < 8; ++d) req.add_vector(static_cast<float>(d));
+    ::vecstore::SearchIndexResponse resp;
+    const grpc::Status status = index_stub_->Search(&ctx, req, &resp);
+    EXPECT_TRUE(status.ok()) << "top_k=" << top_k << ": " << status.error_message();
+    EXPECT_LE(resp.results_size(), 4096) << "results must stay bounded";
+  }
+}
+
+// M4 of docs/code-review-2026-09-24.md: these RPCs take a filesystem path from the
+// caller, and the vecstore listener is unauthenticated — so without a bound they are
+// arbitrary file write and read as the vecstore process.
+TEST_F(GrpcServiceTest, IndexRpcsRefusePathsOutsideTheIndexDir) {
+  const std::string outside = (fs::temp_directory_path() / "stratum-outside-m4").string();
+  const std::string outside_index = outside + "/evil.index";
+  fs::remove_all(outside);
+
+  grpc::ClientContext save_ctx;
+  ::vecstore::SaveIndexRequest save_req;
+  save_req.set_kb_id("kb-1");
+  save_req.set_version_id(1);
+  save_req.set_path(outside_index);
+  ::vecstore::SaveIndexResponse save_resp;
+  const grpc::Status saved = index_stub_->Save(&save_ctx, save_req, &save_resp);
+  EXPECT_EQ(saved.error_code(), grpc::StatusCode::INVALID_ARGUMENT)
+      << "a path outside the configured index directories must be refused";
+  EXPECT_FALSE(fs::exists(outside_index)) << "and nothing may be written there";
+
+  grpc::ClientContext load_ctx;
+  ::vecstore::LoadIndexRequest load_req;
+  load_req.set_kb_id("kb-1");
+  load_req.set_version_id(1);
+  load_req.set_path("/etc/passwd");
+  ::vecstore::LoadIndexResponse load_resp;
+  EXPECT_EQ(index_stub_->Load(&load_ctx, load_req, &load_resp).error_code(),
+            grpc::StatusCode::INVALID_ARGUMENT);
+
+  grpc::ClientContext exists_ctx;
+  ::vecstore::ExistsIndexRequest exists_req;
+  exists_req.set_kb_id("kb-1");
+  exists_req.set_version_id(1);
+  exists_req.set_path("/etc/passwd");
+  ::vecstore::ExistsIndexResponse exists_resp;
+  EXPECT_EQ(index_stub_->ExistsIndex(&exists_ctx, exists_req, &exists_resp).error_code(),
+            grpc::StatusCode::INVALID_ARGUMENT);
+
+  // A traversal from inside the allowed root must not escape it either.
+  grpc::ClientContext escape_ctx;
+  ::vecstore::SaveIndexRequest escape_req;
+  escape_req.set_kb_id("kb-1");
+  escape_req.set_version_id(1);
+  escape_req.set_path((test_dir_ / ".." / ".." / ".." / ".." / "tmp" / "evil.index").string());
+  ::vecstore::SaveIndexResponse escape_resp;
+  EXPECT_EQ(index_stub_->Save(&escape_ctx, escape_req, &escape_resp).error_code(),
+            grpc::StatusCode::INVALID_ARGUMENT)
+      << "normalization must happen before the prefix check";
+}
+
+// M5 of docs/code-review-2026-09-24.md: SearchTopN validates the query vector
+// against the SIDECAR's dimension but hands it to Faiss as raw->d floats, so a
+// sidecar whose dim is smaller than the file's turns every search into an
+// out-of-bounds read. Load must refuse the pair.
+TEST_F(GrpcServiceTest, LoadRefusesASidecarWhoseDimensionDisagrees) {
+  const std::string path = (test_dir_ / "dim-mismatch.index").string();
+  {
+    faiss::IndexFlat flat(8, faiss::METRIC_INNER_PRODUCT);
+    std::vector<float> vectors(16, 0.25f);
+    flat.add(2, vectors.data());
+    faiss::write_index(&flat, path.c_str());
+  }
+  {
+    // Legacy sidecar (no magic): first line is the dimension, and it disagrees
+    // with the file's 8.
+    std::ofstream sidecar(path + ".ids");
+    ASSERT_TRUE(sidecar.good());
+    sidecar << 4 << "\n" << 0 << "\nchunk-a\nchunk-b\n";
+  }
+
+  grpc::ClientContext ctx;
+  ::vecstore::LoadIndexRequest req;
+  req.set_kb_id("kb-dim");
+  req.set_version_id(1);
+  req.set_path(path);
+  ::vecstore::LoadIndexResponse resp;
+  const grpc::Status status = index_stub_->Load(&ctx, req, &resp);
+  EXPECT_FALSE(status.ok());
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INTERNAL)
+      << "a mismatched sidecar is a broken artifact, not a valid index";
+}
+
+// M6 of docs/code-review-2026-09-24.md: gRPC-C++ has no interceptor chain, so a
+// handler that lets a C++ exception escape takes the process down. faiss::read_index
+// on a file that is not an index is exactly that case.
+TEST_F(GrpcServiceTest, LoadOfAMalformedIndexFileAnswersInternalInsteadOfDying) {
+  const std::string path = (test_dir_ / "malformed.index").string();
+  {
+    std::ofstream out(path, std::ios::binary);
+    ASSERT_TRUE(out.good());
+    const std::string junk(512, '\x7f');
+    out.write(junk.data(), static_cast<std::streamsize>(junk.size()));
+  }
+  {
+    // A sidecar that would otherwise pass its own checks: the failure has to come
+    // from the index file itself.
+    std::ofstream sidecar(path + ".ids");
+    ASSERT_TRUE(sidecar.good());
+    sidecar << 8 << "\n" << 0 << "\nchunk-a\n";
+  }
+
+  grpc::ClientContext ctx;
+  ::vecstore::LoadIndexRequest req;
+  req.set_kb_id("kb-junk");
+  req.set_version_id(1);
+  req.set_path(path);
+  ::vecstore::LoadIndexResponse resp;
+  const grpc::Status status = index_stub_->Load(&ctx, req, &resp);
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INTERNAL)
+      << "an exception must become INTERNAL, not terminate the process";
+
+  // And the process is demonstrably still serving: the RPC after the one that threw
+  // works.
+  grpc::ClientContext after_ctx;
+  ::vecstore::DiskUsageRequest after_req;
+  ::vecstore::DiskUsageResponse after_resp;
+  EXPECT_TRUE(chunk_stub_->DiskUsage(&after_ctx, after_req, &after_resp).ok());
 }
 
 }  // namespace

@@ -71,17 +71,29 @@ func freeLoopbackAddr(t *testing.T) string {
 
 // startVecstoreServerForTest starts a real vecstore_server subprocess on a
 // fresh temp-dir RocksDB. Skips the test if the binary is unavailable.
-func startVecstoreServerForTest(t *testing.T) (addr string) {
+//
+// indexDirs is the allow-list for the on-disk index RPCs (M4 of
+// docs/code-review-2026-09-24.md); when the caller does not name one, the process is
+// allowed the temp root the fixtures build their data directories under. That is a
+// fixture convenience, not a deployment shape: scripts/cluster.sh and the console's
+// supervisor pass the node's data directory, and nothing else.
+func startVecstoreServerForTest(t *testing.T, indexDirs ...string) (addr string) {
 	t.Helper()
 	binPath := vecstoreServerBin(t)
 
 	addr = freeLoopbackAddr(t)
 	dbDir := t.TempDir()
 
-	cmd := exec.Command(binPath,
-		"--rocksdb_path="+filepath.Join(dbDir, "db"),
-		"--grpc_addr="+addr,
-	)
+	args := []string{
+		"--rocksdb_path=" + filepath.Join(dbDir, "db"),
+		"--grpc_addr=" + addr,
+	}
+	if len(indexDirs) == 0 {
+		indexDirs = []string{os.TempDir()}
+	}
+	args = append(args, "--index_dir="+strings.Join(indexDirs, ","))
+
+	cmd := exec.Command(binPath, args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

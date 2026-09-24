@@ -1,6 +1,7 @@
 package chunkdoc
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 
@@ -194,23 +195,34 @@ func (m *PebbleChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) ([]s
 
 // ListChunkIDsByDocs implements ChunkDocMapper: reverse-prefix-scans each
 // docID in turn, merging and de-duplicating the resulting chunk IDs.
+//
+// ONE iterator serves the whole batch, SeekGE'd per document. It used to build an
+// iterator per docID — and the caller passes a version's entire document set, so a
+// large version paid thousands of iterator allocations for what is thousands of
+// seeks' worth of work (M9 of docs/code-review-2026-09-24.md). Nothing about the
+// scan needs a fresh iterator: the prefixes are disjoint, and SeekGE positions the
+// same one at each in turn. The upper bound is checked by hand (HasPrefix) because
+// it differs per document, which is why this cannot use IterOptions bounds.
 func (m *PebbleChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, docIDs []string) ([]string, error) {
 	seen := make(map[string]struct{})
 	var out []string
 
+	iter, err := m.db.NewIter(nil)
+	if err != nil {
+		return nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): new iterator: %w", kbID, err)
+	}
+	defer iter.Close()
+
 	for _, docID := range docIDs {
 		prefix := encodeReversePrefix(kbID, docID)
-		upperBound := pebbleutil.PrefixSuccessor(prefix)
 
-		iter, err := m.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound})
-		if err != nil {
-			return nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): new iterator for doc %s: %w", kbID, docID, err)
-		}
-
-		for iter.First(); iter.Valid(); iter.Next() {
-			chunkID, decErr := decodeSuffixString(iter.Key(), prefix)
+		for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
+			key := iter.Key()
+			if !bytes.HasPrefix(key, prefix) {
+				break // moved past this document's entries
+			}
+			chunkID, decErr := decodeSuffixString(key, prefix)
 			if decErr != nil {
-				iter.Close()
 				return nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): %w", kbID, decErr)
 			}
 			if _, ok := seen[chunkID]; !ok {
@@ -218,9 +230,7 @@ func (m *PebbleChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string
 				out = append(out, chunkID)
 			}
 		}
-		iterErr := iter.Error()
-		iter.Close()
-		if iterErr != nil {
+		if iterErr := iter.Error(); iterErr != nil {
 			return nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): iterator error for doc %s: %w", kbID, docID, iterErr)
 		}
 	}

@@ -102,7 +102,7 @@ func TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack(t *te
 	}
 	commit := func(versionID int64) {
 		t.Helper()
-		if err := writer.fileWAL.WriteVersionID(ctx, versionID); err != nil {
+		if err := writer.fileWAL.WriteVersionID(ctx, kbID, versionID); err != nil {
 			t.Fatalf("WriteVersionID(%d): %v", versionID, err)
 		}
 		if err := writer.fileWAL.WriteCommit(ctx, versionID); err != nil {
@@ -115,7 +115,7 @@ func TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack(t *te
 	commit(v1 + 2)
 	// v4: BEGIN and VERSION_ID, never committed.
 	begin(v1+2, "doc-4")
-	if err := writer.fileWAL.WriteVersionID(ctx, v1+3); err != nil {
+	if err := writer.fileWAL.WriteVersionID(ctx, kbID, v1+3); err != nil {
 		t.Fatalf("WriteVersionID(v4): %v", err)
 	}
 

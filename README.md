@@ -136,7 +136,7 @@ scripts/cluster.sh --topology two-tier status  # 每容器状态与控制组 lea
 - **"已删"只问当前状态**:判定某版本是否已被删除,依据是两件**当前**事实——该版本号是否已被分配(分配计数器单调递增、随快照走),以及它是否仍在存活版本集合里;两者同时成立即为"已删或已弃"。判定因此**不依赖任何需要保留的历史记录**,版本链的 backfill(缺口里的版本是空的还是已删的)与本地残留的对账(启动对账)共用同一判据;控制节点读自己的状态机,纯存储节点(`role=storage`)经内部读拿到同样的答案,两种形态一致。被删版本对客户端始终只是"不存在"。
 - **MVCC 零成本快照**:基于 PebbleDB 前缀编码,未变更文档在新版本中零拷贝;文档历史被压缩保存。
 - **布隆过滤器**:每个版本一份完整文档 ID 集合的布隆过滤器,成员检查开销极低;磁盘副本缺失时自动从 `VersionDocList` 重建。
-- **垃圾回收**:`ChunkGarbageCollector` 周期性(默认 5 分钟,`gc.sweep_interval_s`)清扫不再被任何版本引用的 chunk。sweep 两遍:先无锁枚举孤儿候选,再持写锁按 Raft **当前**版本复查后删除,与并发写入互斥、不依赖过期快照(stale-snapshot race 免疫),锁粒度为一个 chunk,阻塞毫秒级。
+- **垃圾回收**:`ChunkGarbageCollector` 周期性(默认 5 分钟,`gc.sweep_interval_s`)清扫不再被任何版本引用的 chunk。sweep 两遍:先无锁枚举孤儿候选,再按 Raft **当前**版本复查后删除,该复查与删除**按知识库**与并发写入互斥(与写路径共用同一套 per-KB 写锁),不依赖过期快照(stale-snapshot race 免疫),锁粒度为一个 chunk、一次知识库,阻塞毫秒级。
 - **写幂等**:`CreateVersion.client_request_id` 是可选幂等键——同一知识库上重发同一 key 会复用首次分配的版本,而不是再分配一个。这是"数据没落地的版本"能被客户端救回的**唯一**途径(§7.12);省略则保持历史语义,每次调用分配新版本。
 - **任何节点都能写**:非 leader 节点把已编码的提案经内部 `InternalService.Propose` 交给 leader 执行;接收方不是 leader 时回传 `leader_id` 让调用方改问,转发不会成链。错误以稳定 wire name(`internal/errors.Name` / `ByName`)跨进程传递,认不出某个名字的一方只保留 message,不臆造 sentinel。
 - **卡住的版本有明确归宿**:PENDING 的版本若没有任何候选副本持有其数据,即为 **DATA_MISSING**(写入方在分配版本后、数据落盘前死亡,或每次都推送失败),客户端可以 `AwaitVersion` 看到 `data_missing` 后按同一 `client_request_id` 重发,或用 **`DiscardVersion`** 放弃;失败尝试耗尽重试预算或撞上不可恢复错误时,控制面判定 **FAILED_PERMANENT**,不再自动重试,只有运维能重试或放弃——重试是 `ForceRetryVersion`(只针对索引侧:数据侧的终态没有可重试的写入),放弃是 `ForceAbandonVersion`(只接受判死版本,走 `DeleteVersion` 的 SINGLE 语义);要看清队列里的全部判死版本用 `ListFailedVersions`。放弃会向**所有**候选副本广播物理回收,因为控制面并不知道数据实际落在哪几个副本上(§10.1 / §10.6)。
@@ -232,7 +232,7 @@ CDC 的默认参数:最小 256 B、最大 1536 B、期望平均 2^9 = 512 B。�
 
 ## 部署形态
 
-- **单节点**:`cmd/stratum`(gRPC,默认 `127.0.0.1:7000`)+ 外部 C++ vecstore 进程。
+- **单节点**:`cmd/stratum`(gRPC,默认 `127.0.0.1:7000`)+ 外部 C++ vecstore 进程。vecstore 的写/读索引 RPC(`Save`/`Load`/`LoadForAppend`/`ExistsIndex`)接受调用方给的文件路径,所以它只允许在 `--index_dir` 指定的目录里读写;不传该参数时退化为 `--rocksdb_path` 的父目录,而部署脚本与网关 supervisor 显式传节点的 data_dir。少了这道闸门,能连上 vecstore 端口的一方就能以该进程的身份读写任意文件(`docs/code-review-2026-09-24.md` M4)。
 - **多节点集群**:多个 stratum 节点组成 Raft 集群,共享一套元数据。
 - **角色分离**:`node.role` 选择进程承担哪一半——`all`(默认,控制面 + 存储面同进程)、`control`(只跑控制面:Raft 日志与元数据,不持有任何 data plane,连 vecstore 数据目录都不创建)、`storage`(只跑存储层:文档 / chunk / 索引 / vecstore,不留 Raft 日志,元数据经 `RemoteRaftNode` 读取,也从不参与选举)。存储组由 `storage.nodes` 声明;省略即"每个 Raft 成员都持有数据",与拆分前的部署完全一致,老配置无需改动。
   - **两层拓扑的两条硬约束**:① 控制层 ID(`1..N`,即 Raft member ID)与存储层 ID(`11..1N`,同时是 `storage.nodes` 的键)**不得重叠**,否则控制节点会把存储节点的地址认成自己的;② 写入由控制层在 apply 时按副本拓扑**指派**给某个存储节点执行(`ExecuteVersionWrite`,那个节点作为该次写入的协调者再 fan-out),读由服务站路由到持有该版本的存储节点。
@@ -525,7 +525,7 @@ CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 
 - **段 4 量的不是"挑候选",是"等候选干完"。** 挑候选只花 `resolve_us`(读副本拓扑 + 排序 + 健康排序,两列都是 **2–3 µs**);`tried_us` 里那 1,684.8 ms 是**候选节点执行写事务**的墙钟时间,它 ⊇ 段 5 的 1,652.6 ms。要问"轮询了几个候选",看的是 `tried` 的长度:长度为 1 且其值 ≈ 段 5 ⇒ 第一个候选就接下来了(本轮两列都是这一种);多个元素、每个都逼近 `budget_ms`(1,000 篇时 65 s)⇒ 前面的候选不可达、各自吃满了预算(§7.13.2 的候选轮询),那才是段 4 真正会爆的时候。
 - **"等 READY"和"构建索引"不是一回事。** 测试用例报的 `build-accum`(从 `CreateVersion` 返回到 READY)在 1,000 篇时是 2.01 s(全精度)/ 1.51 s(SQ8),而段 6 的 `build_us` 只有 15.3 / 24.2 ms——两者差 62–131 倍,因为 `CreateVersion` 在**版本提交**时就返回了,之后的 1.5–2 s 是段 4 的数据落盘,不是构建。拿 `build-accum` 当"索引构建耗时"会把它高估一到两个数量级。
 
-各段为什么存在:`txn_wait_us` 是唯一能看见 §7.7 串行化的地方(同一知识库的写排成一队,突发的并发版本只在这里显形);段 6 的 `queue_us` / `build_us` 必须分开——同样的 90 s 排在队列里是并发度问题,花在 `build()` 里是 vecstore / 批次问题,而下游只能看到"PENDING 了 90 s";段 4 的 `tried_us` 分开记每个候选,是因为"第一个候选已失联、吃掉了整个预算"和"候选真的在写 1,000 篇"总耗时相同。
+各段为什么存在:`txn_wait_us` 是唯一能看见 §7.7 串行化的地方(同一知识库的写排成一队——写锁的粒度就是知识库,不同 KB 的写互不等待,而突发的并发版本只在这里显形);段 6 的 `queue_us` / `build_us` 必须分开——同样的 90 s 排在队列里是并发度问题,花在 `build()` 里是 vecstore / 批次问题,而下游只能看到"PENDING 了 90 s";段 4 的 `tried_us` 分开记每个候选,是因为"第一个候选已失联、吃掉了整个预算"和"候选真的在写 1,000 篇"总耗时相同。
 
 存储节点内的分段计时(`write: stage timings`)——上表的段 5:
 

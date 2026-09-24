@@ -19,7 +19,8 @@ import (
 // carries the version id and the storage transaction (stage 5) and the index
 // build (stage 6) happen after the client is answered. txn_wait_us is the part
 // with no other measurement at all — §7.7 serializes writes to one knowledge
-// base on txnMu, so a burst of concurrent versions is visible here and nowhere
+// base on its KB write lock, so a burst of concurrent versions is visible here and
+// nowhere
 // else.
 func TestWriteCoordinator_ExecuteReportsStageTimings(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)

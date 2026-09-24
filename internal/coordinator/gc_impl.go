@@ -3,7 +3,6 @@ package coordinator
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -20,16 +19,17 @@ type ChunkGarbageCollectorImpl struct {
 }
 
 // NewChunkGarbageCollectorImpl constructs a ChunkGarbageCollectorImpl,
-// defaulting a non-positive sweep interval to 5 minutes. When
-// cfg.WriteMu is nil a private lock is allocated — sufficient for tests
-// without concurrent writes; production wiring must inject the same
-// mutex that WriteCoordinatorConfig.WriteMu points to.
+// defaulting a non-positive sweep interval to 5 minutes. When cfg.Locks
+// is nil a private set is allocated — sufficient for tests without
+// concurrent writes; production wiring must inject the same instance that
+// WriteCoordinatorConfig.Locks points to, or a sweep could erase data a
+// concurrent write to the same knowledge base committed.
 func NewChunkGarbageCollectorImpl(cfg ChunkGarbageCollectorConfig) *ChunkGarbageCollectorImpl {
 	if cfg.SweepIntervalSec <= 0 {
 		cfg.SweepIntervalSec = defaultGCSweepIntervalSec
 	}
-	if cfg.WriteMu == nil {
-		cfg.WriteMu = &sync.Mutex{}
+	if cfg.Locks == nil {
+		cfg.Locks = NewKBLockSet()
 	}
 	return &ChunkGarbageCollectorImpl{cfg: cfg}
 }
@@ -103,7 +103,7 @@ func (g *ChunkGarbageCollectorImpl) sweepKB(ctx context.Context, kbID string) er
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		orphan, err := g.isOrphanChunk(ctx, kbID, chunkID, snapshotMaxVersion)
+		orphan, _, err := g.isOrphanChunk(ctx, kbID, chunkID, snapshotMaxVersion)
 		if err != nil {
 			return err
 		}
@@ -122,7 +122,8 @@ func (g *ChunkGarbageCollectorImpl) sweepKB(ctx context.Context, kbID string) er
 
 // reclaimOrphan deletes one snapshot-candidate orphan chunk after
 // re-validating orphanhood against the raft CURRENT version, holding the
-// write mutex shared with WriteCoordinatorImpl (WriteMu == txnMu).
+// write lock shared with WriteCoordinatorImpl (ChunkGarbageCollectorConfig.Locks
+// == WriteCoordinatorConfig.Locks), taken per knowledge base.
 //
 // This closes the stale-snapshot race: the first-pass judgement in
 // sweepKB uses the version list taken at sweep start, and a newer
@@ -143,9 +144,19 @@ func (g *ChunkGarbageCollectorImpl) sweepKB(ctx context.Context, kbID string) er
 // concurrent CreateVersion is blocked only for this single chunk's
 // re-check + local deletes + one RPC (milliseconds), never for the whole
 // sweep.
+//
+// Why the re-check itself cannot leave the critical section (M9 of
+// docs/code-review-2026-09-24.md suggests moving the confirmation stage out): the
+// cheap-looking shortcut is to compare the current tail against the snapshot's and
+// skip the document re-read when they match. That is wrong, and a test says so
+// (TestGC_SharedWriteMu_ConcurrentWriteAndSweep_KeepsLiveChunk): a version's data
+// writes land AFTER its id is allocated, so the tail can be unchanged while a
+// document that keeps this chunk alive becomes readable. The document read IS the
+// confirmation, so it stays inside the lock. What M9 can remove from the lock is
+// the SECOND scan of those documents — see the docIDs reuse below.
 func (g *ChunkGarbageCollectorImpl) reclaimOrphan(ctx context.Context, kbID, chunkID string) error {
-	g.cfg.WriteMu.Lock()
-	defer g.cfg.WriteMu.Unlock()
+	unlock := g.cfg.Locks.Lock(kbID)
+	defer unlock()
 
 	// Re-check against the CURRENT raft version list, not the
 	// start-of-sweep snapshot.
@@ -158,7 +169,7 @@ func (g *ChunkGarbageCollectorImpl) reclaimOrphan(ctx context.Context, kbID, chu
 		// the data to the KB-deletion path's full cleanup.
 		return nil
 	}
-	orphan, err := g.isOrphanChunk(ctx, kbID, chunkID, tail)
+	orphan, docIDs, err := g.isOrphanChunk(ctx, kbID, chunkID, tail)
 	if err != nil {
 		return fmt.Errorf("chunk-gc: reclaim re-check (%s,%s): %w", kbID, chunkID, err)
 	}
@@ -171,10 +182,11 @@ func (g *ChunkGarbageCollectorImpl) reclaimOrphan(ctx context.Context, kbID, chu
 	// Confirmed orphan: mappings first, vector second (idempotent; see
 	// the interface doc comment for crash-safety rationale). Both inside
 	// the write critical section — see the method doc comment.
-	docIDs, err := g.cfg.ChunkDocMapper.ListDocIDs(ctx, kbID, chunkID)
-	if err != nil {
-		return fmt.Errorf("chunk-gc: ListDocIDs(%s,%s): %w", kbID, chunkID, err)
-	}
+	//
+	// docIDs comes back from the re-check rather than being re-scanned here: the
+	// re-check already listed this chunk's documents, and that list is exactly what
+	// the delete needs. Scanning it twice was the other half of M9 of
+	// docs/code-review-2026-09-24.md — same iterator work, twice, inside the lock.
 	for _, docID := range docIDs {
 		if err := g.cfg.ChunkDocMapper.DeleteByDoc(ctx, kbID, docID); err != nil {
 			return fmt.Errorf("chunk-gc: DeleteByDoc(%s,%s): %w", kbID, docID, err)
@@ -191,14 +203,16 @@ func (g *ChunkGarbageCollectorImpl) reclaimOrphan(ctx context.Context, kbID, chu
 }
 
 // isOrphanChunk reports whether every document mapped to chunkID is
-// deleted or tombstoned at the KB's newest version.
-func (g *ChunkGarbageCollectorImpl) isOrphanChunk(ctx context.Context, kbID, chunkID string, maxVersion int64) (bool, error) {
+// deleted or tombstoned at the KB's newest version, and returns the document list
+// it consulted so the caller can reuse it instead of scanning the mapping again
+// (M9 of docs/code-review-2026-09-24.md).
+func (g *ChunkGarbageCollectorImpl) isOrphanChunk(ctx context.Context, kbID, chunkID string, maxVersion int64) (bool, []string, error) {
 	docIDs, err := g.cfg.ChunkDocMapper.ListDocIDs(ctx, kbID, chunkID)
 	if err != nil {
-		return false, fmt.Errorf("chunk-gc: ListDocIDs(%s,%s): %w", kbID, chunkID, err)
+		return false, nil, fmt.Errorf("chunk-gc: ListDocIDs(%s,%s): %w", kbID, chunkID, err)
 	}
 	if len(docIDs) == 0 {
-		return false, nil // no mapping entries at all: nothing to reclaim here
+		return false, nil, nil // no mapping entries at all: nothing to reclaim here
 	}
 	for _, docID := range docIDs {
 		content, err := g.cfg.DocStore.ReadAt(ctx, kbID, docID, maxVersion)
@@ -209,11 +223,11 @@ func (g *ChunkGarbageCollectorImpl) isOrphanChunk(ctx context.Context, kbID, chu
 		}
 		if len(content) > 0 {
 			// At least one live document still references the chunk.
-			return false, nil
+			return false, nil, nil
 		}
 		// An empty non-error value is a tombstone at maxVersion.
 	}
-	return true, nil
+	return true, docIDs, nil
 }
 
 var _ ChunkGarbageCollector = (*ChunkGarbageCollectorImpl)(nil)

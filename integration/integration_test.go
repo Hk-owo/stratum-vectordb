@@ -756,7 +756,7 @@ func TestIntegration_CrashRecovery_VersionWriteResume(t *testing.T) {
 	// WAL has versionID=1 (from CreateKB) and any further versions from
 	// the initial setup. Add versionID=5 as a simulated crash residual.
 	cluster.WAL.WriteBegin(ctx, "", 0, nil)
-	cluster.WAL.WriteVersionID(ctx, 5)
+	cluster.WAL.WriteVersionID(ctx, "", 5)
 
 	records, err := cluster.WAL.Recover(ctx)
 	if err != nil {

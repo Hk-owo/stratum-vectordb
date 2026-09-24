@@ -80,9 +80,14 @@ type WAL interface {
 	WriteBegin(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange) error
 
 	// WriteVersionID records that Raft apply has assigned versionID to
-	// the in-flight transaction. Idempotent: repeated calls with the same
+	// the in-flight transaction for kbID. Idempotent: repeated calls with the same
 	// versionID return success without producing duplicate records.
-	WriteVersionID(ctx context.Context, versionID int64) error
+	//
+	// kbID is part of the signature because the record now carries it, and that is
+	// what keeps the BEGIN/VERSION_ID pairing exact once writes to different
+	// knowledge bases run concurrently (M7 of docs/code-review-2026-09-24.md). The
+	// version id alone cannot identify the transaction.
+	WriteVersionID(ctx context.Context, kbID string, versionID int64) error
 
 	// WriteCommit marks that all storage-layer writes for versionID have
 	// completed successfully.

@@ -549,6 +549,17 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 	var lastErr error
 	backoff := 200 * time.Millisecond
 	for {
+		// M10 of docs/code-review-2026-09-24.md: the loop has to notice the
+		// caller's context. Nothing else here does — every failure below is
+		// treated as "try again" — so a cancelled pull kept running to its idle
+		// timeout (30 s) or its ceiling (10 min) while the goroutine that asked
+		// for it had already gone, and each retry sent RPCs nobody was waiting
+		// for. Cancellation is an answer, not a failure to retry.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("plane: EnsureIndex(%s, %d): pull cancelled after %s (attempts=%d, local cursor=%d): %w",
+				kbID, versionID, time.Since(start).Round(time.Millisecond), attempts,
+				d.localVersionOf(kbID), err)
+		}
 		// Re-checked every attempt: when this node is the coordinator, its own
 		// apply can run ahead of its storage writes, so the callback reaches
 		// here before the data lands locally (§8.5). The write path advances
@@ -571,6 +582,15 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 		attempts++
 		err := d.puller.PullVersion(ctx, addr, kbID, versionID)
 		if err != nil {
+			// A cancelled context surfaces here too (the transfer aborts mid-flight),
+			// and it must not be logged as "will retry" — there is nobody left to
+			// retry for. The loop-top check would catch it next round; returning now
+			// skips a log line that would read like a peer problem.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("plane: EnsureIndex(%s, %d): pull cancelled after %s (attempts=%d, local cursor=%d): %w",
+					kbID, versionID, time.Since(start).Round(time.Millisecond), attempts,
+					d.localVersionOf(kbID), ctxErr)
+			}
 			lastErr = err
 			d.logger.Warn("plane: data pull failed, will retry",
 				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
@@ -624,7 +644,15 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 				kbID, versionID, pullMaxDuration, attempts,
 				d.localVersionOf(kbID), versionID, lastErr)
 		}
-		time.Sleep(backoff)
+		// The backoff is interruptible for the same reason the loop checks ctx: a
+		// cancelled pull must not sit here for up to 5 s (the cap) before noticing.
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return fmt.Errorf("plane: EnsureIndex(%s, %d): pull cancelled after %s (attempts=%d, local cursor=%d): %w",
+				kbID, versionID, time.Since(start).Round(time.Millisecond), attempts,
+				d.localVersionOf(kbID), ctx.Err())
+		}
 		if backoff < 5*time.Second {
 			backoff *= 2
 		}

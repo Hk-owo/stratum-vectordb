@@ -127,7 +127,7 @@ func TestMockWAL_DeleteByKBDropsOneKnowledgeBaseOnly(t *testing.T) {
 		if err := w.WriteBegin(ctx, kb, parent, changesFixture("doc")); err != nil {
 			t.Fatalf("WriteBegin(%s): %v", kb, err)
 		}
-		if err := w.WriteVersionID(ctx, version); err != nil {
+		if err := w.WriteVersionID(ctx, kb, version); err != nil {
 			t.Fatalf("WriteVersionID(v%d): %v", version, err)
 		}
 		if err := w.WriteCommit(ctx, version); err != nil {

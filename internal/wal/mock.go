@@ -84,22 +84,22 @@ func NewMockWAL() *MockWAL {
 func (w *MockWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int64, changes []types.DocChange) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.records = append(w.records, record{kind: recordBegin, begin: beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}})
+	w.records = append(w.records, record{kind: recordBegin, kbID: kbID, begin: beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}})
 	return nil
 }
 
-func (w *MockWAL) WriteVersionID(_ context.Context, versionID int64) error {
+func (w *MockWAL) WriteVersionID(_ context.Context, kbID string, versionID int64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.versionIDsWritten[versionID] {
 		return nil // idempotent
 	}
 	w.versionIDsWritten[versionID] = true
-	w.records = append(w.records, record{kind: recordVersionID, versionID: versionID})
-	// Bind the most recent unpaired BEGIN's replay input to this version,
-	// mirroring FileWAL.rebuildIndex.
+	w.records = append(w.records, record{kind: recordVersionID, kbID: kbID, versionID: versionID})
+	// Bind the most recent unpaired BEGIN of THIS knowledge base to this version,
+	// mirroring FileWAL.rebuildIndex (M7 of docs/code-review-2026-09-24.md).
 	for i := len(w.records) - 1; i >= 0; i-- {
-		if w.records[i].kind == recordBegin {
+		if w.records[i].kind == recordBegin && w.records[i].kbID == kbID {
 			w.beginDataByVersion[versionID] = w.records[i].begin
 			break
 		}

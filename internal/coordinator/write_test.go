@@ -791,7 +791,7 @@ func TestWriteCoordinator_CrashBeforeRaftPropose(t *testing.T) {
 func TestWriteCoordinator_CrashAfterRaftBeforeCommit(t *testing.T) {
 	w := wal.NewMockWAL()
 	w.WriteBegin(context.Background(), "", 0, nil)
-	w.WriteVersionID(context.Background(), 5)
+	w.WriteVersionID(context.Background(), "", 5)
 
 	records, err := w.Recover(context.Background())
 	if err != nil {

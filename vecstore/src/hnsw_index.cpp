@@ -69,6 +69,13 @@ constexpr int kEfConstruction = 200;
 constexpr int kEfSearch = 128;
 constexpr int kM = 32;  // HNSW graph connectivity parameter
 
+// kMaxSearchTopN bounds the result count SearchTopN will allocate for. The gRPC
+// layer clamps what it passes down (see ClampTopK in grpc_service.cpp); this is the
+// second line of defence for SearchTopN's other callers, because the two buffers
+// below are sized directly from top_n — no exception guard between them and a
+// caller-supplied number (M3 of docs/code-review-2026-09-24.md).
+constexpr int kMaxSearchTopN = 4096;
+
 // Sidecar magic line, introduced together with the atomic + checksummed
 // write path. A legacy sidecar starts with the bare dimension instead, which
 // is what keeps pre-existing index files loadable.
@@ -437,6 +444,11 @@ absl::StatusOr<std::vector<SearchResult>> HNSWVectorIndex::SearchTopN(
   }
   if (top_n <= 0) {
     return std::vector<SearchResult>{};
+  }
+  if (top_n > kMaxSearchTopN) {
+    // Clamped rather than refused: the caller asked for "many", and the answer it
+    // gets is the most this index will produce at once.
+    top_n = kMaxSearchTopN;
   }
 
   std::vector<float> query = vector;
@@ -844,6 +856,21 @@ absl::Status HNSWVectorIndex::LoadLocked(const std::string& path, const char* op
     return absl::InternalError(
         pre + "sidecar lists " + std::to_string(listed) +
         " chunk ids but the index holds " + std::to_string(ntotal) + ": " + path);
+  }
+
+  // The sidecar and the index must agree on the dimension as well, and this one is
+  // a memory-safety check rather than a bookkeeping one (M5 of
+  // docs/code-review-2026-09-24.md): SearchTopN checks the QUERY vector against
+  // dim_, then hands it to Faiss as an array of raw->d floats. A sidecar whose dim
+  // is SMALLER than the index's — torn, hand-edited, or simply not this file's
+  // (the artifact CRC covers the index file, never the sidecar) — passes that check
+  // and turns every search into an out-of-bounds read of the caller's buffer.
+  if (raw->d > 0 && static_cast<int64_t>(raw->d) != static_cast<int64_t>(dim)) {
+    const int64_t file_dim = static_cast<int64_t>(raw->d);
+    delete raw;
+    return absl::InternalError(
+        pre + "sidecar records dimension " + std::to_string(dim) +
+        " but the index was built with " + std::to_string(file_dim) + ": " + path);
   }
 
   // The sidecar and the index must agree on the shape as well as on the vector

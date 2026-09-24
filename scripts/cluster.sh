@@ -86,6 +86,10 @@ ONLY=all
 STORAGE_ID_BASE=10
 VECSTORE_BASE_PORT=7101
 VECSTORE_IMAGE=stratum-node:latest   # 单层的 all-in-one 镜像
+# 宿主 vecstore 允许读写的索引根（M4 of docs/code-review-2026-09-24.md）。单层拓扑
+# 下节点配置的 storage.data_dir 是 /var/lib/stratum/nodeN，索引写在它的 index/ 子目录，
+# 宿主 vecstore 与容器看到的是同一份 bind mount，所以这个根是 /var/lib/stratum。
+VECSTORE_INDEX_DIR="${STRATUM_VECSTORE_INDEX_DIR:-/var/lib/stratum}"
 
 # 单层：每个节点独立 vecstore（宿主进程，:710N），RocksDB 目录各自独立。
 # 两层：容器自带 vecstore，宿主不参与。
@@ -942,6 +946,7 @@ vecstore_start() {
     setsid nohup "$ROOT/run/bin/vecstore_server" \
       --rocksdb_path="$dir/node${id}" \
       --grpc_addr="0.0.0.0:${port}" \
+      --index_dir="$VECSTORE_INDEX_DIR" \
       >> "$(log_dir)/vecstore-node${id}.log" 2>&1 &
     sleep 0.5
   done

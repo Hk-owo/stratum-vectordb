@@ -23,7 +23,7 @@ func TestFileWAL_ChangesInRange_ReturnsOnlyWhatItHolds(t *testing.T) {
 		if err := w.WriteBegin(ctx, "kb-1", v-1, []types.DocChange{{Op: types.ChangeOpAdd, DocID: "d", Content: content}}); err != nil {
 			t.Fatal(err)
 		}
-		if err := w.WriteVersionID(ctx, v); err != nil {
+		if err := w.WriteVersionID(ctx, "kb-1", v); err != nil {
 			t.Fatal(err)
 		}
 		if err := w.WriteCommit(ctx, v); err != nil {
@@ -34,7 +34,7 @@ func TestFileWAL_ChangesInRange_ReturnsOnlyWhatItHolds(t *testing.T) {
 	if err := w.WriteBegin(ctx, "kb-2", 1, []types.DocChange{{Op: types.ChangeOpAdd, DocID: "x", Content: "other"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.WriteVersionID(ctx, 9); err != nil {
+	if err := w.WriteVersionID(ctx, "kb-2", 9); err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,7 +84,7 @@ func TestFileWAL_ChangesInRange_EmptyRange(t *testing.T) {
 	if err := w.WriteBegin(ctx, "kb-1", 1, []types.DocChange{{Op: types.ChangeOpAdd, DocID: "d"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.WriteVersionID(ctx, 2); err != nil {
+	if err := w.WriteVersionID(ctx, "kb-1", 2); err != nil {
 		t.Fatal(err)
 	}
 

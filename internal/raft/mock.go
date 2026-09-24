@@ -185,7 +185,7 @@ func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, pa
 	// eliminates orphan versions on crash recovery — see the WAL package
 	// doc comment and Stratum_设计文档v10.md "关键时序约束".
 	if r.wal != nil {
-		if err := r.wal.WriteVersionID(ctx, versionID); err != nil {
+		if err := r.wal.WriteVersionID(ctx, kbID, versionID); err != nil {
 			return 0, fmt.Errorf("raft: WAL.WriteVersionID failed during apply: %w", err)
 		}
 	}

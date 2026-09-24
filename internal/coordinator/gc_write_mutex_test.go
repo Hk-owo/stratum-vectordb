@@ -3,8 +3,8 @@
 //
 // The orphan-chunk GC deletes a candidate chunk's chunk-doc mappings and
 // its vecstore vector inside the write mutex it shares with
-// WriteCoordinatorImpl (ChunkGarbageCollectorConfig.WriteMu ==
-// WriteCoordinatorConfig.WriteMu, both wired from one &writeMu in
+// WriteCoordinatorImpl (ChunkGarbageCollectorConfig.Locks ==
+// WriteCoordinatorConfig.Locks, both wired from one set in
 // cmd/stratum/main.go). These tests exercise that mutual exclusion
 // against the *real* write path — split, embed, chunk-store write,
 // mapping write, doc write — instead of calling ChunkDocMapper.Write
@@ -230,7 +230,7 @@ var _ chunkstore.ChunkStore = (*gatedChunkStore)(nil)
 // own raft double, and therefore its own knowledge base, so each round's
 // sweep only scans that round's chunk.
 type gcMutexHarness struct {
-	mu       *sync.Mutex // the single mutex both coordinators must share
+	locks    *KBLockSet // the single set both coordinators must share
 	cdm      *chunkdoc.PebbleChunkDocMapper
 	ds       *testDocStore
 	vdl      *testVersionDocList
@@ -249,7 +249,7 @@ func newGCMutexHarness(t *testing.T) *gcMutexHarness {
 	t.Cleanup(func() { _ = cdm.Close() })
 
 	return &gcMutexHarness{
-		mu:       &sync.Mutex{},
+		locks:    NewKBLockSet(),
 		cdm:      cdm,
 		ds:       newTestDocStore(),
 		vdl:      newTestVersionDocList(),
@@ -285,7 +285,7 @@ func (h *gcMutexHarness) newNode(t *testing.T, kbID string, cs chunkstore.ChunkS
 	coord := NewWriteCoordinatorImpl(WriteCoordinatorConfig{
 		MaxRetries:          2,
 		RetryBaseIntervalMS: 1,
-		WriteMu:             h.mu, // ← shared with the GC below
+		Locks:               h.locks, // ← shared with the GC below
 		WAL:                 wal.NewMockWAL(),
 		RaftNode:            rn,
 		Splitter:            h.splitter,
@@ -300,7 +300,7 @@ func (h *gcMutexHarness) newNode(t *testing.T, kbID string, cs chunkstore.ChunkS
 
 	gc := NewChunkGarbageCollectorImpl(ChunkGarbageCollectorConfig{
 		SweepIntervalSec: 1,
-		WriteMu:          h.mu, // ← the same instance, as main.go does
+		Locks:            h.locks, // ← the same instance, as main.go does
 		RaftNode:         rn,
 		ChunkDocMapper:   h.cdm,
 		DocStore:         h.ds,
@@ -419,7 +419,7 @@ func TestGC_SharedWriteMu_BlocksConcurrentWriteDuringReclaim(t *testing.T) {
 
 	select {
 	case err := <-writeDone:
-		t.Fatalf("CreateVersion completed while the GC held the shared write mutex (err=%v): WriteMu is not shared between WriteCoordinatorImpl and ChunkGarbageCollectorImpl", err)
+		t.Fatalf("CreateVersion completed while the GC held the shared write mutex (err=%v): the KB lock set is not shared between WriteCoordinatorImpl and ChunkGarbageCollectorImpl", err)
 	case <-time.After(250 * time.Millisecond):
 		// Expected: the writer is blocked behind the reclaim.
 	}

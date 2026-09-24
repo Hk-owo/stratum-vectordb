@@ -98,10 +98,14 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	defer in.Close()
 	reader := bufio.NewReader(in)
 
-	// pending is the BEGIN that has not yet met its VERSION_ID. A BEGIN carries no
-	// versionID — the pairing is what identifies it — so the decision to keep or
-	// drop it can only be made once its VERSION_ID arrives.
-	var pending *rawRecord
+	// pending holds the BEGIN records that have not yet met their VERSION_ID, one per
+	// knowledge base. A BEGIN carries no versionID — the pairing is what identifies
+	// it — so the decision to keep or drop it can only be made once its VERSION_ID
+	// arrives; and since writes to different KBs are concurrent (M7 of
+	// docs/code-review-2026-09-24.md), their pairs sit interleaved in the log, so a
+	// single slot would pair the wrong two records and drop a live transaction's
+	// replay input.
+	pending := make(map[string]*rawRecord)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -115,17 +119,18 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 
 		switch rec.kind {
 		case recordTypeBegin:
-			// An unpaired BEGIN means the previous transaction never reached its
-			// VERSION_ID: keep it, exactly as Recover would need it.
-			if pending != nil {
-				if _, err := buf.Write(pending.raw); err != nil {
+			// An unpaired BEGIN means the previous transaction OF THIS KB never
+			// reached its VERSION_ID: keep it, exactly as Recover would need it.
+			if prev, ok := pending[raw.kbID]; ok {
+				if _, err := buf.Write(prev.raw); err != nil {
 					return fmt.Errorf("wal: compact: write %s: %w", tmpPath, err)
 				}
 			}
-			pending = raw
+			pending[raw.kbID] = raw
 
 		case recordTypeVersionID:
-			if pending == nil {
+			paired := takePendingBegin(pending, rec.kbID)
+			if paired == nil {
 				// A VERSION_ID with no BEGIN of its own (a follower replaying the
 				// leader's log never wrote one). Nothing to pair, keep as is.
 				if _, err := buf.Write(raw.raw); err != nil {
@@ -133,17 +138,16 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 				}
 				break
 			}
-			if w.reclaimable(pending.kbID, rec.versionID, keepThrough) {
+			if w.reclaimable(paired.kbID, rec.versionID, keepThrough) {
 				reclaimed[rec.versionID] = true
 			} else {
-				if _, err := buf.Write(pending.raw); err != nil {
+				if _, err := buf.Write(paired.raw); err != nil {
 					return fmt.Errorf("wal: compact: write %s: %w", tmpPath, err)
 				}
 				if _, err := buf.Write(raw.raw); err != nil {
 					return fmt.Errorf("wal: compact: write %s: %w", tmpPath, err)
 				}
 			}
-			pending = nil
 
 		case recordTypeCursor:
 			// Cursors are not changes: the reclaim watermark does not apply to
@@ -169,9 +173,10 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 		}
 	}
 	// A BEGIN still waiting at the end of the log is an in-flight transaction: keep
-	// it, or a crash would have nothing left to replay.
-	if pending != nil {
-		if _, err := buf.Write(pending.raw); err != nil {
+	// it, or a crash would have nothing left to replay. Order does not matter here —
+	// each one is kept for its own knowledge base.
+	for _, p := range pending {
+		if _, err := buf.Write(p.raw); err != nil {
 			return fmt.Errorf("wal: compact: write %s: %w", tmpPath, err)
 		}
 	}
@@ -217,11 +222,30 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	}
 	w.file = f
 
-	// Trim the index to match what the log now holds: ChangesFor must report a
-	// reclaimed version as MISSING, not as "here are the changes".
+	// Trim the in-memory index to match what the log now holds: ChangesFor must
+	// report a reclaimed version as MISSING, not as "here are the changes", and
+	// the per-version idempotency records must go with it.
+	//
+	// M2 of docs/code-review-2026-09-24.md: only beginDataByVersion used to be
+	// trimmed here, so versionIDsWritten and committedVersions grew with every
+	// version the process had ever written — a long-running node's memory tracked
+	// its history rather than its work. Dropping these two is safe for the same
+	// reason DeleteByKB already drops them: a reclaimed version's BEGIN and
+	// VERSION_ID records are gone from the log (reclaimable() requires it to be
+	// COMMITTED), so nothing will ever replay it, and the record that would make
+	// WriteVersionID/WriteCommit idempotent for a version the log no longer
+	// mentions protects against a repeat that cannot happen. Recover's
+	// pending-write enumeration is unaffected: it only looks at versions that are
+	// written and NOT committed, and every version here is committed.
 	for versionID := range reclaimed {
 		delete(w.beginDataByVersion, versionID)
+		delete(w.versionIDsWritten, versionID)
+		delete(w.committedVersions, versionID)
 	}
+	// beginDataByVersion still holds the replay input — including the changed
+	// documents' full text — for every version that has NOT been reclaimed. That
+	// set is bounded by the reclaim watermark (which is why it is not a leak), and
+	// it is what answers a lagging peer's ChangesFor without re-reading the log.
 	return nil
 }
 
@@ -376,9 +400,7 @@ func (w *FileWAL) DeleteByKB(ctx context.Context, kbID string) error {
 	delete(w.deleteMarked, kbID)
 	delete(w.deleteCompleted, kbID)
 	delete(w.cursors, kbID)
-	if w.pendingBegin != nil && w.pendingBegin.kbID == kbID {
-		w.pendingBegin = nil
-	}
+	delete(w.pendingBeginByKB, kbID)
 	for key := range w.replayCounters {
 		if key.kbID == kbID {
 			delete(w.replayCounters, key)
@@ -413,6 +435,32 @@ type rawRecord struct {
 // readRawRecord reads one framed record and returns it decoded alongside its raw
 // bytes. readRecord cannot be reused here because it discards the bytes, and
 // compaction must not re-encode a payload it did not author.
+// takePendingBegin returns (and removes) the BEGIN record a VERSION_ID belongs to,
+// pairing by knowledge base.
+//
+// A VERSION_ID written since M7 carries its kbID, so the pairing is exact. One
+// written before that carries only the version id, and those came from a
+// serialized write path — "the single unpaired BEGIN" was unambiguous then, so that
+// remains the fallback for them. Anything ambiguous returns nil on purpose: the
+// caller then keeps the records as they are, which is the direction that costs
+// nothing (a version whose pairing is lost reads as MISSING to ChangesFor, and a
+// lagging peer falls back to a full-state transfer).
+func takePendingBegin(pending map[string]*rawRecord, kbID string) *rawRecord {
+	if kbID != "" {
+		paired := pending[kbID]
+		delete(pending, kbID)
+		return paired
+	}
+	if len(pending) != 1 {
+		return nil
+	}
+	for kb, paired := range pending {
+		delete(pending, kb)
+		return paired
+	}
+	return nil
+}
+
 func readRawRecord(r *bufio.Reader) (parsedRecord, *rawRecord, error) {
 	header := make([]byte, recordHeaderLen)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -447,7 +495,16 @@ func readRawRecord(r *bufio.Reader) (parsedRecord, *rawRecord, error) {
 		}
 		rec.begin = bd
 		raw.kbID = bd.kbID
-	case recordTypeVersionID, recordTypeCommit:
+	case recordTypeVersionID:
+		// 8 bytes from records written before the payload carried the knowledge base
+		// (M7 of docs/code-review-2026-09-24.md); more is versionID + raw kbID bytes.
+		if len(payload) < 8 {
+			return parsedRecord{}, nil, fmt.Errorf("wal: malformed versionID payload length %d", len(payload))
+		}
+		rec.versionID = int64(binary.BigEndian.Uint64(payload[:8]))
+		rec.kbID = string(payload[8:])
+		raw.kbID = rec.kbID
+	case recordTypeCommit:
 		if len(payload) != 8 {
 			return parsedRecord{}, nil, fmt.Errorf("wal: malformed versionID payload length %d", len(payload))
 		}

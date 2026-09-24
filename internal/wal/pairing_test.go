@@ -27,7 +27,7 @@ func TestFileWAL_PairsBeginAndVersionIDInEitherOrder(t *testing.T) {
 	// Version ID first (the control layer allocated it), BEGIN second (the
 	// storage layer's transaction). No COMMIT: the transaction is
 	// interrupted, which is exactly what recovery must resolve.
-	if err := w.WriteVersionID(ctx, 7); err != nil {
+	if err := w.WriteVersionID(ctx, "kb-1", 7); err != nil {
 		t.Fatalf("WriteVersionID: %v", err)
 	}
 	if err := w.WriteBegin(ctx, "kb-1", 3, changes); err != nil {

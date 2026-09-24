@@ -87,6 +87,13 @@ type VecstoreConfig struct {
 	RocksDBPath  string `yaml:"rocksdb_path" json:"rocksdb_path"`                 // default <stratum data_dir>/vecstore_rocksdb
 	HealthAddr   string `yaml:"health_addr" json:"health_addr"`                   // default 127.0.0.1:7101 (informational)
 	ExtraArgsRaw string `yaml:"extra_args,omitempty" json:"extra_args,omitempty"` // extra CLI args (informational)
+
+	// IndexDir is the root the vecstore's on-disk index RPCs are confined to
+	// (vecstore_server --index_dir). Empty means "use the stratum service's
+	// data_dir", which is where the IndexManager writes its indexes; a deployment
+	// that keeps them elsewhere sets this explicitly. Without a root the vecstore
+	// would take whatever path a caller names (M4 of docs/code-review-2026-09-24.md).
+	IndexDir string `yaml:"index_dir,omitempty" json:"index_dir,omitempty"`
 }
 
 // EmbedConfig is the mock embed process parameters.

@@ -172,6 +172,18 @@ func (s *Supervisor) buildCmd(svc ServiceID) (*exec.Cmd, error) {
 			"--rocksdb_path=" + v.RocksDBPath,
 			"--grpc_addr=" + v.GRPCAddr,
 		}
+		// The on-disk index RPCs (Save / Load / LoadForAppend / ExistsIndex) take a
+		// path from the wire, so the vecstore confines them to --index_dir (M4 of
+		// docs/code-review-2026-09-24.md). The node's data directory is where the
+		// IndexManager keeps its indexes, so that is the default; an explicit
+		// index_dir wins when a deployment keeps them elsewhere.
+		indexDir := v.IndexDir
+		if indexDir == "" {
+			indexDir = s.cfg.Services.Stratum.DataDir
+		}
+		if indexDir != "" {
+			args = append(args, "--index_dir="+indexDir)
+		}
 		if v.ExtraArgsRaw != "" {
 			args = append(args, splitArgs(v.ExtraArgsRaw)...)
 		}

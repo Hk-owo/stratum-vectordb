@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "grpcpp/grpcpp.h"
 #include "vecstore.grpc.pb.h"
@@ -62,7 +63,18 @@ class ChunkStorageServiceImpl final : public ::vecstore::ChunkStorageService::Se
 // HNSW").
 class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Service {
  public:
-  explicit VectorIndexServiceImpl(ChunkStorage* storage) : storage_(storage) {}
+  // index_dirs are the ONLY directories the on-disk index RPCs may touch
+  // (Save, Load, LoadForAppend, ExistsIndex). They exist because those RPCs take a
+  // filesystem path straight from the wire: without this, any caller that can
+  // reach the vecstore port reads and writes arbitrary files as the vecstore
+  // process — with the port unauthenticated, that is "whoever can connect"
+  // (M4 of docs/code-review-2026-09-24.md).
+  //
+  // Passed in normalized (see NormalizeIndexDirs in grpc_service.cpp). Empty means
+  // every path is refused: a vecstore that was not told where its indexes live has
+  // no business touching the filesystem on a caller's behalf.
+  VectorIndexServiceImpl(ChunkStorage* storage, std::vector<std::string> index_dirs)
+      : index_dirs_(std::move(index_dirs)), storage_(storage) {}
 
   grpc::Status Build(grpc::ServerContext* context,
                       const ::vecstore::BuildIndexRequest* request,
@@ -124,6 +136,13 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // ExistsIndex's stateless on-disk existence check.
   static bool FileExists(const std::string& path);
 
+  // IndexPathAllowed reports whether path may be touched, and why not when it may
+  // not. Every on-disk RPC goes through it (M4 of docs/code-review-2026-09-24.md).
+  bool IndexPathAllowed(const std::string& path, std::string* reason) const;
+
+  // index_dirs_ are the normalized allowed roots (see the constructor).
+  std::vector<std::string> index_dirs_;
+
   std::mutex mu_;
   // shared_ptr, not unique_ptr, and the reason is Search: it resolves its
   // index under mu_ and then uses it with the lock RELEASED (the rerank
@@ -142,8 +161,11 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
 class VecstoreGrpcServer {
  public:
   // Takes ownership of storage; it is kept alive for the server's
-  // lifetime.
-  explicit VecstoreGrpcServer(std::unique_ptr<ChunkStorage> storage);
+  // lifetime. index_dirs are the directories the on-disk index RPCs may touch;
+  // they are normalized here and empty means "refuse every path" (see
+  // VectorIndexServiceImpl).
+  VecstoreGrpcServer(std::unique_ptr<ChunkStorage> storage,
+                     std::vector<std::string> index_dirs = {});
   ~VecstoreGrpcServer();
 
   VecstoreGrpcServer(const VecstoreGrpcServer&) = delete;

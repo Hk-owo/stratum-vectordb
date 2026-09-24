@@ -371,6 +371,14 @@ type IndexManagerImpl struct {
 	sizeByKey   map[indexKey]int64
 	loadedBytes int64
 
+	// lastPinWarn rate-limits the "over capacity, nothing evictable" warning that
+	// makeRoomLocked emits (M8 of docs/code-review-2026-09-24.md). The condition
+	// lasts as long as a burst of concurrent searches pins every resident index,
+	// and every one of them calls makeRoomLocked — one line per minute is enough
+	// to make the overage visible without turning it into the loudest thing in the
+	// log. Guarded by mu.
+	lastPinWarn time.Time
+
 	// lastSearch records, per version, when a Search request last asked
 	// for it (§8.6a). It is deliberately NOT the same thing as
 	// loadedIndex.lastAccess: that one is an LRU hint that is lost when
@@ -2536,7 +2544,14 @@ func (im *IndexManagerImpl) makeRoomLocked() []indexKey {
 			}
 		}
 		if !found {
-			return evicted // everything is pinned
+			// Everything resident is pinned by a caller in flight, so the overage
+			// cannot be corrected right now. Say so, once in a while: the state is
+			// the one M8 of docs/code-review-2026-09-24.md describes — the bound is
+			// exceeded and looks enforced — and the fix for "silent" is a line, not
+			// a refusal (the overage is transient by construction: the pins belong
+			// to searches that are about to finish).
+			im.warnOnPinnedOverflowLocked(threshold)
+			return evicted
 		}
 		delete(im.loaded, oldestKey)
 		evicted = append(evicted, oldestKey)
@@ -2547,6 +2562,40 @@ func (im *IndexManagerImpl) makeRoomLocked() []indexKey {
 	}
 	return evicted
 }
+
+// warnOnPinnedOverflowLocked records "over capacity and nothing is evictable",
+// rate-limited to one line per minute.
+//
+// Must be called with im.mu held. The numbers are the diagnosis: how far over the
+// bound the manager is (loaded vs LRUCapacity, loadedBytes vs threshold) and how
+// many of the resident indexes are the reason nothing could go (pinned). Without
+// them an operator sees memory climb past a configured ceiling with nothing in the
+// log to say the ceiling was reached rather than misconfigured.
+func (im *IndexManagerImpl) warnOnPinnedOverflowLocked(threshold int64) {
+	now := time.Now()
+	if !im.lastPinWarn.IsZero() && now.Sub(im.lastPinWarn) < pinnedOverflowWarnInterval {
+		return
+	}
+	im.lastPinWarn = now
+
+	pinned := 0
+	for _, idx := range im.loaded {
+		if idx.refCount != 0 {
+			pinned++
+		}
+	}
+	im.logger.Warn("index: over capacity and nothing is evictable; the overage lasts until the in-flight searches release",
+		zap.Int("loaded", len(im.loaded)),
+		zap.Int("lru_capacity", im.cfg.LRUCapacity),
+		zap.Int("pinned", pinned),
+		zap.Int64("loaded_bytes", im.loadedBytes),
+		zap.Int64("memory_threshold_bytes", threshold))
+}
+
+// pinnedOverflowWarnInterval is how often the pinned-overflow state may be logged.
+// Long enough that a burst of concurrent searches produces one line rather than
+// hundreds, short enough that a manager stuck over its bound keeps saying so.
+const pinnedOverflowWarnInterval = time.Minute
 
 // dropEvicted tells the vecstore to release the indexes this node has stopped
 // tracking.

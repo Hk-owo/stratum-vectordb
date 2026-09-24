@@ -15,6 +15,10 @@ set -e
 
 VECSTORE_DATA="${STRATUM_VECSTORE_DATA:-/var/lib/stratum/vecstore}"
 VECSTORE_ADDR="${STRATUM_VECSTORE_ADDR:-127.0.0.1:7100}"
+# The root the vecstore's on-disk index RPCs may touch (M4 of
+# docs/code-review-2026-09-24.md). It is the node's data directory: the storage
+# layer writes `<data>/index/<kbID>/...` and the vecstore loads exactly those paths.
+VECSTORE_INDEX_DIR="${STRATUM_VECSTORE_INDEX_DIR:-/var/lib/stratum}"
 
 mkdir -p /var/log/stratum
 
@@ -36,6 +40,7 @@ mkdir -p "$VECSTORE_DATA"
   /opt/stratum/vecstore_server \
   --grpc_addr="$VECSTORE_ADDR" \
   --rocksdb_path="$VECSTORE_DATA" \
+  --index_dir="$VECSTORE_INDEX_DIR" \
   >>/var/log/stratum/vecstore.log 2>&1 &
 
 # Let it bind before the storage layer's startup reconcile asks it for indexes.

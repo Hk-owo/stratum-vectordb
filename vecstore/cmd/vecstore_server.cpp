@@ -19,10 +19,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "vecstore/src/grpc_service.h"
 #include "vecstore/src/rocksdb_storage.h"
@@ -58,6 +60,34 @@ std::string ParseFlag(int argc, char** argv, const std::string& name,
 int main(int argc, char** argv) {
   std::string rocksdb_path = ParseFlag(argc, argv, "rocksdb_path", "./vecstore_rocksdb");
   std::string grpc_addr = ParseFlag(argc, argv, "grpc_addr", "127.0.0.1:7100");
+  std::string index_dir_flag = ParseFlag(argc, argv, "index_dir", "");
+
+  // index_dirs is the allow-list for the on-disk index RPCs (Save / Load /
+  // LoadForAppend / ExistsIndex), which otherwise take any path a caller names
+  // (M4 of docs/code-review-2026-09-24.md). Comma-separated, because a node may
+  // legitimately keep indexes under more than one root.
+  //
+  // Unset means the parent of --rocksdb_path: the layout every deployment script
+  // uses puts both under one data directory (`<data>/vecstore_rocksdb` and
+  // `<data>/index/...`), so that default confines the RPCs without requiring the
+  // flag. A deployment that stores indexes elsewhere passes --index_dir explicitly
+  // (and gets a refusal, not a silent success, until it does).
+  std::vector<std::string> index_dirs;
+  for (size_t start = 0; start <= index_dir_flag.size();) {
+    const size_t comma = index_dir_flag.find(',', start);
+    const std::string piece = index_dir_flag.substr(
+        start, comma == std::string::npos ? std::string::npos : comma - start);
+    if (!piece.empty()) {
+      index_dirs.push_back(piece);
+    }
+    if (comma == std::string::npos) {
+      break;
+    }
+    start = comma + 1;
+  }
+  if (index_dirs.empty()) {
+    index_dirs.push_back(std::filesystem::path(rocksdb_path).parent_path().string());
+  }
 
   auto storage_or = stratum::vecstore::RocksDBChunkStorage::Open(rocksdb_path);
   if (!storage_or.ok()) {
@@ -67,7 +97,7 @@ int main(int argc, char** argv) {
   }
 
   g_server = std::make_unique<stratum::vecstore::VecstoreGrpcServer>(
-      std::move(storage_or.value()));
+      std::move(storage_or.value()), index_dirs);
 
   if (!g_server->Start(grpc_addr)) {
     std::cerr << "vecstore_server: failed to bind to " << grpc_addr << std::endl;
@@ -78,7 +108,11 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, HandleSignal);
 
   std::cout << "vecstore_server: listening on " << grpc_addr
-            << ", rocksdb_path=" << rocksdb_path << std::endl;
+            << ", rocksdb_path=" << rocksdb_path << ", index_dirs=";
+  for (size_t i = 0; i < index_dirs.size(); ++i) {
+    std::cout << (i == 0 ? "" : ",") << index_dirs[i];
+  }
+  std::cout << std::endl;
 
   // Block forever; HandleSignal exits the process on SIGINT/SIGTERM.
   // grpc::Server itself runs its accept loop on background threads

@@ -138,7 +138,7 @@ func TestFileWAL_RecoverCursorsOnAnOlderLogIsEmpty(t *testing.T) {
 	if err := w.WriteBegin(ctx, "kb-1", 0, changesFixture("doc-1")); err != nil {
 		t.Fatalf("WriteBegin: %v", err)
 	}
-	if err := w.WriteVersionID(ctx, 3); err != nil {
+	if err := w.WriteVersionID(ctx, "kb-1", 3); err != nil {
 		t.Fatalf("WriteVersionID: %v", err)
 	}
 	if err := w.WriteCommit(ctx, 3); err != nil {

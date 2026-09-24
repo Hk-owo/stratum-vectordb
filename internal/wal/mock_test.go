@@ -15,10 +15,10 @@ func TestMockWAL(t *testing.T) {
 
 	t.Run("WriteVersionID is idempotent", func(t *testing.T) {
 		w := NewMockWAL()
-		if err := w.WriteVersionID(ctx, 5); err != nil {
+		if err := w.WriteVersionID(ctx, "kb-1", 5); err != nil {
 			t.Fatalf("WriteVersionID #1: %v", err)
 		}
-		if err := w.WriteVersionID(ctx, 5); err != nil {
+		if err := w.WriteVersionID(ctx, "kb-1", 5); err != nil {
 			t.Fatalf("WriteVersionID #2: %v", err)
 		}
 		pending := w.PendingVersionIDs()
@@ -185,7 +185,9 @@ func mustWriteBegin(t *testing.T, w *MockWAL) {
 
 func mustWriteVersionID(t *testing.T, w *MockWAL, versionID int64) {
 	t.Helper()
-	if err := w.WriteVersionID(context.Background(), versionID); err != nil {
+	// The helper's BEGIN carries no kbID, and pairing is per knowledge base now
+	// (M7 of docs/code-review-2026-09-24.md), so the VERSION_ID says the same.
+	if err := w.WriteVersionID(context.Background(), "", versionID); err != nil {
 		t.Fatalf("WriteVersionID(%d): %v", versionID, err)
 	}
 }

@@ -104,16 +104,16 @@ type WriteCoordinatorConfig struct {
 	// the outer bound, so it must be LARGER than the per-candidate budget.
 	DispatchTimeout time.Duration
 
-	// WriteMu is the lock serializing CreateVersion write transactions
-	// (BEGIN through COMMIT). It is shared with the orphan-chunk
-	// garbage collector so the GC's reclaim phase (current-version
-	// re-check + mapping/vector deletion) is mutually exclusive with
-	// concurrent writes — closing the stale-snapshot race where a sweep
-	// erases data committed by a newer version. When nil, the
-	// WriteCoordinatorImpl allocates a private lock (fine for single
-	// writer; callers that also run a ChunkGarbageCollector MUST inject
-	// the same mutex into both).
-	WriteMu *sync.Mutex
+	// Locks hands out the per-knowledge-base write lock, held for a whole
+	// CreateVersion transaction (BEGIN through COMMIT). It is shared with the
+	// orphan-chunk garbage collector so the GC's reclaim phase (current-version
+	// re-check + mapping/vector deletion) is mutually exclusive with a write to the
+	// SAME knowledge base — closing the stale-snapshot race where a sweep erases data
+	// committed by a newer version — while leaving unrelated knowledge bases free to
+	// write in parallel (M7 of docs/code-review-2026-09-24.md). When nil, the
+	// coordinator allocates a private set; callers that also run a
+	// ChunkGarbageCollector MUST inject the same instance into both.
+	Locks *KBLockSet
 }
 
 // WriteCoordinatorImpl is the real WriteCoordinator implementation,
@@ -122,14 +122,17 @@ type WriteCoordinatorConfig struct {
 type WriteCoordinatorImpl struct {
 	cfg WriteCoordinatorConfig
 
-	// txnMu serializes CreateVersion transactions end to end (BEGIN through
-	// COMMIT) so the WAL record order is BEGIN -> VERSION_ID per
-	// transaction with no interleaved BEGIN from a concurrent transaction —
-	// the property FileWAL.rebuildIndex relies on to bind each VERSION_ID
-	// to the correct transaction's replay input (see internal/wal/file.go).
-	// It is the cfg.WriteMu instance (or a private fallback when nil), and
-	// is shared with ChunkGarbageCollectorImpl's reclaim phase.
-	txnMu *sync.Mutex
+	// locks serializes CreateVersion transactions per knowledge base, end to end
+	// (BEGIN through COMMIT), so the WAL record order within one KB is
+	// BEGIN -> VERSION_ID with no interleaved BEGIN of the same KB — the property
+	// FileWAL relies on to bind each VERSION_ID to the right transaction's replay
+	// input (see internal/wal/file.go). It is cfg.Locks (or a private fallback when
+	// nil), shared with ChunkGarbageCollectorImpl's reclaim phase.
+	//
+	// Per KB rather than global: the lock spans a Raft round trip plus, on the
+	// inline path, the storage fan-out, so a single lock made every KB wait behind
+	// every other KB's network hop (M7 of docs/code-review-2026-09-24.md).
+	locks *KBLockSet
 
 	// pendingDispatch holds the changes of writes this node has proposed but not
 	// yet dispatched (§7.13.2). The dispatch runs on the apply of the entry, and
@@ -264,11 +267,11 @@ func NewWriteCoordinatorImpl(cfg WriteCoordinatorConfig) *WriteCoordinatorImpl {
 	if cfg.RetryBaseIntervalMS <= 0 {
 		cfg.RetryBaseIntervalMS = 100
 	}
-	mu := cfg.WriteMu
-	if mu == nil {
-		mu = &sync.Mutex{}
+	locks := cfg.Locks
+	if locks == nil {
+		locks = NewKBLockSet()
 	}
-	c := &WriteCoordinatorImpl{cfg: cfg, txnMu: mu}
+	c := &WriteCoordinatorImpl{cfg: cfg, locks: locks}
 	if c.cfg.DataPlane == nil {
 		c.cfg.DataPlane = plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
 			IndexManager: cfg.IndexManager,
@@ -293,7 +296,8 @@ func (c *WriteCoordinatorImpl) SetDataPlane(dp plane.DataPlane) {
 // Exported because the service layer needs the same generator: it stamps the key
 // onto CreateVersionResponse, so the format a caller is handed is the format the
 // coordinator's own log lines show (docs/await-version-plan.md §7 Step 4).
-// Execute runs under txnMu, so the timestamp alone is unambiguous.
+// Execute runs under the knowledge base's write lock, so the timestamp alone is
+// unambiguous.
 func NewDispatchID() string {
 	return fmt.Sprintf("auto-%d", time.Now().UnixNano())
 }
@@ -308,7 +312,7 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	// after it. So this line answers "why is CreateVersion slow" on its own, with
 	// the two parts that can be slow for reasons the caller cannot see:
 	//
-	//   - txn_wait_us is the serialization of §7.7 (txnMu): writes to one
+	//   - txn_wait_us is the serialization of §7.7 (the KB write lock): writes to one
 	//     knowledge base run one at a time, so a burst of concurrent versions
 	//     shows up here and nowhere else.
 	//   - propose_us is the Raft round trip plus the apply phase that allocates
@@ -335,12 +339,12 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	}()
 
 	// Serialize the whole transaction (BEGIN through COMMIT) so the WAL's
-	// BEGIN -> VERSION_ID binding per version stays unambiguous (see
-	// txnMu's doc comment).
+	// BEGIN -> VERSION_ID binding per version stays unambiguous — per knowledge base,
+	// which is the granularity the binding actually needs (see locks).
 	txnStart := time.Now()
-	c.txnMu.Lock()
+	unlockTxn := c.locks.Lock(kbID)
 	txnWait = time.Since(txnStart)
-	defer c.txnMu.Unlock()
+	defer unlockTxn()
 
 	// §7.13.2: only the leader accepts a write. It is the node that can put the
 	// entry in the log AND the node that holds the changes, so a client that
@@ -543,8 +547,8 @@ func (c *WriteCoordinatorImpl) logger() *zap.Logger {
 // 3-6 (plus summary + async build) for an already-committed version after
 // a crash, without writing a BEGIN record or proposing a new version.
 func (c *WriteCoordinatorImpl) ReplayVersionStorageWrites(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) error {
-	c.txnMu.Lock()
-	defer c.txnMu.Unlock()
+	unlock := c.locks.Lock(kbID)
+	defer unlock()
 
 	// The WAL already framed this transaction (its BEGIN record is what the
 	// recovery path read the replay input from), so the storage layer resumes

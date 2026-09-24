@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -56,6 +57,21 @@ type QueryServiceImpl struct {
 	// a node that is behind refuses the query, never fetches what it is missing,
 	// and therefore stays behind forever. See the freshness check in Query.
 	backfiller Backfiller
+
+	// pulls records the catch-up goroutines in flight, keyed by (kbID, versionID),
+	// so a burst of queries on a lagging replica starts ONE pull rather than one
+	// each (M1 of docs/code-review-2026-09-24.md). Guarded by pullMu and created
+	// lazily by beginPull: a node that never answers a lagging query never needs
+	// the map at all.
+	pullMu sync.Mutex
+	pulls  map[pullKey]bool
+}
+
+// pullKey identifies one in-flight catch-up: this node's history for one
+// knowledge base up to one version.
+type pullKey struct {
+	kbID      string
+	versionID int64
 }
 
 // NewQueryService constructs a QueryServiceImpl.
@@ -84,6 +100,84 @@ type Backfiller interface {
 // simply never catches up on demand, which is the pre-existing behaviour.
 func (s *QueryServiceImpl) SetBackfiller(b Backfiller) {
 	s.backfiller = b
+}
+
+// startBackgroundPull brings this node's history up to versionID, unless an
+// identical pull is already running.
+//
+// It runs on a context of its own, and that part is deliberate and older than the
+// de-duplication: tied to the caller's ctx (as this once was) the pull is
+// cancelled by the very deadline that made the caller ask — measured as
+// DeadlineExceeded on every attempt, a fraction of the way in, so the node never
+// caught up and never answered. Off the request, the caller is told to ask
+// someone else (retryably) while the pull runs to completion behind it, and the
+// next query is served from here.
+//
+// What is new here (M1 of docs/code-review-2026-09-24.md) is the de-duplication.
+// The pull is idempotent — EnsureIndex re-checks the cursor on every pass and
+// returns as soon as it is satisfied — so overlapping pulls bought nothing while
+// costing a full transfer each: N concurrent queries on a lagging replica meant N
+// goroutines each making a four-attempt pull of the same version, which is an
+// amplification anyone able to send queries could ask for.
+func (s *QueryServiceImpl) startBackgroundPull(kbID string, versionID int64) {
+	if s.backfiller == nil || !s.beginPull(kbID, versionID) {
+		return
+	}
+	go func() {
+		defer s.endPull(kbID, versionID)
+		// Bounded retry with backoff, because this is the node's ONLY way back: the
+		// write that should have brought the data here reached quorum without it
+		// (§7.1) and the announcement that would have asked it to pull is
+		// best-effort, so if this attempt fails nothing else will come along. A
+		// single attempt is not enough — it can land in a window where the control
+		// tier is electing or a peer is restarting, measured on an otherwise healthy
+		// cluster as "resolve data source: GetClusterStatus: raft: remote: read at
+		// control node 3". One unlucky attempt must not decide between a node that
+		// catches up and one that stays behind for good.
+		for attempt, backoff := 0, time.Second; attempt < 4; attempt++ {
+			// Comfortably longer than EnsureIndex's own 30 s pull loop, so what
+			// bounds a pull is the pull, not this wrapper.
+			pullCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			err := s.backfiller.EnsureIndex(pullCtx, kbID, versionID)
+			cancel()
+			if err == nil {
+				return
+			}
+			s.logger.Debug("query: background pull did not complete; will retry",
+				zap.String("kb_id", kbID), zap.Int64("want", versionID),
+				zap.Int("attempt", attempt+1), zap.Duration("backoff", backoff), zap.Error(err))
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+	}()
+}
+
+// beginPull registers a catch-up, reporting false when one for the same
+// (kbID, versionID) is already in flight. The false case is the whole point: the
+// caller then does nothing, which is exactly what the duplicate pull would have
+// amounted to.
+func (s *QueryServiceImpl) beginPull(kbID string, versionID int64) bool {
+	key := pullKey{kbID: kbID, versionID: versionID}
+	s.pullMu.Lock()
+	defer s.pullMu.Unlock()
+	if s.pulls == nil {
+		s.pulls = make(map[pullKey]bool)
+	}
+	if s.pulls[key] {
+		return false
+	}
+	s.pulls[key] = true
+	return true
+}
+
+// endPull clears the registration, whichever way the pull finished. Called from a
+// defer so a panic in the pull cannot pin the key forever and silence every
+// later catch-up for that version.
+func (s *QueryServiceImpl) endPull(kbID string, versionID int64) {
+	key := pullKey{kbID: kbID, versionID: versionID}
+	s.pullMu.Lock()
+	defer s.pullMu.Unlock()
+	delete(s.pulls, key)
 }
 
 func NewQueryService(
@@ -230,39 +324,14 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 				//
 				// Re-triggering is harmless: EnsureIndex re-checks the cursor on every
 				// pass and returns immediately once it is satisfied (see its pull loop).
-				pullKB, pullWant := kbID, want
-				go func() {
-					// Bounded retry with backoff, because this is the node's ONLY way
-					// back: the write that should have brought the data here reached
-					// quorum without it (§7.1) and the announcement that would have
-					// asked it to pull is best-effort, so if this attempt fails nothing
-					// else will come along. A single attempt is not enough — it can
-					// land in a window where the control tier is electing or a peer is
-					// restarting, measured on an otherwise healthy cluster as
-					// "resolve data source: GetClusterStatus: raft: remote: read at
-					// control node 3". One unlucky attempt must not decide between a
-					// node that catches up and one that stays behind for good.
-					for attempt, backoff := 0, time.Second; attempt < 4; attempt++ {
-						// Comfortably longer than EnsureIndex's own 30 s pull loop, so
-						// what bounds a pull is the pull, not this wrapper.
-						pullCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-						err := s.backfiller.EnsureIndex(pullCtx, pullKB, pullWant)
-						cancel()
-						if err == nil {
-							return
-						}
-						s.logger.Debug("query: background pull did not complete; will retry",
-							zap.String("kb_id", pullKB), zap.Int64("want", pullWant),
-							zap.Int("attempt", attempt+1), zap.Duration("backoff", backoff), zap.Error(err))
-						select {
-						case <-time.After(backoff):
-						case <-ctx.Done():
-							// The caller gave up, but that is not a reason for this node
-							// to stay behind: keep the retry schedule, drop the wait.
-						}
-						backoff *= 2
-					}
-				}()
+				//
+				// M1 of docs/code-review-2026-09-24.md: "harmless" was true of the
+				// WORK but not of the cost. Every query that missed on the same
+				// (kbID, version) started its own goroutine and its own four-attempt
+				// full pull, so N concurrent queries meant N pulls of the same
+				// version — RPC and IO amplification an unauthenticated caller could
+				// ask for at will. startBackgroundPull keeps exactly one in flight.
+				s.startBackgroundPull(kbID, want)
 			}
 			if have = s.localVersion.LocalVersionOf(kbID); have < want {
 				// Wrapped, not replaced: the wire name keeps it retryable for a

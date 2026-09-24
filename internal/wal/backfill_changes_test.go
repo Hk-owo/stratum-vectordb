@@ -25,7 +25,7 @@ func TestFileWAL_ChangesFor_AnswersBackfillFromTheSameRecordCrashRecoveryReplays
 	if err := w.WriteBegin(ctx, "kb-1", 1, changes); err != nil {
 		t.Fatalf("WriteBegin: %v", err)
 	}
-	if err := w.WriteVersionID(ctx, 7); err != nil {
+	if err := w.WriteVersionID(ctx, "kb-1", 7); err != nil {
 		t.Fatalf("WriteVersionID: %v", err)
 	}
 	if err := w.WriteCommit(ctx, 7); err != nil {
@@ -83,7 +83,7 @@ func TestFileWAL_ChangesFor_OtherKnowledgeBaseIsAbsent(t *testing.T) {
 	if err := w.WriteBegin(ctx, "kb-1", 1, []types.DocChange{{Op: types.ChangeOpAdd, DocID: "d", Content: "c"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.WriteVersionID(ctx, 7); err != nil {
+	if err := w.WriteVersionID(ctx, "kb-1", 7); err != nil {
 		t.Fatal(err)
 	}
 
@@ -106,7 +106,7 @@ func TestFileWAL_ChangesFor_WalksAnInterval(t *testing.T) {
 		if err := w.WriteBegin(ctx, "kb-1", v-1, []types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc", Content: contents[v]}}); err != nil {
 			t.Fatal(err)
 		}
-		if err := w.WriteVersionID(ctx, v); err != nil {
+		if err := w.WriteVersionID(ctx, "kb-1", v); err != nil {
 			t.Fatal(err)
 		}
 		if err := w.WriteCommit(ctx, v); err != nil {

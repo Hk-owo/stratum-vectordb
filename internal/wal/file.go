@@ -224,12 +224,15 @@ type FileWAL struct {
 
 	// beginDataByVersion maps each versionID whose VERSION_ID record is in
 	// the log to the replay input of the BEGIN record that preceded it. The
-	// most recent unpaired BEGIN binds to the next VERSION_ID; correctness
-	// relies on the coordinator serializing each CreateVersion transaction end
-	// to end, so no other BEGIN can interleave. Rebuilt by rebuildIndex on
-	// Open and kept current by WriteBegin/WriteVersionID, so it also answers
-	// ChangesFor (a lagging peer's backfill request, §7.5) for versions
-	// written since this process started — not only for those on disk at Open.
+	// pairing is PER KNOWLEDGE BASE (see pendingBeginByKB): writes to different
+	// knowledge bases run concurrently, so their BEGIN/VERSION_ID pairs interleave
+	// in the log and a single "most recent unpaired BEGIN" could no longer identify
+	// the right transaction. Within one knowledge base the coordinator still
+	// serializes transactions end to end, which is what keeps the pairing
+	// unambiguous there. Rebuilt by rebuildIndex on Open and kept current by
+	// WriteBegin/WriteVersionID, so it also answers ChangesFor (a lagging peer's
+	// backfill request, §7.5) for versions written since this process started — not
+	// only for those on disk at Open.
 	beginDataByVersion map[int64]beginData
 
 	// cursors is the data cursor per knowledge base that this log has
@@ -238,9 +241,14 @@ type FileWAL struct {
 	// instead of inferring it (§7.8), which is the whole point of the record.
 	cursors map[string]int64
 
-	// pendingBegin is the BEGIN record still awaiting its VERSION_ID — the
-	// runtime counterpart of rebuildIndex's local pendingBegin.
-	pendingBegin *beginData
+	// pendingBeginByKB holds the BEGIN records still awaiting their VERSION_ID, one
+	// per knowledge base — the runtime counterpart of rebuildIndex's local
+	// pendingBegin. Per knowledge base rather than a single slot because writes to
+	// different KBs now run concurrently (M7 of docs/code-review-2026-09-24.md): a
+	// single slot would let KB A's BEGIN bind to KB B's VERSION_ID, and the replay
+	// input ChangesFor hands a lagging peer would then belong to the wrong
+	// knowledge base.
+	pendingBeginByKB map[string]beginData
 
 	replayCounters map[replayKey]int
 }
@@ -264,6 +272,7 @@ func NewFileWAL(path string) (*FileWAL, error) {
 		versionDeleteMarked: make(map[int64]string),
 		versionDeleteDone:   make(map[int64]bool),
 		beginDataByVersion:  make(map[int64]beginData),
+		pendingBeginByKB:    make(map[string]beginData),
 		cursors:             make(map[string]int64),
 		replayCounters:      make(map[replayKey]int),
 	}
@@ -321,12 +330,21 @@ func (w *FileWAL) rebuildIndex() error {
 	// BEGIN first, so that an already-allocated version always had its replay
 	// input on disk. The split write path of the control/data separation
 	// (Stratum_设计文档v13.md §7.12) allocates the version ID first and writes
-	// BEGIN as part of the storage layer's own transaction. The write path
-	// serializes transactions, so at most one of the two is ever unpaired and
-	// the pairing stays unambiguous.
+	// BEGIN as part of the storage layer's own transaction. Writes to one knowledge
+	// base are serialized, so at most one BEGIN per KB is ever unpaired; different
+	// KBs pair independently (M7 of docs/code-review-2026-09-24.md).
+	//
+	// The pairing itself is by kbID, because a VERSION_ID now records which
+	// knowledge base it belongs to (see WriteVersionID). Records written before that
+	// change carry no kbID — they come from an era when the whole write path was
+	// serialized, where "the one unpaired BEGIN" was unambiguous, so legacy records
+	// keep pairing that way. Anything ambiguous is left UNPAIRED on purpose:
+	// ChangesFor then reports the version as missing, and a lagging peer falls back
+	// to a full-state transfer, which is recoverable — a wrong pairing would hand it
+	// another knowledge base's changes.
 	var validEnd int64
-	var pendingBegin *beginData // BEGIN seen, waiting for its VERSION_ID
-	var pendingVersionID int64  // VERSION_ID seen, waiting for its BEGIN
+	pendingBegin := make(map[string]beginData) // KB → BEGIN awaiting its VERSION_ID
+	var pendingVersionID int64                 // VERSION_ID seen, waiting for its BEGIN
 	for {
 		rec, recLen, err := readRecord(r)
 		if err != nil {
@@ -339,13 +357,27 @@ func (w *FileWAL) rebuildIndex() error {
 				w.beginDataByVersion[pendingVersionID] = bd
 				pendingVersionID = 0
 			} else {
-				pendingBegin = &bd
+				pendingBegin[bd.kbID] = bd
 			}
 		case recordTypeVersionID:
-			if pendingBegin != nil {
-				w.beginDataByVersion[rec.versionID] = *pendingBegin
-				pendingBegin = nil
-			} else {
+			paired := false
+			if rec.kbID != "" {
+				if bd, ok := pendingBegin[rec.kbID]; ok {
+					w.beginDataByVersion[rec.versionID] = bd
+					delete(pendingBegin, rec.kbID)
+					paired = true
+				}
+			} else if len(pendingBegin) == 1 {
+				for kb, bd := range pendingBegin {
+					w.beginDataByVersion[rec.versionID] = bd
+					delete(pendingBegin, kb)
+				}
+				paired = true
+			}
+			if !paired {
+				// Either an ambiguous pairing or a VERSION_ID whose BEGIN comes
+				// later in the log (the historical order this file still accepts):
+				// hold it for the next BEGIN of that knowledge base.
 				pendingVersionID = rec.versionID
 			}
 		}
@@ -422,7 +454,16 @@ func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 			return parsedRecord{}, 0, fmt.Errorf("wal: corrupt BEGIN payload: %w", err)
 		}
 		rec.begin = bd
-	case recordTypeVersionID, recordTypeCommit:
+	case recordTypeVersionID:
+		// 8 bytes from records written before the payload carried the knowledge
+		// base; more is the version id followed by the kbID's raw bytes (M7 of
+		// docs/code-review-2026-09-24.md).
+		if len(payload) < 8 {
+			return parsedRecord{}, 0, fmt.Errorf("wal: malformed versionID payload length %d", len(payload))
+		}
+		rec.versionID = int64(binary.BigEndian.Uint64(payload[:8]))
+		rec.kbID = string(payload[8:])
+	case recordTypeCommit:
 		if len(payload) != 8 {
 			return parsedRecord{}, 0, fmt.Errorf("wal: malformed versionID payload length %d", len(payload))
 		}
@@ -517,18 +558,28 @@ func (w *FileWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int
 	// beginDataByVersion, for a peer's later backfill request). Only after the
 	// record is durably written: an in-memory binding for a record that failed
 	// to land would be a lie.
-	w.pendingBegin = &beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}
+	//
+	// Per knowledge base, because writes to different KBs are concurrent now
+	// (M7 of docs/code-review-2026-09-24.md): a single slot would let this BEGIN
+	// bind to another KB's VERSION_ID.
+	w.pendingBeginByKB[kbID] = beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}
 	return nil
 }
 
-func (w *FileWAL) WriteVersionID(_ context.Context, versionID int64) error {
+func (w *FileWAL) WriteVersionID(_ context.Context, kbID string, versionID int64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.versionIDsWritten[versionID] {
 		return nil // idempotent
 	}
-	payload := make([]byte, 8)
-	binary.BigEndian.PutUint64(payload, uint64(versionID))
+	// The record carries the knowledge base, so the BEGIN/VERSION_ID pairing is
+	// exact regardless of how two KBs' writes interleave on disk (M7 of
+	// docs/code-review-2026-09-24.md). Records written before this change carry only
+	// the version id; rebuildIndex still reads those (len==8) and pairs them the old
+	// way.
+	payload := make([]byte, 8+len(kbID))
+	binary.BigEndian.PutUint64(payload[:8], uint64(versionID))
+	copy(payload[8:], kbID)
 	if err := w.writeRecordLocked(recordTypeVersionID, payload); err != nil {
 		return fmt.Errorf("wal: WriteVersionID(%d): %w", versionID, err)
 	}
@@ -537,9 +588,9 @@ func (w *FileWAL) WriteVersionID(_ context.Context, versionID int64) error {
 	// rebuildIndex performs when it replays the pair from disk. Without this, a
 	// version written by this process could not answer a peer's backfill
 	// request until the next restart.
-	if w.pendingBegin != nil {
-		w.beginDataByVersion[versionID] = *w.pendingBegin
-		w.pendingBegin = nil
+	if bd, ok := w.pendingBeginByKB[kbID]; ok {
+		w.beginDataByVersion[versionID] = bd
+		delete(w.pendingBeginByKB, kbID)
 	}
 	return nil
 }

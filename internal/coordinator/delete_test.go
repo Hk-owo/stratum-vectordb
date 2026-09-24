@@ -631,7 +631,7 @@ func TestDeleteCoordinator_ClearsTheDeletedKnowledgeBasesWAL(t *testing.T) {
 	if err := w.WriteBegin(ctx, "kb-1", 0, []types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "body"}}); err != nil {
 		t.Fatalf("WriteBegin: %v", err)
 	}
-	if err := w.WriteVersionID(ctx, 1); err != nil {
+	if err := w.WriteVersionID(ctx, "kb-1", 1); err != nil {
 		t.Fatalf("WriteVersionID: %v", err)
 	}
 	if err := w.WriteCommit(ctx, 1); err != nil {

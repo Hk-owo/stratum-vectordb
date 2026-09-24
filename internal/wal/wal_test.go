@@ -24,10 +24,10 @@ func TestFileWAL(t *testing.T) {
 
 	t.Run("WriteVersionID idempotent: second call returns success, no error", func(t *testing.T) {
 		w := newTestFileWAL(t)
-		if err := w.WriteVersionID(ctx, 5); err != nil {
+		if err := w.WriteVersionID(ctx, "kb-1", 5); err != nil {
 			t.Fatalf("WriteVersionID #1: %v", err)
 		}
-		if err := w.WriteVersionID(ctx, 5); err != nil {
+		if err := w.WriteVersionID(ctx, "kb-1", 5); err != nil {
 			t.Fatalf("WriteVersionID #2: %v", err)
 		}
 		pending, err := w.Recover(ctx)
@@ -64,7 +64,7 @@ func TestFileWAL(t *testing.T) {
 		if err := w.WriteBegin(ctx, "", 0, nil); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
-		if err := w.WriteVersionID(ctx, 5); err != nil {
+		if err := w.WriteVersionID(ctx, "", 5); err != nil {
 			t.Fatalf("WriteVersionID: %v", err)
 		}
 		mustCloseFileWAL(t, w)
@@ -91,7 +91,7 @@ func TestFileWAL(t *testing.T) {
 		if err := w.WriteBegin(ctx, "kb-1", 7, changes); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
-		if err := w.WriteVersionID(ctx, 5); err != nil {
+		if err := w.WriteVersionID(ctx, "kb-1", 5); err != nil {
 			t.Fatalf("WriteVersionID: %v", err)
 		}
 		mustCloseFileWAL(t, w)
@@ -157,7 +157,7 @@ func TestFileWAL(t *testing.T) {
 		if err := w.WriteBegin(ctx, "", 0, nil); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
-		if err := w.WriteVersionID(ctx, 5); err != nil {
+		if err := w.WriteVersionID(ctx, "", 5); err != nil {
 			t.Fatalf("WriteVersionID: %v", err)
 		}
 		if err := w.WriteCommit(ctx, 5); err != nil {
@@ -304,7 +304,7 @@ func TestFileWAL_PhysicalTruncation(t *testing.T) {
 		if err := w.WriteBegin(ctx, "", 0, nil); err != nil {
 			t.Fatalf("WriteBegin: %v", err)
 		}
-		if err := w.WriteVersionID(ctx, 5); err != nil {
+		if err := w.WriteVersionID(ctx, "", 5); err != nil {
 			t.Fatalf("WriteVersionID: %v", err)
 		}
 		mustCloseFileWAL(t, w)

@@ -349,11 +349,12 @@ func main() {
 	}
 
 	// --- Coordinators ---
-	// writeMu serializes CreateVersion write transactions (BEGIN through
-	// COMMIT) and is shared with the orphan-chunk GC's reclaim phase so a
-	// sweep re-validates and deletes candidates under mutual exclusion
-	// with concurrent writes (see gc_impl.go reclaimOrphan). Both sides
-	// MUST receive the same mutex.
+	// kbLocks hands out the per-knowledge-base write lock held for a whole
+	// CreateVersion transaction (BEGIN through COMMIT). It is shared with the
+	// orphan-chunk GC's reclaim phase so a sweep re-validates and deletes candidates
+	// under mutual exclusion with writes to the SAME knowledge base, while writes to
+	// other knowledge bases proceed (M7 of docs/code-review-2026-09-24.md). Both
+	// sides MUST receive the same set.
 	// dispatchVersionWrite and resolveReplicaAddrs are late-bound: the coordinator
 	// needs a dispatcher, the dispatcher needs the data plane, and the data plane
 	// needs the coordinator (§7.13.2). Routing them through these closures keeps
@@ -361,7 +362,7 @@ func main() {
 	var dispatchVersionWrite func(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error
 	var resolveReplicaAddrs func(ctx context.Context) ([]string, error)
 
-	var writeMu sync.Mutex
+	kbLocks := coordinator.NewKBLockSet()
 
 	// The storage handles above are declared as concrete pointer types
 	// (var ds *docstore.PebbleDocStore, ...) because that is what the
@@ -404,7 +405,7 @@ func main() {
 	writeCoord := coordinator.NewWriteCoordinatorImpl(coordinator.WriteCoordinatorConfig{
 		MaxRetries:          cfg.WriteMaxRetries,
 		RetryBaseIntervalMS: cfg.WriteRetryBaseMS,
-		WriteMu:             &writeMu,
+		Locks:               kbLocks,
 		WAL:                 walImpl,
 		RaftNode:            rn,
 		Splitter:            chunkSplitter,
@@ -568,7 +569,7 @@ func main() {
 	if storageLocal {
 		gcImpl := coordinator.NewChunkGarbageCollectorImpl(coordinator.ChunkGarbageCollectorConfig{
 			SweepIntervalSec: cfg.GCSweepIntervalSec,
-			WriteMu:          &writeMu, // same mutex as WriteCoordinatorConfig.WriteMu
+			Locks:            kbLocks, // same set as WriteCoordinatorConfig.Locks
 			RaftNode:         rn,
 			ChunkDocMapper:   cdm,
 			DocStore:         ds,
