@@ -162,6 +162,72 @@ func TestDropEvictedDropsAVersionThatIsNoLongerLoaded(t *testing.T) {
 	}
 }
 
+// The compensation half of the H5 race: when a version is loaded again WHILE its
+// Drop is in flight, the object the drop deleted is the one this node is now using,
+// so the manager has to ask for it back. Without this the node believes it holds an
+// index the vecstore no longer has — the "state says READY, query says index not
+// ready" symptom TestRealStack_ThreeNodeCluster_SnapshotPipeline caught.
+func TestReloadAfterDropAsksForTheVersionBack(t *testing.T) {
+	im, vc, _ := newDropTestManager(t, 4)
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	waitLoaded(t, im, "kb-1", 1)
+
+	vc.mu.Lock()
+	before := vc.loadCalls
+	vc.mu.Unlock()
+
+	im.reloadAfterDrop(context.Background(), indexKey{"kb-1", 1})
+
+	vc.mu.Lock()
+	calls, path := vc.loadCalls, vc.lastLoadPath
+	vc.mu.Unlock()
+
+	if calls != before+1 {
+		t.Fatalf("Load calls = %d, want one more than %d", calls, before)
+	}
+	if want := im.indexPath("kb-1", 1); path != want {
+		t.Fatalf("Load path = %q, want the version's artifact %q", path, want)
+	}
+}
+
+// With persistence unconfigured there is no artifact to re-load, so the
+// compensation must stay a no-op rather than sending a request with an empty path.
+func TestReloadAfterDropIsANoOpWithoutDiskPersistence(t *testing.T) {
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: time.Second})
+	vc := newMockVectorIndexClient()
+	im.vectorIndexClient = vc
+	t.Cleanup(func() { _ = im.Close() })
+
+	im.reloadAfterDrop(context.Background(), indexKey{"kb-1", 1})
+
+	vc.mu.Lock()
+	calls := vc.loadCalls
+	vc.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("Load calls = %d, want 0 when the node holds no index files", calls)
+	}
+}
+
+// A Load that fails is logged and swallowed: the version is already gone from this
+// node's view, its artifact is on disk, and the next query's load path retries — the
+// compensation must not turn a leak-shaped problem into a failing write path.
+func TestReloadAfterDropSwallowsAFailedLoad(t *testing.T) {
+	im, vc, _ := newDropTestManager(t, 4)
+
+	// The mock mirrors the real vecstore: loading an index it never built fails.
+	im.reloadAfterDrop(context.Background(), indexKey{"kb-never-built", 9})
+
+	vc.mu.Lock()
+	calls := vc.loadCalls
+	vc.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("Load calls = %d, want exactly one attempt", calls)
+	}
+}
+
 // waitLoaded blocks until the (asynchronous) build has published the version.
 func waitLoaded(t *testing.T, im *IndexManagerImpl, kbID string, versionID int64) {
 	t.Helper()

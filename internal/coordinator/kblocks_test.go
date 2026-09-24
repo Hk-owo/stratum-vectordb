@@ -74,6 +74,17 @@ func TestKBLockSet_ForgetsIdleKnowledgeBases(t *testing.T) {
 	}
 }
 
+// A nil set is what a directly-constructed coordinator can hold, so the calls have to
+// be safe on it rather than panicking deep inside a write.
+func TestKBLockSet_NilIsSafe(t *testing.T) {
+	var s *KBLockSet
+	unlock := s.Lock("kb-1")
+	unlock() // must not panic: there is nothing to unlock
+	if got := s.Len(); got != 0 {
+		t.Fatalf("Len() on a nil set = %d, want 0", got)
+	}
+}
+
 // And the coordinator uses it that way: a write to one knowledge base proceeds
 // while another knowledge base's write is in flight, while a second write to the
 // SAME knowledge base still queues.

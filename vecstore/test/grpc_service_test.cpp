@@ -7,11 +7,13 @@
 //
 // Written before src/grpc_service.cpp exists (TDD): this file does not
 // compile until VecstoreGrpcServer is added.
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -632,6 +634,119 @@ TEST_F(GrpcServiceTest, LoadOfAMalformedIndexFileAnswersInternalInsteadOfDying) 
   ::vecstore::DiskUsageRequest after_req;
   ::vecstore::DiskUsageResponse after_resp;
   EXPECT_TRUE(chunk_stub_->DiskUsage(&after_ctx, after_req, &after_resp).ok());
+}
+
+// H6 of docs/code-review-2026-09-24.md: Search resolves its index under mu_ and then
+// uses it with the lock RELEASED (the rerank reads the chunk store, which must not
+// happen while holding a lock every other index RPC needs). A concurrent Build can
+// replace that entry inside the window — a §8.6a cold reshape, or a KB quantizer
+// change — and with the map holding unique_ptr that replacement destroyed the object
+// the search was still dereferencing. indexes_ holds shared_ptr now, and the search's
+// own copy keeps it alive.
+//
+// The assertion here is "still serving, nothing corrupted". A use-after-free does not
+// reliably crash without a sanitizer, which is why the same test is also run under
+// ASan (see the vecstore notes in docs/code-review-2026-09-24.md): the load-bearing
+// part of this fixture is that it drives the exact interleaving.
+TEST_F(GrpcServiceTest, ConcurrentReshapeDoesNotFreeTheIndexBeingSearched) {
+  constexpr int kDim = 8;
+  constexpr int kChunks = 200;
+  const std::string kb = "kb-reshape-race";
+
+  auto build = [&](::vecstore::QuantizerTypeProto quantizer) {
+    grpc::ClientContext ctx;
+    ::vecstore::BuildIndexRequest req;
+    req.set_kb_id(kb);
+    req.set_version_id(1);
+    req.set_metric(::vecstore::COSINE);
+    req.set_quantizer(quantizer);
+    for (int i = 0; i < kChunks; ++i) {
+      auto* chunk = req.add_chunks();
+      chunk->set_chunk_id("chunk-" + std::to_string(i));
+      for (int d = 0; d < kDim; ++d) {
+        chunk->add_vector(static_cast<float>((i + d) % 11) - 5.0f);
+      }
+    }
+    ::vecstore::BuildIndexResponse resp;
+    const grpc::Status status = index_stub_->Build(&ctx, req, &resp);
+    EXPECT_TRUE(status.ok()) << status.error_message();
+    return status.ok();
+  };
+
+  // Start from a quantized index: its search reads the chunk store back for the
+  // rerank, which is the window between resolving the object and being done with it
+  // (a full-precision search never leaves the vecstore's own memory).
+  ASSERT_TRUE(build(::vecstore::QUANTIZER_SQ8));
+  {
+    grpc::ClientContext ctx;
+    ::vecstore::SaveIndexRequest req;
+    req.set_kb_id(kb);
+    req.set_version_id(1);
+    req.set_path((test_dir_ / "reshape-race.bin").string());
+    ::vecstore::SaveIndexResponse resp;
+    ASSERT_TRUE(index_stub_->Save(&ctx, req, &resp).ok());
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> searches_ok{0};
+  std::atomic<int> searches_refused{0};
+  std::thread searcher([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      grpc::ClientContext ctx;
+      ::vecstore::SearchIndexRequest req;
+      req.set_kb_id(kb);
+      req.set_version_id(1);
+      req.set_top_k(5);
+      for (int d = 0; d < kDim; ++d) req.add_vector(static_cast<float>(d % 3) - 1.0f);
+      ::vecstore::SearchIndexResponse resp;
+      const grpc::Status status = index_stub_->Search(&ctx, req, &resp);
+      if (status.ok()) {
+        searches_ok.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        // A build in progress legitimately refuses (BUILDING is not queryable).
+        searches_refused.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  });
+
+  // Reshape under the searcher: every iteration replaces the resident object.
+  for (int i = 0; i < 60; ++i) {
+    if (!build(i % 2 == 0 ? ::vecstore::QUANTIZER_OFF : ::vecstore::QUANTIZER_SQ8)) {
+      break;
+    }
+  }
+  stop.store(true);
+  searcher.join();
+
+  // The interchange happened (both sides made progress), and the process is still
+  // serving — the point of the fix is that neither crashed.
+  EXPECT_GT(searches_ok.load() + searches_refused.load(), 0);
+  grpc::ClientContext after_ctx;
+  ::vecstore::DiskUsageRequest after_req;
+  ::vecstore::DiskUsageResponse after_resp;
+  EXPECT_TRUE(chunk_stub_->DiskUsage(&after_ctx, after_req, &after_resp).ok());
+
+  // Seal the last build so the final search is against a READY index: a BUILDING one
+  // legitimately refuses, and what this asserts is that the object is still whole.
+  {
+    grpc::ClientContext ctx;
+    ::vecstore::SaveIndexRequest req;
+    req.set_kb_id(kb);
+    req.set_version_id(1);
+    req.set_path((test_dir_ / "reshape-race.bin").string());
+    ::vecstore::SaveIndexResponse resp;
+    ASSERT_TRUE(index_stub_->Save(&ctx, req, &resp).ok());
+  }
+
+  grpc::ClientContext final_ctx;
+  ::vecstore::SearchIndexRequest final_req;
+  final_req.set_kb_id(kb);
+  final_req.set_version_id(1);
+  final_req.set_top_k(5);
+  for (int d = 0; d < kDim; ++d) final_req.add_vector(static_cast<float>(d % 3) - 1.0f);
+  ::vecstore::SearchIndexResponse final_resp;
+  const grpc::Status final_status = index_stub_->Search(&final_ctx, final_req, &final_resp);
+  EXPECT_TRUE(final_status.ok()) << final_status.error_message();
 }
 
 }  // namespace

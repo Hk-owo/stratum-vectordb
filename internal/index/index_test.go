@@ -61,6 +61,10 @@ type mockVectorIndexClient struct {
 	dropCalls int
 	dropped   []indexKey
 	dropErr   error
+	// Load calls, with the last path asked for — H5's re-load compensation goes
+	// through Load, and a test needs to see both.
+	loadCalls    int
+	lastLoadPath string
 }
 
 func newMockVectorIndexClient() *mockVectorIndexClient {
@@ -159,6 +163,8 @@ func (m *mockVectorIndexClient) Save(_ context.Context, _ *vecstorepb.SaveIndexR
 func (m *mockVectorIndexClient) Load(_ context.Context, in *vecstorepb.LoadIndexRequest, _ ...grpc.CallOption) (*vecstorepb.LoadIndexResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.loadCalls++
+	m.lastLoadPath = in.Path
 	if _, ok := m.built[indexKey{kbID: in.KbId, versionID: in.VersionId}]; !ok {
 		// Mirrors the real vecstore: loading a never-built index fails.
 		return nil, status.Error(codes.NotFound, "no index built or loaded")

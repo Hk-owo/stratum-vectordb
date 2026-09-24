@@ -182,6 +182,18 @@ func TestOpsPutConfigRefusesAScriptOutsideScriptsDir(t *testing.T) {
 	}
 }
 
+// script_two_tier is the same class of field — the two-tier topology runs it instead
+// — so it gets the same check, not only the one-tier path.
+func TestOpsPutConfigRefusesATwoTierScriptOutsideScriptsDir(t *testing.T) {
+	srv, _ := opsHardenedServer(t, 1)
+
+	status := doOpsWithOrigin(t, srv.URL+"/ops/config", http.MethodPut,
+		map[string]any{"docker": map[string]any{"script_two_tier": "/tmp/evil.sh"}}, "", "")
+	if status != http.StatusForbidden {
+		t.Fatalf("PUT with a two-tier script outside scripts/ = %d, want 403", status)
+	}
+}
+
 // The ordinary case still works: the console must remain usable, or operators
 // turn the protections off.
 func TestOpsPutConfigAcceptsAnOrdinaryParameterEdit(t *testing.T) {
