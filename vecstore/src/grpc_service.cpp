@@ -7,10 +7,12 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "grpc/grpc.h"
 #include "grpcpp/grpcpp.h"
 #include "vecstore.grpc.pb.h"
 #include "vecstore/include/key_codec.h"
@@ -751,18 +753,42 @@ grpc::Status VectorIndexServiceImpl::Drop(grpc::ServerContext* context,
 // VecstoreGrpcServer
 // ---------------------------------------------------------------------------
 
+std::vector<std::pair<std::string, int>> ServerKeepaliveArgs(
+    const ServerKeepalive& keepalive) {
+  // The pairs are (arg name, value) in the order gRPC expects to receive them;
+  // the two constants come from grpc/grpc.h (the C core's channel-argument names,
+  // which is where the C++ ChannelArguments' keys come from too).
+  return {
+      {GRPC_ARG_KEEPALIVE_TIME_MS, keepalive.time_ms},
+      {GRPC_ARG_KEEPALIVE_TIMEOUT_MS, keepalive.timeout_ms},
+      // Explicit rather than left to the default, because here the default is
+      // load-bearing: 0 means "ping only while a call is in flight", and a call in
+      // flight is exactly the situation this policy is for (a handler working on
+      // something the caller may no longer want). Pinging idle connections would
+      // buy nothing and would spend the peer's ping budget — which is the
+      // argument that matters when the peer is a C-core client rather than
+      // grpc-go.
+      {GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 0},
+  };
+}
+
 VecstoreGrpcServer::VecstoreGrpcServer(std::unique_ptr<ChunkStorage> storage,
-                                       std::vector<std::string> index_dirs)
+                                       std::vector<std::string> index_dirs,
+                                       ServerKeepalive keepalive)
     : storage_(std::move(storage)),
       chunk_service_(std::make_unique<ChunkStorageServiceImpl>(storage_.get())),
       index_service_(std::make_unique<VectorIndexServiceImpl>(storage_.get(),
-                                                              NormalizeIndexDirs(index_dirs))) {}
+                                                              NormalizeIndexDirs(index_dirs))),
+      keepalive_(keepalive) {}
 
 VecstoreGrpcServer::~VecstoreGrpcServer() { Shutdown(); }
 
 bool VecstoreGrpcServer::Start(const std::string& address) {
   grpc::ServerBuilder builder;
   builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+  for (const auto& arg : ServerKeepaliveArgs(keepalive_)) {
+    builder.AddChannelArgument(arg.first, arg.second);
+  }
   builder.RegisterService(chunk_service_.get());
   builder.RegisterService(index_service_.get());
   server_ = builder.BuildAndStart();
@@ -773,6 +799,9 @@ int VecstoreGrpcServer::StartOnLoopbackWithEphemeralPort() {
   grpc::ServerBuilder builder;
   int selected_port = 0;
   builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &selected_port);
+  for (const auto& arg : ServerKeepaliveArgs(keepalive_)) {
+    builder.AddChannelArgument(arg.first, arg.second);
+  }
   builder.RegisterService(chunk_service_.get());
   builder.RegisterService(index_service_.get());
   server_ = builder.BuildAndStart();

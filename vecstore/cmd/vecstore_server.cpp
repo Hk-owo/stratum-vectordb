@@ -62,6 +62,19 @@ int main(int argc, char** argv) {
   std::string grpc_addr = ParseFlag(argc, argv, "grpc_addr", "127.0.0.1:7100");
   std::string index_dir_flag = ParseFlag(argc, argv, "index_dir", "");
 
+  // Keepalive overrides. Left empty, the compiled-in defaults apply (see
+  // ServerKeepalive in grpc_service.h for why the default is what it is, and for
+  // the compatibility bound that keeps an aggressive server ping from being
+  // GOAWAY'd by a C-core client whose enforcement still has the 5-minute
+  // default).
+  stratum::vecstore::ServerKeepalive keepalive;
+  if (const std::string v = ParseFlag(argc, argv, "keepalive_time_ms", ""); !v.empty()) {
+    keepalive.time_ms = std::atoi(v.c_str());
+  }
+  if (const std::string v = ParseFlag(argc, argv, "keepalive_timeout_ms", ""); !v.empty()) {
+    keepalive.timeout_ms = std::atoi(v.c_str());
+  }
+
   // index_dirs is the allow-list for the on-disk index RPCs (Save / Load /
   // LoadForAppend / ExistsIndex), which otherwise take any path a caller names
   // (M4 of docs/code-review-2026-09-24.md). Comma-separated, because a node may
@@ -97,7 +110,7 @@ int main(int argc, char** argv) {
   }
 
   g_server = std::make_unique<stratum::vecstore::VecstoreGrpcServer>(
-      std::move(storage_or.value()), index_dirs);
+      std::move(storage_or.value()), index_dirs, keepalive);
 
   if (!g_server->Start(grpc_addr)) {
     std::cerr << "vecstore_server: failed to bind to " << grpc_addr << std::endl;
@@ -112,6 +125,13 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < index_dirs.size(); ++i) {
     std::cout << (i == 0 ? "" : ",") << index_dirs[i];
   }
+  // Printed because it is the one setting here that decides how long work
+  // continues for a caller that is gone, and because a value that came from the
+  // compiled-in default rather than the command line is worth seeing: it is the
+  // difference between "the server will notice in five minutes" and "never" (see
+  // ServerKeepalive in grpc_service.h).
+  std::cout << ", keepalive_time_ms=" << keepalive.time_ms
+            << ", keepalive_timeout_ms=" << keepalive.timeout_ms;
   std::cout << std::endl;
 
   // Block forever; HandleSignal exits the process on SIGINT/SIGTERM.

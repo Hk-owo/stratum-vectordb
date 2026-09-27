@@ -216,6 +216,55 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   ChunkStorage* storage_;  // not owned; supplied by VecstoreGrpcServer
 };
 
+// ServerKeepalive is the keepalive policy the vecstore server runs, and it exists
+// to answer a question nothing else can: "is the client that asked for this
+// still there?".
+//
+// A cancellation that a live client sends (RST_STREAM on ctx cancel, or a
+// deadline carried in the grpc-timeout header) reaches a C++ sync handler's
+// ServerContext within about a millisecond — measured — and the handler's
+// cancellation checks then stop the remaining work. A client that VANISHES
+// silently (SIGKILL, a cut link, a power loss) sends nothing at all: no FIN, no
+// RST, no pong. Nothing on the client side can report that, so the server has to
+// ask, and only keepalive asks.
+//
+// Measured with a one-off probe (a handler sampling IsCancelled once per
+// millisecond while the client froze itself):
+//   - keepalive off: the server still did not know after 6 s
+//   - keepalive 200 ms / timeout 300 ms: IsCancelled() == true after 701 ms
+//
+// The defaults below are the conservative end on purpose. time_ms must stay
+// compatible with what OTHER ends allow: gRPC C-core's ping enforcement
+// (GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, default 5 minutes, and
+// GRPC_ARG_HTTP2_MAX_PING_STRIKES, default 2) counts a too-frequent ping as a
+// strike and eventually answers GOAWAY(ENHANCE_YOUR_CALM, "too_many_pings"). The
+// Go client this deployment uses (grpc-go) does NOT enforce on the client side —
+// its pingStrikes live in internal/transport/http2_server.go only — but a
+// grpcurl/Python/C-core client on the same port would, and that is exactly the
+// kind of thing that only shows up in someone else's debug session. So the
+// default is the largest of the two useful values: the peer's default minimum.
+// A deployment whose clients all relax their enforcement can lower it.
+struct ServerKeepalive {
+  // time_ms is how long a connection with a call in flight may go without the
+  // server hearing anything before the server pings it.
+  int time_ms = 300000;  // 5 min = C-core's default min_recv_ping_interval_without_data
+  // timeout_ms is how long the server waits for the pong before it decides the
+  // peer is gone and closes the connection (which is what turns the in-flight
+  // call's IsCancelled() true).
+  int timeout_ms = 20000;  // gRPC default
+};
+
+// ServerKeepaliveArgs turns the policy into the channel arguments Start() adds to
+// its ServerBuilder, as name/value pairs.
+//
+// Pairs rather than a grpc::ChannelArguments because this version of the C++
+// library can only SET arguments (there is no GetIntValue to read one back), and
+// what the server asks gRPC for is the part of this feature that belongs to us:
+// the behaviour itself was measured once with the probe above and is gRPC's to
+// keep.
+std::vector<std::pair<std::string, int>> ServerKeepaliveArgs(
+    const ServerKeepalive& keepalive);
+
 // VecstoreGrpcServer owns a ChunkStorage, a VectorIndexServiceImpl, and a
 // real grpc::Server hosting both services.
 class VecstoreGrpcServer {
@@ -224,8 +273,12 @@ class VecstoreGrpcServer {
   // lifetime. index_dirs are the directories the on-disk index RPCs may touch;
   // they are normalized here and empty means "refuse every path" (see
   // VectorIndexServiceImpl).
+  //
+  // keepalive is the policy above; the default is the value a deployment should
+  // want (see ServerKeepalive for why).
   VecstoreGrpcServer(std::unique_ptr<ChunkStorage> storage,
-                     std::vector<std::string> index_dirs = {});
+                     std::vector<std::string> index_dirs = {},
+                     ServerKeepalive keepalive = {});
   ~VecstoreGrpcServer();
 
   VecstoreGrpcServer(const VecstoreGrpcServer&) = delete;
@@ -251,6 +304,9 @@ class VecstoreGrpcServer {
   std::unique_ptr<ChunkStorageServiceImpl> chunk_service_;
   std::unique_ptr<VectorIndexServiceImpl> index_service_;
   std::unique_ptr<grpc::Server> server_;
+  // Copied in at construction: Start() and StartOnLoopbackWithEphemeralPort() are
+  // separate entry points and must not disagree about the policy.
+  ServerKeepalive keepalive_;
 };
 
 }  // namespace vecstore

@@ -15,6 +15,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -878,6 +879,77 @@ TEST_F(GrpcServiceTest, LongBuildOfOneKeyDoesNotBlockSearchOnAnother) {
   EXPECT_TRUE(build_was_still_running)
       << "the build finished before the search was issued, so the overlap this "
          "test needs did not happen";
+}
+
+// ---------------------------------------------------------------------------
+// Server keepalive
+// ---------------------------------------------------------------------------
+
+// FindArg returns the value of key in args, or nullptr when it is absent.
+const int* FindArg(const std::vector<std::pair<std::string, int>>& args,
+                   const char* key) {
+  for (const auto& arg : args) {
+    if (arg.first == key) {
+      return &arg.second;
+    }
+  }
+  return nullptr;
+}
+
+// ServerAsksForAKeepaliveItsPeersCanLiveWith pins the policy the vecstore hands
+// gRPC so that a client which vanished WITHOUT closing its connection stops
+// costing it work — and the bound that keeps that ping from being GOAWAY'd by the
+// peer.
+//
+// Why the ARGUMENTS rather than the behaviour: the behaviour is gRPC's, and it was
+// measured once with a throwaway probe (a handler sampling IsCancelled once per
+// millisecond while the client froze itself, i.e. no FIN and no RST, which is what
+// SIGKILL and a cut link look like): with keepalive off the server still did not
+// know after 6 s; with time 200 ms / timeout 300 ms it knew after 701 ms. What
+// belongs to this repository is the CHOICE — the numbers and their compatibility
+// bound — so those are what is asserted here.
+TEST(VecstoreKeepaliveTest, ServerAsksForAKeepaliveItsPeersCanLiveWith) {
+  const std::vector<std::pair<std::string, int>> defaults =
+      ServerKeepaliveArgs(ServerKeepalive{});
+
+  const int* time_ms = FindArg(defaults, GRPC_ARG_KEEPALIVE_TIME_MS);
+  const int* timeout_ms = FindArg(defaults, GRPC_ARG_KEEPALIVE_TIMEOUT_MS);
+  const int* permit_without_calls =
+      FindArg(defaults, GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS);
+  ASSERT_NE(time_ms, nullptr);
+  ASSERT_NE(timeout_ms, nullptr);
+  ASSERT_NE(permit_without_calls, nullptr);
+
+  // Pings stay tied to in-flight calls. The situation this policy exists for is a
+  // handler working on something the caller no longer wants, so pinging idle
+  // connections would buy nothing while spending the peer's ping budget.
+  EXPECT_EQ(*permit_without_calls, 0);
+
+  // The compatibility bound, and the reason the default is 5 minutes rather than
+  // something useful-looking like 30 s: gRPC C-core treats a ping that arrives less
+  // than GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS (default 5 minutes)
+  // after the previous one, with no data in between, as a strike, and after
+  // GRPC_ARG_HTTP2_MAX_PING_STRIKES (default 2) it answers
+  // GOAWAY(ENHANCE_YOUR_CALM, "too_many_pings"). Sending faster than the peer's own
+  // default would therefore break exactly the clients that did not relax theirs —
+  // so the default must not go below it. grpc-go does not enforce on the client
+  // side (its pingStrikes live in internal/transport/http2_server.go only), but the
+  // server cannot assume every peer on its port is grpc-go.
+  EXPECT_GE(*time_ms, 300000);
+  EXPECT_GT(*timeout_ms, 0);
+  EXPECT_LE(*timeout_ms, 60000);
+
+  // Overrides reach gRPC unchanged: a deployment whose clients all relaxed their
+  // enforcement can ask for a faster probe.
+  ServerKeepalive custom;
+  custom.time_ms = 60000;
+  custom.timeout_ms = 5000;
+  const std::vector<std::pair<std::string, int>> args = ServerKeepaliveArgs(custom);
+  ASSERT_NE(FindArg(args, GRPC_ARG_KEEPALIVE_TIME_MS), nullptr);
+  ASSERT_NE(FindArg(args, GRPC_ARG_KEEPALIVE_TIMEOUT_MS), nullptr);
+  EXPECT_EQ(*FindArg(args, GRPC_ARG_KEEPALIVE_TIME_MS), 60000);
+  EXPECT_EQ(*FindArg(args, GRPC_ARG_KEEPALIVE_TIMEOUT_MS), 5000);
+  EXPECT_EQ(*FindArg(args, GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS), 0);
 }
 
 }  // namespace
