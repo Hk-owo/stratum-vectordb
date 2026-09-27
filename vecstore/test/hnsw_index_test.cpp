@@ -1232,6 +1232,154 @@ TEST_F(HNSWVectorIndexTest, AddChunksRejectsZeroDimensionChunks) {
   EXPECT_EQ(index.TotalVectors(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// Cancellation seams (CancelCheck in include/vector_index.h)
+// ---------------------------------------------------------------------------
+
+// CountingChunkStorage wraps a ChunkStorage and counts ReadMulti calls, so a test
+// can tell "the rerank never read the chunk store" from "it read and threw the
+// result away" — which is the entire difference a cancellation check makes in the
+// seam between the coarse pass and the rerank read.
+class CountingChunkStorage : public ChunkStorage {
+ public:
+  explicit CountingChunkStorage(ChunkStorage* inner) : inner_(inner) {}
+
+  int read_multi_calls() const { return read_multi_calls_; }
+
+  absl::Status Write(const std::string& key,
+                     const std::vector<float>& vector) override {
+    return inner_->Write(key, vector);
+  }
+  absl::StatusOr<std::vector<float>> Read(const std::string& key) override {
+    return inner_->Read(key);
+  }
+  absl::StatusOr<MultiReadResult> ReadMulti(
+      const std::vector<std::string>& keys) override {
+    ++read_multi_calls_;
+    return inner_->ReadMulti(keys);
+  }
+  absl::StatusOr<bool> Exists(const std::string& key) override {
+    return inner_->Exists(key);
+  }
+  absl::Status Delete(const std::string& key) override {
+    return inner_->Delete(key);
+  }
+  absl::Status DeleteByPrefix(const std::string& prefix) override {
+    return inner_->DeleteByPrefix(prefix);
+  }
+  absl::StatusOr<uint64_t> DiskUsage() override { return inner_->DiskUsage(); }
+
+ private:
+  ChunkStorage* inner_;
+  int read_multi_calls_ = 0;
+};
+
+// CancelledRerankStopsAtTheNextSeam pins the C++ end of "the caller went away"
+// (CancelCheck in include/vector_index.h): the Go query path hands the two-stage
+// search a predicate over the gRPC ServerContext's IsCancelled, and what that
+// predicate buys is measured here — the rerank's read of up to candidate_n
+// full-precision vectors does not happen.
+//
+// The cases are written against seams, not against a call count: the predicate
+// answers true from the (n+1)-th question on, so what each case asserts is the
+// EXPENSIVE thing not done, plus the refusal itself. A check that fires earlier or
+// later than the current implementation does still satisfies them, which keeps the
+// test from breaking every time a seam moves.
+TEST_F(HNSWVectorIndexTest, CancelledRerankStopsAtTheNextSeam) {
+  // More chunks than kCancelCheckStride, so the re-score loop's own check can fire
+  // too — the last case below relies on a seam existing after the read.
+  constexpr int kNumChunks = 600;
+  constexpr int kTopK = 5;
+  const std::string kb_id = "kb-cancel";
+
+  std::mt19937 rng(2024);
+  auto chunks = MakeRandomChunks(kNumChunks, rng);
+
+  auto storage_or = RocksDBChunkStorage::Open((test_dir_ / "rocksdb").string());
+  ASSERT_TRUE(storage_or.ok()) << storage_or.status();
+  WriteChunksToStore(storage_or.value().get(), kb_id, chunks);
+
+  QuantizerConfig cfg;
+  cfg.type = QuantizerType::kSQ8;
+  HNSWVectorIndex index(cfg);
+  ASSERT_TRUE(index.Build(chunks, MetricType::COSINE).ok());
+  ASSERT_TRUE(index.Save(save_path_).ok());  // seal BUILDING→READY (v12 2.6)
+
+  CountingChunkStorage counting(storage_or.value().get());
+  const std::vector<float> query = chunks[0].vector;
+
+  // Answers true from the (n+1)-th question onwards, false before that.
+  const auto cancels_after = [](int n) {
+    auto asked = std::make_shared<int>(0);
+    return [asked, n]() { return ++*asked > n; };
+  };
+
+  auto baseline = index.SearchWithRerank(&counting, kb_id, query, kTopK, kNumChunks);
+  ASSERT_TRUE(baseline.ok()) << baseline.status();
+  ASSERT_GT(baseline->size(), 0u);
+  EXPECT_EQ(counting.read_multi_calls(), 1);
+
+  // Gone before the coarse pass: nothing has been spent yet, and the read must not
+  // start.
+  {
+    const int reads_before = counting.read_multi_calls();
+    auto r = index.SearchWithRerank(&counting, kb_id, query, kTopK, kNumChunks,
+                                    cancels_after(0));
+    ASSERT_FALSE(r.ok());
+    EXPECT_EQ(r.status().code(), absl::StatusCode::kCancelled) << r.status();
+    EXPECT_EQ(counting.read_multi_calls(), reads_before)
+        << "the rerank read the chunk store after the caller was gone";
+  }
+
+  // Gone between the coarse pass and the rerank read: the read IS the cost being
+  // avoided, so it must not happen.
+  {
+    const int reads_before = counting.read_multi_calls();
+    auto r = index.SearchWithRerank(&counting, kb_id, query, kTopK, kNumChunks,
+                                    cancels_after(1));
+    ASSERT_FALSE(r.ok());
+    EXPECT_EQ(r.status().code(), absl::StatusCode::kCancelled) << r.status();
+    EXPECT_EQ(counting.read_multi_calls(), reads_before)
+        << "the rerank read the chunk store after the caller was gone";
+  }
+
+  // Gone after the read came back: the vectors are in memory now, but the answer is
+  // still refused — the contract is "stop at the next seam", not "finish what is
+  // cheap".
+  {
+    const int reads_before = counting.read_multi_calls();
+    auto r = index.SearchWithRerank(&counting, kb_id, query, kTopK, kNumChunks,
+                                    cancels_after(2));
+    ASSERT_FALSE(r.ok());
+    EXPECT_EQ(r.status().code(), absl::StatusCode::kCancelled) << r.status();
+    EXPECT_EQ(counting.read_multi_calls(), reads_before + 1);
+  }
+
+  // A null CancelCheck means "never cancelled" — the default argument existing
+  // callers rely on (the tests and the benchmarks). Same answer as the baseline.
+  {
+    auto r = index.SearchWithRerank(&counting, kb_id, query, kTopK, kNumChunks);
+    ASSERT_TRUE(r.ok()) << r.status();
+    ASSERT_EQ(r->size(), baseline->size());
+    for (size_t i = 0; i < r->size(); ++i) {
+      EXPECT_EQ((*r)[i].chunk_id, (*baseline)[i].chunk_id) << "rank=" << i;
+      EXPECT_NEAR((*r)[i].score, (*baseline)[i].score, 1e-4) << "rank=" << i;
+    }
+  }
+
+  // A predicate that never fires is not a different code path: the default argument
+  // and an explicit always-false check must agree.
+  {
+    auto r = index.SearchWithRerank(&counting, kb_id, query, kTopK, kNumChunks,
+                                    []() { return false; });
+    ASSERT_TRUE(r.ok()) << r.status();
+    ASSERT_EQ(r->size(), baseline->size());
+    for (size_t i = 0; i < r->size(); ++i) {
+      EXPECT_EQ((*r)[i].chunk_id, (*baseline)[i].chunk_id) << "rank=" << i;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace vecstore
 }  // namespace stratum

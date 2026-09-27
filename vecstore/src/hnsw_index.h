@@ -91,10 +91,13 @@ class HNSWVectorIndex : public VectorIndex {
       const std::vector<float>& vector, int top_k) override;
   absl::StatusOr<std::vector<SearchResult>> SearchCandidates(
       const std::vector<float>& vector, int top_n) override;
+  // The default argument is repeated here (not just on the interface) because the
+  // tests and the benchmarks call this through an HNSWVectorIndex*, where the
+  // base declaration's default is not in scope.
   absl::StatusOr<std::vector<SearchResult>> SearchWithRerank(
       ChunkStorage* storage, const std::string& kb_id,
       const std::vector<float>& vector, int top_k,
-      int candidate_n) override;
+      int candidate_n, const CancelCheck& cancelled = {}) override;
   absl::Status Save(const std::string& path) override;
   absl::Status Load(const std::string& path) override;
   absl::Status LoadForAppend(const std::string& path) override;

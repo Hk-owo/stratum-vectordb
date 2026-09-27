@@ -64,9 +64,31 @@ grpc::Status ToGrpcStatus(const absl::Status& s) {
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, std::string(s.message()));
     case absl::StatusCode::kFailedPrecondition:
       return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, std::string(s.message()));
+    case absl::StatusCode::kCancelled:
+      // The caller went away (gRPC cancellation or deadline expiry). Not an
+      // internal failure: reporting it as CANCELLED is what keeps "we stopped
+      // because nobody was listening" distinguishable from "we broke" in a log.
+      return grpc::Status(grpc::StatusCode::CANCELLED, std::string(s.message()));
     default:
       return grpc::Status(grpc::StatusCode::INTERNAL, std::string(s.message()));
   }
+}
+
+// CancelledOnEntry reports a caller that was already gone before the handler
+// started. Nothing has been done yet, so there is nothing to finish and nothing
+// to undo — and nothing worth spending on an answer nobody will read.
+//
+// This is the only cancellation check the handlers do themselves. Everything a
+// handler does afterwards is short except the index operations, and those carry
+// the check into their own seams (see CancelCheck in vector_index.h): the handler
+// owns "do not start", the index owns "stop at the next seam".
+//
+// gRPC discards whatever a cancelled handler returns; the point is the work that
+// did not happen.
+grpc::Status CancelledOnEntry(const char* rpc) {
+  return grpc::Status(grpc::StatusCode::CANCELLED,
+                      std::string("vecstore: ") + rpc +
+                          ": cancelled by the caller before any work started");
 }
 
 MetricType FromProtoMetric(::vecstore::MetricTypeProto proto_metric) {
@@ -204,18 +226,24 @@ grpc::Status Guard(const char* rpc, F&& fn) {
 // ChunkStorageServiceImpl
 // ---------------------------------------------------------------------------
 
-grpc::Status ChunkStorageServiceImpl::Write(grpc::ServerContext* /*context*/,
+grpc::Status ChunkStorageServiceImpl::Write(grpc::ServerContext* context,
                                              const ::vecstore::WriteChunkRequest* request,
                                              ::vecstore::WriteChunkResponse* /*response*/) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Write");
+  }
   return Guard("Write", [&] {
     std::vector<float> vec(request->vector().begin(), request->vector().end());
     return ToGrpcStatus(storage_->Write(request->key(), vec));
   });
 }
 
-grpc::Status ChunkStorageServiceImpl::Read(grpc::ServerContext* /*context*/,
+grpc::Status ChunkStorageServiceImpl::Read(grpc::ServerContext* context,
                                             const ::vecstore::ReadChunkRequest* request,
                                             ::vecstore::ReadChunkResponse* response) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Read");
+  }
   return Guard("Read", [&] {
     auto result = storage_->Read(request->key());
     if (!result.ok()) {
@@ -228,9 +256,12 @@ grpc::Status ChunkStorageServiceImpl::Read(grpc::ServerContext* /*context*/,
   });
 }
 
-grpc::Status ChunkStorageServiceImpl::Exists(grpc::ServerContext* /*context*/,
+grpc::Status ChunkStorageServiceImpl::Exists(grpc::ServerContext* context,
                                               const ::vecstore::ExistsChunkRequest* request,
                                               ::vecstore::ExistsChunkResponse* response) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Exists");
+  }
   return Guard("Exists", [&] {
     auto result = storage_->Exists(request->key());
     if (!result.ok()) {
@@ -241,15 +272,21 @@ grpc::Status ChunkStorageServiceImpl::Exists(grpc::ServerContext* /*context*/,
   });
 }
 
-grpc::Status ChunkStorageServiceImpl::Delete(grpc::ServerContext* /*context*/,
+grpc::Status ChunkStorageServiceImpl::Delete(grpc::ServerContext* context,
                                               const ::vecstore::DeleteChunkRequest* request,
                                               ::vecstore::DeleteChunkResponse* /*response*/) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Delete");
+  }
   return Guard("Delete", [&] { return ToGrpcStatus(storage_->Delete(request->key())); });
 }
 
 grpc::Status ChunkStorageServiceImpl::DeleteByPrefix(
-    grpc::ServerContext* /*context*/, const ::vecstore::DeleteByPrefixRequest* request,
+    grpc::ServerContext* context, const ::vecstore::DeleteByPrefixRequest* request,
     ::vecstore::DeleteByPrefixResponse* /*response*/) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("DeleteByPrefix");
+  }
   return Guard("DeleteByPrefix", [&] {
     // The boundary check is stated here as well as inside the storage
     // implementation, because this handler is what an unauthenticated caller
@@ -266,8 +303,11 @@ grpc::Status ChunkStorageServiceImpl::DeleteByPrefix(
 }
 
 grpc::Status ChunkStorageServiceImpl::DiskUsage(
-    grpc::ServerContext* /*context*/, const ::vecstore::DiskUsageRequest* /*request*/,
+    grpc::ServerContext* context, const ::vecstore::DiskUsageRequest* /*request*/,
     ::vecstore::DiskUsageResponse* response) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("DiskUsage");
+  }
   return Guard("DiskUsage", [&] {
     auto result = storage_->DiskUsage();
     if (!result.ok()) {
@@ -343,9 +383,37 @@ std::shared_ptr<VectorIndex> VectorIndexServiceImpl::GetOrCreateForShapeLocked(
   return inserted.first->second;
 }
 
-grpc::Status VectorIndexServiceImpl::Build(grpc::ServerContext* /*context*/,
+// The three accessors every handler goes through. Each one takes mu_, copies the
+// instance's shared_ptr out and releases the lock before returning — see mu_ in
+// grpc_service.h for why the lock must not survive the lookup and what keeps the
+// unlocked use safe. The map work itself lives in the *Locked helpers above.
+std::shared_ptr<VectorIndex> VectorIndexServiceImpl::IndexFor(const IndexKey& key) {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto it = indexes_.find(key);
+  if (it == indexes_.end()) {
+    return nullptr;
+  }
+  return it->second;
+}
+
+std::shared_ptr<VectorIndex> VectorIndexServiceImpl::GetOrCreate(
+    const IndexKey& key, const QuantizerConfig& config) {
+  std::lock_guard<std::mutex> lock(mu_);
+  return GetOrCreateLocked(key, config);
+}
+
+std::shared_ptr<VectorIndex> VectorIndexServiceImpl::GetOrCreateForShape(
+    const IndexKey& key, const QuantizerConfig& config) {
+  std::lock_guard<std::mutex> lock(mu_);
+  return GetOrCreateForShapeLocked(key, config);
+}
+
+grpc::Status VectorIndexServiceImpl::Build(grpc::ServerContext* context,
                                             const ::vecstore::BuildIndexRequest* request,
                                             ::vecstore::BuildIndexResponse* response) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Build");
+  }
   return Guard("Build", [&] {
     std::vector<ChunkVector> chunks;
     chunks.reserve(request->chunks_size());
@@ -362,10 +430,12 @@ grpc::Status VectorIndexServiceImpl::Build(grpc::ServerContext* /*context*/,
     if (const absl::Status bad = ValidateChunkVectors(chunks, "Build"); !bad.ok()) {
       return ToGrpcStatus(bad);
     }
-    std::lock_guard<std::mutex> lock(mu_);
-    // Build names the shape it wants, so a reshape (§8.6a) replaces the
-    // resident index rather than rebuilding the shape it already had.
-    std::shared_ptr<VectorIndex> index = GetOrCreateForShapeLocked(key, config);
+    // The lookup takes mu_; the build does not. Build names the shape it wants,
+    // so a reshape (§8.6a) replaces the resident index rather than rebuilding the
+    // shape it already had — and it is the longest index RPC there is (faiss
+    // train + insert over a whole version), which is why it must not run with a
+    // mutex the whole process shares (see mu_ in grpc_service.h).
+    std::shared_ptr<VectorIndex> index = GetOrCreateForShape(key, config);
     absl::Status status = index->Build(chunks, FromProtoMetric(request->metric()));
     if (!status.ok()) {
       return ToGrpcStatus(status);
@@ -375,9 +445,12 @@ grpc::Status VectorIndexServiceImpl::Build(grpc::ServerContext* /*context*/,
   });
 }
 
-grpc::Status VectorIndexServiceImpl::AddChunks(grpc::ServerContext* /*context*/,
+grpc::Status VectorIndexServiceImpl::AddChunks(grpc::ServerContext* context,
                                                 const ::vecstore::AddChunksRequest* request,
                                                 ::vecstore::AddChunksResponse* response) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("AddChunks");
+  }
   return Guard("AddChunks", [&] {
     std::vector<ChunkVector> chunks;
     chunks.reserve(request->chunks_size());
@@ -392,8 +465,7 @@ grpc::Status VectorIndexServiceImpl::AddChunks(grpc::ServerContext* /*context*/,
     if (const absl::Status bad = ValidateChunkVectors(chunks, "AddChunks"); !bad.ok()) {
       return ToGrpcStatus(bad);
     }
-    std::lock_guard<std::mutex> lock(mu_);
-    std::shared_ptr<VectorIndex> index = GetOrCreateLocked(key);
+    std::shared_ptr<VectorIndex> index = GetOrCreate(key);
     absl::Status status = index->AddChunks(chunks);
     if (!status.ok()) {
       return ToGrpcStatus(status);
@@ -403,27 +475,24 @@ grpc::Status VectorIndexServiceImpl::AddChunks(grpc::ServerContext* /*context*/,
   });
 }
 
-grpc::Status VectorIndexServiceImpl::Search(grpc::ServerContext* /*context*/,
+grpc::Status VectorIndexServiceImpl::Search(grpc::ServerContext* context,
                                              const ::vecstore::SearchIndexRequest* request,
                                              ::vecstore::SearchIndexResponse* response) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Search");
+  }
   return Guard("Search", [&] {
     IndexKey key{request->kb_id(), request->version_id()};
 
-    std::shared_ptr<VectorIndex> index;
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      auto it = indexes_.find(key);
-      if (it == indexes_.end()) {
-        return grpc::Status(grpc::StatusCode::NOT_FOUND,
-                             "no index built or loaded for kb_id=" + request->kb_id() +
-                                 " version_id=" + std::to_string(request->version_id()));
-      }
-      // A copy, not the map's entry: the search below runs with mu_ released
-      // (the rerank reads the chunk store), and a concurrent Build may swap the
-      // entry for this key in that window. The shared_ptr keeps THIS index
-      // alive until the search is done, which is the whole point of storing
-      // them as shared_ptr (see indexes_ in grpc_service.h).
-      index = it->second;
+    // IndexFor copies the instance's shared_ptr out from under mu_ and releases
+    // the lock; the search below (including the rerank's chunk-store reads) runs
+    // with the lock released, which is the point of the shared_ptr (see
+    // grpc_service.h).
+    std::shared_ptr<VectorIndex> index = IndexFor(key);
+    if (index == nullptr) {
+      return grpc::Status(grpc::StatusCode::NOT_FOUND,
+                           "no index built or loaded for kb_id=" + request->kb_id() +
+                               " version_id=" + std::to_string(request->version_id()));
     }
 
     std::vector<float> query(request->vector().begin(), request->vector().end());
@@ -442,8 +511,14 @@ grpc::Status VectorIndexServiceImpl::Search(grpc::ServerContext* /*context*/,
   const int top_k = ClampTopK(request->top_k());
   const int requested_candidates = ClampCandidateN(request->candidate_n());
   const int candidate_n = requested_candidates > 0 ? requested_candidates : CandidateCountFor(top_k);
-  auto result = index->SearchWithRerank(storage_, request->kb_id(), query,
-                                        top_k, candidate_n);
+  // The cancellation check travels INTO the two-stage search: the rerank reads up
+  // to candidate_n full-precision vectors back from the chunk store, and a caller
+  // that has gone away should not be paying for that (see CancelCheck in
+  // vector_index.h). The handler's own check above only covers "already gone
+  // before we started"; this one covers going away while the search runs.
+  auto result = index->SearchWithRerank(
+      storage_, request->kb_id(), query, top_k, candidate_n,
+      [context]() -> bool { return context->IsCancelled(); });
     if (!result.ok()) {
       return ToGrpcStatus(result.status());
     }
@@ -456,9 +531,12 @@ grpc::Status VectorIndexServiceImpl::Search(grpc::ServerContext* /*context*/,
   });
 }
 
-grpc::Status VectorIndexServiceImpl::Save(grpc::ServerContext* /*context*/,
+grpc::Status VectorIndexServiceImpl::Save(grpc::ServerContext* context,
                                            const ::vecstore::SaveIndexRequest* request,
                                            ::vecstore::SaveIndexResponse* /*response*/) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Save");
+  }
   return Guard("Save", [&] {
     std::string why;
     if (!IndexPathAllowed(request->path(), &why)) {
@@ -466,20 +544,24 @@ grpc::Status VectorIndexServiceImpl::Save(grpc::ServerContext* /*context*/,
           std::string("vecstore: Save: ") + why + ": " + request->path()));
     }
     IndexKey key{request->kb_id(), request->version_id()};
-    std::lock_guard<std::mutex> lock(mu_);
-    auto it = indexes_.find(key);
-    if (it == indexes_.end()) {
+    // Save's work — write_index, the CRC pass over the file, the rename and the
+    // fsync — is all disk IO under the instance's own write lock, not under mu_.
+    std::shared_ptr<VectorIndex> index = IndexFor(key);
+    if (index == nullptr) {
       return grpc::Status(grpc::StatusCode::NOT_FOUND,
                            "no index built or loaded for kb_id=" + request->kb_id() +
                                " version_id=" + std::to_string(request->version_id()));
     }
-    return ToGrpcStatus(it->second->Save(request->path()));
+    return ToGrpcStatus(index->Save(request->path()));
   });
 }
 
-grpc::Status VectorIndexServiceImpl::Load(grpc::ServerContext* /*context*/,
+grpc::Status VectorIndexServiceImpl::Load(grpc::ServerContext* context,
                                            const ::vecstore::LoadIndexRequest* request,
                                            ::vecstore::LoadIndexResponse* /*response*/) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Load");
+  }
   return Guard("Load", [&] {
     std::string why;
     if (!IndexPathAllowed(request->path(), &why)) {
@@ -487,16 +569,18 @@ grpc::Status VectorIndexServiceImpl::Load(grpc::ServerContext* /*context*/,
           std::string("vecstore: Load: ") + why + ": " + request->path()));
     }
     IndexKey key{request->kb_id(), request->version_id()};
-    std::lock_guard<std::mutex> lock(mu_);
-    std::shared_ptr<VectorIndex> index = GetOrCreateLocked(key);
+    std::shared_ptr<VectorIndex> index = GetOrCreate(key);
     return ToGrpcStatus(index->Load(request->path()));
   });
 }
 
 grpc::Status VectorIndexServiceImpl::LoadForAppend(
-    grpc::ServerContext* /*context*/,
+    grpc::ServerContext* context,
     const ::vecstore::LoadIndexForAppendRequest* request,
     ::vecstore::LoadIndexForAppendResponse* response) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("LoadForAppend");
+  }
   return Guard("LoadForAppend", [&] {
     std::string why;
     if (!IndexPathAllowed(request->path(), &why)) {
@@ -508,10 +592,9 @@ grpc::Status VectorIndexServiceImpl::LoadForAppend(
     // is passed: the base file is self-describing and Load restores the
     // retrieval mode from the stored type, so reusing whatever object is
     // resident is correct here. A shape change still goes through Build,
-    // which does replace the object (see GetOrCreateForShapeLocked).
+    // which does replace the object (see GetOrCreateForShape).
     IndexKey key{request->kb_id(), request->version_id()};
-    std::lock_guard<std::mutex> lock(mu_);
-    std::shared_ptr<VectorIndex> index = GetOrCreateLocked(key);
+    std::shared_ptr<VectorIndex> index = GetOrCreate(key);
     const absl::Status status = index->LoadForAppend(request->path());
     if (status.ok()) {
       // How big the base artifact is: the caller compares it with the chunk set
@@ -522,9 +605,12 @@ grpc::Status VectorIndexServiceImpl::LoadForAppend(
   });
 }
 
-grpc::Status VectorIndexServiceImpl::ExistsIndex(grpc::ServerContext* /*context*/,
+grpc::Status VectorIndexServiceImpl::ExistsIndex(grpc::ServerContext* context,
                                                   const ::vecstore::ExistsIndexRequest* request,
                                                   ::vecstore::ExistsIndexResponse* response) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("ExistsIndex");
+  }
   return Guard("ExistsIndex", [&] {
     std::string why;
     if (!IndexPathAllowed(request->path(), &why)) {
@@ -591,49 +677,56 @@ bool VectorIndexServiceImpl::IndexPathAllowed(const std::string& path, std::stri
 }
 
 grpc::Status VectorIndexServiceImpl::RemoveChunks(
-    grpc::ServerContext* /*context*/,
+    grpc::ServerContext* context,
     const ::vecstore::RemoveChunksRequest* request,
     ::vecstore::RemoveChunksResponse* response) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("RemoveChunks");
+  }
   return Guard("RemoveChunks", [&] {
     IndexKey key{request->kb_id(), request->version_id()};
-    std::lock_guard<std::mutex> lock(mu_);
-    // Deliberately not GetOrCreateLocked: asking to remove vectors from an index
+    // Deliberately not GetOrCreate: asking to remove vectors from an index
     // that does not exist here is a caller error, not a reason to materialise an
     // empty one.
-    auto it = indexes_.find(key);
-  if (it == indexes_.end()) {
-    return ToGrpcStatus(absl::FailedPreconditionError(
-        "vecstore: RemoveChunks: no index for this (kb_id, version_id)"));
-  }
-  const std::vector<std::string> chunk_ids(request->chunk_ids().begin(),
-                                           request->chunk_ids().end());
-  auto removed_or = it->second->RemoveChunks(chunk_ids);
-  if (!removed_or.ok()) {
-    return ToGrpcStatus(removed_or.status());
-  }
+    std::shared_ptr<VectorIndex> index = IndexFor(key);
+    if (index == nullptr) {
+      return ToGrpcStatus(absl::FailedPreconditionError(
+          "vecstore: RemoveChunks: no index for this (kb_id, version_id)"));
+    }
+    const std::vector<std::string> chunk_ids(request->chunk_ids().begin(),
+                                             request->chunk_ids().end());
+    auto removed_or = index->RemoveChunks(chunk_ids);
+    if (!removed_or.ok()) {
+      return ToGrpcStatus(removed_or.status());
+    }
     response->set_removed(static_cast<int64_t>(*removed_or));
-    response->set_ntotal(it->second->TotalVectors());
+    response->set_ntotal(index->TotalVectors());
     return grpc::Status::OK;
   });
 }
 
-grpc::Status VectorIndexServiceImpl::Reset(grpc::ServerContext* /*context*/,
+grpc::Status VectorIndexServiceImpl::Reset(grpc::ServerContext* context,
                                             const ::vecstore::ResetIndexRequest* request,
                                             ::vecstore::ResetIndexResponse* /*response*/) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Reset");
+  }
   return Guard("Reset", [&] {
     IndexKey key{request->kb_id(), request->version_id()};
-    std::lock_guard<std::mutex> lock(mu_);
-    auto it = indexes_.find(key);
-    if (it == indexes_.end()) {
+    std::shared_ptr<VectorIndex> index = IndexFor(key);
+    if (index == nullptr) {
       return grpc::Status::OK;  // resetting a never-built index is a no-op, not an error
     }
-    return ToGrpcStatus(it->second->Reset());
+    return ToGrpcStatus(index->Reset());
   });
 }
 
-grpc::Status VectorIndexServiceImpl::Drop(grpc::ServerContext* /*context*/,
+grpc::Status VectorIndexServiceImpl::Drop(grpc::ServerContext* context,
                                            const ::vecstore::DropIndexRequest* request,
                                            ::vecstore::DropIndexResponse* /*response*/) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("Drop");
+  }
   return Guard("Drop", [&] {
     IndexKey key{request->kb_id(), request->version_id()};
     std::lock_guard<std::mutex> lock(mu_);

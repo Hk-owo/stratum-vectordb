@@ -76,6 +76,13 @@ constexpr int kM = 32;  // HNSW graph connectivity parameter
 // caller-supplied number (M3 of docs/code-review-2026-09-24.md).
 constexpr int kMaxSearchTopN = 4096;
 
+// kCancelCheckStride is how often SearchWithRerank's re-scoring loop asks the
+// caller's CancelCheck. The loop itself is arithmetic over vectors that are
+// already in memory, so a stride is enough: what the check is there for is a very
+// large candidate_n on a slow machine (see CancelCheck in vector_index.h), not
+// for cutting a few hundred float comparisons short.
+constexpr size_t kCancelCheckStride = 256;
+
 // Sidecar magic line, introduced together with the atomic + checksummed
 // write path. A legacy sidecar starts with the bare dimension instead, which
 // is what keeps pre-existing index files loadable.
@@ -480,7 +487,8 @@ absl::StatusOr<std::vector<SearchResult>> HNSWVectorIndex::SearchTopN(
 
 absl::StatusOr<std::vector<SearchResult>> HNSWVectorIndex::SearchWithRerank(
     ChunkStorage* storage, const std::string& kb_id,
-    const std::vector<float>& vector, int top_k, int candidate_n) {
+    const std::vector<float>& vector, int top_k, int candidate_n,
+    const CancelCheck& cancelled) {
   // The shared lock is held for the WHOLE two-stage body, including the
   // rerank disk reads: a concurrent Reset/Load/Build (writers) cannot tear
   // the index away mid-search (Stratum_设计文档v12.md 2.6).
@@ -507,6 +515,12 @@ absl::StatusOr<std::vector<SearchResult>> HNSWVectorIndex::SearchWithRerank(
   if (top_k <= 0) {
     return std::vector<SearchResult>{};
   }
+  // Seam 1, before the coarse pass: a caller that is already gone costs nothing
+  // here, and everything below it is the part worth not doing (see CancelCheck).
+  if (cancelled && cancelled()) {
+    return absl::CancelledError(
+        "hnsw_index: SearchWithRerank: caller cancelled before the coarse pass");
+  }
 
   // Stage 1: coarse candidates from the in-memory quantized index.
   // (Directly calls SearchTopN — the lock-free core — instead of the
@@ -519,6 +533,15 @@ absl::StatusOr<std::vector<SearchResult>> HNSWVectorIndex::SearchWithRerank(
   const auto& candidates = candidates_or.value();
   if (candidates.empty()) {
     return std::vector<SearchResult>{};
+  }
+  // Seam 2, between the coarse pass and the disk read: this is the seam that
+  // matters. The read below is a single multi-get of up to candidate_n
+  // full-precision vectors (tens of MB at 768 dims), and it cannot be
+  // interrupted once started — so the question has to be asked before it starts.
+  if (cancelled && cancelled()) {
+    return absl::CancelledError(
+        "hnsw_index: SearchWithRerank: caller cancelled before reading "
+        "candidate vectors from the chunk store");
   }
 
   // Stage 2: read the candidates' full-precision vectors from the chunk
@@ -536,12 +559,32 @@ absl::StatusOr<std::vector<SearchResult>> HNSWVectorIndex::SearchWithRerank(
   if (read.found.empty()) {
     return std::vector<SearchResult>{};
   }
+  // Seam 3, after the read finished: the vectors are in memory, so the
+  // re-scoring could be finished cheaply — but "cheap" is not the caller's
+  // question. A cancelled caller wants nothing back, and abandoning here keeps
+  // the promise that a cancelled call stops at the next seam.
+  if (cancelled && cancelled()) {
+    return absl::CancelledError(
+        "hnsw_index: SearchWithRerank: caller cancelled after reading "
+        "candidate vectors from the chunk store");
+  }
 
   // Stage 3: exact re-score of the candidates whose vectors were found;
   // missing keys are skipped (defensive; see Stratum_设计文档v12.md 2.3.3).
+  //
+  // Re-checked every kCancelCheckStride candidates rather than every one: this
+  // loop is arithmetic over vectors already in memory (microseconds for a
+  // candidate set this size), so the check is not there to cut the loop short so
+  // much as to keep the seam honest for a very large candidate_n on a slow
+  // machine.
   std::vector<std::pair<float, std::string>> scored;  // (score, chunk_id)
   scored.reserve(candidates.size());
   for (size_t i = 0; i < candidates.size(); ++i) {
+    if (cancelled && (i % kCancelCheckStride) == 0 && i > 0 && cancelled()) {
+      return absl::CancelledError(
+          "hnsw_index: SearchWithRerank: caller cancelled while re-scoring "
+          "candidates");
+    }
     auto it = read.found.find(keys[i]);
     if (it == read.found.end()) {
       continue;

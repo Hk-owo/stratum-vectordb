@@ -8,6 +8,7 @@
 // Written before src/grpc_service.cpp exists (TDD): this file does not
 // compile until VecstoreGrpcServer is added.
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -747,6 +748,136 @@ TEST_F(GrpcServiceTest, ConcurrentReshapeDoesNotFreeTheIndexBeingSearched) {
   ::vecstore::SearchIndexResponse final_resp;
   const grpc::Status final_status = index_stub_->Search(&final_ctx, final_req, &final_resp);
   EXPECT_TRUE(final_status.ok()) << final_status.error_message();
+}
+
+// mu_ in VectorIndexServiceImpl used to be held for the WHOLE of every index RPC,
+// the long ones included: Build trains and inserts a whole version, Save writes
+// the Faiss file, hashes it and fsyncs it, Load reads it back. That one mutex
+// serves the entire process — every knowledge base, every version — so a build in
+// flight queued every OTHER key's Search behind it: a query for a knowledge base
+// nobody was writing waited seconds for work it had nothing to do with.
+//
+// The lookup now takes mu_ and releases it before the work starts; ordering within
+// one key is left to the instance's own state_mu_. This is the test that fails if
+// the lock creeps back over the work: a Search against a small READY index must
+// finish WHILE a much larger Build of another key is still running. With the old
+// shape the search returned only after that build finished, queued behind its
+// train.
+TEST_F(GrpcServiceTest, LongBuildOfOneKeyDoesNotBlockSearchOnAnother) {
+  constexpr int kQuietDim = 8;
+  constexpr int kBusyDim = 8;
+  // One RPC, so the payload has to stay under gRPC's 4 MiB default:
+  // 30000 x 8 dims x 4 B ≈ 0.9 MiB of vectors, plus the ids.
+  constexpr int kBusyChunks = 30000;
+  const std::string quiet_kb = "kb-quiet-for-slow-build";
+  const std::string busy_kb = "kb-busy-slow-build";
+
+  // The index that gets searched: small, and Save-sealed so it is READY.
+  {
+    grpc::ClientContext ctx;
+    ::vecstore::BuildIndexRequest req;
+    req.set_kb_id(quiet_kb);
+    req.set_version_id(1);
+    req.set_metric(::vecstore::COSINE);
+    for (int i = 0; i < 100; ++i) {
+      auto* chunk = req.add_chunks();
+      chunk->set_chunk_id("quiet-" + std::to_string(i));
+      for (int d = 0; d < kQuietDim; ++d) {
+        chunk->add_vector(static_cast<float>((i + d) % 7) - 3.0f);
+      }
+    }
+    ::vecstore::BuildIndexResponse resp;
+    ASSERT_TRUE(index_stub_->Build(&ctx, req, &resp).ok());
+  }
+  {
+    grpc::ClientContext ctx;
+    ::vecstore::SaveIndexRequest req;
+    req.set_kb_id(quiet_kb);
+    req.set_version_id(1);
+    req.set_path((test_dir_ / "quiet-for-slow-build.bin").string());
+    ::vecstore::SaveIndexResponse resp;
+    ASSERT_TRUE(index_stub_->Save(&ctx, req, &resp).ok());
+  }
+
+  auto search_quiet = [&](grpc::Status* out_status, int* out_results,
+                          std::chrono::microseconds* out_elapsed) {
+    grpc::ClientContext ctx;
+    ::vecstore::SearchIndexRequest req;
+    req.set_kb_id(quiet_kb);
+    req.set_version_id(1);
+    req.set_top_k(5);
+    for (int d = 0; d < kQuietDim; ++d) {
+      req.add_vector(static_cast<float>(d % 3) - 1.0f);
+    }
+    ::vecstore::SearchIndexResponse resp;
+    const auto start = std::chrono::steady_clock::now();
+    const grpc::Status status = index_stub_->Search(&ctx, req, &resp);
+    *out_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
+    *out_status = status;
+    *out_results = resp.results_size();
+  };
+
+  // Warms the channel and gives the baseline this test's threshold is read
+  // against: the same search, with nothing else going on.
+  grpc::Status warm_status;
+  int warm_results = 0;
+  std::chrono::microseconds warm_elapsed{};
+  search_quiet(&warm_status, &warm_results, &warm_elapsed);
+  ASSERT_TRUE(warm_status.ok()) << warm_status.error_message();
+  ASSERT_GT(warm_results, 0);
+
+  std::atomic<bool> build_started{false};
+  std::atomic<bool> build_done{false};
+  std::thread builder([&] {
+    grpc::ClientContext ctx;
+    ::vecstore::BuildIndexRequest req;
+    req.set_kb_id(busy_kb);
+    req.set_version_id(1);
+    req.set_metric(::vecstore::COSINE);
+    for (int i = 0; i < kBusyChunks; ++i) {
+      auto* chunk = req.add_chunks();
+      chunk->set_chunk_id("busy-" + std::to_string(i));
+      for (int d = 0; d < kBusyDim; ++d) {
+        chunk->add_vector(static_cast<float>((i * 31 + d) % 17) - 8.0f);
+      }
+    }
+    build_started.store(true, std::memory_order_release);
+    ::vecstore::BuildIndexResponse resp;
+    const grpc::Status status = index_stub_->Build(&ctx, req, &resp);
+    EXPECT_TRUE(status.ok()) << status.error_message();
+    build_done.store(true, std::memory_order_release);
+  });
+
+  while (!build_started.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  // Let the request reach the server and get as far as training before searching:
+  // the case under test is a search overlapping a build that is under way.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  grpc::Status race_status;
+  int race_results = 0;
+  std::chrono::microseconds race_elapsed{};
+  search_quiet(&race_status, &race_results, &race_elapsed);
+  const bool build_was_still_running = !build_done.load(std::memory_order_acquire);
+  builder.join();
+
+  ASSERT_TRUE(race_status.ok()) << race_status.error_message();
+  EXPECT_GT(race_results, 0);
+  // The load-bearing assertion. Queued behind the process-wide mutex, this search
+  // waited for the whole remaining build (seconds for this many vectors); with the
+  // lookup released, it costs what the warm-up search cost.
+  EXPECT_LT(race_elapsed.count(), 400000)  // 400 ms
+      << "search took " << race_elapsed.count() / 1000
+      << " ms while another key's build was running (baseline " << warm_elapsed.count() / 1000
+      << " ms, build still running: " << build_was_still_running << ")";
+  // ...and it overlapped the build rather than merely racing ahead of it. If this
+  // fires, the build finished faster than the 100 ms hand-off (raise kBusyChunks):
+  // the numbers above then say nothing about lock scope.
+  EXPECT_TRUE(build_was_still_running)
+      << "the build finished before the search was issued, so the overlap this "
+         "test needs did not happen";
 }
 
 }  // namespace

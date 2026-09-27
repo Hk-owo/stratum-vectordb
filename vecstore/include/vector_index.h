@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "vecstore/include/chunk_storage.h"
@@ -25,6 +26,21 @@
 
 namespace stratum {
 namespace vecstore {
+
+// CancelCheck answers "has the caller of this operation gone away?".
+//
+// It exists because the caller's cancellation has to be able to reach the middle
+// of a long operation — the two-stage search reads thousands of vectors back from
+// disk after the coarse pass — and the index must not grow a dependency on gRPC
+// to ask the question: the service passes a predicate over its ServerContext's
+// IsCancelled, a direct caller passes its own. A null CancelCheck means "never
+// cancelled", which is what the tests and the benchmark paths use.
+//
+// The contract is deliberately about SEAMS, not about aborting a call: neither
+// Faiss nor RocksDB can be interrupted mid-call, so what a check buys is "no
+// further stage is started once the caller is gone", never "the current stage
+// returns early".
+using CancelCheck = absl::AnyInvocable<bool() const>;
 
 // VectorIndex manages a single version's vector index: building it from a
 // batch of chunk vectors, searching it, and persisting/restoring it to/
@@ -87,9 +103,20 @@ class VectorIndex {
   // full-precision index this degrades to Search (single-stage, exact).
   // The default implementation is that single-stage path; quantized
   // implementations override it.
+  //
+  // cancelled is asked at the seams of the two-stage path — before the coarse
+  // pass, before the candidate vectors are read back from storage, and while the
+  // exact re-score walks them. A quantized rerank is the one index operation
+  // whose cost the caller controls (candidate_n up to the clamp) and it is
+  // mostly disk IO, so it is the operation worth abandoning when the caller has
+  // gone: a cancelled call returns absl::CancelledError instead of paying for
+  // the rest and throwing the answer away. A null check means "never cancelled"
+  // (see CancelCheck). Implementations must treat a true check as "stop at the
+  // next seam", not as "interrupt the call in flight".
   virtual absl::StatusOr<std::vector<SearchResult>> SearchWithRerank(
       ChunkStorage* storage, const std::string& kb_id,
-      const std::vector<float>& vector, int top_k, int candidate_n) {
+      const std::vector<float>& vector, int top_k, int candidate_n,
+      const CancelCheck& /*cancelled*/ = {}) {
     return Search(vector, top_k);
   }
 
