@@ -209,7 +209,13 @@ target_link_libraries(vecstore_server PRIVATE vecstore_core)
 find_package(GTest QUIET)
 
 if(GTest_FOUND)
-  file(GLOB VECSTORE_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/test/*_test.cpp")
+  # CONFIGURE_DEPENDS so that a NEW test file is picked up by the next build. Without
+  # it the glob is frozen at configure time, and a freshly added *_test.cpp silently
+  # does not run (and does not fail to run either) until someone happens to re-run
+  # cmake — which is exactly how the cancellation_e2e_test.cpp added alongside this
+  # change first reported "0 tests ran".
+  file(GLOB VECSTORE_TEST_SOURCES CONFIGURE_DEPENDS
+       "${CMAKE_CURRENT_SOURCE_DIR}/test/*_test.cpp")
   if(VECSTORE_TEST_SOURCES)
     enable_testing()
     add_executable(vecstore_tests ${VECSTORE_TEST_SOURCES})
