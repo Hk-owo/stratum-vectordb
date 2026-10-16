@@ -22,6 +22,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "stratum/api/proto/stratum"
 	"stratum/service"
 )
@@ -174,13 +177,27 @@ func awaitDataDurable(t *testing.T, ctx context.Context, addr, kbID string, vers
 		// that running out of window is an ANSWER, not an error ("not yet" is not a
 		// failure), so one call returning DATA_PENDING says nothing about whether
 		// the data will settle.
-		resp, err := kb.AwaitVersion(waitCtx, &pb.AwaitVersionRequest{
+		// A per-call deadline, independent of the loop's: WaitTimeoutMs is the
+		// window the server promises to CLOSE, and a window the server fails to
+		// close must not be able to stall this loop. Measured on the two-tier
+		// suite: one AwaitVersion did not return for six minutes, which pinned this
+		// case until go test's own timeout fired — a panic, not a readable failure.
+		// The loop's own deadline stays what reports the outcome.
+		callCtx, callCancel := context.WithTimeout(waitCtx, 8*time.Second)
+		resp, err := kb.AwaitVersion(callCtx, &pb.AwaitVersionRequest{
 			KnowledgeBaseId: kbID,
 			VersionId:       versionID,
 			Target:          pb.AwaitTarget_AWAIT_TARGET_DATA_DURABLE,
 			WaitTimeoutMs:   5000,
 		})
+		callCancel()
 		if err != nil {
+			// Running out of our own window is the same answer as "not yet" — the
+			// loop's deadline is what decides, so poll on rather than failing here.
+			if st, ok := status.FromError(err); ok && st.Code() == codes.DeadlineExceeded && time.Now().Before(deadline) {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
 			t.Fatalf("AwaitVersion(DATA_DURABLE) for %s v%d on %s: %v", kbID, versionID, addr, err)
 		}
 		switch resp.GetStage() {
@@ -253,7 +270,15 @@ func waitVersionStatus(t *testing.T, ctx context.Context, addr, kbID string, ver
 		_, _, _, conn, err := dialNode(addr)
 		if err == nil {
 			kb := pb.NewKnowledgeBaseServiceClient(conn)
-			resp, err := kb.ListVersions(ctx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
+			// Bounded like the metadata reads in the other helpers: ListVersions
+			// answers from replicated state, so a call that does not return soon
+			// means the node is wedged rather than slow — and the loop's own
+			// deadline must stay the thing that decides the outcome. (The query
+			// above deliberately keeps the caller's budget: a first query may
+			// legitimately wait for a build.)
+			readCtx, readCancel := context.WithTimeout(ctx, 10*time.Second)
+			resp, err := kb.ListVersions(readCtx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
+			readCancel()
 			conn.Close()
 			if err == nil {
 				for _, v := range resp.Versions {

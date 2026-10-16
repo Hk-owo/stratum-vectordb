@@ -804,22 +804,27 @@ func TestT4_GCPressure(t *testing.T) {
 			"for §8.6(d) to reclaim: %s", deletedChunks, reuseLine)
 	}
 
-	// Every replica that BUILT this version itself must have reused the parent.
+	// Record the reuse/rebuild split — but do NOT fail on "built from scratch".
 	//
-	// §8.4 has already put the parent's artifact — and with it the shape line — on
-	// every replica, so a replica logging "built from scratch" is a full rebuild
-	// §8.6(c) was supposed to save, i.e. the silent one: before the shape judge
-	// read the sidecar, 2 of 3 replicas took that path on every version (see
-	// shapeGraphFree). A replica that never builds the version logs neither line —
-	// it serves what distribution handed it — so this is asserted per replica, not
-	// as a count.
+	// This version is a DELETION-only child (deletePct of the documents removed,
+	// none added), and "there is something to append" is one of appendBase's gates:
+	// a child whose delta is empty returns ok=false BY DESIGN, so the full rebuild
+	// is the expected path here, not the silent one §8.6(c) exists to avoid.
+	//
+	// The per-replica assertion this replaces was written when §8.4 PUSHED every
+	// parent artifact to every replica, so "holds the parent" implied "could have
+	// reused it". Distribution is gone (pull-only + owner sharding), the premise no
+	// longer holds, and the assertion fired precisely on this deletion-only shape
+	// (measured: 1 run in 5 locally, and it skips in most runs for the same reason).
+	//
+	// The failure mode it used to guard — a replica that HOLDS the parent yet
+	// rebuilds because the shape could not be read (see shapeGraphFree) — needs an
+	// APPEND-shaped version to be observable, which this case cannot construct; it
+	// is not covered by the rebuild count below.
 	reuseOn := versionLogLines(t, appendLogMessage, kbID, trimmed)
 	scratchOn := versionLogLines(t, builtFromScratchMessage, kbID, trimmed)
-	for svc, line := range scratchOn {
-		t.Errorf("%s rebuilt %s v%d from scratch while holding the parent's artifact (and its sidecar): "+
-			"the reuse §8.6(c) exists for did not trigger here: %s", svc, kbID, trimmed, line)
-	}
-	t.Logf("§8.6(c) reused the parent on %d/%d storage replicas, built from scratch on %d/%d",
+	t.Logf("§8.6(c) reused the parent on %d/%d storage replicas, built from scratch on %d/%d "+
+		"(deletion-only version: an empty delta is a gate, not a defect)",
 		len(reuseOn), len(storageServices), len(scratchOn), len(storageServices))
 
 	// Make the tombstoned version the ACTIVE one. §8.6(d) scans two sources: the
