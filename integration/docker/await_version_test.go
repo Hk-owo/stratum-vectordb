@@ -201,7 +201,24 @@ func TestT4_AwaitVersion_ConvergesFromEveryControlNode(t *testing.T) {
 	waitVersionStatus(t, ctx, nodeAddrs[0], kbID, versionID, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
 
 	for _, addr := range nodeAddrs {
+		// Poll until THIS address reports READY; do not assert on one instant.
+		//
+		// Two things make the instant unsafe. awaitUntilSettled settles on
+		// DATA_DURABLE, which §8.6(b) keeps deliberately apart from index READY —
+		// so "settled" never meant "READY has been applied". And in the two-tier
+		// suite these addresses are the STATION, which balances across control
+		// nodes: the call that saw READY and the call that asserts on it can land
+		// on different replicas, one of which may still be applying the status.
+		// That race failed 1 in 3 runs locally (and once in CI); waiting for the
+		// address to show READY is the property this case actually pins — the
+		// metadata travels whole, it just does not travel instantly.
 		resp := awaitUntilSettled(t, ctx, addr, kbID, versionID)
+		readyDeadline := time.Now().Add(indexBuildTimeout())
+		for resp.GetVersion().GetIndexStatus() != pb.IndexStatus_INDEX_STATUS_READY &&
+			time.Now().Before(readyDeadline) {
+			time.Sleep(200 * time.Millisecond)
+			resp = awaitUntilSettled(t, ctx, addr, kbID, versionID)
+		}
 		// Either settled stage is acceptable: the wait is satisfied by durable data
 		// and by a version that has since been built (this test warms the index up
 		// explicitly just above). What it must NOT be is still in progress.
