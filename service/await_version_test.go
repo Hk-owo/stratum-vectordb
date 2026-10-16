@@ -81,7 +81,7 @@ func TestDeriveStage_CoversEveryCombination(t *testing.T) {
 	}
 }
 
-func TestAwaitReached_DataDurableTargetIsInclusive(t *testing.T) {
+func TestAwaitReached_BothTargetsMeanTheDataIsDurable(t *testing.T) {
 	reached := []string{StageDataDurable, StageIndexReady}
 	for _, stage := range reached {
 		if !awaitReached(stage, pb.AwaitTarget_AWAIT_TARGET_DATA_DURABLE) {
@@ -92,14 +92,19 @@ func TestAwaitReached_DataDurableTargetIsInclusive(t *testing.T) {
 		if awaitReached(stage, pb.AwaitTarget_AWAIT_TARGET_DATA_DURABLE) {
 			t.Errorf("awaitReached(%s, DATA_DURABLE) = true, want false", stage)
 		}
+		if awaitReached(stage, pb.AwaitTarget_AWAIT_TARGET_QUERYABLE) {
+			t.Errorf("awaitReached(%s, QUERYABLE) = true, want false", stage)
+		}
 	}
-	// An INDEX_READY target is satisfied by READY alone: durable data is not
-	// queryable, and asking for READY means asking to be able to read.
-	if !awaitReached(StageIndexReady, pb.AwaitTarget_AWAIT_TARGET_INDEX_READY) {
-		t.Error("awaitReached(INDEX_READY, INDEX_READY) = false, want true")
-	}
-	if awaitReached(StageDataDurable, pb.AwaitTarget_AWAIT_TARGET_INDEX_READY) {
-		t.Error("awaitReached(DATA_DURABLE, INDEX_READY) = true, want false")
+	// §8.6(b): both targets mean the same thing, and the reason is that an index
+	// is built only when something ASKS for the version. Waiting for INDEX_READY
+	// on a version nobody has queried is waiting for something the design does not
+	// produce — so QUERYABLE must be satisfied by durable data, the same as the
+	// explicit target.
+	for _, stage := range reached {
+		if !awaitReached(stage, pb.AwaitTarget_AWAIT_TARGET_QUERYABLE) {
+			t.Errorf("awaitReached(%s, QUERYABLE) = false, want true: an index build is demand-driven, so it cannot be waited for", stage)
+		}
 	}
 }
 
@@ -125,7 +130,7 @@ func TestAwaitVersion_NotReachedIsAnAnswerNotAnError(t *testing.T) {
 	resp, err := svc.AwaitVersion(context.Background(), &pb.AwaitVersionRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       v,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   300,
 	})
 	if err != nil {
@@ -161,7 +166,7 @@ func TestAwaitVersion_ReportsTheTargetStageWhenItArrives(t *testing.T) {
 	resp, err := svc.AwaitVersion(ctx, &pb.AwaitVersionRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       v,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   2000,
 	})
 	if err != nil {
@@ -208,7 +213,7 @@ func TestAwaitVersion_TerminalVerdictIsReportedNotRaised(t *testing.T) {
 	resp, err := svc.AwaitVersion(ctx, &pb.AwaitVersionRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       v,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   5000,
 	})
 	if err != nil {
@@ -235,7 +240,7 @@ func TestAwaitVersion_DeletingStopsTheWait(t *testing.T) {
 	resp, err := svc.AwaitVersion(ctx, &pb.AwaitVersionRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       v,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   5000,
 	})
 	if err != nil {
@@ -259,7 +264,7 @@ func TestAwaitVersion_CancellationIsHonoured(t *testing.T) {
 	_, err := svc.AwaitVersion(ctx, &pb.AwaitVersionRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       v,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   5000, // the server would happily wait 5 s
 	})
 	if err == nil {
@@ -499,7 +504,7 @@ func TestAwaitVersion_NotVisibleYetIsNotReportedAsNotFound(t *testing.T) {
 	resp, err := svc.AwaitVersion(context.Background(), &pb.AwaitVersionRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       v,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   3000,
 	})
 	if err != nil {
@@ -670,7 +675,7 @@ func TestAwaitVersion_WakesOnTheWatcherInsteadOfPolling(t *testing.T) {
 	resp, err := svc.AwaitVersion(context.Background(), &pb.AwaitVersionRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       v,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   5000,
 	})
 	elapsed := time.Since(start)
@@ -705,7 +710,7 @@ func TestAwaitVersion_StillWorksWithoutAWatcher(t *testing.T) {
 	resp, err := svc.AwaitVersion(context.Background(), &pb.AwaitVersionRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       v,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   5000,
 	})
 	if err != nil {

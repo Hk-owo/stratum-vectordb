@@ -145,6 +145,11 @@ func TestRealStack_CursorIsRightImmediatelyAfterARestartWithEveryArtifactDeleted
 			break
 		}
 	}
+	// The victim must hold the version's ARTIFACT too, not just its data: the run
+	// below deletes a replica's artifacts and restarts it, which proves nothing if
+	// it never had any. A non-head replica gets one by fetching it (§8.4), which is
+	// what waitVersionReady does.
+	victim.waitVersionReady(ctx, kbID, v3)
 	waitUntilHolds(t, victim, kbID, v3)
 	// And it has written that fact down: the advance is asynchronous, and the run
 	// below is about what a RESTART reads back.

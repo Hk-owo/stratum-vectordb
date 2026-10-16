@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "stratum/api/proto/stratum"
+	stratuminternalsync "stratum/internal/sync"
 	"stratum/internal/types"
 )
 
@@ -42,6 +43,11 @@ type CoordinatorDispatcher struct {
 	// (§7.13.5). It only reorders candidates — it never removes one — and it is
 	// fed by the attempts below, so it needs no probe loop of its own.
 	health *LocalHealthView
+
+	// redundancy is the sink for this node's own redundancy verdict, derived
+	// from the SAME observations health is fed by. Optional: without it the
+	// verdict is simply not reported.
+	redundancy func(known bool, live, quorum int, detail string)
 }
 
 // defaultCandidateTimeout is how long one candidate may hold a dispatch.
@@ -100,6 +106,21 @@ type CoordinatorDispatcherConfig struct {
 	// one view across a node's outgoing traffic.
 	Health *LocalHealthView
 
+	// Redundancy, when set, receives this node's own verdict on whether a write
+	// can still reach its durability target — derived from the peers it has
+	// actually reached, at the moment it reaches them.
+	//
+	// It takes COUNTS rather than a verdict, deliberately: "how many of the
+	// required replicas did this node reach, out of how many must be reached" is
+	// the fact, and every caller can read it. Handing over a verdict instead
+	// would mean two vocabularies for the same three states plus a mapping
+	// between them that can drift.
+	//
+	// It is NOT the control leader's aggregate. That one is computed from every
+	// replica's reports and exists only on the leader; this is what THIS node
+	// saw, and the two disagreeing is expected rather than a bug to reconcile.
+	Redundancy func(known bool, live, quorum int, detail string)
+
 	Logger *zap.Logger
 }
 
@@ -131,6 +152,7 @@ func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispa
 		logger:           logger,
 		candidateTimeout: defaultCandidateTimeout,
 		health:           health,
+		redundancy:       cfg.Redundancy,
 	}
 }
 
@@ -238,6 +260,11 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 		// §7.13.5: the attempt just made IS the observation — no probe loop,
 		// no extra RPC. It only ever reorders later dispatches.
 		d.health.Observe(addr, err == nil)
+		// docs/storage-node-state-machine-plan.md §3.2: the same observation is
+		// what this node knows about its own redundancy. Derived here rather than
+		// on a timer, so the verdict follows real traffic — and so a node that
+		// talks to nobody keeps saying UNKNOWN instead of guessing.
+		d.reportRedundancy(candidates)
 		if err != nil {
 			lastErr = err
 			d.logger.Warn("plane: dispatch: candidate did not take the write",
@@ -287,6 +314,69 @@ func (d *CoordinatorDispatcher) candidates(ctx context.Context) ([]string, error
 	return out, nil
 }
 
+// reportRedundancy derives this node's own redundancy verdict from the peers it
+// has actually reached, and hands the counts to the sink.
+//
+// It is the LOCAL counterpart of the control leader's aggregate
+// (LocalControlPlane.StorageDegradation), not a copy of it: the leader computes
+// its view from every replica's periodic reports and can only do so while it
+// leads, whereas this node computes its own from the calls it happened to make.
+// The two disagreeing is expected — a health view needs no consensus
+// (§5.1 of docs/coordinator-selection-and-node-liveness-design.md).
+//
+// The verdict is UNKNOWN whenever ANY required peer has never been observed:
+// "I have not talked to it" is not evidence that it is up, and a verdict from a
+// partial sample is exactly the guess a write gate must not act on. The counts
+// travel even then, so an operator can see how far the sample got.
+func (d *CoordinatorDispatcher) reportRedundancy(candidates []string) {
+	if d.redundancy == nil {
+		return
+	}
+
+	required, live, unobserved := 0, 0, 0
+	for _, addr := range candidates {
+		if addr == "" {
+			continue
+		}
+		if addr == d.selfAddr {
+			// This node is running the code that is asking, so it counts as
+			// reached without an observation. Deliberately NOT fed into the
+			// health view: §7.13.5's view exists to order PEERS, and a node that
+			// could demote itself would be measuring something else.
+			required++
+			live++
+			continue
+		}
+		required++
+		switch d.health.State(addr) {
+		case PeerReachable:
+			live++
+		case PeerDemoted:
+			// Not live; already counted in `required`.
+		default:
+			unobserved++
+		}
+	}
+	if required == 0 {
+		// No topology was resolved, so there is nothing to judge. Not an error:
+		// a single-node deployment's candidate set can legitimately hold only
+		// itself, or be empty before the address map is wired.
+		return
+	}
+
+	quorum := required/2 + 1
+	if unobserved > 0 {
+		d.redundancy(false, live, quorum, fmt.Sprintf(
+			"%d of %d required replicas reached; %d never observed", live, required, unobserved))
+		return
+	}
+	detail := ""
+	if live < quorum {
+		detail = fmt.Sprintf("%d of %d required replicas reachable (quorum needs %d)", live, required, quorum)
+	}
+	d.redundancy(true, live, quorum, detail)
+}
+
 // dispatchTo asks one replica to run the write, and insists on its answer: a
 // candidate that accepts the call but does not complete the transaction is not a
 // coordinator, and the caller must move on to the next one.
@@ -301,7 +391,7 @@ func (d *CoordinatorDispatcher) dispatchTo(ctx context.Context, addr, kbID strin
 		KnowledgeBaseId: kbID,
 		VersionId:       versionID,
 		ParentVersionId: parentVersionID,
-		Changes:         docChangesToProto(changes),
+		Changes:         stratuminternalsync.DocChangesToProto(changes),
 	})
 	if err != nil {
 		return fmt.Errorf("ExecuteVersionWrite(%s v%d) at %s: %w", kbID, versionID, addr, err)
@@ -310,24 +400,4 @@ func (d *CoordinatorDispatcher) dispatchTo(ctx context.Context, addr, kbID strin
 		return fmt.Errorf("ExecuteVersionWrite(%s v%d) at %s: accepted but not completed", kbID, versionID, addr)
 	}
 	return nil
-}
-
-// docChangesToProto is the wire form of a change list, the counterpart of
-// sync's docChangesFromProto.
-func docChangesToProto(in []types.DocChange) []*pb.DocChange {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]*pb.DocChange, len(in))
-	for i, c := range in {
-		op := pb.ChangeOp_CHANGE_OP_ADD
-		switch c.Op {
-		case types.ChangeOpDelete:
-			op = pb.ChangeOp_CHANGE_OP_DELETE
-		case types.ChangeOpUpdate:
-			op = pb.ChangeOp_CHANGE_OP_UPDATE
-		}
-		out[i] = &pb.DocChange{Op: op, DocId: c.DocID, Content: c.Content}
-	}
-	return out
 }

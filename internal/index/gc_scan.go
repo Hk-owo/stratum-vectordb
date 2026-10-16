@@ -41,11 +41,16 @@ const (
 	DefaultGCSweepInterval = 10 * time.Minute
 
 	// DefaultGCRatioThreshold is the dead share above which an active version is
-	// reported as a cleanup candidate. It matches DefaultAppendMaxDeadRatio:
-	// both say "this much dead weight is not worth carrying", from two different
-	// vantage points (may a build start from it, vs is a sealed artifact worth
-	// reopening).
-	DefaultGCRatioThreshold = 0.2
+	// reported as a cleanup candidate.
+	//
+	// Deliberately ABOVE DefaultAppendMaxDeadRatio (0.3 vs 0.2) as of 2026-10: at
+	// 0.2 the two bars coincided, so §8.6(c) rebuilt a version exactly when §8.6(d)
+	// started caring about it and the collection path never saw a candidate
+	// (docs/stress-test-report.md §C.5, docs/known-gaps.md §G). The two answer
+	// different questions — may a build start from this artifact, vs is a SEALED
+	// artifact worth reopening — but the collection bar has to sit higher for the
+	// second question to ever be asked.
+	DefaultGCRatioThreshold = 0.3
 
 	// chunkIDLength is the length of a content-addressed chunk id: SHA-256 in
 	// hex (internal/splitter), which is what the index sidecar records.
@@ -88,23 +93,8 @@ func (im *IndexManagerImpl) SetChainTailVersionsProvider(fn func(ctx context.Con
 	im.chainTailVersions = fn
 }
 
-// SetVersionsProvider wires the authoritative version set the §8.6a cold
-// evaluator enumerates: per knowledge base, which versions exist, from the
-// control layer's metadata.
-//
-// The evaluator needs this rather than the local access table because the table
-// is what this process happens to have seen — it is empty after a restart, and
-// an evaluator that walks it would therefore forget every version at exactly
-// the moment it has the most reshaping to do. The table keeps its own job:
-// supplying each version's last-query timestamp.
-func (im *IndexManagerImpl) SetVersionsProvider(fn func(ctx context.Context) (map[string][]int64, error)) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-	im.coldVersions = fn
-}
-
-// StartGCScanner starts the background scan. Like the §8.6a evaluator and the
-// §8.8 artifact sweeper, it is local and passive: it reads this node's own disk
+// StartGCScanner starts the background scan. Like the §8.8 artifact sweeper, it
+// is local and passive: it reads this node's own disk
 // and reports, taking no part in consensus and talking to no peer.
 //
 // A negative GCSweepInterval disables it; <= 0 takes the default. It is a no-op

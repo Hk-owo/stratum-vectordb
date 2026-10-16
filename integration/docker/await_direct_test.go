@@ -39,7 +39,7 @@ func TestT4_AwaitVersion_EveryControlNodeAnswersOnItsOwn(t *testing.T) {
 
 	kbID := createKB(t, ctx, "await-direct")
 	versionID := writeDocumentThroughControl(t, ctx, kbID, "doc-1", "每个控制节点都要能自己回答 await。")
-	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, versionID); settled.GetStage() != service.StageIndexReady {
+	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, versionID); settled.GetStage() != service.StageDataDurable {
 		t.Fatalf("fixture: version %d = %s, want READY", versionID, settled.GetStage())
 	}
 
@@ -55,16 +55,16 @@ func TestT4_AwaitVersion_EveryControlNodeAnswersOnItsOwn(t *testing.T) {
 		resp, err := pb.NewKnowledgeBaseServiceClient(conn).AwaitVersion(trusted, &pb.AwaitVersionRequest{
 			KnowledgeBaseId: kbID,
 			VersionId:       versionID,
-			Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+			Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 			WaitTimeoutMs:   3000,
 		})
 		_ = conn.Close()
 		if err != nil {
 			t.Fatalf("%s: AwaitVersion = %v", addr, err)
 		}
-		if resp.GetStage() != service.StageIndexReady {
+		if resp.GetStage() != service.StageDataDurable {
 			t.Errorf("%s: stage = %s, want %s — every control node holds the same replicated state",
-				addr, resp.GetStage(), service.StageIndexReady)
+				addr, resp.GetStage(), service.StageDataDurable)
 		}
 		if resp.GetVersion().GetVersionId() != versionID {
 			t.Errorf("%s: version.version_id = %d, want %d", addr, resp.GetVersion().GetVersionId(), versionID)

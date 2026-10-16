@@ -44,7 +44,7 @@ import (
 //
 // # Effect on readers
 //
-// After compaction, ChangesFor/ChangesInRange simply have no record for a reclaimed
+// After compaction, ChangesInRange simply has no record for a reclaimed
 // version. That is the intended shape: a gap reads as a MISSING key, which is what
 // tells a lagging peer to fall back to a full-state transfer instead of applying a
 // range it never received (§7.5).
@@ -222,9 +222,9 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	}
 	w.file = f
 
-	// Trim the in-memory index to match what the log now holds: ChangesFor must
-	// report a reclaimed version as MISSING, not as "here are the changes", and
-	// the per-version idempotency records must go with it.
+	// Trim the in-memory index to match what the log now holds: ChangesInRange
+	// must report a reclaimed version as MISSING, not as "here are the changes",
+	// and the per-version idempotency records must go with it.
 	//
 	// M2 of docs/code-review-2026-09-24.md: only beginDataByVersion used to be
 	// trimmed here, so versionIDsWritten and committedVersions grew with every
@@ -245,7 +245,7 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	// beginDataByVersion still holds the replay input — including the changed
 	// documents' full text — for every version that has NOT been reclaimed. That
 	// set is bounded by the reclaim watermark (which is why it is not a leak), and
-	// it is what answers a lagging peer's ChangesFor without re-reading the log.
+	// it is what answers a lagging peer's ChangesInRange without re-reading the log.
 	return nil
 }
 
@@ -443,7 +443,7 @@ type rawRecord struct {
 // serialized write path — "the single unpaired BEGIN" was unambiguous then, so that
 // remains the fallback for them. Anything ambiguous returns nil on purpose: the
 // caller then keeps the records as they are, which is the direction that costs
-// nothing (a version whose pairing is lost reads as MISSING to ChangesFor, and a
+// nothing (a version whose pairing is lost reads as MISSING to ChangesInRange, and a
 // lagging peer falls back to a full-state transfer).
 func takePendingBegin(pending map[string]*rawRecord, kbID string) *rawRecord {
 	if kbID != "" {

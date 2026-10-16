@@ -54,11 +54,13 @@ func TestLoadConfig_GCCollectionKnobs(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_GCCollectionIsOffUnlessAsked is the safety half: the default has
-// to be "collect nothing", because collection rewrites an artifact that is
-// currently serving queries. A config file written before the feature existed must
-// not silently opt in.
-func TestLoadConfig_GCCollectionIsOffUnlessAsked(t *testing.T) {
+// TestLoadConfig_GCCollectionDefaultsOnButCanBeTurnedOff pins the 2026-10 default:
+// an unconfigured node COLLECTS (the scan always ran; the collection is gated by
+// serving_replica_min and gc_ratio_threshold), while an explicit
+// `gc_enabled: false` restores report-only behaviour. The pointer is what makes
+// those two cases distinguishable — a plain bool reads a missing key as false and
+// would have silently disabled the default for every pre-existing config file.
+func TestLoadConfig_GCCollectionDefaultsOnButCanBeTurnedOff(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(path, []byte("index_manager:\n  lru_capacity: 8\n"), 0o644); err != nil {
@@ -70,8 +72,8 @@ func TestLoadConfig_GCCollectionIsOffUnlessAsked(t *testing.T) {
 		t.Fatalf("loadConfig: %v", err)
 	}
 
-	if cfg.IndexGCEnabled {
-		t.Error("IndexGCEnabled = true for a config that never mentioned it; collection must be opt-in")
+	if !cfg.IndexGCEnabled {
+		t.Error("IndexGCEnabled = false for a config that never mentioned it; collection is ON by default since 2026-10")
 	}
 	// 0 means "take the IndexManager's default", which is what lets the default
 	// live in one place (DefaultIndexServingReplicaMin / DefaultGCGraphRebuildRatio)

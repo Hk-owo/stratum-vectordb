@@ -3,7 +3,6 @@ package coordinator
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -1131,28 +1130,7 @@ func (c *WriteCoordinatorImpl) writeVersionDocList(ctx context.Context, kbID str
 
 // retry executes fn with exponential backoff up to MaxRetries times.
 func (c *WriteCoordinatorImpl) retry(ctx context.Context, fn func() error) error {
-	base := time.Duration(c.cfg.RetryBaseIntervalMS) * time.Millisecond
-
-	var lastErr error
-	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := fn(); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-		if attempt < c.cfg.MaxRetries {
-			backoff := base * time.Duration(int64(math.Pow(2, float64(attempt))))
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
-	return fmt.Errorf("retry exhausted after %d attempts: %w", c.cfg.MaxRetries+1, lastErr)
+	return retryWithBackoff(ctx, c.cfg.MaxRetries, c.cfg.RetryBaseIntervalMS, fn)
 }
 
 var _ WriteCoordinator = (*WriteCoordinatorImpl)(nil)

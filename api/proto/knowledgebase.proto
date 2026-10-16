@@ -271,18 +271,27 @@ message ListVersionsResponse {
   repeated VersionInfo versions = 1;
 }
 
-// AwaitTarget is what a caller is waiting for. It is deliberately NOT
-// DataStatus: INDEX_READY is an IndexStatus value, so a DataStatus-typed field
-// could not represent the default target at all (docs/await-version-plan.md §5).
+// AwaitTarget is what a caller is waiting for.
+//
+// BOTH values now mean the same thing — the version's DATA is durable — and the
+// second exists only so a caller can say it explicitly. INDEX_READY used to be
+// the default and to mean "an index is on disk", which §8.6(b) made un-waitable:
+// a version is built when something asks for it, so a version nobody has queried
+// never reaches INDEX_READY however long a caller waits. Waiting for a state the
+// design deliberately does not produce is not a contract, it is a deadlock with
+// a timeout (docs/index-owner-sharding-plan.md §4).
+//
+// A caller that needs the INDEX ready should ask for it (WarmupVersion) or query
+// the version, rather than wait for it to happen.
 enum AwaitTarget {
-  AWAIT_TARGET_INDEX_READY = 0;  // default: queryable — also the precondition for activating a version
-  AWAIT_TARGET_DATA_DURABLE = 1; // data durable only: batch imports that rebuild indexes afterwards
+  AWAIT_TARGET_QUERYABLE = 0;    // default: the version's data is durable here
+  AWAIT_TARGET_DATA_DURABLE = 1; // the same thing, said explicitly
 }
 
 message AwaitVersionRequest {
   string knowledge_base_id = 1; // required: a version id is unique within a knowledge base
   int64 version_id = 2;
-  AwaitTarget target = 3;    // default AWAIT_TARGET_INDEX_READY
+  AwaitTarget target = 3;    // default AWAIT_TARGET_QUERYABLE
   int64 wait_timeout_ms = 4; // this call's longest wait; the server caps it
 }
 

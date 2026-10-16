@@ -467,10 +467,18 @@ embed:
 #      在 (d) 刚开始关心的占比上就重建，墓碑同样留不到被收集的那一刻。删 1600/2000 的
 #      死占比约 0.80，所以必须抬到 0.80 以上（这里给 0.95）。
 index_manager:
-  gc_enabled: true
+  # §8.6(d)：gc_enabled 与 serving_replica_min 刻意不写，让压测覆盖"默认值"这条
+  # 路径（2026-10 起收集默认开启、serving_replica_min 默认 1）。扫描周期与追加
+  # 门槛仍要显式设：前者默认 10 分钟太慢，后者抬高才让 §8.6(d) 看到候选。
   gc_sweep_interval_ms: 5000
-  serving_replica_min: 2
   append_max_dead_ratio: 0.95
+  # §8.6a 冷版本免图分层：连续这么久没被查询的版本，索引就建成「免图」形态
+  # （量化码 + 暴力扫描，省掉图边的构建耗时与常驻内存）。0 = 关闭（默认，
+  # 历史行为：每个版本都建完整 HNSW 图）。
+  #
+  # 做成环境变量是为了能做 A/B：同一个套件在 0 与某个阈值下各跑一遍。阈值
+  # 本身要用真实流量标定（docs/Stratum_设计文档v13.md §10.4 是占位值）。
+  cold_threshold_ms: ${COLD_THRESHOLD_MS:-0}
 
 # 主动落后检测（docs/active-lag-detection-design.md）：没有开关，落后副本自己追，
 # 下面三项只定节奏。
@@ -1132,7 +1140,7 @@ cmd_station_up() {
     sleep 0.1
   done
   log "服务站已就绪：$STATION_ADDR（日志 $(station_log)）"
-  log "客户端凭据：Authorization: Bearer \$(cat $(console_token_file))（凭据表 $(STATION_TOKENS)）"
+  log "客户端凭据：Authorization: Bearer \$(cat $(console_token_file))（凭据表 ${STATION_TOKENS:-$(tokens_file)}）"
 }
 
 cmd_station_down() {

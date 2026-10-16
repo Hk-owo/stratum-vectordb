@@ -16,8 +16,7 @@ const DefaultMaxInFlightWrites = 8
 //
 // A release closes `wait` and installs a fresh one, which is how a waiter is
 // woken without broadcasting: only one slot opens per release, so only one
-// waiter needs to learn about it. It also keeps the limit adjustable — a
-// buffered channel would freeze the limit at creation time.
+// waiter needs to learn about it.
 type perKBGate struct {
 	n    int
 	wait chan struct{}
@@ -36,7 +35,6 @@ type writeLimiter struct {
 	mu           sync.Mutex
 	gates        map[string]*perKBGate
 	defaultLimit int
-	kbLimits     map[string]int
 }
 
 func newWriteLimiter(defaultLimit int) *writeLimiter {
@@ -46,28 +44,7 @@ func newWriteLimiter(defaultLimit int) *writeLimiter {
 	return &writeLimiter{
 		gates:        make(map[string]*perKBGate),
 		defaultLimit: defaultLimit,
-		kbLimits:     make(map[string]int),
 	}
-}
-
-// limitFor returns the effective limit for kbID. Callers hold l.mu.
-func (l *writeLimiter) limitFor(kbID string) int {
-	if n, ok := l.kbLimits[kbID]; ok {
-		return n
-	}
-	return l.defaultLimit
-}
-
-// SetLimit overrides the in-flight limit for one knowledge base. A non-positive
-// value clears the override, returning that KB to the default.
-func (l *writeLimiter) SetLimit(kbID string, n int) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if n <= 0 {
-		delete(l.kbLimits, kbID)
-		return
-	}
-	l.kbLimits[kbID] = n
 }
 
 // Acquire takes a slot for kbID, blocking until one is free or ctx ends.
@@ -83,7 +60,7 @@ func (l *writeLimiter) Acquire(ctx context.Context, kbID string) error {
 			gate = &perKBGate{wait: make(chan struct{})}
 			l.gates[kbID] = gate
 		}
-		if gate.n < l.limitFor(kbID) {
+		if gate.n < l.defaultLimit {
 			gate.n++
 			l.mu.Unlock()
 			return nil

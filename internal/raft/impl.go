@@ -135,7 +135,7 @@ type RaftNodeImpl struct {
 	// data-plane notification ("this version now exists; make sure you hold it"),
 	// so each node has to react for itself, and the plane skips the pull when its
 	// own cursor already covers the version. Set by the startup wiring (main.go)
-	// to trigger data sync (internal/sync.FollowerSync.PullVersion).
+	// to trigger data sync (internal/sync.FollowerSync.PullVersionData).
 	//
 	// The three hooks here are read by the apply loop and written by that
 	// startup wiring, which runs AFTER NewRaftNodeImpl has already started the
@@ -606,7 +606,7 @@ func (impl *RaftNodeImpl) handleSnapshotMsg(msg kvraft.ApplyMsg) {
 	// the DataSync pull of storage-layer data + index build) would never
 	// fire for them. Trigger it explicitly for every snapshot-covered
 	// version, exactly like handleEntryMsg does for a freshly replicated
-	// cmdCreateVersion. PullVersion is idempotent (re-pulls are no-ops),
+	// cmdCreateVersion. PullVersionData is idempotent (re-pulls are no-ops),
 	// and the callback runs asynchronously so the apply loop is not
 	// blocked; Stop() waits for these goroutines via callbackWG.
 	if fn := impl.onVersionCreated.Load(); fn != nil {

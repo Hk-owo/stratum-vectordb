@@ -30,10 +30,6 @@ type sourceRecordingPuller struct {
 // PullVersionData satisfies VersionPuller; the data-only flavour records the
 // same way, since these tests care about which source was chosen.
 func (p *sourceRecordingPuller) PullVersionData(ctx context.Context, sourceAddr, kbID string, versionID int64) error {
-	return p.PullVersion(ctx, sourceAddr, kbID, versionID)
-}
-
-func (p *sourceRecordingPuller) PullVersion(_ context.Context, sourceAddr, _ string, versionID int64) error {
 	p.sources = append(p.sources, sourceAddr)
 	p.versions = append(p.versions, versionID)
 	return nil

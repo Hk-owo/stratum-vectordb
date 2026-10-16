@@ -28,7 +28,6 @@ type managedProc struct {
 	cmd       *exec.Cmd
 	startedAt time.Time
 	logFile   string
-	lastError string
 }
 
 // Supervisor starts/stops the local managed services.

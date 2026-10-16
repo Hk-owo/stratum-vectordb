@@ -84,9 +84,6 @@ func TestNodeHandler_ForwardsEveryDataSyncMethod(t *testing.T) {
 		case pb.DataSyncService_PushVersionDataClient:
 			_, err := s.CloseAndRecv()
 			return err
-		case pb.DataSyncService_PushIndexDataClient:
-			_, err := s.CloseAndRecv()
-			return err
 		}
 		return nil
 	}
@@ -127,9 +124,6 @@ func TestNodeHandler_ForwardsEveryDataSyncMethod(t *testing.T) {
 		}},
 		{"PushVersionData", func() error {
 			return sendStream(client.PushVersionData(ctx))
-		}},
-		{"PushIndexData", func() error {
-			return sendStream(client.PushIndexData(ctx))
 		}},
 	}
 

@@ -51,7 +51,12 @@ type storageStack struct {
 // rn is read only — the chunk-bloom rebuild and the index manager's metadata
 // lookups — so a storage node passes its remote proxy and an all-in-one node its
 // own Raft node without this caring which it is.
-func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *zap.Logger) (*storageStack, error) {
+//
+// buildState is the node state machine's build-status half
+// (docs/storage-node-state-machine-plan.md §7, item 4). The index manager is
+// where it belongs: every build — and every install of a distributed artifact —
+// passes through that one component.
+func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *zap.Logger, buildState index.BuildStateRecorder) (*storageStack, error) {
 	ds, err := docstore.NewPebbleDocStore(dataDir + "/docstore")
 	if err != nil {
 		return nil, fmt.Errorf("open DocStore: %w", err)
@@ -133,7 +138,6 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		// off the request, so the vector store applies clamp(top_k × 8, 16, 4096).
 		CandidateN:         cfg.IndexCandidateN,
 		ColdThreshold:      cfg.IndexColdThreshold,
-		ColdSweepInterval:  cfg.IndexColdSweepInterval,
 		AppendMaxDeadRatio: cfg.IndexAppendMaxDeadRatio,
 		GCRatioThreshold:   cfg.IndexGCRatioThreshold,
 		// §3 codebook refresh (docs/codebook-refresh-plan.md §3). Firing either
@@ -154,18 +158,18 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		GCGraphRebuildRatio:    cfg.IndexGCGraphRebuildRatio,
 		GCSweepInterval:        cfg.IndexGCSweepInterval,
 		BuildConcurrency:       cfg.IndexBuildConcurrency,
+		// docs/storage-node-state-machine-plan.md §7 item 4: the manager owns the
+		// version layer's build transitions, including the install path and the
+		// build that never starts.
+		BuildState: buildState,
 	})
 	indexMgr.SetLogger(logger.Named("index"))
-	// §6: reclaim index artifacts whose build was abandoned. Like the cold
-	// evaluator this is local and passive — it reads only this node's own disk —
-	// so it starts here rather than being driven from the control layer.  On by
+	// §6: reclaim index artifacts whose build was abandoned. This is local and
+	// passive — it reads only this node's own disk — so it starts here rather
+	// than being driven from the control layer.  On by
 	// default: the artifact it removes was never sealed by a Save, so nothing can
 	// serve from it and nothing else will ever come back for it.
 	indexMgr.StartAbandonSweeper()
-	// §8.6a: the cold-version evaluator is a local, passive policy (it only
-	// reads this node's access table), so it starts here rather than being
-	// driven from the control layer. A no-op when no threshold is configured.
-	indexMgr.StartColdPolicy()
 
 	// §8.6(d) phase 1: report — do not yet clean — active versions whose sealed
 	// artifact carries more dead weight than the current document set justifies.
@@ -187,30 +191,6 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		return active, nil
 	})
 
-	// §8.6a: the cold evaluator walks the authoritative version set — every
-	// version the control layer knows about — instead of this node's access
-	// table, which is empty after a restart. Same metadata, same connection.
-	indexMgr.SetVersionsProvider(func(ctx context.Context) (map[string][]int64, error) {
-		kbs, err := rn.ListKnowledgeBases(ctx)
-		if err != nil {
-			return nil, err
-		}
-		out := make(map[string][]int64, len(kbs))
-		for _, kb := range kbs {
-			versions, err := rn.ListVersions(ctx, kb.KBID)
-			if err != nil {
-				logger.Warn("index: cold policy: ListVersions failed",
-					zap.String("kb_id", kb.KBID), zap.Error(err))
-				continue
-			}
-			ids := make([]int64, 0, len(versions))
-			for _, v := range versions {
-				ids = append(ids, v.VersionID)
-			}
-			out[kb.KBID] = ids
-		}
-		return out, nil
-	})
 	indexMgr.StartGCScanner()
 
 	// Build data sources: the IndexManager's async build reads the version's

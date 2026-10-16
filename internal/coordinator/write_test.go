@@ -583,9 +583,12 @@ func TestWriteCoordinator_AddDocuments(t *testing.T) {
 		t.Error("expected chunks to be written to chunk store")
 	}
 
-	// TriggerBuild should have been called
-	if im.triggeredCount() != 1 {
-		t.Errorf("expected 1 TriggerBuild call, got %d", im.triggeredCount())
+	// NO TriggerBuild, and that is §8.6(b) rather than a missing step: a write
+	// makes a version durable, it does not make it worth building. The version is
+	// built when something asks for it — the active-version pre-build, a query, or
+	// an explicit warm-up — and §8.4 owner sharding then decides which node does it.
+	if im.triggeredCount() != 0 {
+		t.Errorf("TriggerBuild calls = %d, want 0: a write must not build an index", im.triggeredCount())
 	}
 }
 
@@ -808,9 +811,15 @@ func TestWriteCoordinator_CrashAfterRaftBeforeCommit(t *testing.T) {
 	}
 }
 
-func TestWriteCoordinator_CrashAfterCommitBeforeBuild(t *testing.T) {
-	// Simulate: crash after WAL COMMIT but before TriggerBuild.
-	// Recovery: IndexManager.TriggerBuild should be called on restart.
+func TestWriteCoordinator_CommitLeavesNoBuildBehind(t *testing.T) {
+	// What this used to check: the write path's stage 6 (IndexManager.TriggerBuild)
+	// is asynchronous, so a crash right after the WAL COMMIT could lose it, and
+	// recovery was expected to call it on restart.
+	//
+	// There is no stage 6 to lose any more. §8.6(b) made the build demand-driven,
+	// so the WAL commit IS the end of a write's obligations — the documents are
+	// durable and the version is built when someone needs it. What this pins now is
+	// that the commit does not leave a build behind it.
 	w := wal.NewMockWAL()
 	ds := newTestDocStore()
 	cdm := newTestChunkDocMapper()
@@ -843,7 +852,7 @@ func TestWriteCoordinator_CrashAfterCommitBeforeBuild(t *testing.T) {
 		IndexManager:        im,
 	})
 
-	// Simulate a complete write (which includes TriggerBuild).
+	// A complete write.
 	_, err := coord.Execute(context.Background(), "kb-1", 0, []types.DocChange{
 		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "test content"},
 	}, "")
@@ -851,9 +860,9 @@ func TestWriteCoordinator_CrashAfterCommitBeforeBuild(t *testing.T) {
 		t.Fatalf("Execute failed: %v", err)
 	}
 
-	// TriggerBuild should have been called exactly once.
-	if im.triggeredCount() != 1 {
-		t.Errorf("expected exactly 1 TriggerBuild call, got %d", im.triggeredCount())
+	// And the write did not ask for one.
+	if im.triggeredCount() != 0 {
+		t.Errorf("TriggerBuild calls = %d, want 0: the write path builds nothing", im.triggeredCount())
 	}
 
 	// WAL should be clean (COMMIT + no pending).
@@ -1123,9 +1132,11 @@ func TestWriteCoordinator_ReplayVersionStorageWrites(t *testing.T) {
 		t.Errorf("doc-a content missing after replay: %v", err)
 	}
 
-	// Index build must have been triggered.
-	if im.triggeredCount() != 2 { // parent Execute + replay
-		t.Errorf("TriggerBuild calls = %d, want 2", im.triggeredCount())
+	// Neither the parent write nor the replay builds anything (§8.6b). Replay in
+	// particular must not: it runs once per version per restart, which is the last
+	// place an eager build belongs.
+	if im.triggeredCount() != 0 {
+		t.Errorf("TriggerBuild calls = %d, want 0: neither a write nor a replay builds", im.triggeredCount())
 	}
 
 	// The WAL must now consider the version committed (no pending

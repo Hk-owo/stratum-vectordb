@@ -763,6 +763,19 @@ func waitGraphFreeShape(t *testing.T, im *IndexManagerImpl, kbID string, version
 	}
 }
 
+// waitGraphHotShape waits for versionID's shape to stop being graph-free.
+func waitGraphHotShape(t *testing.T, im *IndexManagerImpl, kbID string, versionID int64) {
+	t.Helper()
+	key := indexKey{kbID, versionID}
+	if !waitForCondition(5*time.Second, func() bool {
+		im.mu.Lock()
+		defer im.mu.Unlock()
+		return !im.builtGraphFree[key]
+	}) {
+		t.Fatalf("version %s/%d never got its graph back", kbID, versionID)
+	}
+}
+
 func waitForCondition(timeout time.Duration, cond func() bool) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -781,19 +794,18 @@ func newColdPolicyManager(t *testing.T, vc *mockVectorIndexClient, ds *docSource
 	im.listDocIDs = ds.ListDocIDs
 	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
 	im.readChunkVector = ds.ReadChunkVector
-	// §8.6a: the evaluator enumerates the authoritative version set, so the
-	// fixture supplies one. 1..10 keeps a version nobody holds (no artifact, no
-	// memory entry) in scope, and leaves 10 as the end of the chain.
-	im.SetVersionsProvider(func(context.Context) (map[string][]int64, error) {
-		return map[string][]int64{"kb-1": {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}}, nil
-	})
 	return im
 }
 
-// §8.6a: the evaluator must pick exactly the versions that went cold,
-// leave a hot one alone, and not reshape an already graph-free version
-// again on the next sweep.
-func TestIndexManager_ColdPolicyPicksOnlyColdVersions(t *testing.T) {
+// §8.6a: the SHAPE a build uses comes from this node's own access record, decided
+// when something asks for the version.
+//
+// This used to be a background evaluator picking candidates on a timer. Deciding
+// inside the build is what keeps §8.6(a) consistent with §8.6(b) — nothing is
+// built that nobody asked for — and with §8.4 — a node the router does not route
+// to has no queries, so under the old timer it would build artifacts no query
+// could reach.
+func TestIndexManager_ColdShapeIsChosenAtBuildTime(t *testing.T) {
 	vc := newMockVectorIndexClient()
 	ds := newDocSource()
 	for v := int64(1); v <= 2; v++ {
@@ -802,6 +814,7 @@ func TestIndexManager_ColdPolicyPicksOnlyColdVersions(t *testing.T) {
 	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
 		LRUCapacity:     4,
 		LoadWaitTimeout: 5 * time.Second,
+		IndexDataDir:    t.TempDir(),
 		ColdThreshold:   time.Minute,
 	})
 
@@ -813,73 +826,90 @@ func TestIndexManager_ColdPolicyPicksOnlyColdVersions(t *testing.T) {
 	waitIndexLoaded(t, im, "kb-1", 1)
 	waitIndexLoaded(t, im, "kb-1", 2)
 
-	// Freshly built versions were never searched, but the build itself
-	// seeds their access record, so neither is cold yet.
-	if got := im.coldCandidates(context.Background(), time.Now()); len(got) != 0 {
-		t.Fatalf("freshly built versions must not be cold, got %v", got)
+	// Freshly built versions were never searched, but the build itself seeds their
+	// access record, so neither is cold yet — and both therefore carry a graph.
+	im.mu.Lock()
+	fresh1 := im.builtGraphFree[indexKey{"kb-1", 1}]
+	fresh2 := im.builtGraphFree[indexKey{"kb-1", 2}]
+	im.mu.Unlock()
+	if fresh1 || fresh2 {
+		t.Fatalf("freshly built versions must keep their graph (v1 free=%v, v2 free=%v)", fresh1, fresh2)
 	}
 
-	// Age version 1 by hand: it was last relevant an hour ago.
+	// Age version 1 by hand: nothing has asked about it for an hour. The NEXT
+	// build of it is the one that should notice.
 	im.mu.Lock()
 	im.lastSearch[indexKey{"kb-1", 1}] = time.Now().Add(-time.Hour)
 	im.mu.Unlock()
 
-	got := im.coldCandidates(context.Background(), time.Now())
-	want := indexKey{"kb-1", 1}
-	if len(got) != 1 || got[0].key != want {
-		t.Fatalf("expected only %v to be cold, got %v", want, got)
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild v=1 failed: %v", err)
 	}
-
-	im.sweepCold(context.Background(), time.Now())
 	waitGraphFreeShape(t, im, "kb-1", 1)
 
 	vc.mu.Lock()
 	quantizer := vc.lastBuildQuantizer
 	vc.mu.Unlock()
 	if quantizer != vecstorepb.QuantizerTypeProto_QUANTIZER_OFF_FLAT {
-		t.Fatalf("a cold rebuild must ask the vecstore for the graph-free variant, got %v", quantizer)
+		t.Fatalf("a build of a cold version must ask for the graph-free variant, got %v", quantizer)
 	}
 
-	// The hot version keeps its graph.
+	// The hot version keeps its graph: a build of it must not be reshaped.
 	im.mu.Lock()
 	hot := im.builtGraphFree[indexKey{"kb-1", 2}]
 	im.mu.Unlock()
 	if hot {
 		t.Fatal("the version that was not cold must keep its HNSW graph")
 	}
-
-	// Sweeping again must not rebuild what is already graph-free.
-	if got := im.coldCandidates(context.Background(), time.Now()); len(got) != 0 {
-		t.Fatalf("an already graph-free version must not be picked again, got %v", got)
-	}
 }
 
-// §8.6a: the policy is background and automatic — with a threshold
-// configured, nobody has to run the evaluator by hand.
-func TestIndexManager_ColdPolicyRunsInBackground(t *testing.T) {
+// §8.6a: a graph-free version that is queried again gets its graph back, and the
+// check has to read the PREVIOUS query time — the reheat runs before Search
+// stamps "now".
+func TestIndexManager_QueryingAGraphFreeVersionRestoresItsGraph(t *testing.T) {
 	vc := newMockVectorIndexClient()
 	ds := newDocSource()
 	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
 	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
-		LRUCapacity:       4,
-		LoadWaitTimeout:   5 * time.Second,
-		ColdThreshold:     time.Nanosecond, // everything is cold immediately
-		ColdSweepInterval: 5 * time.Millisecond,
+		LRUCapacity:     4,
+		LoadWaitTimeout: 5 * time.Second,
+		IndexDataDir:    t.TempDir(),
+		ColdThreshold:   time.Minute,
 	})
 
-	im.StartColdPolicy()
-	defer im.StopColdPolicy()
-
+	// Build it cold, then note the shape.
+	im.mu.Lock()
+	im.lastSearch[indexKey{"kb-1", 1}] = time.Now().Add(-time.Hour)
+	im.mu.Unlock()
 	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
-		t.Fatalf("TriggerBuild failed: %v", err)
+		t.Fatalf("TriggerBuild: %v", err)
 	}
 	waitGraphFreeShape(t, im, "kb-1", 1)
+
+	// Nothing has queried it for an hour, so a query now must NOT reheat: one
+	// query is not "hot". (The threshold's other half is the bar.)
+	if _, err := im.Search(context.Background(), "kb-1", 1, []float32{0.5, 0.5}, 1); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	im.mu.Lock()
+	firstShape := im.builtGraphFree[indexKey{"kb-1", 1}]
+	im.mu.Unlock()
+	if !firstShape {
+		t.Fatal("a single query after an hour of silence must not restore the graph on its own")
+	}
+
+	// Now it has been queried within half the threshold, so the next query is
+	// inside the reheat window and restores the graph.
+	if _, err := im.Search(context.Background(), "kb-1", 1, []float32{0.5, 0.5}, 1); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	waitGraphHotShape(t, im, "kb-1", 1)
 }
 
-// §8.4's first real reuse point: a cold reshape is an ordinary build, so
-// it reports through the same BuildCompleteCallback that drives index
-// distribution — the replicas replace their copy of the artifact without
-// any new plumbing.
+// §8.4's first real reuse point: a build of a cold version is an ordinary build,
+// so it reports through the same BuildCompleteCallback that drives index
+// distribution — the replicas replace their copy of the artifact without any new
+// plumbing.
 func TestIndexManager_ColdRebuildReportsThroughBuildCallback(t *testing.T) {
 	vc := newMockVectorIndexClient()
 	ds := newDocSource()
@@ -906,26 +936,30 @@ func TestIndexManager_ColdRebuildReportsThroughBuildCallback(t *testing.T) {
 		t.Fatal("the initial build never reported completion")
 	}
 
+	// Age it, then ask for it again: the second build is the cold one, and it has
+	// to report READY like any other — that report is what refreshes the replicas.
 	im.mu.Lock()
 	im.lastSearch[indexKey{"kb-1", 1}] = time.Now().Add(-time.Hour)
 	im.mu.Unlock()
-	im.sweepCold(context.Background(), time.Now())
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild failed: %v", err)
+	}
 	waitGraphFreeShape(t, im, "kb-1", 1)
 
 	select {
 	case status := <-reports:
 		if status != types.IndexStatusReady {
-			t.Fatalf("a cold reshape must report READY so distribution refreshes the replicas, got %v", status)
+			t.Fatalf("a cold rebuild must report READY so distribution refreshes the replicas, got %v", status)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("the cold reshape never reported completion, so replicas would keep the hot artifact")
+		t.Fatal("the cold rebuild never reported completion, so replicas would keep the hot artifact")
 	}
 }
 
 // §8.6a: a version that only ever arrived from another node must still be
 // visible to the cold policy — it is "received here", which is a baseline
 // just like "built here".
-func TestIndexManager_InstallIndexSeedsColdPolicyBaseline(t *testing.T) {
+func TestIndexManager_InstallIndexSeedsTheShapeBaseline(t *testing.T) {
 	vc := newMockVectorIndexClient()
 	im := newColdPolicyManager(t, vc, newDocSource(), IndexManagerConfig{
 		LRUCapacity:     4,
@@ -944,18 +978,16 @@ func TestIndexManager_InstallIndexSeedsColdPolicyBaseline(t *testing.T) {
 		t.Fatalf("InstallIndex failed: %v", err)
 	}
 	if _, ok := im.LastAccess("kb-1", 7); !ok {
-		t.Fatal("receiving an artifact must give the cold policy a baseline for the version")
+		t.Fatal("receiving an artifact must give the shape decision a baseline for the version")
 	}
 
-	// Age it: the replica can now reshape what it received instead of
-	// keeping the shipped shape forever.
+	// Age it: a later build of this version may now choose the graph-free shape
+	// instead of keeping whatever was shipped.
 	im.mu.Lock()
 	im.lastSearch[indexKey{"kb-1", 7}] = time.Now().Add(-time.Hour)
 	im.mu.Unlock()
-	got := im.coldCandidates(context.Background(), time.Now())
-	want := indexKey{"kb-1", 7}
-	if len(got) != 1 || got[0].key != want {
-		t.Fatalf("expected the received version to age into a cold candidate, got %v", got)
+	if !im.coldShapeFor(context.Background(), "kb-1", 7) {
+		t.Fatal("a received artifact that has gone unqueried for an hour must be rebuilt graph-free")
 	}
 }
 
@@ -1034,53 +1066,29 @@ func TestIndexManager_InstallIndexRecordsShippedShape(t *testing.T) {
 		t.Fatalf("the shipped shape must be readable from the sidecar, got graphFree=%v known=%v", graphFree, known)
 	}
 
-	// Long idle, but already graph-free: nothing to reshape.
+	// Long idle: a build now would still choose graph-free, and there is nothing to
+	// reheat — the artifact already has the shape the idle version wants.
 	im.mu.Lock()
 	im.lastSearch[indexKey{"kb-1", 7}] = time.Now().Add(-time.Hour)
 	im.mu.Unlock()
-	if got := im.coldCandidates(context.Background(), time.Now()); len(got) != 0 {
-		t.Fatalf("a received graph-free artifact must not be reshaped again, got %v", got)
+	if !im.coldShapeFor(context.Background(), "kb-1", 7) {
+		t.Fatal("a graph-free artifact idle for an hour must keep the graph-free shape")
+	}
+	if im.needsReshape("kb-1", 7) {
+		t.Fatal("an idle graph-free artifact must not reheat: one shape already fits it")
 	}
 
-	// Queried again: that is the reheat direction, not another cold reshape.
+	// Queried again: that is the reheat direction, and it is the OPPOSITE answer
+	// from coldShapeFor — which is the hysteresis, expressed in one place.
 	im.mu.Lock()
 	im.lastSearch[indexKey{"kb-1", 7}] = time.Now()
 	im.mu.Unlock()
-	got := im.coldCandidates(context.Background(), time.Now())
-	if len(got) != 1 || !got[0].reheat {
-		t.Fatalf("a queried-again graph-free artifact must be a reheat candidate, got %v", got)
+	if !im.needsReshape("kb-1", 7) {
+		t.Fatal("a graph-free artifact queried again within half the threshold must reheat")
 	}
-}
-
-// The evaluator is off unless a threshold is configured, and starting or
-// stopping it is idempotent either way.
-func TestIndexManager_ColdPolicyLifecycle(t *testing.T) {
-	off := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: time.Second})
-	off.StartColdPolicy()
-	off.mu.Lock()
-	cancel := off.coldCancel
-	off.mu.Unlock()
-	if cancel != nil {
-		t.Fatal("no cold threshold configured: the evaluator must not start")
+	if im.coldShapeFor(context.Background(), "kb-1", 7) {
+		t.Fatal("a version queried just now must not be built graph-free")
 	}
-	off.StopColdPolicy() // must be safe on a never-started policy
-
-	on := NewIndexManager(IndexManagerConfig{
-		LRUCapacity:       4,
-		LoadWaitTimeout:   time.Second,
-		ColdThreshold:     time.Hour,
-		ColdSweepInterval: time.Hour,
-	})
-	on.StartColdPolicy()
-	on.StartColdPolicy() // idempotent: still exactly one evaluator
-	on.StopColdPolicy()
-	on.mu.Lock()
-	cancel = on.coldCancel
-	on.mu.Unlock()
-	if cancel != nil {
-		t.Fatal("StopColdPolicy must clear the evaluator handle")
-	}
-	on.StopColdPolicy() // idempotent
 }
 
 func TestIndexManager_ConcurrentSearchSameVersion(t *testing.T) {
@@ -1684,6 +1692,11 @@ func appendTestCaseWith(t *testing.T, ds *docSource, maxDeadRatio float64) (*moc
 		LoadWaitTimeout:    5 * time.Second,
 		IndexDataDir:       t.TempDir(),
 		AppendMaxDeadRatio: maxDeadRatio,
+		// §8.6a is what makes a build graph-free, and it is off unless a threshold
+		// is set — so the shape tests need one. buildParentThenChildWith asks for a
+		// graph-free build by ageing the version, which only reads cold if the
+		// policy is on.
+		ColdThreshold: time.Minute,
 	})
 	im.SetVersionParentGetter(func(_ context.Context, _ string, versionID int64) (int64, error) {
 		if versionID == 2 {
@@ -1701,18 +1714,21 @@ func buildParentThenChild(t *testing.T, im *IndexManagerImpl) {
 	buildParentThenChildWith(t, im, false)
 }
 
-// buildParentThenChildWith is buildParentThenChild with an explicit shape:
-// graphFree builds both versions through TriggerBuildGraphFree, which is what
-// puts §8.6(c)'s RemoveChunks path (graph-free shapes only) in play.
+// buildParentThenChildWith is buildParentThenChild with an explicit shape.
+//
+// The shape is now a consequence of the access record rather than a separate
+// entry point (§8.6a is decided at build time by coldShapeFor), so asking for a
+// graph-free build means making the version look cold first — here, by stamping a
+// last-query time far enough in the past.
 func buildParentThenChildWith(t *testing.T, im *IndexManagerImpl, graphFree bool) {
 	t.Helper()
 	build := func(versionID int64) {
-		var err error
 		if graphFree {
-			err = im.TriggerBuildGraphFree(context.Background(), "kb-1", versionID)
-		} else {
-			err = im.TriggerBuild(context.Background(), "kb-1", versionID)
+			im.mu.Lock()
+			im.lastSearch[indexKey{"kb-1", versionID}] = time.Now().Add(-time.Hour)
+			im.mu.Unlock()
 		}
+		err := im.TriggerBuild(context.Background(), "kb-1", versionID)
 		if err != nil {
 			t.Fatalf("TriggerBuild v%d (graph_free=%v): %v", versionID, graphFree, err)
 		}
@@ -2331,148 +2347,6 @@ func TestAbandonSweeper_IsANoOpWithoutPersistenceOrWhenDisabled(t *testing.T) {
 		t.Error("a negative timeout must leave the sweeper off")
 	}
 	disabled.Close()
-}
-
-// §8.6a: the active version is the one serving queries, so it keeps its graph
-// however long it has gone unqueried — reshaping it would turn the knowledge
-// base's main read path into a scan. With no active pointer, the end of the
-// version chain is what serves, so it is shielded too.
-func TestIndexManager_ColdPolicySkipsActiveVersion(t *testing.T) {
-	vc := newMockVectorIndexClient()
-	ds := newDocSource()
-	for v := int64(1); v <= 3; v++ {
-		ds.addDoc(v, fmt.Sprintf("doc-%d", v), []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
-	}
-	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
-		LRUCapacity:     4,
-		LoadWaitTimeout: 5 * time.Second,
-		ColdThreshold:   time.Minute,
-	})
-	im.SetActiveVersionsProvider(func(context.Context) (map[string]int64, error) {
-		return map[string]int64{"kb-1": 1}, nil
-	})
-	// The chain is 1..3, so 3 is its end — the version that serves when no
-	// active pointer is set. The default fixture goes up to 10.
-	im.SetVersionsProvider(func(context.Context) (map[string][]int64, error) {
-		return map[string][]int64{"kb-1": {1, 2, 3}}, nil
-	})
-	for v := int64(1); v <= 3; v++ {
-		if err := im.TriggerBuild(context.Background(), "kb-1", v); err != nil {
-			t.Fatalf("TriggerBuild v=%d failed: %v", v, err)
-		}
-		waitIndexLoaded(t, im, "kb-1", v)
-	}
-
-	// Every version has been idle for an hour — which alone used to be the
-	// whole criterion.
-	im.mu.Lock()
-	for v := int64(1); v <= 3; v++ {
-		im.lastSearch[indexKey{"kb-1", v}] = time.Now().Add(-time.Hour)
-	}
-	im.mu.Unlock()
-
-	got := im.coldCandidates(context.Background(), time.Now())
-	want := indexKey{"kb-1", 2}
-	if len(got) != 1 || got[0].key != want {
-		t.Fatalf("expected only %v to be cold (1 is active, 3 ends the chain), got %v", want, got)
-	}
-}
-
-// §8.6a: reshaping is not one-way. A graph-free version that is queried again
-// gets its graph back, instead of one cold spell degrading it for good.
-func TestIndexManager_ColdPolicyReheatsGraphFreeVersion(t *testing.T) {
-	vc := newMockVectorIndexClient()
-	dir := t.TempDir()
-	im := newColdPolicyManager(t, vc, newDocSource(), IndexManagerConfig{
-		LRUCapacity:     4,
-		LoadWaitTimeout: 5 * time.Second,
-		IndexDataDir:    dir,
-		ColdThreshold:   time.Minute,
-	})
-	im.SetVersionsProvider(func(context.Context) (map[string][]int64, error) {
-		return map[string][]int64{"kb-1": {5, 6}}, nil
-	})
-
-	// The artifact on disk is the graph-free variant (the shape line vecstore's
-	// Save writes), and the version was just queried.
-	kbDir := filepath.Join(dir, "index", "kb-1")
-	if err := os.MkdirAll(kbDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(kbDir, "5.index"), []byte("x"), 0o644); err != nil {
-		t.Fatalf("write index: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(kbDir, "5.index.ids"),
-		[]byte("stratum-index-1\n2\n0\n0\ngraph_free 1\n"), 0o644); err != nil {
-		t.Fatalf("write sidecar: %v", err)
-	}
-	im.mu.Lock()
-	im.lastSearch[indexKey{"kb-1", 5}] = time.Now()
-	im.mu.Unlock()
-
-	got := im.coldCandidates(context.Background(), time.Now())
-	if len(got) != 1 || got[0].key != (indexKey{"kb-1", 5}) || !got[0].reheat {
-		t.Fatalf("expected a reheat candidate for kb-1/5, got %v", got)
-	}
-}
-
-// §8.6a: a build that failed must not be re-queued on every sweep.
-func TestIndexManager_ColdPolicyBacksOffAfterFailedBuild(t *testing.T) {
-	vc := newMockVectorIndexClient()
-	ds := newDocSource()
-	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {0.5, 0.5}})
-	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
-		LRUCapacity:     4,
-		LoadWaitTimeout: 5 * time.Second,
-		ColdThreshold:   time.Minute,
-	})
-	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
-		t.Fatalf("TriggerBuild failed: %v", err)
-	}
-	waitIndexLoaded(t, im, "kb-1", 1)
-
-	aged := time.Now().Add(-time.Hour)
-	im.mu.Lock()
-	im.lastSearch[indexKey{"kb-1", 1}] = aged
-	im.coldFailedAt[indexKey{"kb-1", 1}] = time.Now()
-	im.mu.Unlock()
-	if got := im.coldCandidates(context.Background(), time.Now()); len(got) != 0 {
-		t.Fatalf("a failed reshape must back off until the version is queried again, got %v", got)
-	}
-
-	// The failure ages; the version does not become a candidate again on age
-	// alone, only once a query has landed since the failure.
-	im.mu.Lock()
-	im.coldFailedAt[indexKey{"kb-1", 1}] = aged.Add(-time.Minute)
-	im.mu.Unlock()
-	if got := im.coldCandidates(context.Background(), time.Now()); len(got) != 1 {
-		t.Fatalf("a failure older than the last query must allow another attempt, got %v", got)
-	}
-}
-
-// §8.6a: only versions this node actually holds are reshaped. A version that
-// was merely queried once, whose index never landed here, must not be built by
-// the evaluator out of nowhere — that would bypass §8.6b's build-on-demand and
-// pair with the disk retention policy into a build-then-delete loop.
-func TestIndexManager_ColdPolicySkipsVersionsThisNodeDoesNotHold(t *testing.T) {
-	vc := newMockVectorIndexClient()
-	im := newColdPolicyManager(t, vc, newDocSource(), IndexManagerConfig{
-		LRUCapacity:     4,
-		LoadWaitTimeout: 5 * time.Second,
-		ColdThreshold:   time.Minute,
-	})
-	im.SetVersionsProvider(func(context.Context) (map[string][]int64, error) {
-		return map[string][]int64{"kb-1": {1, 2}}, nil
-	})
-
-	// Queried here once, long ago — but no artifact was ever built or received.
-	im.mu.Lock()
-	im.lastSearch[indexKey{"kb-1", 1}] = time.Now().Add(-time.Hour)
-	im.mu.Unlock()
-
-	if got := im.coldCandidates(context.Background(), time.Now()); len(got) != 0 {
-		t.Fatalf("a version this node does not hold must not be reshaped, got %v", got)
-	}
 }
 
 // seedIndexFiles lays down a version's on-disk file set (the Faiss file plus
@@ -3098,5 +2972,50 @@ func TestIndexManager_BuildTreatsMalformedBaselineAsUnknown(t *testing.T) {
 	if vc.loadForAppendCalls != 0 {
 		t.Fatalf("LoadForAppend calls = %d, want 0: a malformed baseline must fail safe into a rebuild",
 			vc.loadForAppendCalls)
+	}
+}
+
+// A build already in flight must not turn a small version into a wait.
+//
+// This is the regression that made TestT4_QueryLatency flaky under owner
+// sharding: im.loading[key] is set by triggerBuild BEFORE the build is queued,
+// so a candidate that had merely been asked for the version looked "unavailable"
+// — Search skipped the scan branch (it was guarded by `!loaded && !loading`) and
+// fell into acquire(), which waits load_wait_timeout_ms and then reports
+// ErrIndexLoadTimeout. The version in that test has a dozen chunks; the scan
+// answers it in microseconds.
+//
+// The mock's Build is driven by the test, so nothing here can finish the build:
+// the only way to return a result is to scan.
+func TestIndexManager_SearchScansWhileABuildIsInFlight(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"c1"}, map[string][]float32{"c1": {1, 0}})
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:     4,
+		LoadWaitTimeout: 50 * time.Millisecond,
+	})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	key := indexKey{"kb-1", 1}
+	im.mu.Lock()
+	im.loading[key] = true // a build is on its way; it will never complete here
+	im.mu.Unlock()
+	defer func() {
+		im.mu.Lock()
+		delete(im.loading, key)
+		im.mu.Unlock()
+	}()
+
+	results, err := im.Search(context.Background(), "kb-1", 1, []float32{1, 0}, 2)
+	if err != nil {
+		t.Fatalf("a version whose build is in flight must still be answered by scanning: %v", err)
+	}
+	if len(results) != 1 || results[0].ChunkID != "c1" {
+		t.Fatalf("results = %+v, want the scanned chunk c1", results)
 	}
 }

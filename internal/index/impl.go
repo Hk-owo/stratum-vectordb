@@ -108,25 +108,23 @@ type IndexManagerConfig struct {
 	// query but is what the config file can express today.
 	CandidateN int
 
-	// ColdThreshold is how long a version may go without a Search before
-	// the background evaluator rebuilds it in the graph-free form
-	// (§8.6a). The HNSW graph dominates both build time and resident
-	// memory once vectors are quantized, and a version nobody queries
-	// does not need it; the answers stay equivalent because the
+	// ColdThreshold is how long a version may go without a Search before it is
+	// built in the graph-free form (§8.6a). The HNSW graph dominates both build
+	// time and resident memory once vectors are quantized, and a version nobody
+	// queries does not need it; the answers stay equivalent because the
 	// graph-free variants keep the quantizer and its rerank semantics.
-	// The policy is off when <= 0 (the default), which keeps the
-	// historical "every version carries a full graph" behaviour.
+	// The policy is off when <= 0 (the default), which keeps the historical
+	// "every version carries a full graph" behaviour.
 	//
-	// The evaluator applies it only to versions this node holds that are
-	// neither active nor the end of the version chain, and it reshapes in both
-	// directions: a graph-free version queried again within half the threshold
-	// gets its graph back. The gap is hysteresis, so a version near the
-	// boundary is not rebuilt on every sweep.
+	// There is no sweep interval and no background evaluator: the shape is
+	// decided INSIDE a build (coldShapeFor) and re-checked on the read path
+	// (needsReshape). A timer would decide outside every request — building
+	// artifacts nobody asked for, and unable to see §8.4's owner sets (an
+	// artifact built outside the owner set is one no query ever reaches). Both
+	// directions are covered: a version queried again within half the threshold
+	// gets its graph back, and the gap between the two bars is hysteresis so a
+	// version sitting on the boundary is not rebuilt every time.
 	ColdThreshold time.Duration
-
-	// ColdSweepInterval is how often the evaluator re-reads the access
-	// table. Zero means DefaultColdSweepInterval.
-	ColdSweepInterval time.Duration
 
 	// BuildAbandonTimeout bounds how long a half-built index artifact may sit on
 	// disk before the sweeper deletes it
@@ -200,21 +198,23 @@ type IndexManagerConfig struct {
 	// candidates it finds are then actually collected (reopen the sealed
 	// artifact, drop the dead vectors, reseal).
 	//
-	// Off by default, deliberately. The scan is free and its output is a log
-	// line; the collection rewrites a live artifact — atomically, and the
-	// version stays queryable elsewhere, but it is still a change to data an
-	// operator did not ask for. Everything that touches stored bytes should be
-	// opt-in, and the log line is what tells an operator they want to opt in.
+	// ON since 2026-10 (it was opt-in before that). The collection does rewrite a
+	// live artifact, but it is gated twice before it does: serving_replica_min
+	// requires other replicas to be serving the version (so it stays answerable
+	// while this node steps out), and gc_ratio_threshold requires enough dead
+	// weight to make the rewrite worth it. Deployments that want the pre-2026-10
+	// behaviour set `gc_enabled: false` in the config file.
 	GCEnabled bool
 
 	// IndexServingReplicaMin is how many OTHER replicas must be serving the
 	// version's index before this node may take itself out of service to collect
 	// (§8.6(d)). <= 0 means DefaultIndexServingReplicaMin.
 	//
-	// It is independent of DurabilityPolicy.Replicas on purpose (§8.2): that one
-	// protects durability — the data must survive — while this one protects READ
-	// SERVICE CAPACITY. A deployment can happily run 3 replicas for durability and
-	// require only 2 to be serving before rotating one out for maintenance.
+	// It is independent of the declared replication target on purpose (§8.2):
+	// that one protects durability — the data must survive — while this one
+	// protects READ SERVICE CAPACITY. A deployment can happily run 3 replicas for
+	// durability and require only 2 to be serving before rotating one out for
+	// maintenance.
 	IndexServingReplicaMin int
 
 	// NodeID is the node this manager runs on, used to exclude itself when
@@ -249,13 +249,30 @@ type IndexManagerConfig struct {
 	// caps the contention; the pool's interactive priority is what keeps a live write
 	// from queueing behind the sweep at all.
 	BuildConcurrency int
+
+	// BuildState reports this manager's build transitions to the node state
+	// machine (docs/storage-node-state-machine-plan.md §7, item 4). Optional:
+	// nil means they are simply not reported, which is the unit-test default.
+	//
+	// It belongs here rather than at the call sites because the manager is the
+	// single entry point every build passes through — including the one that
+	// never starts.
+	BuildState BuildStateRecorder
 }
 
-// DefaultIndexServingReplicaMin is the placeholder for IndexServingReplicaMin
-// (§8.6(d)): with the typical DurabilityPolicy.Replicas = 3 it leaves exactly one
-// replica free to rotate through maintenance. Like the other §10.4 numbers it is
-// a starting point for a deployment to adjust, not a derived value.
-const DefaultIndexServingReplicaMin = 2
+// DefaultIndexServingReplicaMin is the default for IndexServingReplicaMin (§8.6(d)):
+// how many OTHER replicas must be serving a version before this node may step out of
+// the pool to collect it.
+//
+// It is 1, not the replication factor minus one. The original 2 was written for a
+// world where every replica holds every version's index; with §8.5's on-demand builds
+// and owner sets that is no longer true — a replica nothing routes to never builds
+// the artifact, so "2 others serving" actually demanded that ALL THREE replicas hold
+// it, and collection could never start. Measured on the 3+3 cluster:
+// `others_serving=1, minimum_required=2` (docs/stress-test-report.md §E). What the
+// gate is FOR is "some other replica still answers after I leave", and 1 delivers
+// exactly that; raise it for a deployment that wants more slack while rotating.
+const DefaultIndexServingReplicaMin = 1
 
 // DefaultGCGraphRebuildRatio is the placeholder for GCGraphRebuildRatio (§8.6(d)):
 // half the artifact's vectors are dead before it is worth rebuilding a graph from
@@ -264,12 +281,6 @@ const DefaultIndexServingReplicaMin = 2
 // about to be replaced.
 const DefaultGCGraphRebuildRatio = 0.5
 
-// DefaultColdSweepInterval is how often the §8.6a evaluator re-reads the
-// access table when ColdSweepInterval is unset. The sweep only reads an
-// in-memory map, so the cost is negligible; the delay it adds is the
-// worst-case lag between a version going cold and being reshaped.
-const DefaultColdSweepInterval = time.Minute
-
 // DefaultBuildAbandonTimeout is how long a half-built artifact may sit before
 // the sweeper reclaims it. The placeholder comes from §6.3: the known target is
 // "a 100k-chunk index builds within 5 minutes", and 6x headroom keeps the
@@ -277,8 +288,8 @@ const DefaultColdSweepInterval = time.Minute
 const DefaultBuildAbandonTimeout = 30 * time.Minute
 
 // DefaultBuildAbandonSweepInterval is how often the sweeper looks. It is
-// deliberately slower than the cold evaluator: the thing it reclaims has been
-// dead for half an hour, so finding it a minute later costs nothing.
+// deliberately coarse — the thing it reclaims has been dead for half an hour,
+// so finding it a minute later costs nothing.
 const DefaultBuildAbandonSweepInterval = 5 * time.Minute
 
 // DefaultAppendMaxDeadRatio is the dead-vector share above which §8.6(c)'s
@@ -363,6 +374,17 @@ type IndexManagerImpl struct {
 	// interleaving their renames leaves an index file beside the wrong sidecar.
 	installShards [installShardCount]sync.Mutex
 
+	// readInflight merges concurrent ReadIndexFiles calls for the SAME version:
+	// the first caller reads the pair off disk, the rest wait for it and share
+	// the bytes (§5.8's 读盘合并). Guarded by readMu, which is held only long
+	// enough to look up or publish the entry — never across the disk read.
+	readInflight map[indexKey]*artifactRead
+	readMu       sync.Mutex
+
+	// readFile is os.ReadFile. Injectable so a test can count and gate the reads
+	// (the same shape as listDocIDs / readChunkVector above).
+	readFile func(string) ([]byte, error)
+
 	// sizeByKey tracks each loaded index's estimated in-memory footprint
 	// (vector payload bytes from the last build; 0 when unknown, e.g. a
 	// pre-policy index loaded without a size sidecar). loadedBytes is
@@ -389,14 +411,14 @@ type IndexManagerImpl struct {
 	// on-disk retention policy). A successful build seeds the entry with
 	// its own timestamp, so a version that is built but never queried
 	// still ages into cold; a version with no entry at all has been
-	// neither searched nor built by this process, so the evaluator does
+	// neither searched nor built by this process, so the cold policy does
 	// not know it exists. Guarded by mu.
 	lastSearch map[indexKey]time.Time
 
 	// builtGraphFree records, per version, whether the index currently
-	// built for it is the graph-free variant (§8.6a). The evaluator uses
-	// it to leave an already-cold-shaped version alone instead of
-	// re-triggering a rebuild on every sweep. Dropped with the version
+	// built for it is the graph-free variant (§8.6a). The read path reads
+	// it (needsReshape) to leave a version whose shape already matches its
+	// traffic alone. Dropped with the version
 	// or KB, like the access record. Guarded by mu.
 	builtGraphFree map[indexKey]bool
 
@@ -404,20 +426,8 @@ type IndexManagerImpl struct {
 	// process has neither queried nor built has no access record at all, so it
 	// is aged from here: after a restart every version is in that state, and
 	// stamping them "now" both avoids reshaping a whole knowledge base at boot
-	// and avoids the evaluator standing still forever. Guarded by mu.
+	// and avoids the cold policy standing still forever. Guarded by mu.
 	startedAt time.Time
-
-	// coldVersions enumerates the authoritative version set (§8.6a): per
-	// knowledge base, which versions exist. The cold evaluator walks THIS, not
-	// the local access table — the table only answers "how long since this was
-	// queried here", and using it as the enumeration source makes the policy
-	// forget every version on each restart. Nil disables the evaluator.
-	coldVersions func(ctx context.Context) (map[string][]int64, error)
-
-	// coldFailedAt records, per version, when a build last failed. The
-	// evaluator consults it to back off: without it, a build that keeps failing
-	// is re-queued on every sweep. Guarded by mu.
-	coldFailedAt map[indexKey]time.Time
 
 	// lastPersist records, per version, when its access time was last written
 	// to disk (the .index.used sidecar). It is only a throttle — the value that
@@ -427,11 +437,6 @@ type IndexManagerImpl struct {
 	// half-built index artifacts (§6). abandonCancel is nil while it is off.
 	abandonCancel context.CancelFunc
 	abandonWG     sync.WaitGroup
-
-	// coldCancel/coldWG govern the background cold-version evaluator
-	// (§8.6a). coldCancel is nil while the policy is off or stopped.
-	coldCancel context.CancelFunc
-	coldWG     sync.WaitGroup
 
 	// activeVersions reports, per knowledge base, the version it is currently
 	// serving. §8.6(d)'s scanner covers only those: a version WITH a successor
@@ -518,7 +523,8 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		sizeByKey:       make(map[indexKey]int64),
 		lastSearch:      make(map[indexKey]time.Time),
 		builtGraphFree:  make(map[indexKey]bool),
-		coldFailedAt:    make(map[indexKey]time.Time),
+		readInflight:    make(map[indexKey]*artifactRead),
+		readFile:        os.ReadFile,
 		lastPersist:     make(map[indexKey]time.Time),
 		startedAt:       time.Now(),
 		deletedKBs:      make(map[string]bool),
@@ -606,9 +612,8 @@ func (im *IndexManagerImpl) SetBuildDataSources(
 }
 
 // Close releases the vecstore gRPC connection, if one was created. It
-// also stops the §8.6a cold-version evaluator.
+// also stops the background sweeps this node runs.
 func (im *IndexManagerImpl) Close() error {
-	im.StopColdPolicy()
 	im.StopAbandonSweeper()
 	im.StopGCScanner()
 	if im.vecstoreConn != nil {
@@ -681,6 +686,21 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 		return nil, stratumerrors.ErrIndexMaintenance
 	}
 
+	// §8.6a reheat: a graph-free artifact whose version has become hot again gets
+	// its graph back.
+	//
+	// This runs BEFORE recordSearch, and that order is the whole trick: recordSearch
+	// stamps "now", and the question is how long it had been since the PREVIOUS
+	// query. With the stamp already written every version would look hot and the
+	// reheat would fire on every query.
+	if im.needsReshape(kbID, versionID) {
+		im.loggerOrNop().Info("index: version's shape no longer matches its traffic; rebuilding (§8.6a)",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+		if err := im.TriggerBuild(ctx, kbID, versionID); err != nil {
+			im.loggerOrNop().Warn("index: could not schedule the reshape",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		}
+	}
 	im.recordSearch(key)
 
 	// Restore path: if the version's index is not already loaded (e.g.
@@ -693,6 +713,30 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 	_, loaded := im.loaded[key]
 	_, loading := im.loading[key]
 	im.mu.Unlock()
+	// A build is already in flight for this version. Do NOT wait it out here:
+	// §8.6b's rule is "a small version is answered by scanning", and what decides
+	// that is the version's SIZE — not whether somebody happens to be building an
+	// index for it. Falling through to acquire() in this state is what turned "a
+	// build is in progress" into a load_wait_timeout stall followed by
+	// ErrIndexLoadTimeout, for versions of a dozen chunks whose scan takes
+	// microseconds (docs/stress-test-report.md §E.4).
+	//
+	// Deliberately no loadFromDisk on this path: loading==true means the artifact
+	// for this key is being written right now, and reading a half-written one is
+	// exactly what the build's own .tmp+rename discipline exists to prevent.
+	if !loaded && loading {
+		bruteStart := time.Now()
+		answered, results, terr := im.tryBruteForce(ctx, kbID, versionID, vector, topK)
+		bruteforceDur = time.Since(bruteStart)
+		if terr != nil {
+			return nil, terr
+		}
+		if answered {
+			return results, nil
+		}
+		// Too large to scan: the build in flight is the only way to answer, so
+		// fall through and wait for it (bounded by load_wait_timeout_ms).
+	}
 	if !loaded && !loading {
 		loadStart := time.Now()
 		loadErr := im.loadFromDisk(ctx, kbID, versionID)
@@ -820,7 +864,7 @@ func (im *IndexManagerImpl) emptySearchMeansTheDataIsStillLanding(ctx context.Co
 // is why a post-restart sweep could outrank live work; reconcile now uses
 // TriggerBuildBackfill below.
 func (im *IndexManagerImpl) TriggerBuild(ctx context.Context, kbID string, versionID int64) error {
-	return im.triggerBuild(kbID, versionID, false, BuildPriorityInteractive)
+	return im.triggerBuild(kbID, versionID, im.coldShapeFor(ctx, kbID, versionID), BuildPriorityInteractive)
 }
 
 // TriggerBuildBackfill schedules a build nobody is waiting for yet — a head start,
@@ -829,17 +873,134 @@ func (im *IndexManagerImpl) TriggerBuild(ctx context.Context, kbID string, versi
 // It yields to every interactive build, so no backlog of these can starve a live
 // write of its build.
 func (im *IndexManagerImpl) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
-	return im.triggerBuild(kbID, versionID, false, BuildPriorityBackfill)
+	return im.triggerBuild(kbID, versionID, im.coldShapeFor(ctx, kbID, versionID), BuildPriorityBackfill)
 }
 
-// TriggerBuildGraphFree builds the version without an HNSW graph (§8.6a), for a
-// cold version whose index is unlikely to be queried: the graph is what makes
-// it expensive to build and to keep resident, and a scan of quantized codes is
-// an acceptable price for a version nobody is asking about.
-func (im *IndexManagerImpl) TriggerBuildGraphFree(ctx context.Context, kbID string, versionID int64) error {
-	// Backfill priority: §8.6a reshapes a COLD version — by definition one nobody is
-	// querying — so this is a head start, not something anyone is waiting for.
-	return im.triggerBuild(kbID, versionID, true, BuildPriorityBackfill)
+// needsReshape reports whether the shape of this version's artifact no longer
+// matches how the version is being used — the artifact is graph-free and the
+// version has heated up, or it has a graph and the version has gone idle.
+//
+// BOTH directions live here because a query is the only thing that can notice
+// either of them. A build decides its shape from coldShapeFor, but a version whose
+// artifact already exists is not built again on its own: nothing about the passage
+// of time rebuilds it. So a query against an artifact whose shape no longer fits
+// is what schedules the rebuild — and "the caller is here, the shape is wrong, fix
+// it" is exactly the demand-driven trigger §8.6(b) asks for.
+//
+// Half the threshold for the reheat direction, the whole threshold for the idle
+// one: the gap between the bars is hysteresis, so a version sitting near the
+// boundary is not rebuilt back and forth on consecutive queries. That gap is
+// inherited from the background evaluator this replaced (§8.6a).
+//
+// It does not keep any "already reshaping" state: triggerBuild de-duplicates
+// in-flight builds, so a second query arriving during the rebuild is a no-op
+// rather than a second build.
+func (im *IndexManagerImpl) needsReshape(kbID string, versionID int64) bool {
+	threshold := im.cfg.ColdThreshold
+	if threshold <= 0 {
+		return false // policy off: every artifact is graphed and stays that way
+	}
+	key := indexKey{kbID, versionID}
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	graphFree, known := im.shapeGraphFreeLocked(key)
+	if !known {
+		return false // no artifact here to reshape
+	}
+	last, ok := im.lastSearch[key]
+	if !ok {
+		return false
+	}
+	age := time.Since(last)
+	if graphFree {
+		return age <= threshold/2 // hot again: restore the graph
+	}
+	return age > threshold // gone idle: drop the graph
+}
+
+// operatorActive reports whether the control layer has designated versionID as the
+// version this knowledge base serves — RollbackVersion is the only thing that sets
+// it (internal/raft/state_machine.go).
+//
+// A read failure answers "no", so the shape falls back to the cold threshold. That
+// direction is deliberate: the caller has already decided to build something, and
+// refusing to build on an unreachable metadata read would trade a possibly-wrong
+// shape for a version that cannot be served at all.
+func (im *IndexManagerImpl) operatorActive(ctx context.Context, kbID string, versionID int64) bool {
+	im.mu.Lock()
+	provider := im.activeVersions
+	im.mu.Unlock()
+	if provider == nil {
+		return false
+	}
+	active, err := provider(ctx)
+	if err != nil {
+		return false
+	}
+	id, ok := active[kbID]
+	return ok && id == versionID
+}
+
+// coldShapeFor decides the SHAPE a build of this version should use, from this
+// node's own access record: a version nothing has asked about recently is built
+// graph-free (§8.6a), and one that is being served keeps its graph.
+//
+// It replaces the background evaluator that used to make this decision on a
+// timer — sweepCold, which walked every version and called TriggerBuildGraphFree
+// directly. That timer was wrong in two ways at once, and both came from deciding
+// OUTSIDE a request:
+//
+//   - It built things nobody had asked for. That is the eager behaviour §8.6(b)
+//     replaced; measured on the 3+3 cluster, a 900-version import produced 404
+//     backfill builds and 3.5 s of build-pool queueing for versions nothing had
+//     ever queried.
+//   - It ignored §8.4's owner sets. A version's index lives on the replicas the
+//     router routes to, so a node outside that set building one produces an
+//     artifact no query will ever reach — and its lastSearch can never say
+//     otherwise, because queries do not arrive there.
+//
+// Deciding here has neither problem: a build only happens because something asked
+// for the version, and "did anything ask on THIS node recently" is exactly the
+// question the shape should answer. ColdThreshold <= 0 disables the policy, which
+// keeps the historical "every version carries a full graph" behaviour.
+//
+// USAGE is the whole criterion. It used to be two proxies on top of the silence —
+// "is this the control layer's ActiveVersionID" and "is this the end of the version
+// chain" — and both are obsolete under this design. The active pointer is moved
+// only by RollbackVersion, so it says nothing about a knowledge base nobody has
+// rolled back; the chain end is just "the newest version number", which correlates
+// with being read and is not the same thing. The router already ranks versions by
+// actual use (internal/router/index_priority.go scores recent queries with decay),
+// and the shape should agree with it rather than with a version counter.
+func (im *IndexManagerImpl) coldShapeFor(ctx context.Context, kbID string, versionID int64) bool {
+	threshold := im.cfg.ColdThreshold
+	if threshold <= 0 {
+		return false
+	}
+	// A version the OPERATOR has made active is never built graph-free, however
+	// long it has gone unqueried. That is the one "active" signal worth keeping:
+	// RollbackVersion is an explicit "serve this one from now on", which is a
+	// stronger statement of use than any query.
+	//
+	// The other signal that used to sit here — "is this the end of the version
+	// chain" — is gone. It was a proxy for popularity ("the newest version is
+	// probably the one being read"), and a version counter is a poor substitute for
+	// the actual record of who asked. The router already ranks versions by recent
+	// queries (internal/router/index_priority.go), so this agrees with it.
+	if im.operatorActive(ctx, kbID, versionID) {
+		return false
+	}
+	key := indexKey{kbID, versionID}
+	im.mu.Lock()
+	last, ok := im.lastSearch[key]
+	if !ok {
+		// Never asked on this node: age it from startup rather than treating it as
+		// permanently hot (the policy would never apply) or as instantly cold (a
+		// restart would reshape everything at once).
+		last = im.startedAt
+	}
+	im.mu.Unlock()
+	return time.Since(last) >= threshold
 }
 
 // StartAbandonSweeper reclaims index artifacts whose build was abandoned
@@ -1000,244 +1161,6 @@ func (im *IndexManagerImpl) removeIfStale(dir, kbID string, e os.DirEntry, now t
 		zap.Duration("age", age), zap.Duration("timeout", timeout))
 }
 
-// StartColdPolicy starts the background evaluator that reshapes versions
-// which have gone cold (§8.6a). It is a no-op when ColdThreshold <= 0, so
-// a deployment that does not configure a threshold keeps the historical
-// "every version carries a full graph" behaviour, and it is idempotent:
-// calling it twice leaves one evaluator running.
-//
-// The policy is intentionally local and passive, per the design's "自动、
-// 存储层自己判": it reads only this node's own access table, takes no
-// part in consensus, and never talks to other nodes. Two replicas may
-// therefore reshape at slightly different times; that is harmless, since
-// the graph-free variant answers the same queries (its quantizer and
-// rerank semantics are unchanged) and each node's build goes through the
-// same Save + §8.4 distribution path as any other build.
-func (im *IndexManagerImpl) StartColdPolicy() {
-	if im.cfg.ColdThreshold <= 0 {
-		return
-	}
-	im.mu.Lock()
-	if im.coldCancel != nil {
-		im.mu.Unlock()
-		return // already running
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	im.coldCancel = cancel
-	im.mu.Unlock()
-
-	interval := im.cfg.ColdSweepInterval
-	if interval <= 0 {
-		interval = DefaultColdSweepInterval
-	}
-	im.coldWG.Add(1)
-	go func() {
-		defer im.coldWG.Done()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-ticker.C:
-				im.sweepCold(ctx, now)
-			}
-		}
-	}()
-}
-
-// StopColdPolicy stops the evaluator and waits for the running sweep to
-// return. Safe to call when the policy was never started.
-func (im *IndexManagerImpl) StopColdPolicy() {
-	im.mu.Lock()
-	cancel := im.coldCancel
-	im.coldCancel = nil
-	im.mu.Unlock()
-	if cancel != nil {
-		cancel()
-		im.coldWG.Wait()
-	}
-}
-
-// sweepCold reshapes every version whose shape no longer matches its traffic:
-// a version that went cold is rebuilt graph-free, and one that came back is
-// rebuilt with its graph. Scheduling is asynchronous (triggerBuild spawns the
-// build), so a sweep never blocks on a vecstore build; a version already
-// building is skipped by triggerBuild itself.
-func (im *IndexManagerImpl) sweepCold(ctx context.Context, now time.Time) {
-	for _, c := range im.coldCandidates(ctx, now) {
-		if ctx.Err() != nil {
-			return
-		}
-		key := c.key
-		var err error
-		if c.reheat {
-			im.logger.Info("index: version is queried again; restoring its graph (§8.6a)",
-				zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID))
-			err = im.TriggerBuildBackfill(ctx, key.kbID, key.versionID)
-		} else {
-			im.logger.Info("index: version is cold; reshaping graph-free (§8.6a)",
-				zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID))
-			err = im.TriggerBuildGraphFree(ctx, key.kbID, key.versionID)
-		}
-		if err != nil {
-			im.logger.Warn("index: could not schedule the reshape",
-				zap.String("kb_id", key.kbID), zap.Int64("version_id", key.versionID), zap.Error(err))
-		}
-	}
-}
-
-// coldCandidate is one version the §8.6a evaluator wants to reshape, with the
-// shape it wants.
-type coldCandidate struct {
-	key indexKey
-	// reheat is true when the version is being queried again and needs its HNSW
-	// graph back; false when it went cold and should be rebuilt graph-free.
-	reheat bool
-}
-
-// coldCandidates returns this sweep's reshapes, in a deterministic
-// (kbID, versionID) order.
-//
-// It walks the AUTHORITATIVE version set (coldVersions, from the control
-// layer's metadata), not the local access table: the table only supplies "how
-// long since this version was queried here", and using it as the enumeration
-// source makes the policy forget every version on each restart (§8.6a). Three
-// filters decide what is left:
-//
-//   - An ACTIVE version is never reshaped. The design says "a cold version —
-//     non-active and long unqueried", and dropping the first half turns the
-//     knowledge base's serving version into an O(n) scan. When the control
-//     layer has no active pointer (the common case: CreateVersion does not move
-//     it, only RollbackVersion does), the end of the version chain — the
-//     largest versionID — is what actually serves, so it is excluded too.
-//   - A version THIS NODE DOES NOT HOLD is never reshaped. A version that was
-//     merely queried once, whose index never landed here, must not be built by
-//     the evaluator out of nowhere: that bypasses §8.6b's build-on-demand and
-//     pairs with the disk retention policy into a build-then-delete loop.
-//   - A FAILED build backs off. Re-enumerating every sweep must not mean
-//     re-queuing a build that keeps failing.
-//
-// The shape is read from the artifact's sidecar (artifactGraphFree), not from
-// the in-memory record: the latter is lost on restart, which would make the
-// evaluator rebuild an already graph-free version on every sweep.
-func (im *IndexManagerImpl) coldCandidates(ctx context.Context, now time.Time) []coldCandidate {
-	threshold := im.cfg.ColdThreshold
-	im.mu.Lock()
-	versionsProvider := im.coldVersions
-	activeProvider := im.activeVersions
-	im.mu.Unlock()
-
-	if versionsProvider == nil {
-		return nil
-	}
-	authority, err := versionsProvider(ctx)
-	if err != nil {
-		im.logger.Warn("index: cold policy could not read the version set", zap.Error(err))
-		return nil
-	}
-
-	active := map[string]int64{}
-	if activeProvider != nil {
-		if a, err := activeProvider(ctx); err != nil {
-			im.logger.Warn("index: cold policy could not read the active versions", zap.Error(err))
-		} else {
-			active = a
-		}
-	}
-
-	im.mu.Lock()
-	defer im.mu.Unlock()
-
-	var out []coldCandidate
-	for kbID, versionIDs := range authority {
-		if im.deletedKBs[kbID] {
-			continue
-		}
-		newest := newestVersion(versionIDs)
-		for _, versionID := range versionIDs {
-			key := indexKey{kbID, versionID}
-			if im.deletedVersions[key] || im.loading[key] {
-				continue
-			}
-			// The version serving queries is never reshaped: the active one, and
-			// the end of the chain (what serves when the control layer has no
-			// active pointer). They can be different versions, so both are
-			// checked rather than one standing in for the other.
-			if act, ok := active[kbID]; ok && versionID == act {
-				continue
-			}
-			if versionID == newest {
-				continue
-			}
-			if !im.holdsArtifactLocked(key) {
-				continue
-			}
-			last, ok := im.lastSearch[key]
-			if !ok {
-				// Never seen by this process: age it from startup rather than
-				// treating it as permanently hot (the policy would stall) or as
-				// immediately cold (a restart would reshape the whole node).
-				last = im.startedAt
-			}
-			if failedAt, ok := im.coldFailedAt[key]; ok && !last.After(failedAt) {
-				continue // nothing queried it since the failure: back off
-			}
-			age := now.Sub(last)
-			graphFree, known := im.shapeGraphFreeLocked(key)
-			switch {
-			case !known || !graphFree:
-				if age >= threshold {
-					out = append(out, coldCandidate{key: key})
-				}
-			case age <= threshold/2:
-				// Queried again within half the cold window: restore the graph.
-				// The gap between the two thresholds is hysteresis — without it
-				// a version sitting near the boundary is rebuilt, and
-				// redistributed, on every sweep, in both directions.
-				out = append(out, coldCandidate{key: key, reheat: true})
-			}
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].key.kbID != out[j].key.kbID {
-			return out[i].key.kbID < out[j].key.kbID
-		}
-		return out[i].key.versionID < out[j].key.versionID
-	})
-	return out
-}
-
-// newestVersion returns the largest version id in ids (0 for an empty set).
-func newestVersion(ids []int64) int64 {
-	var newest int64
-	for _, id := range ids {
-		if id > newest {
-			newest = id
-		}
-	}
-	return newest
-}
-
-// holdsArtifactLocked reports whether this node holds the version's index
-// artifact — in memory, or as a file on disk. The question is "do we have it",
-// not "was it ever queried": a query puts a version in the access table without
-// implying this node has its index, and §8.6a reshapes only what is here.
-// The stat happens under the lock on purpose: the caller is a low-frequency
-// background sweep.
-func (im *IndexManagerImpl) holdsArtifactLocked(key indexKey) bool {
-	if _, ok := im.loaded[key]; ok {
-		return true
-	}
-	if _, ok := im.builtGraphFree[key]; ok {
-		return true
-	}
-	if im.cfg.IndexDataDir == "" {
-		return false
-	}
-	return fileExists(im.indexPath(key.kbID, key.versionID))
-}
-
 // shapeGraphFreeLocked reports the version's current index shape and whether it
 // is known. The in-memory record is consulted first (a version this process
 // just built needs no disk read); the sidecar is the fallback, and the only
@@ -1297,6 +1220,12 @@ func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree
 	im.loading[key] = true
 	im.mu.Unlock()
 
+	// Reported with the lock released, and BEFORE the build is queued: the fact
+	// is "a build is on its way", and the queueing below is what could refuse
+	// it. A version already building is not an error — the early return above
+	// makes this a no-op on the state machine, which treats a repeat as idempotent.
+	im.reportBuildScheduled(kbID, versionID)
+
 	// Queued, not spawned. The pool bounds how many builds run at once, and lets a
 	// build somebody is waiting for jump ahead of a reconcile sweep's backfill.
 	if !im.submitBuild(buildRequest{
@@ -1313,9 +1242,71 @@ func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree
 		im.mu.Lock()
 		delete(im.loading, key)
 		im.mu.Unlock()
+		// The state machine needs the same correction, and it is exactly the case a
+		// callback-based report would miss: no build ever ran, so no completion
+		// callback will fire, and the version would read BUILDING forever.
+		im.reportBuildFailed(kbID, versionID, "the build pool is closed")
 		return errors.New("index: the build pool is closed")
 	}
 	return nil
+}
+
+// reportBuildScheduled, reportBuildSucceeded, reportBuildFailed and
+// reportIndexInstalled forward one transition to the node state machine, if one
+// is wired.
+//
+// A refusal is logged, never returned: these run around work whose outcome has
+// already been decided — a build that finished, an artifact already on disk —
+// and a bookkeeping disagreement must not turn into a build failure the caller
+// acts on.
+func (im *IndexManagerImpl) reportBuildScheduled(kbID string, versionID int64) {
+	if im.cfg.BuildState == nil {
+		return
+	}
+	if err := im.cfg.BuildState.BuildScheduled(kbID, versionID); err != nil {
+		im.logger.Warn("index: build start not recorded in the node state machine",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
+}
+
+func (im *IndexManagerImpl) reportBuildSucceeded(kbID string, versionID int64) {
+	if im.cfg.BuildState == nil {
+		return
+	}
+	if err := im.cfg.BuildState.BuildSucceeded(kbID, versionID); err != nil {
+		im.logger.Warn("index: build success not recorded in the node state machine",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
+}
+
+func (im *IndexManagerImpl) reportBuildFailed(kbID string, versionID int64, detail string) {
+	if im.cfg.BuildState == nil {
+		return
+	}
+	if err := im.cfg.BuildState.BuildFailed(kbID, versionID, detail); err != nil {
+		im.logger.Warn("index: build failure not recorded in the node state machine",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
+}
+
+func (im *IndexManagerImpl) reportIndexDropped(kbID string, versionID int64) {
+	if im.cfg.BuildState == nil {
+		return
+	}
+	if err := im.cfg.BuildState.IndexDropped(kbID, versionID); err != nil {
+		im.logger.Warn("index: retention drop not recorded in the node state machine",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
+}
+
+func (im *IndexManagerImpl) reportIndexInstalled(kbID string, versionID int64) {
+	if im.cfg.BuildState == nil {
+		return
+	}
+	if err := im.cfg.BuildState.IndexInstalled(kbID, versionID); err != nil {
+		im.logger.Warn("index: install not recorded in the node state machine",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
 }
 
 // submitBuild hands a request to the pool, starting it on first use.
@@ -1393,13 +1384,6 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 
 		im.mu.Lock()
 		delete(im.loading, key)
-		if status != types.IndexStatusReady {
-			// Back off the cold evaluator: it re-enumerates on every sweep, so
-			// without a record of this failure a build that cannot succeed is
-			// re-queued forever (both the graph-free reshape and the reheat go
-			// through here).
-			im.coldFailedAt[key] = time.Now()
-		}
 		if status == types.IndexStatusReady {
 			// Make room before inserting the new index, then release whatever it
 			// evicted on the vecstore side once the lock is gone (see
@@ -1408,9 +1392,8 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 			im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
 			im.sizeByKey[key] = sizeBytes
 			im.loadedBytes += sizeBytes
-			// Remember which shape is now on disk, so the cold
-			// evaluator does not rebuild an already graph-free version
-			// on every sweep (§8.6a).
+			// Remember which shape is now on disk, so a version whose
+			// shape already matches its traffic is not rebuilt (§8.6a).
 			im.builtGraphFree[key] = graphFree
 			// A version nobody has searched yet has no access record;
 			// seed one so the cold policy has a baseline to age from
@@ -1435,6 +1418,16 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 			// could drop it runs on the *next* build — possibly one that fires
 			// while this distribution is still queued behind the push semaphore.
 			im.recordInterestNow(kbID, versionID)
+		}
+
+		// Report the outcome to the node state machine before the completion
+		// callbacks run. Same fact, two audiences: the callbacks carry the status
+		// to the control layer, the state machine is the local half — and a reader
+		// of one should not be able to miss the other.
+		if status == types.IndexStatusReady {
+			im.reportBuildSucceeded(kbID, versionID)
+		} else {
+			im.reportBuildFailed(kbID, versionID, "index build reported "+status.String())
 		}
 
 		// Invoke callbacks with retry. The on-disk retention policy is
@@ -2420,7 +2413,7 @@ func (im *IndexManagerImpl) RecordInterest(kbID string, versionID int64) {
 }
 
 // recordAccess is where "something asked for this version" lands: the in-memory
-// access table the cold evaluator reads, and — throttled — the on-disk .used
+// access table the cold policy reads, and — throttled — the on-disk .used
 // sidecar the retention policy reads.
 func (im *IndexManagerImpl) recordAccess(key indexKey) {
 	now := time.Now()
@@ -2453,7 +2446,7 @@ func (im *IndexManagerImpl) recordAccess(key indexKey) {
 // the retention pass that would drop it runs on every later build — so the shield
 // has to be on disk before the next one, not up to a minute later. It maintains
 // only lastPersist (the throttle's own bookkeeping); lastSearch is the cold
-// evaluator's baseline and seedAccessLocked already set it, where a real query
+// policy's baseline and seedAccessLocked already set it, where a real query
 // outranks a build as evidence.
 func (im *IndexManagerImpl) recordInterestNow(kbID string, versionID int64) {
 	if im.retentionProtectWindow() <= 0 || im.cfg.IndexDataDir == "" {
@@ -2473,7 +2466,7 @@ func (im *IndexManagerImpl) recordInterestNow(kbID string, versionID int64) {
 // was never searched here, when its index was last built), and whether
 // this process knows the version at all. It is the fact the cold-version
 // policy reads; false means "neither searched nor built here", in which
-// case the evaluator never sees the version and leaves it alone.
+// case the cold policy never sees the version and leaves it alone.
 func (im *IndexManagerImpl) LastAccess(kbID string, versionID int64) (time.Time, bool) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
@@ -2484,7 +2477,7 @@ func (im *IndexManagerImpl) LastAccess(kbID string, versionID int64) (time.Time,
 // seedAccessLocked gives the cold policy a baseline for key when it has
 // none. A version this node just built or just received counts as "known
 // here from now on": without a record the version would be invisible to
-// the evaluator (§8.6a enumerates the access table, not the Raft state
+// the policy (coldShapeFor reads this access table, not the Raft state
 // machine), so a version nobody ever queries could never age into cold.
 // An existing record is left alone — a real query is better evidence than
 // a build, and re-seeding on every build would keep a version that is
@@ -2954,6 +2947,12 @@ func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string,
 				return fmt.Errorf("index: EnforceDiskRetention(%s): remove %s: %w", kbID, f.base+suffix, err)
 			}
 		}
+		// docs/storage-node-state-machine-plan.md §5.2 and §7 item 5: the disk is
+		// the authority and the state machine is its projection, so a version
+		// whose artifact just went away stops being READY here. Reported per
+		// version rather than in a batch, because the machine's correction is
+		// per version too and this pass is already O(files).
+		im.reportIndexDropped(kbID, f.versionID)
 	}
 	return nil
 }

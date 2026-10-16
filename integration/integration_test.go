@@ -219,11 +219,21 @@ func TestIntegration_CreateKB_CreateVersion_Query(t *testing.T) {
 	}
 	_ = createVerResp.VersionId
 
-	// Step 3: Set created version to READY (index build runs async).
-	// In the mock, TriggerBuild runs synchronously in a goroutine;
-	// wait for it to complete.
+	// Step 3: ask for the version's index.
+	//
+	// This used to write INDEX_STATUS_READY straight into the metadata and sleep,
+	// which is not the same thing as having an index: §8.6(b) builds a version only
+	// when something asks, so a query against a version nobody built now fails with
+	// "index not ready" — correctly. WarmupVersion is the ask (it marks the version
+	// PENDING, registers interest so retention keeps the artifact, and triggers the
+	// build), which is what an operator or a query would do.
+	if _, err := cluster.AdminClient.WarmupVersion(ctx, &pb.WarmupVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       createVerResp.VersionId,
+	}); err != nil {
+		t.Fatalf("WarmupVersion: %v", err)
+	}
 	time.Sleep(100 * time.Millisecond)
-	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, createVerResp.VersionId, types.IndexStatusReady, 0)
 
 	// Step 4: Query with explicit version ID.
 	queryVector := []float32{0.1, 0.2, 0.3, 0.4}

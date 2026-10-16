@@ -58,6 +58,13 @@ type QueryServiceImpl struct {
 	// and therefore stays behind forever. See the freshness check in Query.
 	backfiller Backfiller
 
+	// indexFetcher asks the other replicas for a version's built index. It is what
+	// keeps a replica that does not build for itself (not the version's owner
+	// head, docs/index-owner-sharding-plan.md §5.2) from staying cold forever
+	// when §8.4's fire-and-forget push never reached it. Optional: without it the
+	// PENDING path builds locally, which is the behaviour before on-demand fetch.
+	indexFetcher IndexFetcher
+
 	// pulls records the catch-up goroutines in flight, keyed by (kbID, versionID),
 	// so a burst of queries on a lagging replica starts ONE pull rather than one
 	// each (M1 of docs/code-review-2026-09-24.md). Guarded by pullMu and created
@@ -100,6 +107,23 @@ type Backfiller interface {
 // simply never catches up on demand, which is the pre-existing behaviour.
 func (s *QueryServiceImpl) SetBackfiller(b Backfiller) {
 	s.backfiller = b
+}
+
+// IndexFetcher asks the other replicas whether any holds a version's built index,
+// and installs the first one that answers. plane.LocalDataPlane's
+// FetchIndexFromPeers satisfies it.
+//
+// It reports installed=false with a nil error when nobody had it — an ordinary
+// answer, not a failure, and the caller falls through to building.
+type IndexFetcher interface {
+	FetchIndexFromPeers(ctx context.Context, kbID string, versionID int64) (installed bool, err error)
+}
+
+// SetIndexFetcher wires the on-demand artifact fetch. Optional: without it a
+// queried replica builds the index for itself, which is correct — it is the
+// fallback — but it skips the cheap route of taking a peer's artifact.
+func (s *QueryServiceImpl) SetIndexFetcher(f IndexFetcher) {
+	s.indexFetcher = f
 }
 
 // startBackgroundPull brings this node's history up to versionID, unless an
@@ -408,6 +432,29 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		// Triggering rather than waiting is deliberate: the build runs off this
 		// request (the caller keeps its own deadline), and every retry the station
 		// or the client makes gets a finished index.
+		// docs/index-owner-sharding-plan.md §4.2: the two-step rule for a node that
+		// has been asked for a version. First ask whether a PEER already built this
+		// artifact — installing it is a round trip, building it is minutes — and
+		// fall back to building here if nobody has one.
+		//
+		// Building is the ORDINARY path for the first query after a version is
+		// created: at that point nobody has the artifact. The router decides which
+		// nodes are asked at all (§5), so this runs on the versions a caller
+		// actually wants and nowhere else.
+		if s.indexFetcher != nil {
+			fetched, fetchErr := s.indexFetcher.FetchIndexFromPeers(ctx, kbID, versionID)
+			if fetchErr != nil {
+				s.logger.Debug("query: asking peers for the index artifact failed",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(fetchErr))
+			} else if fetched {
+				// The artifact is on this node's disk and loaded — InstallIndex does
+				// both. This request was already decided against the index state read
+				// above, so it refuses; but the refusal is now index_not_ready rather
+				// than version_pending, because the version is no longer waiting on
+				// anything. The station's retry lands on a replica that has the index.
+				return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrIndexNotReady)
+			}
+		}
 		if err := s.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
 			s.logger.Debug("query: could not trigger a lazy build for a PENDING version",
 				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))

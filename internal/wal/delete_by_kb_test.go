@@ -12,7 +12,6 @@ import (
 // cover the real log and the in-memory one.
 type walReader interface {
 	ChangesInRange(ctx context.Context, kbID string, fromExclusive, toInclusive int64) (map[int64]VersionDelta, error)
-	ChangesFor(ctx context.Context, kbID string, versionID int64) ([]types.DocChange, bool, error)
 	RecoverCursors(ctx context.Context) (map[string]int64, error)
 	Recover(ctx context.Context) ([]types.PendingRecord, error)
 }
@@ -55,10 +54,12 @@ func assertOneKnowledgeBaseDropped(t *testing.T, w walReader, dropped, kept stri
 	// The half a too-wide rewrite would break: the other knowledge base's replay
 	// input is what a lagging peer asks for.
 	for _, v := range keptVersions {
-		if changes, ok, err := w.ChangesFor(ctx, kept, v); err != nil {
-			t.Fatalf("ChangesFor(%s, %d): %v", kept, v, err)
-		} else if !ok || len(changes) == 0 {
-			t.Errorf("kept knowledge base lost the replay input for v%d (ok=%v, %d changes)", v, ok, len(changes))
+		deltas, err := w.ChangesInRange(ctx, kept, v-1, v)
+		if err != nil {
+			t.Fatalf("ChangesInRange(%s, %d): %v", kept, v, err)
+		}
+		if delta, ok := deltas[v]; !ok || len(delta.Changes) == 0 {
+			t.Errorf("kept knowledge base lost the replay input for v%d (ok=%v)", v, ok)
 		}
 	}
 }

@@ -19,7 +19,7 @@ import (
 	"stratum/internal/versiondoc"
 )
 
-// Follower implements FollowerSync. On PullVersion it opens a
+// Follower implements FollowerSync. On PullVersionData it opens a
 // server-side streaming connection to the leader's DataSyncService,
 // applies each SyncEntry to the local stores, and then triggers an
 // HNSW index build via IndexManager.
@@ -52,7 +52,7 @@ type Follower struct {
 
 	// pullDialTimeout bounds the connection handshake of a pull, and ONLY the
 	// handshake. Zero means DefaultPullDialTimeout. Tests set it to prove the
-	// bound does not leak onto the transfer (see PullVersionWith).
+	// bound does not leak onto the transfer (see PullVersionData).
 	pullDialTimeout time.Duration
 }
 
@@ -205,27 +205,18 @@ func NewFollower(
 	}
 }
 
-// PullVersion implements FollowerSync.
-// PullVersionOptions controls what a pull does beyond fetching the data.
-type PullVersionOptions struct {
-	// SkipIndexBuild leaves the index unbuilt after the data lands. It is what
-	// a version that is not the active one wants (Stratum_设计文档v13.md §8.6b):
-	// the data has to be here, but its index is built lazily, on first query.
-	SkipIndexBuild bool
-}
-
-func (f *Follower) PullVersion(ctx context.Context, leaderAddr string, kbID string, versionID int64) error {
-	return f.PullVersionWith(ctx, leaderAddr, kbID, versionID, PullVersionOptions{})
-}
-
-// PullVersionData fetches the version's data and deliberately leaves its index
-// unbuilt, for a version whose index should be built lazily (§8.6b).
+// PullVersionData fetches the version's data and leaves its index unbuilt.
+//
+// The index is not this path's business, and that is §8.6(b) rather than an
+// omission: a version is built when something ASKS for it — a query, an explicit
+// warm-up, or the active-version pre-build — and a data transfer is not an ask.
+//
+// There used to be a PullVersion that did build on arrival, plus a
+// PullVersionOptions to choose between them. Both are gone. What they encoded
+// was the eager behaviour §8.6(b) replaced: a pull runs on every replica a
+// version's data reaches, so building here meant every replica built every
+// version, which is the cost lazy construction exists to remove.
 func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID string, versionID int64) error {
-	return f.PullVersionWith(ctx, leaderAddr, kbID, versionID, PullVersionOptions{SkipIndexBuild: true})
-}
-
-// PullVersionWith is PullVersion with explicit control over the post-pull step.
-func (f *Follower) PullVersionWith(ctx context.Context, leaderAddr string, kbID string, versionID int64, opts PullVersionOptions) error {
 	// The connection HANDSHAKE gets its own bound; the TRANSFER does not.
 	//
 	// grpc.WithBlock() waits for the connection to be established, so a peer that
@@ -300,14 +291,7 @@ func (f *Follower) PullVersionWith(ctx context.Context, leaderAddr string, kbID 
 	// replica has to do this rather than inherit the writer's filter.
 	f.rebuildVersionBloom(ctx, kbID, versionID)
 
-	// All data written; trigger an independent HNSW build on this node.
-	if opts.SkipIndexBuild {
-		return nil
-	}
-	if err := f.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
-		return fmt.Errorf("sync: TriggerBuild(%s, %d): %w", kbID, versionID, err)
-	}
-
+	// All data written. NO BUILD — see the method comment.
 	return nil
 }
 

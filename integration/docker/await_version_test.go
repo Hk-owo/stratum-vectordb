@@ -142,7 +142,7 @@ func awaitOnce(ctx context.Context, client pb.KnowledgeBaseServiceClient, kbID s
 	return client.AwaitVersion(ctx, &pb.AwaitVersionRequest{
 		KnowledgeBaseId: kbID,
 		VersionId:       versionID,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   waitMs,
 	})
 }
@@ -150,7 +150,7 @@ func awaitOnce(ctx context.Context, client pb.KnowledgeBaseServiceClient, kbID s
 // settledStage reports whether a stage means "stop asking about this version".
 func settledStage(stage string) bool {
 	switch stage {
-	case service.StageIndexReady, service.StageIndexFailed,
+	case service.StageDataDurable, service.StageIndexReady, service.StageIndexFailed,
 		service.StageDataFailedPermanent, service.StageIndexFailedPermanent,
 		service.StageDeleting:
 		return true
@@ -194,11 +194,20 @@ func TestT4_AwaitVersion_ConvergesFromEveryControlNode(t *testing.T) {
 	kbID := createKB(t, ctx, "await-converge")
 	versionID := writeDocumentThroughControl(t, ctx, kbID, "doc-1", "await 收敛：这篇文档必须在每个控制节点上看到同一个结论")
 
+	// The index is asked for by querying. §8.6(b) builds a version only when
+	// something requests it, and AwaitVersion deliberately only waits for the data
+	// — so a test that wants to see INDEX_READY in the metadata has to ask, the
+	// same way a caller does (waitVersionStatus does the asking).
+	waitVersionStatus(t, ctx, nodeAddrs[0], kbID, versionID, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
+
 	for _, addr := range nodeAddrs {
 		resp := awaitUntilSettled(t, ctx, addr, kbID, versionID)
-		if resp.GetStage() != service.StageIndexReady {
-			t.Errorf("%s: stage = %s, want %s (the write is a plain one-document ADD)",
-				addr, resp.GetStage(), service.StageIndexReady)
+		// Either settled stage is acceptable: the wait is satisfied by durable data
+		// and by a version that has since been built (this test warms the index up
+		// explicitly just above). What it must NOT be is still in progress.
+		if st := resp.GetStage(); st != service.StageDataDurable && st != service.StageIndexReady {
+			t.Errorf("%s: stage = %s, want %s or %s (the write is a plain one-document ADD)",
+				addr, st, service.StageDataDurable, service.StageIndexReady)
 		}
 		if got := resp.GetVersion().GetVersionId(); got != versionID {
 			t.Errorf("%s: version.version_id = %d, want %d", addr, got, versionID)
@@ -264,8 +273,8 @@ func TestT4_AwaitVersion_NotYetIsAnAnswerNotAnError(t *testing.T) {
 	}
 
 	// And it does converge.
-	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, versionID); settled.GetStage() != service.StageIndexReady {
-		t.Errorf("stage after waiting = %s, want %s", settled.GetStage(), service.StageIndexReady)
+	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, versionID); settled.GetStage() != service.StageDataDurable {
+		t.Errorf("stage after waiting = %s, want %s", settled.GetStage(), service.StageDataDurable)
 	}
 }
 
@@ -301,7 +310,7 @@ func TestT4_DiscardVersion_RefusesASettledVersion(t *testing.T) {
 
 	kbID := createKB(t, ctx, "discard-settled")
 	versionID := writeDocumentThroughControl(t, ctx, kbID, "doc-1", "discard 拒绝：这篇文档一旦落地，就不能再被放弃")
-	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, versionID); settled.GetStage() != service.StageIndexReady {
+	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, versionID); settled.GetStage() != service.StageDataDurable {
 		t.Fatalf("fixture: version %d = %s, want READY", versionID, settled.GetStage())
 	}
 
@@ -333,7 +342,7 @@ func TestT4_DiscardVersion_RefusesTheActiveVersion(t *testing.T) {
 
 	kbID := createKB(t, ctx, "discard-active")
 	versionID := writeDocumentThroughControl(t, ctx, kbID, "doc-1", "discard 拒绝：激活版本不能被放弃")
-	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, versionID); settled.GetStage() != service.StageIndexReady {
+	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, versionID); settled.GetStage() != service.StageDataDurable {
 		t.Fatalf("fixture: version %d = %s, want READY", versionID, settled.GetStage())
 	}
 
@@ -342,6 +351,10 @@ func TestT4_DiscardVersion_RefusesTheActiveVersion(t *testing.T) {
 		t.Fatalf("dial %s: %v", nodeAddrs[0], err)
 	}
 	defer conn.Close()
+
+	// A version cannot be activated while it is PENDING, so its index has to be
+	// built first — and that takes a request (§8.6b), which waitVersionStatus makes.
+	waitVersionStatus(t, ctx, nodeAddrs[0], kbID, versionID, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
 
 	if _, err := kb.RollbackVersion(ctx, &pb.RollbackVersionRequest{KnowledgeBaseId: kbID, TargetVersionId: versionID}); err != nil {
 		t.Fatalf("RollbackVersion(%d): %v", versionID, err)
@@ -454,8 +467,8 @@ func TestT4_DiscardVersion_AbandonsAWriteThatCannotLand(t *testing.T) {
 	if retryID == versionID {
 		t.Errorf("re-sending under the discarded key returned the discarded version %d", versionID)
 	}
-	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, retryID); settled.GetStage() != service.StageIndexReady {
-		t.Errorf("the re-sent version = %s, want %s", settled.GetStage(), service.StageIndexReady)
+	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, retryID); settled.GetStage() != service.StageDataDurable {
+		t.Errorf("the re-sent version = %s, want %s", settled.GetStage(), service.StageDataDurable)
 	}
 }
 
@@ -496,7 +509,7 @@ func TestT4_CreateVersion_ReturnsTheKeyThatMakesAResendIdempotent(t *testing.T) 
 	}
 
 	// And the write really did happen: the version converges on its own.
-	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, first.GetVersionId()); settled.GetStage() != service.StageIndexReady {
-		t.Errorf("the returned version = %s, want %s", settled.GetStage(), service.StageIndexReady)
+	if settled := awaitUntilSettled(t, ctx, nodeAddrs[0], kbID, first.GetVersionId()); settled.GetStage() != service.StageDataDurable {
+		t.Errorf("the returned version = %s, want %s", settled.GetStage(), service.StageDataDurable)
 	}
 }

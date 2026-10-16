@@ -114,9 +114,18 @@ func (s *QueryServer) Query(ctx context.Context, req *pb.QueryRequest) (*pb.Quer
 			req.MinVersion = &v
 		}
 	}
+	// R1 of docs/code-review-2026-10-14.md: a query that names a version is
+	// narrowed by THAT version, not by the knowledge base's active one. The two
+	// are usually the same; when they are not, the caller is asking about a
+	// historical version, and selecting nodes "fresh for the active version"
+	// would pick exactly the ones least likely to still hold the old one.
+	queryOpts := []ForwardOption{}
+	if v := req.GetVersionId(); v != 0 {
+		queryOpts = append(queryOpts, WithPinnedVersion(v))
+	}
 	resp, err := Forward(s.r, ctx, pb.QueryService_Query_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.QueryResponse, error) {
 		return s.r.querys[idx].Query(ctx, req)
-	})
+	}, queryOpts...)
 	if err != nil {
 		return nil, err
 	}

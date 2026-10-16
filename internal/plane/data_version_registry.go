@@ -163,9 +163,14 @@ func (r *DataVersionRegistry) Nodes() []int64 {
 	return nodes
 }
 
-// Forget drops one node's view. The caller uses it when a node leaves the
-// cluster: keeping its last report would let a departed node keep "vouching" for
-// versions it no longer holds.
+// Forget drops one node's view: keeping a departed node's last report would let
+// it keep "vouching" for versions it no longer holds.
+//
+// NOT WIRED, and deliberately kept: this repository has no "node left the
+// cluster" event to call it from — the Raft peer set is static configuration,
+// and a node that restarts has its view replaced wholesale by its own next
+// report (Record overwrites per node). This is the method a membership change
+// would call; today only its test invokes it.
 func (r *DataVersionRegistry) Forget(nodeID int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

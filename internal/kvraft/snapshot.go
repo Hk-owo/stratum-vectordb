@@ -97,20 +97,6 @@ func (rf *Raft) InstallDone(lastIndex, lastTerm uint64) {
 	rf.trimLogLocked(lastIndex, lastTerm)
 }
 
-// TrimLog compacts the log up to and including index without persisting
-// new state-machine snapshot data (used when the snapshot data itself was
-// already persisted separately, e.g. right after InstallSnapshot wrote it
-// via the state-machine layer's own storage).
-func (rf *Raft) TrimLog(index uint64) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	term := rf.lastLogTerm()
-	if offset := rf.logIndex(index); offset < uint64(len(rf.log)) {
-		term = rf.log[offset].Term
-	}
-	rf.trimLogLocked(index, term)
-}
-
 // trimLogLocked must be called with rf.mu held. It compacts the log up to
 // and including index, replacing the covered prefix with a single sentinel
 // entry (index, term). When index is beyond the end of the local log —

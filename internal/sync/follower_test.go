@@ -275,9 +275,9 @@ func startLeaderServer(t *testing.T, fv *fakeVecstore) (*leaderFixture, *grpc.Se
 // TestFollower_PullVersion_EndToEnd is the module-interaction test for
 // sync: a real LeaderHandler streaming over real gRPC into a real
 // Follower whose target stores are real PebbleDB instances. After
-// PullVersion the follower's stores must contain exactly the leader's
+// PullVersionData the follower's stores must contain exactly the leader's
 // dataset, and TriggerBuild must have been invoked.
-func TestFollower_PullVersion_EndToEnd(t *testing.T) {
+func TestFollower_PullVersionData_EndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -315,8 +315,8 @@ func TestFollower_PullVersion_EndToEnd(t *testing.T) {
 		vd.Close()
 	})
 
-	if err := follower.PullVersion(ctx, addr, kbID, versionID); err != nil {
-		t.Fatalf("PullVersion: %v", err)
+	if err := follower.PullVersionData(ctx, addr, kbID, versionID); err != nil {
+		t.Fatalf("PullVersionData: %v", err)
 	}
 
 	// DocStore: visible content matches the leader's.
@@ -347,17 +347,19 @@ func TestFollower_PullVersion_EndToEnd(t *testing.T) {
 		t.Errorf("follower chunkstore vector = %v, %v", vec, err)
 	}
 
-	// TriggerBuild must have fired with the right arguments.
+	// And NO build. §8.6(b): a pull is a data operation, and building on arrival
+	// is the eager behaviour it replaced — a pull runs on every replica a version's
+	// data reaches, so building here made every replica build every version.
 	trig := follower.indexManager.(*recordingTrigger)
-	if trig.len() != 1 {
-		t.Fatalf("TriggerBuild calls = %d, want 1", trig.len())
+	if trig.len() != 0 {
+		t.Fatalf("TriggerBuild calls = %d, want 0: a pull must not build", trig.len())
 	}
 }
 
 // TestFollower_PullVersion_Idempotent verifies that pulling the same
 // version twice converges (all stores idempotent-by-key) and triggers two
 // builds.
-func TestFollower_PullVersion_Idempotent(t *testing.T) {
+func TestFollower_PullVersionData_Idempotent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -395,8 +397,8 @@ func TestFollower_PullVersion_Idempotent(t *testing.T) {
 	follower := NewFollower(ds, cdm, vd, chunkstore.NewMockChunkStore(), trig)
 
 	for i := 0; i < 2; i++ {
-		if err := follower.PullVersion(ctx, addr, kbID, 5); err != nil {
-			t.Fatalf("PullVersion #%d: %v", i+1, err)
+		if err := follower.PullVersionData(ctx, addr, kbID, 5); err != nil {
+			t.Fatalf("PullVersionData #%d: %v", i+1, err)
 		}
 	}
 
@@ -405,8 +407,10 @@ func TestFollower_PullVersion_Idempotent(t *testing.T) {
 	if err != nil || len(docIDs) != 1 {
 		t.Errorf("after double pull forward map = %v, %v; want exactly [doc-1]", docIDs, err)
 	}
-	if trig.len() != 2 {
-		t.Errorf("TriggerBuild calls = %d, want 2", trig.len())
+	// Applied twice, built never (see above): each pull is data only, so
+	// re-applying one cannot start a second build either.
+	if trig.len() != 0 {
+		t.Errorf("TriggerBuild calls = %d, want 0", trig.len())
 	}
 }
 
@@ -426,7 +430,7 @@ func TestFollower_PullVersion_DialError(t *testing.T) {
 
 	trig := &recordingTrigger{}
 	follower := newFollowerWithMocks(trig)
-	err = follower.PullVersion(ctx, deadAddr, "kb", 1)
+	err = follower.PullVersionData(ctx, deadAddr, "kb", 1)
 	if err == nil {
 		t.Fatal("expected PullVersion to fail when the leader is unreachable")
 	}
@@ -458,39 +462,12 @@ func TestFollower_PullVersion_ServerError(t *testing.T) {
 
 	trig := &recordingTrigger{}
 	follower := newFollowerWithMocks(trig)
-	err := follower.PullVersion(ctx, addr, kbID, 1)
+	err := follower.PullVersionData(ctx, addr, kbID, 1)
 	if err == nil {
 		t.Fatal("expected PullVersion to fail when the leader's vecstore read fails")
 	}
 	if trig.len() != 0 {
 		t.Errorf("TriggerBuild should not be called after a failed pull")
-	}
-}
-
-// TestFollower_PullVersion_TriggerBuildFailure verifies that a failing
-// TriggerBuild surfaces as a PullVersion error (the Raft apply loop then
-// retries).
-func TestFollower_PullVersion_TriggerBuildFailure(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	leader, _, addr := startLeaderServer(t, newFakeVecstore())
-	kbID := "kb-trigfail"
-	if err := leader.docStore.Write(ctx, kbID, "doc-1", 1, []byte("x")); err != nil {
-		t.Fatal(err)
-	}
-	if err := leader.versionDoc.Write(ctx, kbID, 1, "doc-1"); err != nil {
-		t.Fatal(err)
-	}
-
-	trig := &recordingTrigger{failNext: true}
-	follower := newFollowerWithMocks(trig)
-	err := follower.PullVersion(ctx, addr, kbID, 1)
-	if err == nil {
-		t.Fatal("expected PullVersion to fail when TriggerBuild fails")
-	}
-	if !strings.Contains(err.Error(), "TriggerBuild") {
-		t.Errorf("unexpected error: %v", err)
 	}
 }
 
@@ -565,7 +542,7 @@ func TestFollower_PullVersion_HandshakeBoundDoesNotBoundTheTransfer(t *testing.T
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := f.PullVersionWith(ctx, lis.Addr().String(), "kb-slow", 3, PullVersionOptions{SkipIndexBuild: true}); err != nil {
+	if err := f.PullVersionData(ctx, lis.Addr().String(), "kb-slow", 3); err != nil {
 		t.Fatalf("PullVersionWith: %v — the handshake bound must not bound the transfer", err)
 	}
 	docs, err := vd.ListDocIDs(ctx, "kb-slow", 3)

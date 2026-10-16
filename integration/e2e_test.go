@@ -231,6 +231,16 @@ type realNode struct {
 	// wants a non-leader coordinator announces it explicitly.
 	dataSources *plane.DataSourceRegistry
 
+	// peerAddrs maps every Raft node id to its Stratum gRPC address, filled from
+	// the peer list at construction.
+	//
+	// Helpers that must reach the LEADER dial through this — WarmupVersion is a
+	// Raft proposal, so only the leader can serve one. It is addresses rather than
+	// pointers to the other fixtures on purpose: a node that RESTARTS is a new
+	// fixture, and a pointer it never got would leave it unable to find the leader
+	// for the rest of the test.
+	peerAddrs map[int64]string
+
 	// logger is where asynchronous work (§8.4 distribution, background index
 	// builds, sync pulls) reports problems. It must NOT be the test's *testing.T:
 	// that work can outlive the test — a build callback fires when its build
@@ -277,12 +287,12 @@ type realNodeConfig struct {
 	// path on reconnect.
 	maxLogLength uint64
 
-	// coldThreshold / coldSweepInterval turn on the §8.6a cold-version
-	// evaluator for this node (index_manager.cold_threshold_ms in a real
-	// deployment). Zero keeps it off, which is the default everywhere else
-	// — a test that wants to watch a version go cold sets both.
-	coldThreshold     time.Duration
-	coldSweepInterval time.Duration
+	// coldThreshold turns on §8.6a for this node
+	// (index_manager.cold_threshold_ms in a real deployment): a build of a version
+	// that has gone that long without a query uses the graph-free shape. Zero keeps
+	// it off, which is the default everywhere else — a test that wants to watch a
+	// version go cold sets this and waits.
+	coldThreshold time.Duration
 }
 
 // newRealNodeWithAddrsAndDir is newRealNode with explicit addresses and a
@@ -361,8 +371,7 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		// without it every build stays in memory and §8.4 has nothing to ship.
 		IndexDataDir: filepath.Join(baseDir, "indexdata"),
 		// §8.6a: optional cold-version policy, off unless a test asks for it.
-		ColdThreshold:     cfg.coldThreshold,
-		ColdSweepInterval: cfg.coldSweepInterval,
+		ColdThreshold: cfg.coldThreshold,
 	})
 	im.SetLogger(nodeLogger)
 	// KB 级量化器的来源，与节点装配（cmd/stratum/storage_stack.go 的
@@ -409,15 +418,15 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 			return resp.GetVector(), nil
 		},
 	)
-	// §8.4: index distribution. The dispatcher is built explicitly so this
-	// stack exercises the same path a node uses — a replica receives a built
+	// §8.4: index distribution, now pull-only. The plane is built explicitly so
+	// this stack exercises the same path a node uses — a replica FETCHES a built
 	// index instead of building its own.
-	var distributeIndex func(kbID string, versionID int64)
 	dataSources := plane.NewDataSourceRegistry()
 	indexDistributor := plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
-		IndexManager: im,
-		IndexReader:  im,
-		IndexShipper: sync.NewIndexPusher(),
+		IndexManager:   im,
+		IndexReader:    im,
+		IndexFetcher:   sync.NewIndexFetcher(),
+		IndexInstaller: im,
 		// §7.8/docs/cursor-persistence-plan.md §3: the cursor is persisted in the
 		// node's own WAL — the same file this stack already keeps — so a restart
 		// reads it back instead of inferring it from the index artifacts, which
@@ -439,52 +448,11 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		},
 	})
 	im.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
-		if status == types.IndexStatusReady && distributeIndex != nil {
-			distributeIndex(kbID, versionID)
-		}
+		// A finished build does NOT push anything. Distribution is pull-only: a
+		// replica that needs the artifact asks this node for it (FetchIndexData),
+		// which is why nothing here has to reach anyone.
 		return rn.ProposeUpdateVersionStatus(context.Background(), versionID, status, 0)
 	})
-	distributeIndex = func(kbID string, versionID int64) {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := indexDistributor.PushIndexToReplicas(ctx, kbID, versionID); err != nil {
-			// Through the logger, not t: this callback fires when a build
-			// finishes, which can be after the test completed (§8.6a's cold
-			// evaluator makes late builds ordinary, not exotic).
-			nodeLogger.Warn("node index distribution failed",
-				zap.Int64("node_id", nodeID), zap.String("kb_id", kbID),
-				zap.Int64("version_id", versionID), zap.Error(err))
-		}
-	}
-	// §8.6a: start the cold-version evaluator only now, so a reshape's
-	// completion callback can ship the new artifact like any other build
-	// (distributeIndex is wired above). No-op when no threshold is set.
-	// §8.6a: the cold evaluator walks the AUTHORITATIVE version set, so this
-	// stack wires it the way a node does (cmd/stratum/storage_stack.go). Without
-	// it the evaluator has nothing to enumerate and stays off.
-	im.SetVersionsProvider(func(ctx context.Context) (map[string][]int64, error) {
-		kbs, err := rn.ListKnowledgeBases(ctx)
-		if err != nil {
-			return nil, err
-		}
-		out := make(map[string][]int64, len(kbs))
-		for _, kb := range kbs {
-			versions, err := rn.ListVersions(ctx, kb.KBID)
-			if err != nil {
-				nodeLogger.Warn("cold policy: ListVersions failed",
-					zap.String("kb_id", kb.KBID), zap.Error(err))
-				continue
-			}
-			ids := make([]int64, 0, len(versions))
-			for _, v := range versions {
-				ids = append(ids, v.VersionID)
-			}
-			out[kb.KBID] = ids
-		}
-		return out, nil
-	})
-	im.StartColdPolicy()
-
 	wc := coordinator.NewWriteCoordinatorImpl(coordinator.WriteCoordinatorConfig{
 		MaxRetries:          2,
 		RetryBaseIntervalMS: 10,
@@ -538,10 +506,14 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 	pb.RegisterDataSyncServiceServer(srv, sync.NewNodeHandler(
 		sync.NewLeaderHandler(ds.DB(), cdm.DB(), vd.DB(), cs.VecstoreClient()),
 		sync.NewPushHandler(syncFollower, nodeID,
-			sync.WithIndexInstaller(im),
 			// §8.5: record a writer's announcement (it rides the §7.3
 			// confirmation) so this node can find that version's data later.
 			sync.WithDataSourceRegistry(dataSources)),
+		// §8.4: the export half of the fetch. Without it a peer asking this node
+		// for an artifact gets "this node does not export index artifacts" and
+		// every node falls back to building — the production wiring has the same
+		// line for the same reason (cmd/stratum/main.go).
+		sync.WithNodeIndexReader(im),
 	))
 	pb.RegisterInternalServiceServer(srv, raft.NewInternalServiceServer(rn))
 
@@ -575,6 +547,7 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		dataSources:      dataSources,
 		srv:              srv,
 		conn:             conn,
+		peerAddrs:        peerAddrByID(peers, nodeID, grpcAddr),
 		KB:               pb.NewKnowledgeBaseServiceClient(conn),
 		Query:            pb.NewQueryServiceClient(conn),
 		Admin:            pb.NewAdminServiceClient(conn),
@@ -668,7 +641,7 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 		}
 		if versionID <= 1 {
 			if addr := sourceAddrFor(ctx, n, kbID, versionID, addrByID); addr != "" {
-				_ = syncFollower.PullVersion(ctx, addr, kbID, versionID)
+				_ = syncFollower.PullVersionData(ctx, addr, kbID, versionID)
 			}
 			// A version with no document set has no digest to verify: the successful
 			// (no-op) pull IS the evidence that this node holds it, which is the same
@@ -683,7 +656,7 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 			// announcement (§8.5) arrives after this callback starts, so an
 			// early attempt legitimately falls back to the leader and fails.
 			if addr := sourceAddrFor(ctx, n, kbID, versionID, addrByID); addr != "" {
-				_ = syncFollower.PullVersion(ctx, addr, kbID, versionID)
+				_ = syncFollower.PullVersionData(ctx, addr, kbID, versionID)
 			}
 			if verifyFollowerPull(ctx, n, kbID, versionID) {
 				// Held, so the cursor may move — see the note above.
@@ -901,6 +874,59 @@ func versionHash(t *testing.T, n *realNode, kbID string, versionID int64) string
 }
 
 // waitVersionReady polls ListVersions until versionID reports READY.
+// peerAddrByID indexes a peer list by node id, INCLUDING the node itself.
+//
+// The self entry matters: a peer list conventionally names the OTHER nodes, but
+// this map answers "where is the leader", and a node that IS the leader would
+// otherwise be told it has no address for node <itself>.
+func peerAddrByID(peers []raft.PeerConfig, selfID int64, selfAddr string) map[int64]string {
+	out := make(map[int64]string, len(peers)+1)
+	for _, p := range peers {
+		out[p.ID] = p.ServiceAddr
+	}
+	out[selfID] = selfAddr
+	return out
+}
+
+// warmupViaLeader asks the cluster's CURRENT leader to build a version.
+//
+// The leader is read from Raft each call rather than remembered, because it moves
+// (this suite restarts nodes) and the address book survives that where a pointer
+// would not.
+func (n *realNode) warmupViaLeader(ctx context.Context, kbID string, versionID int64) error {
+	// Retried: a node that just restarted learns the current leader from Raft, and
+	// asking immediately can legitimately come back leaderless.
+	var leaderID int64
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		st, err := n.raftNode.GetClusterStatus(ctx)
+		if err == nil && st.HasLeader {
+			leaderID = st.LeaderID
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no leader to warm %s v%d through", kbID, versionID)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	addr, ok := n.peerAddrs[leaderID]
+	if !ok {
+		return fmt.Errorf("no gRPC address for leader node %d", leaderID)
+	}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("dial leader %s: %w", addr, err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := pb.NewAdminServiceClient(conn).WarmupVersion(ctx, &pb.WarmupVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       versionID,
+	}); err != nil {
+		return fmt.Errorf("WarmupVersion(%s v%d) via leader node %d: %w", kbID, versionID, leaderID, err)
+	}
+	return nil
+}
+
 func (n *realNode) waitVersionReady(ctx context.Context, kbID string, versionID int64) {
 	n.t.Helper()
 	// This deadline is the FIXTURE's patience, not the system's. The convergence logic
@@ -914,6 +940,25 @@ func (n *realNode) waitVersionReady(ctx context.Context, kbID string, versionID 
 	// whole point: "still PENDING after 60 s" is a convergence problem worth chasing,
 	// while "we gave up at 15 s while the machine was busy" was the fixture failing a
 	// cluster that was doing its job.
+	// §8.6(b): a version is built when something ASKS for it, and waiting is not
+	// asking — a version nothing requests stays PENDING by design. So this helper
+	// makes the request an operator would make (WarmupVersion), once, and then
+	// waits for the result.
+	//
+	// Without this the helper would wait forever on a version the test just
+	// created: CreateVersion does not move the active pointer, so nothing builds
+	// it eagerly, and there is no query in these tests to trigger a lazy build.
+	//
+	// It goes to the LEADER, not to this node: WarmupVersion proposes a status
+	// change, so a follower answers "not leader" whatever it knows about the
+	// version. Building is still local — the proposal marks the version PENDING
+	// and asks that node to build it — so the leader's copy is what becomes READY
+	// first, and the replica below reaches the version by fetching that artifact
+	// (§8.4).
+	if err := n.warmupViaLeader(ctx, kbID, versionID); err != nil {
+		n.t.Fatalf("node %d: %v", n.nodeID, err)
+	}
+
 	deadline := time.Now().Add(60 * time.Second)
 	var last string
 	for time.Now().Before(deadline) {
@@ -923,17 +968,37 @@ func (n *realNode) waitVersionReady(ctx context.Context, kbID string, versionID 
 			for _, v := range resp.Versions {
 				if v.VersionId == versionID {
 					last = v.IndexStatus.String() + "/" + v.DataStatus.String()
-					if v.IndexStatus == pb.IndexStatus_INDEX_STATUS_READY {
-						return
-					}
 				}
 			}
 		} else {
 			last = "ListVersions: " + err.Error()
 		}
+
+		// The judgement is about THIS node, not about the cluster.
+		//
+		// IndexStatus is replicated metadata, so it can read READY cluster-wide
+		// while this node holds nothing: a replica in the version's owner set built
+		// it, and the router has not sent this one a request yet. That gap is
+		// exactly what §8.4 owner sharding introduces, and taking a cluster-wide
+		// READY as "this node is ready" is how a test ends up querying a replica
+		// that never built or fetched the artifact.
+		//
+		// Two routes make THIS node able to serve the version, and both are
+		// accepted because a caller cannot tell them apart:
+		//
+		//   (a) it BUILT the index — it was asked for the version, and §8.6b builds
+		//       only what something asks for;
+		//   (b) it FETCHED the artifact from a peer that has one (§8.4).
+		if exists, err := n.indexMgr.IndexExists(ctx, kbID, versionID); err == nil && exists {
+			return
+		}
+		if fetched, err := n.indexDistributor.FetchIndexFromPeers(ctx, kbID, versionID); err == nil && fetched {
+			return
+		}
+
 		time.Sleep(50 * time.Millisecond)
 	}
-	n.t.Fatalf("node %d: version %d did not become READY within timeout (last observed: %s)",
+	n.t.Fatalf("node %d: version %d never became servable here (last observed: %s)",
 		n.nodeID, versionID, last)
 }
 

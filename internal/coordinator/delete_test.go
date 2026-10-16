@@ -320,6 +320,16 @@ func (im *deleteTestIndexManager) IndexExists(_ context.Context, kbID string, ve
 	return false, nil
 }
 
+// forgettingAnnouncements stands in for the §8.5 data-source table: it records
+// which knowledge bases the flow told it to forget.
+type forgettingAnnouncements struct {
+	forgotten []string
+}
+
+func (f *forgettingAnnouncements) ForgetKB(kbID string) {
+	f.forgotten = append(f.forgotten, kbID)
+}
+
 // === Tests ===
 
 func TestDeleteCoordinator_FullCleanup(t *testing.T) {
@@ -330,6 +340,7 @@ func TestDeleteCoordinator_FullCleanup(t *testing.T) {
 	cdm := newDeleteTestChunkDocMapper()
 	vdl := newDeleteTestVersionDocList()
 	im := newDeleteTestIndexManager()
+	ann := &forgettingAnnouncements{}
 
 	coord := NewDeleteCoordinatorImpl(DeleteCoordinatorConfig{
 		MaxRetries:          2,
@@ -341,6 +352,7 @@ func TestDeleteCoordinator_FullCleanup(t *testing.T) {
 		ChunkStore:          cs,
 		ChunkDocMapper:      cdm,
 		VersionDocList:      vdl,
+		SourceAnnouncements: ann,
 	})
 
 	// The delete mark is written by Execute itself (Step 0), so the
@@ -387,6 +399,13 @@ func TestDeleteCoordinator_FullCleanup(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Errorf("expected 0 pending records after complete cleanup, got %d", len(records))
+	}
+
+	// §8.5's announcements are per-KB state that lives on the receive side, out
+	// of reach of every store above — the flow has to drop them itself, or the
+	// source lookup keeps naming a peer for a knowledge base nobody can query.
+	if len(ann.forgotten) != 1 || ann.forgotten[0] != "kb-1" {
+		t.Errorf("§8.5 announcements forgotten = %v, want [kb-1]", ann.forgotten)
 	}
 }
 

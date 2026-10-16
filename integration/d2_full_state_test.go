@@ -76,7 +76,7 @@ func (p *d2PullRecorder) PullVersion(ctx context.Context, addr, kbID string, ver
 	p.mu.Lock()
 	p.byVer = append(p.byVer, versionID)
 	p.mu.Unlock()
-	return p.inner.PullVersion(ctx, addr, kbID, versionID)
+	return p.inner.PullVersionData(ctx, addr, kbID, versionID)
 }
 
 func (p *d2PullRecorder) PullVersionData(ctx context.Context, addr, kbID string, versionID int64) error {

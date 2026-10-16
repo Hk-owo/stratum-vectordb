@@ -246,20 +246,6 @@ func (w *MockWAL) IsDeleteMarked(kbID string) bool {
 	return w.deleteMarked[kbID]
 }
 
-// ChangesFor returns the replay input recorded for (kbID, versionID) — the same
-// record Recover replays, read for the "answer a lagging peer's backfill
-// request" purpose (Stratum_设计文档v13.md §7.5).
-func (w *MockWAL) ChangesFor(_ context.Context, kbID string, versionID int64) ([]types.DocChange, bool, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	bd, ok := w.beginDataByVersion[versionID]
-	if !ok || bd.kbID != kbID {
-		return nil, false, nil
-	}
-	return bd.changes, true, nil
-}
-
 // ChangesInRange mirrors FileWAL's: the recorded replay input for every version
 // in (fromExclusive, toInclusive] this node wrote, keyed by version ID. Absent
 // keys are gaps, not empty change sets.

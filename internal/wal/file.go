@@ -230,9 +230,9 @@ type FileWAL struct {
 	// the right transaction. Within one knowledge base the coordinator still
 	// serializes transactions end to end, which is what keeps the pairing
 	// unambiguous there. Rebuilt by rebuildIndex on Open and kept current by
-	// WriteBegin/WriteVersionID, so it also answers ChangesFor (a lagging peer's
-	// backfill request, §7.5) for versions written since this process started — not
-	// only for those on disk at Open.
+	// WriteBegin/WriteVersionID, so it also answers ChangesInRange (a lagging
+	// peer's backfill request, §7.5) for versions written since this process
+	// started — not only for those on disk at Open.
 	beginDataByVersion map[int64]beginData
 
 	// cursors is the data cursor per knowledge base that this log has
@@ -246,7 +246,7 @@ type FileWAL struct {
 	// pendingBegin. Per knowledge base rather than a single slot because writes to
 	// different KBs now run concurrently (M7 of docs/code-review-2026-09-24.md): a
 	// single slot would let KB A's BEGIN bind to KB B's VERSION_ID, and the replay
-	// input ChangesFor hands a lagging peer would then belong to the wrong
+	// input ChangesInRange hands a lagging peer would then belong to the wrong
 	// knowledge base.
 	pendingBeginByKB map[string]beginData
 
@@ -339,7 +339,7 @@ func (w *FileWAL) rebuildIndex() error {
 	// change carry no kbID — they come from an era when the whole write path was
 	// serialized, where "the one unpaired BEGIN" was unambiguous, so legacy records
 	// keep pairing that way. Anything ambiguous is left UNPAIRED on purpose:
-	// ChangesFor then reports the version as missing, and a lagging peer falls back
+	// ChangesInRange then reports the version as missing, and a lagging peer falls back
 	// to a full-state transfer, which is recoverable — a wrong pairing would hand it
 	// another knowledge base's changes.
 	var validEnd int64
@@ -674,23 +674,6 @@ func versionDeletePayload(versionID int64, kbID string) []byte {
 	binary.BigEndian.PutUint64(payload[:8], uint64(versionID))
 	copy(payload[8:], kbID)
 	return payload
-}
-
-// ChangesFor returns the replay input recorded for (kbID, versionID): the
-// changes its writer applied. It answers a lagging peer's backfill request
-// (Stratum_设计文档v13.md §7.5) with the same BEGIN record crash recovery
-// replays — one record, two readers. ok is false when no BEGIN record is bound
-// to that version: never written on this node (a follower that merely applied
-// the leader's log writes none), already reclaimed, or predating the format.
-func (w *FileWAL) ChangesFor(_ context.Context, kbID string, versionID int64) ([]types.DocChange, bool, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	bd, ok := w.beginDataByVersion[versionID]
-	if !ok || bd.kbID != kbID {
-		return nil, false, nil
-	}
-	return bd.changes, true, nil
 }
 
 // VersionDelta is one version's recorded replay input: the changes its writer

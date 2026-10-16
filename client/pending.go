@@ -240,9 +240,16 @@ func Decide(resp *pb.AwaitVersionResponse, haveChanges bool) Decision {
 		return DecisionWait
 
 	case stageDataDurable:
-		// Durable but not queryable yet: the caller asked for READY, so keep
-		// waiting. (A caller that only wants durability would have asked for it.)
-		return DecisionWait
+		// Settled. The data is where it needs to be, and that is now the strongest
+		// guarantee the cluster makes on its own: §8.6(b) builds a version's index
+		// only when something ASKS for it, so waiting for INDEX_READY on a version
+		// nobody has queried waits for a state the design does not produce.
+		//
+		// This used to return WAIT, on the reasoning that a caller who asked for
+		// READY wanted to be able to read. It still does — and it can: querying the
+		// version builds the index on demand (service/query.go), as does
+		// WarmupVersion for a caller that wants that cost paid up front.
+		return DecisionDone
 
 	default:
 		// An unknown stage is a newer server's answer. Waiting is the only safe

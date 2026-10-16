@@ -178,16 +178,19 @@ func deriveStage(v types.VersionMeta) string {
 	}
 }
 
-// awaitReached reports whether stage already satisfies target. WAIT_FOR is
-// inclusive in the obvious direction: durable data is past a DATA_DURABLE
-// target, and READY implies both.
+// awaitReached reports whether stage already satisfies target.
+//
+// Both targets now mean the same thing, and that is the §8.6(b) consequence
+// rather than a simplification: an index is built when something ASKS for the
+// version, so a version nobody has queried never becomes INDEX_READY however
+// long a caller waits. Waiting for INDEX_READY used to be the default — a caller
+// would have waited out its timeout on a perfectly healthy cluster.
+//
+// An index that IS on disk still satisfies the wait, which is why READY counts:
+// a version built because someone else asked is more than durable, and returning
+// early is what the caller wanted anyway.
 func awaitReached(stage string, target pb.AwaitTarget) bool {
-	switch target {
-	case pb.AwaitTarget_AWAIT_TARGET_DATA_DURABLE:
-		return stage == StageDataDurable || stage == StageIndexReady
-	default:
-		return stage == StageIndexReady
-	}
+	return stage == StageDataDurable || stage == StageIndexReady
 }
 
 // awaitTerminal reports whether nothing further will happen to this version, so
@@ -206,10 +209,10 @@ func awaitTerminal(stage string) bool {
 // should be told, not handed the default.
 func awaitTargetFromProto(t pb.AwaitTarget) (pb.AwaitTarget, error) {
 	switch t {
-	case pb.AwaitTarget_AWAIT_TARGET_INDEX_READY, pb.AwaitTarget_AWAIT_TARGET_DATA_DURABLE:
+	case pb.AwaitTarget_AWAIT_TARGET_QUERYABLE, pb.AwaitTarget_AWAIT_TARGET_DATA_DURABLE:
 		return t, nil
 	default:
-		return pb.AwaitTarget_AWAIT_TARGET_INDEX_READY, fmt.Errorf("unknown await target %d: %w", t, stratumerrors.ErrInvalidArgument)
+		return pb.AwaitTarget_AWAIT_TARGET_QUERYABLE, fmt.Errorf("unknown await target %d: %w", t, stratumerrors.ErrInvalidArgument)
 	}
 }
 

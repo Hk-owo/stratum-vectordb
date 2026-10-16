@@ -80,11 +80,5 @@ func (d *LocalDataPlane) ReclaimChanges(ctx context.Context) (map[string]int64, 
 // ones whose changes could be sitting in its WAL. A node that never wrote or
 // received a knowledge base has nothing to reclaim there.
 func (d *LocalDataPlane) localKnowledgeBases() []string {
-	d.versionMu.RLock()
-	defer d.versionMu.RUnlock()
-	kbs := make([]string, 0, len(d.localVersion))
-	for kbID := range d.localVersion {
-		kbs = append(kbs, kbID)
-	}
-	return kbs
+	return d.state.KnowledgeBases()
 }

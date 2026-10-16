@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/nodestate"
 	stratinternalsync "stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/wal"
@@ -21,9 +22,13 @@ import (
 // list, chunks) onto this node. *stratumsync.Follower implements it; keeping
 // it as an interface here lets the DataPlane be exercised without a live peer.
 type VersionPuller interface {
-	PullVersion(ctx context.Context, sourceAddr string, kbID string, versionID int64) error
-	// PullVersionData fetches the version's data without scheduling an index
-	// build (see FetchVersionData).
+	// PullVersionData fetches the version's data WITHOUT building its index.
+	//
+	// There is deliberately no "pull and build" flavour. §8.6(b) builds a version
+	// when something asks for it, and a data transfer is not an ask: a pull runs
+	// on every replica a version's data reaches, so building on arrival meant
+	// every replica built every version. That flavour existed as PullVersion and
+	// was removed (internal/sync/follower.go carries the longer note).
 	PullVersionData(ctx context.Context, sourceAddr string, kbID string, versionID int64) error
 }
 
@@ -60,15 +65,25 @@ type VersionPusher interface {
 	PushVersion(ctx context.Context, targetAddr, kbID string, versionID int64) (acceptorID int64, err error)
 }
 
-// IndexShipper ships one version's built index to a peer
-// (DataSyncService.PushIndexData). *sync.IndexPusher implements it.
-type IndexShipper interface {
-	PushIndex(ctx context.Context, targetAddr, kbID string, versionID int64, indexData, sidecarData []byte) error
-	// ProbeIndex asks a peer whether it already holds (kbID, versionID)'s
-	// artifact, WITHOUT shipping it, so the caller can drop that peer before
-	// reading the file it would have shipped (§8.4(a)). A peer that cannot
-	// answer is reported as an error and the caller ships to it anyway.
-	ProbeIndex(ctx context.Context, targetAddr, kbID string, versionID int64) (bool, error)
+// IndexFetcher pulls one version's built index FROM a peer that holds it
+// (DataSyncService.FetchIndexData). *sync.IndexFetcher implements it.
+//
+// This is §8.4's "建一次、分发 N 份" in its only direction: the push half was
+// removed, because a fire-and-forget push cannot tell a replica that its artifact
+// was meant for it and never arrived, while a fetch cannot miss. A peer that does
+// not hold the artifact answers with the caller-recognisable "not exported"
+// error, so the caller moves on rather than retrying — and if no peer has it, the
+// caller builds it (the documented fallback, see EnsureIndex).
+type IndexFetcher interface {
+	FetchIndex(ctx context.Context, sourceAddr, kbID string, versionID int64) (indexData, sidecarData []byte, err error)
+}
+
+// IndexInstaller writes an artifact that CAME FROM a peer onto this node's disk.
+// *index.IndexManagerImpl implements it; installation is the other half of a
+// fetch, since bytes that arrive and are not installed leave the version exactly
+// as cold as before.
+type IndexInstaller interface {
+	InstallIndex(ctx context.Context, kbID string, versionID int64, indexData, sidecarData []byte) error
 }
 
 // IndexReader reads a version's persisted index files from this node's disk.
@@ -172,28 +187,22 @@ type LocalDataPlane struct {
 	// included (1 = no replication). fanOut needs it to tell an expected empty
 	// target list from a broken one; see the field of the same name on
 	// LocalDataPlaneConfig.
-	replicaCount  int
-	cursorQuerier CursorQuerier
-	dropper       VersionDataDropper
-	cleaner       VersionDataCleaner
-	presence      VersionPresenceQuerier
-	digest        VersionDigest
-	confirmer     WriteConfirmer
-	indexReader   IndexReader
-	indexShipper  IndexShipper
+	replicaCount   int
+	cursorQuerier  CursorQuerier
+	dropper        VersionDataDropper
+	cleaner        VersionDataCleaner
+	presence       VersionPresenceQuerier
+	digest         VersionDigest
+	confirmer      WriteConfirmer
+	indexReader    IndexReader
+	indexFetcher   IndexFetcher
+	indexInstaller IndexInstaller
 	// pullIdleTimeout / pullMaxDuration bound the EnsureIndex pull loop by
 	// PROGRESS and by an absolute ceiling respectively (see the loop's comment).
 	// Zero means the Default* constants; the config carries them so a test can
 	// exercise the loop's bounds without waiting out 30 s.
 	pullIdleTimeout time.Duration
 	pullMaxDuration time.Duration
-	// indexPushSem bounds how many PushIndexToReplicas runs may be in flight at
-	// once. One run reads a whole index file into memory and ships it to N
-	// replicas, so this is simultaneously the cap on distribution's memory peak
-	// and on the builder's outbound bandwidth (v13 §8.4(a)). A nil semaphore
-	// means "unconfigured, no limit" — the historical behaviour.
-	indexPushSem chan struct{}
-
 	// selfDataSyncAddr is what this node announces as the holder of the
 	// versions it writes (§8.5). See LocalDataPlaneConfig.SelfDataSyncAddr.
 	selfDataSyncAddr string
@@ -204,18 +213,12 @@ type LocalDataPlane struct {
 
 	logger *zap.Logger
 
-	// localVersion is this node's data cursor per knowledge base: the highest
-	// version it holds contiguously. 0 means "unknown yet" (a node that has
-	// not applied anything for that KB). Guarded by versionMu; it only ever
-	// moves forward.
-	//
-	// "Contiguously" is load-bearing, and handledAbove/announcedAbove exist to
-	// keep it true. The cursor may only step over a version that either this
-	// node holds or that does not exist; a plain maximum would let one failed
-	// push followed by a successful later push claim an unbroken history the
-	// node does not have (§7.5's invariant, §9.3(2)'s freshness check).
-	versionMu    sync.RWMutex
-	localVersion map[string]int64
+	// versionMu guards deletedReconcileDirty and nothing else. The cursor and
+	// the two accounts it advances over used to live behind it; they are the
+	// state machine's now (docs/storage-node-state-machine-plan.md §7, item 3),
+	// which is what makes one component answerable for the whole data layer's
+	// local position.
+	versionMu sync.RWMutex
 
 	// deletedReconcileDirty records that what this node HOLDS has changed since the
 	// last reverse reconciliation — a version landed, or the cursor moved. The
@@ -228,25 +231,6 @@ type LocalDataPlane struct {
 	// to observe here than "something landed". Guarded by versionMu: every change
 	// comes through advanceLocalVersion, which already holds it.
 	deletedReconcileDirty bool
-
-	// handledAbove records versions ABOVE the cursor whose data this node has
-	// accounted for: written here, pulled from a peer, pushed by the
-	// coordinator, dropped as deleted, or covered by a full-state transfer.
-	//
-	// announcedAbove records versions above the cursor that the control layer
-	// says exist, announced at apply time. A version in announcedAbove but not
-	// in handledAbove is a KNOWN GAP: it exists and this node does not have it,
-	// so the cursor must stop below it rather than step over it.
-	//
-	// With nothing announced the two collapse into "the highest version seen",
-	// i.e. the pre-fix behaviour; every storage path announces, so in practice
-	// a gap is always known.
-	//
-	// Both are bounded by the versions of the KB above the cursor: that stays
-	// tiny while the chain is healthy (the cursor advances and the entries are
-	// dropped) and grows only while a gap is genuinely missing.
-	handledAbove   map[string]map[int64]struct{}
-	announcedAbove map[string]map[int64]struct{}
 
 	// cursorMu guards cursorPending and cursorFlushing: the queue of cursor
 	// values waiting to be persisted, and the flag saying a flusher goroutine
@@ -275,6 +259,12 @@ type LocalDataPlane struct {
 	// gone, because every node learns a terminal verdict from its own apply instead.
 	terminalReclaimMu sync.Mutex
 	terminalReclaim   map[string]*cleanupTask
+
+	// state is the node state machine: the version layer's entries, the data
+	// cursor, and the two accounts the cursor advances over
+	// (docs/storage-node-state-machine-plan.md §7). Never nil — see
+	// NewLocalDataPlane for why an unwired plane still gets one.
+	state *nodestate.Machine
 }
 
 // LocalDataPlaneConfig wires a LocalDataPlane.
@@ -369,22 +359,33 @@ type LocalDataPlaneConfig struct {
 	Digest    VersionDigest
 	Confirmer WriteConfirmer
 
-	// IndexReader and IndexShipper carry a built index to the other replicas
+	// IndexReader and IndexFetcher carry a built index to the other replicas
 	// (v13 §8.4). Both are optional: without them a build stays local, and
 	// every replica builds for itself exactly as before.
 	IndexReader  IndexReader
-	IndexShipper IndexShipper
-
-	// MaxConcurrentIndexPush caps concurrent PushIndexToReplicas runs (v13
-	// §8.4(a)). Zero means DefaultMaxConcurrentIndexPush. One distribution reads
-	// a whole index file into memory and ships it to every replica, so the cap
-	// bounds the builder's memory peak and outbound bandwidth at once.
-	MaxConcurrentIndexPush int
+	IndexFetcher IndexFetcher
+	// IndexInstaller lands an artifact fetched from a peer. Optional: without it
+	// (or without IndexFetcher) a replica that does not build for itself has no
+	// way to obtain the artifact, and FetchIndexFromPeers reports "not wired".
+	IndexInstaller IndexInstaller
 
 	// MaxInFlightWrites caps concurrent in-flight writes per knowledge base
-	// (§7.7). Zero means DefaultMaxInFlightWrites. Per-KB values arrive later
-	// through SetDurabilityPolicy.
+	// (§7.7). Zero means DefaultMaxInFlightWrites. The cap is process-wide:
+	// per-KB values used to arrive through the (now removed) durability-policy
+	// declaration and are not wired yet.
 	MaxInFlightWrites int
+
+	// State is the node state machine this plane maintains
+	// (docs/storage-node-state-machine-plan.md §7). Optional: a plane built
+	// without one makes its own, which is what every test gets — and what a
+	// single-node deployment would want anyway. The machine has no dependencies
+	// of its own, so requiring the wiring would only add a failure mode.
+	//
+	// Note what is deliberately NOT here: reconciliation's projection of disk
+	// facts. That is the startup path's job (main runs it once, before the node
+	// serves), because it needs the reconciled artifact set — which this plane
+	// does not produce on its own.
+	State *nodestate.Machine
 
 	// Logger receives progress/retry diagnostics. Optional.
 	Logger *zap.Logger
@@ -395,6 +396,14 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+	// An unwired plane still gets a machine. The alternative — a nil one — would
+	// put an "is it wired" branch at every call site for a component that has no
+	// dependencies and no failure mode, and would mean the plane's data cursor
+	// (the one thing this layer is authoritative about) had nowhere to live.
+	state := cfg.State
+	if state == nil {
+		state = nodestate.New(nodestate.Options{Logger: logger.Named("nodestate")})
 	}
 	return &LocalDataPlane{
 		indexMgr:         cfg.IndexManager,
@@ -418,16 +427,14 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		digest:           cfg.Digest,
 		confirmer:        cfg.Confirmer,
 		indexReader:      cfg.IndexReader,
-		indexShipper:     cfg.IndexShipper,
-		indexPushSem:     newIndexPushSem(cfg.MaxConcurrentIndexPush),
+		indexFetcher:     cfg.IndexFetcher,
+		indexInstaller:   cfg.IndexInstaller,
 		selfDataSyncAddr: cfg.SelfDataSyncAddr,
 		pullIdleTimeout:  cfg.PullIdleTimeout,
 		pullMaxDuration:  cfg.PullMaxDuration,
 		limiter:          newWriteLimiter(cfg.MaxInFlightWrites),
+		state:            state,
 		logger:           logger,
-		localVersion:     make(map[string]int64),
-		handledAbove:     make(map[string]map[int64]struct{}),
-		announcedAbove:   make(map[string]map[int64]struct{}),
 		pendingTakeovers: make(map[string]*takeoverWatch),
 		cursorPending:    make(map[string]int64),
 	}
@@ -447,11 +454,49 @@ const DefaultPullIdleTimeout = 30 * time.Second
 // a little progress forever still ends (LocalDataPlaneConfig.PullMaxDuration).
 const DefaultPullMaxDuration = 10 * time.Minute
 
-// EnsureIndex brings (kbID, versionID) to a queryable state on this node:
-// the version's data is fetched if this node does not hold it yet — the
-// "replication lives inside the storage layer" move of
-// control-data-separation-design.md §7 — and the index build is then scheduled
-// by the puller itself. Idempotent, so re-running it after a crash is safe.
+// effectivePullIdleTimeout is the no-progress bound with its default applied.
+//
+// It exists because "unset" and "zero" are the same value in the config, and a
+// zero bound is not a small bound — it is one that fires immediately, which
+// turned every on-demand fetch into an instant timeout. Both callers must go
+// through this rather than reading the field.
+func (d *LocalDataPlane) effectivePullIdleTimeout() time.Duration {
+	if d.pullIdleTimeout > 0 {
+		return d.pullIdleTimeout
+	}
+	return DefaultPullIdleTimeout
+}
+
+// effectivePullMaxDuration is the absolute ceiling with its default applied.
+func (d *LocalDataPlane) effectivePullMaxDuration() time.Duration {
+	if d.pullMaxDuration > 0 {
+		return d.pullMaxDuration
+	}
+	return DefaultPullMaxDuration
+}
+
+// EnsureIndex brings (kbID, versionID) to the state THIS NODE is meant to hold
+// it in: always the data, and the index only if this node owns the version.
+//
+// The data half is the "replication lives inside the storage layer" move of
+// control-data-separation-design.md §7. The index half is §8.4's owner sharding:
+// one node builds and everyone else takes the artifact from it, so a node that
+// is not the owner ends up here with data and no index, and that is the intended
+// end state rather than a half-done job.
+//
+// Callers are therefore of two kinds, and the difference matters:
+//
+//   - Background catch-up (the apply hook's active version, lag catch-up):
+//     "make this node able to serve the version if it ever has to". Non-owners
+//     stop at the data, because building here is exactly the duplicate work
+//     sharding exists to remove, and because the head's artifact is on its way.
+//   - A caller that needs to ANSWER FROM THIS NODE NOW: it must ask for the
+//     artifact and, failing that, build it. That fallback lives with the query
+//     path (service/query.go), not here — a query that cannot get an artifact
+//     still has to answer, while a catch-up that cannot get one can simply wait
+//     for the next query to ask again.
+//
+// Idempotent, so re-running it after a crash is safe.
 func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID int64) error {
 	if d.puller == nil {
 		// Nowhere to fetch from: this node has no storage-layer connection to a peer
@@ -461,14 +506,27 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 		return fmt.Errorf("plane: EnsureIndex(%s, %d): this node has no puller", kbID, versionID)
 	}
 	// Holding the version's data already is the authoritative "nothing to
-	// fetch" fact, and after §8.5 it is the *only* one: the old code read
+	// FETCH" fact, and after §8.5 it is the *only* one: the old code read
 	// resolve()'s ok=false as "I am the writer", which held only while the
 	// writer was also the leader. The contiguous cursor says it directly — it
 	// advances exactly when a version's data has landed (write path, pull, or
 	// backfill) and never moves backwards.
+	//
+	// It is not, however, "nothing to DO". The cursor is the DATA cursor, and a
+	// node can hold every byte of a version and still have no index for it — which
+	// for a node that has been ASKED for the version is a job outstanding, not a
+	// finished one. Reading it as "done" is what left versions built by nobody:
+	// measured on the 3+3 cluster, storage2 held v4 and v7 with no index and built
+	// neither, while all three replicas reported the data present. So the index
+	// half is checked separately, below.
 	if d.localVersionOf(kbID) >= versionID {
-		return nil
+		return d.ensureOwnIndex(ctx, kbID, versionID)
 	}
+	// The data is what has to be fetched here, and ONLY the data: the index comes
+	// after, in ensureOwnIndex, because an index on this node is worth nothing
+	// without the records it indexes. See that function for the ordering bug that
+	// taught this — asking for the artifact first let a node return "done" holding
+	// a peer's index and none of the version's data.
 	addr, ok, err := d.resolve(ctx, kbID, versionID)
 	if err != nil {
 		return fmt.Errorf("plane: EnsureIndex(%s, %d): resolve data source: %w", kbID, versionID, err)
@@ -535,14 +593,8 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 	// longer holds the version, a stream that keeps being refused — is attempts that
 	// make NO progress. So idle time is what gets bounded, with an absolute ceiling
 	// so that a pathological loop still ends.
-	pullIdleTimeout := d.pullIdleTimeout
-	if pullIdleTimeout <= 0 {
-		pullIdleTimeout = DefaultPullIdleTimeout
-	}
-	pullMaxDuration := d.pullMaxDuration
-	if pullMaxDuration <= 0 {
-		pullMaxDuration = DefaultPullMaxDuration
-	}
+	pullIdleTimeout := d.effectivePullIdleTimeout()
+	pullMaxDuration := d.effectivePullMaxDuration()
 	start := time.Now()
 	lastProgress := start
 	attempts := 0
@@ -580,7 +632,27 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 			addr = fresh
 		}
 		attempts++
-		err := d.puller.PullVersion(ctx, addr, kbID, versionID)
+		// DATA ONLY. This method does not build, and §8.6(b) is the reason: the
+		// only version worth building eagerly is the active one, and catch-up is
+		// not a reason to build anything. Building here would mean every lagging
+		// node rebuilds every version the chain advances through.
+		//
+		// The fetch above is tried first and can succeed — a replayed log, a
+		// version whose head finished long ago, a node that was simply behind. It
+		// usually cannot, because background catch-up runs the moment the chain
+		// tail moves, which is before the head has finished building. That is fine:
+		// reaching here without an artifact means "nobody has published one yet",
+		// and the answer is to wait. A query for the version will ask again and, if
+		// that still fails, build it (service/query.go) — the fallback belongs to
+		// the caller that has to answer, not here.
+		//
+		// A node left holding data and no index is not stranded, and the fallback
+		// deliberately lives with the caller that needs it rather than here. A
+		// query that reaches such a version asks for the artifact and, failing
+		// that, builds it (service/query.go) — that path has to answer, so it
+		// cannot wait. Background catch-up can, and does: the next query asks
+		// again, and the head's artifact usually arrives in the meantime.
+		err := d.puller.PullVersionData(ctx, addr, kbID, versionID)
 		if err != nil {
 			// A cancelled context surfaces here too (the transfer aborts mid-flight),
 			// and it must not be logged as "will retry" — there is nobody left to
@@ -607,8 +679,13 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 			lastProgress = time.Now()
 			lastErr = nil
 			if d.verify(ctx, kbID, versionID) {
-				d.advanceLocalVersion(kbID, versionID)
-				return nil
+				d.dataLanded(kbID, versionID)
+				// The data is here; the index is a separate question, and this node
+				// was ASKED for the version — so it takes a peer's artifact or builds
+				// one. Returning straight after the data left a requested version
+				// with no index on this node at all, which is what the empty-version
+				// branch below had already got right.
+				return d.ensureOwnIndex(ctx, kbID, versionID)
 			}
 			if empty, emptyErr := d.versionHasNoDocuments(ctx, kbID, versionID); emptyErr == nil && empty {
 				// The pull succeeded and the version holds no documents — so the
@@ -622,8 +699,10 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 				// Gated on the pull having SUCCEEDED just above: a pull that failed
 				// never reaches here, so a broken transfer can never be mistaken for
 				// an empty version.
-				d.advanceLocalVersion(kbID, versionID)
-				return nil
+				d.dataLanded(kbID, versionID)
+				// The data is here; the index is a separate question, and a node
+				// that was ASKED for this version answers it by building.
+				return d.ensureOwnIndex(ctx, kbID, versionID)
 			}
 		}
 		// Both ceilings carry the diagnosis the old message could not: how far this
@@ -686,6 +765,51 @@ func (d *LocalDataPlane) versionHasNoDocuments(ctx context.Context, kbID string,
 	return got == stratinternalsync.ComputeDocIDSetHash(nil), nil
 }
 
+// ensureOwnIndex makes this node able to serve versionID: it takes an existing
+// artifact from a peer if one has it, and builds the index itself if none does.
+//
+// This is the whole of a storage node's rule, and it needs no knowledge of who
+// owns what. WHO builds is decided in the station (§8.4 owner sets,
+// internal/router): queries are routed to a version's owners, so a node that is
+// never asked never builds anything. What happens here is the other half — a node
+// that HAS been asked becomes able to answer.
+//
+// ORDER MATTERS, and it is the reason this is called only once the data has
+// landed. Asking for the artifact is cheap and is tried first, but an artifact
+// existing somewhere says nothing about THIS node's data: a replica can hold a
+// peer's index and none of the version's records. Taking the index and returning
+// early on that basis left the version's data unfetched — measured on the 3+3
+// cluster, a catch-up logged "caught up with the chain tail" while the node's
+// cursor stayed 55 versions behind, which is exactly the misleading-success trap
+// the resolve() comment above describes.
+func (d *LocalDataPlane) ensureOwnIndex(ctx context.Context, kbID string, versionID int64) error {
+	if d.indexMgr == nil {
+		return nil
+	}
+	// Cheap route first: somebody else's artifact costs a round trip to install,
+	// against minutes to build.
+	if installed, err := d.FetchIndexFromPeers(ctx, kbID, versionID); err == nil && installed {
+		return nil
+	}
+	// It deliberately does not call TriggerBuild unconditionally: a build for a
+	// version whose artifact is already on disk is a FULL REBUILD — triggerBuild
+	// de-duplicates in-flight builds, not finished ones — so every catch-up round
+	// would rebuild.
+	exists, err := d.indexMgr.IndexExists(ctx, kbID, versionID)
+	if err != nil {
+		// Unknown is not "absent": building on an unanswered question risks a
+		// redundant rebuild, so the failure is reported and the caller retries.
+		return fmt.Errorf("plane: ensureOwnIndex(%s, %d): check for an existing artifact: %w", kbID, versionID, err)
+	}
+	if exists {
+		return nil
+	}
+	if err := d.indexMgr.TriggerBuild(ctx, kbID, versionID); err != nil {
+		return fmt.Errorf("plane: ensureOwnIndex(%s, %d): schedule the build: %w", kbID, versionID, err)
+	}
+	return nil
+}
+
 // FetchVersionData brings the version's data here without building its index.
 //
 // It is what a non-active version needs (§8.6b): the data must be present for
@@ -695,6 +819,16 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 	// Same fact as in EnsureIndex: this node holding the version already means
 	// there is nothing to fetch — which after §8.5 can no longer be inferred
 	// from "I am the leader/writer".
+	// "Data only" is the whole contract. This is the §8.6(b) INACTIVE path: no
+	// build, on any node. The version is built when a query asks for it
+	// (service/query.go) or an operator warms it, and the router's owner set is
+	// what decides which nodes those requests reach (internal/router, §5 of
+	// docs/index-owner-sharding-plan.md).
+	//
+	// It is tempting to build here "because the data just arrived anyway". That is
+	// exactly the eager behaviour §8.6(b) removed, and on a bulk import it is the
+	// whole cost: measured on the 3+3 cluster, a run of N
+	// versions built all N, most of them for versions nothing had ever queried.
 	if d.localVersionOf(kbID) >= versionID {
 		return nil
 	}
@@ -713,7 +847,7 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 	if err := d.puller.PullVersionData(ctx, addr, kbID, versionID); err != nil {
 		return err
 	}
-	d.advanceLocalVersion(kbID, versionID)
+	d.dataLanded(kbID, versionID)
 	return nil
 }
 
@@ -731,26 +865,13 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 // cursor has already passed it does not pull the cursor back either. The fix is
 // for the future, not a retroactive correction.
 func (d *LocalDataPlane) advanceLocalVersion(kbID string, versionID int64) {
-	d.versionMu.Lock()
-	// Whatever brought us here changed what this node holds — including the early
-	// return right below, which is exactly the late-push case (a version landing under
-	// a cursor that has already moved past it, §B's no-failure-needed leftover). The
-	// reverse reconciliation only has to run again after such a change, so mark it
-	// before deciding anything.
-	d.deletedReconcileDirty = true
-	if versionID <= d.localVersion[kbID] {
-		d.versionMu.Unlock()
-		return
-	}
-	handled := d.handledAbove[kbID]
-	if handled == nil {
-		handled = make(map[int64]struct{})
-		d.handledAbove[kbID] = handled
-	}
-	handled[versionID] = struct{}{}
-	d.advanceCursorLocked(kbID)
-	cursor := d.localVersion[kbID]
-	d.versionMu.Unlock()
+	// Whatever brought us here changed what this node holds — including a late
+	// push (a version landing under a cursor that has already moved past it,
+	// §B's no-failure-needed leftover), which the machine's advance treats as a
+	// no-op on the cursor but not on what this node holds. The reverse
+	// reconciliation only has to run again after such a change, so mark it
+	// before asking.
+	d.noteHoldingsChanged()
 
 	// Data first, cursor second — the invariant the whole record depends on. It
 	// is enforced HERE, on the single path every advance goes through, rather
@@ -762,7 +883,63 @@ func (d *LocalDataPlane) advanceLocalVersion(kbID string, versionID int64) {
 	// only moves over a contiguous run, so after an advance it may have stepped
 	// over several versions at once — and that boundary is the thing worth
 	// recording.
-	d.persistCursor(kbID, cursor)
+	d.persistCursor(kbID, d.state.Advance(kbID, versionID))
+}
+
+// noteHoldingsChanged records that what this node HOLDS has changed — a version
+// landed, was reclaimed, or the cursor moved — so the next reverse
+// reconciliation has to run.
+//
+// It is set on every advance rather than only on the ones that can actually
+// leave a leftover, and that is the conservative direction on purpose: "did
+// that cleanup land" is a much harder fact to observe here than "something
+// changed", and a missed mark means a leftover nothing will ever collect.
+func (d *LocalDataPlane) noteHoldingsChanged() {
+	d.versionMu.Lock()
+	d.deletedReconcileDirty = true
+	d.versionMu.Unlock()
+}
+
+// dataLanded records a version landing on this node: the fact first (the state
+// machine), then the cursor (how far the unbroken history reaches).
+//
+// The order is the invariant every other advance follows — data first, cursor
+// second — and it is why this is one named pair rather than the cursor call
+// alone at each of the half-dozen sites that produce a landing (a local write,
+// a pull, a push, a backfill, a resumed transaction).
+func (d *LocalDataPlane) dataLanded(kbID string, versionID int64) {
+	d.noteDataLanded(kbID, versionID)
+	d.advanceLocalVersion(kbID, versionID)
+}
+
+// cursorStepsPast records the OPPOSITE fact from dataLanded: this node will
+// never hold versionID, so the cursor has to be able to move over it (a version
+// the control layer retired and this node reclaimed — see
+// reclaimTerminalVersionLocally). Telling the state machine is what keeps "the
+// version is not here" from being recorded as "it landed and then vanished".
+func (d *LocalDataPlane) cursorStepsPast(kbID string, versionID int64) {
+	d.noteVersionDropped(kbID, versionID)
+	d.advanceLocalVersion(kbID, versionID)
+}
+
+// noteDataLanded reports a landing to the state machine, if one is wired.
+//
+// A refused transition is LOGGED, not returned: it means this layer produced an
+// event the machine's table says cannot happen, which is worth seeing — but the
+// storage write has already committed by the time this runs, so failing the
+// write over a bookkeeping disagreement would turn a reporting bug into data
+// loss. The machine keeps its previous value and the log is the evidence.
+func (d *LocalDataPlane) noteDataLanded(kbID string, versionID int64) {
+	if err := d.state.DataLanded(kbID, versionID); err != nil {
+		d.logger.Warn("plane: node state: landing not recorded",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
+}
+
+// noteVersionDropped reports a removal to the state machine, if one is wired.
+// Nothing can refuse it, so there is nothing to log.
+func (d *LocalDataPlane) noteVersionDropped(kbID string, versionID int64) {
+	d.state.VersionDropped(kbID, versionID)
 }
 
 // AnnounceVersion records that the control layer says versionID exists. It is the
@@ -772,70 +949,7 @@ func (d *LocalDataPlane) advanceLocalVersion(kbID string, versionID int64) {
 // Announcing is idempotent and cheap, and it deliberately does NOT move the
 // cursor: existence is not possession.
 func (d *LocalDataPlane) AnnounceVersion(kbID string, versionID int64) {
-	d.versionMu.Lock()
-	defer d.versionMu.Unlock()
-	if versionID <= d.localVersion[kbID] {
-		return
-	}
-	announced := d.announcedAbove[kbID]
-	if announced == nil {
-		announced = make(map[int64]struct{})
-		d.announcedAbove[kbID] = announced
-	}
-	announced[versionID] = struct{}{}
-}
-
-// advanceCursorLocked walks the cursor up over every accounted-for version,
-// stopping at the first KNOWN version that is not accounted for (or when nothing
-// above the cursor is known).
-//
-// The work is proportional to the number of versions above the cursor still being
-// tracked, which is one in the healthy case — an advance immediately consumes its
-// own entry — and grows only while a gap is genuinely missing.
-func (d *LocalDataPlane) advanceCursorLocked(kbID string) {
-	handled := d.handledAbove[kbID]
-	announced := d.announcedAbove[kbID]
-	for {
-		next, ok := d.lowestAboveLocked(kbID)
-		if !ok {
-			break
-		}
-		if _, done := handled[next]; !done {
-			// A version the control layer says exists and this node does not
-			// hold: the cursor stops below it rather than claiming a history
-			// with a hole in it.
-			break
-		}
-		delete(handled, next)
-		delete(announced, next)
-		d.localVersion[kbID] = next
-	}
-	if len(handled) == 0 {
-		delete(d.handledAbove, kbID)
-	}
-	if len(announced) == 0 {
-		delete(d.announcedAbove, kbID)
-	}
-}
-
-// lowestAboveLocked returns the smallest version above the cursor that this node
-// knows of — accounted for or merely announced. The second return value is false
-// when nothing above the cursor is known, i.e. there is nothing left to step over.
-func (d *LocalDataPlane) lowestAboveLocked(kbID string) (int64, bool) {
-	cursor := d.localVersion[kbID]
-	found := false
-	var lowest int64
-	for _, set := range []map[int64]struct{}{d.handledAbove[kbID], d.announcedAbove[kbID]} {
-		for v := range set {
-			if v <= cursor {
-				continue
-			}
-			if !found || v < lowest {
-				lowest, found = v, true
-			}
-		}
-	}
-	return lowest, found
+	d.state.Announce(kbID, versionID)
 }
 
 // markVersionsHandled accounts for every version in [from, to] in one step. It is
@@ -843,21 +957,7 @@ func (d *LocalDataPlane) lowestAboveLocked(kbID string) (int64, bool) {
 // transfer is the only one — where advancing version by version would re-scan the
 // pending sets once per version.
 func (d *LocalDataPlane) markVersionsHandled(kbID string, from, to int64) {
-	d.versionMu.Lock()
-	handled := d.handledAbove[kbID]
-	if handled == nil {
-		handled = make(map[int64]struct{})
-		d.handledAbove[kbID] = handled
-	}
-	for v := from; v <= to; v++ {
-		if v > d.localVersion[kbID] {
-			handled[v] = struct{}{}
-		}
-	}
-	d.advanceCursorLocked(kbID)
-	cursor := d.localVersion[kbID]
-	d.versionMu.Unlock()
-	d.persistCursor(kbID, cursor)
+	d.persistCursor(kbID, d.state.MarkHandled(kbID, from, to))
 }
 
 // MarkVersionContiguous implements sync.LocalVersionAdvancer: a version whose
@@ -869,7 +969,7 @@ func (d *LocalDataPlane) markVersionsHandled(kbID string, from, to int64) {
 // replica with every record on disk still answered "version 0" to the station's
 // freshness check (§9.3(2)) and was refused as stale.
 func (d *LocalDataPlane) MarkVersionContiguous(kbID string, versionID int64) {
-	d.advanceLocalVersion(kbID, versionID)
+	d.dataLanded(kbID, versionID)
 }
 
 // LocalVersionOf reports the highest version this node holds contiguously for
@@ -882,9 +982,7 @@ func (d *LocalDataPlane) LocalVersionOf(kbID string) int64 {
 // localVersionOf reports the highest version this node holds contiguously for
 // kbID (0 = nothing known yet).
 func (d *LocalDataPlane) localVersionOf(kbID string) int64 {
-	d.versionMu.RLock()
-	defer d.versionMu.RUnlock()
-	return d.localVersion[kbID]
+	return d.state.Cursor(kbID)
 }
 
 // cursorWriteTimeout bounds ONE cursor record's write. The write is a local
@@ -1001,11 +1099,7 @@ func (d *LocalDataPlane) persistedCursors(ctx context.Context) (map[string]int64
 // is: memory may already have moved past the record (a write that landed before
 // this ran), and moving back would forget versions this node holds.
 func (d *LocalDataPlane) installPersistedCursor(kbID string, versionID int64) {
-	d.versionMu.Lock()
-	defer d.versionMu.Unlock()
-	if versionID > d.localVersion[kbID] {
-		d.localVersion[kbID] = versionID
-	}
+	d.state.InstallCursor(kbID, versionID)
 }
 
 // DataVersionsSnapshot returns a copy of every knowledge base's contiguous
@@ -1017,13 +1111,7 @@ func (d *LocalDataPlane) installPersistedCursor(kbID string, versionID int64) {
 // can tell "reported 0" from "never reported" — a distinction §7.13.4's aggregate
 // depends on.
 func (d *LocalDataPlane) DataVersionsSnapshot() map[string]int64 {
-	d.versionMu.RLock()
-	defer d.versionMu.RUnlock()
-	snapshot := make(map[string]int64, len(d.localVersion))
-	for kbID, versionID := range d.localVersion {
-		snapshot[kbID] = versionID
-	}
-	return snapshot
+	return d.state.Cursors()
 }
 
 // backfillTo closes a known gap before versionID is applied, by pulling
@@ -1138,7 +1226,7 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 			// at versionID-1 — exactly what the gap's own need admits — holds no data
 			// for it. Such a replica answers with an empty stream, which the sync
 			// layer reports as success and cannot tell apart from a version that is
-			// genuinely empty (Follower.PullVersionWith advances the cursor on any
+			// genuinely empty (Follower.PullVersionData advances the cursor on any
 			// completed receive, including one that carried nothing), so transferring
 			// from it would move this node's cursor onto a version it does not hold —
 			// and "the cursor says the data landed" is what every later fetch is
@@ -1150,10 +1238,15 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 			}
 			return d.transferFullState(ctx, holder, kbID, local, versionID, v)
 		}
-		if err := d.puller.PullVersion(ctx, source, kbID, v); err != nil {
+		// Data only. Backfill fills in a GAP — the versions between this node's
+		// cursor and the one being applied — and nothing asked for those versions:
+		// they are being filled so the chain is unbroken, not so they can be
+		// served. Building each of them would be the eager behaviour §8.6(b)
+		// removed, multiplied by the size of the gap.
+		if err := d.puller.PullVersionData(ctx, source, kbID, v); err != nil {
 			return fmt.Errorf("plane: backfill %s v%d from %s (local cursor %d): %w", kbID, v, source, local, err)
 		}
-		d.advanceLocalVersion(kbID, v)
+		d.dataLanded(kbID, v)
 	}
 	return nil
 }
@@ -1437,133 +1530,6 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 	return d.finishVersionWrite(ctx, kbID, versionID, len(changes), docIDs, &fin)
 }
 
-// PushIndexToReplicas ships a locally built index to the candidate replicas, so
-// they load the artifact instead of building their own — "建一次、分发 N 份"
-// (Stratum_设计文档v13.md §8.4).
-//
-// Best effort per replica, and it never fails the build. A replica that cannot
-// be reached falls back to building for itself, which is exactly the behaviour
-// the cluster had before distribution existed: distribution is an optimisation
-// over that baseline, not a new way for a version to become unservable.
-//
-// §8.4(a): the call is bounded by indexPushSem. Distribution is the third of the
-// storage layer's resource-hungry paths — after replayed writes and local index
-// builds — and was the only one without a gate, so a batch of version switches
-// or a set of replicas catching up at once would have every build's callback open
-// a distribution at the same moment, each reading a whole index file into memory.
-// The gate counts calls, not replicas: one call already covers N replicas, and N
-// is small.
-func (d *LocalDataPlane) PushIndexToReplicas(ctx context.Context, kbID string, versionID int64) error {
-	if d.indexReader == nil || d.indexShipper == nil || d.resolveReplicas == nil {
-		return nil // distribution not wired; each replica builds its own
-	}
-	peers, err := d.resolveReplicas(ctx)
-	if err != nil {
-		return fmt.Errorf("plane: PushIndexToReplicas: resolve replicas: %w", err)
-	}
-
-	// §8.4(a) probe before the read. The probe needs only the ids, while the read
-	// is where the memory peaks (tens of megabytes held in the builder for as long
-	// as the fan-out runs), so asking first turns "everyone already has it" — the
-	// multi-builder round-robin this exists for — into N small RTTs: no read, no
-	// distribution slot, no outbound bytes.
-	//
-	// The probes deliberately sit OUTSIDE indexPushSem. That gate means "one
-	// whole-file read plus its fan-out"; a probe queued behind one would lose
-	// exactly the head start it is here to win. A peer that cannot answer counts
-	// as "ship it": not knowing is not the same as knowing it is absent.
-	needed := make([]string, 0, len(peers))
-	var skipped int
-	for _, peer := range peers {
-		probeCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
-		held, probeErr := d.indexShipper.ProbeIndex(probeCtx, peer, kbID, versionID)
-		cancel()
-		switch {
-		case probeErr != nil:
-			d.logger.Debug("plane: index presence probe failed; shipping anyway",
-				zap.String("peer", peer), zap.String("kb_id", kbID),
-				zap.Int64("version_id", versionID), zap.Error(probeErr))
-			needed = append(needed, peer)
-		case held:
-			skipped++
-		default:
-			needed = append(needed, peer)
-		}
-	}
-
-	// The ship that follows probes too — PushIndex opens with the same frame — so
-	// a peer can still answer "already held" between the two checks. Both feed the
-	// same tally: the line below is about how much distribution the probe saved,
-	// not about which of the two noticed. It is a deferred report because the
-	// count is only final once the fan-out has finished.
-	defer func() {
-		if skipped > 0 {
-			d.logger.Info("plane: index distribution skipped replicas that already hold the artifact",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("skipped", skipped))
-		}
-	}()
-
-	if len(needed) == 0 {
-		// Every candidate already holds the artifact: the read and the fan-out are
-		// both unnecessary, so neither happens.
-		return nil
-	}
-
-	// Acquire before the read, not before the ship: the read is what makes the
-	// memory peak, so it has to be inside the gate. Honouring ctx matters as much
-	// as the bound — the callers are background goroutines (the build callback in
-	// cmd/stratum and reconcile), and one that cannot be cancelled would sit here
-	// for as long as the storm lasts.
-	if d.indexPushSem != nil {
-		select {
-		case d.indexPushSem <- struct{}{}:
-			defer func() { <-d.indexPushSem }()
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	indexData, sidecarData, err := d.indexReader.ReadIndexFiles(kbID, versionID)
-	if err != nil {
-		return fmt.Errorf("plane: PushIndexToReplicas(%s v%d): read local index: %w", kbID, versionID, err)
-	}
-	for _, peer := range needed {
-		err := d.indexShipper.PushIndex(ctx, peer, kbID, versionID, indexData, sidecarData)
-		switch {
-		case err == nil:
-		case errors.Is(err, stratinternalsync.ErrIndexAlreadyPresent):
-			// The peer answered the in-stream probe with "already held". No bytes
-			// moved for it, and the read above could not know that in advance
-			// because the other peers did need the ship.
-			skipped++
-		default:
-			d.logger.Warn("plane: index distribution failed; that replica will build its own",
-				zap.String("peer", peer), zap.String("kb_id", kbID),
-				zap.Int64("version_id", versionID), zap.Error(err))
-		}
-	}
-	return nil
-}
-
-// DefaultMaxConcurrentIndexPush is how many PushIndexToReplicas runs may be in
-// flight at once when nothing is configured (v13 §8.4(a)).
-//
-// One distribution reads a whole index file into memory and streams it to every
-// replica, so this number bounds two resources at once: the builder's memory peak
-// and its outbound bandwidth. Four is deliberately modest — the point is to turn
-// a distribution storm (a batch of version switches, or replicas catching up at
-// once) into a queue instead of a spike, not to saturate the network. Like the
-// other budget numbers it is a §10.4 placeholder, to be revised once measured.
-const DefaultMaxConcurrentIndexPush = 4
-
-// newIndexPushSem builds the distribution semaphore. A non-positive limit takes
-// the default, following LocalDataPlaneConfig.MaxInFlightWrites' convention.
-func newIndexPushSem(limit int) chan struct{} {
-	if limit <= 0 {
-		limit = DefaultMaxConcurrentIndexPush
-	}
-	return make(chan struct{}, limit)
-}
-
 // The confirmation broadcast's budget. All placeholder values in the §10.4 sense:
 // what matters is the shape — a per-attempt deadline, a bounded number of
 // attempts, and a whole-broadcast ceiling with room for every peer to spend its
@@ -1792,7 +1758,7 @@ func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string,
 	if err != nil {
 		return nil, fmt.Errorf("plane: WriteVersionData: WAL.WriteCommit: %w", err)
 	}
-	d.advanceLocalVersion(kbID, versionID)
+	d.dataLanded(kbID, versionID)
 	return docIDs, nil
 }
 
@@ -2038,19 +2004,16 @@ func (d *LocalDataPlane) finishVersionWrite(ctx context.Context, kbID string, ve
 		// backfill — not the version's existence, and not its ability to be served
 		// from here.
 		//
-		// So the build is scheduled on this path too. It used to be reachable only
-		// through reportAndSchedule on the success path, which left a version whose
-		// replication fell short with no index and no report at all: the control
-		// layer kept it PENDING, every query answered "index not ready", and the
-		// documents sat on disk with nobody able to finish or serve them. Measured
-		// on a 1000-document batch: report_us = 0 on all three replicas, each of
-		// which had already spent 14.6 s committing that very version.
-		reportStart := time.Now()
-		d.scheduleIndexBuild(ctx, kbID, versionID)
-		if st != nil {
-			st.report = time.Since(reportStart)
-		}
-
+		// This path used to schedule an index build here as well, so that a version
+		// whose replication fell short still had an index. That is no longer
+		// needed and no longer happens: §8.6(b) builds a version when something
+		// asks for it, and a query for a version with no index builds one on the
+		// spot (service/query.go) — including a version the control layer has left
+		// PENDING, which is what that workaround was really about. Leaving the
+		// build here would mean every write builds eagerly, which is the cost
+		// lazy construction exists to avoid.
+		//
+		// Note what is deliberately NOT done: no durable report either — see below.
 		// Replication failed, and it is still transient (peers come back), so it is
 		// reported and returned — the caller's Saga owns the retry decision (§10.1).
 		// Note what is deliberately NOT done: no durable report. Durability is
@@ -2093,7 +2056,7 @@ func (d *LocalDataPlane) ResumeVersionWrite(ctx context.Context, kbID string, ve
 	if err := d.wal.WriteCommit(ctx, versionID); err != nil {
 		return fmt.Errorf("plane: ResumeVersionWrite: WAL.WriteCommit: %w", err)
 	}
-	d.advanceLocalVersion(kbID, versionID)
+	d.dataLanded(kbID, versionID)
 	// The same tail the normal path runs, fan-out included. Recovery used to skip
 	// straight to the durable report, so a crash during the local write produced a
 	// version the control layer called durable while no other replica held it.
@@ -2140,22 +2103,6 @@ func (d *LocalDataPlane) reportAndSchedule(ctx context.Context, kbID string, ver
 	} else {
 		d.logger.Debug("plane: no control plane wired; the version's digest is not reported",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
-	}
-	d.scheduleIndexBuild(ctx, kbID, versionID)
-}
-
-// scheduleIndexBuild asks for this version's index to be built on this node.
-//
-// It is separate from reportAndSchedule because the two have different
-// preconditions. Reporting durable is a claim about *quorum*: only the caller
-// that got enough replica acknowledgements may make it (§7.1). Scheduling the
-// build is a claim about *this node*, and it is warranted as soon as the local
-// transaction has committed — the documents, the document-ID set and the WAL
-// commit record are all here, so the index can be built and a query answered
-// from this node whenever the version becomes servable.
-func (d *LocalDataPlane) scheduleIndexBuild(ctx context.Context, kbID string, versionID int64) {
-	if d.indexMgr != nil {
-		_ = d.indexMgr.TriggerBuild(ctx, kbID, versionID)
 	}
 }
 
@@ -2277,7 +2224,7 @@ func (d *LocalDataPlane) reclaimTerminalVersionLocally(kbID string, versionID in
 	// never arrive must not hold the contiguous cursor back (that would read as "this
 	// node is behind" and start a catch-up that can never finish), and the order is the
 	// same invariant every other advance follows — data first, cursor second.
-	d.advanceLocalVersion(kbID, versionID)
+	d.cursorStepsPast(kbID, versionID)
 	d.clearTerminalReclaim(kbID, versionID)
 	return nil
 }
@@ -2344,7 +2291,7 @@ func (d *LocalDataPlane) retryTerminalReclaims(ctx context.Context) {
 				continue
 			}
 		}
-		d.advanceLocalVersion(task.kbID, task.versionID)
+		d.cursorStepsPast(task.kbID, task.versionID)
 		d.clearTerminalReclaim(task.kbID, task.versionID)
 	}
 }
@@ -2398,7 +2345,7 @@ func (d *LocalDataPlane) DropVersionData(ctx context.Context, kbID string, versi
 	} else if d.cleaner == nil {
 		return fmt.Errorf("plane: DropVersionData: not wired (no local dropper and no broadcaster)")
 	}
-	d.advanceLocalVersion(kbID, versionID)
+	d.cursorStepsPast(kbID, versionID)
 	// A broadcast that did not reach everyone is no longer retried here. It used to be:
 	// §10.6's only way to reclaim a version on a replica that missed the message was to
 	// tell it again. Every replica now learns a terminal verdict from its own apply and
@@ -2410,26 +2357,6 @@ func (d *LocalDataPlane) DropVersionData(ctx context.Context, kbID string, versi
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(firstErr))
 	}
 	return firstErr
-}
-
-// SetDurabilityPolicy records the declarative target for kbID.
-//
-// The failure budget it carries is passed straight on to the control layer,
-// which owns the terminal verdict (Stratum_设计文档v13.md §10.1): the policy is
-// declared at the storage-layer boundary but enforced where the decision lives.
-// The replication target itself stays advisory for now — the replica set comes
-// from the cluster's topology (§7.1/§7.2), not from this value.
-func (d *LocalDataPlane) SetDurabilityPolicy(ctx context.Context, kbID string, policy DurabilityPolicy) error {
-	// §7.7: the in-flight cap is enforced here, where the backlog would form.
-	d.limiter.SetLimit(kbID, policy.MaxInFlightWrites)
-
-	if d.control == nil || policy.MaxFailures <= 0 {
-		return nil
-	}
-	if err := d.control.SetFailureBudget(ctx, kbID, policy.MaxFailures); err != nil {
-		return fmt.Errorf("plane: SetDurabilityPolicy(%s): %w", kbID, err)
-	}
-	return nil
 }
 
 // TransactionWAL frames the storage layer's write transaction. *wal.FileWAL
@@ -3026,4 +2953,59 @@ func retentionCutoffOf(onDisk []int64, retentionCount int) int64 {
 	ids := append([]int64(nil), onDisk...)
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids[len(ids)-retentionCount]
+}
+
+// FetchIndexFromPeers asks the other replicas whether any of them holds
+// versionID's artifact, and installs the first one that answers.
+//
+// Under §8.4 owner sharding a version's index lives on ONE node, so every other
+// replica that needs it has to get it from there — and asking is the only way,
+// because distribution is pull-only (the push half was removed; see
+// sync.IndexFetcher for why a fire-and-forget ship was the wrong mechanism).
+// This is the ask.
+//
+// Returns installed=false (with a nil error) when nothing needed doing or nobody
+// had it — "no peer holds this" is an ordinary answer, not a failure, and the
+// caller falls through to building. Errors are reserved for transport trouble
+// worth a log line, and even then the caller may still build.
+func (d *LocalDataPlane) FetchIndexFromPeers(ctx context.Context, kbID string, versionID int64) (bool, error) {
+	if d.indexFetcher == nil || d.indexInstaller == nil || d.resolveReplicas == nil {
+		return false, nil // nothing to fetch with, or nobody to fetch from
+	}
+	peers, err := d.resolveReplicas(ctx)
+	if err != nil {
+		return false, fmt.Errorf("plane: FetchIndexFromPeers: resolve replicas: %w", err)
+	}
+
+	var lastErr error
+	for _, peer := range peers {
+		if peer == "" {
+			continue
+		}
+		fetchCtx, cancel := context.WithTimeout(ctx, d.effectivePullIdleTimeout())
+		indexData, sidecarData, fetchErr := d.indexFetcher.FetchIndex(fetchCtx, peer, kbID, versionID)
+		cancel()
+		if fetchErr != nil {
+			if errors.Is(fetchErr, stratinternalsync.ErrIndexNotExported) {
+				// This peer does not have it. Ordinary; try the next.
+				continue
+			}
+			lastErr = fetchErr
+			d.logger.Warn("plane: fetching an index artifact from a peer failed",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.String("peer", peer), zap.Error(fetchErr))
+			continue
+		}
+		if err := d.indexInstaller.InstallIndex(ctx, kbID, versionID, indexData, sidecarData); err != nil {
+			lastErr = err
+			d.logger.Warn("plane: installing a fetched index artifact failed",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.String("peer", peer), zap.Error(err))
+			continue
+		}
+		d.logger.Info("plane: fetched an index artifact from a peer instead of building",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.String("peer", peer))
+		return true, nil
+	}
+	return false, lastErr
 }

@@ -64,18 +64,10 @@ func (s *stubDeletedVersions) VersionLiveness(_ context.Context, _ string, fromE
 	return alive, bound, nil
 }
 
-// snapshotPuller records the two transfer paths separately, so a test can tell
-// "filled the gap version by version" from "fell back to a full-state transfer".
+// snapshotPuller records which versions were fetched, in order.
 type snapshotPuller struct {
-	versionPulls []int64
-	dataPulls    []int64
-	versionErr   map[int64]error
-	dataErr      error
-}
-
-func (p *snapshotPuller) PullVersion(_ context.Context, _, _ string, versionID int64) error {
-	p.versionPulls = append(p.versionPulls, versionID)
-	return p.versionErr[versionID]
+	dataPulls []int64
+	dataErr   error
 }
 
 func (p *snapshotPuller) PullVersionData(_ context.Context, _, _ string, versionID int64) error {
@@ -105,11 +97,8 @@ func TestLocalDataPlane_DeletedVersionTriggersFullStateTransfer(t *testing.T) {
 	}
 
 	// The deleted version was never fetched: the check runs before the pull, so a
-	// version we know is gone costs no transfer. This is also the observable that
-	// proves the full-state path ran rather than the version-by-version one.
-	if len(puller.versionPulls) != 0 {
-		t.Errorf("version pulls = %v, want none (a confirmed-deleted version is not fetched)", puller.versionPulls)
-	}
+	// version we know is gone costs no transfer. Only the version being applied
+	// appears — never the confirmed-deleted one.
 	if len(puller.dataPulls) != 1 || puller.dataPulls[0] != 5 {
 		t.Errorf("full-state pulls = %v, want [5] (the version being applied)", puller.dataPulls)
 	}
@@ -178,11 +167,13 @@ func TestLocalDataPlane_EmptyButExistingVersionStillAdvances(t *testing.T) {
 	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 5); err != nil {
 		t.Fatalf("backfillTo: %v", err)
 	}
-	if len(puller.dataPulls) != 0 {
-		t.Errorf("full-state pulls = %v, want none: nothing was deleted", puller.dataPulls)
-	}
+	// The cursor landing on 4 is what distinguishes "filled the gap version by
+	// version" from "fell back to a full-state transfer", which would have moved
+	// it to 5. Asserting on the pull log cannot tell them apart any more: both
+	// paths fetch data and nothing else (§8.6b), so dataPulls is [3 4] for the
+	// ordinary fill and [5] for the snapshot — the cursor is the observable.
 	if got := dp.LocalVersionOf("kb-1"); got != 4 {
-		t.Errorf("localVersion = %d, want 4", got)
+		t.Errorf("localVersion = %d, want 4 (the gap was filled version by version)", got)
 	}
 	// Two versions in the gap, still ONE metadata read.
 	if deleted.calls != 1 {
@@ -212,7 +203,7 @@ func TestLocalDataPlane_ExistenceCheckFailureStopsTheBackfill(t *testing.T) {
 // A transport failure is likewise not a deletion: the original invariant (abort the
 // apply rather than skip silently) stays intact.
 func TestLocalDataPlane_PullFailureStillAbortsRatherThanSkipping(t *testing.T) {
-	puller := &snapshotPuller{versionErr: map[int64]error{2: errors.New("pull failed")}}
+	puller := &snapshotPuller{dataErr: errors.New("pull failed")}
 	deleted := &stubDeletedVersions{deleted: []int64{}}
 	dp := deletedBackfillPlane(puller, deleted)
 	dp.advanceLocalVersion("kb-1", 1)
@@ -220,9 +211,9 @@ func TestLocalDataPlane_PullFailureStillAbortsRatherThanSkipping(t *testing.T) {
 	if err := dp.backfillTo(context.Background(), "peer:7001", "kb-1", 3); err == nil {
 		t.Fatal("a failed pull must abort the apply")
 	}
-	if len(puller.dataPulls) != 0 {
-		t.Errorf("full-state pulls = %v, want none: a transport failure is not a deletion", puller.dataPulls)
-	}
+	// The abort above is the assertion that matters. There is no "and no
+	// full-state transfer ran" half any more: both paths fetch data, so the pull
+	// log cannot distinguish them (§8.6b) — the ERROR does.
 }
 
 // With no checker wired the plane keeps its previous behaviour: this is what keeps
@@ -238,8 +229,10 @@ func TestLocalDataPlane_NoExistenceCheckerKeepsOldBehaviour(t *testing.T) {
 	if got := dp.LocalVersionOf("kb-1"); got != 3 {
 		t.Errorf("localVersion = %d, want 3 (unchanged behaviour)", got)
 	}
-	if len(puller.dataPulls) != 0 {
-		t.Errorf("full-state pulls = %v, want none", puller.dataPulls)
+	// Filling the gap version by version is the behaviour, so the pull happening
+	// is the assertion: with no checker, v3 is fetched and the cursor moves to it.
+	if len(puller.dataPulls) != 1 || puller.dataPulls[0] != 3 {
+		t.Errorf("pulls = %v, want [3]: the gap is filled directly", puller.dataPulls)
 	}
 }
 

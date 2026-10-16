@@ -102,8 +102,12 @@ func TestPusher_PushVersion_EndToEnd(t *testing.T) {
 	if chunkIDs, err := follower.chunkDoc.ListChunkIDsByDocs(ctx, kbID, []string{"doc-1"}); err != nil || len(chunkIDs) != 1 || chunkIDs[0] != "c-1" {
 		t.Errorf("target chunkdoc = %v, %v", chunkIDs, err)
 	}
-	if trigger.len() == 0 {
-		t.Error("the target must schedule its own index build after applying a pushed version")
+	// The target builds NOTHING (§8.6b). A push delivers data; the version is
+	// built when something asks for it, and §8.4 owner sharding decides which node
+	// that is. The handler used to build here for every landing, gated on "am I the
+	// owner head" — correct about who, wrong about whether.
+	if trigger.len() != 0 {
+		t.Errorf("TriggerBuild calls = %d, want 0: a push must not build", trigger.len())
 	}
 }
 
@@ -231,8 +235,8 @@ func TestFollower_PullVersion_AdvancesTheCursor(t *testing.T) {
 	follower, _, _ := startPushServer(t, 5)
 	follower.SetLocalVersionAdvancer(adv)
 
-	if err := follower.PullVersion(ctx, leaderAddr, kbID, versionID); err != nil {
-		t.Fatalf("PullVersion: %v", err)
+	if err := follower.PullVersionData(ctx, leaderAddr, kbID, versionID); err != nil {
+		t.Fatalf("PullVersionData: %v", err)
 	}
 
 	got := adv.got()

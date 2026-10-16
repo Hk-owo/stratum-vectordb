@@ -44,7 +44,6 @@ type RouteTable struct {
 
 	mu       sync.RWMutex
 	snapshot routeSnapshot
-	updated  time.Time
 	// ready is false until the first successful refresh: an empty table is not
 	// the same answer as "nothing is servable".
 	ready bool
@@ -237,7 +236,6 @@ func (t *RouteTable) Refresh(ctx context.Context) {
 	}
 	t.mu.Lock()
 	t.snapshot = snap
-	t.updated = time.Now()
 	t.ready = true
 	t.mu.Unlock()
 }
@@ -247,6 +245,13 @@ func (t *RouteTable) Refresh(ctx context.Context) {
 //
 // A minVersion of 0 means "no credential": every node qualifies, because there
 // is nothing to be fresh about.
+//
+// NOTE on what the result now IS: it is the set of nodes that HOLD the version,
+// which Router.candidates then intersects with the version's index OWNERS
+// (docs/index-owner-sharding-plan.md §5.1). It is therefore a filter input, not
+// the final candidate set — the holders are necessary but not sufficient once
+// sharding is on. Reading it as "these are the nodes we will try" is still
+// correct with sharding off, which is the default.
 //
 // Before the first successful refresh it also returns every node, and it does the
 // same whenever the leader named no holder for the KB. Both are deliberate and
@@ -305,16 +310,6 @@ func (t *RouteTable) ExpectedVersion(kbID string) (int64, bool) {
 	}
 	v, ok := t.snapshot.expected[kbID]
 	return v, ok
-}
-
-// Updated reports when the table was last refreshed successfully.
-func (t *RouteTable) Updated() time.Time {
-	if t == nil {
-		return time.Time{}
-	}
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.updated
 }
 
 func allIndexes(n int) []int {

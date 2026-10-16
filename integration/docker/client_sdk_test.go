@@ -123,8 +123,12 @@ func TestT4_ClientSDK_WaitsForReadinessAndDiscards(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WaitUntilSettled: %v", err)
 	}
-	if resp.GetStage() != "INDEX_READY" {
-		t.Fatalf("stage = %s, want INDEX_READY (a version that never becomes READY points at the cluster's index builds, not at this client)", resp.GetStage())
+	// DATA_DURABLE is the settled stage now: an index is built when something asks
+	// for the version (§8.6b), so a client that waits for READY waits for something
+	// the cluster does not produce on its own. A caller that wants the index
+	// queried or warmed up asks for it — see client.Decide.
+	if resp.GetStage() != "DATA_DURABLE" {
+		t.Fatalf("stage = %s, want DATA_DURABLE (a version whose data never settles points at the cluster's replication, not at this client)", resp.GetStage())
 	}
 	if decision != client.DecisionDone {
 		t.Errorf("decision = %v, want DONE", decision)

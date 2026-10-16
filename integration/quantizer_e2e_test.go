@@ -290,6 +290,13 @@ func TestRealStack_PQTrainingShortfallFailsReadably(t *testing.T) {
 	}
 	vid := resp.VersionId
 
+	// Ask for the build. §8.6(b) builds a version when something requests it, and
+	// this test is about what happens DURING that build — without the request the
+	// version sits PENDING and the assertions below would be vacuous.
+	if err := leader.warmupViaLeader(ctx, kbID, vid); err != nil {
+		t.Fatalf("warmup %s v%d: %v", kbID, vid, err)
+	}
+
 	deadline := time.Now().Add(90 * time.Second)
 	last := pb.IndexStatus_INDEX_STATUS_PENDING
 	for time.Now().Before(deadline) {

@@ -25,59 +25,6 @@ import (
 	"stratum/internal/types"
 )
 
-// DurabilityPolicy is the declarative persistence target the control layer
-// hands to the storage layer for one knowledge base (v1 §4.1
-// SetDurabilityPolicy). How that target is met — replication factor, erasure
-// coding, placement — is a storage-layer internal matter; the control layer
-// only declares and then consumes the reported availability.
-type DurabilityPolicy struct {
-	// MaxFailures is how many failed attempts the control layer tolerates
-	// before declaring a version FAILED_PERMANENT (Stratum_设计文档v13.md
-	// §10.1). Zero means "unset": DefaultFailureBudget applies.
-	MaxFailures int
-
-	// MaxInFlightWrites caps how many writes may be in flight for this KB at
-	// once (Stratum_设计文档v13.md §7.7). Zero means "unset": the default
-	// applies. It is the storage layer's backstop against a stalled version
-	// letting the rest pile up behind it.
-	MaxInFlightWrites int
-
-	// Replicas is the desired number of durable copies. Zero means "unset":
-	// the storage layer keeps its current (or default) target.
-	Replicas int
-}
-
-// Availability is the abstract serviceability state the storage layer reports
-// up (v1 §4.3). The control layer stores this state without learning *why* a
-// version is degraded — that is precisely the "control layer is blind to
-// physical details" property the separation is built on.
-type Availability int
-
-const (
-	// AvailabilityAvailable: data meets the durability policy and the index
-	// can serve reads.
-	AvailabilityAvailable Availability = iota
-	// AvailabilityDegraded: serviceable, but below the redundancy target or
-	// requiring cold-data decoding first.
-	AvailabilityDegraded
-	// AvailabilityUnavailable: not serviceable.
-	AvailabilityUnavailable
-)
-
-// String renders an Availability for logs and error messages.
-func (a Availability) String() string {
-	switch a {
-	case AvailabilityAvailable:
-		return "AVAILABLE"
-	case AvailabilityDegraded:
-		return "DEGRADED"
-	case AvailabilityUnavailable:
-		return "UNAVAILABLE"
-	default:
-		return "UNKNOWN"
-	}
-}
-
 // VersionRef names one (knowledge base, version) pair for bulk reports.
 type VersionRef struct {
 	KBID      string
@@ -133,9 +80,6 @@ type DataPlane interface {
 
 	// Search runs a vector query against versionID's index.
 	Search(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error)
-
-	// SetDurabilityPolicy declares the persistence target for kbID.
-	SetDurabilityPolicy(ctx context.Context, kbID string, policy DurabilityPolicy) error
 }
 
 // ControlPlane is what the storage layer calls back on the control layer
@@ -171,13 +115,12 @@ type ControlPlane interface {
 	ReportVersionFailure(ctx context.Context, kbID string, versionID int64, side types.FailureSide, class types.FailureClass, detail string) (terminal bool, err error)
 
 	// SetFailureBudget declares how many failed attempts kbID tolerates before
-	// its versions are declared FAILED_PERMANENT. It comes from the KB's
-	// DurabilityPolicy: the *decision* stays the control layer's (§10.1), but
-	// the number is per-KB policy. A non-positive value means "use the default".
+	// its versions are declared FAILED_PERMANENT: the *decision* stays the
+	// control layer's (§10.1), but the number is per-KB policy. A non-positive
+	// value means "use the default". Nothing calls it yet — the per-KB number
+	// had arrived through the durability-policy declaration — so the process
+	// default is what governs.
 	SetFailureBudget(ctx context.Context, kbID string, maxFailures int) error
-
-	// ReportAvailability reports versionID's abstract availability state.
-	ReportAvailability(ctx context.Context, kbID string, versionID int64, state Availability) error
 
 	// ReportEpoch reconciles control-layer state with storage-layer facts
 	// after a restart (v1 §5.3): the control layer records the new epoch,

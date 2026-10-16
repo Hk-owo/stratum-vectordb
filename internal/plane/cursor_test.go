@@ -15,10 +15,6 @@ type recordingPuller struct {
 
 // PullVersionData satisfies VersionPuller.
 func (p *recordingPuller) PullVersionData(ctx context.Context, sourceAddr, kbID string, versionID int64) error {
-	return p.PullVersion(ctx, sourceAddr, kbID, versionID)
-}
-
-func (p *recordingPuller) PullVersion(_ context.Context, _ string, _ string, versionID int64) error {
 	if p.fail[versionID] {
 		return errors.New("pull failed")
 	}

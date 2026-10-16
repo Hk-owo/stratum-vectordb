@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"stratum/internal/nodestate"
 )
 
 // LagCatchup turns the chain tails the control leader carries back on this node's
@@ -41,19 +43,20 @@ import (
 type LagCatchup struct {
 	cfg LagCatchupConfig
 
-	mu       sync.Mutex
-	inflight map[string]bool // knowledge bases currently catching up
+	mu sync.Mutex
 
 	// tails is the latest chain-tail mirror the leader carried back, per knowledge
 	// base. Catch-up itself does not need to remember it (every report repeats it),
 	// but §8.6(d)'s tombstone scan does: "the versions with nothing after them" is
 	// exactly this map, and reading it here costs no RPC that is not already made.
+	//
+	// Deliberately NOT in the state machine, unlike the catch-up set: this is a
+	// mirror of what ANOTHER node said, not a fact about this one.
 	tails map[string]int64
 }
 
-// storeTails keeps the latest mirror under the same lock as inflight. A copy, not
-// the caller's map: the caller is the sync layer's response handler and may reuse or
-// mutate what it decoded.
+// storeTails keeps the latest mirror. A copy, not the caller's map: the caller is
+// the sync layer's response handler and may reuse or mutate what it decoded.
 func (l *LagCatchup) storeTails(tails map[string]int64) {
 	cp := make(map[string]int64, len(tails))
 	for kbID, versionID := range tails {
@@ -112,6 +115,18 @@ type LagCatchupConfig struct {
 	// Cursor reports this node's own contiguous cursor per knowledge base. Required.
 	Cursor func() map[string]int64
 
+	// NodeState is the node state machine, which OWNS the catch-up set
+	// (docs/storage-node-state-machine-plan.md §3.3). Optional: a catch-up built
+	// without one makes its own, the same way the data plane does. The set
+	// cannot stay private to this component without becoming a second source for
+	// a fact the node reports.
+	//
+	// It is a NODE-level fact, which is why it lives here rather than being read
+	// off the version layer: a knowledge base is behind the moment its cursor
+	// says so, while nothing of it has moved yet (the jitter delay, then a pull),
+	// so there would be no version entry to aggregate from.
+	NodeState *nodestate.Machine
+
 	// Logger is optional.
 	Logger *zap.Logger
 
@@ -141,7 +156,10 @@ func NewLagCatchup(cfg LagCatchupConfig) *LagCatchup {
 	if cfg.Logger == nil {
 		cfg.Logger = zap.NewNop()
 	}
-	return &LagCatchup{cfg: cfg, inflight: make(map[string]bool)}
+	if cfg.NodeState == nil {
+		cfg.NodeState = nodestate.New(nodestate.Options{Logger: cfg.Logger})
+	}
+	return &LagCatchup{cfg: cfg}
 }
 
 // SetChainTails implements sync.ChainTailSink: it is handed the tails the leader
@@ -186,18 +204,24 @@ func (l *LagCatchup) SetChainTails(tails map[string]int64) {
 	defer l.mu.Unlock()
 	started := 0
 	for kbID, tail := range tails {
-		if len(l.inflight) >= maxKBs {
+		if l.cfg.NodeState.CatchingUpCount() >= maxKBs {
 			// Out of room: the rest wait for the next report, which is a few
 			// seconds away by construction.
 			return
 		}
-		if l.inflight[kbID] || tail <= 0 {
+		// The catch-up set IS the state machine's, so "already catching up" and
+		// "start one" cannot disagree: there is no second copy that can fall
+		// behind the one an operator reads.
+		if l.cfg.NodeState.IsCatchingUp(kbID) || tail <= 0 {
 			continue
 		}
 		if cursor[kbID]+l.lagThreshold() > tail {
 			continue // not behind enough to act on
 		}
-		l.inflight[kbID] = true
+		// Declared while l.mu is held, so one report's decision to run a
+		// catch-up and the declaration of it are a single step. The state machine
+		// never calls back into this component, so this cannot deadlock.
+		l.cfg.NodeState.MarkCatchingUp(kbID, true)
 		started++
 		go l.catchUp(kbID, tail)
 	}
@@ -221,11 +245,10 @@ func (l *LagCatchup) lagThreshold() int64 {
 // catchUp is one knowledge base's catch-up: wait out the jitter, then ask the data
 // plane to bring the tail's version to a queryable state.
 func (l *LagCatchup) catchUp(kbID string, target int64) {
-	defer func() {
-		l.mu.Lock()
-		delete(l.inflight, kbID)
-		l.mu.Unlock()
-	}()
+	// Cleared on every exit, a panic inside Ensure included: a knowledge base left
+	// declared as catching up is one nothing will ever pick up again, because
+	// SetChainTails skips what is already declared.
+	defer l.cfg.NodeState.MarkCatchingUp(kbID, false)
 
 	if delay := l.jitterFor(kbID); delay > 0 {
 		l.cfg.sleep(delay)

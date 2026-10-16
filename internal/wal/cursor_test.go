@@ -119,9 +119,9 @@ func TestFileWAL_CompactKeepsTheNewestCursorAndIgnoresTheReclaimWatermark(t *tes
 	}
 	// Not a vacuous pass: the changes really were reclaimed, so the cursor survived
 	// a compaction that did drop records for this knowledge base.
-	if _, ok, err := reopened.ChangesFor(ctx, "kb-1", 1); err != nil {
-		t.Fatalf("ChangesFor: %v", err)
-	} else if ok {
+	if deltas, err := reopened.ChangesInRange(ctx, "kb-1", 0, 1); err != nil {
+		t.Fatalf("ChangesInRange: %v", err)
+	} else if _, ok := deltas[1]; ok {
 		t.Error("v1's changes are still present: the compaction test would then prove nothing about cursors")
 	}
 }

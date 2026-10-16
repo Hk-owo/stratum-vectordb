@@ -18,6 +18,7 @@ import (
 
 	"stratum/internal/authmeta"
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/owner"
 )
 
 // Config configures a Router.
@@ -41,6 +42,27 @@ type Config struct {
 	// every node is both. That is the behaviour the router has always had, so
 	// an unmodified deployment keeps working.
 	StorageAddrs []string
+
+	// OwnerInactiveK is how many replicas should hold a NON-active version's
+	// index (docs/index-owner-sharding-plan.md §3). <= 0 disables sharding: every
+	// node qualifies for every version, which is the pre-sharding behaviour.
+	//
+	// The active version always keeps its whole replica set, because any node may
+	// be asked for it. That is not a special case in the owner math — it is just
+	// k = everyone for that one version.
+	OwnerInactiveK int
+
+	// OwnerPriorityHalfLife is how long it takes a version's query score to decay
+	// by half, and it is also the switch: <= 0 leaves every non-active version at
+	// exactly OwnerInactiveK, which is the behaviour before priorities existed.
+	// DefaultPriorityHalfLife is what the station's flag defaults to, so a
+	// deployment that says nothing gets the priority ladder; 0 turns it off.
+	//
+	// The ladder itself is DefaultPriorityTable, deliberately not configurable
+	// yet: the thresholds are a placeholder to be calibrated against real traffic,
+	// and exposing them now would invite tuning against a number nobody has
+	// measured.
+	OwnerPriorityHalfLife time.Duration
 
 	// Auth is the station's authentication checkpoint (§9.3(5)). nil means
 	// "deployment controls access by isolation" — the pre-§9 arrangement —
@@ -110,6 +132,16 @@ type Router struct {
 	controlBreakers []*breaker
 	storageBreakers []*breaker
 
+	// controlInflight / storageInflight count this station's outstanding calls per
+	// node, per layer — the same split the breakers use, and for the same reason:
+	// a slow metadata read and a slow query are different observations.
+	//
+	// Only this station's own calls are counted. Another station's load on the
+	// same node is invisible here, which is the trade P2C makes for needing no
+	// shared state at all.
+	controlInflight []*inflight
+	storageInflight []*inflight
+
 	auth *Authenticator
 
 	// mark stamps each forwarded call so a node can tell it came through this
@@ -125,6 +157,15 @@ type Router struct {
 	// routes is the station's local cache of "which node can serve which KB at
 	// which version". nil when disabled.
 	routes *RouteTable
+
+	// ownerInactiveK is Config.OwnerInactiveK: the BASE owner count for a version
+	// that is not active — the floor the priority ladder raises from.
+	ownerInactiveK int
+
+	// priority raises k for versions the cluster keeps querying, and lets it fall
+	// back for versions it stopped querying. Nil means "every non-active version
+	// gets exactly OwnerInactiveK", which is the pre-priority behaviour.
+	priority *indexPriority
 }
 
 // NewRouter dials every node address (non-blocking, like the HTTP
@@ -145,6 +186,10 @@ func NewRouter(cfg Config) (*Router, error) {
 		auth:               cfg.Auth,
 		mark:               cfg.Mark,
 		logger:             cfg.Logger,
+		ownerInactiveK:     cfg.OwnerInactiveK,
+		priority:           newIndexPriority(cfg.OwnerPriorityHalfLife, nil),
+		controlInflight:    newInflight(len(cfg.Addrs)),
+		storageInflight:    newInflight(len(storage)),
 	}
 	if r.logger == nil {
 		r.logger = zap.NewNop()
@@ -398,19 +443,91 @@ func (r *Router) versionHolders(ctx context.Context, kbID string, version int64)
 	return holdersAnswer{}, lastErr
 }
 
-// candidates narrows a storage-layer call to the nodes the routing table says
-// can serve it (§9.3(1)).
+// candidates narrows a storage-layer call to the nodes that should serve it:
+// the version's INDEX OWNERS that also HOLD its data.
 //
-// expectedVersion is the freshness credential the caller will attach: a node
-// whose cursor has not reached it cannot answer without returning a stale-but-
-// complete result, which is the failure §9.1 risk 1 describes. When there is no
-// credential, every node qualifies and this is the plain round-robin it used to
-// be.
-func (r *Router) candidates(kbID string, expectedVersion int64, n int) []int {
+// versionID does double duty, and that is not a coincidence — it is the same
+// value in both roles. It is the freshness credential §9.3(1) needs (a node whose
+// cursor has not reached it cannot answer without returning a stale-but-complete
+// result), and it is the key the owner set is computed from.
+//
+// The two sets are combined by INTERSECTION, and neither alone would do:
+//
+//   - holders alone is what this used to be, and it is why every node converged
+//     on the same working set (R3 of docs/code-review-2026-10-14.md): a query
+//     landed on whichever holder the round-robin reached, so every node's LRU
+//     filled with the same versions and the cluster held N copies of one working
+//     set.
+//   - owners alone would send reads to replicas that may not hold the data yet.
+//
+// An empty intersection falls back to the holders, deliberately: an owner set
+// that no holder belongs to means the owner view is stale or the topology has
+// just changed, and "the node that has the data" is the answer that still works.
+func (r *Router) candidates(kbID string, versionID int64, n int) []int {
 	if r.routes == nil {
 		return allIndexes(n)
 	}
-	return r.routes.Servable(kbID, expectedVersion, n)
+	holders := r.routes.Servable(kbID, versionID, n)
+	if r.ownerInactiveK <= 0 || len(r.storageAddrs) == 0 {
+		return holders // sharding off: every holder qualifies
+	}
+
+	owners := r.ownersOf(kbID, versionID)
+	if len(owners) == 0 {
+		return holders
+	}
+	narrowed := make([]int, 0, len(holders))
+	for _, idx := range holders {
+		if idx >= 0 && idx < len(r.storageAddrs) && owners[r.storageAddrs[idx]] {
+			narrowed = append(narrowed, idx)
+		}
+	}
+	if len(narrowed) == 0 {
+		// Nobody in the owner set holds the version yet. Serving from a holder is
+		// still correct (the freshness credential is what guarantees the answer),
+		// and refusing would turn a topology change into an outage.
+		return holders
+	}
+	return narrowed
+}
+
+// ownerKFor decides how many replicas should hold this version's index.
+//
+// Two rules, in order:
+//
+//   - The ACTIVE version — the one the routing table says this knowledge base
+//     serves — keeps the whole replica set (k = 0, "every member"). Any node may
+//     be asked for it, so all of them are expected to hold its index.
+//   - Everything else starts at OwnerInactiveK and climbs one rung per priority
+//     tier, capped at the replica count. A version the cluster keeps querying earns
+//     more owners; one it stops querying lets them go. With no half-life
+//     configured the ladder is not consulted at all and k is simply the base.
+func (r *Router) ownerKFor(kbID string, versionID int64) int {
+	if expected, ok := r.ExpectedVersion(kbID); ok && expected == versionID {
+		return 0
+	}
+	k := r.ownerInactiveK
+	if r.priority != nil {
+		k += r.priority.Tier(kbID, versionID)
+		if k > len(r.storageAddrs) {
+			k = len(r.storageAddrs)
+		}
+	}
+	return k
+}
+
+// ownersOf computes the index owner set for one version, as the set of addresses
+// that should hold it.
+func (r *Router) ownersOf(kbID string, versionID int64) map[string]bool {
+	owners := owner.Owners(kbID, versionID, r.storageAddrs, r.ownerKFor(kbID, versionID))
+	if len(owners) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(owners))
+	for _, addr := range owners {
+		set[addr] = true
+	}
+	return set
 }
 
 // ExpectedVersion exposes the control layer's answer for kbID, so a caller can
@@ -445,8 +562,12 @@ func (r *Router) Close() {
 // storage node can tell "the station sent this" from "something reached me
 // directly". The caller's credential is deliberately not among what is
 // forwarded.
-func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
+func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn func(idx int, ctx context.Context) (T, error), opts ...ForwardOption) (T, error) {
 	var zero T
+	var fo forwardOpts
+	for _, opt := range opts {
+		opt(&fo)
+	}
 	// The start of this station's own share of the call, so the write path can
 	// report what the station added on top of the node it forwards to. Nothing
 	// else on this path can measure that: from the client's side a station hop
@@ -484,9 +605,29 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 		// knowledge base the table has not seen yields no expected version, and
 		// then every node qualifies — routing degrades to round-robin rather
 		// than to refusal.
+		//
+		// R1 of docs/code-review-2026-10-14.md: when the caller PINNED a
+		// version, that version is the credential — not the active one. Narrowing
+		// a pinned read by "fresh for the active version" selects exactly the
+		// nodes least likely to still hold the old one, since the whole point of
+		// the active pointer is that older versions stop being the working set.
 		expected, _ := r.ExpectedVersion(kbID)
+		if fo.pinnedVersion != 0 {
+			expected = fo.pinnedVersion
+		}
+		// Sampling happens HERE, on the read being served, rather than on a ticker:
+		// the versions worth counting are exactly the ones somebody asks for, and a
+		// table a timer walked would keep decaying entries nobody is looking at
+		// (docs/index-owner-sharding-plan.md §4).
+		if r.priority != nil && expected != 0 {
+			r.priority.Observe(kbID, expected)
+		}
+		// P2C over the candidates the owner intersection produced: send the call to
+		// the less busy of two randomly chosen nodes. It reorders only — a node
+		// that is merely slow is still tried, just not first.
+		cands := leastLoadedFirst(r.candidates(kbID, expected, n), r.storageInflight)
 		return forwardRead(r, ctx, readTrace{kbID: kbID, layer: "storage", admission: time.Since(stationStart)},
-			r.candidates(kbID, expected, n), r.storageBreakers, fn)
+			cands, r.storageBreakers, r.storageInflight, fn)
 	}
 	if isWriteMethod(fullMethod) {
 		// §4.3(1): refuse a write this station already knows cannot reach quorum,
@@ -500,7 +641,28 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 		return forwardWrite(r, ctx, kbID, time.Since(stationStart), fn)
 	}
 	return forwardRead(r, ctx, readTrace{kbID: kbID, layer: "control", admission: time.Since(stationStart)},
-		allIndexes(len(r.controlAddrs)), r.controlBreakers, fn)
+		leastLoadedFirst(allIndexes(len(r.controlAddrs)), r.controlInflight),
+		r.controlBreakers, r.controlInflight, fn)
+}
+
+// ForwardOption tunes how one forwarded call picks its candidates.
+type ForwardOption func(*forwardOpts)
+
+type forwardOpts struct {
+	// pinnedVersion is the version the CALLER named, when it named one. Zero
+	// means the caller did not pin, and the routing table's expected version is
+	// the credential.
+	pinnedVersion int64
+}
+
+// WithPinnedVersion tells the router the caller asked for one SPECIFIC version,
+// so that version — not the knowledge base's active one — is what the candidates
+// are narrowed by (R1 of docs/code-review-2026-10-14.md).
+//
+// It is an option rather than a parameter because most forwarded calls have no
+// version to pin: metadata reads and writes are about the knowledge base.
+func WithPinnedVersion(versionID int64) ForwardOption {
+	return func(o *forwardOpts) { o.pinnedVersion = versionID }
 }
 
 // writeGate refuses a write the routing cache already knows cannot reach quorum
@@ -748,7 +910,7 @@ type readTrace struct {
 // n is the layer's node count rather than a length read off the Router, because
 // the same helper serves both layers and their client slices are indexed by
 // their own node lists.
-func forwardRead[T any](r *Router, ctx context.Context, trace readTrace, candidates []int, breakers []*breaker, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
+func forwardRead[T any](r *Router, ctx context.Context, trace readTrace, candidates []int, breakers []*breaker, load []*inflight, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
 	var zero T
 
 	// Per-stage timings of one forwarded read, at debug level — the read-side
@@ -790,7 +952,23 @@ func forwardRead[T any](r *Router, ctx context.Context, trace readTrace, candida
 		admitted++
 		attemptCtx, cancel := budgetSlice(ctx, n-i)
 		attemptStart := time.Now()
-		resp, err := fn(idx, attemptCtx)
+		// P2C's other half: the counter is held for exactly as long as the call is
+		// outstanding, and only for a call that was actually made. A node skipped
+		// by the breaker above has nothing in flight, and counting it would make
+		// the healthy nodes look busier than the sick one.
+		//
+		// The defer lives inside the closure so the decrement happens on every
+		// exit — including a panic on the way out. Incrementing in the loop and
+		// decrementing in the function's own defer is the version of this that
+		// leaks a count per interval, forever.
+		call := func() (T, error) {
+			if idx < len(load) && load[idx] != nil {
+				load[idx].n.Add(1)
+				defer load[idx].n.Add(-1)
+			}
+			return fn(idx, attemptCtx)
+		}
+		resp, err := call()
 		tAttempt += time.Since(attemptStart)
 		cancel()
 		attempts++
@@ -921,6 +1099,13 @@ var writeTerminalReasons = map[string]bool{
 var retryableReasons = map[string]bool{
 	// This replica has not built the version's index (yet); another one may have.
 	"index_not_ready": true,
+	// This replica IS building the version's index, and the caller waited out
+	// load_wait_timeout_ms for it. The same family as index_not_ready — local and
+	// transient, and another candidate may already be serving the version — with
+	// an even stronger case: a build that has been running longer than the wait
+	// is positive evidence that this replica is busy. Leaving it out made ONE busy
+	// candidate a terminal error for the caller (docs/stress-test-report.md §E.4).
+	"index_load_timeout": true,
 	// This replica took the version's index out of service on purpose, for the
 	// §8.6(d) rolling cleanup; another one is serving it.
 	"index_maintenance": true,

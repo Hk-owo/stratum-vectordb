@@ -15,6 +15,7 @@ import (
 	"stratum/internal/docstore"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
+	"stratum/internal/nodestate"
 	"stratum/internal/raft"
 	"stratum/internal/types"
 	"stratum/internal/wal"
@@ -59,11 +60,43 @@ type AdminServiceImpl struct {
 	// and leaving the reclamation to whoever happens to call DeleteVersion next.
 	deleteVersionCoord coordinator.DeleteVersionCoordinator
 
+	// nodeState answers "what state is THIS node in" — its lifecycle phase, its
+	// own redundancy verdict, and where its versions stand
+	// (docs/storage-node-state-machine-plan.md §6). Optional: a control node
+	// runs no storage stack and has no state machine, which reports nothing
+	// rather than inventing a phase.
+	nodeState NodeStateSource
+
 	// logger records what an operator-facing action did. An abandoned version's
 	// cleanup failing must not be silent — the version stays DELETING, and this
 	// line is what connects that state to the decision that put it there. Never
 	// nil; see NewAdminService.
 	logger *zap.Logger
+}
+
+// NodeStateSource is the storage node's own state machine, narrowed to the two
+// reads the admin surface makes.
+//
+// Declared here, by the consumer, like GCPressureReporter and PresenceChecker:
+// the service layer answers an operator without reaching into the state
+// machine's construction. *nodestate.Machine satisfies it.
+type NodeStateSource interface {
+	// Snapshot returns the node layer's phase, redundancy verdict and activity
+	// in one consistent read.
+	Snapshot() nodestate.NodeSnapshot
+	// NonSteadyVersions lists the versions that are not at rest — building, or
+	// with a failed build — sorted. It deliberately excludes data-present
+	// versions (the designed state of one nobody has asked for) and ready ones
+	// (a node holding thousands has nothing to say about each).
+	NonSteadyVersions() []nodestate.VersionEntry
+}
+
+// SetNodeStateSource wires the storage node's state machine into the admin
+// surface (docs/storage-node-state-machine-plan.md §6). Optional: without it
+// GetSystemStatus omits node_state/version_states and HealthCheck says nothing
+// about the node's phase, which is the pre-existing behaviour.
+func (s *AdminServiceImpl) SetNodeStateSource(src NodeStateSource) {
+	s.nodeState = src
 }
 
 // GCPressureReporter reports the versions whose §8.6(d) dead-weight collection is
@@ -220,6 +253,37 @@ func (s *AdminServiceImpl) HealthCheck(ctx context.Context, req *pb.HealthCheckR
 		}
 	}
 
+	// The node's own phase and redundancy verdict
+	// (docs/storage-node-state-machine-plan.md §6.2). Reported in Details and
+	// NOT in the status, for the reason the storage line above gives: a probe
+	// that turned UNHEALTHY here would have a load balancer pull traffic off a
+	// node whose reads are perfectly fine.
+	//
+	// Only what an operator needs to act on is reported. SERVING is the
+	// ordinary phase and says nothing; RedundancyUnknown says only that this
+	// node has no basis for a verdict, which the write gate deliberately fails
+	// OPEN on — printing it would put a line on every non-leader's health
+	// output, which is the noise that hides the real thing.
+	if s.nodeState != nil {
+		snap := s.nodeState.Snapshot()
+		if snap.State != nodestate.NodeServing {
+			if details != "" {
+				details += "; "
+			}
+			details += "node: " + snap.State.String()
+		}
+		switch snap.Redundancy {
+		case nodestate.RedundancyDegraded, nodestate.RedundancyUnavailable:
+			if details != "" {
+				details += "; "
+			}
+			details += "node redundancy: " + snap.Redundancy.String()
+			if snap.RedundancyDetail != "" {
+				details += " (" + snap.RedundancyDetail + ")"
+			}
+		}
+	}
+
 	if status == pb.HealthStatus_HEALTH_STATUS_HEALTHY && details == "" {
 		details = "ok"
 	}
@@ -356,7 +420,54 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 			JudgementAvailable: reclaimJudgeable,
 			Blocked:            reclaimBlocked,
 		},
+		// This node's own state (docs/storage-node-state-machine-plan.md §6.1).
+		// It answers a different question from every field above: those name
+		// conditions that need a human, this one describes the node itself.
+		NodeState:     s.nodeStatePayload(),
+		VersionStates: s.versionStatePayload(),
 	}, nil
+}
+
+// nodeStatePayload maps the state machine's node layer onto the status
+// payload. A nil state machine (a control node, which keeps no storage) yields
+// nil, so the field is simply absent rather than claiming a phase.
+func (s *AdminServiceImpl) nodeStatePayload() *pb.NodeState {
+	if s.nodeState == nil {
+		return nil
+	}
+	snap := s.nodeState.Snapshot()
+	return &pb.NodeState{
+		State:            snap.State.String(),
+		Since:            snap.Since.Format(time.RFC3339),
+		Redundancy:       snap.Redundancy.String(),
+		RedundancyDetail: snap.RedundancyDetail,
+		Actions:          snap.Actions,
+	}
+}
+
+// versionStatePayload maps the versions that are not at rest onto the status
+// payload. Same reasoning as nodeStatePayload for the nil case, and the same
+// reasoning as gcBlockedVersions for why an empty list is the normal answer:
+// an idle node has nothing building and nothing failed.
+func (s *AdminServiceImpl) versionStatePayload() []*pb.VersionStateEntry {
+	if s.nodeState == nil {
+		return nil
+	}
+	entries := s.nodeState.NonSteadyVersions()
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]*pb.VersionStateEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, &pb.VersionStateEntry{
+			KbId:      e.KBID,
+			VersionId: e.VersionID,
+			State:     e.State.String(),
+			Since:     e.Since.Format(time.RFC3339),
+			Detail:    e.Detail,
+		})
+	}
+	return out
 }
 
 // reclaimBlockedKB maps one knowledge base's watermark blockers onto the status payload.

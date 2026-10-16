@@ -56,9 +56,6 @@ func (c *takeoverControl) ReportIndexReady(context.Context, string, int64) error
 func (c *takeoverControl) ReportEpoch(context.Context, uint64, map[string]int64, map[string][]int64) error {
 	return nil
 }
-func (c *takeoverControl) ReportAvailability(context.Context, string, int64, Availability) error {
-	return nil
-}
 func (c *takeoverControl) ReportVersionFailure(context.Context, string, int64, types.FailureSide, types.FailureClass, string) (bool, error) {
 	return false, nil
 }

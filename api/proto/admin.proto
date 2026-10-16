@@ -129,6 +129,67 @@ message GetSystemStatusResponse {
   // anywhere else, and its remedy (dropping the node from storage.nodes) is a decision an
   // operator has to make deliberately.
   ReclaimDiagnostics reclaim = 10;
+  // node_state is THIS node's own lifecycle phase, its own view of storage
+  // redundancy, and what it is currently working on
+  // (docs/storage-node-state-machine-plan.md §3).
+  //
+  // It is the one place to ask "what state is this node in". Before it, that
+  // answer was computed on demand in six unrelated places and differed by
+  // caller: the process phase was not represented at all, redundancy was
+  // re-derived from a report aggregate per call, and "index build in progress"
+  // was private to the index manager. The other fields of this response
+  // describe conditions that need a human; this one describes the node.
+  NodeState node_state = 11;
+  // version_states lists this node's versions that are NOT at rest — being
+  // built, or with a failed build. Deliberately not every version: data
+  // present with no index is the designed state of a version nobody has asked
+  // for (lazy builds), and a node holding thousands of READY versions has
+  // nothing to report about each. What belongs here is the small, moving set.
+  repeated VersionStateEntry version_states = 12;
+}
+
+// NodeState is the storage node's own lifecycle phase and local view
+// (docs/storage-node-state-machine-plan.md §3).
+message NodeState {
+  // state is STARTING / RECONCILING / SERVING / STOPPING.
+  string state = 1;
+  // since is when the current phase was entered, RFC3339.
+  string since = 2;
+  // redundancy is UNKNOWN / HEALTHY / DEGRADED / UNAVAILABLE.
+  //
+  // UNKNOWN is not a problem state: it is this node saying it has no basis for
+  // a verdict (it does not lead the control plane, or nothing has reported
+  // yet). The write gate fails OPEN on exactly this input, so a reader must
+  // not treat it as evidence of trouble.
+  string redundancy = 3;
+  // redundancy_detail explains a non-healthy redundancy verdict, and is empty
+  // otherwise.
+  string redundancy_detail = 4;
+  // actions is what the node is doing right now — "reconciling indexes",
+  // "building 3 index(es)", "catching up kb-1". FOR HUMANS: it is a projection
+  // of the phase and the version states, and nothing may branch on it.
+  repeated string actions = 5;
+}
+
+// VersionStateEntry is one version's local state on the node that answered
+// (docs/storage-node-state-machine-plan.md §4).
+message VersionStateEntry {
+  string kb_id = 1;
+  int64 version_id = 2;
+  // state is ABSENT / DATA_PRESENT / BUILDING / READY / BUILD_FAILED.
+  //
+  // This is a LOCAL fact and is not IndexStatus or DataStatus: those are the
+  // control layer's replicated metadata, identical on every node and copied
+  // through snapshots. The same version is routinely READY on one replica,
+  // BUILDING on the next and DATA_PRESENT on the third, which is healthy
+  // rather than divergent. The control layer's FAILED_PERMANENT does not
+  // appear here at all — that verdict is the retry budget's conclusion, and
+  // this node knows only that its own build failed.
+  string state = 3;
+  // since is when the version entered state, RFC3339.
+  string since = 4;
+  // detail carries the cause for BUILD_FAILED, empty otherwise.
+  string detail = 5;
 }
 
 // GCBlockedVersion is one version whose dead-weight collection is stuck behind

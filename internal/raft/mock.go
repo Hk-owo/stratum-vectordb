@@ -39,12 +39,6 @@ type MockRaftNode struct {
 	// (Stratum_设计文档v13.md §7.12). Tests are short-lived, so unlike the
 	// real state machine this map is not pruned on version/KB removal.
 	versionsByRequest map[string]int64
-
-	// leader mirrors the real node's view of itself. It defaults to true: every
-	// existing test drives a single-node stack, where the node is its own leader,
-	// so the §7.13.2 "only the leader accepts a write" rule must not change their
-	// behaviour. SetLeader(false) is how a test asserts the follower case.
-	leader bool
 }
 
 // NewMockRaftNode constructs an empty MockRaftNode. w is the WAL instance
@@ -60,23 +54,18 @@ func NewMockRaftNode(w wal.WAL) *MockRaftNode {
 		versionsByKB:      make(map[string][]int64),
 		nextVersionID:     1,
 		versionsByRequest: make(map[string]int64),
-		leader:            true,
 	}
 }
 
-// IsLeader implements RaftNode.
+// IsLeader implements RaftNode. It always answers true: the mock drives
+// single-node stacks, where the node is its own leader, so §7.13.2's "only the
+// leader accepts a write" rule must never change their behaviour.
+//
+// A test that needs the FOLLOWER path has nothing to drive it with here — the
+// mock has no way to stop being the leader (the SetLeader hook was removed
+// unused). Such a test needs the real node, or the hook back.
 func (r *MockRaftNode) IsLeader() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.leader
-}
-
-// SetLeader switches this node's view of itself, so a test can drive the
-// follower path (the write must be refused with ErrNotLeader).
-func (r *MockRaftNode) SetLeader(leader bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.leader = leader
+	return true
 }
 
 func (r *MockRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBaseMeta) error {

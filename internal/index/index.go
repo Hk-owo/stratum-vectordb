@@ -24,6 +24,40 @@ import (
 // need a real or mock RaftNode).
 type BuildCompleteCallback func(kbID string, versionID int64, status types.IndexStatus) error
 
+// BuildStateRecorder is the slice of the node state machine the index manager
+// reports to (docs/storage-node-state-machine-plan.md §7, item 4).
+//
+// The manager owns these transitions because it is the ONLY entry point a build
+// has: TriggerBuild, TriggerBuildBackfill and the install path all funnel
+// through it, whereas a callback-based report misses the case where the build
+// never starts at all (the pool is closed, so triggerBuild clears its in-progress
+// marker and returns an error — a version that looks BUILDING forever to anyone
+// reading the state machine).
+//
+// Declared here, by the producer's own package, as a narrow interface so the
+// manager keeps its independence from the state machine's construction — the
+// same reason the plane declares its recorders. A nil recorder means the
+// transitions are simply not reported, which is the unit-test default.
+type BuildStateRecorder interface {
+	// BuildScheduled reports that a build for versionID is queued or running.
+	BuildScheduled(kbID string, versionID int64) error
+	// BuildSucceeded reports that the build finished and the artifact is on
+	// disk. Only ever sent after BuildScheduled.
+	BuildSucceeded(kbID string, versionID int64) error
+	// BuildFailed reports that the attempt failed, with the cause.
+	BuildFailed(kbID string, versionID int64, detail string) error
+	// IndexInstalled reports that an index for versionID arrived from another
+	// replica and is now on this node's disk. It is NOT a build: the artifact
+	// was produced elsewhere and copied here, so it is recorded the same way the
+	// startup reconcile records what it finds on disk (§8.4's distribution).
+	IndexInstalled(kbID string, versionID int64) error
+	// IndexDropped reports that versionID's artifact was removed from this
+	// node's disk by the retention policy, so the version is no longer READY
+	// here — its data is untouched and it will be rebuilt on demand, which is
+	// what that policy means.
+	IndexDropped(kbID string, versionID int64) error
+}
+
 // IndexManager manages the lifecycle of per-version HNSW indexes:
 // asynchronous building, in-memory LRU caching with reference-counted
 // eviction protection, and search.
@@ -88,18 +122,18 @@ type IndexManager interface {
 	// filesystem, so it answers correctly even right after a vecstore
 	// restart. This is the authoritative "is this version's index built
 	// and durable" fact that the startup reconcile derives READY status
-	// from, and — through IndexManagerImpl.HasIndex — the answer §8.4(a)'s
-	// distribution probe ships on.
+	// from, and what ensureOwnIndex asks before scheduling a build — a
+	// build for an artifact already on disk is a FULL rebuild, since
+	// triggerBuild de-duplicates in-flight builds, not finished ones.
 	//
 	// Do NOT delete it because "holding a version must not be judged from an
 	// artifact" (docs/cursor-persistence-plan.md §4). That rule is about the
 	// CURSOR, and it is right there: an artifact is a cache the retention policy
 	// may delete, so it cannot answer "does this node hold the version". The
-	// distribution probe asks a different question in the same words — "is this
-	// file on your disk" — and for it the artifact IS the answer, because a file
-	// that is not there is a file that has to be re-sent. Removing this method
-	// removes the probe's only way to ask, and the failure mode is silent:
-	// distribution falls back to shipping everything, with no error.
+	// question asked here is the narrower "is this file on your disk", and for
+	// deciding whether to build it IS the answer: a file that is not there is a
+	// build that has to be scheduled. (It is also the fallback the cursor's own
+	// recovery uses, marked deprecated there for the same §4 reason.)
 	IndexExists(ctx context.Context, kbID string, versionID int64) (bool, error)
 
 	// Evict removes a single version's index from memory (if loaded; a

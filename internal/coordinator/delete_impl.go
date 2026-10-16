@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
-	"time"
 
 	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
@@ -48,6 +46,23 @@ type DeleteCoordinatorConfig struct {
 	// layer-by-layer deletes, so the fallback is not a second code path but the
 	// same one reached without wiring.
 	Dropper KBStorageDropper
+
+	// SourceAnnouncements, when set, forgets the knowledge base's §8.5
+	// data-source announcements as it is deleted. Those entries live on the
+	// receive side (sync.PushHandler), which would otherwise keep naming a peer
+	// for a knowledge base that no longer exists — and the source lookup would
+	// keep answering with it.
+	//
+	// Optional: without it the table keeps one dead entry per version of the
+	// deleted KB (it is in-memory, so a restart clears it).
+	SourceAnnouncements KBAnnouncementForgetter
+}
+
+// KBAnnouncementForgetter drops every §8.5 data-source announcement of one
+// knowledge base. Declared here rather than importing plane: the coordinator
+// needs exactly this method.
+type KBAnnouncementForgetter interface {
+	ForgetKB(kbID string)
 }
 
 // DeleteCoordinatorImpl is the real DeleteCoordinator implementation,
@@ -160,6 +175,18 @@ func (c *DeleteCoordinatorImpl) Execute(ctx context.Context, kbID string) error 
 		return fmt.Errorf("WAL.DeleteByKB: %w", err)
 	}
 
+	// Last of all, this node's per-KB in-memory state: the §8.5 announcements
+	// naming where the knowledge base's versions used to live. They are not
+	// reachable through any store above, and leaving them would keep the source
+	// lookup pointing at a peer for a knowledge base nobody can query.
+	//
+	// No error to report — the call cannot fail — and no ordering constraint: the
+	// entries are a pure cache of "who to ask", so a crash between them and the
+	// line above costs one stale entry, nothing more.
+	if c.cfg.SourceAnnouncements != nil {
+		c.cfg.SourceAnnouncements.ForgetKB(kbID)
+	}
+
 	return nil
 }
 
@@ -172,28 +199,7 @@ func (c *DeleteCoordinatorImpl) abort(ctx context.Context, kbID string, cause er
 
 // retry executes fn with exponential backoff up to MaxRetries times.
 func (c *DeleteCoordinatorImpl) retry(ctx context.Context, fn func() error) error {
-	base := time.Duration(c.cfg.RetryBaseIntervalMS) * time.Millisecond
-
-	var lastErr error
-	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := fn(); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-		if attempt < c.cfg.MaxRetries {
-			backoff := base * time.Duration(int64(math.Pow(2, float64(attempt))))
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
-	return fmt.Errorf("retry exhausted after %d attempts: %w", c.cfg.MaxRetries+1, lastErr)
+	return retryWithBackoff(ctx, c.cfg.MaxRetries, c.cfg.RetryBaseIntervalMS, fn)
 }
 
 var _ DeleteCoordinator = (*DeleteCoordinatorImpl)(nil)

@@ -45,9 +45,6 @@ func (c *stubControl) ReportIndexReady(context.Context, string, int64) error { r
 func (c *stubControl) ReportEpoch(context.Context, uint64, map[string]int64, map[string][]int64) error {
 	return nil
 }
-func (c *stubControl) ReportAvailability(context.Context, string, int64, Availability) error {
-	return nil
-}
 
 func (c *stubControl) SetFailureBudget(_ context.Context, _ string, _ int) error { return nil }
 

@@ -140,6 +140,11 @@ func serveVector(ctx context.Context, addr, kbID string, versionID int64, vector
 func awaitServable(t *testing.T, ctx context.Context, addr, kbID string, versionID int64, timeout time.Duration) *pb.QueryResponse {
 	t.Helper()
 
+	// No separate warm-up: the query below IS the request. §8.6(b) builds a version
+	// when something asks for it, and this helper asks by querying — which is also
+	// the honest shape, since a query is what a real caller sends. The station
+	// routes it to the version's index owners, and the loop below simply waits out
+	// the build it just triggered.
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {

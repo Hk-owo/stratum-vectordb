@@ -49,7 +49,6 @@ package kvraft
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -527,19 +526,4 @@ func (rf *Raft) NodeID() int64 {
 // this one.
 func (rf *Raft) ClusterSize() int {
 	return rf.transport.PeerCount() + 1
-}
-
-// stateName returns a human-readable name for a Raft state constant, for
-// logging.
-func stateName(s int) string {
-	switch s {
-	case Leader:
-		return "Leader"
-	case Candidate:
-		return "Candidate"
-	case Follower:
-		return "Follower"
-	default:
-		return fmt.Sprintf("Unknown(%d)", s)
-	}
 }

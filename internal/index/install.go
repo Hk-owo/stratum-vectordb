@@ -29,28 +29,6 @@ func installShardOf(key indexKey) int {
 	return int(h % installShardCount)
 }
 
-// HasIndex reports whether this node already holds an on-disk artifact for
-// (kbID, versionID) — the question §8.4(a)'s pre-flight probe asks so a sender
-// never spends tens of megabytes shipping a copy the receiver already has.
-//
-// Read-only on purpose: it stats the persisted file rather than building,
-// loading or fetching anything, because the whole point of asking is to avoid
-// that work on the sending side. With an empty IndexDataDir (persistence
-// unconfigured) it reports false, exactly as IndexExists does.
-//
-// It defers to IndexExists rather than re-deriving the answer: the startup
-// reconcile asks the same question, and two answers to one question are two
-// answers that can drift.
-//
-// This probe is why IndexExists has to stay on the IndexManager interface: it is
-// that method's only remaining caller on a MAIN path (docs/cursor-persistence-plan.md
-// §4 downgraded the cursor's use of it to a fallback, and that downgrade must not
-// reach here — see the note on IndexExists itself for why the two questions only
-// look alike).
-func (im *IndexManagerImpl) HasIndex(ctx context.Context, kbID string, versionID int64) (bool, error) {
-	return im.IndexExists(ctx, kbID, versionID)
-}
-
 // InstallIndex writes an index built elsewhere into this node's index
 // directory and loads it, so a replica can serve a version it never built
 // (Stratum_设计文档v13.md §8.4: "建一次、分发 N 份").
@@ -108,13 +86,13 @@ func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versi
 	// §8.6a: receiving an artifact counts as this node's baseline for the
 	// version, exactly as building it does. Without this, a version a replica
 	// only ever received would never appear in the access table, so the cold
-	// evaluator would never look at it and the shipped shape would be permanent
+	// policy would never look at it and the shipped shape would be permanent
 	// there.
 	im.mu.Lock()
 	im.seedAccessLocked(indexKey{kbID, versionID})
 	// Drop any remembered shape: the artifact that just landed decides it, and
 	// the sidecar beside it is now the authority (§8.6a). Keeping a stale entry
-	// here would make the evaluator treat a received graph-free artifact as
+	// here would make the policy treat a received graph-free artifact as
 	// still graphed and rebuild it into the shape it already has.
 	delete(im.builtGraphFree, indexKey{kbID, versionID})
 	im.mu.Unlock()
@@ -124,6 +102,13 @@ func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versi
 	// retention pass or the startup EnforceRetention: installed, then dropped,
 	// for a version the sender just spent bandwidth shipping.
 	im.recordInterestNow(kbID, versionID)
+
+	// docs/storage-node-state-machine-plan.md §7 item 4: the artifact is on this
+	// node's disk, so the version is READY here — recorded as a DISK FACT rather
+	// than as a build, because no build happened on this node. The artifact was
+	// produced elsewhere and copied, which is the whole point of §8.4's "build
+	// once, distribute N".
+	im.reportIndexInstalled(kbID, versionID)
 
 	// Report the artifact as READY on THIS node, through the same callback the
 	// build path uses.
@@ -214,24 +199,77 @@ func (im *IndexManagerImpl) sidecarPath(kbID string, versionID int64) string {
 	return filepath.Join(im.cfg.IndexDataDir, "index", kbID, fmt.Sprintf("%d.index.ids", versionID))
 }
 
+// artifactRead is one in-flight ReadIndexFiles: the bytes it produced, and the
+// signal that they are ready. Waiters read the fields only after <-done — the
+// close is the happens-before edge that publishes them.
+type artifactRead struct {
+	done        chan struct{}
+	indexData   []byte
+	sidecarData []byte
+	err         error
+}
+
 // ReadIndexFiles returns the raw bytes of (kbID, versionID)'s persisted index
-// and sidecar, for shipping them to a replica (§8.4). The caller decides who
+// and sidecar, for shipping them to a replica (§5.8). The caller decides who
 // receives them; this side only knows what is on its own disk.
+//
+// Concurrent reads of the SAME version are merged: the first caller reads the
+// pair, the rest wait for it and share the bytes. Two reasons, and the second is
+// the one that was missing:
+//
+//   - one pass over the pair instead of N. N leaves pulling one artifact at once
+//     is the ordinary shape of a cold replica catching up (§5.8), and the source
+//     has no reason to pay N times for the same bytes;
+//   - memory peaks once instead of N times. The read holds the whole artifact, so
+//     "N concurrent readers" used to mean N whole copies resident at the source
+//     (v14 §10.3 recorded that peak as unmeasured).
+//
+// Deliberately NOT a cache: the entry lives only while the read is in flight, so
+// the next call after a rebuild reads the NEW artifact. That is the same property
+// the shard lock protects — a receiver must never be handed a mixed pair.
+//
+// The returned bytes are SHARED with the other callers of the same read: treat
+// them as read-only.
 //
 // It takes the same shard lock the writers take (see installShards): the two
 // files are read one after the other, and a rebuild landing between those two
 // reads would hand the receiver a new index beside the previous sidecar — a pair
 // it cannot Load. Holding the lock keeps the pair consistent for the whole read.
 func (im *IndexManagerImpl) ReadIndexFiles(kbID string, versionID int64) (indexData, sidecarData []byte, err error) {
+	key := indexKey{kbID, versionID}
+
+	im.readMu.Lock()
+	if inflight, ok := im.readInflight[key]; ok {
+		im.readMu.Unlock()
+		<-inflight.done
+		return inflight.indexData, inflight.sidecarData, inflight.err
+	}
+	inflight := &artifactRead{done: make(chan struct{})}
+	im.readInflight[key] = inflight
+	im.readMu.Unlock()
+
+	inflight.indexData, inflight.sidecarData, inflight.err = im.readIndexFilesUnshared(kbID, versionID)
+
+	im.readMu.Lock()
+	delete(im.readInflight, key)
+	im.readMu.Unlock()
+	close(inflight.done) // publishes the fields above to every waiter
+	return inflight.indexData, inflight.sidecarData, inflight.err
+}
+
+// readIndexFilesUnshared is the disk half of ReadIndexFiles: one caller reads,
+// the others share its result. Callers must already be registered in
+// readInflight, or two reads of the same version can interleave.
+func (im *IndexManagerImpl) readIndexFilesUnshared(kbID string, versionID int64) (indexData, sidecarData []byte, err error) {
 	shard := &im.installShards[installShardOf(indexKey{kbID, versionID})]
 	shard.Lock()
 	defer shard.Unlock()
 
-	indexData, err = os.ReadFile(im.indexPath(kbID, versionID))
+	indexData, err = im.readFile(im.indexPath(kbID, versionID))
 	if err != nil {
 		return nil, nil, fmt.Errorf("index: read %s: %w", im.indexPath(kbID, versionID), err)
 	}
-	sidecarData, err = os.ReadFile(im.sidecarPath(kbID, versionID))
+	sidecarData, err = im.readFile(im.sidecarPath(kbID, versionID))
 	if err != nil {
 		return nil, nil, fmt.Errorf("index: read %s: %w", im.sidecarPath(kbID, versionID), err)
 	}

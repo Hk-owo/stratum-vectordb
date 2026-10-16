@@ -26,10 +26,10 @@ import (
 //	artifact counts, before and after — how deep the window actually is
 //	"read local index" failures        — a ship whose artifact retention had already taken
 //
-// The second is the one that matters: PushIndexToReplicas reads the whole file
-// before shipping it, so a distribution that is queued behind the push gate when
-// the next retention pass runs finds nothing to send. (It degrades to "that
-// replica builds its own" — an optimisation lost, never a correctness problem.)
+// The second is the one that matters: a peer serves an artifact by reading the
+// whole file, so a fetch that arrives after the next retention pass finds nothing
+// to send. (It degrades to "the asker builds its own" — an optimisation lost,
+// never a correctness problem.)
 //
 // The numbers are PRINTED, not asserted: what counts as too shallow depends on a
 // deployment's write rate. STRATUM_LAG_VERSIONS picks the batch size (default 55,

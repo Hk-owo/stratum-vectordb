@@ -92,17 +92,6 @@ func TestChangeOp_Order(t *testing.T) {
 	}
 }
 
-// TestAggregationMethod_Order verifies that MEDIAN is the default (0) so
-// that an unset proto field falls through to median aggregation.
-func TestAggregationMethod_Order(t *testing.T) {
-	if AggregationMethodMedian != 0 {
-		t.Errorf("AggregationMethodMedian = %d, want 0 (default)", AggregationMethodMedian)
-	}
-	if !(AggregationMethodMedian < AggregationMethodMax && AggregationMethodMax < AggregationMethodMean) {
-		t.Errorf("expected MEDIAN < MAX < MEAN")
-	}
-}
-
 // TestPendingRecord_Fields verifies PendingRecord carries exactly the
 // fields each PendingRecordType needs and that constructing records for
 // both recovery scenarios yields the documented values.

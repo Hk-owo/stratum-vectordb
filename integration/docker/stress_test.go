@@ -303,42 +303,42 @@ func versionIndexBytes(t *testing.T, kbID string, versionID int64) int64 {
 	return total
 }
 
-// awaitReplicaArtifact waits until every storage replica holds the version's
-// artifact on disk.
+// awaitOneReplicaArtifact waits until AT LEAST ONE storage replica holds the
+// version's artifact on disk.
 //
-// Why the collection case needs it: §8.6(c) reuses the parent artifact only where
-// that parent IS. Its build ran on one node and §8.4 distributes it to the rest,
-// so a child version written while that distribution is still in flight reuses
-// nothing and is rebuilt from scratch — carrying no tombstones, which leaves
-// §8.6(d) with nothing to collect. Measured twice: 74 MB (reused, tombstones
-// present, collection ran and reclaimed 7,322 chunks) versus 41 MB against the
-// parent's 65 MB (rebuilt, no tombstones, case correctly refuses to continue).
-// The case is about collection, not about distribution timing, so it waits the
-// race out instead of rolling dice on which node dispatches picked.
+// It used to require every replica, which was the "§8.4 分发 N 份" model: one
+// builder shipped the artifact to all the rest. Indices are not distributed that
+// way any more — the owner set decides which replicas hold a version's index
+// (docs/index-owner-sharding-plan.md §3), and for an inactive version that is a
+// deliberate subset. Requiring all of them would wait out a distribution the
+// design no longer performs.
+//
+// What the collection case actually needs is narrower: §8.6(c) reuses the parent
+// artifact only where that parent IS, so what matters is that the parent's
+// artifact exists on a node that may then append. One is enough for that, and for
+// the other half of the measurement — `du` over the group reads whatever is
+// there.
 //
 // Note this is NOT sufficient on its own to make the child reuse the parent: a
-// replica that received the parent this way knows the artifact is on disk but not
-// its SHAPE, and appendBase requires the latter (see awaitVersionBuildLog). What
-// this wait buys is the other half of the measurement — every replica holding the
-// version's artifact, so `du` reads the whole group rather than whoever finished
-// first.
-func awaitReplicaArtifact(t *testing.T, kbID string, versionID int64, timeout time.Duration) {
+// replica needs to know the artifact's SHAPE as well, and appendBase requires it
+// (see awaitVersionBuildLog).
+func awaitOneReplicaArtifact(t *testing.T, kbID string, versionID int64, timeout time.Duration) {
 	t.Helper()
-	for i, svc := range storageServices {
-		dir := fmt.Sprintf("%s/index/%s", storageDataDir(i), kbID)
-		deadline := time.Now().Add(timeout)
-		for {
+	deadline := time.Now().Add(timeout)
+	for {
+		for i, svc := range storageServices {
+			dir := fmt.Sprintf("%s/index/%s", storageDataDir(i), kbID)
 			out, _ := exec.Command("docker", "exec", svc, "sh", "-c",
 				fmt.Sprintf("test -s %s/%d.index && test -s %s/%d.index.ids && echo yes",
 					dir, versionID, dir, versionID)).Output()
 			if strings.Contains(string(out), "yes") {
-				break
+				return
 			}
-			if time.Now().After(deadline) {
-				t.Fatalf("replica %s never received the artifact for %s v%d within %v", svc, kbID, versionID, timeout)
-			}
-			time.Sleep(500 * time.Millisecond)
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no storage replica held the artifact for %s v%d within %v", kbID, versionID, timeout)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
@@ -604,6 +604,23 @@ func TestT4_QueryLatency(t *testing.T) {
 	if err := waitForListen(storageAddrs[coldIdx], 60*time.Second); err != nil {
 		t.Fatalf("storage %d did not come back after restart: %v", coldIdx+1, err)
 	}
+	// Wait until the ROUTER can see the node again, without counting that wait as
+	// part of the measurement. The port being open is not the same as the routing
+	// layer knowing the node is back, and a query sent in that window is refused
+	// with "all nodes unavailable" — a statement about the topology, not about the
+	// index, and not what this test measures.
+	routeDeadline := time.Now().Add(60 * time.Second)
+	for {
+		if _, err := serveFrom(ctx, storageAddrs[coldIdx], kbID, versionID); err == nil ||
+			!strings.Contains(err.Error(), "all nodes unavailable") {
+			break
+		}
+		if time.Now().After(routeDeadline) {
+			t.Fatalf("storage %d never became routable again after its restart", coldIdx+1)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
 	// The port being open is not the same as the artifact being loaded: that is
 	// exactly the work the cold query pays for.
 	coldStart := time.Now()
@@ -666,9 +683,10 @@ func TestT4_QueryLatency(t *testing.T) {
 // whole chain (scan → decide → reopen/rebuild → save → redistribute) runs on real
 // bytes.
 //
-// Collection is opt-in (index_manager.gc_enabled). A run whose configs leave it off
-// is a legitimate run, so this skips with the reason rather than failing — "the
-// operator has not enabled it" is not a defect.
+// Collection is ON by default since 2026-10 (index_manager.gc_enabled, gated by
+// serving_replica_min and gc_ratio_threshold), but a run whose configs turn it off
+// is still legitimate, so this skips with the reason rather than failing — "the
+// operator disabled it" is not a defect.
 func TestT4_GCPressure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), stressTimeout())
 	defer cancel()
@@ -681,9 +699,9 @@ func TestT4_GCPressure(t *testing.T) {
 
 	baseVersion := writeVersion(t, ctx, leaderAddr, kbID, docs)
 	waitVersionStatus(t, ctx, leaderAddr, kbID, baseVersion, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
-	// Every replica must hold the parent's artifact before the child is written:
-	// §8.6(c) can only reuse what is locally there (see awaitReplicaArtifact).
-	awaitReplicaArtifact(t, kbID, baseVersion, 120*time.Second)
+	// The parent's artifact must exist somewhere before the child is written:
+	// §8.6(c) can only reuse what is locally there (see awaitOneReplicaArtifact).
+	awaitOneReplicaArtifact(t, kbID, baseVersion, 120*time.Second)
 	baseBytes := versionIndexBytes(t, kbID, baseVersion)
 	t.Logf("base version %d READY on every replica; artifact bytes across the storage group: %d", baseVersion, baseBytes)
 
@@ -737,7 +755,7 @@ func TestT4_GCPressure(t *testing.T) {
 	// replicas — measured: 66.7 MB across the group for an artifact that settles at
 	// 99.2 MB (two replicas plus a fraction of the third), which then made the
 	// post-collection reading look unchanged.
-	awaitReplicaArtifact(t, kbID, trimmed, 120*time.Second)
+	awaitOneReplicaArtifact(t, kbID, trimmed, 120*time.Second)
 	afterDelete := versionIndexBytes(t, kbID, trimmed)
 	t.Logf("version %d READY after deleting %d/%d docs; artifact bytes: %d (parent's clean artifact: %d)",
 		trimmed, deleteCount, docCount, afterDelete, baseBytes)

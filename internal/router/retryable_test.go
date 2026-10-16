@@ -35,6 +35,14 @@ func TestIsRetryableErr_DecidesOnTheSentinelNotTheCode(t *testing.T) {
 			want: true,
 		},
 		{
+			// This replica IS building the version's index and the caller waited
+			// out load_wait_timeout_ms. Local and transient: another candidate may
+			// already be serving it.
+			name: "index load timeout",
+			err:  stratumerrors.ToGRPCStatus(stratumerrors.ErrIndexLoadTimeout),
+			want: true,
+		},
+		{
 			// Terminal: the version is going away. Retrying anywhere is wrong.
 			name: "version deleting",
 			err:  stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionDeleting),

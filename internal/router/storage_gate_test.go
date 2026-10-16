@@ -21,7 +21,6 @@ func tableWithVerdicts(verdicts map[string]degradationVerdict) *RouteTable {
 		expected:    map[string]int64{},
 		degradation: verdicts,
 	}
-	table.updated = time.Now()
 	table.ready = true
 	table.mu.Unlock()
 	return table

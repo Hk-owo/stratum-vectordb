@@ -194,10 +194,12 @@ func TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack(t *te
 		t.Fatalf("reopen WAL: %v", err)
 	}
 	defer reopened.Close()
+	reclaimed, err := reopened.ChangesInRange(ctx, kbID, v1, v1+2)
+	if err != nil {
+		t.Fatalf("ChangesInRange: %v", err)
+	}
 	for _, v := range []int64{v1 + 1, v1 + 2} {
-		if _, ok, err := reopened.ChangesFor(ctx, kbID, v); err != nil {
-			t.Fatalf("ChangesFor(v%d): %v", v, err)
-		} else if ok {
+		if _, ok := reclaimed[v]; ok {
 			t.Errorf("v%d survived reclamation although every replica reported holding it", v)
 		}
 	}

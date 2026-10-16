@@ -89,15 +89,30 @@ service DataSyncService {
   // quorum, so the §7.3 takeover timer it started can stand down.
   rpc ConfirmVersionWrite(ConfirmVersionWriteRequest) returns (ConfirmVersionWriteResponse);
 
-  // PushIndexData streams one version's built index to a replica, so the
-  // replica loads the artifact instead of rebuilding it: "建一次、分发 N 份"
-  // (Stratum_设计文档v13.md §8.4). It replaces the "every replica builds its own
-  // HNSW" premise, which also removed the build-collision defect where
-  // several nodes ran Build (Reset + AddChunks) on the same version.
-  rpc PushIndexData(stream PushIndexChunk) returns (PushIndexDataResponse);
+  // FetchIndexData streams one version's built index FROM a peer that already
+  // holds it — this is §8.4's "分发 N 份" in its only direction.
+  //
+  // It IS the distribution path, not a complement to one. The push direction
+  // (PushIndexData) used to exist beside it and was removed: a push is
+  // fire-and-forget, so nothing on the receiving side ever learned that an
+  // artifact was meant for it and never arrived, while a replica that is not
+  // the owner head (docs/index-owner-sharding-plan.md §5.2) does not build for
+  // itself. Asking for it turns that permanent gap into one round trip, and it
+  // leaves exactly one闸门 to reason about instead of two half-gates.
+  rpc FetchIndexData(FetchIndexDataRequest) returns (stream IndexChunk);
 }
 
-message PushIndexChunk {
+// FetchIndexDataRequest names the artifact to fetch. It carries no hint about
+// WHO might hold it: the caller asks the peers it knows about and takes the first
+// that answers.
+message FetchIndexDataRequest {
+  string knowledge_base_id = 1;
+  int64 version_id = 2;
+}
+
+// IndexChunk is one slice of an artifact on the wire. The framing is sidecar
+// first, then the index, in 1 MiB slices, terminated by a chunk with last set.
+message IndexChunk {
   string knowledge_base_id = 1;
   int64 version_id = 2;
   // sidecar marks the .ids companion, which carries the checksum the index
@@ -107,10 +122,6 @@ message PushIndexChunk {
   bytes data = 4;
   // last marks the final chunk of the whole transfer (both files).
   bool last = 5;
-}
-
-message PushIndexDataResponse {
-  int64 node_id = 1;
 }
 
 message ConfirmVersionWriteRequest {
@@ -258,6 +269,7 @@ message ReportDataVersionsRequest {
   // alongside the cursors so GetDataVersionHolders can hand consumers something
   // they can dial, instead of every consumer growing its own id→address map.
   string address = 3;
+
 }
 
 message ReportDataVersionsResponse {
@@ -311,6 +323,7 @@ message ReportDataVersionsResponse {
   // the aggregate is soft state, scoped to a leadership term, refreshed every
   // interval.
   map<string, HolderList> holders = 5;
+
 }
 
 // HolderList is one knowledge base's holders, in ascending node-id order so a

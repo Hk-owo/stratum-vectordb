@@ -14,18 +14,18 @@ import "context"
 // cmdCreateVersion entry — i.e. the Raft state machine has a new version
 // whose storage-layer data needs to be pulled from the leader.
 type FollowerSync interface {
-	// PullVersion pulls the full storage-layer dataset for (kbID,
+	// PullVersionData pulls the full storage-layer dataset for (kbID,
 	// versionID) from the leader at leaderAddr and writes it into this
 	// node's local DocStore, ChunkDocMapper, VersionDocList, and
 	// ChunkStore.
 	//
 	// Idempotent: every write to the local PebbleDB stores is keyed by
 	// (kbID, versionID, docID/chunkID) and all four stores are
-	// idempotent-by-key. Calling PullVersion with the same arguments
+	// idempotent-by-key. Calling PullVersionData with the same arguments
 	// more than once is safe.
 	//
-	// On success the follower calls IndexManager.TriggerBuild to kick
-	// off an independent HNSW build; on failure the caller (the Raft
-	// apply loop) retries with exponential backoff.
-	PullVersion(ctx context.Context, leaderAddr string, kbID string, versionID int64) error
+	// The index is NOT built here (Stratum_设计文档v13.md §8.6b): a version is built
+	// when something asks for it, and pulling its data is not an ask. On failure
+	// the caller (the Raft apply loop, or the plane's catch-up) retries.
+	PullVersionData(ctx context.Context, leaderAddr string, kbID string, versionID int64) error
 }

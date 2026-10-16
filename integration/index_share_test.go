@@ -116,11 +116,21 @@ func TestRealStack_IndexDistributionInstallsTheBuildersArtifact(t *testing.T) {
 	versionID := resp.GetVersionId()
 	t.Logf("created %s v%d", kbID, versionID)
 
+	// Ask for the build before waiting for a file on disk. §8.6(b) builds a version
+	// when something requests it, and this test creates a version that is not the
+	// active one — so without the request nothing would ever appear on disk.
+	leader.waitVersionReady(ctx, kbID, versionID)
+
 	leaderIndex, leaderSidecar := waitForIndex(t, leaderDir, kbID, versionID, 60*time.Second)
 	if leaderIndex == nil {
 		t.Fatal("the leader never persisted an index for the version")
 	}
 	t.Logf("leader index: %d bytes + %d sidecar bytes", len(leaderIndex), len(leaderSidecar))
+
+	// Same for the replica: it builds nothing on its own (§8.6b), so it reaches the
+	// version by FETCHING the head's artifact (§8.4) — which is the thing this test
+	// is about.
+	follower.waitVersionReady(ctx, kbID, versionID)
 
 	followerIndex, followerSidecar := waitForIndex(t, followerDir, kbID, versionID, 60*time.Second)
 	if followerIndex == nil {

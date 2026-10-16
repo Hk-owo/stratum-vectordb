@@ -55,8 +55,8 @@ type LocalControlPlane struct {
 	failures      map[string]int32
 	failureBudget int32
 
-	// kbBudgets overrides the budget per knowledge base, set from that KB's
-	// DurabilityPolicy (SetFailureBudget). Absent means "use failureBudget".
+	// kbBudgets overrides the budget per knowledge base, set through
+	// SetFailureBudget. Absent means "use failureBudget".
 	kbBudgets map[string]int32
 
 	// dataVersions is the leader's §7.13.4 aggregate of the storage layer's
@@ -198,9 +198,10 @@ func (c *LocalControlPlane) ReportVersionFailure(ctx context.Context, kbID strin
 }
 
 // SetFailureBudget records the retry budget declared for kbID. It is how a
-// KB's DurabilityPolicy reaches the layer that owns the terminal verdict
-// (Stratum_设计文档v13.md §10.1). A non-positive value clears any override,
-// falling back to the process default.
+// KB's declared failure budget would reach the layer that owns the terminal
+// verdict (Stratum_设计文档v13.md §10.1); nothing in the node assembly calls it
+// today, so the process default governs. A non-positive value clears any
+// override, falling back to the process default.
 func (c *LocalControlPlane) SetFailureBudget(_ context.Context, kbID string, maxFailures int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -318,31 +319,6 @@ func (c *LocalControlPlane) IndexReadyReplicaCount(ctx context.Context, kbID str
 	}
 	return 0, fmt.Errorf("plane: IndexReadyReplicaCount: version %d of %s not found: %w",
 		versionID, kbID, stratumerrors.ErrVersionNotFound)
-}
-
-// ReportAvailability maps the abstract storage-layer availability onto the
-// version status the control layer keeps (v1 §4.3: AVAILABLE → READY,
-// UNAVAILABLE → FAILED).
-//
-// DEGRADED deliberately maps to no status change: it describes the read
-// service capacity distribution rather than the version's own state
-// (Stratum_设计文档v13.md §8.2), so the version stays READY and the
-// degradation is an alerting concern upstream.
-//
-// nodeID 0: these are verdicts ABOUT the version, not a replica claiming it is
-// serving (§8.6(d) counts the latter). Recording a node here would let one
-// replica's availability verdict stand in for another's readiness.
-func (c *LocalControlPlane) ReportAvailability(ctx context.Context, _ string, versionID int64, state Availability) error {
-	switch state {
-	case AvailabilityDegraded:
-		return nil
-	case AvailabilityAvailable:
-		return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, 0)
-	case AvailabilityUnavailable:
-		return c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusFailed, 0)
-	default:
-		return fmt.Errorf("plane: ReportAvailability: unknown availability %d", int(state))
-	}
 }
 
 // ReportEpoch reconciles control-layer state with storage-layer facts after a

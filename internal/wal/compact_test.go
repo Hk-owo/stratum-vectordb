@@ -56,16 +56,16 @@ func TestFileWAL_CompactDropsReclaimedVersions(t *testing.T) {
 	}
 	defer reopened.Close()
 
+	reclaimed, err := reopened.ChangesInRange(ctx, "kb-1", 0, 3)
+	if err != nil {
+		t.Fatalf("ChangesInRange: %v", err)
+	}
 	for _, v := range []int64{1, 2} {
-		if _, ok, err := reopened.ChangesFor(ctx, "kb-1", v); err != nil {
-			t.Fatalf("ChangesFor(v%d): %v", v, err)
-		} else if ok {
+		if _, ok := reclaimed[v]; ok {
 			t.Errorf("v%d is still present after compaction; a reclaimed version must read as a MISSING key", v)
 		}
 	}
-	if _, ok, err := reopened.ChangesFor(ctx, "kb-1", 3); err != nil {
-		t.Fatalf("ChangesFor(v3): %v", err)
-	} else if !ok {
+	if _, ok := reclaimed[3]; !ok {
 		t.Error("v3 is above the watermark and must survive compaction")
 	}
 }
@@ -161,9 +161,9 @@ func TestFileWAL_CompactKeepsUncommittedFlows(t *testing.T) {
 	if len(pending) == 0 {
 		t.Fatal("an uncommitted flow was reclaimed; its replay input is gone and the crash can no longer be repaired")
 	}
-	if _, ok, err := reopened.ChangesFor(ctx, "kb-1", 2); err != nil {
-		t.Fatalf("ChangesFor(v2): %v", err)
-	} else if !ok {
+	if deltas, err := reopened.ChangesInRange(ctx, "kb-1", 1, 2); err != nil {
+		t.Fatalf("ChangesInRange(v2): %v", err)
+	} else if _, ok := deltas[2]; !ok {
 		t.Error("the uncommitted version's changes were dropped")
 	}
 }
@@ -236,10 +236,10 @@ func TestFileWAL_CompactKeepsKnowledgeBasesWithoutAWatermark(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	if _, ok, _ := reopened.ChangesFor(ctx, "kb-1", 1); ok {
+	if deltas, _ := reopened.ChangesInRange(ctx, "kb-1", 0, 1); len(deltas) != 0 {
 		t.Error("kb-1 was at its watermark and should have been reclaimed")
 	}
-	if _, ok, _ := reopened.ChangesFor(ctx, "kb-2", 100); !ok {
+	if deltas, _ := reopened.ChangesInRange(ctx, "kb-2", 99, 100); len(deltas) == 0 {
 		t.Error("kb-2 had no watermark and must keep its records")
 	}
 }
@@ -268,8 +268,8 @@ func TestFileWAL_CompactLeavesAnAppendableLog(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	if _, ok, err := reopened.ChangesFor(ctx, "kb-1", 2); err != nil || !ok {
-		t.Fatalf("a version written after compaction is unreadable: ok=%v err=%v", ok, err)
+	if deltas, err := reopened.ChangesInRange(ctx, "kb-1", 1, 2); err != nil || len(deltas) == 0 {
+		t.Fatalf("a version written after compaction is unreadable: err=%v", err)
 	}
 	// The temporary file must not be left behind.
 	if _, err := os.Stat(path + ".compact"); !os.IsNotExist(err) {

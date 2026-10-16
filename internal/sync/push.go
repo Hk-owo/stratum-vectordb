@@ -1,7 +1,6 @@
 package sync
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -116,9 +115,6 @@ type PushHandler struct {
 	// should be ready to stand up for it if the coordinator goes quiet.
 	watcher VersionWriteWatcher
 
-	// installer receives indexes built elsewhere (§8.4).
-	installer IndexInstaller
-
 	// logger records the receive side's own decisions. Nop unless wired, but
 	// wiring it matters for one decision in particular: a §8.4(a) probe that
 	// could not be answered turns a skip back into a full transfer, and without
@@ -131,6 +127,17 @@ type PushHandler struct {
 	// without it this node learns nothing and keeps resolving sources the
 	// pre-§8.5 way (ask the leader).
 	dataSources DataSourceRegistry
+
+	// members is the replica set owner sets are computed over, and inactiveK is
+	// the k used for versions that are not the active one
+	// (docs/index-owner-sharding-plan.md §3/§5.2). Optional: with no members this
+	// handler builds on every landing, which is exactly the pre-sharding
+	// behaviour — the safe default for a deployment that has not opted in.
+	//
+	// activeVersion answers §8.6b's question, and it has to be asked HERE rather
+	// than only in the apply hook: a pure storage node (role=storage) runs no
+	// Raft and gets no OnVersionCreated, so this is its only chance to have the
+	// active version warm before a query arrives.
 
 	// writeExecutor, when set, lets this node act as the coordinator the
 	// control layer dispatched a write to (§7.13.2): the local write
@@ -324,23 +331,6 @@ func WithVersionWriteWatcher(w VersionWriteWatcher) PushHandlerOption {
 	return func(h *PushHandler) { h.watcher = w }
 }
 
-// IndexInstaller writes a distributed index into this node's index directory
-// and loads it, so a replica can serve a version it never built
-// (Stratum_设计文档v13.md §8.4). *index.IndexManagerImpl implements it.
-type IndexInstaller interface {
-	InstallIndex(ctx context.Context, kbID string, versionID int64, indexData, sidecarData []byte) error
-	// HasIndex reports whether this node already holds an on-disk artifact for
-	// the version — the fact §8.4(a)'s probe answers with. Read-only by
-	// contract: it must not build, load or fetch anything, because every caller
-	// asks it precisely to avoid that work.
-	HasIndex(ctx context.Context, kbID string, versionID int64) (bool, error)
-}
-
-// WithIndexInstaller wires the §8.4 destination of a pushed index.
-func WithIndexInstaller(i IndexInstaller) PushHandlerOption {
-	return func(h *PushHandler) { h.installer = i }
-}
-
 // WithLogger wires the receive side's log. Optional, but a §8.4(a) probe that
 // fails is otherwise invisible: "I could not find out" and "it is not there"
 // lead to the same behaviour — accept the push — and only one of them is
@@ -380,7 +370,9 @@ func WithLocalVersionAdvancer(a LocalVersionAdvancer) PushHandlerOption {
 
 // NewPushHandler returns a PushHandler applying through follower.
 func NewPushHandler(follower *Follower, nodeID int64, opts ...PushHandlerOption) *PushHandler {
-	h := &PushHandler{follower: follower, nodeID: nodeID, logger: zap.NewNop()}
+	h := &PushHandler{
+		follower: follower, nodeID: nodeID, logger: zap.NewNop(),
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(h)
@@ -434,9 +426,30 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 		if h.follower != nil {
 			h.follower.rebuildVersionBloom(ctx, kbID, versionID)
 		}
-		if err := h.follower.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
-			return fmt.Errorf("sync: push trigger build (%s v%d): %w", kbID, versionID, err)
-		}
+		// §8.4: a replica INSTALLS the coordinator's artifact rather than building
+		// its own. Building here anyway is what made distribution a no-op — this
+		// handler runs the moment the DATA lands, while the coordinator still has
+		// to finish building before it can ship anything, so the replica always
+		// got there first and §8.4(a)'s probe then found an artifact already held.
+		//
+		// The build is therefore restricted to the replica that OWNS the version
+		// (docs/index-owner-sharding-plan.md §5.2): owners() is a pure function of
+		// (kbID, versionID) and the member set, so every replica computes the same
+		// answer without asking anyone.
+		//
+		// NO BUILD HAPPENS HERE, and that is §8.6(b)'s lazy construction rather
+		// than an omission. Landing data is not a reason to build an index: the
+		// only version worth building eagerly is the ACTIVE one, and that decision
+		// belongs to the apply hook, which knows which version is active
+		// (cmd/stratum's version-created callback, §8.6b). Every other version is
+		// built when something asks for it — a query (service/query.go) or an
+		// explicit operator request — and the router's owner set decides which
+		// nodes those requests reach (docs/index-owner-sharding-plan.md §5).
+		//
+		// This handler used to build here for every landing. Whatever gate it had
+		// (the owner set, the active version, nothing at all) was answering the
+		// wrong question: it made every push arrival a build, which is the eager
+		// behaviour §8.6(b) had already replaced.
 		// Start the §7.3 takeover timer. The data is here; the only thing that
 		// can still go missing is the coordinator's word that a quorum holds
 		// it, and this is how a replica notices that word never arrived.
@@ -525,7 +538,7 @@ func (h *PushHandler) PullVersionChanges(req *pb.PullVersionChangesRequest, stre
 		if err := stream.Send(&pb.VersionChanges{
 			VersionId:       d.VersionID,
 			ParentVersionId: d.ParentVersionID,
-			Changes:         docChangesToProto(d.Changes),
+			Changes:         DocChangesToProto(d.Changes),
 		}); err != nil {
 			return err
 		}
@@ -552,6 +565,7 @@ func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 	}
 	h.dataVersions.Record(req.GetNodeId(), req.GetAddress(), req.GetDataVersions())
 
+	// §2: an owner set is a pure function of (kbID, versionID) and the member set,
 	resp := &pb.ReportDataVersionsResponse{Accepted: true, NodeId: h.nodeID}
 	// Carry back the watermarks for the knowledge bases this reporter just told us
 	// about: those are the ones it holds data for, and hence whose changes could be
@@ -611,9 +625,14 @@ func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 	return resp, nil
 }
 
-// docChangesToProto is the wire form of a change list — the counterpart of
+// DocChangesToProto is the wire form of a change list — the counterpart of
 // docChangesFromProto.
-func docChangesToProto(in []types.DocChange) []*pb.DocChange {
+//
+// Exported because the storage layer encodes the same payload: the coordinator
+// dispatcher ships a version's changes to the peer that will coordinate it
+// (plane.CoordinatorDispatcher), so the two encodings have to stay one function
+// rather than two that can drift.
+func DocChangesToProto(in []types.DocChange) []*pb.DocChange {
 	if len(in) == 0 {
 		return nil
 	}
@@ -679,99 +698,6 @@ func (h *PushHandler) VersionPresence(ctx context.Context, req *pb.VersionPresen
 		Present: len(docIDs) > 0,
 		NodeId:  h.nodeID,
 	}, nil
-}
-
-// PushIndexData implements DataSyncService.PushIndexData: it receives an index
-// built by another node and installs it, so this replica serves the version
-// without building anything (Stratum_设计文档v13.md §8.4).
-//
-// The stream is buffered in memory rather than written through: installation
-// has to be atomic (see index.InstallIndex), and a half-installed index is the
-// one state worth paying memory to avoid. Indexes are tens of megabytes, not
-// gigabytes.
-func (h *PushHandler) PushIndexData(stream pb.DataSyncService_PushIndexDataServer) error {
-	// Same reason as PushVersionData: installing an index needs a local index
-	// directory, which a control node does not have.
-	if h.installer == nil {
-		return status.Errorf(codes.Unimplemented, "sync: PushIndexData: this node holds no storage")
-	}
-	var (
-		kbID       string
-		versionID  int64
-		indexBuf   bytes.Buffer
-		sidecarBuf bytes.Buffer
-		// frames counts what has arrived, so "probe" can mean the first frame and
-		// nothing else; probed remembers that the first frame was one, which is
-		// what the bare-probe answer below turns on.
-		frames int
-		probed bool
-	)
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		kbID = chunk.GetKnowledgeBaseId()
-		versionID = chunk.GetVersionId()
-
-		// §8.4(a) probe: the sender asks "do you already hold this artifact?"
-		// with a zero-length frame before spending tens of megabytes. Answering
-		// AlreadyExists closes the stream, so the transfer never starts.
-		//
-		// It has to be the FIRST frame, and the frame count — not merely "no probe
-		// seen yet" — is what says so. A real transfer opens with a sidecar chunk
-		// (Sidecar=true) and the sending side refuses an empty index payload, so
-		// this combination does not occur in the normal flow; but a zero-length
-		// frame arriving mid-transfer must be treated as the data frame it is
-		// rather than raced against as a probe.
-		isProbe := frames == 0 && len(chunk.GetData()) == 0 && !chunk.GetSidecar() && !chunk.GetLast()
-		frames++
-		if isProbe {
-			probed = true
-			held, err := h.installer.HasIndex(stream.Context(), kbID, versionID)
-			if err != nil {
-				// "I could not find out" is not "it is absent": accept the push
-				// rather than silently skipping a ship that was actually needed.
-				h.logger.Warn("sync: PushIndexData: presence probe failed; accepting the push",
-					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-			} else if held {
-				return status.Errorf(codes.AlreadyExists,
-					"sync: PushIndexData: %s v%d already holds an artifact; skipping the ship", kbID, versionID)
-			}
-			continue
-		}
-
-		if chunk.GetSidecar() {
-			sidecarBuf.Write(chunk.GetData())
-		} else {
-			indexBuf.Write(chunk.GetData())
-		}
-		if chunk.GetLast() {
-			break
-		}
-	}
-	if kbID == "" {
-		return status.Error(codes.InvalidArgument, "sync: PushIndexData: no knowledge base id in the stream")
-	}
-	// A probe that arrived and then closed the stream with nothing behind it is
-	// the §8.4(a) pre-flight, not a transfer: the sender wants a yes/no answer
-	// and got "not held" from HasIndex above. Answering NotFound makes that
-	// explicit, so the sender's probe does not have to be inferred from the
-	// side effect of an empty install.
-	if probed && indexBuf.Len() == 0 && sidecarBuf.Len() == 0 {
-		return status.Errorf(codes.NotFound,
-			"sync: PushIndexData: this node holds no artifact for %s v%d", kbID, versionID)
-	}
-	if h.installer == nil {
-		return status.Error(codes.FailedPrecondition, "sync: PushIndexData: index install is not wired on this node")
-	}
-	if err := h.installer.InstallIndex(stream.Context(), kbID, versionID, indexBuf.Bytes(), sidecarBuf.Bytes()); err != nil {
-		return status.Errorf(codes.Internal, "sync: PushIndexData(%s v%d): %v", kbID, versionID, err)
-	}
-	return stream.SendAndClose(&pb.PushIndexDataResponse{NodeId: h.nodeID})
 }
 
 // DeleteVersionData implements DataSyncService.DeleteVersionData: it reclaims

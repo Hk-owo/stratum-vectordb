@@ -64,8 +64,8 @@ npm run desktop:build    # 打包（产物在 src-tauri/target/release/bundle/�
 ```
 
 打包**不会**自带后端。桌面窗口要连一个跑着的 gateway——地址在 `settings.json` 的
-`gateway_url`（默认 `http://127.0.0.1:8081`）。仓库根目录的 `./start.sh` 会拉起
-完整链路（vecstore → stratum → 服务站 → gateway）。
+`gateway_url`（默认 `http://127.0.0.1:8081`）。仓库根目录的 `scripts/gateway.sh --with-db`
+会拉起完整链路（vecstore → stratum → 服务站 → gateway）。
 
 ## 两个环境下的差异
 

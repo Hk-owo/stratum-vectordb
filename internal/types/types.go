@@ -282,17 +282,6 @@ type SearchResult struct {
 	Score   float32
 }
 
-// AggregationMethod controls how per-chunk scores are combined into a
-// per-document score when multiple chunks of the same document are hit.
-// Configurable per query; default is Median.
-type AggregationMethod int
-
-const (
-	AggregationMethodMedian AggregationMethod = iota // default
-	AggregationMethodMax
-	AggregationMethodMean
-)
-
 // EmbedConfig describes the embed service a knowledge base is bound to.
 // This is a knowledge-base-level fixed attribute: set at creation time and
 // immutable afterward.

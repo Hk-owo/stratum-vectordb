@@ -137,15 +137,6 @@ type WAL interface {
 	// as cursor 0.
 	RecoverCursors(ctx context.Context) (map[string]int64, error)
 
-	// ChangesFor returns the replay input recorded for (kbID, versionID): the
-	// changes its writer applied. It answers a lagging peer's backfill request
-	// (Stratum_设计文档v13.md §7.5) with the very same BEGIN record crash
-	// recovery replays — one record, two readers. ok is false when no BEGIN
-	// record is bound to that version: never written on this node (a follower
-	// that merely applied the leader's log writes none), already reclaimed, or
-	// predating the current format.
-	ChangesFor(ctx context.Context, kbID string, versionID int64) (changes []types.DocChange, ok bool, err error)
-
 	// ChangesInRange returns the recorded replay input for every version in
 	// (fromExclusive, toInclusive] that this node wrote, keyed by version ID,
 	// each entry carrying the parent it was applied to (a version's document set

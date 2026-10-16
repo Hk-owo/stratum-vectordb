@@ -157,7 +157,11 @@ func TestDecide_EveryStageAndBothOwnershipStates(t *testing.T) {
 		{"ready is done", stageIndexReady, false, true, DecisionDone},
 		{"ready is done without changes too", stageIndexReady, false, false, DecisionDone},
 		{"still writing: wait", stageDataPending, false, true, DecisionWait},
-		{"durable but not ready: keep waiting for the target", stageDataDurable, false, true, DecisionWait},
+		// The data being durable IS the settled state now: an index is built on
+		// demand (§8.6b), so waiting for INDEX_READY would wait forever on a
+		// version nobody has queried.
+		{"durable is settled: the index is demand-driven", stageDataDurable, false, true, DecisionDone},
+		{"durable is settled without changes too", stageDataDurable, false, false, DecisionDone},
 		{"index failed: rebuildable, wait", stageIndexFailed, false, true, DecisionWait},
 		{"deleting: give up on it", stageDeleting, false, true, DecisionDiscard},
 		{"data missing, changes kept: re-send", stageDataPending, true, true, DecisionResend},

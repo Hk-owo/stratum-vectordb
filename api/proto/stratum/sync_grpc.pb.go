@@ -45,7 +45,7 @@ const (
 	DataSyncService_LocalVersion_FullMethodName        = "/stratum.DataSyncService/LocalVersion"
 	DataSyncService_DeleteVersionData_FullMethodName   = "/stratum.DataSyncService/DeleteVersionData"
 	DataSyncService_ConfirmVersionWrite_FullMethodName = "/stratum.DataSyncService/ConfirmVersionWrite"
-	DataSyncService_PushIndexData_FullMethodName       = "/stratum.DataSyncService/PushIndexData"
+	DataSyncService_FetchIndexData_FullMethodName      = "/stratum.DataSyncService/FetchIndexData"
 )
 
 // DataSyncServiceClient is the client API for DataSyncService service.
@@ -111,12 +111,17 @@ type DataSyncServiceClient interface {
 	// ConfirmVersionWrite tells a replica that the version it received did reach
 	// quorum, so the §7.3 takeover timer it started can stand down.
 	ConfirmVersionWrite(ctx context.Context, in *ConfirmVersionWriteRequest, opts ...grpc.CallOption) (*ConfirmVersionWriteResponse, error)
-	// PushIndexData streams one version's built index to a replica, so the
-	// replica loads the artifact instead of rebuilding it: "建一次、分发 N 份"
-	// (Stratum_设计文档v13.md §8.4). It replaces the "every replica builds its own
-	// HNSW" premise, which also removed the build-collision defect where
-	// several nodes ran Build (Reset + AddChunks) on the same version.
-	PushIndexData(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushIndexChunk, PushIndexDataResponse], error)
+	// FetchIndexData streams one version's built index FROM a peer that already
+	// holds it — this is §8.4's "分发 N 份" in its only direction.
+	//
+	// It IS the distribution path, not a complement to one. The push direction
+	// (PushIndexData) used to exist beside it and was removed: a push is
+	// fire-and-forget, so nothing on the receiving side ever learned that an
+	// artifact was meant for it and never arrived, while a replica that is not
+	// the owner head (docs/index-owner-sharding-plan.md §5.2) does not build for
+	// itself. Asking for it turns that permanent gap into one round trip, and it
+	// leaves exactly one闸门 to reason about instead of two half-gates.
+	FetchIndexData(ctx context.Context, in *FetchIndexDataRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[IndexChunk], error)
 }
 
 type dataSyncServiceClient struct {
@@ -238,18 +243,24 @@ func (c *dataSyncServiceClient) ConfirmVersionWrite(ctx context.Context, in *Con
 	return out, nil
 }
 
-func (c *dataSyncServiceClient) PushIndexData(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushIndexChunk, PushIndexDataResponse], error) {
+func (c *dataSyncServiceClient) FetchIndexData(ctx context.Context, in *FetchIndexDataRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[IndexChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &DataSyncService_ServiceDesc.Streams[3], DataSyncService_PushIndexData_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &DataSyncService_ServiceDesc.Streams[3], DataSyncService_FetchIndexData_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[PushIndexChunk, PushIndexDataResponse]{ClientStream: stream}
+	x := &grpc.GenericClientStream[FetchIndexDataRequest, IndexChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
 	return x, nil
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type DataSyncService_PushIndexDataClient = grpc.ClientStreamingClient[PushIndexChunk, PushIndexDataResponse]
+type DataSyncService_FetchIndexDataClient = grpc.ServerStreamingClient[IndexChunk]
 
 // DataSyncServiceServer is the server API for DataSyncService service.
 // All implementations must embed UnimplementedDataSyncServiceServer
@@ -314,12 +325,17 @@ type DataSyncServiceServer interface {
 	// ConfirmVersionWrite tells a replica that the version it received did reach
 	// quorum, so the §7.3 takeover timer it started can stand down.
 	ConfirmVersionWrite(context.Context, *ConfirmVersionWriteRequest) (*ConfirmVersionWriteResponse, error)
-	// PushIndexData streams one version's built index to a replica, so the
-	// replica loads the artifact instead of rebuilding it: "建一次、分发 N 份"
-	// (Stratum_设计文档v13.md §8.4). It replaces the "every replica builds its own
-	// HNSW" premise, which also removed the build-collision defect where
-	// several nodes ran Build (Reset + AddChunks) on the same version.
-	PushIndexData(grpc.ClientStreamingServer[PushIndexChunk, PushIndexDataResponse]) error
+	// FetchIndexData streams one version's built index FROM a peer that already
+	// holds it — this is §8.4's "分发 N 份" in its only direction.
+	//
+	// It IS the distribution path, not a complement to one. The push direction
+	// (PushIndexData) used to exist beside it and was removed: a push is
+	// fire-and-forget, so nothing on the receiving side ever learned that an
+	// artifact was meant for it and never arrived, while a replica that is not
+	// the owner head (docs/index-owner-sharding-plan.md §5.2) does not build for
+	// itself. Asking for it turns that permanent gap into one round trip, and it
+	// leaves exactly one闸门 to reason about instead of two half-gates.
+	FetchIndexData(*FetchIndexDataRequest, grpc.ServerStreamingServer[IndexChunk]) error
 	mustEmbedUnimplementedDataSyncServiceServer()
 }
 
@@ -357,8 +373,8 @@ func (UnimplementedDataSyncServiceServer) DeleteVersionData(context.Context, *De
 func (UnimplementedDataSyncServiceServer) ConfirmVersionWrite(context.Context, *ConfirmVersionWriteRequest) (*ConfirmVersionWriteResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ConfirmVersionWrite not implemented")
 }
-func (UnimplementedDataSyncServiceServer) PushIndexData(grpc.ClientStreamingServer[PushIndexChunk, PushIndexDataResponse]) error {
-	return status.Errorf(codes.Unimplemented, "method PushIndexData not implemented")
+func (UnimplementedDataSyncServiceServer) FetchIndexData(*FetchIndexDataRequest, grpc.ServerStreamingServer[IndexChunk]) error {
+	return status.Errorf(codes.Unimplemented, "method FetchIndexData not implemented")
 }
 func (UnimplementedDataSyncServiceServer) mustEmbedUnimplementedDataSyncServiceServer() {}
 func (UnimplementedDataSyncServiceServer) testEmbeddedByValue()                         {}
@@ -518,12 +534,16 @@ func _DataSyncService_ConfirmVersionWrite_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
-func _DataSyncService_PushIndexData_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(DataSyncServiceServer).PushIndexData(&grpc.GenericServerStream[PushIndexChunk, PushIndexDataResponse]{ServerStream: stream})
+func _DataSyncService_FetchIndexData_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(FetchIndexDataRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(DataSyncServiceServer).FetchIndexData(m, &grpc.GenericServerStream[FetchIndexDataRequest, IndexChunk]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type DataSyncService_PushIndexDataServer = grpc.ClientStreamingServer[PushIndexChunk, PushIndexDataResponse]
+type DataSyncService_FetchIndexDataServer = grpc.ServerStreamingServer[IndexChunk]
 
 // DataSyncService_ServiceDesc is the grpc.ServiceDesc for DataSyncService service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -574,9 +594,9 @@ var DataSyncService_ServiceDesc = grpc.ServiceDesc{
 			ClientStreams: true,
 		},
 		{
-			StreamName:    "PushIndexData",
-			Handler:       _DataSyncService_PushIndexData_Handler,
-			ClientStreams: true,
+			StreamName:    "FetchIndexData",
+			Handler:       _DataSyncService_FetchIndexData_Handler,
+			ServerStreams: true,
 		},
 	},
 	Metadata: "sync.proto",

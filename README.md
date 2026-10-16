@@ -19,17 +19,17 @@
   - **审计**：每个查询结果都追溯到产生它的具体版本。
 - **内容定义分块（默认）** —— 边界来自文档字节上的滚动 Rabin 指纹，而非"从头数偏移"，因此中部插入/删除只扰动编辑点附近的 chunk：同一批真实语料实测，编辑点之后的 chunk **保住 ChunkID 的比例从 0% 升到约 95%**，需要重新 embed 的文本从 64% 降到 10%。边界还会吸附到句末标点、并对齐到 rune 起点（后者是正确性红线，不是调参）。
 - **内容寻址 chunk** —— `ChunkID = SHA-256(text + model ID)` 天然去重，无需跨节点协调；写入路径在 **embed 之前**按 ChunkID 过滤已存在的 chunk，复用因此真的省下 embedding 调用，并把复用率与 embed 调用量落进日志（`chunks_already_present` / `embed_skipped`）。
-- **每版本独立 HNSW 索引** —— 版本之间零干扰；索引按 LRU 驻留内存，换出/重载廉价，不会影响查询结果精度。
+- **每版本独立 HNSW 索引，且不跨节点复制** —— 版本之间零干扰；每个版本只落在**该版本的 owner 集**上（服务站按 (知识库, 版本) 确定性算出：活跃版本全体副本都是 owner，非活跃版本按“最近是否被查询”加档），需要它的副本按需向 owner 拉取、或自己建；索引按 LRU 驻留内存，换出/重载廉价，不会影响查询结果精度。
 - **量化两段式检索（可选，默认全精度）** —— 开启后内存只驻留量化粗筛器（HNSW 图 + SQ/PQ 码），查询先粗筛出候选、再按候选读 L2 全精度向量做精确 rerank：精度由全精度 rerank 决定，量化只影响候选覆盖。量化后端为 Faiss 内建 `IndexHNSWSQ`/`IndexHNSWPQ`——评估 hnswlib（无量化）、DiskANN（C++ 分支已停止维护）、USearch（仅免训练标量降位、需整体换后端）后选定：零新依赖，且与现有 `write_index`/`read_index` 序列化格式完全兼容。此外**码本能被重新训练**：累积新增向量比或追加次数越界时自动全量重建，避免"只 append 不删除"的库量化误差随分布漂移静默上升。
 - **索引对象生命周期状态机** —— 每个 vecstore 索引实例显式区分 `EMPTY`/`BUILDING`/`READY` 三态，读锁贯穿查询（含 rerank 磁盘 IO）、写锁保护构建/加载/重置，杜绝 Search 与并发 Reset/Load/AddChunks 之间的 use-after-free 与错位结果。
 - **Raft 强一致 + 崩溃一致性** —— 元数据写操作经 leader 并受 WAL 保护；查询可负载均衡到任意节点；快照不阻塞心跳与写入。存储节点的**数据游标同样落在 WAL 里**，重启后立即准确可用，不再靠扫产物的结论推断。
 - **控制面 / 存储面契约分离** —— `internal/plane` 定义两层之间的契约（`ControlPlane` / `DataPlane`），只传逻辑对象（知识库、版本、抽象可用性），**从不暴露副本数、纠删码、文件路径或节点身份**，因此两层可以拆成独立进程/集群而控制层无需知道数据放在哪。`node.role` 支持 `all`（默认，两层同进程）、`control`（只跑控制面：Raft 日志与元数据，不建数据目录、不建索引）与 `storage`（只跑存储层，不留 Raft 日志，元数据经 `RemoteRaftNode` 走 gRPC 读取），`storage.nodes` 声明存储组。
 - **任何节点都能发起写** —— Raft 只在 leader 追加日志，但"刚写完一个版本""启动 reconcile 有结论"这类事实可能发生在任何节点，所以非 leader 把提案经内部 `InternalService.Propose` 转给 leader（转发不成链）；错误以稳定 wire name 跨进程传递，转发后 `errors.Is` 依然成立。
 - **写幂等 + 卡住的版本有明确归宿** —— `CreateVersion` 的 `client_request_id` 让重试复用首次分配的版本而非另分配一个；PENDING 不再等同于"永远在构建"：**DATA_MISSING**（没有任何候选副本持有该版本的数据，写入方可按同一 key 重发，或用 `DiscardVersion` 放弃）与 **FAILED_PERMANENT**（重试预算耗尽或不可恢复，只有运维能重试或放弃）都会在 `GetSystemStatus` 里显式列出。**数据与索引各有自己的状态与终态**（`DataStatus` / `IndexStatus`，判死时标明落在哪一侧），数据写失败不再被记成索引失败;只有**数据侧**的终态才触发物理回收——索引侧判死说的是"构建失败",不代表数据没了。
-- **落后副本自己追上来** —— 存储节点每 5 秒上报一次自己的连续游标，leader 在响应里捎带每个知识库的**链尾**；发现自己落后的节点随即在后台补齐数据、再触发索引（可能直接装载分发来的产物）。**没有开关**：落后自愈是常态，能调的只是节奏（滞后阈值、抖动窗口、并发上限）。
+- **落后副本自己追上来** —— 存储节点每 5 秒上报一次自己的连续游标，leader 在响应里捎带每个知识库的**链尾**；发现自己落后的节点随即在后台补齐数据、再触发索引（owner 仍持有产物时直接按需拉取装载）。**没有开关**：落后自愈是常态，能调的只是节奏（滞后阈值、抖动窗口、并发上限）。
 - **数据源解析有四层** —— 本地注册表 → leader 回退 → 游标探测 → **控制层 holders 镜像**（心跳响应捎带、本地缓存，查表即可，绝不在 Raft apply 路径上发 RPC）。一个错过 push 广播的副本仍能自己找到持有者。
 - **存储层退化是显式信号** —— 存活副本低于 quorum 时，**写被明确拒绝**（`kb_storage_degraded` / `storage_unavailable`，可重试），而**读照常服务**：判据来自已有的周期上报聚合，未知态一律放行；服务站转发前拦一道（省掉注定失败的往返），控制层在提交 Raft 之前再拦一道（不浪费版本号与日志）。**只读调用方也能发现它**：查询响应上的 `storage_degraded` 由服务站填，不必先撞上一次写失败。
-- **自动存储卫生** —— 周期 chunk GC、每版本布隆过滤器、磁盘保留策略的**访问保护**（还在被读的老版本不会被当成死版本删掉）、构建残留的自超时回收、以及可选的墓碑回收；启动时从磁盘事实与持久化游标推导版本可服务状态，不依赖构建回调确实送达。
+- **自动存储卫生** —— 周期 chunk GC、每版本布隆过滤器、磁盘保留策略的**访问保护**（还在被读的老版本不会被当成死版本删掉）、构建残留的自超时回收、以及**默认开启**的墓碑回收（可显式关闭）；启动时从磁盘事实与持久化游标推导版本可服务状态，不依赖构建回调确实送达。
 - **开箱可运维** —— 三态健康检查；Prometheus `/metrics` 端点（`node.metrics_addr`）；HTTP 网关 + Web 控制台（同源提供、免 CORS）；`scripts/gateway.sh --with-db` 一条命令拉起完整链路。
 
 Stratum 是 RAG 管线的**存储与检索层**：不处理聊天历史、用户会话或 prompt 构造——这些属于其上方的应用层。
@@ -126,7 +126,7 @@ scripts/cluster.sh --topology two-tier status  # 每容器状态与控制组 lea
 
 两层既能在同一进程里跑,也能分开部署:`role=control` 的节点不写本地存储(只有 Raft 日志与快照),`role=storage` 的节点不参与选举(它从控制面读元数据、向控制面报告进度)。上面的服务站是**独立形态**——`scripts/cluster.sh --topology two-tier up --with-station` 一次拉起"控制面 + 存储面 + 服务站 + embed"的完整拓扑。
 
-**数据传输有闸门,且不推无用之物**。三条会成规模消耗资源的路径各自有上限:增量恢复的文档写(`maxConcurrentDocumentWrites`,8 路)、索引本地重建(`index_manager.build_concurrency`,构建池同时是两级优先队列)、索引分发(`index_manager.push_concurrency`,默认 4)。分发前还会**先探测对端是否已持有该版本产物**——已持有则一个字节都不传,也不占分发额度。
+**数据传输有闸门,且只传真正被需要的产物**。两条会成规模消耗资源的路径各自有上限:增量恢复的文档写(`maxConcurrentDocumentWrites`,8 路)、索引本地重建(`index_manager.build_concurrency`,构建池同时是两级优先队列)。索引产物的分发已改为**按需拉取**:接收方向持有者索要,对端没有就改问别人或自己建,因此不存在"推了一堆对方用不上的产物"这回事;提供传输的一侧另有 `index_manager.fetch_concurrency` 闸门(默认不限,用于压住同一版本被 N−1 个副本同时索要的突发);同一版本的并发索要还会**合并成一次读盘**(字节多路复用,源节点内存峰值从 N 份整产物降到 1 份;不是缓存——读一结束就重建,重建后的下一次读仍读新产物)。
 
 ## 核心概念:版本化文档库
 
@@ -156,7 +156,7 @@ scripts/cluster.sh --topology two-tier status  # 每容器状态与控制组 lea
 
 CDC 的默认参数:最小 256 B、最大 1536 B、期望平均 2^9 = 512 B。实测平均 **738 B / chunk**(滑窗为 766 B),因此检索粒度不变,而复用率不是。
 
-由此得到两条实测收益(同一批真实语料,见 `docs/content-defined-chunking-plan.md` §1.2b):编辑点之后保住 ChunkID 的 chunk 比例 **0% → 约 95%**,需要重新 embed 的文本 **64% → 10%**。
+由此得到两条实测收益(同一批真实语料,见 `docs/Stratum_设计文档v14.md` §6.1 与附录 C.3):编辑点之后保住 ChunkID 的 chunk 比例 **0% → 约 95%**,需要重新 embed 的文本 **64% → 10%**。
 
 写路径还会在 **embed 之前**按 ChunkID 过滤掉本节点已持有的 chunk(Bloom + Exists),于是"chunk 复用"真的省下 embedding 调用;每篇文档的 `chunks` / `chunks_already_present` / `embed_skipped` 都会落进日志,复用率与 embed 调用量因此可观测。
 
@@ -187,22 +187,22 @@ CDC 的默认参数:最小 256 B、最大 1536 B、期望平均 2^9 = 512 B。�
 
 **码本会漂移,所以它能被重新训练**。对学习码本的类型(`SQ8` / `PQ`),索引构建默认走"纯追加复用"(见下节),于是**几乎不会**重训码本,量化误差随数据分布漂移上升、召回静默退化。因此全量重建有第二个独立触发条件:自上次训练以来累积新增向量超过基线的一定比例(`index_manager.max_codebook_drift_ratio`,默认 0.25),或追加次数越过兜底(`index_manager.max_codebook_appends`,默认 50);基线太小(低于 `min_codebook_baseline_vectors`)则忽略比例,免得小库每个版本都重建。两个数都随产物持久化,重启后依然有效;免训练类型(`OFF` / `SQ_FP16` / `SQ_BF16`)不参与判定,默认部署不会平白多出周期性重建。
 
-**实测**(2026-09,合成数据;方法见 `Stratum_设计文档v13.md` §2.5 与附录 D):
+**实测**(2026-09,合成数据;方法见 `docs/Stratum_设计文档v14.md` §5.1 与附录 C.2):
 
 - 召回:SQ8 / SQ_BF16 / SQ_FP16 ≈ Flat HNSW;PQ 随候选 N 提升(0.56@32 → 0.75@256);
 - 端到端(top-10、候选 N=80、热 cache、单线程):OFF ≈ 0.27 ms,SQ8/FP16 ≈ 0.71 ms,PQ ≈ 1.0 ms——增量来自候选放大读盘 + rerank。候选数默认由**服务端策略**决定(`clamp(top_k × 8, 16, 4096)`);节点可用 `index_manager.candidate_n` 覆盖它(0 = 用服务端默认),这是"量化召回 ↔ 延迟"之间唯一的旋钮。
 
 ## 索引生命周期:构建、保留与回收
 
-**构建**:每个版本一份产物,构建只跑在一个候选节点上,完成后按 §8.4 "建一次、分发 N 份"推给副本(副本装载而不再各自重建)。构建有**两级优先级**:`EnsureIndex` 触发的实时构建(有人在等)永远优先于 reconcile 的批量补建(没人等)——worker 空闲时先取高优先队列,空了才看低优先,因此**补建积压再多,也不会挡住一次实时写入**;全局并发上限为 `index_manager.build_concurrency`(0 = 按 CPU 核数),避免一批补建把 CPU、磁盘与 vecstore 一起占满。启动时 reconcile 只补 `PENDING` 与活跃版本,不做全历史重建。
+**构建**:每个版本一份产物,索引**不跨节点复制**——按 (知识库, 版本) 算出的 **owner 集**决定谁持有它,读只路由到 owner,于是构建只发生在**被请求到的那个 owner** 上(`-index-owner-inactive-k`,默认 2:活跃版本全体副本都是 owner,非活跃版本按"最近是否被查询"的优先级加档)。产物由需要它的一方**按需拉取**(`FetchIndexData`,装到本地即用,不必各自重建)。构建有**两级优先级**:`EnsureIndex` 触发的实时构建(有人在等)永远优先于 reconcile 的批量补建(没人等)——worker 空闲时先取高优先队列,空了才看低优先,因此**补建积压再多,也不会挡住一次实时写入**;全局并发上限为 `index_manager.build_concurrency`(0 = 按 CPU 核数),避免一批补建把 CPU、磁盘与 vecstore 一起占满。启动时 reconcile 只补 `PENDING` 与活跃版本,不做全历史重建。
 
-**分发**:`index_manager.push_concurrency`(默认 4)限制同时在跑的分发数;发送端在传输前**探测对端是否已持有该版本产物**,命中则一个字节都不传、不读本地产物、不占额度;分发两端的产物都会拿到保留盾,不会在传输途中被保留策略删掉。
+**索引传输**:自 §8.4 改为**按需拉取**后,传输由需要产物的节点发起(`FetchIndexData`),接收方拿到产物直接加载、不必各自重建;提供传输的一侧受 `index_manager.fetch_concurrency` 限流(默认不限——闸门是给"同一版本被 N−1 个副本同时索要"这种突发准备的)。两端的产物都会拿到保留盾,不会在传输途中被保留策略删掉。
 
 **保留**:磁盘上每 KB 保留 `gc.version_retention_count`(默认 50)个最新版本的产物——这个数同时是"分发还能修复多深的落后"。**访问保护**在其上再叠一层:窗口内(`index_manager.retention_protect_window_ms`,默认 24h)被查询过的版本额外保留,上限 `index_manager.retention_protect_max`(默认取 `version_retention_count`),因此磁盘最多保留 2×。访问时间写在 `<versionID>.index.used` 旁车里,所以进程重启后(启动时那一遍删得最多)依然有效;`RebuildIndex` / `WarmupVersion` 也登记同一份兴趣,运维手动重建的产物不会被随后的保留清掉。负值即关闭该保护,回到"只保新"。
 
-**形态分层(§8.6a)与纯追加复用(§8.6c)**:某版本连续 `cold_threshold_ms` 没被查询,后台评估器把它重塑为"免图"形态(量化码 + 暴力扫描,省掉图边的构建耗时与常驻内存),检索语义不变;它**是双向的**——免图版本在冷阈的一半内被查询过就重建回带图,两个阈值之间是迟滞,避免边界抖动来回重建。评估器枚举**权威版本集合**(控制层元数据)而非本地内存访问表,因此重启后立即生效,并且只塑形本节点真正持有的版本。形态随产物 sidecar 一起走(`graph_free` 行),接收分发来的产物与重启后都能正确识别,不会重复重塑。若版本 N 只是 N-1 的纯追加且父产物还在本节点,构建就以其产物为起点只追加新增 chunk;因删除文档而留在产物里的"墓碑"占比超过 `index_manager.append_max_dead_ratio`(默认 0.2,1.0 = 不检查)时改用全量重建。
+**形态分层(§8.6a)与纯追加复用(§8.6c)**:某版本连续 `cold_threshold_ms`(默认 0 = 关闭)没被查询,它的索引就建成"免图"形态(量化码 + 暴力扫描,省掉图边的构建耗时与常驻内存),检索语义不变;它**是双向的**——免图版本在冷阈的一半内被查询过就重建回带图,两个阈值之间是迟滞,避免边界抖动来回重建。**形态在构建那一刻按本节点自己的访问记录决定**(没有后台扫描周期可调),所以只塑形真正被请求到、且本节点持有的版本。形态随产物 sidecar 一起走(`graph_free` 行),被按需拉去别的副本、或重启后都能正确识别,不会重复重塑。**它的收益与「每版本唯一向量数」成正比**(HNSW 图边 ≈ 0.26 KB/向量,M=32):压测用的那份**重复**语料(`genDataVolumeDocs`,6 句话循环拼接)每版本只有约 11 个唯一 chunk,实测只省 3 KB/版本(8.5%),构建时间与查询延迟都无可测差异;每版本上万点(≥ 2.6 MB/版本)时才值得开,百万点级别才是它的主场。阈值取该知识库的版本复核周期的 2–3 倍以上——判定的迟滞带是 `[T/2, T]`,阈值落在查询节奏附近会让形态来回翻转,而每次翻转都是一次全量重建。完整读数见 `docs/stress-test-report.md` §D(`COLD_THRESHOLD_MS=5000` 的 A/B)。若版本 N 只是 N-1 的纯追加且父产物还在本节点,构建就以其产物为起点只追加新增 chunk;因删除文档而留在产物里的"墓碑"占比超过 `index_manager.append_max_dead_ratio`(默认 0.2,1.0 = 不检查)时改用全量重建。
 
-**墓碑回收(§8.6d)**:扫面默认就在跑(只读本地产物与当前文档集,不动任何东西),把墓碑占比超过 `index_manager.gc_ratio_threshold`(默认 0.2)的"活跃且长期没有后继版本"记进日志与 `GetSystemStatus` 的 `gc_blocked_versions`;真正**重写正在对外服务的产物**是运维显式打开的开关(`index_manager.gc_enabled`,默认关)。收集前先问控制层"除我之外还有几个副本在服务这个版本",不足 `serving_replica_min`(默认 2)就放弃——滚动回收的前提是"我暂时下线之后仍有人能服务";若总副本数恰好等于该值,收集永远无法启动,此时以 `gc_blocked_versions` 上报(不会静默卡死),处置办法是调大副本数。带图形态没有"原地删向量"这条路(Faiss 的 HNSW 不支持 `RemoveIds`),只能整图重建,所以它的阈值 `graph_rebuild_ratio`(默认 0.5)比追加路径高得多。这里有一个**已知的待改进点,而不是有意决策**:报告门槛(`gc_ratio_threshold`)与追加路径的重建门槛(`append_max_dead_ratio`)默认值目前相同(都是 0.2),同值时 §8.6c 恰好会在 §8.6d 开始关心的那一刻重建,于是 (d) 在压测里永远看不到候选。三个阈值现在都能在配置里分开调(`index_manager.append_max_dead_ratio` / `gc_ratio_threshold` / `graph_rebuild_ratio`),**怎么定值需要真实部署数据**,所以在拿到之前只把旋钮交出来、不改默认值——"先给个可在配置文件里覆盖的默认值"正是这条路径的形态。
+**墓碑回收(§8.6d)**:扫面默认就在跑(只读本地产物与当前文档集,不动任何东西),把墓碑占比超过 `index_manager.gc_ratio_threshold`(默认 0.3)的"活跃且长期没有后继版本"记进日志与 `GetSystemStatus` 的 `gc_blocked_versions`;真正**重写正在对外服务的产物**是 `index_manager.gc_enabled`,**2026-10 起默认开启**——它是滚动回收:一次只动一个副本,该副本临时退出服务池(查询返回可重试哨兵,服务站换候选),写完再回来。要回到"只报告不收集"就写 `false`。收集前先问控制层"除我之外还有几个副本在服务这个版本",不足 `serving_replica_min`(**默认 1**)就放弃——滚动回收的前提是"我暂时下线之后仍有人能服务"。**默认曾是 2,2026-10 降到 1**:索引是按需构建的,一个没被路由到的副本不会持有该版本的索引,于是 3 副本下"另有 2 个在服务"实际要求三个副本全都持有,收集永远启不动(实测 `others_serving=1 < minimum_required=2`)。仍不满足时以 `gc_blocked_versions` 上报(不会静默卡死),处置办法是调大副本数或调小这个门槛。带图形态没有"原地删向量"这条路(Faiss 的 HNSW 不支持 `RemoveIds`),只能整图重建,所以它的阈值 `graph_rebuild_ratio`(默认 0.5)比追加路径高得多。这里曾有一个**已知的待改进点**:报告门槛(`gc_ratio_threshold`)与追加路径的重建门槛(`append_max_dead_ratio`)默认值相同(都是 0.2),同值时 §8.6c 恰好会在 §8.6d 开始关心的那一刻重建,于是 (d) 在压测里永远看不到候选。**2026-10 已解开**:报告门槛默认抬到 0.3(复用门槛仍 0.2),`internal/index/gc_thresholds_test.go` 用一条断言把"回收门槛必须高于复用门槛"钉住。三个阈值仍都能在配置里分开调(`index_manager.append_max_dead_ratio` / `gc_ratio_threshold` / `graph_rebuild_ratio`)。
 
 **残留回收**:构建在候选节点上失败或被放弃时留下的半成品(`.index.tmp` / `.index.ids.tmp`,或"有 `.index` 无 `.index.ids`")由后台扫描按 mtime 超过 `build_abandon_timeout_ms`(默认 30 分钟)回收;已封印的一对永不触碰,那是保留策略的职责。同一版本产物的读写另有版本分片锁,避免"一边重写、一边装载"。
 
@@ -210,7 +210,7 @@ CDC 的默认参数:最小 256 B、最大 1536 B、期望平均 2^9 = 512 B。�
 
 **连续游标是本地事实,且是持久的**。每个存储节点为每个知识库维护一个"完全持有的最高版本"游标,推进时同步落进 WAL(`CURSOR` 记录,幂等且单调;Compact 只保留每 KB 最新一条)。重启后游标**立即准确可用**,不再靠"扫磁盘上有哪些产物"推断——后者既慢,又会与保留策略耦合(产物被删 ⇒ 游标偏低)。没有记录的旧库才回退到推断,并把结论回写。
 
-**落后副本自己追上来**。节点每 5 秒向控制 leader 上报游标,leader 在响应里捎带每个 KB 的**链尾**(已提交的最新版本——刻意不用 ActiveVersionID:落后是"数据链没跟上",而 active 只是"读路由选谁",回滚会让后者抖动)。本节点若发现 `本地游标 < 链尾` 且滞后达到 `lag_catchup.min_lag_versions`(默认 1),就在后台补齐:先走既有的数据拉取路径把数据追到链尾,再触发索引构建(若构建者仍持有产物,直接装载分发来的那份,沿用分发闸门)。追链是**预热性质**的,绝不与实时查询抢构建队列;同时最多追 `lag_catchup.max_concurrent_kbs`(默认 2)个知识库,触发时带 `lag_catchup.jitter_ms` 的随机延迟把"同时发现"摊平。这里没有开关——把 SLO 上的节点关成"不可服务"不是选项,能调的只是节奏。补齐分两档:缺口里每个版本都能**逐版本重放**时走 WAL 记下的变更增量;缺口里含**已被删除**的版本时整段退回**全量状态传输**(取本次要 apply 的那个版本的整份状态)。判据来自控制层元数据——**只有确认删除才退,元数据读不到不退**;跳过被删版本继续增量重放是错的,那些版本的文档集要按父版本集合推出,而父版本已经不在了(`ListDocIDs` 对不存在的父版本返回空表且不报错,会静默丢文档)。
+**落后副本自己追上来**。节点每 5 秒向控制 leader 上报游标,leader 在响应里捎带每个 KB 的**链尾**(已提交的最新版本——刻意不用 ActiveVersionID:落后是"数据链没跟上",而 active 只是"读路由选谁",回滚会让后者抖动)。本节点若发现 `本地游标 < 链尾` 且滞后达到 `lag_catchup.min_lag_versions`(默认 1),就在后台补齐:先走既有的数据拉取路径把数据追到链尾,再触发索引构建(若 owner 仍持有产物,直接按需拉取装载,沿用 `index_manager.fetch_concurrency` 闸门)。追链是**预热性质**的,绝不与实时查询抢构建队列;同时最多追 `lag_catchup.max_concurrent_kbs`(默认 2)个知识库,触发时带 `lag_catchup.jitter_ms` 的随机延迟把"同时发现"摊平。这里没有开关——把 SLO 上的节点关成"不可服务"不是选项,能调的只是节奏。补齐分两档:缺口里每个版本都能**逐版本重放**时走 WAL 记下的变更增量;缺口里含**已被删除**的版本时整段退回**全量状态传输**(取本次要 apply 的那个版本的整份状态)。判据来自控制层元数据——**只有确认删除才退,元数据读不到不退**;跳过被删版本继续增量重放是错的,那些版本的文档集要按父版本集合推出,而父版本已经不在了(`ListDocIDs` 对不存在的父版本返回空表且不报错,会静默丢文档)。
 
 **数据源解析有四层**,`resolve` 依次尝试:① §8.5 本地注册表(谁把版本推给了我);② 回退 leader;③ 游标探测(向对等节点问"你到哪了");④ **控制层 holders 镜像**——节点在自己的 5 秒上报心跳里收到 leader 的聚合视图(哪些节点报过持有该版本及其自报地址),存成本地缓存,查表即得。第四层补的是这样一个环:一个副本既没收到 push、也没收到确认广播(广播是有界的一次性 fire-and-forget),本地表里就不会有源;而它不查询、也就不会 miss、也就永远找不回来。缓存条目会自行过期,且"问不到"从不写进缓存——"我不知道"与"没人有"导向相反的动作。
 
@@ -299,6 +299,116 @@ scripts/cluster.sh [--topology single|two-tier] <命令>      # Docker 集群编
 
 > Docker 集群模式下 vecstore 是宿主机上的外部依赖(`vecstore.grpc_addr: host.docker.internal:7100`),必须监听宿主机的**对外接口**(`--grpc_addr=0.0.0.0:7100`);只绑 `127.0.0.1` 时容器内无法访问,会导致索引构建失败、删除报错等连锁问题。
 
+## 性能实测
+
+> 以下为 **2026-10-16** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,经服务站测量。宿主 **7.2 GiB 内存**。集群按当前代码 `clean` 后 `build` + `up` 重建,数据卷全新。口径:写入与读取分开称量。**逐轮口径、原始读数与所有发现见 `docs/stress-test-report.md` §D/§E**,本节是它的摘要(冲突时以报告为准)。
+
+**这一轮测的就是默认配置**:索引 owner 分片开启(服务站 `-index-owner-inactive-k=2`)、§8.6(d) 墓碑回收默认开启(`gc_enabled=true` / `serving_replica_min=1` / `gc_ratio_threshold=0.3`)、冷阈 `cold_threshold_ms` 仍默认关闭。
+
+### 查询延迟(全精度 `OFF`)
+
+`TestT4_QueryLatency` —— 2,000 / 8,000 / 20,000 篇文档,各 200 次热查询 + 20 次全零向量对照,**冷热分开**报:
+
+| 指标 | 2,000 篇 | 8,000 篇 | 20,000 篇 |
+|---|---|---|---|
+| 冷查询(重启副本后的首次) | 7.67 ms | 18.23 ms | 39.95 ms |
+| p50(热) | **3.78 ms** | **9.78 ms** | **22.13 ms** |
+| p95 | 5.41 ms | 13.27 ms | 31.00 ms |
+| p99 | 6.37 ms | 17.62 ms | 37.83 ms |
+| 平均 | 3.98 ms | 10.02 ms | 23.13 ms |
+| 全零向量对照 p50 | 3.61 ms | 9.57 ms | 22.14 ms |
+
+热 p50 随文档数近似线性(1 : 2.59 : 5.85,文档数 1 : 4 : 10)。**为什么冷热必须分开**:重启一个副本后,它的第一次查询要把产物从磁盘 `Load` 回内存,之后都在内存里——两者成本不可比,取平均既不描述常见情况也不描述最坏情况。
+
+### 量化对照(`SQ8`,2,000 档)
+
+同一个用例、同一台机器,只把知识库创建时的量化类型换成 `SQ8`(创建后不可变):
+
+| 指标 | 2,000 篇 `OFF` | 2,000 篇 `SQ8` | 8,000 篇 `OFF` | 8,000 篇 `SQ8` |
+|---|---|---|---|---|
+| 冷查询 | 7.67 ms | 58.27 ms | 18.23 ms | 16.40 ms |
+| p50(热) | 3.78 ms | **3.55 ms** | 9.78 ms | 11.82 ms |
+| p95 | 5.41 ms | 4.80 ms | 13.27 ms | 15.32 ms |
+| p99 | 6.37 ms | 5.23 ms | 17.62 ms | 17.59 ms |
+| 平均 | 3.98 ms | 4.04 ms | 10.02 ms | 13.30 ms |
+| 全零向量对照 p50 | 3.61 ms | 3.26 ms | 9.57 ms | 9.91 ms |
+
+**量化买到的是内存,不是延迟**:`SQ8` 把每向量的内存载荷从 4 B/维压到 1 B/维,而热分位**两个方向都有**:2,000 档比全精度快 0.23 ms,8,000 档慢 2.04 ms(报告 §C.3 同档记的也是 +2.04 ms,同一方向、同一量级)。两个方向的绝对值都小于"宿主/页缓存"这类轮间差异,能确定的仍然是"没有收益"。`cold` 那一格是**单样本**(每轮只重启一个副本、只测一次首查询,且服务站可能把这一跳给别的副本),不据此下结论。写入侧 `SQ8` 的构建更快(2,000 档 4.04 s vs 9.90 s),但同为单次测量,**不做因果归因**。
+
+> `SQ8` 取 2,000 与 8,000 档;20,000 档未跑。
+
+### 查询成本的构成
+
+分段计时只在存储节点日志级别为 `debug` 时产生(`query: stage timings`),日志本身会给延迟加一点开销,所以**绝对值以 `info` 级为准**,这里看的是**构成与占比**(经服务站、经 owner 分片;单位 µs,`chunkmap_us` 是 `filter_us` 的子项):
+
+| 段 | 做什么 | 2,000 篇 p50 | 2,000 篇 p95 | 8,000 篇 p50 | 8,000 篇 p95 |
+|---|---|---|---|---|---|
+| `filter_us` | 候选的版本过滤 + 聚合(`chunkmap_us` 是它的子项) | **2061** | 3224 | **6722** | 9516 |
+| ↳ `chunkmap_us` | 每个候选 chunk 一次 `ListDocIDs`(chunk → 文档) | 1138 | 2072 | 2903 | 4221 |
+| `bloom_us` | bloom 过滤器 + 该版本的文档 ID 集合 | 37 | 53 | 164 | 245 |
+| `meta_us` | 向控制面读版本元数据(连接已复用) | 295 | 661 | 345 | 685 |
+| `search_us` | vecstore 的 HNSW 检索 | 324 | 719 | 381 | 670 |
+| `read_us` | 读命中文档的正文 | 87 | 123 | 157 | 244 |
+| **`total_us`** | 节点内合计 | **3026** | 5448 | **9005** | 23352 |
+
+**大头不是向量检索**:`search_us` 只占 `total_us` 的 **4–11%**;主导项是 `filter_us`——把候选 chunk 映射回文档的那几次本地读,它随"候选数 × 文档数"一起涨。这与更早的 debug 轮(报告 §A.3)构成一致,而绝对值更低(2,000 档 `total` p50 4558 → 3026 µs;8,000 档 14247 → 9005 µs)——**不归因**:宿主、页缓存与数据卷状态都不同。
+
+### 写入量
+
+`TestT4_DataVolume` —— 每批 1,000 篇:
+
+| 规模 | 写入(`CreateVersion` × N 批) | 累计索引构建 | 端到端 | 数据目录(3 节点)¹ |
+|---|---|---|---|---|
+| 2,000 篇(2 批) | **52.8 ms** | 9.90 s | 10.7 s | 62.8 MB |
+| 8,000 篇(8 批) | **200.6 ms** | 48.27 s | 49.5 s | 438.6 MB |
+| 20,000 篇(20 批) | **626.9 ms** | **4 m 25.6 s** | 267.8 s | 964.9 MB |
+
+¹ **这一列是累积值**:三档连续跑、数据卷未清,后一档包含前面几档的知识库。**干净的单档占用**测过一次(测量前 `clean`,只跑 20,000 篇):**346.19 MiB**(3 节点;storage1 136.7 / storage2 108.9 / storage3 100.5 MiB),同一次端到端 373.5 s、构建 **6 m 11.4 s**——比上表热身后的 4 m 25.6 s 慢,因为冷启动时后台 reconcile 正与写入的索引构建争资源。
+
+**写入 API 与规模几乎无关**(20,000 篇 20 批合计 0.63 s);代价全在索引构建,且随**版本数**超线性(8 批 → 20 批:48 s → 266 s,批次 2.5×、耗时 5.5×)。这是"每个版本一份产物"的固有开销——owner 分片减少的是**持有份数**(每版本只有 owner 集持有),不是每一份的构建成本。
+
+**owner 分片对构建次数的效果**(报告 §C.6 留的待办,第一次读数):同一批写入、同一集群,只换服务站的 `-index-owner-inactive-k` —— 8,000 篇(8 个版本)时 `k=0`(关闭)产生 **21** 次索引构建,`k=2`(默认开)**16** 次(= 8 版本 × 2 个 owner,一个不多);2,000 篇(2 版本)时是 4 vs 3。也就是说**默认配置下的索引构建次数比"每个副本各建"低约 24%**,而降幅随非活跃版本的比例增长。
+
+### 多版本换出与墓碑回收(2,000 档)
+
+- **多版本换出**(`TestT4_MultiVersionEviction`,6 版本 × 3 轮 = 18 次查询):每个版本在轮换中**始终应答**,12.7 s;
+- **墓碑回收**(`TestT4_GCPressure`,2,000 篇删 80%):产物 **33,064,960 → 16,217,948 B**(回收 **51%**),收集后查询正常,40.0 s。这是 `gc_enabled` 默认开启 + `serving_replica_min=1` 之后第一次端到端确认(默认还是 2 时同一用例失败并打印 `others_serving=1 < minimum_required=2`,见报告 §E.4)。
+
+### 冷版本免图分层(§8.6a)的标定
+
+同一个套件、只换 `cold_threshold_ms`(报告 §D 的 A/B;`5000` ms 是**加速因子**,把"多久没被查算冷"压到秒级;判定逻辑与时间尺度无关,所以形状可比、绝对值不可搬):
+
+| 组 | `cold_threshold_ms` | reshape 次数 | 形态(带图 / 免图) |
+|---|---|---|---|
+| 基线 | 0 | **0** | 27 / 0 |
+| 开启 | 5000 | 16 | 19 / 9 |
+
+逐产物对照:带图 **36,966 B** vs 免图 **33,837 B** → **省 3,129 B / 产物(8.5%)**。这 3 KB 就是 HNSW 的图结构:3,129 ÷ 11 个 chunk ≈ 284 B/chunk,与 M=32 邻居表(≈256 B/点)吻合。
+
+**结论:保持默认关**。收益 ≈ **0.26 KB/向量**;而压测语料每版本只有约 11 个唯一 chunk(`genDataVolumeDocs`,6 句话循环拼接),所以只省 8.5% × 37 KB,构建与延迟都无可测差异。每版本上万点(≥ 2.6 MB/版本)才值得开,且阈值要 ≥ 该知识库版本复核周期的 2–3 倍——判定的迟滞带是 `[T/2, T]`,阈值落在查询节奏附近会让形态来回翻转,而每次翻转是一次全量重建。
+
+### 资源占用
+
+宿主只有 **7.2 GiB**,而两个最重的档各开着一整套两层 3+3 集群(每个存储容器内含 vecstore + RocksDB)。实测内存轨迹(压测期间每 20 s 采样):
+
+| 档 | used | available |
+|---|---|---|
+| `QueryLatency` 20,000 | 4.17–4.28 GB | 3.1–3.2 GB |
+| `DataVolume` 20,000 | 3.99–4.42 GB | 2.96–3.39 GB |
+
+**全程没有接近吃紧**——7.2 GiB 上跑这两档是可行的。(压测期间有一次桌面被压垮,原因是"集群 + `docker build` + Go 构建同时开",不是压测本身。)
+
+### 与更早轮次的对照(热 p50,全精度)
+
+| 规模 | §0(09-20) | §A(09-21) | §C(10-15) | **§E(本轮)** |
+|---|---|---|---|---|
+| 该轮的 owner 分片 | 不存在 | 不存在 | 已落地但**关闭**(`=0`) | **默认开**(`=2`) |
+| 2,000 | 4.24 ms | 4.85 ms | 4.79 ms | **3.78 ms** |
+| 8,000 | 8.18 ms | 10.81 ms | 9.99 ms | **9.78 ms** |
+| 20,000 | 18.45 ms | 35.50 ms | 30.61 ms | **22.13 ms** |
+
+三档都落在同一散布内或更低。**这不构成"变快了"的结论**:轮间差异的主要来源是宿主、页缓存与数据卷状态(报告 §B 论证过);而且 §C 之前 owner 分片还是**关闭**的,不能与 §E 直接比较。
+
 ## gRPC API
 
 Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部服务(`DataSyncService`、`InternalService`、C++ 端的 vecstore 服务)。所谓内部,是指有意不向集群外暴露,只供节点之间使用。
@@ -354,294 +464,4 @@ Protobuf 定义在 `api/proto/`:三个外部服务(下面三节)加三个内部�
 | `ReportDataVersions` | 存储层周期性向控制 leader 上报数据游标(默认每 5 秒);响应里带回可回收的 changes 水位、每 KB 的**链尾**(落后据此开始追赶),以及 leader 的 **holders 聚合**镜像(数据源解析的第四层) |
 | `DeleteVersionData` | 回收本节点上某版本的物理数据(**删除版本**时向所有候选副本广播:控制面不知道字节在哪几个节点上;判死后不再走这条广播,改为每个 Raft 成员从自己的 apply 得知后本地回收(不参与 Raft 的存储节点只有"检测者就地清"与"重启扫一次"两条);**接收端无法执行清理时以错误回答**,不静默成功——否则控制面会先删掉元数据行,这里的残骸再也没人能命名) |
 | `ConfirmVersionWrite` | 告知副本它收到的版本已达 quorum,stand down 其接管计时器 |
-| `PushIndexData` | 流式**推送已构建的索引**,副本直接加载而不再各自重建("建一次、分发 N 份");发送端先探测对端是否已持有,端到端受 `push_concurrency` 限流 |
-
-## 工程与测试
-
-| 批次 | 范围 | 状态 |
-|---|---|---|
-| T1 | 单模块契约(8 个模块) | ✅ |
-| T2 | 跨模块集成(4 组) | ✅ |
-| T3 | 单节点全链路(15 个场景) | ✅ |
-| T4 | 3 节点 Raft 集群(进程内 + Docker 集群 + 数据量 + 压测 + 故障注入) | ✅ |
-| T5 | 真实栈 e2e(真实 Pebble/WAL/Raft/IndexManager + vecstore 子进程,零 mock) | ✅ |
-
-```bash
-go test ./integration/... -run TestRealStack -v   # 全真实栈端到端(需 C++ 二进制,缺失时跳过)
-go test ./integration/... -run TestMultiNode -v   # 3 节点进程内集群:选主、复制 KB + 版本元数据
-STRATUM_STRESS_DOCS=20000 go test ./integration/docker/ -tags=docker -count=1 -run TestT4_QueryLatency -v
-
-scripts/t4-integration.sh                      # T4 整套(默认 both 拓扑,自动起集群)
-scripts/t4-integration.sh -t all-in-one        # 换 CI 用的那种拓扑
-scripts/t4-integration.sh -r 'TestT4_Await'    # 只跑某一组用例
-```
-
-全量单测(25 个测试包)与 3 节点 Docker 集群(T4)命令见[快速开始](#快速开始)。
-
-CI(`.github/workflows/ci.yml`,push main 与 PR):gofmt + `go vet` + `go build` + 全量单测(`go test ./...`,25 个测试包) + raft/kvraft/index 竞态检测 + 3 节点 Docker 集群(T4)容错运行;C++ vecstore 由手动触发的工作流(`vecstore-cpp.yml`)覆盖。
-
-**T4 集群套件覆盖的场景**(`integration/docker`,两层拓扑需 `STRATUM_T4_NODE_SERVICES` 指向控制组容器):
-
-| 用例 | 覆盖 |
-|---|---|
-| `TestT4_MultiNode_Consistency` | 选主、元数据复制、版本一致性 |
-| `TestT4_MinorityFaultTolerance` / `TestT4_LeaderFailover` / `TestT4_NodeRestartRecovery` | 少数派故障、换届、节点重启后的恢复 |
-| `TestT4_QueryLatency` / `TestT4_DataVolume` / `TestT4_MultiVersionEviction` / `TestT4_GCPressure` | 延迟、写入量、多版本换出、墓碑回收 |
-| `TestTwoTier_EveryStorageNodeServesTheWrittenVersion` / `TestTwoTier_StorageGroupToleratesOneNodeDown` | 存储组每个副本都能服务写过的版本;挂一个副本仍可用 |
-| `TestT4_StorageDegradationRefusesWritesButStillServesReads` | 副本低于 quorum:写被明确拒绝、读照常;恢复一个副本后门控消失 |
-| `TestT4_StorageUnavailabilityIsNamedDistinctly` | 一个必需副本都不活:改报 `storage_unavailable`——"存储层整体没了"与"还差一个副本"是两句不同的话,且都要能重试 |
-| `TestT4_ActiveLagCatchupCatchesUpWithoutAQuery` / `TestT4_LagCatchupRetentionWindow` | 落后副本不靠查询自己追上;分发能修复的落后深度 |
-| `TestT4_HoldersFallbackPullsTheVersionItMissed` | 错过 push 的副本经控制层 holders 兜底找到数据源 |
-| `TestT4_AwaitVersion_*` / `TestT4_CreateVersion_ReturnsTheKeyThatMakesAResendIdempotent` | 续等:`AwaitVersion` 收敛、"还没好"正常返回 stage 而不是错误、只有真的不存在才 `NotFound`;响应回传的 `client_request_id` 能用来重发并复用同一版本 |
-| `TestT4_AwaitVersion_EveryControlNodeAnswersOnItsOwn` | 绕过服务站直连每个控制节点:等待的锚点是复制状态,不是连接(服务站每次重选后端,会把这条性质藏起来) |
-| `TestT4_DiscardVersion_*` | 放弃从未落地的版本:拒绝已落地(`version_not_pending`)与激活版本(`version_is_active`);embedder 停机时版本停在 PENDING、越过探测门槛后 `data_missing=true`,放弃成功后同 key 重发拿到**新**版本 |
-| `TestT4_ClientSDK_*` | `client/` 包端到端:先落盘再提交、同 key 重发幂等、丢掉本地 changes 后只剩放弃;以及等就绪的完整流程(需要索引构建可用) |
-| `TestT4_UnconvergedReplicaDoesNotAnswerEmpty` | **绕过服务站**直连一个刚重新加入、仍在追赶的副本:它在收到该版本之前只能**可重试地拒绝**,绝不能返回 `results=0, err=nil`——那种答案与"确实没有相关文档"不可区分,且不可重试,服务站也没理由换候选(见 `docs/stress-test-report.md` §7.4) |
-
-## 性能实测
-
-> 以下为 **2026-09-22** 在两层拓扑(控制组 3 + 存储组 3,每个存储容器自带真实 Faiss HNSW + RocksDB,768 维)上的实测,由 `scripts/cluster.sh --topology two-tier` 起集群、经服务站测量。宿主 **12 核 / 15 GB**,容器与压测进程共享这台机器。测量前集群镜像按当前代码重建、数据卷清空重来(3 个存储节点合计 0.9–1.5 GB,本轮新建)。**完整口径与原始数据见 `docs/stress-test-report.md`**,本节只是它的摘要。
-
-### 查询延迟
-
-![查询延迟随文档规模的变化:p50 / p95 / p99 与冷查询(全精度 OFF)](assets/latency-vs-scale.svg)
-
-`TestT4_QueryLatency` —— 2,000 / 8,000 / 20,000 篇文档,各 200 次查询,**冷热分开**报:
-
-| 指标 | 2,000 篇 / 200 次查询 | 8,000 篇 / 200 次查询 | 20,000 篇 / 200 次查询 |
-|---|---|---|---|
-| 冷查询(重启副本后的首次,口径见下) | **17.03 ms** | **22.07 ms** | **25.15 ms** |
-| p50(热) | **4.69 ms** | **10.50 ms** | **25.58 ms** |
-| p95 | **7.10 ms** | **13.28 ms** | **45.71 ms** |
-| p99 | **10.70 ms** | **18.55 ms** | **78.12 ms** |
-| 平均 | 5.08 ms | 10.78 ms | 28.38 ms |
-| 全零向量对照 p50 | 4.38 ms | 9.47 ms | 24.37 ms |
-
-查询向量与 embedder 同卦限(`queryVector(768)`,固定种子、分量非负),所以 HNSW 的剪枝强度与真实调用方一致;全零向量那行是同一次运行内的对照——它与所有文档等距,贪心遍历无从剪枝,是"测了一个没人会发的请求"的代价。热 p50 与文档数**比线性更陡**(4.69 → 10.50 → 25.58;文档数比 1:4:10,延迟比 1:2.24:5.46):本套语料经内容定义分块去重后唯一 chunk 极少,`matched_docs` 恒等于全部文档数,所以这条路径量的是"候选映射到多少个文档",而这一段的工作量随文档数放大后,尾部分位(p95/p99)比 p50 涨得更快——20,000 篇的 p99/p50 已到 3.05(2,000 篇 2.28)。
-
-**量化对照** —— 同一个用例、同一台机器,只把知识库创建时的量化类型换成 `SQ8`(创建后不可变):
-
-![量化两段式 OFF 与 SQ8 的延迟对比:买到的是内存,不是延迟](assets/quantization-off-vs-sq8.svg)
-
-| 指标 | 2,000 篇 `OFF` | 2,000 篇 `SQ8` | 8,000 篇 `OFF` | 8,000 篇 `SQ8` | 20,000 篇 `OFF` | 20,000 篇 `SQ8` |
-|---|---|---|---|---|---|---|
-| 冷查询 | 17.03 ms | 6.60 ms | 22.07 ms | 18.34 ms | 25.15 ms | **39.04 ms**¹ |
-| p50(热) | 4.69 ms | 5.21 ms | 10.50 ms | 8.69 ms | 25.58 ms | 23.71 ms |
-| p95 | 7.10 ms | 7.60 ms | 13.28 ms | 12.98 ms | 45.71 ms | 34.06 ms |
-| p99 | 10.70 ms | 11.07 ms | 18.55 ms | 14.61 ms | 78.12 ms | 40.78 ms |
-| 平均 | 5.08 ms | 5.50 ms | 10.78 ms | 9.05 ms | 28.38 ms | 24.94 ms |
-| 全零向量对照 p50 | 4.38 ms | 5.27 ms | 9.47 ms | 10.22 ms | 24.37 ms | 25.56 ms |
-
-> ¹ 20,000 篇 `SQ8` 的冷查询是 **2026-09-23 复测值**:两轮独立复测 39.04 / 54.05 ms(同一集群、同一 `STRATUM_T4_QUANTIZER=sq8`、同一"经服务站"口径)。2026-09-22 轮这一格记的 277.72 ms 是孤立样本,两次复测均不可复现;三个样本的对照与口径见 `docs/stress-test-report.md` §B。表内其余数字仍取自 2026-09-22 轮。
-
-**量化买到的是内存,不是延迟**:`SQ8` 把每向量的内存载荷从 4 B/维压到 1 B/维,而这条路径的延迟**不降**——两段式的粗筛省下的时间,被"按候选回读全精度向量做 rerank"吃掉了。本轮 2,000 篇上 `SQ8` 比全精度高 0.52 ms p50,8,000 / 20,000 篇上反而低 1.81 / 1.87 ms(20,000 篇那格的冷查询已按 2026-09-23 复测改写 —— 2026-09-22 轮记的 277.72 ms 不可复现,见上表脚注)。**三个方向都落在轮间噪声里,能确定的只有"没有收益"**:量化的收益在内存与产物字节(见下),不在查询延迟。要不要开量化,取决于部署的内存压力(以及 §2.4 里那张载荷表)。写入路径同理:量化只影响索引构建(见下),不影响写入事务。
-
-**为什么冷热必须分开**:重启一个副本后,它的第一次查询要把产物从磁盘 `Load` 回内存,之后都在内存里——两者成本不可比,取平均得到的数字既不描述常见情况也不描述最坏情况。这正是设计文档阶段⑤"含磁盘读"的落点;尾部分位同理,一个检索服务是被它最慢的查询定义的。
-
-**但 `cold` 这一列不是副本级测量**:用例经**服务站**发查询(那是部署形态),而服务站按自己的健康视图选副本——它量的是"重启之后服务站把这一跳路由给该副本时的首次查询",不保证落在被重启的那一台,也可能把刚重启、尚未上报健康的副本整个排除在外。`docs/stress-test-report.md` §3.4 记了这条口径问题与一次正面旁证。要测真正的冷加载,得像 `TestProbeChainTiming` 那样直连副本。
-
-### 查询成本的构成
-
-分段计时只在 `logging.level: debug` 下产生(`query: stage timings`),日志本身会给延迟加一点开销,所以**绝对值以 info 级别的冷热分位为准**;这里的用途是看构成与占比。
-
-**全精度(`OFF`)** —— 各 246 / 248 个查询,p50 / p95(µs):
-
-| 段 | 做什么 | 2,000 篇 p50 | 2,000 篇 p95 | 8,000 篇 p50 | 8,000 篇 p95 |
-|---|---|---|---|---|---|
-| `filter_us` | 候选的版本过滤 + 聚合(`chunkmap_us` 是它的子项) | **2111** | 3121 | **8114** | 13911 |
-| ↳ `chunkmap_us` | 每个候选 chunk 一次 `ListDocIDs`(chunk → 文档) | 1348 | 2017 | 3660 | 7588 |
-| `bloom_us` | bloom 过滤器 + 该版本的文档 ID 集合(各一次本地读) | 34 | 71 | 170 | 474 |
-| ↳ `doclist_us` | 读该版本的文档 ID 集合(`bloom_us` 的子项) | 1 | 1 | 1 | 2 |
-| `meta_us` | 向控制面读版本元数据(`GetVersion`,连接已复用) | 234 | 730 | 352 | 1123 |
-| `search_us` | vecstore 的 HNSW 检索 | 262 | 599 | 434 | 1259 |
-| `read_us` | 读命中文档的正文 | 110 | 189 | 217 | 560 |
-| **`total_us`** | 节点内合计 | **3017** | 5042 | **10461** | 18840 |
-
-**量化(`SQ8`)** —— 同口径:
-
-| 段 | 2,000 篇 p50 | 2,000 篇 p95 | 8,000 篇 p50 | 8,000 篇 p95 |
-|---|---|---|---|---|
-| `filter_us` | **1971** | 3621 | **10624** | 14685 |
-| ↳ `chunkmap_us` | 1023 | 1954 | 5188 | 7604 |
-| `bloom_us` | 41 | 77 | 152 | 278 |
-| `meta_us` | 274 | 864 | 317 | 802 |
-| `search_us` | 372 | 965 | 441 | 1354 |
-| `read_us` | 151 | 220 | 180 | 251 |
-| **`total_us`** | **3103** | 5235 | **12848** | 17216 |
-
-读法:各段 p50 之和看起来大于 `total_us`,因为 `chunkmap_us` 是 `filter_us` 的子项(它在过滤循环内部累加)。真正的大头是**与候选规模成正比**的那两项(`chunkmap_us` + 过滤本身),而不是检索;`search_us` 占比始终是个位数百分比(全精度 2,000 篇 8.7%、8,000 篇 4.1%)——这条路径对 top-k 与候选数敏感,对文档总量只通过"候选映射到多少文档"间接敏感。本套语料是合成的高重复语料(6 句循环拼接),唯一 chunk 极少,所以候选数恒为 11、`matched_docs` 等于全部文档数;量化的两段式在这里也体现不出粗筛的规模优势,真实语料下量化的收益是**内存**(§2.4 的载荷口径),不是这条路径的延迟。这张表只用于看构成与占比,不用于跨轮比较:同一集群上的 `total_us` p50 在轮间可以差 1.5 倍以上(单次运行的样本里已见到 2.9–4.2 ms 的 2,000 篇档)。
-
-### 写入量
-
-`TestT4_DataVolume` —— 真实栈上采样(CDC 默认切块;每批 1,000 篇,`STRATUM_VOLUME_DOCS=10000|20000`):
-
-| 指标 | 10,000 篇 `OFF` | 10,000 篇 `SQ8` | 20,000 篇 `OFF` | 20,000 篇 `SQ8` |
-|---|---|---|---|---|
-| 写入(`CreateVersion` × 10 / 20 批,仅 API 用时) | **619.03 ms** | **548.02 ms** | **1.316 s** | **1.352 s** |
-| 累计索引构建(10 / 20 批串行,每批等前一批 READY) | **1 m 22.5 s** | **1 m 11.9 s** | **4 m 32.7 s** | **4 m 38.6 s** |
-| 端到端 | **84.4 s** | **73.8 s** | **275.6 s** | **281.6 s** |
-| 数据目录(3 个存储节点合计) | 898 MB | 993 MB | 1.25 GB | 1.50 GB |
-| 单版本索引产物(1,000 篇 / 11 chunk,`debug` 轮的 `build timings`) | 33,792 B | **11,440 B** | 同左 | 同左 |
-| 查询 | top-k=10 返回 10 条结果 | 同左 | 同左 | 同左 |
-
-四列来自同一次压测、同一集群,差别只在规模与知识库创建时的量化类型(创建后不可变)。**索引产物**是量化在这里唯一干净的可比量:`.index` 同时装 HNSW 图与向量载荷,同一份数据下 SQ8 的产物约为 `OFF` 的 34%(1,000 篇:11,440 / 33,792)。
-
-两件从这张表里读出来、且不能只读数字的事:**写入 API 的用时与规模几乎无关**(10,000 篇 619 ms、20,000 篇 1.32 s,摊到每批 54–66 ms)——版本提交在批量固定时是常数级操作,数据落盘与索引构建都在响应返回之后;**累计构建则超线性**(10 批 1.37 m → 20 批 4.54 m,规模翻倍 3.3×),因为每个版本都要重写完整的 doc-ID 集并重建整个索引,这是"每版本独立索引"模型的固有开销,不是回归。此外**产物字节与文档规模无关**:本套语料高度重复,内容定义分块去重后各规模的唯一 chunk 集一样大,而 `.index` 装的是 chunk(内容寻址)而不是文档——这也正是"产物大小不能用来衡量文档规模"的原因。
-
-数据目录总量统计的是整个数据目录,含在此之前已建的知识库,因此**不可跨轮比较**。
-
-要点(与数字无关):写入须分批——单条 `CreateVersion` 受 4 MiB gRPC 消息上限约束(约 1,400 篇),每批成一版本且前一批 READY 后才链接;耗时随版本号递增(每版本重写完整 doc-ID 集并重建索引),这是"每版本独立索引"模型的固有开销。Raft 快照(`max_log_length`)在这一轮里被反复触发:日志即时 trim、写入与心跳不停摆——快照在 RLock 下深拷贝并异步持久化,apply 与心跳永不被阻塞。
-
-### 写入成本的构成
-
-**一条写链路有六个分段,横跨三个进程。** 只有前两段是**客户端在等**的:版本号提交后响应就返回,数据落盘(段 5)与索引构建(段 6)都在后台继续——所以"`CreateVersion` 慢"和"版本迟迟不可查"是两个问题,各有各的段。全部段都在 debug 级别产生(节点: `logging.level: debug`;服务站: `-log-level debug`),跨节点用 `kb_id` + `version_id` 拼接:同一知识库的每个写都有独立版本号,所以并发写不会串线。
-
-| # | 段(它做什么) | 日志 | 字段 | 产生在 |
-|---|---|---|---|---|
-| 1 | 服务站转发:鉴权 + 存储门 → 找 leader → 转发 RPC | `router: write forward timings` | `admission_us` · `leader_lookup_us` · `attempt_us` · `attempts` · `leader_index` | 服务站 |
-| 2 | 控制面入口:存储门 → proto 转换 → 调协调器 | `service: create version timings` | `gate_us` · `convert_us` · `execute_us` | 控制节点 |
-| 3 | 控制面事务:等 `txnMu` → 注册变更 → Raft 提交 → 交接 dispatch | `coordinator: write execute timings` | `txn_wait_us` · `register_us` · `propose_us` · `handoff_us` · `storage_us` · `dispatched` | 控制节点 |
-| 4 | 分发:解析候选(µs 级) → **把写交给入选者执行并等它做完**(这一层包着段 5) | `plane: dispatch timings` | `resolve_us` · `attempts_us` · `tried` / `tried_us` · `chosen` · `budget_ms` | 控制节点(后台) |
-| 5 | 存储节点写事务 | `write: stage timings` | `acquire_us` · `local_us` · `fanout_us` · `report_us` · `confirm_us`,及其子段 `wal_begin_us` · `storage_us` · `wal_commit_us` · `resolve_us` · `push_us` | 存储节点 |
-| 6 | 索引构建:排队 → 构建 | `index: build timings` | `queue_us` · `build_us` · `size_bytes` · `status` | 存储节点(后台) |
-
-嵌套关系(按定义成立,不是巧合):段 1 的 `attempt_us` ⊇ 段 2 + 段 3 + 网络;段 2 的 `execute_us` ⊇ 段 3 的 `total_us`(只差函数进出的几十 µs);段 4 的 `tried_us` 里成功那一次的耗时 ⊇ 段 5 的 `total_us`(候选是本地时就是它自己);段 5 的 `report_us` 只覆盖"入队",段 6 才是构建本身。**读法是各段对同一 `(kb_id, version_id)` 的 `*_us` 纵向对比**,而不是把跨节点的绝对时刻相减——不同进程的时钟不做假设。
-
-实测一例(3+3 容器集群,一批 1,000 篇;两列是两个知识库各自的第一次写入,只差别在创建时的量化类型):
-
-| 段 | 1,000 篇(全精度) | 1,000 篇(SQ8) |
-|---|---|---|
-| 段 1 `total_us`(其中 `leader_lookup_us` / `attempt_us`) | 90.1 ms(1.1 / 89.0) | 34.6 ms(1.7 / 32.8) |
-| 段 2 `total_us`(其中 `gate_us` / `convert_us` / `execute_us`) | 12.0 ms(0.01 / 0.01 / 12.0) | 8.7 ms(0.01 / 0.02 / 8.7) |
-| 段 3 `total_us`(其中 `txn_wait_us` / `propose_us` / `handoff_us`) | 11.9 ms(0 / 11.9 / 0.01) | 8.7 ms(0 / 8.7 / 0.01) |
-| 段 4 `total_us`(其中 `tried_us` 唯一那次) | **1,684.8 ms**(1,684.8) | 1,051.9 ms(1,051.9) |
-| 段 5 `total_us`(其中 `local_us` / `fanout_us` / `report_us`) | **1,652.6 ms**(377.3 / 1,263.6 / 11.7) | 1,032.4 ms(221.6 / 800.3 / 10.4) |
-| 段 6 `total_us`(其中 `queue_us` / `build_us` / `size_bytes`) | **15.3 ms**(0.04 / 15.3 / 33,792) | 24.2 ms(0.04 / 24.2 / 11,440) |
-
-四条从这张表里读出来、别处看不到的事:
-
-- **客户端等的时间主要不是节点算的。** 段 1 的 90.1 ms 里,节点内部只占 12.0 ms(段 2),其余 ~78 ms 是把这 1,000 篇搬过服务站→控制节点那条 wire(收发 + 序列化);同一轮里 SQ8 列同一差额只有 ~26 ms,可见它随当时的 wire/负载抖动,而不随请求数走。
-- **批量写的成本在复制,不在本地处理。** 段 5 的 1.65 s 里 `local_us` 0.38 s(切分 + embed + 落盘)、`fanout_us` **1.26 s(76%)**。要压批量写入的墙钟时间,该看的是副本侧,不是本机——之前几轮里同一批 1,000 篇的 `fanout_us` 在 2.3–22.5 s 之间抖过(近 10×),整批墙钟随之涨到 28 s,而 `local_us` 的变化远小于它。
-- **段 4 量的不是"挑候选",是"等候选干完"。** 挑候选只花 `resolve_us`(读副本拓扑 + 排序 + 健康排序,两列都是 **2–3 µs**);`tried_us` 里那 1,684.8 ms 是**候选节点执行写事务**的墙钟时间,它 ⊇ 段 5 的 1,652.6 ms。要问"轮询了几个候选",看的是 `tried` 的长度:长度为 1 且其值 ≈ 段 5 ⇒ 第一个候选就接下来了(本轮两列都是这一种);多个元素、每个都逼近 `budget_ms`(1,000 篇时 65 s)⇒ 前面的候选不可达、各自吃满了预算(§7.13.2 的候选轮询),那才是段 4 真正会爆的时候。
-- **"等 READY"和"构建索引"不是一回事。** 测试用例报的 `build-accum`(从 `CreateVersion` 返回到 READY)在 1,000 篇时是 2.01 s(全精度)/ 1.51 s(SQ8),而段 6 的 `build_us` 只有 15.3 / 24.2 ms——两者差 62–131 倍,因为 `CreateVersion` 在**版本提交**时就返回了,之后的 1.5–2 s 是段 4 的数据落盘,不是构建。拿 `build-accum` 当"索引构建耗时"会把它高估一到两个数量级。
-
-各段为什么存在:`txn_wait_us` 是唯一能看见 §7.7 串行化的地方(同一知识库的写排成一队——写锁的粒度就是知识库,不同 KB 的写互不等待,而突发的并发版本只在这里显形);段 6 的 `queue_us` / `build_us` 必须分开——同样的 90 s 排在队列里是并发度问题,花在 `build()` 里是 vecstore / 批次问题,而下游只能看到"PENDING 了 90 s";段 4 的 `tried_us` 分开记每个候选,是因为"第一个候选已失联、吃掉了整个预算"和"候选真的在写 1,000 篇"总耗时相同。
-
-存储节点内的分段计时(`write: stage timings`)——上表的段 5:
-
-| 段 | 做什么 | 1,000 篇(全精度) | 1,000 篇(SQ8) |
-|---|---|---|---|
-| `acquire_us` | 该知识库在途写入的限流(§7.7) | 2 µs | 2 µs |
-| `local_us` | 本地事务:切分 → embed → 落盘 | **377.3 ms** | **221.6 ms** |
-| ↳ `wal_begin_us` | WAL 写 BEGIN(把重放输入持久化) | 13.9 ms | 6.3 ms |
-| ↳ `storage_us` | 每文档切分 / embed / 落盘 + 版本文档集 + bloom | **362.6 ms** | **214.9 ms** |
-| ↳ `wal_commit_us` | WAL 写 COMMIT | 0.8 ms | 0.3 ms |
-| `fanout_us` | 复制到副本(quorum;对端各自拉取并落盘) | **1,263.6 ms** | **800.3 ms** |
-| ↳ `resolve_us` | 解析副本集合 | 3 µs | 2 µs |
-| ↳ `push_us` | 等对端把它自己那份事务做完 | **1,263.6 ms** | **800.3 ms** |
-| `report_us` | 上报"数据已可持久" + 触发索引构建 | 11.7 ms | 10.4 ms |
-| `confirm_us` | 广播确认(异步触发,基本不计入) | 0 µs | 1 µs |
-| **`total_us`** | 节点内合计 | **1,652.6 ms** | **1,032.4 ms** |
-
-子段回答了"这两段为什么慢"这个问题:`local_us` 里 **99.5% 是 `storage_us`**(WAL 的 BEGIN/COMMIT 两端合计不到 4%),而 `fanout_us` 里 **`push_us` 占 99.999%**——`resolve_us` 只有个位数 µs,挑副本根本不花钱,时间全花在**等对端把它自己那份事务做完**(对端跑的是同一个 `storage_us`)。所以批量写入的墙钟由"副本侧的 storage 事务"决定,本机省下的时间在对端一样省得到,反之亦然。
-
-本轮两列来自同一轮 `debug` 测量(各自知识库的第一次写入),所以 `local_us` / `fanout_us` 的差异(全精度 vs SQ8:41% / 37%)是环境抖动而不是量化造成的。可比的是**量与构成**:量化的影响只在段 6(见下),不在这条事务里。`report_us` 很小,却是最不能少的一步:它同时是"数据已可持久"的上报与索引构建的触发点。
-
-同一规模(1,000 篇)下 SQ8 对**索引构建**的影响看段 6:`build_us` 从 **15.3 ms** 升到 **24.2 ms**(训练码本),`size_bytes` 从 **33,792** 降到 **11,440**——这就是量化买到的内存,与写入事务无关。
-
-### 压力测试
-
-压测覆盖设计文档阶段⑤ 要求的单版本大 n 构建/查询延迟(含重启后的磁盘读)与多版本分级换出稳定性。规模用环境变量控制(`STRATUM_STRESS_DOCS` / `_QUERIES` / `_VERSIONS` / `_TIMEOUT`),默认值小到能进 CI;量化对照用 `STRATUM_T4_QUANTIZER=off|sq8|sq_fp16|sq_bf16|pq` 切换,测量用例会为它单独建一个知识库(量化类型创建后不可变)。
-
-**定位:写入与读取分别称量。** 每个用例都是"写完并 READY 之后才开始读",两者从不并发——这不是漏测,而是刻意的:混跑会让写入侧的构建/IO/CPU 摊进查询的分位里,得到的数字既不是写入成本也不是读取成本。
-
-| 用例 | 测什么 | 实测 |
-|---|---|---|
-| `TestT4_QueryLatency` | 单版本查询延迟,**冷热分开报** | 2,000 篇:cold **17.03 ms** · p50 **4.69 ms** · p95 7.10 ms · p99 10.70 ms;8,000 篇:cold **22.07 ms** · p50 **10.50 ms** · p95 13.28 ms · p99 18.55 ms;20,000 篇:cold **25.15 ms** · p50 **25.58 ms** · p95 45.71 ms · p99 78.12 ms |
-| `TestT4_DataVolume` | 写入量:写 / 构建 / 占用 | 10,000 篇(10 批 × 1,000):写入 API **619 ms** · 累计索引构建 **1 m 22 s** · 数据目录 **898 MB**;20,000 篇(20 批):写入 **1.32 s** · 构建 **4 m 33 s** · **1.25 GB**;量化(SQ8)同口径:10,000 篇 **548 ms / 1 m 12 s / 993 MB**,20,000 篇 **1.35 s / 4 m 39 s / 1.50 GB** |
-| `TestTwoTier_EveryStorageNodeServesTheWrittenVersion` | 控制组提交的版本在每个存储副本上都能读到 | 每个存储副本都能服务写过的版本 |
-| `TestTwoTier_StorageGroupToleratesOneNodeDown` | 一个存储副本挂掉后写入与读取仍可用 | 通过 |
-| `TestT4_MultiVersionEviction` | 多版本分级换出的稳定性 | 8 版本 × 3 轮轮转、24 次查询,每个版本始终应答(12 s) |
-| `TestT4_GCPressure` | 墓碑回收的端到端可见性(写入 → 删除 → 观察产物 → 查询仍正确) | **产物 99,194,880 B → 49,282,907 B(回收 50.3%)**,§8.6(c) 在 **2/3** 存储副本上复用了父产物(复用点删掉 7,322 个 chunk,即本次回收针对的墓碑),收集后查询仍返回 5 条结果;用时 37 s |
-
-测量类用例的规模都可由环境变量放大,默认值小到能进 CI;放大时记得同时放大 `STRATUM_STRESS_TIMEOUT`(20,000 篇建议 `90m`)。
-
-```bash
-STRATUM_STRESS_DOCS=20000 STRATUM_STRESS_TIMEOUT=90m STRATUM_INDEX_BUILD_TIMEOUT=25m \
-  go test ./integration/docker/ -tags=docker -count=1 -run TestT4_QueryLatency -v
-STRATUM_VOLUME_DOCS=20000 STRATUM_VOLUME_TIMEOUT=150m \
-  go test ./integration/docker/ -tags=docker -count=1 -run TestT4_DataVolume -v
-
-# 量化对照:同一个用例、同一台机器,只换知识库的量化类型
-STRATUM_T4_QUANTIZER=sq8 STRATUM_STRESS_DOCS=20000 STRATUM_STRESS_TIMEOUT=90m \
-  go test ./integration/docker/ -tags=docker -count=1 -run TestT4_QueryLatency -v
-
-# 分段计时(上面的"查询成本的构成"与"写入成本的构成"):集群与服务站都换 debug 级,
-# 并让套件复用**同一个**服务站进程(STRATUM_T4_STATION_ADDR)
-LOG_LEVEL=debug scripts/cluster.sh --topology two-tier up --force
-go build -o /tmp/stratum-router ./cmd/stratum-router/
-setsid nohup /tmp/stratum-router -listen 127.0.0.1:7020 \
-  -nodes localhost:17000,localhost:17001,localhost:17002 \
-  -storage-nodes localhost:17100,localhost:17101,localhost:17102 \
-  -log-level debug > /tmp/station-debug.log 2>&1 &
-export STRATUM_T4_STATION_ADDR=127.0.0.1:7020
-STRATUM_STRESS_DOCS=2000 STRATUM_STRESS_QUERIES=224 go test ./integration/docker/ -tags=docker -count=1 -run TestT4_QueryLatency -v
-STRATUM_VOLUME_DOCS=1000 go test ./integration/docker/ -tags=docker -count=1 -run TestT4_DataVolume -v
-```
-
-## 项目结构
-
-```
-api/proto/           # Protobuf 定义(.proto)→ 生成代码在 api/proto/stratum/
-internal/            # Go 核心
-  docstore/          #   MVCC 文档存储(PebbleDB)
-  versiondoc/        #   版本元数据与文档集映射(含 doc_id_set_hash)
-  chunkdoc/          #   chunk ↔ 文档双向映射
-  chunkstore/        #   chunk 正文存储(内容寻址)
-  bloom/             #   chunk 存在性 + 每版本文档布隆过滤器
-  splitter/          #   切块:内容定义分块(默认)+ 滑动窗口(对照)
-  embed/             #   embed 服务客户端(HTTP)
-  index/             #   IndexManager(LRU + 引用计数 + 构建池 + 保留/回收 + 分发)
-  kvraft/            #   Raft 共识(选主 / 日志复制 / 快照)
-  raft/              #   Stratum Raft 状态机(KB + 版本元数据)+ 节点间转发
-  plane/             #   控制面 ↔ 存储面契约 + 同进程实现(写门 / 游标 / holders / 追链)
-  wire/              #   gRPC proto ↔ 领域类型映射
-  wal/               #   崩溃一致性写前日志(含游标记录与按水位重写)
-  sync/              #   Leader→Follower 数据同步 + 索引分发 + 上报(游标 / 链尾 / holders)
-  coordinator/       #   Write / Delete / DeleteVersion / chunk-GC 编排
-  router/            #   写 → leader、读负载均衡、路由表与写入门控
-  kvstorage/ pebbleutil/ authmeta/ types/ errors/
-service/             # gRPC 服务实现(含测试)
-cmd/stratum/         # 节点入口(-config YAML / flags)
-cmd/stratum-router/  # 服务站:单地址接入 Raft 集群,集群唯一对外入口
-cmd/stratum-gateway/ # HTTP/JSON 网关 + /ops 控制台控制面
-vecstore/            # C++ 向量存储:Faiss HNSW + RocksDB,支持量化两段式检索
-web/                 # Web 控制台前端(HTML/CSS/JS)
-integration/         # mock 集成 + 真实栈 e2e + docker/(T4 集群测试)
-scripts/             # cluster.sh(集群编排) / gateway.sh(本地入口) / t4-integration.sh / update-all.sh / ops/(运维 CLI)
-                     #   用法与选项见 scripts/README.md(脚本文档,随脚本一起纳入版本控制)
-configs/             # 示例配置文件
-```
-
-## 配套文档
-
-与代码同目录维护一套随实现演进的中文设计文档——**不纳入版本控制**(`.gitignore` 忽略根目录除本 README 外的全部 Markdown),仅供本地阅读:
-
-- `Stratum_设计文档v13.md` —— 最新版设计总纲(控制面 / 存储面契约 §7.0、节点间转发 §7.3、游标与追链 §7.5、数据侧独立终态 §10.1b、数据缺失与幂等重发 §7.12、存储层状态上报 §7.13、索引分发 §8.4、索引形态与回收 §8.6、FAILED_PERMANENT §10.1、存储集群独立进程 §11 阶段 ④;含量化两段式 §2.5/§2.6、附录 D 实测方法)
-- `Stratum_接口设计v9.md` —— gRPC/内部接口与语义
-- `Stratum_设计目标.md` —— 功能目标、性能指标与验收标准
-- `Stratum_测试顺序.md` / `Stratum_实现顺序.md` / `Stratum_代码风格.md`
-- `client-integration-guide.md` —— **客户端接入指南**(调用方视角:数据模型、怎么选择文档提交、REST / gRPC 调用全流程、幂等与责任边界)
-- 专题计划与落地记录:`content-defined-chunking-plan.md`、`codebook-refresh-plan.md`、`cursor-persistence-plan.md`、`active-lag-detection-design.md`、`data-source-holders-fallback-plan.md`、`index-distribution-backpressure-plan.md`、`index-push-probe-plan.md`、`storage-degradation-signal-plan.md`
-- `HANDOFF.md` —— 故障史与排查记录;`改动内容.md` —— 开发日志
-- `stress-test-report.md` —— **压测报告**:逐轮的口径、原始数据与发现(README「性能实测」是它的摘要,冲突时以报告为准)
-
-## 前置依赖
-
-- **Go 1.24**(依赖 `restic/chunker` 做滚动指纹分块)
-- **C++17**(vecstore):Faiss ≥ 1.9.0、RocksDB、gRPC、Protobuf、BLAS/LAPACK、OpenMP
-- C++ 构建仅在需要 Faiss HNSW 后端时必需;Go 单测使用进程内 mock。
-
-## 许可证
-
-[MIT](LICENSE) © 2026 Hk-owo —— 可自由使用、修改、分发与商用,需保留版权声明与许可声明。
+| `FetchIndexData` | 流式**拉取**已构建的索引产物,接收方直接加载而不再各自重建(索引唯一的跨节点传输方向;推送/分发侧已整体移除):按 (kb, version) 幂等,对端不持有该版本时以 `ErrIndexNotExported` 回答,调用方据此改问其他副本或自建。提供传输的一侧受 `index_manager.fetch_concurrency` 限流(<= 0 不限) |

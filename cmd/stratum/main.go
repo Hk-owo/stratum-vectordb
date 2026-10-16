@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/signal"
 	"sort"
-	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +32,7 @@ import (
 	"stratum/internal/docstore"
 	"stratum/internal/embed"
 	"stratum/internal/index"
+	"stratum/internal/nodestate"
 	"stratum/internal/plane"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
@@ -251,9 +251,26 @@ func main() {
 	var indexMgr *index.IndexManagerImpl
 	var embedClient *embed.HTTPEmbedClient
 
+	// docs/storage-node-state-machine-plan.md §3: this node's own state, in one
+	// place. Created only where there is storage — a control node keeps none, so
+	// it has no phases to report, and its admin surface omits node_state rather
+	// than claiming a phase it does not have.
+	//
+	// Created BEFORE the storage stack opens, deliberately: STARTING is a phase
+	// a node really passes through (opening Pebble stores, dialling vecstore),
+	// and constructing the machine past it would make it unreportable.
+	var nodeState *nodestate.Machine
+	if storageLocal {
+		nodeState = nodestate.New(nodestate.Options{Logger: logger.Named("nodestate")})
+	}
+
 	ctx := context.Background()
 	if storageLocal {
-		stack, err := buildStorageStack(cfg, dataDir, rn, logger)
+		// nodeState goes in here because the index manager owns the version layer's
+		// build transitions (docs/storage-node-state-machine-plan.md §7, item 4):
+		// every build and every installed artifact passes through it, and the one
+		// build that never starts is only visible from inside.
+		stack, err := buildStorageStack(cfg, dataDir, rn, logger, nodeState)
 		if err != nil {
 			logger.Fatal("failed to initialize the storage layer", zap.Error(err))
 		}
@@ -262,6 +279,16 @@ func main() {
 		chunkBloom, vBloomStore = stack.ChunkBloom, stack.VersionBloom
 		chunkSplitter, indexMgr, embedClient = stack.ChunkSplitter, stack.IndexManager, stack.EmbedClient
 		logger.Info("storage layer initialized", zap.String("role", string(cfg.Role)))
+
+		// The stack is open, so startup reconciliation is what this node is
+		// doing now: recovering cursors, reconciling indexes against disk
+		// facts, publishing the epoch payload. The phase lasts until SERVING
+		// below, and it is observable for its whole duration — which is the
+		// point, since it is the window in which queries are answered from a
+		// partially restored node.
+		if err := nodeState.Transition(nodestate.NodeReconciling); err != nil {
+			logger.Fatal("node state: entering RECONCILING", zap.Error(err))
+		}
 	} else {
 		logger.Info("starting without local storage: metadata only (control role)",
 			zap.String("role", string(cfg.Role)))
@@ -322,14 +349,17 @@ func main() {
 	if indexMgr != nil {
 		indexMgr.SetGCReplicaCounter(controlPlane, cfg.NodeID)
 	}
-	// distributeIndex ships a freshly built index to the other replicas
-	// (Stratum_设计文档v13.md §8.4). It is assigned once the data plane exists,
-	// further down; until then a build stays local, which is exactly how the
-	// cluster behaved before distribution existed.
-	var distributeIndex func(kbID string, versionID int64)
 	// A control node has no index manager, so no builds to observe.
 	if indexMgr != nil {
 		indexMgr.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
+			// NOTE: the node state machine's build transitions are NOT reported
+			// here. They belong to the index manager itself (its BuildState
+			// recorder, wired in buildStorageStack), which is the single entry
+			// point every build passes through — including the one that never
+			// starts because the pool is closed, which this callback would never
+			// hear about. Reporting from both would be two sources for one fact,
+			// which is what the state machine exists to end.
+			//
 			// Apply the on-disk retention policy after every successful build:
 			// keep the newest cfg.IndexRetentionCount index files per KB, drop
 			// older ones (rebuilt on demand via RebuildIndex). The active
@@ -339,9 +369,6 @@ func main() {
 			if status == types.IndexStatusReady {
 				if kb, err := rn.GetKB(context.Background(), kbID); err == nil {
 					_ = indexMgr.EnforceDiskRetention(context.Background(), kbID, []int64{kb.ActiveVersionID, versionID})
-				}
-				if distributeIndex != nil {
-					distributeIndex(kbID, versionID)
 				}
 			}
 			return reportIndexStatus(context.Background(), controlPlane, kbID, versionID, status)
@@ -358,7 +385,8 @@ func main() {
 	// dispatchVersionWrite and resolveReplicaAddrs are late-bound: the coordinator
 	// needs a dispatcher, the dispatcher needs the data plane, and the data plane
 	// needs the coordinator (§7.13.2). Routing them through these closures keeps
-	// the assembly acyclic (the same trick distributeIndex uses).
+	// the assembly acyclic (the same late-binding trick dispatchVersionWrite and
+	// resolveReplicaAddrs already use).
 	var dispatchVersionWrite func(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error
 	var resolveReplicaAddrs func(ctx context.Context) ([]string, error)
 
@@ -467,6 +495,18 @@ func main() {
 		}
 		return droppers
 	})
+	// §8.5: data-source announcements. A writer tells its replicas where a
+	// version's data lives — the §7.3 confirmation carries its own address —
+	// and the source lookup reads that table before falling back to the leader.
+	// That keeps the lookup a map read, which matters because it runs on the
+	// Raft apply path; probing peers there is what made the first attempt at
+	// §8.5 unusable.
+	//
+	// Built here, ahead of the delete coordinator, because a knowledge base's
+	// deletion has to drop its entries (DeleteCoordinatorConfig.
+	// SourceAnnouncements). It reaches the receive side further down.
+	dataSources := plane.NewDataSourceRegistry()
+
 	deleteCoord := coordinator.NewDeleteCoordinatorImpl(coordinator.DeleteCoordinatorConfig{
 		MaxRetries:          cfg.DeleteMaxRetries,
 		RetryBaseIntervalMS: cfg.DeleteRetryBaseMS,
@@ -479,6 +519,7 @@ func main() {
 		VersionDocList:      vd,
 		VersionBloom:        vBloomStore,
 		Dropper:             kbDropper,
+		SourceAnnouncements: dataSources,
 	})
 
 	// Same two halves as the whole-KB dropper above, for the same reason: the
@@ -721,14 +762,6 @@ func main() {
 		})
 	}
 
-	// §8.5: data-source announcements. A writer tells its replicas where a
-	// version's data lives — the §7.3 confirmation carries its own address —
-	// and the source lookup reads that table before falling back to the leader.
-	// That keeps the lookup a map read, which matters because it runs on the
-	// Raft apply path; probing peers there is what made the first attempt at
-	// §8.5 unusable.
-	dataSources := plane.NewDataSourceRegistry()
-
 	// §8.5's fourth layer (docs/data-source-holders-fallback-plan.md): the table
 	// above is filled only by a writer's confirmation, which is a bounded
 	// fire-and-forget broadcast. A replica that missed it has no source at all —
@@ -777,9 +810,15 @@ func main() {
 	dataPlane = plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
 		IndexManager:  indexMgr,
 		LocalVersions: vd,
-		Liveness:      liveness,
-		Puller:        syncFollower,
-		WAL:           walImpl,
+		// §8.4 owner sharding is decided in the STATION, not here: the router
+		// computes each version's owner set and routes queries to it, so a storage
+		// node that is never asked never builds anything. This node's own rule is
+		// the other half of that and needs no owner knowledge: when it IS asked for
+		// a version, it takes an existing artifact if a peer has one and builds the
+		// index itself if none does.
+		Liveness: liveness,
+		Puller:   syncFollower,
+		WAL:      walImpl,
 		// §7.8/docs/cursor-persistence-plan.md §3: the cursor is persisted in the
 		// WAL this node already fsyncs, so a restart reads it back instead of
 		// inferring it from index artifacts the retention policy may have
@@ -800,8 +839,12 @@ func main() {
 		Confirmer: stratumsync.NewConfirmBroadcaster(stratumsync.PresenceCheckerConfig{}),
 		// §8.4: "建一次、分发 N 份" — the builder reads its own index files and
 		// ships them; replicas install them instead of building their own.
-		IndexReader:     indexMgr,
-		IndexShipper:    stratumsync.NewIndexPusher(),
+		IndexReader:  indexMgr,
+		IndexFetcher: stratumsync.NewIndexFetcher(),
+		// docs/index-owner-sharding-plan.md §7: where an artifact FETCHED from a
+		// peer lands. The same call the push direction ends in, so a fetched
+		// artifact and a shipped one are indistinguishable once installed.
+		IndexInstaller:  indexMgr,
 		ResolveReplicas: resolveReplicaAddrs,
 		// The same topology resolveReplicaAddrs walks, counted this time: how many
 		// replicas should hold a written version. fanOut reads it to recognise the
@@ -815,9 +858,6 @@ func main() {
 			}
 			return len(cfg.Peers)
 		}(),
-		// §8.4(a): bound how many distributions run at once; 0 takes the
-		// default (DefaultMaxConcurrentIndexPush).
-		MaxConcurrentIndexPush: cfg.IndexPushConcurrency,
 		// §7.5: a backfill can replay the changes a peer recorded instead of
 		// pulling each version in full. Same dialer config as the other
 		// peer-facing helpers.
@@ -842,7 +882,7 @@ func main() {
 			// 本节点就是 leader:存储层数据已由写路径直接落盘,无需(也不应)
 			// 向自己发起拉取。尤其关键的是重启后 raft 重放历史日志时,每条
 			// CreateVersion 都会走"非本节点提案"分支触发本回调;若在此处向
-			// 不可达的 leader 地址发起阻塞式 PullVersion,整个 apply 循环会
+			// 不可达的 leader 地址发起阻塞式拉取,整个 apply 循环会
 			// 卡死,后续所有日志永远无法应用。
 			//
 			// 注意本函数必须是"廉价、不探测"的查找：它跑在 Raft apply 路径上,
@@ -878,7 +918,13 @@ func main() {
 		// replicas learn where the data is. It is its own DataSyncService
 		// address — the same gRPC endpoint serves every service.
 		SelfDataSyncAddr: localAddr,
-		Logger:           logger,
+		// docs/storage-node-state-machine-plan.md §7: the machine this plane
+		// maintains — the version layer's entries, the data cursor, and the two
+		// accounts the cursor advances over. nil on a control node, where the
+		// plane makes its own: it has no storage to be authoritative about, and
+		// a concrete pointer keeps this a plain nil comparison.
+		State:  nodeState,
+		Logger: logger,
 	})
 
 	// One plane serves both paths: the write path runs its storage transaction
@@ -920,6 +966,17 @@ func main() {
 		SelfAddr: localAddr,
 		Logger:   logger,
 	}
+	// docs/storage-node-state-machine-plan.md §3.2: this node's own redundancy
+	// verdict — what IT observed while reaching its peers, not the control
+	// leader's aggregate over everyone's reports. The two are computed from
+	// different evidence, which is why they are expected to disagree; neither is
+	// derived from the other.
+	//
+	// Wired only where there is a state machine: a method value taken from a nil
+	// *Machine is itself non-nil, so a control node must leave the func unset.
+	if nodeState != nil {
+		dispatcherCfg.Redundancy = nodeState.SetPeerRedundancy
+	}
 	if storageLocal {
 		// Coordinating locally is the last resort: it keeps a single-node cluster
 		// — or one whose peers are all unreachable — progressing without a second
@@ -933,54 +990,6 @@ func main() {
 		// wants the address for its log line, calls writeDispatcher directly.
 		_, err := writeDispatcher.Dispatch(ctx, kbID, versionID, parentVersionID, changes)
 		return err
-	}
-
-	// §8.4: with the data plane in place, a completed build ships its index to
-	// the other replicas so they load it instead of building their own. Best
-	// effort — a replica that cannot be reached builds for itself, which is the
-	// behaviour the cluster had before distribution existed.
-	//
-	// Fire-and-forget, deliberately. This runs inside the build callback, which
-	// runs on a buildPool worker; shipping an index means reading the whole file
-	// into memory and streaming it to N replicas, and PushIndexToReplicas parks
-	// on a bounded semaphore while a distribution storm is in progress. Inline,
-	// that would hold a build worker for the whole push — and under enough
-	// storms every worker would queue behind distribution while the builds that
-	// queries and writes are waiting on stall. The 2-minute timeout and
-	// context.Background() below already described a call nobody waits for; this
-	// makes it one.
-	// One distribution per version at a time. The build callback is retried on
-	// failure (invokeCallback, up to 4 attempts) and every attempt calls this
-	// again; while distribution ran inline those attempts were strictly
-	// sequential, so a version was never shipped twice at once. Off the worker
-	// they can overlap — and overlapping ships of one version are exactly what
-	// lets a receiver's installs interleave (measured: an index/sidecar checksum
-	// mismatch on the receiving node). A ship already in flight is the same work,
-	// so skip it; once it finishes, a later attempt may try again.
-	distributing := sync.Map{}
-	distributeIndex = func(kbID string, versionID int64) {
-		key := fmt.Sprintf("%s\x00%d", kbID, versionID)
-		if _, inFlight := distributing.LoadOrStore(key, struct{}{}); inFlight {
-			return
-		}
-		go func() {
-			defer distributing.Delete(key)
-			// A panic here used to be caught by doBuild's recover, which marked
-			// the version FAILED. Off the worker goroutine there is nothing above
-			// to catch it, so it would take the process down.
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Error("index distribution panicked",
-						zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Any("panic", r))
-				}
-			}()
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-			if err := dataPlane.PushIndexToReplicas(ctx, kbID, versionID); err != nil {
-				logger.Warn("index distribution failed",
-					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-			}
-		}()
 	}
 
 	// Startup maintenance across the contract: the storage layer trims index
@@ -999,6 +1008,13 @@ func main() {
 			logger.Warn("index retention: ListKnowledgeBases failed", zap.Error(err))
 		}
 		epochDurable = reconcileIndexStatus(ctx, logger, dataPlane, controlPlane, rn, cfg.IndexRetentionCount)
+
+		// docs/storage-node-state-machine-plan.md §5.1: project the reconciled
+		// disk facts into the version layer. Done ONCE, here, before the node
+		// serves — which is what lets every later reader treat the machine as
+		// complete, with no "no entry, go ask the disk" fallback on the read
+		// path.
+		projectNodeState(ctx, logger, nodeState, dataPlane, rn, epochDurable)
 
 		// A terminal verdict does not come back on a restart — once the log is
 		// compacted the entry is only ever restored as snapshot state, so the apply
@@ -1086,26 +1102,20 @@ func main() {
 			// that needs the gap recorded.
 			dataPlane.AnnounceVersion(kbID, versionID)
 
-			// §8.6b: only the active version is worth building eagerly — it is what
-			// ordinary queries hit. Every other version still gets its data (the
-			// data has to be here for the version to count as durable) but no
-			// index; a query that does reach one builds it lazily, by scanning if
-			// the version is small and by waiting for a build if it is not.
+			// §8.6b: the DATA, always; the index, never on this path.
 			//
-			// "Which version is active" is read from the replicated metadata rather
-			// than pushed down: the storage layer already has a read-only view of
-			// it (§7.0's MetadataLister), so no new control-layer channel is needed.
-			active := false
-			if kb, err := rn.GetKB(context.Background(), kbID); err == nil && kb.ActiveVersionID == versionID {
-				active = true
-			}
-			if active {
-				if err := dataPlane.EnsureIndex(context.Background(), kbID, versionID); err != nil {
-					logger.Error("sync: version data pull did not converge",
-						zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-				}
-				return
-			}
+			// This used to build the index eagerly for whichever version was the
+			// control layer's ActiveVersionID. That exception is gone, and its going
+			// is the point of §8.6(b) being consistent: "who needs this version" is a
+			// question about USE, and applying happens for every version whether
+			// anybody reads it or not. The router already answers the question — it
+			// ranks versions by recent queries and routes to the owners of the ones
+			// that are being read (internal/router/index_priority.go) — so a build
+			// happens when a request arrives, and not before.
+			//
+			// The active pointer was never a good stand-in anyway: only
+			// RollbackVersion moves it, so for a knowledge base nobody has rolled
+			// back it equals "version 0" and the rule did nothing.
 			if err := dataPlane.FetchVersionData(context.Background(), kbID, versionID); err != nil {
 				logger.Error("sync: version data fetch did not converge",
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
@@ -1256,6 +1266,11 @@ func main() {
 		// this a replica that missed a version's data can never fetch it, because
 		// the only path that triggers a pull is the query being refused.
 		querySvc.SetBackfiller(dataPlane)
+		// docs/index-owner-sharding-plan.md §4.2: a node that has been asked for a
+		// version first asks the peers for the artifact and only builds if nobody
+		// has one. The router decides which node is asked (§5), so this is reached
+		// on the versions a caller actually wants.
+		querySvc.SetIndexFetcher(dataPlane)
 		// Per-stage query timings, at debug level. Without this the query path
 		// is opaque from the node's own log — localizing the O(candidates ×
 		// documents) defect needed an outside-in probe plus temporary C++
@@ -1286,6 +1301,14 @@ func main() {
 		// still" — the one thing the watermark's own answer cannot carry, and the state
 		// that otherwise stops both pruning and WAL reclamation silently.
 		adminSvc.SetReclaimDiagnosticsSource(reclaimDiagnosticsSource{controlPlane})
+		// docs/storage-node-state-machine-plan.md §6: surface this node's own
+		// phase and its not-at-rest versions through the existing admin entry
+		// points. Inside this branch the machine always exists — the typed-nil
+		// guard is here so a later move of this line cannot quietly turn into a
+		// call on a nil receiver.
+		if nodeState != nil {
+			adminSvc.SetNodeStateSource(nodeState)
+		}
 		pb.RegisterQueryServiceServer(grpcServer, querySvc)
 		pb.RegisterAdminServiceServer(grpcServer, adminSvc)
 	} else {
@@ -1305,6 +1328,11 @@ func main() {
 	nodeHandler := stratumsync.NewNodeHandler(
 		syncLeader,
 		stratumsync.NewPushHandler(syncFollower, cfg.NodeID,
+			// docs/index-owner-sharding-plan.md §5.2: only the version's owner HEAD
+			// builds, so a push landing here does not start a build on every replica
+			// (the measured baseline was N builds per version, with §8.4's
+			// distribution never sending a byte). An empty member set — a single-node
+			// deployment, or a control node — leaves the behaviour unchanged.
 			stratumsync.WithLocalVersion(dataPlane),
 			// §9.3(2): receiving a version's records is what makes this node
 			// hold it; without this the cursor stays 0 and the station's
@@ -1312,7 +1340,6 @@ func main() {
 			stratumsync.WithLocalVersionAdvancer(dataPlane),
 			stratumsync.WithVersionDataDropper(writeCoord),
 			stratumsync.WithVersionWriteWatcher(dataPlane),
-			stratumsync.WithIndexInstaller(indexMgr),
 			// §8.4(a): the presence probe's answer and its failures are only
 			// visible in the log, so the receive side gets this node's logger.
 			stratumsync.WithLogger(logger),
@@ -1344,6 +1371,16 @@ func main() {
 			// reporter mirrors so its data-source lookup can answer without dialling —
 			// that lookup may run on the Raft apply path, where it cannot ask.
 			stratumsync.WithHolders(dataVersionRegistry)),
+		// docs/index-owner-sharding-plan.md §7: the export half of the fetch.
+		// Without it a peer asking this node for an artifact gets "this node does
+		// not export index artifacts", every fetch fails, and every node falls
+		// back to building — the cost the sharding exists to remove, silently
+		// restored. Measured on the 3+3 cluster: 34 builds for 10 versions with
+		// this missing, against 10 with it wired.
+		stratumsync.WithNodeIndexReader(indexMgr),
+		// §8.4(a) survives the push direction: this is the serving side's gate,
+		// and with distribution pull-only it is the only one left.
+		stratumsync.WithMaxConcurrentIndexFetch(cfg.IndexFetchConcurrency),
 	)
 	pb.RegisterDataSyncServiceServer(grpcServer, nodeHandler)
 
@@ -1382,6 +1419,15 @@ func main() {
 	go func() {
 		sig := <-sigCh
 		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
+		// docs/storage-node-state-machine-plan.md §3.1: STOPPING is terminal, and
+		// it is declared before the server stops taking work — so a status call
+		// arriving mid-shutdown sees the wind-down rather than a healthy node
+		// that then stops answering.
+		if nodeState != nil {
+			if err := nodeState.Transition(nodestate.NodeStopping); err != nil {
+				logger.Warn("node state: entering STOPPING", zap.Error(err))
+			}
+		}
 		if metricsSrv != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
@@ -1411,7 +1457,14 @@ func main() {
 			MaxConcurrentKBs: cfg.LagCatchupMaxConcurrentKBs,
 			Ensure:           dataPlane.EnsureIndex,
 			Cursor:           dataPlane.DataVersionsSnapshot,
-			Logger:           logger,
+			// docs/storage-node-state-machine-plan.md §3.3: declare the
+			// knowledge bases this node is catching up on, so the node's state
+			// answers "is it behind" without re-deriving it from the cursors at
+			// each reader. Only reachable inside this branch, where the machine
+			// exists — see versionStateRecorder for the typed-nil discipline the
+			// other wiring needs.
+			NodeState: nodeState,
+			Logger:    logger,
 		})
 		chainTails = lagCatchup
 
@@ -1452,6 +1505,8 @@ func main() {
 		// source lookup's holders client: both want the same address, and for the
 		// same reason — §7.13.1's re-resolve instead of a cached forwarding path.
 		ResolveLeader: resolveControlLeader,
+		// The same fingerprint, so the leader and this node can each tell whether
+		// the other computes owner sets over the same replica set.
 		// §7.5: store the watermarks the leader carries back, so this node's WAL can
 		// be reclaimed even when this node is not the leader.
 		Watermarks: controlPlane,
@@ -1475,6 +1530,21 @@ func main() {
 	}).Run(ctx)
 
 	logger.Info("Stratum gRPC server listening", zap.String("addr", cfg.GRPCAddr))
+
+	// docs/storage-node-state-machine-plan.md §3.1: reconciliation is done and
+	// the listener is accepting, so the node is SERVING. It is the last phase
+	// transition of startup and the one an operator's status call should see for
+	// the life of the process.
+	//
+	// Note what is NOT a condition here: whether every knowledge base is caught
+	// up, or whether a replica is short. Those are the orthogonal dimensions —
+	// a node serves while it catches up, and reporting it as not-serving would
+	// read as an outage.
+	if nodeState != nil {
+		if err := nodeState.Transition(nodestate.NodeServing); err != nil {
+			logger.Error("node state: entering SERVING", zap.Error(err))
+		}
+	}
 
 	// §7.9: publish the epoch payload now that this node is serving. It cannot be
 	// done during the reconcile above, because the payload's data side is a quorum
@@ -1547,11 +1617,12 @@ func (r replicaPusher) PushVersion(ctx context.Context, targetAddr, kbID string,
 // failure on the INDEX side, which is where a build's retry budget and its
 // terminal verdict live (Stratum_设计文档v13.md §10.1, §10.1b).
 //
-// It deliberately no longer goes through ReportAvailability: that channel
-// describes the version's abstract availability, a different question from "did
-// this build fail". Routing build failures through it set a retryable FAILED
-// with no budget behind it — so nothing ever reached a verdict for the index
-// side, and a build that kept failing simply kept reporting.
+// It deliberately no longer goes through the storage layer's availability
+// channel (plane.ControlPlane had a ReportAvailability method, now removed):
+// that channel described the version's abstract availability, a different
+// question from "did this build fail". Routing build failures through it set a
+// retryable FAILED with no budget behind it — so nothing ever reached a verdict
+// for the index side, and a build that kept failing simply kept reporting.
 func reportIndexStatus(ctx context.Context, cp plane.ControlPlane, kbID string, versionID int64, status types.IndexStatus) error {
 	switch status {
 	case types.IndexStatusReady:
@@ -1669,6 +1740,78 @@ func runCrashRecovery(
 // function walked local disks and proposed status itself — see
 // control-data-separation-design.md §5.3/§7 and the decision table at the
 // call site.
+// projectNodeState rebuilds the version layer from disk facts at startup
+// (docs/storage-node-state-machine-plan.md §5.1).
+//
+// Both inputs are facts this process has already established by the time it is
+// called: the reconciled durable set (an artifact is on disk) and the recovered
+// data cursors (everything at or below one is held). Nothing here probes the
+// disk again, which is the point — the machine is a projection of work already
+// done, not a second scan.
+//
+// Artifacts go in FIRST. An artifact is the stronger fact, and the cursor pass
+// covers a superset of versions, so doing it the other way round would leave
+// every built version looking like data-with-no-index.
+//
+// A version with neither is left with no entry at all, rather than recorded as
+// absent: absence is the absence of a fact, and the machine reports it as
+// ABSENT without needing one. That also keeps the entry count proportional to
+// what this node actually holds.
+func projectNodeState(
+	ctx context.Context,
+	logger *zap.Logger,
+	m *nodestate.Machine,
+	dp *plane.LocalDataPlane,
+	meta plane.MetadataLister,
+	durable []plane.VersionRef,
+) {
+	if m == nil {
+		return
+	}
+
+	// Tracked separately from the machine so the cursor pass can skip these
+	// without a read-back and a lock per version.
+	ready := make(map[string]map[int64]struct{}, len(durable))
+	for _, ref := range durable {
+		if ready[ref.KBID] == nil {
+			ready[ref.KBID] = make(map[int64]struct{})
+		}
+		ready[ref.KBID][ref.VersionID] = struct{}{}
+		if err := m.RestoreVersion(ref.KBID, ref.VersionID, nodestate.VersionReady, ""); err != nil {
+			logger.Warn("nodestate: projecting a durable index failed",
+				zap.String("kb_id", ref.KBID), zap.Int64("version_id", ref.VersionID), zap.Error(err))
+		}
+	}
+
+	kbs, err := meta.ListKnowledgeBases(ctx)
+	if err != nil {
+		// Partial is worth saying out loud: the machine now under-reports what
+		// this node holds, and a reader would see ABSENT for versions that are
+		// on disk.
+		logger.Warn("nodestate: version layer projection is partial: listing knowledge bases failed", zap.Error(err))
+		return
+	}
+
+	var held int
+	for _, kb := range kbs {
+		cursor := dp.LocalVersionOf(kb.KBID)
+		for v := int64(1); v <= cursor; v++ {
+			if _, isReady := ready[kb.KBID][v]; isReady {
+				continue
+			}
+			if err := m.RestoreVersion(kb.KBID, v, nodestate.VersionDataPresent, ""); err != nil {
+				logger.Warn("nodestate: projecting a held version failed",
+					zap.String("kb_id", kb.KBID), zap.Int64("version_id", v), zap.Error(err))
+				continue
+			}
+			held++
+		}
+	}
+
+	logger.Info("nodestate: version layer projected from disk facts",
+		zap.Int("knowledge_bases", len(kbs)), zap.Int("ready", len(durable)), zap.Int("data_present", held))
+}
+
 func reconcileIndexStatus(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPlane, cp plane.ControlPlane, meta plane.MetadataLister, retentionCount int) []plane.VersionRef {
 	// §7.8: the contiguous cursor lives in memory, so a restarted node would
 	// answer "0" for every knowledge base — data complete, index on disk, and
@@ -1955,9 +2098,9 @@ type appConfig struct {
 	// control_plane.failure_budget. Zero or negative keeps
 	// plane.DefaultFailureBudget.
 	//
-	// It is only the default: the control plane also carries a per-KB override
-	// (plane.DurabilityPolicy.MaxFailures). Nothing in the node assembly sets
-	// that one today, so this value is what actually decides the verdict.
+	// It is only the default: the control plane can also carry a per-KB
+	// override (ControlPlane.SetFailureBudget). Nothing in the node assembly
+	// sets that one today, so this value is what actually decides the verdict.
 	ControlPlaneFailureBudget int
 
 	VecstoreGRPCAddr string
@@ -1999,9 +2142,10 @@ type appConfig struct {
 	// field unset so the vector store applies clamp(top_k × 8, 16, 4096).
 	IndexCandidateN int
 
-	// IndexColdThreshold is how long a version may go unqueried before
-	// the background evaluator rebuilds it in the graph-free form
-	// (index_manager.cold_threshold_ms, §8.6a); <= 0 disables the policy.
+	// IndexColdThreshold is how long a version may go unqueried before it is
+	// built in the graph-free form (index_manager.cold_threshold_ms, §8.6a);
+	// <= 0 disables the policy. There is no sweep interval — the shape is decided
+	// inside a build (coldShapeFor) and re-checked on the read path.
 	IndexColdThreshold time.Duration
 
 	// IndexBuildAbandonTimeout is how long a half-built index artifact may sit
@@ -2014,11 +2158,6 @@ type appConfig struct {
 	// is ON by default (<= 0 takes 30 minutes) and only a NEGATIVE value disables
 	// it.
 	IndexBuildAbandonTimeout time.Duration
-
-	// IndexColdSweepInterval is how often that evaluator re-reads the
-	// access table (index_manager.cold_sweep_interval_ms); <= 0 means the
-	// IndexManager's default.
-	IndexColdSweepInterval time.Duration
 
 	// IndexAppendMaxDeadRatio bounds the dead weight a §8.6(c) pure-append
 	// reuse may carry (index_manager.append_max_dead_ratio); <= 0 means the
@@ -2055,11 +2194,12 @@ type appConfig struct {
 	// the IndexManager's default, NEGATIVE removes the floor.
 	IndexMinCodebookBaselineVectors int64
 
-	// IndexGCEnabled turns on §8.6(d) collection (index_manager.gc_enabled). Off
-	// by default: the scanner always runs and only reports, but collection
-	// rewrites an artifact that is currently SERVING queries, so turning it on is
-	// an operator's decision — the log line and the GetSystemStatus entry are the
-	// signals that it is worth making.
+	// IndexGCEnabled turns on §8.6(d) collection (index_manager.gc_enabled). ON by
+	// default since 2026-10: the scanner always runs and only reports, and the
+	// collection itself is gated by serving_replica_min (other replicas must be
+	// serving that version, so the version stays answerable while this node steps
+	// out) and by gc_ratio_threshold (how much dead weight is enough). Set
+	// `gc_enabled: false` to go back to report-only.
 	IndexGCEnabled bool
 
 	// ReconcileDeletedVersions reclaims this node's leftovers of DELETED versions
@@ -2138,12 +2278,16 @@ type appConfig struct {
 	// manager's build pool separately keeps such a sweep from outranking a live write.
 	IndexBuildConcurrency int
 
-	// IndexPushConcurrency is how many index distributions (§8.4) may be in
-	// flight at once (index_manager.push_concurrency); <= 0 means the data
-	// plane's default (DefaultMaxConcurrentIndexPush). One distribution reads a
-	// whole index file into memory and ships it to every replica, so this bounds
-	// the builder's memory peak and outbound bandwidth together.
-	IndexPushConcurrency int
+	// IndexFetchConcurrency is how many index-artifact transfers (§8.4) THIS
+	// NODE WILL SERVE AT ONCE (index_manager.fetch_concurrency); <= 0 serves
+	// them without a bound.
+	//
+	// It bounds the serving side, which is where the resource is spent: one
+	// transfer reads a whole index file into memory before streaming it, so with
+	// distribution now pull-only this is the one place a distribution storm —
+	// every replica asking the same node for the same artifact — turns into a
+	// queue instead of a memory spike.
+	IndexFetchConcurrency int
 
 	WriteMaxRetries   int
 	WriteRetryBaseMS  int
@@ -2278,7 +2422,6 @@ type fileConfig struct {
 		// BuildAbandonTimeoutMS is the §6 abandoned-artifact window. <= 0 takes
 		// the default (30 minutes); negative disables the sweeper.
 		BuildAbandonTimeoutMS int     `yaml:"build_abandon_timeout_ms"`
-		ColdSweepIntervalMS   int     `yaml:"cold_sweep_interval_ms"`
 		AppendMaxDeadRatio    float64 `yaml:"append_max_dead_ratio"`
 		// §8.6(d) scanner threshold. 0 = unset, which leaves the IndexManager's
 		// own default in place (the same reading as append_max_dead_ratio above).
@@ -2292,10 +2435,15 @@ type fileConfig struct {
 		// MinBaselineVectors is the baseline size below which the drift ratio is
 		// ignored, so a tiny KB does not rebuild on every version.
 		MinBaselineVectors int64 `yaml:"min_codebook_baseline_vectors"`
-		// §8.6(d) collection. GCEnabled is the opt-in: the scanner always runs (it
-		// only reads), but rewriting a SERVING artifact happens only when an
-		// operator says so.
-		GCEnabled bool `yaml:"gc_enabled"`
+		// §8.6(d) collection. The scanner always runs (it only reads); GCEnabled
+		// additionally lets it rewrite a SERVING artifact.
+		//
+		// A pointer so "absent" and "false" are distinguishable: absent takes the
+		// default, which is ON since 2026-10 (collection is gated by
+		// serving_replica_min and only fires when the dead share clears
+		// gc_ratio_threshold — see DefaultGCRatioThreshold). Write `false`
+		// explicitly for the pre-2026-10 report-only behaviour.
+		GCEnabled *bool `yaml:"gc_enabled"`
 		// ServingReplicaMin is how many other replicas must be serving before this
 		// node steps out to collect (§8.6(d)). <= 0 takes the default (2).
 		ServingReplicaMin int `yaml:"serving_replica_min"`
@@ -2315,14 +2463,16 @@ type fileConfig struct {
 		// that trade depends on the deployment's disk and vecstore, not on anything
 		// this repository can know.
 		BuildConcurrency int `yaml:"build_concurrency"`
-		// PushConcurrency is how many index distributions (§8.4) may be in flight
-		// at once. <= 0 takes the data plane's default (4).
+		// FetchConcurrency is how many artifact transfers (§8.4) this node will
+		// serve at once. <= 0 serves them without a bound — the gate is off, which
+		// is the shape a single-replica or throwaway deployment wants.
 		//
-		// It bounds a distribution storm's cost in network, source-node disk IO and
-		// memory — one distribution reads the whole index file into memory before
-		// shipping it to N replicas. Distribution is already asynchronous (it no
-		// longer occupies a build worker), so this is its only gate.
-		PushConcurrency int `yaml:"push_concurrency"`
+		// It bounds a fetch storm's cost in source-node disk IO and memory — one
+		// transfer reads the whole index file into memory before streaming it, and
+		// N−1 replicas asking the same node for the same artifact is the ordinary
+		// consequence of a version switch. Since distribution became pull-only
+		// this is the only gate on it.
+		FetchConcurrency int `yaml:"fetch_concurrency"`
 	} `yaml:"index_manager"`
 
 	WriteCoordinator struct {
@@ -2484,9 +2634,6 @@ func loadConfig(path string) (appConfig, error) {
 	if ms := fc.IndexManager.BuildAbandonTimeoutMS; ms != 0 {
 		cfg.IndexBuildAbandonTimeout = time.Duration(ms) * time.Millisecond
 	}
-	if fc.IndexManager.ColdSweepIntervalMS != 0 {
-		cfg.IndexColdSweepInterval = time.Duration(fc.IndexManager.ColdSweepIntervalMS) * time.Millisecond
-	}
 	if fc.IndexManager.AppendMaxDeadRatio != 0 {
 		cfg.IndexAppendMaxDeadRatio = fc.IndexManager.AppendMaxDeadRatio
 	}
@@ -2504,10 +2651,13 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.IndexManager.MinBaselineVectors != 0 {
 		cfg.IndexMinCodebookBaselineVectors = fc.IndexManager.MinBaselineVectors
 	}
-	// §8.6(d). gc_enabled is a plain bool: absent and false both mean "collect
-	// nothing", which is the only safe reading of a config file that predates the
-	// feature.
-	cfg.IndexGCEnabled = fc.IndexManager.GCEnabled
+	// §8.6(d). gc_enabled is a *bool so an ABSENT key keeps the default (ON since
+	// 2026-10) while an explicit `false` still turns collection off. A plain bool
+	// cannot tell those two apart, and its zero value would silently disable the
+	// default for every config file that predates the change.
+	if fc.IndexManager.GCEnabled != nil {
+		cfg.IndexGCEnabled = *fc.IndexManager.GCEnabled
+	}
 	cfg.ReconcileDeletedVersions = fc.Reconcile.DeletedVersions
 	cfg.ReconcileDeletedVersionsPeriodic = fc.Reconcile.DeletedVersionsPeriodic
 	cfg.ReconcileDeletedVersionsIntervalS = fc.Reconcile.DeletedVersionsIntervalS
@@ -2525,8 +2675,8 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.IndexManager.BuildConcurrency != 0 {
 		cfg.IndexBuildConcurrency = fc.IndexManager.BuildConcurrency
 	}
-	if fc.IndexManager.PushConcurrency != 0 {
-		cfg.IndexPushConcurrency = fc.IndexManager.PushConcurrency
+	if fc.IndexManager.FetchConcurrency != 0 {
+		cfg.IndexFetchConcurrency = fc.IndexManager.FetchConcurrency
 	}
 	if fc.WriteCoordinator.MaxRetries != 0 {
 		cfg.WriteMaxRetries = fc.WriteCoordinator.MaxRetries
@@ -2604,12 +2754,11 @@ func defaultConfig() appConfig {
 		IndexRetentionCount:    0,
 		IndexMemoryThresholdMB: 0,
 
-		// §8.6a cold-version policy: also off by default, so an
-		// unconfigured node keeps building a full HNSW graph for every
-		// version. Enable with index_manager.cold_threshold_ms (and
-		// optionally cold_sweep_interval_ms).
-		IndexColdThreshold:     0,
-		IndexColdSweepInterval: 0,
+		// §8.6a cold-version policy: off by default, so an unconfigured node
+		// builds a full HNSW graph for every version. Enable with
+		// index_manager.cold_threshold_ms. There is no sweep interval to set —
+		// the shape is decided inside a build, not by a background evaluator.
+		IndexColdThreshold: 0,
 
 		// §8.6(c) pure-append reuse: 0 means the IndexManager's own default
 		// ratio (20% dead vectors). Set append_max_dead_ratio to 1.0 to never
@@ -2624,11 +2773,14 @@ func defaultConfig() appConfig {
 		// 0 => the IndexManager's floor (1000); negative removes it.
 		IndexMinCodebookBaselineVectors: 0,
 
-		// §8.6(d) collection: 0/false means the IndexManager's own defaults, which
-		// are "do not collect" for gc_enabled and 2 for serving_replica_min. The
-		// scanner still runs and reports, so a node that has never been configured
-		// for collection will still say when collection would have been worth it.
-		IndexGCEnabled:           false,
+		// §8.6(d) collection: ON since 2026-10, gated twice — serving_replica_min
+		// (2) says how many OTHER replicas must be serving before this node may step
+		// out, and gc_ratio_threshold (0.3, deliberately above
+		// append_max_dead_ratio's 0.2) says how much dead weight is enough to
+		// bother. The scanner always runs and reports regardless, so a node that
+		// turns collection off still says when it would have been worth it. Write
+		// `gc_enabled: false` for the pre-2026-10 behaviour.
+		IndexGCEnabled:           true,
 		ReconcileDeletedVersions: true,
 		// On by default too — see the field comments for why this pair differs from
 		// every other irreversibility switch in this file.

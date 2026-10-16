@@ -192,7 +192,7 @@ func (c *Client) AwaitOnce(ctx context.Context, id string) (PendingWrite, *pb.Aw
 	resp, err := c.kb.AwaitVersion(ctx, &pb.AwaitVersionRequest{
 		KnowledgeBaseId: w.KnowledgeBaseID,
 		VersionId:       w.VersionID,
-		Target:          pb.AwaitTarget_AWAIT_TARGET_INDEX_READY,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   int64(awaitCallWindow / time.Millisecond),
 	})
 	if err != nil {

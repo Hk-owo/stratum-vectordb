@@ -120,16 +120,17 @@ func TestFileWAL_CompactKeepsInterleavedPairings(t *testing.T) {
 
 func assertReplayInput(t *testing.T, w *FileWAL, kbID string, versionID int64, wantDocID string) {
 	t.Helper()
-	changes, ok, err := w.ChangesFor(context.Background(), kbID, versionID)
+	deltas, err := w.ChangesInRange(context.Background(), kbID, versionID-1, versionID)
 	if err != nil {
-		t.Fatalf("ChangesFor(%s, %d): %v", kbID, versionID, err)
+		t.Fatalf("ChangesInRange(%s, %d): %v", kbID, versionID, err)
 	}
+	delta, ok := deltas[versionID]
 	if !ok {
-		t.Fatalf("ChangesFor(%s, %d): the replay input is MISSING (wrong pairing drops a live transaction)", kbID, versionID)
+		t.Fatalf("ChangesInRange(%s, %d): the replay input is MISSING (wrong pairing drops a live transaction)", kbID, versionID)
 	}
-	if len(changes) != 1 || changes[0].DocID != wantDocID {
-		t.Fatalf("ChangesFor(%s, %d) = %+v, want the %s transaction's changes",
-			kbID, versionID, changes, wantDocID)
+	if len(delta.Changes) != 1 || delta.Changes[0].DocID != wantDocID {
+		t.Fatalf("ChangesInRange(%s, %d) = %+v, want the %s transaction's changes",
+			kbID, versionID, delta.Changes, wantDocID)
 	}
 }
 

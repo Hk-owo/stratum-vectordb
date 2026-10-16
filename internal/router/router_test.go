@@ -208,7 +208,7 @@ func TestForwardRead_RoundRobin(t *testing.T) {
 	r := &Router{controlAddrs: []string{"a", "b", "c"}}
 	var hits [3]int
 	for i := 0; i < 6; i++ {
-		_, err := forwardRead(r, context.Background(), readTrace{}, allIndexes(3), nil, func(idx int, ctx context.Context) (string, error) {
+		_, err := forwardRead(r, context.Background(), readTrace{}, allIndexes(3), nil, nil, func(idx int, ctx context.Context) (string, error) {
 			hits[idx]++
 			return "ok", nil
 		})
@@ -223,7 +223,7 @@ func TestForwardRead_RoundRobin(t *testing.T) {
 
 func TestForwardRead_Failover(t *testing.T) {
 	r := &Router{controlAddrs: []string{"a", "b", "c"}}
-	got, err := forwardRead(r, context.Background(), readTrace{}, allIndexes(3), nil, func(idx int, ctx context.Context) (string, error) {
+	got, err := forwardRead(r, context.Background(), readTrace{}, allIndexes(3), nil, nil, func(idx int, ctx context.Context) (string, error) {
 		if idx == 0 {
 			return "", unavailableErr()
 		}
@@ -239,7 +239,7 @@ func TestForwardRead_Failover(t *testing.T) {
 
 func TestForwardRead_AllDown(t *testing.T) {
 	r := &Router{controlAddrs: []string{"a", "b", "c"}}
-	_, err := forwardRead(r, context.Background(), readTrace{}, allIndexes(3), nil, func(idx int, ctx context.Context) (string, error) {
+	_, err := forwardRead(r, context.Background(), readTrace{}, allIndexes(3), nil, nil, func(idx int, ctx context.Context) (string, error) {
 		return "", unavailableErr()
 	})
 	if err == nil || err.Error() != "router: all nodes unavailable" {
@@ -250,7 +250,7 @@ func TestForwardRead_AllDown(t *testing.T) {
 func TestForwardRead_NonRetryable(t *testing.T) {
 	r := &Router{controlAddrs: []string{"a", "b", "c"}}
 	want := status.Error(codes.NotFound, "not found")
-	_, err := forwardRead(r, context.Background(), readTrace{}, allIndexes(3), nil, func(idx int, ctx context.Context) (string, error) {
+	_, err := forwardRead(r, context.Background(), readTrace{}, allIndexes(3), nil, nil, func(idx int, ctx context.Context) (string, error) {
 		return "", want
 	})
 	if err != want {

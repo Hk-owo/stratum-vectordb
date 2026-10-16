@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/nodestate"
 )
 
 // The version is gone — discarded by its caller, or deleted — while its write
@@ -22,6 +23,7 @@ func TestReportAndSchedule_VersionGoneIsNotAWarning(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)
 	dp := &LocalDataPlane{
 		control: &stubControl{durableErr: stratumerrors.ErrVersionNotFound},
+		state:   nodestate.New(nodestate.Options{}),
 		logger:  zap.New(core),
 	}
 
@@ -40,6 +42,7 @@ func TestReportAndSchedule_OtherFailuresStillWarn(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)
 	dp := &LocalDataPlane{
 		control: &stubControl{durableErr: errors.New("control plane unreachable")},
+		state:   nodestate.New(nodestate.Options{}),
 		logger:  zap.New(core),
 	}
 
@@ -77,6 +80,7 @@ func TestFanOut_EmptyTargetsDependsOnTheReplicaCount(t *testing.T) {
 				pusher:          &stubPusher{},
 				resolveReplicas: noReplicas,
 				replicaCount:    tc.replicaCount,
+				state:           nodestate.New(nodestate.Options{}),
 				logger:          zap.New(core),
 			}
 

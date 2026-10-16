@@ -127,6 +127,46 @@ func (v *LocalHealthView) Observe(addr string, ok bool) {
 	}
 }
 
+// PeerState is what this node's local view currently believes about one peer.
+//
+// It is deliberately three-valued, and the third value is not decoration: a
+// peer this node has never called is not "reachable", it is UNKNOWN, and a
+// caller that has to count reachable replicas must be able to tell "I have
+// evidence it is up" from "I have no evidence either way".
+type PeerState int
+
+const (
+	// PeerUnknown: no call to this peer has ever been observed, so the view has
+	// no basis for an opinion.
+	PeerUnknown PeerState = iota
+	// PeerReachable: the last call succeeded, or the failures are below the
+	// demotion threshold — i.e. Rank would not move it.
+	PeerReachable
+	// PeerDemoted: a run of consecutive failures put it behind the others.
+	PeerDemoted
+)
+
+// State reports the view's current belief about addr.
+//
+// It applies Rank's expiry rule, from the same clock, so the two cannot
+// disagree about one peer at one moment: a demotion that has outlived demoteFor
+// counts as gone here too.
+func (v *LocalHealthView) State(addr string) PeerState {
+	if v == nil || addr == "" {
+		return PeerUnknown
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	entry, ok := v.entries[addr]
+	if !ok {
+		return PeerUnknown
+	}
+	if entry.demotedAt.IsZero() || v.now().Sub(entry.demotedAt) >= v.demoteFor {
+		return PeerReachable
+	}
+	return PeerDemoted
+}
+
 // Rank returns addrs with recently-unreachable peers moved to the back.
 //
 // Two properties matter more than the ordering itself:

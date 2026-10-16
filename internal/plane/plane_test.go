@@ -187,10 +187,6 @@ type stubPuller struct {
 
 // PullVersionData satisfies VersionPuller.
 func (p *stubPuller) PullVersionData(ctx context.Context, sourceAddr, kbID string, versionID int64) error {
-	return p.PullVersion(ctx, sourceAddr, kbID, versionID)
-}
-
-func (p *stubPuller) PullVersion(context.Context, string, string, int64) error {
 	p.calls++
 	return p.err
 }
@@ -205,10 +201,6 @@ type sequencedPuller struct {
 }
 
 func (p *sequencedPuller) PullVersionData(ctx context.Context, sourceAddr, kbID string, versionID int64) error {
-	return p.PullVersion(ctx, sourceAddr, kbID, versionID)
-}
-
-func (p *sequencedPuller) PullVersion(ctx context.Context, _, _ string, _ int64) error {
 	p.calls++
 	if p.delay > 0 {
 		select {
@@ -295,38 +287,6 @@ func TestLocalControlPlane_ReportDataDurable(t *testing.T) {
 	}
 	if got := meta.digestCalls[0]; got.versionID != 3 || got.digest != "digest-3" {
 		t.Fatalf("proposal = %+v, want (3, digest-3)", got)
-	}
-}
-
-func TestLocalControlPlane_ReportAvailability(t *testing.T) {
-	cases := []struct {
-		name      string
-		state     Availability
-		wantCalls int
-		wantStat  types.IndexStatus
-		wantErr   bool
-	}{
-		{"available maps to READY", AvailabilityAvailable, 1, types.IndexStatusReady, false},
-		{"unavailable maps to FAILED", AvailabilityUnavailable, 1, types.IndexStatusFailed, false},
-		{"degraded leaves the version alone", AvailabilityDegraded, 0, 0, false},
-		{"unknown availability is rejected", Availability(42), 0, 0, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			meta := &stubMeta{}
-			cp := NewLocalControlPlane(meta)
-
-			err := cp.ReportAvailability(context.Background(), "kb-1", 5, tc.state)
-			if tc.wantErr != (err != nil) {
-				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
-			}
-			if len(meta.statusCalls) != tc.wantCalls {
-				t.Fatalf("status proposals = %+v, want %d", meta.statusCalls, tc.wantCalls)
-			}
-			if tc.wantCalls == 1 && meta.statusCalls[0].status != tc.wantStat {
-				t.Fatalf("status = %v, want %v", meta.statusCalls[0].status, tc.wantStat)
-			}
-		})
 	}
 }
 
@@ -672,29 +632,11 @@ func TestLocalDataPlane_WriteVersionData_RequiresConfiguration(t *testing.T) {
 	}
 }
 
-func TestLocalDataPlane_DropVersionDataAndDurabilityPolicy(t *testing.T) {
+func TestLocalDataPlane_DropVersionData(t *testing.T) {
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{IndexManager: &stubIndexStore{}})
-	ctx := context.Background()
 
-	if err := dp.DropVersionData(ctx, "kb-1", 1); err == nil {
+	if err := dp.DropVersionData(context.Background(), "kb-1", 1); err == nil {
 		t.Error("DropVersionData is not wired yet (storage-cluster work)")
-	}
-	if err := dp.SetDurabilityPolicy(ctx, "kb-1", DurabilityPolicy{Replicas: 3}); err != nil {
-		t.Errorf("SetDurabilityPolicy is accepted (no-op until stage ④): %v", err)
-	}
-}
-
-func TestAvailabilityString(t *testing.T) {
-	cases := map[Availability]string{
-		AvailabilityAvailable:   "AVAILABLE",
-		AvailabilityDegraded:    "DEGRADED",
-		AvailabilityUnavailable: "UNAVAILABLE",
-		Availability(99):        "UNKNOWN",
-	}
-	for state, want := range cases {
-		if got := state.String(); got != want {
-			t.Errorf("Availability(%d).String() = %s, want %s", int(state), got, want)
-		}
 	}
 }
 

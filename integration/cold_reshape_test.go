@@ -31,12 +31,12 @@ func waitUntil(timeout time.Duration, cond func() bool) bool {
 
 // wireSyncPullDataOnly is wireSyncPull with the §8.6b data-only pull: a node
 // fetches the version's documents and chunks but never builds an index of its
-// own, so its only route to an index is the leader's §8.4 distribution — which
-// is exactly the artifact the cold reshape later replaces.
+// own, so its only route to an index is pulling the owner's artifact (§8.4) —
+// which is exactly the artifact the cold reshape later replaces.
 //
 // The distinction matters for the cold-reshape test for a second reason: a node
 // that builds on its own has its (kb, version) entry marked "loading" for as
-// long as that build keeps retrying, and the cold evaluator deliberately leaves
+// long as that build keeps retrying, and the cold policy deliberately leaves
 // such a version alone (§8.6a: the build in flight decides its own shape). With
 // data-only pulls the reshaping node is never stuck behind its own build.
 func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) {
@@ -73,7 +73,7 @@ func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) 
 	})
 }
 
-// TestRealStack_ColdRebuildRedistributesTheArtifact is the cluster-level proof
+// TestRealStack_ColdRebuildReplacesOnlyTheLocalArtifact is the cluster-level proof
 // of the last piece of Stratum_设计文档v13.md §8.6(a): a version that has gone
 // cold is rebuilt in the graph-free shape, and §8.4's callback chain is what
 // puts that rebuild through — no new channel.
@@ -87,7 +87,8 @@ func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) 
 // (§8.6a), so the cost is a resource-suboptimal (still graphed) artifact on the
 // replica — never an unservable version.
 //
-// Only node 1 runs the cold evaluator; node 2 never reshapes anything by itself.
+// Only node 1 runs the cold policy (a non-zero threshold); node 2 never reshapes
+// anything by itself.
 // That is what makes the assertions meaningful in both directions: node 1's
 // smaller file can only have come from the reshape, and node 2's UNCHANGED file
 // can only have come from the probe having skipped it — node 2 has no other
@@ -97,7 +98,7 @@ func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) 
 // phases are ordered: the version is graphed and distributed, then it ages
 // (nobody queries it, which is exactly what makes it cold), then node 1 reshapes
 // it.
-func TestRealStack_ColdRebuildRedistributesTheArtifact(t *testing.T) {
+func TestRealStack_ColdRebuildReplacesOnlyTheLocalArtifact(t *testing.T) {
 	vecAddrs := [2]string{
 		startVecstoreServerForTest(t),
 		startVecstoreServerForTest(t),
@@ -126,7 +127,6 @@ func TestRealStack_ColdRebuildRedistributesTheArtifact(t *testing.T) {
 			// generous enough that the first distribution is long settled
 			// before anything is considered cold.
 			cfg.coldThreshold = 10 * time.Second
-			cfg.coldSweepInterval = 200 * time.Millisecond
 		}
 		nodes[i] = newRealNodeWithAddrsAndDirOpts(t, int64(i+1), peers, vecAddrs[i], embedURL,
 			raftAddrs[i], grpcAddrs[i], baseDirs[i], cfg)
@@ -157,49 +157,50 @@ func TestRealStack_ColdRebuildRedistributesTheArtifact(t *testing.T) {
 	versionID := resp.GetVersionId()
 	t.Logf("created %s v%d", kbID, versionID)
 
-	// Node 1's artifact is where the cold policy starts counting: it was just
-	// built or received, so the threshold is still ahead of us.
-	if data, _ := waitForIndex(t, baseDirs[0], kbID, versionID, 60*time.Second); data == nil {
-		t.Fatal("node 1 never got an index for the version")
-	}
-
-	// Both nodes must agree on the first (graphed) artifact before we start
-	// watching for a change: otherwise a late independent build could be
-	// mistaken for the reshape. This is also the §8.4 distribution working —
-	// node 2 has no other way to get an index — and it is the one moment when
-	// byte-for-byte equality between the nodes is expected.
-	if !waitUntil(30*time.Second, func() bool {
-		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
-		b, _ := indexFileOf(baseDirs[1], kbID, versionID)
-		return len(a) > 0 && bytes.Equal(a, b)
-	}) {
-		t.Fatal("the two nodes never converged on the first artifact")
-	}
+	// Node 1 ends up holding an artifact, by either of the two legitimate routes,
+	// and the test does not care which: it builds one if it was the node the
+	// request reached, and fetches a peer's copy otherwise. Nothing pushes it —
+	// distribution is pull-only, and the router decides which nodes are asked at
+	// all (§8.4 owner sets).
+	//
+	// The shared helper waits for either route; which one applies to node 1
+	// depends on routing and on who built first, and this test does not need to
+	// know.
+	//
+	// However it arrived, this is also where the cold policy starts counting for
+	// node 1: the artifact has just appeared here, so the threshold is ahead.
+	nodes[0].waitVersionReady(ctx, kbID, versionID)
 	graphed, _ := indexFileOf(baseDirs[0], kbID, versionID)
-	t.Logf("graphed index: %d bytes (both nodes)", len(graphed))
+	// NO byte-for-byte comparison against node 2 here any more. It used to hold
+	// (and to be the §8.4 evidence) while a build PUSHED its artifact; with
+	// distribution pull-only, node 1's copy is node 2's only when node 1 fetched
+	// it, which is one of two legitimate outcomes. The assertion that still
+	// matters is later: the reshape must change node 1's artifact and only
+	// node 1's.
+	t.Logf("graphed index on node 1: %d bytes", len(graphed))
 
-	// §8.6a reshapes a version that is neither active nor the end of the chain —
-	// the end is what serves when the control layer has no active pointer, which
-	// is the normal state in this stack. So the reshaped version has to stop
-	// being the end first. Its tail is created here rather than up front because
-	// a version cannot parent another while it is still PENDING.
-	tail, err := leader.KB.CreateVersion(ctx, &pb.CreateVersionRequest{
-		KnowledgeBaseId: kbID,
-		ParentVersionId: versionID,
-		Changes: []*pb.DocChange{{
-			Op:      pb.ChangeOp_CHANGE_OP_ADD,
-			DocId:   "doc-tail",
-			Content: "tail version so the reshaped one is not the chain end",
-		}},
-	})
-	if err != nil {
-		t.Fatalf("CreateVersion (tail): %v", err)
-	}
-	t.Logf("created tail %s v%d", kbID, tail.GetVersionId())
+	// §8.6a: the SHAPE is chosen when a build happens, from how long this node has
+	// gone without querying the version. A reshape is therefore not something a
+	// background timer does — it is what the NEXT build of an idle version looks
+	// like. Two things follow for this test:
+	//
+	//   - the version must sit idle for longer than the threshold (10 s here), which
+	//     is real time the test has to spend;
+	//   - it must then be BUILT again, which means asking for it.
+	//
+	// Nothing shields this version: the active pointer is only ever set by
+	// RollbackVersion, and this stack never rolls back.
+	time.Sleep(12 * time.Second)
 
-	// The version goes cold on node 1 and is rebuilt graph-free. The artifact
-	// must differ from, and be smaller than, the graphed one: what the reshape
-	// drops is precisely the HNSW graph (edges + level arrays), which the
+	// Ask for it the way a caller would. The build that follows reads the access
+	// record BEFORE this query is stamped, so it sees the twelve idle seconds and
+	// chooses the graph-free shape.
+	vec := make([]float32, 16)
+	vec[0] = 1
+	nodes[0].queryTolerant(ctx, kbID, versionID, vec, 5)
+
+	// The artifact must differ from, and be smaller than, the graphed one: what the
+	// reshape drops is precisely the HNSW graph (edges + level arrays), which the
 	// graph-free form does not carry.
 	if !waitUntil(90*time.Second, func() bool {
 		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
@@ -207,44 +208,41 @@ func TestRealStack_ColdRebuildRedistributesTheArtifact(t *testing.T) {
 	}) {
 		now, _ := indexFileOf(baseDirs[0], kbID, versionID)
 		other, _ := indexFileOf(baseDirs[1], kbID, versionID)
-		t.Fatalf("node 1 never reshaped the cold version into a smaller artifact: n1=%d n2=%d graphed=%d",
+		t.Fatalf("node 1 never rebuilt the idle version into a smaller artifact: n1=%d n2=%d graphed=%d",
 			len(now), len(other), len(graphed))
 	}
 	reshaped, _ := indexFileOf(baseDirs[0], kbID, versionID)
 	t.Logf("reshaped index: %d bytes (graphed was %d)", len(reshaped), len(graphed))
 
-	// The reshape stays node 1's. Allowing a little time for the redistribution
-	// the build callback drives, node 1 must hold the reshaped bytes — and node 2
-	// must NOT: it already held an artifact when the reshaped one was offered, so
-	// §8.4(a)'s probe answers AlreadyExists and the ship is skipped
-	// (docs/index-push-probe-plan.md §3).
+	// The reshape stays node 1's, and it stays there for a structural reason
+	// rather than a probe answer: nothing pushes a rebuilt artifact any more.
 	//
-	// Asserting node 2's file is UNCHANGED is asserting the probe, and it is
-	// stable rather than racy: node 2 is data-only (wireSyncPullDataOnly) and
-	// never builds, reshapes or receives a second copy for this version.
+	// Node 2 is data-only (wireSyncPullDataOnly): it never builds and never
+	// reshapes. So its artifact can only be one of two things — the copy it
+	// fetched from node 1 before the reshape (when node 1 was the builder), or
+	// nothing at all (when node 2 was the builder and node 1 fetched it). What it
+	// must never be is the RESHAPED bytes.
 	if !waitUntil(30*time.Second, func() bool {
 		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
-		b, _ := indexFileOf(baseDirs[1], kbID, versionID)
-		return bytes.Equal(a, reshaped) && len(b) > 0
+		return bytes.Equal(a, reshaped)
 	}) {
 		a, _ := indexFileOf(baseDirs[0], kbID, versionID)
-		b, _ := indexFileOf(baseDirs[1], kbID, versionID)
-		t.Fatalf("node 1 never published the reshaped artifact: n1=%d n2=%d reshaped=%d",
-			len(a), len(b), len(reshaped))
+		t.Fatalf("node 1 never settled on the reshaped artifact: n1=%d reshaped=%d", len(a), len(reshaped))
 	}
-	if node2, _ := indexFileOf(baseDirs[1], kbID, versionID); !bytes.Equal(node2, graphed) {
-		t.Errorf("node 2's artifact is now %d bytes (graphed was %d): §8.4(a)'s probe was supposed to skip a replica that already holds the version, leaving it with the shape it has",
-			len(node2), len(graphed))
-	} else {
-		t.Logf("node 2 kept its graphed artifact (%d bytes): the probe skipped a ship it did not need", len(node2))
+	node2, _ := indexFileOf(baseDirs[1], kbID, versionID)
+	switch {
+	case bytes.Equal(node2, reshaped):
+		t.Errorf("node 2 holds the RESHAPED artifact (%d bytes): a rebuilt artifact must not leave the node that rebuilt it", len(node2))
+	case len(node2) == 0:
+		t.Logf("node 2 holds no artifact for this version — it never built one, and nothing pushed one to it")
+	default:
+		t.Logf("node 2 kept the artifact it had (%d bytes), not the reshaped one", len(node2))
 	}
 
-	// The point of accepting that skip is that it costs nothing a reader can
-	// see: §8.6a makes the two shapes retrieval-equivalent, so both nodes must
-	// still answer for the reshaped version — one from the graph-free artifact,
-	// the other from the graphed one it kept.
-	vec := make([]float32, 16)
-	vec[0] = 1
+	// The point of letting the shapes differ is that it costs nothing a reader can
+	// see: §8.6a makes the two retrieval-equivalent, so both nodes must still
+	// answer for the reshaped version — one from the graph-free artifact it built,
+	// the other from whatever it has (its own copy, or a lazy build on the spot).
 	for _, n := range nodes {
 		results := n.queryTolerant(ctx, kbID, versionID, vec, 5)
 		if len(results) == 0 {

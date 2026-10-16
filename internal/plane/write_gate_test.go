@@ -100,42 +100,6 @@ func TestWriteLimiter_LimitsArePerKnowledgeBase(t *testing.T) {
 	}
 }
 
-// A declared per-KB cap replaces the default, and clearing it restores the
-// default without stranding the count.
-func TestWriteLimiter_SetLimitOverridesPerKnowledgeBase(t *testing.T) {
-	l := newWriteLimiter(3)
-	l.SetLimit("kb-1", 1)
-
-	ctx := context.Background()
-	if err := l.Acquire(ctx, "kb-1"); err != nil {
-		t.Fatal(err)
-	}
-	blocked := make(chan struct{})
-	go func() {
-		defer close(blocked)
-		_ = l.Acquire(ctx, "kb-1")
-	}()
-	select {
-	case <-blocked:
-		t.Fatal("the override (1) was not enforced")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	l.Release("kb-1")
-	<-blocked
-	// The woken goroutine took the slot and never gave it back; hand it over
-	// before probing the restored default.
-	l.Release("kb-1")
-
-	// Clearing the override returns kb-1 to the default of 3.
-	l.SetLimit("kb-1", 0)
-	for i := 0; i < 3; i++ {
-		if err := l.Acquire(ctx, "kb-1"); err != nil {
-			t.Fatalf("acquire under the restored default: %v", err)
-		}
-	}
-}
-
 // Releasing without a slot in hand must not drive the count negative and
 // silently widen the real limit.
 func TestWriteLimiter_ReleaseWithoutAcquireIsIgnored(t *testing.T) {

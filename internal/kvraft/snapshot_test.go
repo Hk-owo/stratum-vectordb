@@ -83,20 +83,11 @@ func TestSnapshot_LocalCompactionRoundTrip(t *testing.T) {
 		t.Fatalf("Propose after snapshot: %v", err)
 	}
 	_ = readUntilIndex(t, applyCh, idx, 5*time.Second)
-
-	// Second compaction: TrimLog path (no new snapshot data persisted).
-	trimAt := rf.LastApplied()
-	rf.TrimLog(trimAt)
-	rf.mu.Lock()
-	if rf.log[0].Index != trimAt {
-		t.Errorf("after TrimLog: log[0].Index = %d, want %d", rf.log[0].Index, trimAt)
-	}
-	rf.mu.Unlock()
 }
 
 // TestSnapshot_BookkeepingCovers the remaining snapshot bookkeeping
 // helpers (SnapshotDone / InstallDone / ResetSnapshotPending) plus the
-// no-op guards on Snapshot/TrimLog for indices outside the log.
+// no-op guards on Snapshot for indices outside the log.
 func TestSnapshot_Bookkeeping(t *testing.T) {
 	rf, _, applyCh := newTestRaft(t, 1, WithMaxLogLength(64), WithLogger(zap.NewNop()))
 	rf.Run()
@@ -110,7 +101,6 @@ func TestSnapshot_Bookkeeping(t *testing.T) {
 	before := len(rf.log)
 	rf.mu.Unlock()
 	rf.Snapshot(0, []byte("x"))              // index 0 <= log[0].Index → no-op
-	rf.TrimLog(0)                            // no-op
 	rf.Snapshot(base+1_000_000, []byte("x")) // beyond the log end → no-op
 	rf.mu.Lock()
 	if len(rf.log) != before {
@@ -145,27 +135,15 @@ func TestSnapshot_Bookkeeping(t *testing.T) {
 	rf.mu.Unlock()
 }
 
-// TestSnapshot_AccessorsAndStateName covers NodeID / stateName and the
-// trivial option setters (WithLogger, WithMaxLogLength).
-func TestSnapshot_AccessorsAndStateName(t *testing.T) {
+// TestSnapshot_Accessors covers NodeID and the trivial option setters
+// (WithLogger, WithMaxLogLength).
+func TestSnapshot_Accessors(t *testing.T) {
 	rf, _, _ := newTestRaft(t, 7, WithLogger(zap.NewNop()), WithMaxLogLength(16))
 	if rf.NodeID() != 7 {
 		t.Errorf("NodeID = %d, want 7", rf.NodeID())
 	}
 	if rf.ClusterSize() != 1 {
 		t.Errorf("ClusterSize = %d, want 1", rf.ClusterSize())
-	}
-	if got := stateName(Leader); got != "Leader" {
-		t.Errorf("stateName(Leader) = %q", got)
-	}
-	if got := stateName(Candidate); got != "Candidate" {
-		t.Errorf("stateName(Candidate) = %q", got)
-	}
-	if got := stateName(Follower); got != "Follower" {
-		t.Errorf("stateName(Follower) = %q", got)
-	}
-	if got := stateName(999); got == "Leader" || got == "Candidate" || got == "Follower" {
-		t.Errorf("stateName(999) = %q, want Unknown", got)
 	}
 	// NodeID / accessor smoke: node still constructs and stops cleanly.
 	rf.Stop()
