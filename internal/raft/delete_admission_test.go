@@ -51,7 +51,7 @@ func TestStateMachine_Apply_MarkVersionDeleting_DataTerminalVersionIsDeletable(t
 
 	// v1 is the active version, so the delete below cannot be refused for that.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
 
 	// v2: the write never landed, so the control layer recorded the terminal verdict
@@ -95,9 +95,9 @@ func TestStateMachine_Apply_MarkVersionDeleting_DataTerminalSurvivorIsAllowed(t 
 
 	// Chain A: root -> a1 (READY, to be deleted) -> a2 (data-side verdict).
 	rootA := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: rootA.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, rootA.VersionID)
 	a1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: rootA.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: a1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, a1.VersionID)
 	a2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: a1.VersionID}, w, zap.NewNop())
 	if res := sm.apply(ctx, command{
 		Type: cmdMarkVersionFailedPermanent, KBID: "kb-1", VersionID: a2.VersionID,
@@ -108,9 +108,9 @@ func TestStateMachine_Apply_MarkVersionDeleting_DataTerminalSurvivorIsAllowed(t 
 
 	// Chain B is the control: same shape, but the survivor is still writing.
 	rootB := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: rootB.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, rootB.VersionID)
 	b1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: rootB.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: b1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, b1.VersionID)
 	sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: b1.VersionID}, w, zap.NewNop())
 
 	// Chain B: the survivor may still be writing, so the splice is refused.

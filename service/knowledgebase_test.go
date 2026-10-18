@@ -223,6 +223,7 @@ func TestKnowledgeBaseService_RollbackVersion(t *testing.T) {
 		t.Fatalf("create v1: %v", err)
 	}
 	// It is PENDING by default; mark it as READY to allow rollback.
+	_ = h.raftNode.ProposeMarkVersionDataDurable(context.Background(), v1)
 	if err := h.raftNode.ProposeUpdateVersionStatus(context.Background(), v1, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v1 READY: %v", err)
 	}
@@ -426,6 +427,7 @@ func TestKnowledgeBaseService_DeleteVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create v1: %v", err)
 	}
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, v1)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v1 READY: %v", err)
 	}
@@ -437,6 +439,7 @@ func TestKnowledgeBaseService_DeleteVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create v2: %v", err)
 	}
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, v2)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v2 READY: %v", err)
 	}
@@ -508,6 +511,7 @@ func kbSvcTestHarnessWithChain(t *testing.T, h *kbSvcTestHarness) (string, int64
 	}
 	// READY before anything forks off it: the state machine rejects a PENDING
 	// parent, so the chain can only grow once v1 has been built.
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, v1)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v1 READY: %v", err)
 	}
@@ -516,6 +520,7 @@ func kbSvcTestHarnessWithChain(t *testing.T, h *kbSvcTestHarness) (string, int64
 		t.Fatalf("create v2: %v", err)
 	}
 	for _, v := range []int64{v1, v2} {
+		_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, v)
 		if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v, types.IndexStatusReady, 0); err != nil {
 			t.Fatalf("v%d READY: %v", v, err)
 		}
@@ -524,6 +529,7 @@ func kbSvcTestHarnessWithChain(t *testing.T, h *kbSvcTestHarness) (string, int64
 	if err != nil {
 		t.Fatalf("create v3: %v", err)
 	}
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, v3)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v3 READY: %v", err)
 	}

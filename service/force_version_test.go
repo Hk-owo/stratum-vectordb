@@ -46,6 +46,7 @@ func TestListFailedVersions_ReportsEveryTerminalVerdict(t *testing.T) {
 	dataV := mustVersion(t, h, "kb-1")
 	indexV := mustVersion(t, h, "kb-1")
 	healthyV := mustVersion(t, h, "kb-1")
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, healthyV)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, healthyV, types.IndexStatusReady, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -189,6 +190,7 @@ func TestForceRetryVersion_Refusals(t *testing.T) {
 	if err := h.raftNode.ProposeMarkVersionFailedPermanent(ctx, "kb-1", dataV, types.FailureSideData, "data unavailable", 5); err != nil {
 		t.Fatal(err)
 	}
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, healthyV)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, healthyV, types.IndexStatusReady, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -263,6 +265,7 @@ func TestForceAbandonVersion_Refusals(t *testing.T) {
 		h.svc.SetDeleteVersionCoordinator(coordinator.NewMockDeleteVersionCoordinator())
 		mustKB(t, h, "kb-1")
 		versionID := mustVersion(t, h, "kb-1")
+		_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, versionID)
 		if err := h.raftNode.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, 0); err != nil {
 			t.Fatal(err)
 		}

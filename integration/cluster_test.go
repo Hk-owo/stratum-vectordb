@@ -157,6 +157,8 @@ func TestMultiNode_RaftNodeImpl_3Node(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProposeCreateVersion: %v", err)
 	}
+	// Data durable first: the parent gate reads the DATA side.
+	_ = leader.impl.ProposeMarkVersionDataDurable(ctx, vID)
 	_ = leader.impl.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0)
 
 	// Wait for replication.

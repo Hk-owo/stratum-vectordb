@@ -21,6 +21,26 @@ func newTestSM(t *testing.T) (*stateMachine, *wal.MockWAL) {
 	return newStateMachine(), w
 }
 
+// markIndexReady puts a version into the state tests use to mean "complete":
+// data durable, then index ready — in that order, because that is the order
+// production reaches it in (the data lands during the write; the index is built
+// later, when a query asks for it).
+//
+// The data half is not optional any more: applyCreateVersion's parent gate reads
+// the DATA side, since "may I build on this version" depends on the parent's
+// document set and not on a read-side artifact whose placement follows query
+// traffic.
+func markIndexReady(t *testing.T, sm *stateMachine, w wal.WAL, versionID int64) {
+	t.Helper()
+	ctx := context.Background()
+	if res := sm.apply(ctx, command{Type: cmdMarkDataDurable, VersionID: versionID}, w, zap.NewNop()); res.Err != nil {
+		t.Fatalf("mark v%d data durable: %v", versionID, res.Err)
+	}
+	if res := sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: versionID, Status: types.IndexStatusReady}, w, zap.NewNop()); res.Err != nil {
+		t.Fatalf("mark v%d index ready: %v", versionID, res.Err)
+	}
+}
+
 func testKB(kbID string) types.KnowledgeBaseMeta {
 	return types.KnowledgeBaseMeta{
 		KBID:             kbID,
@@ -152,13 +172,13 @@ func TestStateMachine_Apply_CreateVersion_Constraints(t *testing.T) {
 	// there are no forks (see Stratum_设计文档v13.md §6).
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-3"))}, w, zap.NewNop())
 	root := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: root.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, root.VersionID)
 
 	first := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3", ParentVersionID: root.VersionID}, w, zap.NewNop())
 	if first.Err != nil {
 		t.Fatalf("first child of a READY root failed: %v", first.Err)
 	}
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: first.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, first.VersionID)
 
 	second := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3", ParentVersionID: root.VersionID}, w, zap.NewNop())
 	if !errors.Is(second.Err, stratumerrors.ErrInvalidParentVersion) {
@@ -176,14 +196,14 @@ func TestStateMachine_Apply_CreateVersion_AllocatesAndWritesWAL(t *testing.T) {
 
 	// Mark parent READY so a child can be forked.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 
 	// Chained children get distinct monotonic IDs.
 	c1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
 	if c1.Err != nil {
 		t.Fatalf("first child: %v", c1.Err)
 	}
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: c1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, c1.VersionID)
 	c2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: c1.VersionID}, w, zap.NewNop())
 	if c2.Err != nil {
 		t.Fatalf("second child: %v", c2.Err)
@@ -271,7 +291,7 @@ func TestStateMachine_SerializeRestore_RoundTrip(t *testing.T) {
 	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v.VersionID)
 
 	data, err := sm.serialize()
 	if err != nil {
@@ -402,11 +422,11 @@ func TestStateMachine_Apply_MarkVersionDeleting(t *testing.T) {
 
 	// v1: active (set via Rollback below), READY.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
 	// v2: child of v1, READY.
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 
 	// Active version must be rejected.
 	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v1.VersionID}, w, zap.NewNop())
@@ -459,11 +479,11 @@ func TestStateMachine_Apply_MarkVersionDeleting_Recursive(t *testing.T) {
 
 	// Chain v1 -> v2 -> v3, all READY; v1 active.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 	v3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v3.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
 
 	// Delete v2: v2 and v3 both marked; v1 untouched.
@@ -483,9 +503,9 @@ func TestStateMachine_Apply_MarkVersionDeleting_Recursive(t *testing.T) {
 	// KB: v4 -> v5, v5 active.
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-2"))}, w, zap.NewNop())
 	v4 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v4.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v4.VersionID)
 	v5 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: v4.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v5.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v5.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-2", TargetVersionID: v5.VersionID}, w, zap.NewNop())
 
 	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-2", VersionID: v4.VersionID}, w, zap.NewNop())
@@ -500,9 +520,9 @@ func TestStateMachine_Apply_MarkVersionDeleting_Recursive(t *testing.T) {
 	// kb-3: v6 -> v7 -> v8 (v8 stays PENDING), v6 active.
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-3"))}, w, zap.NewNop())
 	v6 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v6.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v6.VersionID)
 	v7 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3", ParentVersionID: v6.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v7.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v7.VersionID)
 	v8 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3", ParentVersionID: v7.VersionID}, w, zap.NewNop()) // stays PENDING
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-3", TargetVersionID: v6.VersionID}, w, zap.NewNop())
 
@@ -522,7 +542,7 @@ func TestStateMachine_Apply_RemoveVersionMeta(t *testing.T) {
 	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
 
 	res := sm.apply(ctx, command{Type: cmdRemoveVersionMeta, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
@@ -562,10 +582,10 @@ func TestStateMachine_Apply_Rollback_RejectsDeleting(t *testing.T) {
 	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 	sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
 
 	res := sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v2.VersionID}, w, zap.NewNop())
@@ -584,10 +604,10 @@ func TestStateMachine_Apply_CreateVersion_RejectsDeletingParent(t *testing.T) {
 	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 	sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID}, w, zap.NewNop())
 
 	res := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
@@ -606,11 +626,11 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorOfActive(t *testing.T) {
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 	v3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v3.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v3.VersionID}, w, zap.NewNop())
 
 	// Parent of the active version: rejected.
@@ -644,14 +664,14 @@ func TestStateMachine_Apply_MarkVersionDeleting_SingleSplicesChildren(t *testing
 
 	// v1 -> v2 -> v3 -> v4 (strictly linear). v1 is active.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v1.VersionID}, w, zap.NewNop())
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 	v3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v3.VersionID)
 	v4 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v3.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v4.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v4.VersionID)
 
 	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v2.VersionID, Mode: types.VersionDeleteSingle}, w, zap.NewNop())
 	if res.Err != nil {
@@ -700,11 +720,11 @@ func TestStateMachine_Apply_MarkVersionDeleting_Ancestors(t *testing.T) {
 	// v1 -> v2 -> v3 (strictly linear, so no sibling branches exist).
 	// v3 is active.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 	v3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v3.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v3.VersionID}, w, zap.NewNop())
 
 	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v3.VersionID, Mode: types.VersionDeleteAncestors}, w, zap.NewNop())
@@ -736,10 +756,10 @@ func TestStateMachine_Apply_MarkVersionDeleting_Ancestors(t *testing.T) {
 	// must not touch v3's parent pointer.
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-2"))}, w, zap.NewNop())
 	o1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: o1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, o1.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-2", TargetVersionID: o1.VersionID}, w, zap.NewNop())
 	o2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: o1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: o2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, o2.VersionID)
 
 	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-2", VersionID: o2.VersionID, Mode: types.VersionDeleteAncestors}, w, zap.NewNop())
 	if !errors.Is(res.Err, stratumerrors.ErrVersionIsActive) {
@@ -762,9 +782,9 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorsIsNoopOnBase(t *testing
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 
 	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v1.VersionID, Mode: types.VersionDeleteAncestors}, w, zap.NewNop())
 	if res.Err != nil {
@@ -796,11 +816,11 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorsReplayAndPending(t *tes
 
 	// v1 -> v2 -> v3, all READY; v3 active.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 	v3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v2.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v3.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v3.VersionID}, w, zap.NewNop())
 
 	ancestors := command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v3.VersionID, Mode: types.VersionDeleteAncestors}
@@ -829,9 +849,9 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorsReplayAndPending(t *tes
 	// kb-2: o1 -> o2 -> o3, o3 left PENDING and active.
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-2"))}, w, zap.NewNop())
 	o1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: o1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, o1.VersionID)
 	o2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: o1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: o2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, o2.VersionID)
 	o3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: o2.VersionID}, w, zap.NewNop()) // stays PENDING
 
 	res = sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-2", VersionID: o3.VersionID, Mode: types.VersionDeleteAncestors}, w, zap.NewNop())
@@ -859,9 +879,9 @@ func TestStateMachine_Apply_MarkVersionDeleting_SingleSpliceEdgeCases(t *testing
 
 	// v1 is the base; v2 is active so v1 can be removed.
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v2.VersionID}, w, zap.NewNop())
 
 	res := sm.apply(ctx, command{Type: cmdMarkVersionDeleting, KBID: "kb-1", VersionID: v1.VersionID, Mode: types.VersionDeleteSingle}, w, zap.NewNop())
@@ -876,11 +896,11 @@ func TestStateMachine_Apply_MarkVersionDeleting_SingleSpliceEdgeCases(t *testing
 	// to a version whose metadata is about to be removed.
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-2"))}, w, zap.NewNop())
 	p1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: p1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, p1.VersionID)
 	p2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: p1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: p2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, p2.VersionID)
 	p3 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-2", ParentVersionID: p2.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: p3.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, p3.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-2", TargetVersionID: p3.VersionID}, w, zap.NewNop())
 	// Simulate p1 caught mid-cleanup (a concurrent SUBTREE delete already
 	// marked it, its metadata not yet removed by RemoveVersionMeta).
@@ -908,9 +928,9 @@ func TestStateMachine_Apply_MarkVersionDeleting_AncestorsHealsBrokenChain(t *tes
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 
 	v1 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v1.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v1.VersionID)
 	v2 := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: v1.VersionID}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v2.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v2.VersionID)
 	sm.apply(ctx, command{Type: cmdRollback, KBID: "kb-1", TargetVersionID: v2.VersionID}, w, zap.NewNop())
 
 	// v1's metadata is already gone while v2 still points at it.
@@ -976,7 +996,10 @@ func TestMockAndStateMachine_VersionDeleteModesAgree(t *testing.T) {
 				t.Fatalf("%s: sm version ID %d != mock version ID %d", name, res.VersionID, mockID)
 			}
 			if ready {
-				sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: mockID, Status: types.IndexStatusReady}, w, zap.NewNop())
+				markIndexReady(t, sm, w, mockID)
+				if err := mock.ProposeMarkVersionDataDurable(ctx, mockID); err != nil {
+					t.Fatalf("mock %s data durable: %v", name, err)
+				}
 				if err := mock.ProposeUpdateVersionStatus(ctx, mockID, types.IndexStatusReady, 0); err != nil {
 					t.Fatalf("mock %s READY: %v", name, err)
 				}

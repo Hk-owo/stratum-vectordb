@@ -299,6 +299,7 @@ func TestAdmin_WarmupVersion_Success(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, vID)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -360,6 +361,7 @@ func TestAdmin_WarmupVersion_TriggerBuildError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = rn.ProposeMarkVersionDataDurable(ctx, vID)
 	if err := rn.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -460,6 +462,7 @@ func TestAdmin_RebuildIndex_RefusesVersionFromAnotherKB(t *testing.T) {
 	}
 	// A version someone is actually serving, which is what makes the status change
 	// worth attacking.
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, otherKBsVersion)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, otherKBsVersion, types.IndexStatusReady, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -501,6 +504,7 @@ func TestAdmin_WarmupVersion_RefusesVersionFromAnotherKB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, otherKBsVersion)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, otherKBsVersion, types.IndexStatusReady, 0); err != nil {
 		t.Fatal(err)
 	}

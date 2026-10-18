@@ -229,6 +229,7 @@ func TestAwaitVersion_DeletingStopsTheWait(t *testing.T) {
 	ctx := context.Background()
 	// A version has to be settled before DeleteVersion will take it, and
 	// deleting it must not make the waiter sit out its whole window.
+	_ = rn.ProposeMarkVersionDataDurable(ctx, v)
 	if err := rn.ProposeUpdateVersionStatus(ctx, v, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("READY: %v", err)
 	}
@@ -667,6 +668,7 @@ func TestAwaitVersion_WakesOnTheWatcherInsteadOfPolling(t *testing.T) {
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)
+		_ = rn.ProposeMarkVersionDataDurable(context.Background(), v)
 		_ = rn.ProposeUpdateVersionStatus(context.Background(), v, types.IndexStatusReady, 0)
 		watcher.signal()
 	}()
@@ -704,6 +706,7 @@ func TestAwaitVersion_StillWorksWithoutAWatcher(t *testing.T) {
 
 	go func() {
 		time.Sleep(30 * time.Millisecond)
+		_ = rn.ProposeMarkVersionDataDurable(context.Background(), v)
 		_ = rn.ProposeUpdateVersionStatus(context.Background(), v, types.IndexStatusReady, 0)
 	}()
 

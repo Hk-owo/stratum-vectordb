@@ -91,7 +91,7 @@ func TestStateMachine_Apply_RetryVersion_Refusals(t *testing.T) {
 
 	t.Run("index side is not terminal", func(t *testing.T) {
 		sm, w, versionID := retryFixture(t)
-		sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: versionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+		markIndexReady(t, sm, w, versionID)
 
 		res := sm.apply(ctx, command{Type: cmdRetryVersion, KBID: "kb-1", VersionID: versionID, FailureSide: types.FailureSideIndex}, w, zap.NewNop())
 		if !errors.Is(res.Err, stratumerrors.ErrVersionNotFailedPermanent) {

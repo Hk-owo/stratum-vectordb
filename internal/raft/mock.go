@@ -152,8 +152,12 @@ func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, pa
 		if parent.KBID != kbID {
 			return 0, fmt.Errorf("parent version %d belongs to a different knowledge base: %w", parentVersionID, stratumerrors.ErrInvalidParentVersion)
 		}
-		if parent.IndexStatus == types.IndexStatusPending {
-			return 0, fmt.Errorf("parent version %d is PENDING: %w", parentVersionID, stratumerrors.ErrInvalidParentVersion)
+		if parent.DataStatus != types.DataStatusDurable {
+			// Same rule as the real state machine: the parent gate reads the DATA
+			// side. The index is a read-side product built on demand, so requiring
+			// it here would make the two implementations disagree.
+			return 0, fmt.Errorf("parent version %d has no durable data (data_status=%s): %w",
+				parentVersionID, parent.DataStatus.String(), stratumerrors.ErrInvalidParentVersion)
 		}
 		if parent.Deleting {
 			return 0, fmt.Errorf("parent version %d is being deleted: %w", parentVersionID, stratumerrors.ErrInvalidParentVersion)

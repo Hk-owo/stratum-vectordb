@@ -223,6 +223,13 @@ func mustCreateKB(t *testing.T, r *MockRaftNode, kbID string) {
 
 func mustUpdateStatus(t *testing.T, r *MockRaftNode, versionID int64, status types.IndexStatus) {
 	t.Helper()
+	// Same reasoning as mustUpdateStatusImpl: READY implies the data landed first,
+	// and the parent gate reads the DATA side now.
+	if status == types.IndexStatusReady {
+		if err := r.ProposeMarkVersionDataDurable(proposeCtx(t), versionID); err != nil {
+			t.Fatalf("ProposeMarkVersionDataDurable(%d): %v", versionID, err)
+		}
+	}
 	if err := r.ProposeUpdateVersionStatus(proposeCtx(t), versionID, status, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus(%d, %v): %v", versionID, status, err)
 	}

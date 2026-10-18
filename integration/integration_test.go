@@ -427,6 +427,10 @@ func TestIntegration_DeleteVersion(t *testing.T) {
 		t.Fatalf("CreateVersion(v2): %v", err)
 	}
 	v2 := v2Resp.VersionId
+	// Data durable first: the parent gate reads the DATA side (see applyCreateVersion).
+	// The mock cluster does not run a storage write path, so the test states the fact
+	// directly, exactly as it already states the index side.
+	cluster.RaftNode.ProposeMarkVersionDataDurable(ctx, v2)
 	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady, 0)
 
 	v3Resp, err := cluster.KBClient.CreateVersion(ctx, &pb.CreateVersionRequest{
@@ -440,6 +444,7 @@ func TestIntegration_DeleteVersion(t *testing.T) {
 		t.Fatalf("CreateVersion(v3): %v", err)
 	}
 	v3 := v3Resp.VersionId
+	cluster.RaftNode.ProposeMarkVersionDataDurable(ctx, v3)
 	cluster.RaftNode.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady, 0)
 
 	// Deleting the active version is rejected.
@@ -873,6 +878,7 @@ func TestIntegration_StuckVersionsInSystemStatus(t *testing.T) {
 // the in-process suites and the real-stack ones.
 type rootVersionProposer interface {
 	ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64, opts ...raft.ProposeOption) (int64, error)
+	ProposeMarkVersionDataDurable(ctx context.Context, versionID int64) error
 	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error
 }
 
@@ -890,6 +896,12 @@ func seedRootVersion(t testing.TB, rn rootVersionProposer, ctx context.Context, 
 	v, err := rn.ProposeCreateVersion(ctx, kbID, 0)
 	if err != nil {
 		t.Fatalf("create the root version of %s: %v", kbID, err)
+	}
+	// Data durable first: the parent gate reads the DATA side (a new version inherits
+	// its parent's document set), so a root that is only "index READY" cannot be
+	// built on. Production reaches these in this order too.
+	if err := rn.ProposeMarkVersionDataDurable(ctx, v); err != nil {
+		t.Fatalf("mark v%d of %s data durable: %v", v, kbID, err)
 	}
 	if err := rn.ProposeUpdateVersionStatus(ctx, v, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("mark v%d of %s READY: %v", v, kbID, err)

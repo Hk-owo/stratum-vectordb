@@ -479,18 +479,21 @@ func (s *KnowledgeBaseServiceImpl) ListVersions(ctx context.Context, req *pb.Lis
 
 // RollbackVersion implements KnowledgeBaseServiceServer.
 func (s *KnowledgeBaseServiceImpl) RollbackVersion(ctx context.Context, req *pb.RollbackVersionRequest) (*pb.RollbackVersionResponse, error) {
-	// Validate the target version exists and is READY. §F: read the one version the
+	// Validate the target version has durable data. §F: read the one version the
 	// request names instead of the whole chain — the same question, answered at the
 	// shape's own cost (O(1) on a control node, a narrow read elsewhere).
+	//
+	// 门禁看**数据侧**：发布不改任何数据，它只是把"以后默认查哪一版"挪过去，
+	// 所以要求的是"这一版的内容真的在"。索引不参与判断——它是查询按需构建的
+	// 读侧产物（§8.6(b)：第一次查到谁，谁才建），把它当门禁会让数据早已落盘的
+	// 版本无法发布；而读路径本来就会为没索引的版本触发构建，并在构建完成前
+	// 返回可重试的 index_not_ready。
 	v, err := s.raftNode.GetVersion(ctx, req.KnowledgeBaseId, req.GetTargetVersionId())
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
-	if v.IndexStatus == types.IndexStatusPending {
-		return nil, status.Error(codes.FailedPrecondition, "target version is PENDING")
-	}
-	if v.IndexStatus.IsFailed() {
-		return nil, status.Error(codes.FailedPrecondition, "target version index is FAILED")
+	if v.DataStatus != types.DataStatusDurable {
+		return nil, status.Error(codes.FailedPrecondition, "target version has no durable data yet")
 	}
 
 	if err := s.raftNode.ProposeRollback(ctx, req.KnowledgeBaseId, req.TargetVersionId); err != nil {

@@ -20,6 +20,7 @@ func TestWatchVersion_FiresOnStateChanges(t *testing.T) {
 	changed, stop := impl.WatchVersion(versionID)
 	defer stop()
 
+	_ = impl.ProposeMarkVersionDataDurable(ctx, versionID)
 	if err := impl.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus: %v", err)
 	}
@@ -59,6 +60,7 @@ func TestWatchVersion_StopsAfterStop(t *testing.T) {
 	stop()
 	stop() // idempotent: the await path calls it from several exits
 
+	_ = impl.ProposeMarkVersionDataDurable(ctx, versionID)
 	if err := impl.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus: %v", err)
 	}

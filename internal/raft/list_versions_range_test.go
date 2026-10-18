@@ -17,8 +17,8 @@ func TestRaftNodeImpl_ListVersionsInRange_NarrowsTheChain(t *testing.T) {
 		t.Fatalf("ProposeCreateKB: %v", err)
 	}
 
-	// The chain is linear and a parent must not be PENDING, so each link is marked
-	// READY before the next is created.
+	// The chain is linear and a parent must have durable data, so each link is
+	// brought to READY (data durable, then index) before the next is created.
 	var ids []int64
 	for i := 0; i < 4; i++ {
 		parent := int64(0)
@@ -28,6 +28,9 @@ func TestRaftNodeImpl_ListVersionsInRange_NarrowsTheChain(t *testing.T) {
 		id, err := impl.ProposeCreateVersion(ctx, "kb-1", parent)
 		if err != nil {
 			t.Fatalf("create #%d: %v", i, err)
+		}
+		if err := impl.ProposeMarkVersionDataDurable(ctx, id); err != nil {
+			t.Fatalf("mark data durable #%d: %v", i, err)
 		}
 		if err := impl.ProposeUpdateVersionStatus(ctx, id, types.IndexStatusReady, 0); err != nil {
 			t.Fatalf("mark READY #%d: %v", i, err)

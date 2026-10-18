@@ -385,6 +385,15 @@ func mustCreateKBImpl(t *testing.T, impl *RaftNodeImpl, kbID string) {
 
 func mustUpdateStatusImpl(t *testing.T, impl *RaftNodeImpl, versionID int64, status types.IndexStatus) {
 	t.Helper()
+	// A version only reaches INDEX_READY after its data has landed, so a test that
+	// uses READY to mean "this version is complete" must mark the data side too:
+	// the parent gate reads the DATA side now (stateMachine.applyCreateVersion).
+	// Doing it here keeps every fixture as truthful as production.
+	if status == types.IndexStatusReady {
+		if err := impl.ProposeMarkVersionDataDurable(proposeCtx(t), versionID); err != nil {
+			t.Fatalf("ProposeMarkVersionDataDurable(%d): %v", versionID, err)
+		}
+	}
 	if err := impl.ProposeUpdateVersionStatus(proposeCtx(t), versionID, status, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus(%d, %v): %v", versionID, status, err)
 	}

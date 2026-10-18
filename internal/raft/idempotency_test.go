@@ -4,8 +4,6 @@ import (
 	"testing"
 
 	"go.uber.org/zap"
-
-	"stratum/internal/types"
 )
 
 // TestStateMachine_Apply_CreateVersion_IdempotentRetry pins the core of the
@@ -66,7 +64,7 @@ func TestStateMachine_Apply_CreateVersion_IdempotentRetryBeatsParentChecks(t *te
 	if root.Err != nil {
 		t.Fatalf("root create: %v", root.Err)
 	}
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: root.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, root.VersionID)
 
 	first := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: root.VersionID, ClientRequestID: "req-1"}, w, zap.NewNop())
 	if first.Err != nil {

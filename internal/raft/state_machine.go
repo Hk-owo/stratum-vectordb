@@ -495,12 +495,15 @@ func (sm *stateMachine) validateSurvivorsNotPending(kbID string, removed []int64
 //
 // IndexStatus still decides the rest, deliberately: PENDING with durable data means
 // the index build is what is outstanding, and that window is exactly when dropping
-// the version's VersionDocList would hurt a survivor. The same reasoning explains
-// what is NOT changed: applyCreateVersion's parent check keeps refusing a PENDING
-// parent even when that PENDING is a data-side verdict, because a new version
-// derives its document set from the parent's, and a parent whose data will never
-// arrive cannot contribute one — "you cannot build on it" is the right answer there,
-// not an oversight.
+// the version's VersionDocList would hurt a survivor.
+//
+// This is the ONE admission rule that still reads the index side. applyCreateVersion's
+// parent check used to as well, and no longer does: a new version derives its document
+// set from the parent's DATA, and the index is a read-side product built on demand
+// wherever queries land (§8.6(b)) — so "the parent's index is not built yet" was never
+// a real reason to refuse a write, only a reason to wait for something nothing was
+// going to do. The two rules reading different sides is the point, not an
+// inconsistency.
 func deleteBlockedByPending(v types.VersionMeta) bool {
 	return v.IndexStatus == types.IndexStatusPending && v.DataStatus != types.DataStatusFailedPermanent
 }
@@ -772,8 +775,17 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 		if parent.KBID != cmd.KBID {
 			return applyResult{Err: fmt.Errorf("parent version %d belongs to a different knowledge base: %w", cmd.ParentVersionID, stratumerrors.ErrInvalidParentVersion)}
 		}
-		if parent.IndexStatus == types.IndexStatusPending {
-			return applyResult{Err: fmt.Errorf("parent version %d is PENDING: %w", cmd.ParentVersionID, stratumerrors.ErrInvalidParentVersion)}
+		if parent.DataStatus != types.DataStatusDurable {
+			// 门禁看**数据侧**：数据落盘（VersionDocList 已写）就足以派生下一版的
+			// 文档集，这也是唯一真实的依赖。
+			//
+			// 索引不参与，理由不是"省事"：它是读侧产物，构建与放置由查询频率动态
+			// 决定（owner 集 + 按需构建，§8.4/§8.6(b)）。写路径既不知道它什么时候
+			// 建、也不该知道——以前这里看 IndexStatus，等于要求"父版本的索引已建好"
+			// 才能写下一版；而索引没人查就不建，于是数据早已落盘的库照样被拒在
+			// invalid_parent_version 上，链就卡在那里。
+			return applyResult{Err: fmt.Errorf("parent version %d has no durable data (data_status=%s): %w",
+				cmd.ParentVersionID, parent.DataStatus.String(), stratumerrors.ErrInvalidParentVersion)}
 		}
 		if parent.Deleting {
 			return applyResult{Err: fmt.Errorf("parent version %d is being deleted: %w", cmd.ParentVersionID, stratumerrors.ErrInvalidParentVersion)}

@@ -250,6 +250,7 @@ func TestQueryService_UnavailableVersionDataIsNotAnEmptyResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProposeCreateVersion: %v", err)
 	}
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, vID)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("READY: %v", err)
 	}
@@ -293,6 +294,7 @@ func TestQueryService_EmptyDocumentSetVersionAnswersWithNoResults(t *testing.T) 
 	if err != nil {
 		t.Fatalf("ProposeCreateVersion: %v", err)
 	}
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, vID)
 	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("READY: %v", err)
 	}
@@ -369,6 +371,7 @@ func (h *querySvcHarness) setupQueryableKB(t *testing.T, docChunks map[string][]
 		EmbedConfig: types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
 	})
 	vID, _ := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, vID)
 	h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusReady, 0)
 
 	// Write doc-chunk mappings and doc content.
@@ -400,6 +403,7 @@ func TestQueryService_VersionIsolation(t *testing.T) {
 
 	// Create a second version with a different document.
 	v2ID, _ := h.raftNode.ProposeCreateVersion(ctx, kbID, v1ID)
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, v2ID)
 	h.raftNode.ProposeUpdateVersionStatus(ctx, v2ID, types.IndexStatusReady, 0)
 	h.chunkMapper.Write(ctx, kbID, "chunk-2", "doc-b")
 	h.versionDocs.Write(ctx, kbID, v2ID, "doc-b")

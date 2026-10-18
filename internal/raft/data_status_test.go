@@ -127,7 +127,7 @@ func TestStateMachine_DigestArrivingAfterIndexReadyStillCommits(t *testing.T) {
 	ctx := proposeCtx(t)
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
 	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
-	sm.apply(ctx, command{Type: cmdUpdateVersionStatus, VersionID: v.VersionID, Status: types.IndexStatusReady}, w, zap.NewNop())
+	markIndexReady(t, sm, w, v.VersionID)
 
 	sm.apply(ctx, command{Type: cmdUpdateVersionSummary, VersionID: v.VersionID, DocIDSetHash: "digest-after-ready"}, w, zap.NewNop())
 
