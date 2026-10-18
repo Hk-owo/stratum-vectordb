@@ -401,6 +401,7 @@ func (w *FileWAL) DeleteByKB(ctx context.Context, kbID string) error {
 	delete(w.deleteCompleted, kbID)
 	delete(w.cursors, kbID)
 	delete(w.pendingBeginByKB, kbID)
+	delete(w.pendingVersionIDByKB, kbID)
 	for key := range w.replayCounters {
 		if key.kbID == kbID {
 			delete(w.replayCounters, key)

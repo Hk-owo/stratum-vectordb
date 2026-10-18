@@ -434,3 +434,91 @@ func TestAdmin_RebuildAndWarmupRegisterRetentionInterest(t *testing.T) {
 		}
 	}
 }
+
+// TestAdmin_RebuildIndex_RefusesVersionFromAnotherKB pins C6 of
+// docs/code-review-2026-10-18.md.
+//
+// Version ids are global; a caller's authorization is per knowledge base. The
+// status change is keyed by version id alone in the state machine, so naming your
+// own kb_id together with somebody else's version_id used to flip that version to
+// PENDING — which refuses queries, rollback and parenting — for as long as the
+// caller cared to keep asking.
+func TestAdmin_RebuildIndex_RefusesVersionFromAnotherKB(t *testing.T) {
+	h := newAdminHarness()
+	ctx := context.Background()
+	for _, kb := range []string{"kb-a", "kb-b"} {
+		if err := h.raftNode.ProposeCreateKB(ctx, kbMeta(kb, types.KBStatusActive)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.raftNode.ProposeCreateVersion(ctx, "kb-a", 0); err != nil {
+		t.Fatal(err)
+	}
+	otherKBsVersion, err := h.raftNode.ProposeCreateVersion(ctx, "kb-b", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A version someone is actually serving, which is what makes the status change
+	// worth attacking.
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, otherKBsVersion, types.IndexStatusReady, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// kb-a's name with kb-b's version.
+	if _, err := h.svc.RebuildIndex(ctx, &pb.RebuildIndexRequest{
+		KnowledgeBaseId: "kb-a",
+		VersionId:       otherKBsVersion,
+	}); err == nil {
+		t.Fatal("RebuildIndex must refuse a version that does not belong to the named knowledge base")
+	}
+
+	versions, err := h.raftNode.ListVersions(ctx, "kb-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range versions {
+		if v.VersionID == otherKBsVersion && v.IndexStatus != types.IndexStatusReady {
+			t.Errorf("the other knowledge base's version was changed to %v by a cross-KB request", v.IndexStatus)
+		}
+	}
+}
+
+// TestAdmin_WarmupVersion_RefusesVersionFromAnotherKB is the same rule on the other
+// entry point (it takes the same (kbID, versionID) pair and proposes the same kind
+// of status change).
+func TestAdmin_WarmupVersion_RefusesVersionFromAnotherKB(t *testing.T) {
+	h := newAdminHarness()
+	ctx := context.Background()
+	for _, kb := range []string{"kb-a", "kb-b"} {
+		if err := h.raftNode.ProposeCreateKB(ctx, kbMeta(kb, types.KBStatusActive)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.raftNode.ProposeCreateVersion(ctx, "kb-a", 0); err != nil {
+		t.Fatal(err)
+	}
+	otherKBsVersion, err := h.raftNode.ProposeCreateVersion(ctx, "kb-b", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raftNode.ProposeUpdateVersionStatus(ctx, otherKBsVersion, types.IndexStatusReady, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h.svc.WarmupVersion(ctx, &pb.WarmupVersionRequest{
+		KnowledgeBaseId: "kb-a",
+		VersionId:       otherKBsVersion,
+	}); err == nil {
+		t.Fatal("WarmupVersion must refuse a version that does not belong to the named knowledge base")
+	}
+
+	versions, err := h.raftNode.ListVersions(ctx, "kb-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range versions {
+		if v.VersionID == otherKBsVersion && v.IndexStatus != types.IndexStatusReady {
+			t.Errorf("the other knowledge base's version was changed to %v by a cross-KB request", v.IndexStatus)
+		}
+	}
+}

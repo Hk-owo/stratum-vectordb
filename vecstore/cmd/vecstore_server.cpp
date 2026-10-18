@@ -80,11 +80,17 @@ int main(int argc, char** argv) {
   // (M4 of docs/code-review-2026-09-24.md). Comma-separated, because a node may
   // legitimately keep indexes under more than one root.
   //
-  // Unset means the parent of --rocksdb_path: the layout every deployment script
-  // uses puts both under one data directory (`<data>/vecstore_rocksdb` and
-  // `<data>/index/...`), so that default confines the RPCs without requiring the
-  // flag. A deployment that stores indexes elsewhere passes --index_dir explicitly
-  // (and gets a refusal, not a silent success, until it does).
+  // Unset means `<rocksdb_path>/../index` — the parent directory's `index`
+  // subdirectory, NOT the parent itself. The layout every deployment script uses
+  // puts the indexes under `<data>/index/<kbID>/...` while the chunk store sits
+  // beside them, so this default confines the RPCs without requiring the flag.
+  //
+  // Why not the parent: the allow-list is the ONLY thing confining these RPCs, and a
+  // root that contains the chunk store confines them to include it. `Save()` writes
+  // whatever path it is handed through a temp file and a rename, so one call naming
+  // `<rocksdb>/CURRENT` (or `MANIFEST-*`, or an `.sst`) replaces RocksDB's own engine
+  // file — and the store does not open again (C3 of
+  // docs/code-review-2026-10-18.md).
   std::vector<std::string> index_dirs;
   for (size_t start = 0; start <= index_dir_flag.size();) {
     const size_t comma = index_dir_flag.find(',', start);
@@ -99,8 +105,15 @@ int main(int argc, char** argv) {
     start = comma + 1;
   }
   if (index_dirs.empty()) {
-    index_dirs.push_back(std::filesystem::path(rocksdb_path).parent_path().string());
+    index_dirs.push_back(
+        (std::filesystem::path(rocksdb_path).parent_path() / "index").string());
   }
+
+  // The chunk store's own directory is excluded from the allow-list by the service,
+  // not by refusing to start here: tests and single-machine runs legitimately use a
+  // wide root (a temp directory), and turning that into a start-up failure would make
+  // the safety property depend on how the process was launched rather than on what it
+  // will accept. See VectorIndexServiceImpl::IndexPathAllowed.
 
   auto storage_or = stratum::vecstore::RocksDBChunkStorage::Open(rocksdb_path);
   if (!storage_or.ok()) {
@@ -109,8 +122,13 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // The chunk store's own directory is excluded at the RPC (see
+  // IndexPathAllowed): the allow-list confines Save/Load, and a root that happens to
+  // contain the store would otherwise let one Save() replace RocksDB's engine files
+  // (C3 of docs/code-review-2026-10-18.md).
   g_server = std::make_unique<stratum::vecstore::VecstoreGrpcServer>(
-      std::move(storage_or.value()), index_dirs, keepalive);
+      std::move(storage_or.value()), index_dirs, keepalive,
+      std::vector<std::string>{rocksdb_path});
 
   if (!g_server->Start(grpc_addr)) {
     std::cerr << "vecstore_server: failed to bind to " << grpc_addr << std::endl;

@@ -2,10 +2,13 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"go.uber.org/zap"
+
+	stratumerrors "stratum/internal/errors"
 )
 
 // defaultGCSweepIntervalSec is used when the config leaves the interval
@@ -64,12 +67,29 @@ func (g *ChunkGarbageCollectorImpl) Sweep(ctx context.Context) error {
 		return fmt.Errorf("chunk-gc: ListKnowledgeBases: %w", err)
 	}
 
+	// One knowledge base's failure must not stop the rest (M18 of
+	// docs/code-review-2026-10-18.md). Returning at the first error meant a single KB
+	// whose LastVersionID (or one of its chunk deletes) kept failing left every KB
+	// after it in the list unreclaimed — for good, every sweep — while the log showed
+	// one warning. Same policy as deleting_sweep.go: note it, keep going, report the
+	// first failure at the end.
+	var firstErr error
 	for _, kb := range kbs {
-		if err := g.sweepKB(ctx, kb.KBID); err != nil {
+		if err := ctx.Err(); err != nil {
+			// Shutting down: the next sweep starts from the same list.
 			return err
 		}
+		if err := g.sweepKB(ctx, kb.KBID); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("chunk-gc: sweep %s: %w", kb.KBID, err)
+			}
+			if g.logger != nil {
+				g.logger.Warn("chunk GC: could not finish this knowledge base; the next sweep retries it",
+					zap.String("kb_id", kb.KBID), zap.Error(err))
+			}
+		}
 	}
-	return nil
+	return firstErr
 }
 
 // sweepKB reclaims every orphan chunk of a single knowledge base.
@@ -187,9 +207,16 @@ func (g *ChunkGarbageCollectorImpl) reclaimOrphan(ctx context.Context, kbID, chu
 	// re-check already listed this chunk's documents, and that list is exactly what
 	// the delete needs. Scanning it twice was the other half of M9 of
 	// docs/code-review-2026-09-24.md — same iterator work, twice, inside the lock.
+	//
+	// DeleteMapping, not DeleteByDoc (H3 of docs/code-review-2026-10-18.md):
+	// DeleteByDoc removes the document's mapping to every chunk it has, so the
+	// document's OTHER chunks would vanish from the sweep's candidate set (found by
+	// scanning the forward keyspace) while their vectors stayed in the store
+	// forever. Reclaiming one chunk may only unpin that chunk; the siblings stay
+	// visible and get their own pass.
 	for _, docID := range docIDs {
-		if err := g.cfg.ChunkDocMapper.DeleteByDoc(ctx, kbID, docID); err != nil {
-			return fmt.Errorf("chunk-gc: DeleteByDoc(%s,%s): %w", kbID, docID, err)
+		if err := g.cfg.ChunkDocMapper.DeleteMapping(ctx, kbID, chunkID, docID); err != nil {
+			return fmt.Errorf("chunk-gc: DeleteMapping(%s,%s,%s): %w", kbID, chunkID, docID, err)
 		}
 	}
 	if err := g.cfg.ChunkStore.Delete(ctx, kbID, chunkID); err != nil {
@@ -217,8 +244,17 @@ func (g *ChunkGarbageCollectorImpl) isOrphanChunk(ctx context.Context, kbID, chu
 	for _, docID := range docIDs {
 		content, err := g.cfg.DocStore.ReadAt(ctx, kbID, docID, maxVersion)
 		if err != nil {
-			// Not found or tombstone at the newest version: the document
-			// is gone, so this reference cannot keep the chunk alive.
+			// Only "this document has no entry at or before maxVersion" means the
+			// reference is dead. Anything else — an iterator that could not be
+			// created, a corrupt value, an I/O failure — is the store being unable
+			// to answer, and treating that as "the document is gone" reclaims a
+			// LIVE document's chunks on the strength of a read failure (H2 of
+			// docs/code-review-2026-10-18.md). Report it so the sweep retries
+			// instead of deleting.
+			if !errors.Is(err, stratumerrors.ErrVersionNotFound) {
+				return false, nil, fmt.Errorf(
+					"chunk-gc: read %s/%s at newest version %d: %w", kbID, docID, maxVersion, err)
+			}
 			continue
 		}
 		if len(content) > 0 {

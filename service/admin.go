@@ -561,12 +561,38 @@ func (s *AdminServiceImpl) GetClusterStatus(ctx context.Context, req *pb.GetClus
 	}, nil
 }
 
+// requireVersionInKB refuses a (kbID, versionID) pair where versionID is not a
+// version of kbID.
+//
+// It exists because version ids are GLOBAL while a caller's authorization is per
+// knowledge base: the state machine keys the status change by versionID alone
+// (state_machine.apply's cmdUpdateVersionStatus), so without this read a caller
+// authorized for kb-A could name its own kb_id and another KB's version_id and have
+// that version's status changed — flipping someone else's active version to
+// PENDING, which refuses queries, rollback and parenting until a human notices (C6
+// of docs/code-review-2026-10-18.md). GetVersion is what refuses the combination:
+// it answers ErrVersionNotFound when v.KBID != kbID.
+func (s *AdminServiceImpl) requireVersionInKB(ctx context.Context, kbID string, versionID int64) error {
+	if kbID == "" || versionID == 0 {
+		return fmt.Errorf("%w: knowledge_base_id and version_id are required", stratumerrors.ErrInvalidArgument)
+	}
+	if _, err := s.raftNode.GetVersion(ctx, kbID, versionID); err != nil {
+		return fmt.Errorf("version %d does not belong to knowledge base %s: %w", versionID, kbID, err)
+	}
+	return nil
+}
+
 // RebuildIndex implements AdminServiceServer.
 func (s *AdminServiceImpl) RebuildIndex(ctx context.Context, req *pb.RebuildIndexRequest) (*pb.RebuildIndexResponse, error) {
+	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
+	if err := s.requireVersionInKB(ctx, kbID, versionID); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+
 	// Set status to PENDING, then trigger build.
 	// nodeID 0: this is the control layer's verdict about the version, not a
 	// replica reporting that it serves it.
-	if err := s.raftNode.ProposeUpdateVersionStatus(ctx, req.VersionId, 0, 0); err != nil { // 0 = IndexStatusPending
+	if err := s.raftNode.ProposeUpdateVersionStatus(ctx, versionID, 0, 0); err != nil { // 0 = IndexStatusPending
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
@@ -577,9 +603,9 @@ func (s *AdminServiceImpl) RebuildIndex(ctx context.Context, req *pb.RebuildInde
 	// finish — running the post-build retention pass — before the registration
 	// would have executed, leaving the artifact unprotected at the exact moment
 	// it is freshest.
-	s.indexManager.RecordInterest(req.KnowledgeBaseId, req.VersionId)
+	s.indexManager.RecordInterest(kbID, versionID)
 
-	if err := s.indexManager.TriggerBuild(ctx, req.KnowledgeBaseId, req.VersionId); err != nil {
+	if err := s.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
@@ -588,12 +614,17 @@ func (s *AdminServiceImpl) RebuildIndex(ctx context.Context, req *pb.RebuildInde
 
 // WarmupVersion implements AdminServiceServer.
 func (s *AdminServiceImpl) WarmupVersion(ctx context.Context, req *pb.WarmupVersionRequest) (*pb.WarmupVersionResponse, error) {
+	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
+	if err := s.requireVersionInKB(ctx, kbID, versionID); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+
 	// Warmup rebuilds and re-homes the version's index in memory. Mark the
 	// version PENDING first so the console shows "warming up" and refuses
 	// rollback/parenting while the async build runs, then trigger the build
 	// exactly like RebuildIndex. Completion is reported via the registered
 	// BuildCompleteCallback, which flips the status back to READY/FAILED.
-	if err := s.raftNode.ProposeUpdateVersionStatus(ctx, req.VersionId, types.IndexStatusPending, 0); err != nil { // nodeID 0: see RebuildIndex
+	if err := s.raftNode.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusPending, 0); err != nil { // nodeID 0: see RebuildIndex
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
@@ -601,9 +632,9 @@ func (s *AdminServiceImpl) WarmupVersion(ctx context.Context, req *pb.WarmupVers
 	// ready, so the retention policy must not drop the artifact afterwards — and
 	// for the same reason the registration goes first: the build it starts is
 	// asynchronous, so the shield has to be on disk before that build can finish.
-	s.indexManager.RecordInterest(req.KnowledgeBaseId, req.VersionId)
+	s.indexManager.RecordInterest(kbID, versionID)
 
-	if err := s.indexManager.TriggerBuild(ctx, req.KnowledgeBaseId, req.VersionId); err != nil {
+	if err := s.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 

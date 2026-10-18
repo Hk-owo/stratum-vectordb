@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -195,13 +196,16 @@ func (p *stubPuller) PullVersionData(ctx context.Context, sourceAddr, kbID strin
 // transfer that takes a while" from "a transfer that fails" — the two states the
 // pull loop's bound has to distinguish.
 type sequencedPuller struct {
-	calls int
+	// calls is atomic: EnsureIndex runs on the test's goroutine while the assertion
+	// reads the counter from the test body (see pull_cancel_test.go). A plain int here
+	// was a data race the -race detector reports as soon as the two interleave.
+	calls atomic.Int64
 	err   error
 	delay time.Duration
 }
 
 func (p *sequencedPuller) PullVersionData(ctx context.Context, sourceAddr, kbID string, versionID int64) error {
-	p.calls++
+	p.calls.Add(1)
 	if p.delay > 0 {
 		select {
 		case <-time.After(p.delay):
@@ -402,8 +406,8 @@ func TestLocalDataPlane_EnsureIndex_ProgressKeepsTheLoopAlive(t *testing.T) {
 	if err := dp.EnsureIndex(context.Background(), "kb-1", 4); err != nil {
 		t.Fatalf("EnsureIndex: %v — a completed transfer is progress, and progress must not run out of idle budget", err)
 	}
-	if puller.calls != 3 {
-		t.Fatalf("puller calls = %d, want 3", puller.calls)
+	if puller.calls.Load() != 3 {
+		t.Fatalf("puller calls = %d, want 3", puller.calls.Load())
 	}
 }
 
@@ -435,8 +439,8 @@ func TestLocalDataPlane_EnsureIndex_FailureWithoutProgressReportsDiagnosis(t *te
 			t.Errorf("error %q does not carry %q", err, want)
 		}
 	}
-	if puller.calls < 2 {
-		t.Errorf("puller calls = %d, want at least 2: the loop retries before it gives up", puller.calls)
+	if puller.calls.Load() < 2 {
+		t.Errorf("puller calls = %d, want at least 2: the loop retries before it gives up", puller.calls.Load())
 	}
 }
 

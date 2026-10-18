@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -512,5 +513,87 @@ func TestLeaderHandler_MetadataEmptyVectors(t *testing.T) {
 	}
 	if got := bytesToFloat32s(b); len(got) != 0 {
 		t.Errorf("expected empty deserialization, got %v", got)
+	}
+}
+
+// TestLeaderHandler_MiddleVersionExportIncludesLaterUpdatedDocs pins C4 of
+// docs/code-review-2026-10-18.md.
+//
+// Exporting a version whose documents have since been updated has to ship the
+// entries visible AT THAT VERSION. The iterator bound used to be the document
+// prefix's successor, so SeekLT landed on the document's newest entry; the
+// version guard then rejected it and dropped the document from the export
+// completely — while its VERSION_DOC_LIST entry still went out. The gap backfill
+// pulls middle versions, so this is its ordinary case, not an edge one.
+func TestLeaderHandler_MiddleVersionExportIncludesLaterUpdatedDocs(t *testing.T) {
+	f := newLeaderFixture(t)
+	ctx := f.ctx
+	const kbID = "kb-1"
+
+	// doc-1 exists at v3 and was updated again at v5; doc-2 only exists at v3.
+	if err := f.docStore.Write(ctx, kbID, "doc-1", 3, []byte("at-v3")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.docStore.Write(ctx, kbID, "doc-1", 5, []byte("at-v5")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.docStore.Write(ctx, kbID, "doc-2", 3, []byte("at-v3")); err != nil {
+		t.Fatal(err)
+	}
+	for _, docID := range []string{"doc-1", "doc-2"} {
+		if err := f.versionDoc.Write(ctx, kbID, 3, docID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entries := f.pull(t, kbID, 3)
+	dsEntries := entriesByType(entries)[pb.SyncEntryType_SYNC_ENTRY_TYPE_DOC_STORE]
+	if len(dsEntries) != 2 {
+		t.Fatalf("pulling v3 must export both listed documents, got %d DOC_STORE entries: %+v",
+			len(dsEntries), entries)
+	}
+	got := make(map[string]string, len(dsEntries))
+	for _, e := range dsEntries {
+		got[e.DocId] = docContent(t, e)
+		if e.VersionId != 3 {
+			t.Errorf("%s exported at version %d, want 3", e.DocId, e.VersionId)
+		}
+	}
+	if got["doc-1"] != "at-v3" {
+		t.Errorf("doc-1 = %q, want %q (the entry at v3, not the later one)", got["doc-1"], "at-v3")
+	}
+	if got["doc-2"] != "at-v3" {
+		t.Errorf("doc-2 = %q, want %q", got["doc-2"], "at-v3")
+	}
+}
+
+// TestLeaderHandler_ListedDocMissingFromDocStore pins the other half of C4: a
+// document the version lists but whose version range holds no entry is the two
+// stores disagreeing. Shipping the version without the document (what used to
+// happen) is indistinguishable to the follower from a version that genuinely
+// does not contain it, so the export fails instead.
+func TestLeaderHandler_ListedDocMissingFromDocStore(t *testing.T) {
+	f := newLeaderFixture(t)
+	ctx := f.ctx
+	const kbID = "kb-1"
+
+	// doc-1 has entries, but only AFTER the version being exported.
+	if err := f.docStore.Write(ctx, kbID, "doc-1", 7, []byte("too late")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.versionDoc.Write(ctx, kbID, 3, "doc-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	stream := &captureStream{ctx: f.ctx}
+	err := f.handler.PullVersionData(&pb.PullVersionDataRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       3,
+	}, stream)
+	if err == nil {
+		t.Fatalf("expected the export to fail for a listed document with no entry ≤ v3, got %d entries", len(stream.entries))
+	}
+	if !strings.Contains(err.Error(), "no entry at or before version 3") {
+		t.Errorf("error should name the missing entry, got: %v", err)
 	}
 }

@@ -73,9 +73,46 @@ func (s *KBServer) DiscardVersion(ctx context.Context, req *pb.DiscardVersionReq
 }
 
 func (s *KBServer) ListKnowledgeBases(ctx context.Context, req *pb.ListKnowledgeBasesRequest) (*pb.ListKnowledgeBasesResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_ListKnowledgeBases_FullMethodName, "", func(idx int, ctx context.Context) (*pb.ListKnowledgeBasesResponse, error) {
+	resp, err := Forward(s.r, ctx, pb.KnowledgeBaseService_ListKnowledgeBases_FullMethodName, "", func(idx int, ctx context.Context) (*pb.ListKnowledgeBasesResponse, error) {
 		return s.r.kbs[idx].ListKnowledgeBases(ctx, req)
 	})
+	if err != nil {
+		return nil, err
+	}
+	return s.keepVisibleKnowledgeBases(ctx, resp), nil
+}
+
+// keepVisibleKnowledgeBases drops the entries this caller may not read.
+//
+// The request names no knowledge base, so Authorize could only check the credential
+// — and every entry it returned carries the KB's name, id and embed config. A token
+// granted one KB therefore got an inventory of the whole cluster, which is the half
+// of tenant isolation that does not depend on guessing an id (M16 of
+// docs/code-review-2026-10-18.md). Filtering has to happen here: the service layer
+// has no principal, by design (see authgate's ClientFacing comment), so the station
+// is the only layer that knows who is asking.
+func (s *KBServer) keepVisibleKnowledgeBases(ctx context.Context, resp *pb.ListKnowledgeBasesResponse) *pb.ListKnowledgeBasesResponse {
+	if resp == nil || s.r.auth == nil {
+		// No credential table: the deployment has no tenants, so there is nothing to
+		// filter by. Filtering to nothing would break the table-less shape entirely.
+		return resp
+	}
+	p, err := s.r.auth.Authenticate(ctx)
+	if err != nil {
+		// Forward already refused an unauthenticated caller; nothing to narrow.
+		return resp
+	}
+	if p.AllKBs {
+		return resp
+	}
+	kept := make([]*pb.KnowledgeBaseInfo, 0, len(resp.GetKnowledgeBases()))
+	for _, kb := range resp.GetKnowledgeBases() {
+		if p.Allows(kb.GetKnowledgeBaseId(), false) {
+			kept = append(kept, kb)
+		}
+	}
+	resp.KnowledgeBases = kept
+	return resp
 }
 
 func (s *KBServer) GetKnowledgeBase(ctx context.Context, req *pb.GetKnowledgeBaseRequest) (*pb.GetKnowledgeBaseResponse, error) {
@@ -227,9 +264,30 @@ func (s *AdminServer) WarmupVersion(ctx context.Context, req *pb.WarmupVersionRe
 // load-balanced like any other metadata read; an empty key is what Forward already
 // does for GetSystemStatus.
 func (s *AdminServer) ListFailedVersions(ctx context.Context, req *pb.ListFailedVersionsRequest) (*pb.ListFailedVersionsResponse, error) {
-	return Forward(s.r, ctx, pb.AdminService_ListFailedVersions_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ListFailedVersionsResponse, error) {
+	resp, err := Forward(s.r, ctx, pb.AdminService_ListFailedVersions_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ListFailedVersionsResponse, error) {
 		return s.r.admins[idx].ListFailedVersions(ctx, req)
 	})
+	if err != nil {
+		return nil, err
+	}
+	// The knowledge base is optional here, so a cluster-wide query is served — and
+	// every entry names a version of somebody's KB. Narrow it the same way
+	// ListKnowledgeBases is narrowed (M16 of docs/code-review-2026-10-18.md).
+	if s.r.auth == nil || req.GetKnowledgeBaseId() != "" {
+		return resp, nil
+	}
+	p, authErr := s.r.auth.Authenticate(ctx)
+	if authErr != nil || p.AllKBs {
+		return resp, nil
+	}
+	kept := make([]*pb.FailedVersion, 0, len(resp.GetVersions()))
+	for _, v := range resp.GetVersions() {
+		if p.Allows(v.GetKbId(), false) {
+			kept = append(kept, v)
+		}
+	}
+	resp.Versions = kept
+	return resp, nil
 }
 
 // ForceRetryVersion proxies an operator's retry of an index-side verdict. It is a

@@ -49,6 +49,7 @@ package kvraft
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -157,7 +158,16 @@ func WithElectionTimeoutRange(min, max time.Duration) Option {
 // prior persisted state and snapshot are loaded synchronously before
 // NewRaft returns. The node does not start participating in the cluster
 // (no elections, no heartbeats) until Run is called.
-func NewRaft(id int64, transport *Transport, applyCh chan ApplyMsg, persister *kvstorage.Persister, opts ...Option) *Raft {
+//
+// A persisted state or snapshot that cannot be READ is returned as an error
+// rather than logged and ignored. Boot-from-zero is not a safe fallback for
+// either: an unreadable state file means the node would restart in term 0 with an
+// empty log — free to vote again in a term it has already voted in, and forgetful
+// of committed entries — and an unreadable snapshot means an empty state machine
+// whose lastApplied still claims the compacted range was applied. Both are silent
+// until they are not, so refusing to start is the only honest answer (H4 of
+// docs/code-review-2026-10-18.md).
+func NewRaft(id int64, transport *Transport, applyCh chan ApplyMsg, persister *kvstorage.Persister, opts ...Option) (*Raft, error) {
 	rf := &Raft{
 		me:                 id,
 		transport:          transport,
@@ -186,7 +196,7 @@ func NewRaft(id int64, transport *Transport, applyCh chan ApplyMsg, persister *k
 	rf.electionTimeout = randomElectionTimeout(rf.electionTimeoutMin, rf.electionTimeoutMax)
 
 	if term, voteFor, log, err := persister.LoadState(); err != nil {
-		rf.logger.Error("failed to load persisted Raft state; starting fresh", zap.Int64("node_id", id), zap.Error(err))
+		return nil, fmt.Errorf("kvraft: node %d: load persisted raft state: %w", id, err)
 	} else if term > 0 || len(log) > 0 {
 		rf.term = term
 		rf.voteFor = voteFor
@@ -196,13 +206,13 @@ func NewRaft(id int64, transport *Transport, applyCh chan ApplyMsg, persister *k
 	}
 
 	if data, lastIndex, err := persister.LoadSnapshot(); err != nil {
-		rf.logger.Error("failed to load persisted snapshot", zap.Int64("node_id", id), zap.Error(err))
+		return nil, fmt.Errorf("kvraft: node %d: load persisted snapshot: %w", id, err)
 	} else if data != nil {
 		rf.lastApplied = lastIndex
 		rf.lastCommitIndex = lastIndex
 	}
 
-	return rf
+	return rf, nil
 }
 
 func randomElectionTimeout(minDur, maxDur time.Duration) time.Duration {

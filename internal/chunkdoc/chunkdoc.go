@@ -58,9 +58,18 @@ type ChunkDocMapper interface {
 	DeleteByKB(ctx context.Context, kbID string) error
 
 	// DeleteByDoc removes all forward and reverse entries that mention
-	// docID within kbID. Used by the asynchronous orphan-chunk GC path
-	// after a document DELETE: this clears the mapping entries for the
-	// deleted document without touching the chunk vectors themselves
-	// (orphan chunk vector deletion is a separate, later GC step).
+	// docID within kbID. Used by knowledge base / document deletion, where the
+	// whole document is going away.
 	DeleteByDoc(ctx context.Context, kbID, docID string) error
+
+	// DeleteMapping removes exactly one (chunkID, docID) pair within kbID: the
+	// forward entry for that chunk and the reverse entry for that chunk only.
+	//
+	// It exists because DeleteByDoc is the wrong tool for reclaiming one chunk.
+	// DeleteByDoc drops the document's mapping to EVERY chunk it has, which makes
+	// the document's other chunks invisible to the orphan sweep (the sweep finds
+	// candidates by scanning the forward keyspace) while their vectors stay in the
+	// store forever — H3 of docs/code-review-2026-10-18.md. Reclaiming a chunk
+	// must only unpin that chunk.
+	DeleteMapping(ctx context.Context, kbID, chunkID, docID string) error
 }

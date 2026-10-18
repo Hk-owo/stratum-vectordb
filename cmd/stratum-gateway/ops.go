@@ -275,6 +275,14 @@ func (m *opsManager) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	// check: a refused edit must leave the live config untouched, or the console
 	// keeps running with the value it just told the caller it rejected.
 	next := *m.cfg
+	// Cluster is the only reference field in OpsConfig, so the copy above would share
+	// its array with the object being replaced. Copy it too, and then publish a NEW
+	// pointer instead of overwriting this one (M15 of docs/code-review-2026-10-18.md):
+	// the supervisor and every handler that takes `cfg := m.cfg` under m.mu and then
+	// works outside it read a snapshot, so a snapshot must stop changing the moment it
+	// is handed out. Writing through the old pointer raced those readers under a lock
+	// nobody shared.
+	next.Cluster = append([]ClusterNode(nil), m.cfg.Cluster...)
 	// Edits that decide WHAT GETS EXECUTED are refused over HTTP, rather than
 	// silently ignored (H2 of docs/code-review-2026-09-24.md): bin_dir, the
 	// cluster table forwardNode sends requests to, and the orchestration script
@@ -315,7 +323,7 @@ func (m *opsManager) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeOpsError(w, http.StatusInternalServerError, "save config: "+err.Error())
 		return
 	}
-	*m.cfg = next
+	m.cfg = &next
 	m.sup.SetConfig(m.cfg)
 	writeOpsJSON(w, http.StatusOK, map[string]any{
 		"ok":   true,
@@ -725,39 +733,109 @@ func (m *opsManager) handleDockerGetConfig(w http.ResponseWriter, _ *http.Reques
 }
 
 // handleDockerPutConfig 更新集群级统一参数并持久化（整个集群一起生效）。
+// dockerClusterPatch is the body of PUT /ops/docker/config.
+//
+// Every field is a pointer so "absent" is distinguishable from "zero": with plain
+// values, `{"network":"my-net"}` used to switch docker management OFF, because the
+// omitted booleans decoded to false and were written through unconditionally. An
+// operator would see the console's buttons stop working and have no reason to
+// connect that to the parameter they just saved.
+type dockerClusterPatch struct {
+	Enabled         *bool   `json:"enabled"`
+	Topology        *string `json:"topology"`
+	Script          *string `json:"script"`
+	ScriptTwoTier   *string `json:"script_two_tier"`
+	Nodes           *int    `json:"nodes"`
+	StorageNodes    *int    `json:"storage_nodes"`
+	BasePort        *int    `json:"base_port"`
+	StorageBasePort *int    `json:"storage_base_port"`
+	Network         *string `json:"network"`
+	Image           *string `json:"image"`
+	ContainerPrefix *string `json:"container_prefix"`
+	WithEmbed       *bool   `json:"with_embed"`
+}
+
+// handleDockerPutConfig 更新集群级统一参数并持久化（整个集群一起生效）。
+//
+// This is the SECOND way to write the config over HTTP, so it has to obey the same
+// rules as handlePutConfig (C2 of docs/code-review-2026-10-18.md). It used to obey
+// none: `docker.script` was written straight through and `dockerCluster.run` execs
+// that path, which meant one PUT plus POST /ops/docker/up was arbitrary command
+// execution as the gateway — exactly what refusing the same field on /ops/config
+// was meant to prevent, reached through the endpoint next to it.
 func (m *opsManager) handleDockerPutConfig(w http.ResponseWriter, r *http.Request) {
-	var patch DockerClusterConfig
+	var patch dockerClusterPatch
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		writeOpsError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return
 	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if patch.Script != "" {
-		m.cfg.Docker.Script = patch.Script
+
+	// Refused rather than validated, and refused loudly: there is no safe new value
+	// for "run this other program", and an operator who sends one and sees 200 would
+	// believe it took effect.
+	if patch.Script != nil && *patch.Script != m.cfg.Docker.Script {
+		writeOpsError(w, http.StatusForbidden,
+			"docker.script 由部署脚本写入，/ops 不允许通过 HTTP 修改（它是会被执行的编排脚本）")
+		return
 	}
-	if patch.Nodes > 0 {
-		m.cfg.Docker.Nodes = patch.Nodes
+	if patch.ScriptTwoTier != nil && *patch.ScriptTwoTier != m.cfg.Docker.ScriptTwoTier {
+		writeOpsError(w, http.StatusForbidden,
+			"docker.script_two_tier 由部署脚本写入，/ops 不允许通过 HTTP 修改（它是会被执行的编排脚本）")
+		return
 	}
-	if patch.BasePort > 0 {
-		m.cfg.Docker.BasePort = patch.BasePort
+
+	// Applied to a COPY and published only after the write succeeds, so a refused or
+	// failed save leaves the live config untouched.
+	next := *m.cfg
+	next.Cluster = append([]ClusterNode(nil), m.cfg.Cluster...)
+	next.Docker = m.cfg.Docker
+	d := &next.Docker
+	if patch.Enabled != nil {
+		d.Enabled = *patch.Enabled
 	}
-	if patch.Network != "" {
-		m.cfg.Docker.Network = patch.Network
+	if patch.Topology != nil {
+		d.Topology = *patch.Topology
 	}
-	if patch.Image != "" {
-		m.cfg.Docker.Image = patch.Image
+	if patch.Nodes != nil {
+		d.Nodes = *patch.Nodes
 	}
-	if patch.ContainerPrefix != "" {
-		m.cfg.Docker.ContainerPrefix = patch.ContainerPrefix
+	if patch.StorageNodes != nil {
+		d.StorageNodes = *patch.StorageNodes
 	}
-	// 布尔字段允许显式关闭：WithEmbed/Enabled 以 patch 中的值为准。
-	m.cfg.Docker.WithEmbed = patch.WithEmbed
-	m.cfg.Docker.Enabled = patch.Enabled
-	if err := saveOpsConfig(m.cfgPath, m.cfg); err != nil {
+	if patch.BasePort != nil {
+		d.BasePort = *patch.BasePort
+	}
+	if patch.StorageBasePort != nil {
+		d.StorageBasePort = *patch.StorageBasePort
+	}
+	if patch.Network != nil {
+		d.Network = *patch.Network
+	}
+	if patch.Image != nil {
+		d.Image = *patch.Image
+	}
+	if patch.ContainerPrefix != nil {
+		d.ContainerPrefix = *patch.ContainerPrefix
+	}
+	if patch.WithEmbed != nil {
+		d.WithEmbed = *patch.WithEmbed
+	}
+
+	// Deliberately NOT re-running validateExecConfig here. The scripts cannot have
+	// changed through this handler (they are refused above), and the rest of the
+	// fields only pick parameters, not programs. Re-validating the whole config would
+	// turn any pre-existing oddity in a deployment's script path into a 403 on an
+	// unrelated parameter edit — a check that fails on the wrong thing teaches
+	// operators to work around it.
+	if err := saveOpsConfig(m.cfgPath, &next); err != nil {
 		writeOpsError(w, http.StatusInternalServerError, "save config: "+err.Error())
 		return
 	}
+	m.cfg = &next
+	m.sup.SetConfig(m.cfg)
 	writeOpsJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"note":   "集群参数已保存；对运行中的集群执行「启动/重建」后生效",

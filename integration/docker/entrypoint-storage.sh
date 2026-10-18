@@ -16,9 +16,16 @@ set -e
 VECSTORE_DATA="${STRATUM_VECSTORE_DATA:-/var/lib/stratum/vecstore}"
 VECSTORE_ADDR="${STRATUM_VECSTORE_ADDR:-127.0.0.1:7100}"
 # The root the vecstore's on-disk index RPCs may touch (M4 of
-# docs/code-review-2026-09-24.md). It is the node's data directory: the storage
-# layer writes `<data>/index/<kbID>/...` and the vecstore loads exactly those paths.
-VECSTORE_INDEX_DIR="${STRATUM_VECSTORE_INDEX_DIR:-/var/lib/stratum}"
+# docs/code-review-2026-09-24.md). The storage layer writes
+# `<data>/index/<kbID>/...`, so the root is `<data>/index` — NOT `<data>`: these
+# RPCs write any path they are handed, and `<data>` also holds the RocksDB chunk
+# store and the document/metadata stores, which a single Save() can overwrite
+# (C3 of docs/code-review-2026-10-18.md).
+# Derived from the node's own data_dir (`<data_dir>/index`), so the root matches
+# where the indexes actually are and still excludes the chunk store, the document
+# store and the metadata stores that live beside them.
+NODE_DATA_DIR="$(sed -n 's/^[[:space:]]*data_dir:[[:space:]]*//p' /etc/stratum/config.yaml | head -n1 | tr -d '"')"
+VECSTORE_INDEX_DIR="${STRATUM_VECSTORE_INDEX_DIR:-${NODE_DATA_DIR:-/var/lib/stratum}/index}"
 
 mkdir -p /var/log/stratum
 

@@ -145,9 +145,19 @@ func (p *Persister) LoadSnapshot() (data []byte, lastIndex uint64, err error) {
 // half-written, corrupt file at path — readers always see either the
 // previous complete version or the new complete version, never a partial
 // one.
+//
+// The fsyncs are the other half of that promise, and they are not optional:
+// rename is atomic with respect to the DIRECTORY ENTRY, not with respect to the
+// file's CONTENTS. Without the file sync, a power loss can leave the renamed
+// file present but zero-length or half-written; without the parent-directory
+// sync, the rename itself may not have reached disk. Either way the result is a
+// state file that fails to decode on the next start — and for Raft's hard state
+// that means term 0 / no vote / empty log, which lets the node vote twice in one
+// term (H4 of docs/code-review-2026-10-18.md).
 func atomicWriteGob(path string, val any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 
 	var buf bytes.Buffer
@@ -156,11 +166,39 @@ func atomicWriteGob(path string, val any) error {
 	}
 
 	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, buf.Bytes(), 0o644); err != nil {
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", tmpPath, err)
+	}
+	if _, err := f.Write(buf.Bytes()); err != nil {
+		f.Close()
 		return fmt.Errorf("write %s: %w", tmpPath, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync %s: %w", tmpPath, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpPath, err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("rename %s -> %s: %w", tmpPath, path, err)
 	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("sync directory %s: %w", dir, err)
+	}
 	return nil
+}
+
+// syncDir fsyncs a directory, making the renames inside it durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }

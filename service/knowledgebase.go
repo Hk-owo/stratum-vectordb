@@ -412,12 +412,24 @@ func (s *KnowledgeBaseServiceImpl) CreateVersion(ctx context.Context, req *pb.Cr
 	stepStart = time.Now()
 	changes := make([]types.DocChange, len(req.Changes))
 	for i, c := range req.Changes {
+		// No silent default (M1 of docs/code-review-2026-10-18.md). An op this build
+		// does not recognise is not "add": the caller may have meant DELETE, and
+		// executing it as ADD with an empty content field would quietly blank the
+		// document instead of removing it. Every other enum on this path is refused
+		// explicitly for the same reason (see the quantizer mapping above and
+		// await_version's status mapping) — this one was the exception.
 		op := types.ChangeOpAdd
 		switch c.Op {
+		case pb.ChangeOp_CHANGE_OP_ADD:
+			// explicit, so the default below is reachable only by an unknown value
 		case pb.ChangeOp_CHANGE_OP_DELETE:
 			op = types.ChangeOpDelete
 		case pb.ChangeOp_CHANGE_OP_UPDATE:
 			op = types.ChangeOpUpdate
+		default:
+			return nil, stratumerrors.ToGRPCStatus(fmt.Errorf(
+				"%w: changes[%d] (%s) has op %v, which this server does not recognise",
+				stratumerrors.ErrInvalidArgument, i, c.DocId, c.Op))
 		}
 		changes[i] = types.DocChange{
 			Op:      op,

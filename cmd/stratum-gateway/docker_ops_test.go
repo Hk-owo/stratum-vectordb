@@ -344,3 +344,73 @@ func TestOpsDockerSingleTierUnchanged(t *testing.T) {
 		t.Errorf("single-tier must not use tier options, got: %s", logs)
 	}
 }
+
+// TestOpsDockerConfigPut_RefusesScriptRewrite pins C2 of
+// docs/code-review-2026-10-18.md.
+//
+// /ops/config refuses to change docker.script because dockerCluster execs it, and
+// it is not a parameter — it is the choice of program to run. This endpoint is the
+// second writer of the same config and used to accept the field straight through,
+// so one PUT plus POST /ops/docker/up was arbitrary execution as the gateway: the
+// guard on the neighbouring route with a hole beside it.
+func TestOpsDockerConfigPut_RefusesScriptRewrite(t *testing.T) {
+	srv, m, _ := testDockerOpsServer(t)
+	m.mu.Lock()
+	before := m.cfg.Docker.Script
+	m.mu.Unlock()
+
+	code, body := doOps(t, srv.URL+"/ops/docker/config", "PUT", map[string]any{
+		"script": "/tmp/evil.sh",
+	})
+	if code != http.StatusForbidden {
+		t.Fatalf("script rewrite: code=%d body=%v, want 403", code, body)
+	}
+	m.mu.Lock()
+	after := m.cfg.Docker.Script
+	m.mu.Unlock()
+	if after != before {
+		t.Errorf("docker.script changed to %q despite the refusal", after)
+	}
+
+	// The two-tier variant is the same program under another key.
+	if code, body := doOps(t, srv.URL+"/ops/docker/config", "PUT", map[string]any{
+		"script_two_tier": "/tmp/evil2.sh",
+	}); code != http.StatusForbidden {
+		t.Errorf("script_two_tier rewrite: code=%d body=%v, want 403", code, body)
+	}
+
+	// Echoing the current value back is not a rewrite and must stay allowed, or the
+	// console could not save the form it just loaded.
+	if code, body := doOps(t, srv.URL+"/ops/docker/config", "PUT", map[string]any{
+		"script": before,
+		"nodes":  4,
+	}); code != http.StatusOK {
+		t.Errorf("echoing the current script back: code=%d body=%v, want 200", code, body)
+	}
+}
+
+// TestOpsDockerConfigPut_OmittedBooleansStay pins the other half of the same
+// handler: a parameter edit must not silently switch docker management off.
+func TestOpsDockerConfigPut_OmittedBooleansStay(t *testing.T) {
+	srv, m, _ := testDockerOpsServer(t)
+	m.mu.Lock()
+	m.cfg.Docker.Enabled = true
+	m.cfg.Docker.WithEmbed = true
+	m.mu.Unlock()
+
+	code, body := doOps(t, srv.URL+"/ops/docker/config", "PUT", map[string]any{
+		"network": "another-net",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("network-only patch: code=%d body=%v", code, body)
+	}
+	m.mu.Lock()
+	got := m.cfg.Docker
+	m.mu.Unlock()
+	if !got.Enabled || !got.WithEmbed {
+		t.Errorf("omitted booleans were written through as false: %+v", got)
+	}
+	if got.Network != "another-net" {
+		t.Errorf("network = %q, want another-net", got.Network)
+	}
+}

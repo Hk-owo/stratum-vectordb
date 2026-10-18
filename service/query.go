@@ -76,9 +76,19 @@ type QueryServiceImpl struct {
 
 // pullKey identifies one in-flight catch-up: this node's history for one
 // knowledge base up to one version.
+// pullKey is the de-duplication key for a background catch-up, and it holds the
+// knowledge base ONLY (M2 of docs/code-review-2026-10-18.md).
+//
+// It used to be (kbID, versionID), which made the de-duplication trivially
+// bypassable: nothing bounds min_version, so a caller that alternated two values had
+// two keys and got two goroutines, then three, then nine... each one a four-attempt
+// pull with a 5-minute budget. The unit of work is not the version either — a pull
+// always runs to the node's current cursor, and EnsureIndex returns as soon as it is
+// satisfied — so "one catch-up per knowledge base at a time" is both the correct
+// bound and the coarser one. A caller asking for a newer version while a pull runs
+// needs nothing extra: the next query re-triggers, and by then the cursor has moved.
 type pullKey struct {
-	kbID      string
-	versionID int64
+	kbID string
 }
 
 // NewQueryService constructs a QueryServiceImpl.
@@ -144,11 +154,11 @@ func (s *QueryServiceImpl) SetIndexFetcher(f IndexFetcher) {
 // goroutines each making a four-attempt pull of the same version, which is an
 // amplification anyone able to send queries could ask for.
 func (s *QueryServiceImpl) startBackgroundPull(kbID string, versionID int64) {
-	if s.backfiller == nil || !s.beginPull(kbID, versionID) {
+	if s.backfiller == nil || !s.beginPull(kbID) {
 		return
 	}
 	go func() {
-		defer s.endPull(kbID, versionID)
+		defer s.endPull(kbID)
 		// Bounded retry with backoff, because this is the node's ONLY way back: the
 		// write that should have brought the data here reached quorum without it
 		// (§7.1) and the announcement that would have asked it to pull is
@@ -180,8 +190,8 @@ func (s *QueryServiceImpl) startBackgroundPull(kbID string, versionID int64) {
 // (kbID, versionID) is already in flight. The false case is the whole point: the
 // caller then does nothing, which is exactly what the duplicate pull would have
 // amounted to.
-func (s *QueryServiceImpl) beginPull(kbID string, versionID int64) bool {
-	key := pullKey{kbID: kbID, versionID: versionID}
+func (s *QueryServiceImpl) beginPull(kbID string) bool {
+	key := pullKey{kbID: kbID}
 	s.pullMu.Lock()
 	defer s.pullMu.Unlock()
 	if s.pulls == nil {
@@ -197,8 +207,8 @@ func (s *QueryServiceImpl) beginPull(kbID string, versionID int64) bool {
 // endPull clears the registration, whichever way the pull finished. Called from a
 // defer so a panic in the pull cannot pin the key forever and silence every
 // later catch-up for that version.
-func (s *QueryServiceImpl) endPull(kbID string, versionID int64) {
-	key := pullKey{kbID: kbID, versionID: versionID}
+func (s *QueryServiceImpl) endPull(kbID string) {
+	key := pullKey{kbID: kbID}
 	s.pullMu.Lock()
 	defer s.pullMu.Unlock()
 	delete(s.pulls, key)

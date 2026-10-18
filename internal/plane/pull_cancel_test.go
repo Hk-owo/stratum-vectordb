@@ -23,10 +23,10 @@ func TestEnsureIndexStopsWhenTheContextIsCancelled(t *testing.T) {
 	// Let it fail at least once, so the test is about the retrying loop and not
 	// about a call that never started.
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) && puller.calls == 0 {
+	for time.Now().Before(deadline) && puller.calls.Load() == 0 {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if puller.calls == 0 {
+	if puller.calls.Load() == 0 {
 		t.Fatal("the pull never started")
 	}
 
@@ -41,9 +41,9 @@ func TestEnsureIndexStopsWhenTheContextIsCancelled(t *testing.T) {
 	}
 
 	// And it must actually stop: no further attempts after the return.
-	settled := puller.calls
+	settled := puller.calls.Load()
 	time.Sleep(300 * time.Millisecond)
-	if got := puller.calls; got != settled {
+	if got := puller.calls.Load(); got != settled {
 		t.Fatalf("the loop kept pulling after cancellation: %d → %d attempts", settled, got)
 	}
 }
@@ -62,7 +62,7 @@ func TestEnsureIndexRefusesAnAlreadyCancelledContext(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if puller.calls != 0 {
-		t.Fatalf("a cancelled context started %d pulls", puller.calls)
+	if puller.calls.Load() != 0 {
+		t.Fatalf("a cancelled context started %d pulls", puller.calls.Load())
 	}
 }

@@ -302,6 +302,30 @@ func (m *PebbleChunkDocMapper) DeleteByDoc(_ context.Context, kbID, docID string
 	return nil
 }
 
+// DeleteMapping implements ChunkDocMapper: one (chunkID, docID) pair, both
+// directions, one durable commit.
+//
+// Both directions go in the same batch for the same reason Write does: a forward
+// entry without its reverse is a document whose chunk is invisible to the build
+// path, and a reverse entry without its forward is a chunk whose documents are
+// invisible to the query path. Deleting one side only would trade one leak for
+// another.
+func (m *PebbleChunkDocMapper) DeleteMapping(_ context.Context, kbID, chunkID, docID string) error {
+	batch := m.db.NewBatch()
+	defer batch.Close()
+
+	if err := batch.Delete(encodeForwardKey(kbID, chunkID, docID), nil); err != nil {
+		return fmt.Errorf("chunkdoc: DeleteMapping(%s,%s,%s): delete forward entry: %w", kbID, chunkID, docID, err)
+	}
+	if err := batch.Delete(encodeReverseKey(kbID, docID, chunkID), nil); err != nil {
+		return fmt.Errorf("chunkdoc: DeleteMapping(%s,%s,%s): delete reverse entry: %w", kbID, chunkID, docID, err)
+	}
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("chunkdoc: DeleteMapping(%s,%s,%s): commit: %w", kbID, chunkID, docID, err)
+	}
+	return nil
+}
+
 // decodeSuffixString strips prefix from key and decodes the remaining
 // bytes as a single EncodeString-encoded string (the final component of
 // either a forward or reverse key).

@@ -38,6 +38,13 @@ var writeMethods = map[string]bool{
 	pb.KnowledgeBaseService_DiscardVersion_FullMethodName:      true,
 	pb.AdminService_RebuildIndex_FullMethodName:                true,
 	pb.AdminService_WarmupVersion_FullMethodName:               true,
+	// Both call Propose* (ProposeRetryVersion / ProposeMarkVersionFailedPermanent),
+	// which is this map's own stated criterion, and both change a version's verdict.
+	// They were missing, so a caller holding only read grants could revoke or abandon
+	// a version AND skip the leader-bound routing every other write takes (M17 of
+	// docs/code-review-2026-10-18.md).
+	pb.AdminService_ForceRetryVersion_FullMethodName:   true,
+	pb.AdminService_ForceAbandonVersion_FullMethodName: true,
 }
 
 // isWriteMethod reports whether fullMethod (e.g.

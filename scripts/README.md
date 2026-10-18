@@ -108,11 +108,17 @@ station up|down|status|logs  服务站（宿主进程）
   会留下一个服务于「已被重建过的集群」的孤儿。`--with-station` 可让 `up` 顺手拉起它。
 - 存储侧生成的配置里 `gc_enabled: true` + `gc_sweep_interval_ms: 5000` +
   `append_max_dead_ratio: 0.95` 是**测试夹具**取值（见脚本内注释）：生产值需要另行决定。
-- **宿主 vecstore 只被允许碰节点的数据目录**：单层拓扑下它由 `vecstore start` 以
-  `--index_dir="$VECSTORE_INDEX_DIR"`（默认 `/var/lib/stratum`，即节点配置里
-  `storage.data_dir` 的父目录）启动，容器的存储半边同理（`STRATUM_VECSTORE_INDEX_DIR`
-  可覆盖）。vecstore 的 `Save`/`Load` 等 RPC 直接用调用方给的路径，没有这道闸门就是
-  "能连端口就能读写任意文件"（`docs/code-review-2026-09-24.md` M4）。
+- **宿主 vecstore 只被允许碰节点的索引目录**：单层拓扑下它由 `vecstore start` 以
+  `--index_dir="$VECSTORE_INDEX_ROOT/nodeN/index"`（`STRATUM_VECSTORE_INDEX_ROOT` 可覆盖，
+  默认 `/var/lib/stratum`）启动，容器的存储半边同理（`STRATUM_VECSTORE_INDEX_DIR`，默认
+  由该容器的 `storage.data_dir` + `/index` 推出）。vecstore 的 `Save`/`Load` 等 RPC 直接用
+  调用方给的路径，没有这道闸门就是"能连端口就能读写任意文件"
+  （`docs/code-review-2026-09-24.md` M4）。
+- 根必须收到 **`<data_dir>/index`** 这一层，不能是它的父目录：`<data_dir>` 下面还躺着
+  RocksDB（`vecstore_rocksdb/` 或节点目录本身）与文档/元数据存储，而 `Save` 是带 rename
+  的整文件替换 —— 一次 `Save(<data>/vecstore_rocksdb/CURRENT)` 就把引擎文件换成索引字节，
+  库再也打不开（`docs/code-review-2026-10-18.md` C3）。vecstore 另有第二道锁：启动时传入
+  的 `rocksdb_path` 被列为**排除根**，落在它下面的路径即使匹配允许根也会被拒。
 
 ## 三、`gateway.sh` —— 本地入口（服务站 + 控制台）
 

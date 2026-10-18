@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"stratum/internal/plane"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
+	stratumync "stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 	"stratum/internal/wal"
@@ -462,7 +464,7 @@ func (c *WriteCoordinatorImpl) dispatchInBackground(kbID string, versionID int64
 			// Not just a log line: hand it to the same give-up path the apply
 			// hook uses, so §10.1's retry budget owns the verdict instead of the
 			// version sitting PENDING forever.
-			c.AbandonDispatch(ctx, kbID, versionID, types.FailureTransient,
+			c.AbandonDispatch(ctx, kbID, versionID, dispatchFailureClass(err),
 				fmt.Sprintf("dispatch failed: %v", err))
 		}
 	}()
@@ -474,6 +476,31 @@ func (c *WriteCoordinatorImpl) dispatchTimeout() time.Duration {
 		return c.cfg.DispatchTimeout
 	}
 	return DefaultDispatchTimeout
+}
+
+// abandonReportTimeout bounds the Raft round trip that records a give-up.
+//
+// Short, and independent of anything the caller holds: it exists so the give-up path
+// can always record its verdict, not to bound work the caller asked for.
+const abandonReportTimeout = 30 * time.Second
+
+// dispatchFailureClass maps a dispatch failure onto the class §10.1 should see.
+//
+// The call site used to hardcode FailureTransient, so a permanent refusal — the
+// knowledge base is gone, the parent version is invalid, the write was rejected
+// outright — spent the version's whole retry budget, keeping it PENDING the entire
+// time, before reaching the same verdict it could have reached immediately.
+func dispatchFailureClass(err error) types.FailureClass {
+	switch {
+	case errors.Is(err, stratumerrors.ErrKnowledgeBaseNotFound),
+		errors.Is(err, stratumerrors.ErrKnowledgeBaseDeleted),
+		errors.Is(err, stratumerrors.ErrVersionNotFound),
+		errors.Is(err, stratumerrors.ErrInvalidArgument),
+		errors.Is(err, stratumerrors.ErrInvalidParentVersion),
+		errors.Is(err, stratumerrors.ErrEmptyChanges):
+		return types.FailureFatalGlobal
+	}
+	return types.FailureTransient
 }
 
 // AbandonDispatch is the single give-up path of the write path: the ONE place a
@@ -508,7 +535,16 @@ func (c *WriteCoordinatorImpl) AbandonDispatch(ctx context.Context, kbID string,
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
 		return
 	}
-	terminal, err := c.cfg.ControlPlane.ReportVersionFailure(ctx, kbID, versionID, types.FailureSideData, class, detail)
+	// The caller's context is very often the one that just expired: a dispatch that ran
+	// out its budget is the most common reason to be here at all. Reporting runs a Raft
+	// round trip, so inheriting that context guaranteed the report failed too — the one
+	// give-up path unable to record the giving-up, leaving the version PENDING with its
+	// retry budget already spent (H10 of docs/code-review-2026-10-18.md).
+	// WithoutCancel keeps the context's values (trace ids, deadlines that were not the
+	// problem) and drops the cancellation, so a fresh bound decides instead.
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abandonReportTimeout)
+	defer cancel()
+	terminal, err := c.cfg.ControlPlane.ReportVersionFailure(reportCtx, kbID, versionID, types.FailureSideData, class, detail)
 	if err != nil {
 		log.Warn("coordinator: reporting a version's failure",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
@@ -1091,6 +1127,19 @@ func (c *WriteCoordinatorImpl) writeVersionDocList(ctx context.Context, kbID str
 		if err != nil {
 			return nil, fmt.Errorf("coordinator: list parent version %d docs: %w", parentVersionID, err)
 		}
+		// "This node holds no data for the parent" and "the parent has no
+		// documents" both come back from ListDocIDs as an empty slice, and the
+		// difference decides whether the child version is correct (H1 of
+		// docs/code-review-2026-10-18.md). It matters under the dispatch topology:
+		// the candidate set is "every replica of the KB", with no check that the
+		// candidate actually holds the parent version, so a replica whose fan-out
+		// failed — or that restarted, or just joined — would derive the child's
+		// document set from nothing. Every inherited document would then vanish from
+		// the new version, and because the bogus set is what gets hashed into
+		// DocIDSetHash and fanned out, the whole cluster would agree on it.
+		if err := c.verifyParentDocSet(ctx, kbID, parentVersionID, docIDs); err != nil {
+			return nil, err
+		}
 		for _, id := range docIDs {
 			parentDocs[id] = true
 		}
@@ -1126,6 +1175,39 @@ func (c *WriteCoordinatorImpl) writeVersionDocList(ctx context.Context, kbID str
 	}
 
 	return docIDs, nil
+}
+
+// verifyParentDocSet checks that the parent document set read from this node's
+// store is the one the control layer committed for that version.
+//
+// The comparison is the ONLY thing that separates "I hold the parent version" from
+// "I hold nothing for it": both read back from ListDocIDs as an empty list. A
+// mismatch means the child's document set must not be derived here — the write has
+// to be retried (the parent's data may still be landing) or handled by a replica
+// that does hold it.
+func (c *WriteCoordinatorImpl) verifyParentDocSet(ctx context.Context, kbID string, parentVersionID int64, docIDs []string) error {
+	if c.cfg.RaftNode == nil {
+		return nil // no metadata source wired (unit-test stacks): nothing to compare against
+	}
+	parent, err := c.cfg.RaftNode.GetVersion(ctx, kbID, parentVersionID)
+	if err != nil {
+		return fmt.Errorf("coordinator: read parent version %d metadata: %w", parentVersionID, err)
+	}
+	if parent.DocIDSetHash == "" {
+		// No digest committed for the parent yet (its write is still in flight, or
+		// the version predates the field). Unverifiable is not the same as wrong, so
+		// the write proceeds rather than being blocked on a fact nobody has.
+		return nil
+	}
+	got := stratumync.ComputeDocIDSetHash(docIDs)
+	if got == parent.DocIDSetHash {
+		return nil
+	}
+	return fmt.Errorf(
+		"coordinator: parent version %d's local document set does not match its committed digest "+
+			"(local %s, committed %s): this node does not hold the parent version's data, so deriving "+
+			"the child's document set here would drop every inherited document: %w",
+		parentVersionID, got, parent.DocIDSetHash, stratumerrors.ErrIndexNotReady)
 }
 
 // retry executes fn with exponential backoff up to MaxRetries times.

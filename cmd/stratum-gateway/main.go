@@ -473,11 +473,30 @@ func logRequests(next http.Handler) http.Handler {
 // A request that DOES carry an Authorization header (the API path, and any
 // integration that uses the gateway as a plain HTTP front end) keeps its own
 // credential: the fallback must never upgrade a caller.
+//
+// That last sentence is a rule to ENFORCE, not to assert (C1 of
+// docs/code-review-2026-10-18.md). scripts/gateway.sh mints the fallback token with
+// `kb_ids: ["*"]` — it has to, because kb ids are generated server-side and no static
+// table can name the ones that do not exist yet — so handing it to every request that
+// lacks an Authorization header turns "anonymous" into "read and write every
+// knowledge base". The container shape publishes :8081 on the host
+// (`-p ${PORT}:8081 -http-addr 0.0.0.0:8081`), where "anyone who can reach the port"
+// is not a small set.
+//
+// So the fallback now applies only to the console's own pages: /api/* calls from a
+// same-origin document. Static assets are served untouched, and any other anonymous
+// /api/ request gets 401 instead of the console's identity.
 func withCredential(fallback string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token := strings.TrimSpace(r.Header.Get("Authorization"))
-			if token == "" {
+			if token == "" && fallback != "" && strings.HasPrefix(r.URL.Path, "/api/") {
+				if !consoleSameOrigin(r) {
+					writeOpsError(w, http.StatusUnauthorized,
+						"this endpoint requires an Authorization header: the console's own credential "+
+							"is applied only to same-origin requests from the console's pages")
+					return
+				}
 				token = fallback
 			}
 			if token != "" {
@@ -486,6 +505,26 @@ func withCredential(fallback string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// consoleSameOrigin reports whether a request came from the console's own pages.
+//
+// The fallback credential is a privilege decision (see withCredential), so "is this
+// the console?" has to be answered from something a page cannot forge. Both headers
+// below are chosen by the BROWSER, not by script: a page on another origin can only
+// ever ask for "cross-site"/"same-site", and cannot set either to a same-origin value.
+func consoleSameOrigin(r *http.Request) bool {
+	// Fetch Metadata: sent by every current browser.
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" {
+		return site == "same-origin"
+	}
+	// Older browsers: Origin, which same-origin fetch/XHR sends for non-GET methods.
+	// A request carrying neither header is not a browser page at all — curl, a script,
+	// a bot — and must not receive the console's identity.
+	if origin := r.Header.Get("Origin"); origin != "" {
+		return sameOriginAsRequest(origin, r.Host)
+	}
+	return false
 }
 
 // noCacheStatic disables browser caching for the frontend assets, so that

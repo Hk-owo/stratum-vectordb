@@ -70,7 +70,10 @@ func newTestCluster(t *testing.T, n int, opts ...Option) []*testNode {
 		applyCh := make(chan ApplyMsg, 256)
 		persister := kvstorage.NewPersister(filepath.Join(t.TempDir(), fmt.Sprintf("raft-%d", id)))
 		allOpts := append(testClusterTiming(), opts...)
-		rf := NewRaft(id, transport, applyCh, persister, allOpts...)
+		rf, err := NewRaft(id, transport, applyCh, persister, allOpts...)
+		if err != nil {
+			t.Fatalf("NewRaft(%d): %v", id, err)
+		}
 		nodes[i] = &testNode{id: id, addr: addrs[i], rf: rf, applyCh: applyCh, transport: transport, persister: persister}
 	}
 

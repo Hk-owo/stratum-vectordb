@@ -173,6 +173,24 @@ func (h *LeaderHandler) streamVersionDocList(
 	return docIDs, nil
 }
 
+// versionScopedUpperBound returns the exclusive upper bound for one document's
+// keys restricted to versionIDs ≤ versionID: the document prefix followed by the
+// encoded versionID+1. This is the same bound docstore.ReadAt uses, and the
+// reason both need it is the same — the keyspace orders by (kb, doc, version), so
+// only a version-suffixed bound excludes later versions of the SAME document.
+func versionScopedUpperBound(docPrefix []byte, versionID int64) []byte {
+	if versionID == math.MaxInt64 {
+		// Unreachable in practice (version ids come from a Raft counter that
+		// starts at 1), and versionID+1 would overflow into a bound that admits
+		// everything. Degrading to the document prefix keeps that theoretical case
+		// from turning into a wrong answer.
+		return pebbleutil.PrefixSuccessor(docPrefix)
+	}
+	upper := make([]byte, 0, len(docPrefix)+8)
+	upper = append(upper, docPrefix...)
+	return append(upper, pebbleutil.EncodeVersionID(versionID+1)...)
+}
+
 // streamDocStore scans the leader's docstore for each docID and streams
 // the visible entry at versionID (largest version ≤ versionID).
 func (h *LeaderHandler) streamDocStore(
@@ -183,7 +201,17 @@ func (h *LeaderHandler) streamDocStore(
 
 	for _, docID := range docIDs {
 		docPrefix := append(kbPrefix, pebbleutil.EncodeString(docID)...)
-		upper := pebbleutil.PrefixSuccessor(docPrefix)
+		// The bound has to be "the first key past this version", not "the
+		// successor of the document prefix". Bounded by the prefix successor,
+		// SeekLT lands on the document's NEWEST entry; when the document was
+		// updated after versionID, the version check that used to sit below then
+		// dropped it and the export shipped no record for it at all (C4 of
+		// docs/code-review-2026-10-18.md). Pulling a middle version — which the
+		// gap backfill does for every version between this node's cursor and the
+		// one being applied — therefore produced a version whose document list
+		// was complete and whose bodies were missing, and the follower advanced
+		// its cursor over it, so nothing ever asked again.
+		upper := versionScopedUpperBound(docPrefix, versionID)
 
 		iter, err := h.docstoreDB.NewIter(&pebble.IterOptions{
 			LowerBound: docPrefix,
@@ -193,38 +221,35 @@ func (h *LeaderHandler) streamDocStore(
 			return err
 		}
 
-		// Seek to the last entry ≤ versionID: the upper bound is
-		// docPrefix's successor, so we seek to that and move one
-		// back (the last entry in the prefix range).
+		// The bound already restricts the range to versions ≤ versionID, so the
+		// last key inside it IS the entry to send.
 		var foundKey []byte
 		var foundVal []byte
 		var foundVersion int64
-		iter.SeekLT(upper)
-		if iter.Valid() {
+		if iter.SeekLT(upper) {
 			k := iter.Key()
-			// Extract versionID from key suffix.
-			kbLen := 4 + len(kbID)
-			docLen := 4 + len(docID)
-			verStart := kbLen + docLen
-			if len(k) >= verStart+8 {
-				foundVersion = int64(binary.BigEndian.Uint64(k[verStart : verStart+8]))
-				if foundVersion <= versionID {
-					foundKey = make([]byte, len(k))
-					copy(foundKey, k)
-					v, err := iter.ValueAndErr()
-					if err != nil {
-						iter.Close()
-						return err
-					}
-					foundVal = make([]byte, len(v))
-					copy(foundVal, v)
+			if ver, ok := pebbleutil.DecodeVersionID(k[len(docPrefix):]); ok {
+				v, err := iter.ValueAndErr()
+				if err != nil {
+					iter.Close()
+					return err
 				}
+				foundVersion = ver
+				foundKey = append([]byte(nil), k...)
+				foundVal = append([]byte(nil), v...)
 			}
 		}
 		iter.Close()
 
 		if foundKey == nil {
-			continue // doc not found at this version (shouldn't happen)
+			// The version's document list names this document, so having no entry
+			// for it at or before versionID means the two stores disagree — not
+			// that the document is absent. Saying so is the point: what used to
+			// happen here was shipping the version without the document, which the
+			// follower could not tell apart from a version that really lacks it.
+			return fmt.Errorf(
+				"sync: stream DocStore: %s/%s has no entry at or before version %d, but the version's document list includes it",
+				kbID, docID, versionID)
 		}
 
 		// The raw value carries docstore's internal tag byte

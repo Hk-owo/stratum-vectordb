@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
 	stratuminternalsync "stratum/internal/sync"
+	"stratum/internal/types"
 )
 
 // stubIndexInstaller records what a fetched artifact lands as. Installation is
@@ -289,5 +291,162 @@ func TestEnsureIndex_BuildsWhenNobodyHasTheArtifact(t *testing.T) {
 	}
 	if got := installer.installedEntries(); len(got) != 0 {
 		t.Fatalf("installed = %v, want nothing", got)
+	}
+}
+
+// slowIndexFetcher blocks inside FetchIndex until released, so a test can hold a
+// fetch open and watch what the second caller does.
+type slowIndexFetcher struct {
+	inner   *stubIndexFetcher
+	entered chan struct{}
+	release chan struct{}
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *slowIndexFetcher) FetchIndex(ctx context.Context, sourceAddr, kbID string, versionID int64) ([]byte, []byte, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
+	return s.inner.FetchIndex(ctx, sourceAddr, kbID, versionID)
+}
+
+func (s *slowIndexFetcher) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestFetchIndexFromPeers_SharesOneFetchAcrossConcurrentCallers pins the
+// deduplication half of H9 of docs/code-review-2026-10-18.md.
+//
+// The query path asks for the artifact on every PENDING query and the catch-up loop
+// on every round, so the same version is asked about repeatedly and concurrently.
+// Each ask used to download the whole artifact and rewrite the file on disk
+// (InstallIndex serialises per version, so the rewrites queued up rather than
+// overlapping).
+func TestFetchIndexFromPeers_SharesOneFetchAcrossConcurrentCallers(t *testing.T) {
+	fetcher := &slowIndexFetcher{
+		inner:   &stubIndexFetcher{fetchable: map[string][]byte{"peer-a": []byte("artifact")}},
+		entered: make(chan struct{}, 8),
+		release: make(chan struct{}),
+	}
+	dp := newFetchPlane(fetcher, &stubIndexInstaller{}, "peer-a")
+
+	type result struct {
+		installed bool
+		err       error
+	}
+
+	// First caller: reaches the download and stays there.
+	first := make(chan result, 1)
+	go func() {
+		installed, err := dp.FetchIndexFromPeers(context.Background(), "kb-1", 7)
+		first <- result{installed, err}
+	}()
+	<-fetcher.entered
+
+	// Second caller, while the first download is still open: it must attach to that
+	// download instead of starting another.
+	second := make(chan result, 1)
+	go func() {
+		installed, err := dp.FetchIndexFromPeers(context.Background(), "kb-1", 7)
+		second <- result{installed, err}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if got := fetcher.callCount(); got != 1 {
+		t.Fatalf("FetchIndex was called %d times while one download was open, want 1 (the second caller must share it)", got)
+	}
+
+	close(fetcher.release)
+	for i, ch := range []chan result{first, second} {
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("caller %d: %v", i, r.err)
+		}
+		if !r.installed {
+			t.Errorf("caller %d did not see the artifact as installed", i)
+		}
+	}
+	if got := fetcher.callCount(); got != 1 {
+		t.Errorf("FetchIndex ran %d times for one version, want 1", got)
+	}
+}
+
+// existingArtifactIndexStore answers IndexExists with true and TriggerBuild with a
+// tattle, so a test can tell "asked the disk" from "asked the cluster".
+type existingArtifactIndexStore struct {
+	mu          sync.Mutex
+	existsCalls int
+	builds      int
+}
+
+func (s *existingArtifactIndexStore) Search(context.Context, string, int64, []float32, int) ([]types.SearchResult, error) {
+	return nil, nil
+}
+
+func (s *existingArtifactIndexStore) TriggerBuild(context.Context, string, int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.builds++
+	return nil
+}
+
+func (s *existingArtifactIndexStore) TriggerBuildBackfill(context.Context, string, int64) error {
+	return nil
+}
+
+func (s *existingArtifactIndexStore) IndexExists(context.Context, string, int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.existsCalls++
+	return true, nil
+}
+
+func (s *existingArtifactIndexStore) EnforceDiskRetention(context.Context, string, []int64) error {
+	return nil
+}
+
+// TestEnsureOwnIndex_AsksTheDiskBeforeTheCluster pins the ordering half of H9: a
+// version whose artifact is already here must not be re-downloaded on every
+// EnsureIndex.
+func TestEnsureOwnIndex_AsksTheDiskBeforeTheCluster(t *testing.T) {
+	fetcher := &stubIndexFetcher{fetchable: map[string][]byte{"peer-a": []byte("artifact")}}
+	store := &existingArtifactIndexStore{}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		IndexManager:   store,
+		IndexFetcher:   fetcher,
+		IndexInstaller: &stubIndexInstaller{},
+		ResolveReplicas: func(context.Context) ([]string, error) {
+			return []string{"peer-a"}, nil
+		},
+		Logger: zap.NewNop(),
+	})
+
+	if err := dp.ensureOwnIndex(context.Background(), "kb-1", 7); err != nil {
+		t.Fatalf("ensureOwnIndex: %v", err)
+	}
+	if got := fetcher.fetchedTargets(); len(got) != 0 {
+		t.Errorf("the artifact was fetched from %v even though it is already on this node's disk", got)
+	}
+	store.mu.Lock()
+	exists := store.existsCalls
+	builds := store.builds
+	store.mu.Unlock()
+	if exists == 0 {
+		t.Error("IndexExists was never consulted")
+	}
+	if builds != 0 {
+		t.Errorf("TriggerBuild ran %d times for a version that is already present", builds)
 	}
 }

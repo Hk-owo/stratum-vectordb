@@ -207,7 +207,10 @@ func restartTestNode(t *testing.T, old *testNode, peers []*testNode) *testNode {
 		}
 	}
 	applyCh := make(chan ApplyMsg, 256)
-	rf := NewRaft(old.id, transport, applyCh, old.persister, testClusterTiming()...)
+	rf, err := NewRaft(old.id, transport, applyCh, old.persister, testClusterTiming()...)
+	if err != nil {
+		t.Fatalf("NewRaft(%d): %v", old.id, err)
+	}
 	nd := &testNode{id: old.id, addr: old.addr, rf: rf, applyCh: applyCh, transport: transport, persister: old.persister}
 	if err := rf.StartGRPC(old.addr); err != nil {
 		t.Fatalf("restart StartGRPC(%d): %v", old.id, err)

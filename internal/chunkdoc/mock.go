@@ -126,6 +126,25 @@ func (m *MockChunkDocMapper) DeleteByDoc(_ context.Context, kbID, docID string) 
 	return nil
 }
 
+func (m *MockChunkDocMapper) DeleteMapping(_ context.Context, kbID, chunkID, docID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if fwd, ok := m.forward[kbID][chunkID]; ok {
+		delete(fwd, docID)
+		if len(fwd) == 0 {
+			delete(m.forward[kbID], chunkID)
+		}
+	}
+	if rev, ok := m.reverse[kbID][docID]; ok {
+		delete(rev, chunkID)
+		if len(rev) == 0 {
+			delete(m.reverse[kbID], docID)
+		}
+	}
+	return nil
+}
+
 // Reset clears all stored state. Convenience for tests; not part of the
 // ChunkDocMapper interface.
 func (m *MockChunkDocMapper) Reset() {

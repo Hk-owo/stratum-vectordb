@@ -250,6 +250,25 @@ type FileWAL struct {
 	// knowledge base.
 	pendingBeginByKB map[string]beginData
 
+	// pendingVersionIDByKB holds the VERSION_ID records still awaiting their
+	// BEGIN, one per knowledge base — the mirror of pendingBeginByKB, and the
+	// reason both directions need a slot (C5 of docs/code-review-2026-10-18.md).
+	//
+	// The pairing is written from two places with the two possible orders: the
+	// inline write path writes BEGIN then proposes (apply writes VERSION_ID), while
+	// the dispatch topology proposes first (apply writes VERSION_ID) and only then
+	// fans the storage write out to this node, which writes BEGIN. A single
+	// BEGIN-side slot silently bound each version to the PREVIOUS version's replay
+	// input in the second order, and ChangesInRange then handed a lagging peer the
+	// wrong changes.
+	pendingVersionIDByKB map[string]int64
+
+	// broken is set when the log can no longer be trusted to append: a partial
+	// record could not be rolled back (see writeRecordLocked). Every later write
+	// fails with it, because appending after an unknown partial record only shows
+	// up on the next restart — as silently missing history.
+	broken error
+
 	replayCounters map[replayKey]int
 }
 
@@ -263,18 +282,19 @@ func NewFileWAL(path string) (*FileWAL, error) {
 	}
 
 	w := &FileWAL{
-		file:                f,
-		path:                path,
-		versionIDsWritten:   make(map[int64]bool),
-		committedVersions:   make(map[int64]bool),
-		deleteMarked:        make(map[string]bool),
-		deleteCompleted:     make(map[string]bool),
-		versionDeleteMarked: make(map[int64]string),
-		versionDeleteDone:   make(map[int64]bool),
-		beginDataByVersion:  make(map[int64]beginData),
-		pendingBeginByKB:    make(map[string]beginData),
-		cursors:             make(map[string]int64),
-		replayCounters:      make(map[replayKey]int),
+		file:                 f,
+		path:                 path,
+		versionIDsWritten:    make(map[int64]bool),
+		committedVersions:    make(map[int64]bool),
+		deleteMarked:         make(map[string]bool),
+		deleteCompleted:      make(map[string]bool),
+		versionDeleteMarked:  make(map[int64]string),
+		versionDeleteDone:    make(map[int64]bool),
+		beginDataByVersion:   make(map[int64]beginData),
+		pendingBeginByKB:     make(map[string]beginData),
+		pendingVersionIDByKB: make(map[string]int64),
+		cursors:              make(map[string]int64),
+		replayCounters:       make(map[replayKey]int),
 	}
 
 	if err := w.rebuildIndex(); err != nil {
@@ -524,7 +544,18 @@ func (w *FileWAL) applyRecordLocked(rec parsedRecord) {
 
 // writeRecordLocked appends a single framed record to the file and
 // fsyncs before returning. Must be called with w.mu held.
+//
+// A record is three writes (header, payload, CRC). If any of them fails the file
+// is rewound to where the record started before the error is returned: recovery
+// stops at the first unparseable record and truncates from there, so a half
+// record left in the middle of the log silently discards every valid record after
+// it — ones whose callers were already told the write succeeded (H6 of
+// docs/code-review-2026-10-18.md).
 func (w *FileWAL) writeRecordLocked(kind recordType, payload []byte) error {
+	if w.broken != nil {
+		return fmt.Errorf("wal: %s cannot accept writes: %w", w.path, w.broken)
+	}
+
 	header := make([]byte, recordHeaderLen)
 	header[0] = byte(kind)
 	binary.BigEndian.PutUint32(header[1:5], uint32(len(payload)))
@@ -534,6 +565,20 @@ func (w *FileWAL) writeRecordLocked(kind recordType, payload []byte) error {
 	crcBytes := make([]byte, recordCRCLen)
 	binary.BigEndian.PutUint32(crcBytes, crc)
 
+	start, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("wal: %s: record start offset: %w", w.path, err)
+	}
+	if err := w.appendRecord(header, payload, crcBytes); err != nil {
+		w.rewindTo(start)
+		return err
+	}
+	return nil
+}
+
+// appendRecord performs the three writes of one record and the fsync. Split out
+// so writeRecordLocked can rewind on any of their failures.
+func (w *FileWAL) appendRecord(header, payload, crcBytes []byte) error {
 	if _, err := w.file.Write(header); err != nil {
 		return err
 	}
@@ -546,6 +591,27 @@ func (w *FileWAL) writeRecordLocked(kind recordType, payload []byte) error {
 		return err
 	}
 	return w.file.Sync()
+}
+
+// rewindTo truncates the log back to start (dropping a partially written record)
+// and repositions the write cursor there, so the next record begins at a clean
+// boundary. If any of that fails the log is marked broken: continuing to append
+// after a partial record of unknown length is worse than refusing to, because the
+// damage would only appear on the next restart.
+func (w *FileWAL) rewindTo(start int64) {
+	if err := w.file.Truncate(start); err != nil {
+		w.broken = fmt.Errorf("roll back partial record at offset %d: %w", start, err)
+		return
+	}
+	if _, err := w.file.Seek(start, io.SeekStart); err != nil {
+		w.broken = fmt.Errorf("reposition after rolling back partial record at offset %d: %w", start, err)
+		return
+	}
+	// The truncate has to reach the disk, otherwise a restart can still see the
+	// partial record.
+	if err := w.file.Sync(); err != nil {
+		w.broken = fmt.Errorf("sync after rolling back partial record at offset %d: %w", start, err)
+	}
 }
 
 func (w *FileWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int64, changes []types.DocChange) error {
@@ -562,7 +628,18 @@ func (w *FileWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int
 	// Per knowledge base, because writes to different KBs are concurrent now
 	// (M7 of docs/code-review-2026-09-24.md): a single slot would let this BEGIN
 	// bind to another KB's VERSION_ID.
-	w.pendingBeginByKB[kbID] = beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}
+	bd := beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}
+	// A VERSION_ID may already be waiting for this BEGIN: under the dispatch
+	// topology the proposal — and therefore the apply that writes VERSION_ID —
+	// happens BEFORE the storage write that lands here (C5 of
+	// docs/code-review-2026-10-18.md). Binding it now is what keeps the replay
+	// input attached to the right version in that order too.
+	if versionID, ok := w.pendingVersionIDByKB[kbID]; ok {
+		w.beginDataByVersion[versionID] = bd
+		delete(w.pendingVersionIDByKB, kbID)
+		return nil
+	}
+	w.pendingBeginByKB[kbID] = bd
 	return nil
 }
 
@@ -588,10 +665,17 @@ func (w *FileWAL) WriteVersionID(_ context.Context, kbID string, versionID int64
 	// rebuildIndex performs when it replays the pair from disk. Without this, a
 	// version written by this process could not answer a peer's backfill
 	// request until the next restart.
+	//
+	// When no BEGIN is waiting, the write is in the other order (propose/apply
+	// first, storage write later: the dispatch topology), so THIS version waits
+	// for its BEGIN instead of the next version silently stealing the BEGIN that
+	// arrives afterwards (C5 of docs/code-review-2026-10-18.md).
 	if bd, ok := w.pendingBeginByKB[kbID]; ok {
 		w.beginDataByVersion[versionID] = bd
 		delete(w.pendingBeginByKB, kbID)
+		return nil
 	}
+	w.pendingVersionIDByKB[kbID] = versionID
 	return nil
 }
 

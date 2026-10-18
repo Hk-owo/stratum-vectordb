@@ -173,7 +173,17 @@ func (t *Transport) replicateToPeer(rf *Raft, id int64, peer *peerConn) {
 	}
 	nextIndex = rf.clampNextIndex(id, nextIndex)
 	prev := rf.logEntry(nextIndex - 1)
-	entries := rf.log[rf.logIndex(nextIndex):]
+	// Copy, do not share (M6 of docs/code-review-2026-10-18.md). This slice shares its
+	// backing array with rf.log, and the lock is released before the request is
+	// encoded. A handler that receives an AppendEntries meanwhile rewrites that array in
+	// place — `rf.log = append(rf.log[:localIdx+1], req.Entries...)` in
+	// rpc_handlers.go — so the outgoing request could be encoding entries that another
+	// goroutine had already overwritten. Rare (it needs two leaders' term overlap to
+	// interleave) and silent when it happens, which is the worst combination for a
+	// consensus log.
+	from := rf.logIndex(nextIndex)
+	entries := make([]*kvraftpb.Entry, len(rf.log)-int(from))
+	copy(entries, rf.log[from:])
 	req := &kvraftpb.AppendEntriesRequest{
 		Term:         rf.term,
 		LeaderId:     rf.me,

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -46,7 +47,11 @@ func argValue(args []string, prefix string) (string, bool) {
 	return "", false
 }
 
-func TestSupervisorPassesTheNodesDataDirAsTheIndexDir(t *testing.T) {
+// The root handed to the vecstore must be <data_dir>/index, not <data_dir> itself
+// (C3 of docs/code-review-2026-10-18.md): the on-disk index RPCs write whatever
+// path they are given, so the root IS their writable set — and <data_dir> also
+// contains RocksDB's files, the document store and the metadata stores.
+func TestSupervisorPassesTheNodesIndexDirAsTheIndexDir(t *testing.T) {
 	cfg := newTestOpsConfig(t)
 	cfg.Services.Stratum.DataDir = "/data/node1"
 
@@ -54,8 +59,8 @@ func TestSupervisorPassesTheNodesDataDirAsTheIndexDir(t *testing.T) {
 	if !ok {
 		t.Fatal("the vecstore was started without --index_dir")
 	}
-	if got != "/data/node1" {
-		t.Fatalf("--index_dir = %q, want the stratum service's data_dir", got)
+	if want := filepath.Join("/data/node1", "index"); got != want {
+		t.Fatalf("--index_dir = %q, want %q (the directory the IndexManager writes, not its parent)", got, want)
 	}
 }
 

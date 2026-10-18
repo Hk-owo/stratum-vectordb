@@ -210,6 +210,9 @@ func (m *deleteTestChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) 
 func (m *deleteTestChunkDocMapper) DeleteByDoc(_ context.Context, kbID, docID string) error {
 	return nil
 }
+func (m *deleteTestChunkDocMapper) DeleteMapping(_ context.Context, kbID, chunkID, docID string) error {
+	return nil
+}
 func (m *deleteTestChunkDocMapper) DeleteByKB(_ context.Context, kbID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -155,10 +155,17 @@ func TestDropEvictedDropsAVersionThatIsNoLongerLoaded(t *testing.T) {
 		t.Fatalf("Evict: %v", err)
 	}
 
-	im.dropEvicted([]indexKey{{"kb-1", 1}})
-
+	// Evict releases the vecstore copy itself (L6 of docs/code-review-2026-10-18.md):
+	// dropping only the Go-side view left that copy resident for the life of the
+	// process, which is the leak every other eviction path already closed.
 	if got := vc.droppedKeys(); len(got) != 1 || got[0] != (indexKey{"kb-1", 1}) {
-		t.Fatalf("vecstore drops = %v, want [kb-1/1]", got)
+		t.Fatalf("vecstore drops after Evict = %v, want exactly [kb-1/1]", got)
+	}
+
+	// A second drop is still harmless (idempotent on the vecstore side).
+	im.dropEvicted([]indexKey{{"kb-1", 1}})
+	if got := vc.droppedKeys(); len(got) != 2 {
+		t.Fatalf("vecstore drops = %v, want 2", got)
 	}
 }
 

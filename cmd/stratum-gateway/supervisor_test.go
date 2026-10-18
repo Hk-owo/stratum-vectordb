@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -130,4 +132,66 @@ func findService(list []ServiceStatus, svc ServiceID) ServiceStatus {
 		}
 	}
 	return ServiceStatus{Service: svc}
+}
+
+// exitingServiceBin 写一个立刻以 code 退出的脚本，用来模拟"服务自己崩了"。
+func exitingServiceBin(t *testing.T, dir, name string, code int) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("#!/bin/sh\nexit %d\n", code)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSupervisor_ReapsExitedChildAndCanRestart pins H11 of
+// docs/code-review-2026-10-18.md.
+//
+// Nothing called Wait on a started child, so a service that crashed became a zombie.
+// kill(pid, 0) succeeds on a zombie, so the console kept reporting it as running —
+// with the PID of a corpse — and Start, believing the service was already up,
+// answered nil and did nothing. The operator's only symptom was "the start button
+// does nothing", and the process table grew by one entry per crash.
+func TestSupervisor_ReapsExitedChildAndCanRestart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := defaultOpsConfig(1)
+	cfg.BinDir = dir
+	cfg.LogDir = t.TempDir()
+	cfg.ConfigDir = t.TempDir()
+	exitingServiceBin(t, dir, cfg.Services.Vecstore.Bin, 3)
+	sup := NewSupervisor(&cfg)
+
+	if err := sup.Start(ServiceVecstore); err != nil {
+		t.Fatalf("Start(vecstore): %v", err)
+	}
+	sup.mu.Lock()
+	firstPID := sup.procs[ServiceVecstore].cmd.Process.Pid
+	sup.mu.Unlock()
+
+	// The exit has to become state, not a zombie.
+	var st ServiceStatus
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st = findService(sup.Status(), ServiceVecstore)
+		if !st.Running || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st.Running {
+		t.Fatalf("an exited child is still reported running (pid %d): it was never reaped", st.PID)
+	}
+	if !strings.Contains(st.LastError, "exit status 3") {
+		t.Errorf("LastError = %q, want the exit reason so the operator does not have to guess", st.LastError)
+	}
+
+	// And the service can be started again.
+	if err := sup.Start(ServiceVecstore); err != nil {
+		t.Fatalf("Start after the child exited: %v", err)
+	}
+	sup.mu.Lock()
+	secondPID := sup.procs[ServiceVecstore].cmd.Process.Pid
+	sup.mu.Unlock()
+	if secondPID == firstPID {
+		t.Errorf("Start launched nothing (pid still %d): it took the crashed entry for a running service", secondPID)
+	}
 }

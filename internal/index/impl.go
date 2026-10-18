@@ -464,7 +464,11 @@ type IndexManagerImpl struct {
 	//
 	// Started lazily on the first Submit, so a manager that never builds anything —
 	// most unit tests — starts no workers and leaks none. buildPoolOnce guards it.
-	buildPool     *buildPool
+	buildPool *buildPool
+	// buildPoolMu guards buildPool for Close. buildPoolOnce already orders the
+	// creation for submitBuild (sync.Once is a happens-before edge), but Close may run
+	// on a different goroutine at any point, so it needs a real lock to read the field.
+	buildPoolMu   sync.Mutex
 	buildPoolOnce sync.Once
 
 	// replicaCounter answers "how many OTHER replicas are serving this version"
@@ -616,6 +620,18 @@ func (im *IndexManagerImpl) SetBuildDataSources(
 func (im *IndexManagerImpl) Close() error {
 	im.StopAbandonSweeper()
 	im.StopGCScanner()
+	// The build pool FIRST, and before the connection: a build holds the vecstore
+	// client for its whole Build → AddChunks → Save sequence, so closing the
+	// connection under it turns an orderly shutdown into a burst of failures — and
+	// leaving the pool running leaves its workers parked in cond.Wait() forever
+	// (M7 of docs/code-review-2026-10-18.md). A manager that never built anything has
+	// no pool, which is the common case in tests.
+	im.buildPoolMu.Lock()
+	pool := im.buildPool
+	im.buildPoolMu.Unlock()
+	if pool != nil {
+		pool.Close()
+	}
 	if im.vecstoreConn != nil {
 		return im.vecstoreConn.Close()
 	}
@@ -1126,6 +1142,15 @@ func (im *IndexManagerImpl) sweepAbandonedArtifacts(now time.Time) {
 			case strings.HasSuffix(name, ".index.tmp"), strings.HasSuffix(name, ".index.ids.tmp"):
 				im.removeIfStale(dir, kb.Name(), e, now, timeout,
 					"an abandoned Save temporary")
+			case strings.Contains(name, ".installing."):
+				// InstallIndex writes through os.CreateTemp with a ".installing." infix
+				// (see install.go's installFile). Those names matched none of the
+				// patterns here, so a process killed mid-fetch left one remainder per
+				// attempt — each a whole index's size — that nothing would ever delete
+				// (L5 of docs/code-review-2026-10-18.md). The payload is another node's
+				// artifact, and an abandoned copy is as much a remainder as a Save's.
+				im.removeIfStale(dir, kb.Name(), e, now, timeout,
+					"an abandoned InstallIndex temporary")
 			case strings.HasSuffix(name, ".index"):
 				version := strings.TrimSuffix(name, ".index")
 				// Sealed by a Save: a completed artifact, not a remainder.
@@ -1316,9 +1341,12 @@ func (im *IndexManagerImpl) reportIndexInstalled(kbID string, versionID int64) {
 // cost where the work is.
 func (im *IndexManagerImpl) submitBuild(req buildRequest) bool {
 	im.buildPoolOnce.Do(func() {
-		im.buildPool = newBuildPool(im.cfg.BuildConcurrency, func(r buildRequest) {
+		pool := newBuildPool(im.cfg.BuildConcurrency, func(r buildRequest) {
 			im.doBuild(r)
 		}, im.logger)
+		im.buildPoolMu.Lock()
+		im.buildPool = pool
+		im.buildPoolMu.Unlock()
 	})
 	return im.buildPool.Submit(req)
 }
@@ -1389,7 +1417,28 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 			// evicted on the vecstore side once the lock is gone (see
 			// dropEvicted).
 			evicted = im.makeRoomLocked()
-			im.loaded[key] = &loadedIndex{lastAccess: time.Now()}
+			// The key may ALREADY be resident: a version that is loaded and gets
+			// rebuilt (needsReshape → TriggerBuild → here, §8.6a) arrives with its
+			// entry in place. Replacing that entry wholesale loses two things that are
+			// not this build's to lose (H8 of docs/code-review-2026-10-18.md):
+			//
+			//   - the refCount pins held by searches already in flight. release() looks
+			//     up the CURRENT entry, so it decrements a fresh zero and does nothing,
+			//     and the version becomes evictable — and Droppable in vecstore — while
+			//     another goroutine is still searching it;
+			//   - the old size in the accounting: loadedBytes only ever grew, so each
+			//     rebuild added a whole index worth of bytes that nothing would ever
+			//     subtract, and MemoryThresholdMB turned into a permanent eviction
+			//     trigger.
+			idx, ok := im.loaded[key]
+			if !ok {
+				idx = &loadedIndex{}
+				im.loaded[key] = idx
+			}
+			idx.lastAccess = time.Now()
+			if old, ok := im.sizeByKey[key]; ok {
+				im.loadedBytes -= old
+			}
 			im.sizeByKey[key] = sizeBytes
 			im.loadedBytes += sizeBytes
 			// Remember which shape is now on disk, so a version whose
@@ -1752,7 +1801,26 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 					zap.String("kb_id", kbID),
 					zap.Int64("version_id", versionID),
 					zap.Int("documents", len(ids)))
-				return 0, nil
+				// Reporting is not enough (H7 of docs/code-review-2026-10-18.md).
+				// Returning (0, nil) marked this build as SUCCEEDED: doBuild kept the
+				// status at READY, inserted the version into `loaded` and told the
+				// control layer this node serves it. But nothing was ever built in
+				// vecstore — this branch never calls Build/Save — so every later query
+				// was a `loaded` hit, went to vecstore, got NOT_FOUND, and failed with
+				// ErrIndexNotReady. Because the version was in `loaded`, the lazy
+				// rebuild path was unreachable too: the version was permanently
+				// unqueryable on this node while being routed here as ready.
+				//
+				// A plain (non-status) error, i.e. a DETERMINISTIC failure: retrying
+				// the same missing data cannot succeed, and marking it retryable is the
+				// mistake this branch's own history records — a transient verdict puts
+				// the build into the 5-minute retry window, keeps loading[key] true the
+				// whole time, and turns every query for the version into an index load
+				// timeout. The control layer records FAILED_PERMANENT instead, and an
+				// operator re-triggers the build once the data has actually landed.
+				return 0, fmt.Errorf(
+					"index: %s v%d has %d documents but produced no chunks: its data never landed, so there is nothing to build",
+					kbID, versionID, len(ids))
 			}
 		}
 		im.logger.Info("index: version has no chunks; nothing to build",
@@ -2725,13 +2793,24 @@ func (im *IndexManagerImpl) RegisterBuildCallback(cb BuildCompleteCallback) {
 // Evict implements IndexManager.
 func (im *IndexManagerImpl) Evict(_ context.Context, kbID string, versionID int64) error {
 	im.mu.Lock()
-	defer im.mu.Unlock()
 	key := indexKey{kbID, versionID}
-	delete(im.loaded, key)
+	var evicted []indexKey
+	if _, ok := im.loaded[key]; ok {
+		delete(im.loaded, key)
+		evicted = append(evicted, key)
+	}
 	if size, ok := im.sizeByKey[key]; ok {
 		im.loadedBytes -= size
 		delete(im.sizeByKey, key)
 	}
+	im.mu.Unlock()
+
+	// Same release every other eviction path performs (L6 of
+	// docs/code-review-2026-10-18.md): the vecstore keeps its own copy of each
+	// resident index, so dropping only this side's view leaves that copy resident for
+	// the life of the process. EvictByKB and Discard already do this; this entry
+	// point was the one H5 of the 09-24 review missed.
+	im.dropEvicted(evicted)
 	return nil
 }
 
@@ -2814,10 +2893,15 @@ func (im *IndexManagerImpl) DeleteFilesByKB(_ context.Context, kbID string) erro
 		return nil
 	}
 	dir := filepath.Join(im.cfg.IndexDataDir, "index", kbID)
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("index: DeleteFilesByKB(%s): %w", kbID, err)
-	}
-	return nil
+	// Every shard, because this removes a directory whose versions are not named
+	// here: a fetch reading one version's pair must not have the tree pulled out from
+	// under it (M8 of docs/code-review-2026-10-18.md).
+	return im.withAllInstallShards(func() error {
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("index: DeleteFilesByKB(%s): %w", kbID, err)
+		}
+		return nil
+	})
 }
 
 // EnforceDiskRetention implements the per-KB on-disk retention policy
@@ -2941,11 +3025,21 @@ func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string,
 	// size sidecar is <versionID>.index.mem, and the access-time sidecar (the
 	// retention shield above) is <versionID>.index.used.
 	for _, f := range files[:len(files)-im.cfg.IndexRetentionCount] {
-		for _, suffix := range []string{".index", ".index.ids", ".index.mem", ".index.used"} {
-			path := filepath.Join(dir, f.base+suffix)
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("index: EnforceDiskRetention(%s): remove %s: %w", kbID, f.base+suffix, err)
+		// This version's shard: retention must not delete an artifact another node is
+		// in the middle of fetching (M8 of docs/code-review-2026-10-18.md). Taken per
+		// version rather than for the whole loop, so one slow fetch cannot stall the
+		// rest of the pass.
+		f := f
+		if err := im.withInstallShard(kbID, f.versionID, func() error {
+			for _, suffix := range []string{".index", ".index.ids", ".index.mem", ".index.used"} {
+				path := filepath.Join(dir, f.base+suffix)
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("index: EnforceDiskRetention(%s): remove %s: %w", kbID, f.base+suffix, err)
+				}
 			}
+			return nil
+		}); err != nil {
+			return err
 		}
 		// docs/storage-node-state-machine-plan.md §5.2 and §7 item 5: the disk is
 		// the authority and the state machine is its projection, so a version
@@ -2955,6 +3049,36 @@ func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string,
 		im.reportIndexDropped(kbID, f.versionID)
 	}
 	return nil
+}
+
+// withInstallShard runs fn holding the install shard for one version.
+//
+// The shard is what serialises InstallIndex and ReadIndexFiles per version (see
+// install.go), and it is also what makes the index/sidecar PAIR a unit: a reader
+// holding it knows nothing is renaming either half of the pair underneath it. The
+// delete paths take it too (M8 of docs/code-review-2026-10-18.md) — a removal that
+// skipped it could pull the .ids sidecar out from under a concurrent fetch, which
+// then stores an index whose chunk ids it can no longer look up.
+func (im *IndexManagerImpl) withInstallShard(kbID string, versionID int64, fn func() error) error {
+	shard := &im.installShards[installShardOf(indexKey{kbID, versionID})]
+	shard.Lock()
+	defer shard.Unlock()
+	return fn()
+}
+
+// withAllInstallShards runs fn holding every shard, for the deletions that cannot
+// name the versions they remove (a whole KB's directory). Acquired in index order,
+// which is what keeps two such callers from deadlocking on each other.
+func (im *IndexManagerImpl) withAllInstallShards(fn func() error) error {
+	for i := range im.installShards {
+		im.installShards[i].Lock()
+	}
+	defer func() {
+		for i := len(im.installShards) - 1; i >= 0; i-- {
+			im.installShards[i].Unlock()
+		}
+	}()
+	return fn()
 }
 
 // persistSizeSidecar writes the version's estimated index footprint (in
@@ -3131,11 +3255,19 @@ func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID 
 	// Without this, a deleted version's files would linger and skew the
 	// disk retention window (see EnforceDiskRetention).
 	if im.cfg.IndexDataDir != "" {
-		for _, suffix := range []string{"", ".ids", ".mem", ".used"} {
-			path := im.indexPath(kbID, versionID) + suffix
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("index: Discard(%s,%d): remove %q: %w", kbID, versionID, filepath.Base(path), err)
+		// The version's shard, so a concurrent fetch cannot be reading the pair while
+		// half of it disappears (M8 of docs/code-review-2026-10-18.md).
+		err := im.withInstallShard(kbID, versionID, func() error {
+			for _, suffix := range []string{"", ".ids", ".mem", ".used"} {
+				path := im.indexPath(kbID, versionID) + suffix
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+					return fmt.Errorf("index: Discard(%s,%d): remove %q: %w", kbID, versionID, filepath.Base(path), err)
+				}
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 	return nil

@@ -212,7 +212,12 @@ func (m *mockVectorIndexClient) Drop(_ context.Context, in *vecstorepb.DropIndex
 	m.dropCalls++
 	key := indexKey{kbID: in.KbId, versionID: in.VersionId}
 	m.dropped = append(m.dropped, key)
-	delete(m.built, key)
+	// Deliberately NOT deleting m.built here. The real vecstore's Drop releases the
+	// in-memory index object; the artifact that Save wrote stays on disk and Load
+	// rebuilds from it. This mock has no disk, so keeping the entry is what makes
+	// "evict, then search again" behave like production — which is exactly the path
+	// L6 of docs/code-review-2026-10-18.md made reachable (Evict now drops).
+	_ = key
 	if m.dropErr != nil {
 		return nil, m.dropErr
 	}
@@ -774,6 +779,35 @@ func waitGraphHotShape(t *testing.T, im *IndexManagerImpl, kbID string, versionI
 	}) {
 		t.Fatalf("version %s/%d never got its graph back", kbID, versionID)
 	}
+}
+
+// waitForIndexLoaded 等到某个版本进入 loaded（构建完成并插入）。
+func waitForIndexLoaded(t *testing.T, im *IndexManagerImpl, kbID string, versionID int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if im.IsLoaded(kbID, versionID) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s v%d never became loaded", kbID, versionID)
+}
+
+// waitForNoBuildsInFlight 等到没有构建在进行（loading 表清空）。
+func waitForNoBuildsInFlight(t *testing.T, im *IndexManagerImpl) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		im.mu.Lock()
+		inFlight := len(im.loading)
+		im.mu.Unlock()
+		if inFlight == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("a build stayed in flight")
 }
 
 func waitForCondition(timeout time.Duration, cond func() bool) bool {
@@ -3017,5 +3051,107 @@ func TestIndexManager_SearchScansWhileABuildIsInFlight(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].ChunkID != "c1" {
 		t.Fatalf("results = %+v, want the scanned chunk c1", results)
+	}
+}
+
+// TestIndexManager_DocumentsWithoutChunksIsNeverReportedReady pins H7 of
+// docs/code-review-2026-10-18.md.
+//
+// "Has documents but produced no chunks" is a half-successful write: the version
+// was committed, its data never landed. The build used to report it as SUCCEEDED —
+// status stayed READY, the version went into `loaded`, and the control layer was
+// told this node serves it. Nothing existed in vecstore, so every query was a
+// `loaded` hit that failed with ErrIndexNotReady, and because the version was in
+// `loaded` the lazy rebuild path could not fire either: unqueryable here, and
+// routed here anyway.
+func TestIndexManager_DocumentsWithoutChunksIsNeverReportedReady(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", nil, nil) // document present, zero chunks
+
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: 5 * time.Second, VecstoreAddr: "unused"})
+	im.logger = zap.NewNop()
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+	t.Cleanup(func() { _ = im.Close() })
+
+	var reported atomic.Value
+	im.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
+		reported.Store(status)
+		return nil
+	})
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for reported.Load() == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if reported.Load() == nil {
+		t.Fatal("the build never reported an outcome")
+	}
+	if got := reported.Load().(types.IndexStatus); got == types.IndexStatusReady {
+		t.Errorf("build reported %v for a version with documents and no chunks", got)
+	}
+	if im.IsLoaded("kb-1", 1) {
+		t.Error("the version was inserted into `loaded`, which short-circuits the lazy rebuild path and makes it permanently unqueryable here")
+	}
+}
+
+// TestIndexManager_RebuildKeepsPinsAndAccounting pins H8 of
+// docs/code-review-2026-10-18.md.
+//
+// Rebuilding a version that is ALREADY resident used to replace its `loaded` entry
+// wholesale. That dropped the refCount pins held by searches in flight — release()
+// then decremented a fresh zero, leaving the version evictable (and Droppable in
+// vecstore) while still in use — and it added the new size without subtracting the
+// old one, so every rebuild inflated loadedBytes by a whole index.
+func TestIndexManager_RebuildKeepsPinsAndAccounting(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-1"}, map[string][]float32{"chunk-1": {0.1, 0.2, 0.3, 0.4}})
+
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 8, LoadWaitTimeout: 5 * time.Second, VecstoreAddr: "unused"})
+	im.logger = zap.NewNop()
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+	t.Cleanup(func() { _ = im.Close() })
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("first TriggerBuild: %v", err)
+	}
+	waitForIndexLoaded(t, im, "kb-1", 1)
+
+	key := indexKey{"kb-1", 1}
+	im.mu.Lock()
+	firstBytes := im.loadedBytes
+	firstSize := im.sizeByKey[key]
+	// A search is in flight while the rebuild lands.
+	im.loaded[key].refCount = 1
+	im.mu.Unlock()
+	if firstBytes <= 0 || firstSize <= 0 {
+		t.Fatalf("precondition: first build recorded bytes=%d size=%d", firstBytes, firstSize)
+	}
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("rebuild TriggerBuild: %v", err)
+	}
+	waitForNoBuildsInFlight(t, im)
+
+	im.mu.Lock()
+	refCount := im.loaded[key].refCount
+	total := im.loadedBytes
+	im.mu.Unlock()
+
+	if refCount != 1 {
+		t.Errorf("refCount = %d after the rebuild, want 1: the in-flight search's pin was thrown away", refCount)
+	}
+	if total != firstBytes {
+		t.Errorf("loadedBytes = %d after rebuilding the same version, want %d (unchanged): the old size was never subtracted", total, firstBytes)
 	}
 }

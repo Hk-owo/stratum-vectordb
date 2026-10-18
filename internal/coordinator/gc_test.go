@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -484,3 +485,115 @@ func TestChunkGarbageCollector_ReclaimBeforeConcurrentWrite_Recovers(t *testing.
 }
 
 var _ chunkstore.ChunkStore = (*gcChunkStore)(nil)
+
+// TestChunkGarbageCollector_ReclaimsEveryChunkOfADeadDocument pins H3 of
+// docs/code-review-2026-10-18.md.
+//
+// One document maps to several chunks. Reclaiming one of them used to call
+// DeleteByDoc, which drops the dead document's mapping to EVERY chunk it has —
+// so the sibling chunks lost their forward entries, stopped being sweep
+// candidates (ListChunkIDs scans the forward keyspace), and their vectors stayed
+// in the store for good. Each chunk has to be reclaimed on its own.
+func TestChunkGarbageCollector_ReclaimsEveryChunkOfADeadDocument(t *testing.T) {
+	ctx := context.Background()
+	cdm, err := chunkdoc.NewPebbleChunkDocMapper(t.TempDir())
+	if err != nil {
+		t.Fatalf("open pebble chunkdoc: %v", err)
+	}
+	defer cdm.Close()
+
+	ds := newTestDocStore()
+	cs := newGCChunkStore()
+
+	// doc-dead is split into two chunks and is deleted at v2.
+	for _, chunkID := range []string{"chunk-a", "chunk-b"} {
+		if err := cdm.Write(ctx, "kb-1", chunkID, "doc-dead"); err != nil {
+			t.Fatalf("cdm.Write(%s): %v", chunkID, err)
+		}
+		if err := cs.Write(ctx, "kb-1", chunkID, []float32{1}); err != nil {
+			t.Fatalf("cs.Write(%s): %v", chunkID, err)
+		}
+	}
+	if err := ds.Write(ctx, "kb-1", "doc-dead", 1, []byte("live at v1")); err != nil {
+		t.Fatalf("ds.Write v1: %v", err)
+	}
+	if err := ds.Write(ctx, "kb-1", "doc-dead", 2, nil); err != nil { // tombstone
+		t.Fatalf("ds.Write tombstone: %v", err)
+	}
+
+	gc := NewChunkGarbageCollectorImpl(ChunkGarbageCollectorConfig{
+		SweepIntervalSec: 1,
+		RaftNode: &gcTestRaftNode{
+			kbs:      []types.KnowledgeBaseMeta{{KBID: "kb-1"}},
+			versions: map[string][]types.VersionMeta{"kb-1": {{VersionID: 2, KBID: "kb-1"}}},
+		},
+		ChunkDocMapper: cdm,
+		DocStore:       ds,
+		ChunkStore:     cs,
+	})
+	if err := gc.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	reclaimed := make(map[string]bool, len(cs.deleted))
+	for _, d := range cs.deleted {
+		reclaimed[d] = true
+	}
+	for _, chunkID := range []string{"chunk-a", "chunk-b"} {
+		if !reclaimed["kb-1|"+chunkID] {
+			t.Errorf("%s's vector was not reclaimed (deleted=%v): one chunk's reclaim must not unpin another",
+				chunkID, cs.deleted)
+		}
+	}
+}
+
+// readErrorDocStore answers every ReadAt with a storage failure that is NOT
+// "no such version".
+type readErrorDocStore struct{ *testDocStore }
+
+func (s *readErrorDocStore) ReadAt(context.Context, string, string, int64) ([]byte, error) {
+	return nil, fmt.Errorf("pebble: iterator creation failed")
+}
+
+// TestChunkGarbageCollector_StoreReadErrorKeepsChunk pins H2 of
+// docs/code-review-2026-10-18.md: only "the document is not there" means a
+// reference is dead. A store that cannot answer must not be read as a deletion —
+// that reclaims a live document's chunks on the strength of a read failure.
+func TestChunkGarbageCollector_StoreReadErrorKeepsChunk(t *testing.T) {
+	ctx := context.Background()
+	cdm, err := chunkdoc.NewPebbleChunkDocMapper(t.TempDir())
+	if err != nil {
+		t.Fatalf("open pebble chunkdoc: %v", err)
+	}
+	defer cdm.Close()
+
+	cs := newGCChunkStore()
+	if err := cdm.Write(ctx, "kb-1", "chunk-live", "doc-live"); err != nil {
+		t.Fatalf("cdm.Write: %v", err)
+	}
+	if err := cs.Write(ctx, "kb-1", "chunk-live", []float32{1}); err != nil {
+		t.Fatalf("cs.Write: %v", err)
+	}
+
+	gc := NewChunkGarbageCollectorImpl(ChunkGarbageCollectorConfig{
+		SweepIntervalSec: 1,
+		RaftNode: &gcTestRaftNode{
+			kbs:      []types.KnowledgeBaseMeta{{KBID: "kb-1"}},
+			versions: map[string][]types.VersionMeta{"kb-1": {{VersionID: 1, KBID: "kb-1"}}},
+		},
+		ChunkDocMapper: cdm,
+		DocStore:       &readErrorDocStore{newTestDocStore()},
+		ChunkStore:     cs,
+	})
+
+	// The failure has to surface, not be swallowed.
+	if err := gc.Sweep(ctx); err == nil {
+		t.Error("Sweep must report the store read failure instead of treating it as a deletion")
+	}
+	if len(cs.deleted) != 0 {
+		t.Errorf("a read failure reclaimed chunks: deleted=%v", cs.deleted)
+	}
+	if docs, err := cdm.ListDocIDs(ctx, "kb-1", "chunk-live"); err != nil || !contains(docs, "doc-live") {
+		t.Errorf("the live chunk's mapping was dropped: docs=%v err=%v", docs, err)
+	}
+}

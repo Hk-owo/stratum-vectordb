@@ -662,6 +662,26 @@ bool VectorIndexServiceImpl::IndexPathAllowed(const std::string& path, std::stri
   if (ec) {
     target = std::filesystem::absolute(path, ec).lexically_normal();
   }
+
+  // An excluded root wins over an allowed one. It exists for the chunk store's own
+  // directory: an allow-list wide enough to contain the store would otherwise permit
+  // Save() to rename index bytes over RocksDB's CURRENT/MANIFEST/*.sst, which ends the
+  // store (C3 of docs/code-review-2026-10-18.md).
+  for (const auto& dir : excluded_dirs_) {
+    const std::string rel = target.lexically_relative(dir).string();
+    if (rel.empty()) {
+      continue;  // no relationship at all
+    }
+    if (rel == "." || rel.rfind("..", 0) != 0) {
+      if (reason != nullptr) {
+        *reason =
+            "path is inside a directory the on-disk index RPCs are not allowed to touch "
+            "(the chunk store)";
+      }
+      return false;
+    }
+  }
+
   for (const auto& dir : index_dirs_) {
     const std::filesystem::path relative = target.lexically_relative(dir);
     if (relative.empty()) {
@@ -774,11 +794,13 @@ std::vector<std::pair<std::string, int>> ServerKeepaliveArgs(
 
 VecstoreGrpcServer::VecstoreGrpcServer(std::unique_ptr<ChunkStorage> storage,
                                        std::vector<std::string> index_dirs,
-                                       ServerKeepalive keepalive)
+                                       ServerKeepalive keepalive,
+                                       std::vector<std::string> excluded_dirs)
     : storage_(std::move(storage)),
       chunk_service_(std::make_unique<ChunkStorageServiceImpl>(storage_.get())),
       index_service_(std::make_unique<VectorIndexServiceImpl>(storage_.get(),
-                                                              NormalizeIndexDirs(index_dirs))),
+                                                              NormalizeIndexDirs(index_dirs),
+                                                              NormalizeIndexDirs(excluded_dirs))),
       keepalive_(keepalive) {}
 
 VecstoreGrpcServer::~VecstoreGrpcServer() { Shutdown(); }

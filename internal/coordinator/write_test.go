@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"stratum/internal/bloom"
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
 	"stratum/internal/raft"
 	stratumync "stratum/internal/sync"
@@ -58,7 +59,12 @@ func (s *testDocStore) ReadAt(_ context.Context, kbID, docID string, maxVersionI
 		}
 	}
 	if !found {
-		return nil, fmt.Errorf("not found")
+		// The real docstore reports a missing document as ErrVersionNotFound;
+		// returning a bare error here would let the GC's "is this reference dead?"
+		// check treat a store failure as a deletion (H2 of
+		// docs/code-review-2026-10-18.md). Fakes have to honour the same contract.
+		return nil, fmt.Errorf("docstore: %s/%s not found at version %d: %w",
+			kbID, docID, maxVersionID, stratumerrors.ErrVersionNotFound)
 	}
 	return bestValue, nil
 }
@@ -162,6 +168,24 @@ func (m *testChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, 
 
 func (m *testChunkDocMapper) DeleteByKB(_ context.Context, kbID string) error         { return nil }
 func (m *testChunkDocMapper) DeleteByDoc(_ context.Context, kbID, docID string) error { return nil }
+
+func (m *testChunkDocMapper) DeleteMapping(_ context.Context, kbID, chunkID, docID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if fwd, ok := m.forward[chunkID]; ok {
+		delete(fwd, docID)
+		if len(fwd) == 0 {
+			delete(m.forward, chunkID)
+		}
+	}
+	if rev, ok := m.reverse[docID]; ok {
+		delete(rev, chunkID)
+		if len(rev) == 0 {
+			delete(m.reverse, docID)
+		}
+	}
+	return nil
+}
 
 func (m *testChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) ([]string, error) {
 	m.mu.Lock()

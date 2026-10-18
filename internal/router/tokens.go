@@ -1,6 +1,7 @@
 package router
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 
@@ -15,7 +16,18 @@ import (
 // exist for credentials that change often while a service must not stop, and
 // paying that complexity here would be paying it for nothing.
 type TokenTable struct {
-	principals map[string]Principal
+	// Keyed by the SHA-256 of the token, not by the token itself (L1 of
+	// docs/code-review-2026-10-18.md). Looking a plaintext secret up in a map compares
+	// it byte by byte and stops at the first difference, so lookup time leaks how much
+	// of a candidate is right — the classic argument for constant-time comparison. With
+	// the digest as the key, the comparison an attacker can observe is over a value
+	// they cannot aim at: producing the right bucket already requires the exact token.
+	principals map[[sha256.Size]byte]Principal
+}
+
+// tokenKey is the map key for a credential.
+func tokenKey(token string) [sha256.Size]byte {
+	return sha256.Sum256([]byte(token))
 }
 
 // tokenFile mirrors the on-disk schema:
@@ -59,12 +71,12 @@ func LoadTokenTable(path string) (*TokenTable, error) {
 		return nil, fmt.Errorf("router: token table %s lists no tokens", path)
 	}
 
-	principals := make(map[string]Principal, len(tf.Tokens))
+	principals := make(map[[sha256.Size]byte]Principal, len(tf.Tokens))
 	for i, e := range tf.Tokens {
 		if e.Token == "" {
 			return nil, fmt.Errorf("router: token table %s: entry %d has an empty token", path, i)
 		}
-		if _, dup := principals[e.Token]; dup {
+		if _, dup := principals[tokenKey(e.Token)]; dup {
 			return nil, fmt.Errorf("router: token table %s: entry %d repeats a token", path, i)
 		}
 		if len(e.KBIDs) == 0 {
@@ -77,7 +89,7 @@ func LoadTokenTable(path string) (*TokenTable, error) {
 		// and an entry whose meaning depends on which list the reader is looking at
 		// is how a table stops being auditable.
 		if len(e.KBIDs) == 1 && e.KBIDs[0] == "*" {
-			principals[e.Token] = Principal{AllKBs: true}
+			principals[tokenKey(e.Token)] = Principal{AllKBs: true}
 			continue
 		}
 		grants := make(map[string]Grant, len(e.KBIDs))
@@ -93,17 +105,20 @@ func LoadTokenTable(path string) (*TokenTable, error) {
 		}
 		// No tenant id: the table's unit is the credential, and inventorying
 		// "who" is not something the routing layer needs in order to decide.
-		principals[e.Token] = Principal{Grants: grants}
+		principals[tokenKey(e.Token)] = Principal{Grants: grants}
 	}
 	return &TokenTable{principals: principals}, nil
 }
 
 // Lookup resolves a token, satisfying the Authenticator's lookup shape.
 func (t *TokenTable) Lookup(token string) (Principal, bool) {
-	if t == nil {
+	if t == nil || token == "" {
+		// An empty credential never matches, whatever the table holds: the load path
+		// already refuses empty tokens, and this keeps a future table source from
+		// making "no credential" mean "some credential".
 		return Principal{}, false
 	}
-	p, ok := t.principals[token]
+	p, ok := t.principals[tokenKey(token)]
 	return p, ok
 }
 

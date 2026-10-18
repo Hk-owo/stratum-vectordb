@@ -952,6 +952,74 @@ TEST(VecstoreKeepaliveTest, ServerAsksForAKeepaliveItsPeersCanLiveWith) {
   EXPECT_EQ(*FindArg(args, GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS), 0);
 }
 
+// C3 of docs/code-review-2026-10-18.md.
+//
+// The allow-list is the only thing confining the on-disk index RPCs, so a root that
+// CONTAINS the chunk store confines them to include the store: Save() writes through a
+// temp file and a rename, so one Save() naming <rocksdb>/CURRENT replaces RocksDB's
+// engine file and the store never opens again. The excluded root keeps the store
+// unreachable while still allowing a wide root — which is what a test or an ad-hoc run
+// legitimately uses.
+TEST_F(GrpcServiceTest, SaveRefusesAPathInsideTheChunkStore) {
+  const fs::path store = test_dir_ / "rocksdb2";
+  auto storage_or = RocksDBChunkStorage::Open(store.string());
+  ASSERT_TRUE(storage_or.ok()) << storage_or.status();
+
+  // An allowed root that contains the store, plus the store itself excluded.
+  VecstoreGrpcServer server(std::move(storage_or.value()),
+                            std::vector<std::string>{test_dir_.string()}, {},
+                            std::vector<std::string>{store.string()});
+  int port = server.StartOnLoopbackWithEphemeralPort();
+  ASSERT_GT(port, 0) << "server failed to bind to a port";
+  auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                     grpc::InsecureChannelCredentials());
+  auto stub = ::vecstore::VectorIndexService::NewStub(channel);
+
+  // Something real to save.
+  grpc::ClientContext build_ctx;
+  ::vecstore::BuildIndexRequest build_req;
+  build_req.set_kb_id("kb1");
+  build_req.set_version_id(1);
+  build_req.set_metric(::vecstore::COSINE);
+  for (int i = 0; i < 20; ++i) {
+    auto* chunk = build_req.add_chunks();
+    chunk->set_chunk_id("chunk-" + std::to_string(i));
+    for (int d = 0; d < 8; ++d) {
+      chunk->add_vector(static_cast<float>((i + d) % 7) - 3.0f);
+    }
+  }
+  ::vecstore::BuildIndexResponse build_resp;
+  ASSERT_TRUE(stub->Build(&build_ctx, build_req, &build_resp).ok());
+
+  // Saving onto something RocksDB owns is refused, and nothing is written.
+  const fs::path engine_file = store / "CURRENT";
+  grpc::ClientContext bad_ctx;
+  ::vecstore::SaveIndexRequest bad_req;
+  bad_req.set_kb_id("kb1");
+  bad_req.set_version_id(1);
+  bad_req.set_path(engine_file.string());
+  ::vecstore::SaveIndexResponse bad_resp;
+  const grpc::Status bad = stub->Save(&bad_ctx, bad_req, &bad_resp);
+  EXPECT_EQ(bad.error_code(), grpc::StatusCode::INVALID_ARGUMENT)
+      << "a root that contains the chunk store must not let Save reach it";
+  EXPECT_TRUE(fs::exists(engine_file))
+      << "and the engine file must still be there (unchanged, not replaced)";
+  EXPECT_FALSE(fs::exists(engine_file.string() + ".tmp"))
+      << "no temp file may be left behind either";
+
+  // The same call into an ordinary path under the allowed root still works.
+  grpc::ClientContext ok_ctx;
+  ::vecstore::SaveIndexRequest ok_req;
+  ok_req.set_kb_id("kb1");
+  ok_req.set_version_id(1);
+  ok_req.set_path((test_dir_ / "fine.index").string());
+  ::vecstore::SaveIndexResponse ok_resp;
+  EXPECT_TRUE(stub->Save(&ok_ctx, ok_req, &ok_resp).ok())
+      << "excluding the store must not narrow anything else";
+
+  server.Shutdown();
+}
+
 }  // namespace
 }  // namespace vecstore
 }  // namespace stratum

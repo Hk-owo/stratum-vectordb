@@ -79,8 +79,19 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // Passed in normalized (see NormalizeIndexDirs in grpc_service.cpp). Empty means
   // every path is refused: a vecstore that was not told where its indexes live has
   // no business touching the filesystem on a caller's behalf.
-  VectorIndexServiceImpl(ChunkStorage* storage, std::vector<std::string> index_dirs)
-      : index_dirs_(std::move(index_dirs)), storage_(storage) {}
+  // excluded_dirs are roots NO on-disk index RPC may touch even though they sit under
+  // an allowed root. The one that matters is the chunk store's own directory: the
+  // allow-list is the only thing confining Save/Load, and a root that CONTAINS the
+  // store confines them to include it — one Save() naming <rocksdb>/CURRENT replaces
+  // RocksDB's engine file and the store never opens again (C3 of
+  // docs/code-review-2026-10-18.md). Excluded at the RPC rather than by refusing to
+  // start, so a wide root stays usable for what it is for (tests, ad-hoc runs) while
+  // the store's own files stay unreachable.
+  VectorIndexServiceImpl(ChunkStorage* storage, std::vector<std::string> index_dirs,
+                         std::vector<std::string> excluded_dirs = {})
+      : index_dirs_(std::move(index_dirs)),
+        excluded_dirs_(std::move(excluded_dirs)),
+        storage_(storage) {}
 
   grpc::Status Build(grpc::ServerContext* context,
                       const ::vecstore::BuildIndexRequest* request,
@@ -188,6 +199,9 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
 
   // index_dirs_ are the normalized allowed roots (see the constructor).
   std::vector<std::string> index_dirs_;
+  // excluded_dirs_ are normalized roots that win over index_dirs_ (see the
+  // constructor): a path under both is refused.
+  std::vector<std::string> excluded_dirs_;
 
   // mu_ guards the MAP and nothing else: which key currently holds which
   // instance. Every handler reaches its instance through IndexFor /
@@ -278,7 +292,8 @@ class VecstoreGrpcServer {
   // want (see ServerKeepalive for why).
   VecstoreGrpcServer(std::unique_ptr<ChunkStorage> storage,
                      std::vector<std::string> index_dirs = {},
-                     ServerKeepalive keepalive = {});
+                     ServerKeepalive keepalive = {},
+                     std::vector<std::string> excluded_dirs = {});
   ~VecstoreGrpcServer();
 
   VecstoreGrpcServer(const VecstoreGrpcServer&) = delete;

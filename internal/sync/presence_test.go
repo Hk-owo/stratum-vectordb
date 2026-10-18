@@ -46,6 +46,14 @@ func TestPushHandler_VersionPresence(t *testing.T) {
 	if err := leader.versionDoc.Write(ctx, "kb-1", 5, "doc-1"); err != nil {
 		t.Fatal(err)
 	}
+	// The document list naming doc-1 implies the docstore holds an entry for it:
+	// that invariant is what the export relies on now (a listed document with no
+	// entry inside its version range is a store disagreement and fails the
+	// export rather than being dropped). A fixture that only writes the list
+	// would be describing a state the write path never produces.
+	if err := leader.docStore.Write(ctx, "kb-1", "doc-1", 5, []byte("content")); err != nil {
+		t.Fatal(err)
+	}
 	pusher := NewPusher(PusherConfig{Exporter: leader.handler, NodeID: 1})
 	if _, err := pusher.PushVersion(ctx, addr, "kb-1", 5); err != nil {
 		t.Fatalf("PushVersion: %v", err)

@@ -73,6 +73,10 @@ func loggerAtLevel(base *zap.Logger, level string) *zap.Logger {
 	return rebuilt
 }
 
+// maxConcurrentVersionFetches bounds the on-apply version transfers started by
+// SetOnVersionCreated. See the semaphore's comment in the assembly below.
+const maxConcurrentVersionFetches = 4
+
 func main() {
 	logger, err := zap.NewProduction()
 	if err != nil {
@@ -1082,6 +1086,17 @@ func main() {
 	// The mechanism has since been retired outright: the command, the state-machine field,
 	// the snapshot field, the internal read and the loop that drove them are gone.
 
+	// Bounds how many on-apply version transfers run at once (M19 of
+	// docs/code-review-2026-10-18.md). A bulk import — or a log replay after a
+	// restart — produces one cmdCreateVersion per version, and raft/impl.go runs this
+	// hook on its own goroutine for each of them. Every hook that decides it needs the
+	// data then starts a whole version transfer, so N versions meant N simultaneous
+	// transfers, each with its own retry loop and multi-minute deadlines, all competing
+	// for the same links. Four is the order LagCatchup uses: enough to make progress on
+	// a multi-version gap, few enough that the links are not turned into one queue per
+	// version. Waiting costs nothing here — the hook is already off the apply loop.
+	fetchSlots := make(chan struct{}, maxConcurrentVersionFetches)
+
 	if storageLocal && raftNode != nil {
 		// §10.6's reclaim is a best-effort broadcast: a partitioned or restarting
 		// replica never hears it, and the metadata that would have named the leftover
@@ -1091,6 +1106,16 @@ func main() {
 		raftNode.SetOnVersionFailedPermanent(dataPlane.NoteTerminalVersion)
 
 		raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
+			// Take a transfer slot before doing any work, and give it back however this
+			// returns. A caller that gives up (shutdown) just leaves the version to the
+			// next sweep — the data is not lost, only not fetched now.
+			select {
+			case fetchSlots <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-fetchSlots }()
+
 			// §7.5: as of this apply the version EXISTS, whether or not this node
 			// ends up holding it. Telling the plane is what keeps its cursor
 			// honest — a version announced but not held blocks the cursor from
@@ -1162,6 +1187,16 @@ func main() {
 		// from a previous life.
 		raftNode.MarkAllDeletingDirty()
 		go coordinator.NewDeletingVersionSweeper(raftNode, raftNode, deleteVersionCoord, 0, logger).Run(ctx)
+
+		// The knowledge-base half of the same repair (M3 of
+		// docs/code-review-2026-10-18.md). DeleteKnowledgeBase proposes the
+		// Deleting status first and starts the cleanup — which is what writes the
+		// WAL's delete mark — only afterwards, so a crash in between used to leave
+		// the KB stuck in DELETING with nothing that would finish it: no WAL record
+		// to resume from (it was never written), and no other pass looks for a KB
+		// that is still in the metadata. This sweep re-runs the same idempotent
+		// cleanup, so an interrupted deletion is resumed instead of forgotten.
+		go coordinator.NewDeletingKBSweeper(raftNode, deleteCoord, 0, logger).Run(ctx)
 	}
 
 	// --- gRPC services ---

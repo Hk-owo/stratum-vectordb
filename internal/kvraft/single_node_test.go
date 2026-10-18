@@ -15,7 +15,10 @@ func newTestRaft(t *testing.T, id int64, opts ...Option) (*Raft, *Transport, cha
 	applyCh := make(chan ApplyMsg, 16)
 	persister := kvstorage.NewPersister(filepath.Join(t.TempDir(), "raft"))
 	allOpts := append([]Option{WithElectionTimeoutRange(30*time.Millisecond, 60*time.Millisecond), WithHeartbeatInterval(15 * time.Millisecond)}, opts...)
-	rf := NewRaft(id, transport, applyCh, persister, allOpts...)
+	rf, err := NewRaft(id, transport, applyCh, persister, allOpts...)
+	if err != nil {
+		t.Fatalf("NewRaft(%d): %v", id, err)
+	}
 	t.Cleanup(rf.Stop)
 	return rf, transport, applyCh
 }
@@ -124,9 +127,12 @@ func TestSingleNode_PersistsAndRecoversStateAcrossRestart(t *testing.T) {
 	transport1 := NewTransport(nil)
 	applyCh1 := make(chan ApplyMsg, 16)
 	persister1 := kvstorage.NewPersister(persisterPath)
-	rf1 := NewRaft(1, transport1, applyCh1, persister1,
+	rf1, err := NewRaft(1, transport1, applyCh1, persister1,
 		WithElectionTimeoutRange(30*time.Millisecond, 60*time.Millisecond),
 		WithHeartbeatInterval(15*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewRaft: %v", err)
+	}
 	rf1.Run()
 	if !waitFor(t, 2*time.Second, rf1.IsLeader) {
 		t.Fatalf("never became leader")
@@ -145,9 +151,12 @@ func TestSingleNode_PersistsAndRecoversStateAcrossRestart(t *testing.T) {
 	transport2 := NewTransport(nil)
 	applyCh2 := make(chan ApplyMsg, 16)
 	persister2 := kvstorage.NewPersister(persisterPath)
-	rf2 := NewRaft(1, transport2, applyCh2, persister2,
+	rf2, err := NewRaft(1, transport2, applyCh2, persister2,
 		WithElectionTimeoutRange(30*time.Millisecond, 60*time.Millisecond),
 		WithHeartbeatInterval(15*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewRaft after reopen: %v", err)
+	}
 	t.Cleanup(rf2.Stop)
 
 	if rf2.Term() < 1 {

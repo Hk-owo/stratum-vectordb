@@ -214,7 +214,10 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 		opts = append(opts, kvraft.WithElectionTimeoutRange(cfg.ElectionTimeoutMin, cfg.ElectionTimeoutMax))
 	}
 
-	rf := kvraft.NewRaft(cfg.NodeID, transport, applyCh, persister, opts...)
+	rf, err := kvraft.NewRaft(cfg.NodeID, transport, applyCh, persister, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("raft: node %d: %w", cfg.NodeID, err)
+	}
 
 	impl := &RaftNodeImpl{
 		raft:          rf,
@@ -577,8 +580,19 @@ func (impl *RaftNodeImpl) handleSnapshotMsg(msg kvraft.ApplyMsg) {
 		return
 	}
 
-	// A snapshot pushed by the leader because this node had fallen too
-	// far behind for incremental replication to catch up.
+	// Persist the installed snapshot BEFORE anything below depends on it: InstallDone
+	// (via trimLogLocked) discards every covered log entry, and sm.restore replaces
+	// the state machine, so without durable snapshot data a restart would find a
+	// trimmed log with no matching state — the state machine boots empty while
+	// lastApplied claims the compacted entries were applied, and the metadata they
+	// carried is gone from both places (H5 of docs/code-review-2026-10-18.md).
+	// Failing here leaves the node untouched; the leader will send the snapshot
+	// again.
+	if err := impl.persister.SaveSnapshot(msg.SnapshotData, msg.SnapshotIndex); err != nil {
+		impl.logger.Error("failed to persist installed snapshot; refusing to install it",
+			zap.Uint64("snapshot_index", msg.SnapshotIndex), zap.Error(err))
+		return
+	}
 	if err := impl.sm.restore(msg.SnapshotData); err != nil {
 		impl.logger.Error("failed to restore state machine from installed snapshot",
 			zap.Uint64("snapshot_index", msg.SnapshotIndex), zap.Error(err))
@@ -589,15 +603,6 @@ func (impl *RaftNodeImpl) handleSnapshotMsg(msg kvraft.ApplyMsg) {
 	// as dirty: the next sweep asks about all of them, which is what it did before the
 	// dirty set existed.
 	impl.MarkAllDeletingDirty()
-	// Persist the installed snapshot: InstallDone (via trimLogLocked)
-	// discards every covered log entry, so without durable snapshot data
-	// a restart would find a trimmed log but no matching state-machine
-	// state — the state machine would boot empty while lastApplied claims
-	// the compacted entries were applied.
-	if err := impl.persister.SaveSnapshot(msg.SnapshotData, msg.SnapshotIndex); err != nil {
-		impl.logger.Error("failed to persist installed snapshot; restart after compaction may not recover state",
-			zap.Uint64("snapshot_index", msg.SnapshotIndex), zap.Error(err))
-	}
 	impl.raft.InstallDone(msg.SnapshotIndex, msg.SnapshotTerm)
 
 	// The installed snapshot restored every pre-compaction version into
@@ -1017,6 +1022,34 @@ func (impl *RaftNodeImpl) DeletingVersionIDs(_ context.Context, kbID string) ([]
 			out = append(out, id)
 		}
 	}
+	return out, nil
+}
+
+// DeletingKBIDs answers the knowledge-base half of the delete sweep: which
+// knowledge bases are still marked Deleting. Straight out of the in-memory state
+// machine and ids only — the same shape as DeletingVersionIDs, for the same
+// reason, and what lets the sweep run without walking the metadata of every KB a
+// node happens to hold.
+//
+// It exists because a KB deletion has the same crash window a version deletion
+// has, and no equivalent repair until now (M3 of
+// docs/code-review-2026-10-18.md): DeleteKnowledgeBase proposes the Deleting
+// status first (durable, replicated, the moment the API answers the caller) and
+// only then starts the cleanup goroutine, which is what writes the WAL's delete
+// mark. A process that dies in between leaves the KB in DELETING with neither a
+// WAL record to resume from nor anything else that would notice.
+func (impl *RaftNodeImpl) DeletingKBIDs(_ context.Context) ([]string, error) {
+	impl.sm.mu.RLock()
+	defer impl.sm.mu.RUnlock()
+	var out []string
+	for kbID, kb := range impl.sm.kbs {
+		if kb.Status == types.KBStatusDeleting {
+			out = append(out, kbID)
+		}
+	}
+	// Sorted so the sweep's order — and any log line or test asserting on it — does
+	// not depend on Go's map iteration order.
+	sort.Strings(out)
 	return out, nil
 }
 

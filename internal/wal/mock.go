@@ -59,6 +59,13 @@ type MockWAL struct {
 	// WriteVersionID).
 	beginDataByVersion map[int64]beginData
 
+	// The two pending slots mirror FileWAL's: a BEGIN and a VERSION_ID can arrive
+	// in either order (inline write path vs. dispatch topology), so each side
+	// waits for the other instead of assuming one order (C5 of
+	// docs/code-review-2026-10-18.md).
+	pendingBeginByKB     map[string]beginData
+	pendingVersionIDByKB map[string]int64
+
 	// cursors mirrors FileWAL's: the persisted data cursor per knowledge base,
 	// kept as the maximum over the recorded values.
 	cursors map[string]int64
@@ -69,22 +76,31 @@ type MockWAL struct {
 // NewMockWAL constructs an empty MockWAL.
 func NewMockWAL() *MockWAL {
 	return &MockWAL{
-		versionIDsWritten:   make(map[int64]bool),
-		committedVersions:   make(map[int64]bool),
-		deleteMarked:        make(map[string]bool),
-		deleteCompleted:     make(map[string]bool),
-		versionDeleteMarked: make(map[int64]string),
-		versionDeleteDone:   make(map[int64]bool),
-		beginDataByVersion:  make(map[int64]beginData),
-		cursors:             make(map[string]int64),
-		replayCounters:      make(map[replayKey]int),
+		versionIDsWritten:    make(map[int64]bool),
+		committedVersions:    make(map[int64]bool),
+		deleteMarked:         make(map[string]bool),
+		deleteCompleted:      make(map[string]bool),
+		versionDeleteMarked:  make(map[int64]string),
+		versionDeleteDone:    make(map[int64]bool),
+		beginDataByVersion:   make(map[int64]beginData),
+		pendingBeginByKB:     make(map[string]beginData),
+		pendingVersionIDByKB: make(map[string]int64),
+		cursors:              make(map[string]int64),
+		replayCounters:       make(map[replayKey]int),
 	}
 }
 
 func (w *MockWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int64, changes []types.DocChange) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.records = append(w.records, record{kind: recordBegin, kbID: kbID, begin: beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}})
+	bd := beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}
+	w.records = append(w.records, record{kind: recordBegin, kbID: kbID, begin: bd})
+	if versionID, ok := w.pendingVersionIDByKB[kbID]; ok {
+		w.beginDataByVersion[versionID] = bd
+		delete(w.pendingVersionIDByKB, kbID)
+		return nil
+	}
+	w.pendingBeginByKB[kbID] = bd
 	return nil
 }
 
@@ -96,14 +112,15 @@ func (w *MockWAL) WriteVersionID(_ context.Context, kbID string, versionID int64
 	}
 	w.versionIDsWritten[versionID] = true
 	w.records = append(w.records, record{kind: recordVersionID, kbID: kbID, versionID: versionID})
-	// Bind the most recent unpaired BEGIN of THIS knowledge base to this version,
-	// mirroring FileWAL.rebuildIndex (M7 of docs/code-review-2026-09-24.md).
-	for i := len(w.records) - 1; i >= 0; i-- {
-		if w.records[i].kind == recordBegin && w.records[i].kbID == kbID {
-			w.beginDataByVersion[versionID] = w.records[i].begin
-			break
-		}
+	// Bind the unpaired BEGIN of THIS knowledge base, or — when the VERSION_ID
+	// arrived first, which is what the dispatch topology does — wait for it to
+	// turn up (C5 of docs/code-review-2026-10-18.md).
+	if bd, ok := w.pendingBeginByKB[kbID]; ok {
+		w.beginDataByVersion[versionID] = bd
+		delete(w.pendingBeginByKB, kbID)
+		return nil
 	}
+	w.pendingVersionIDByKB[kbID] = versionID
 	return nil
 }
 

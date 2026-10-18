@@ -35,35 +35,50 @@ func (rf *Raft) ResetSnapshotting() {
 // actually in the log.
 //
 // The memory trim is done under rf.mu (cheap); the durable snapshot write
-// happens AFTER releasing it, so a slow disk can no longer stall the raft
-// loop (heartbeats, proposals, apply) — this was the direct cause of the
-// "snapshot blocking" hang observed under large write volumes. Order is
-// preserved: the snapshot file is written before persist() flushes the
-// trimmed log, so a crash between the two leaves a log whose base is no
-// newer than the persisted snapshot.
+// happens outside it, so a slow disk cannot stall the raft loop (heartbeats,
+// proposals, apply) — this was the direct cause of the "snapshot blocking" hang
+// observed under large write volumes.
+//
+// The snapshot is persisted BEFORE the log is trimmed, and a failed write leaves
+// the log alone. Trimming first (what this used to do, logging the failed write
+// and persisting the trim regardless) is irreversible: the [snapshotIndex,
+// logBase] entries exist neither in the snapshot nor in the log, so a restart
+// replays neither, the state machine boots from an older snapshot, and the
+// metadata those entries carried is simply gone — including whatever the version
+// counter had reached (H5 of docs/code-review-2026-10-18.md).
 func (rf *Raft) Snapshot(index uint64, data []byte) {
 	rf.mu.Lock()
 	if index <= rf.log[0].Index {
 		rf.mu.Unlock()
 		return
 	}
-	offset := rf.logIndex(index)
-	if offset >= uint64(len(rf.log)) {
+	if rf.logIndex(index) >= uint64(len(rf.log)) {
 		rf.mu.Unlock()
 		return
 	}
-
-	newLog := []*kvraftpb.Entry{{Index: index, Term: rf.log[offset].Term}}
-	newLog = append(newLog, rf.log[offset+1:]...)
-	rf.log = newLog
 	rf.mu.Unlock()
 
 	if err := rf.persister.SaveSnapshot(data, index); err != nil {
-		rf.logger.Error("SaveSnapshot failed", zap.Int64("node_id", rf.me), zap.Uint64("index", index), zap.Error(err))
+		rf.logger.Error("SaveSnapshot failed; keeping the log untrimmed so its entries stay replayable",
+			zap.Int64("node_id", rf.me), zap.Uint64("index", index), zap.Error(err))
+		return
 	}
+
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// Re-check: the log may have been trimmed further (or a newer snapshot
+	// installed) while the write was in flight.
+	if index <= rf.log[0].Index {
+		return
+	}
+	offset := rf.logIndex(index)
+	if offset >= uint64(len(rf.log)) {
+		return
+	}
+	newLog := []*kvraftpb.Entry{{Index: index, Term: rf.log[offset].Term}}
+	newLog = append(newLog, rf.log[offset+1:]...)
+	rf.log = newLog
 	rf.persist()
-	rf.mu.Unlock()
 }
 
 // SnapshotDone is called by the state-machine layer once an out-of-band

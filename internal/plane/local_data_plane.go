@@ -265,6 +265,32 @@ type LocalDataPlane struct {
 	// (docs/storage-node-state-machine-plan.md §7). Never nil — see
 	// NewLocalDataPlane for why an unwired plane still gets one.
 	state *nodestate.Machine
+
+	// indexFetchMu guards indexFetchInflight: the artifact fetches currently
+	// running, one per (kb, version).
+	//
+	// The deduplication is not an optimisation (H9 of
+	// docs/code-review-2026-10-18.md). Two callers ask about the same version as a
+	// matter of course — the query path on every PENDING query, the catch-up loop on
+	// every round — so N concurrent asks used to mean N downloads of the same
+	// artifact, and InstallIndex's per-version shard lock then serialised them into N
+	// disk rewrites of the same file.
+	indexFetchMu       sync.Mutex
+	indexFetchInflight map[fetchInflightKey]*indexFetchCall
+}
+
+// fetchInflightKey identifies one artifact fetch.
+type fetchInflightKey struct {
+	kbID      string
+	versionID int64
+}
+
+// indexFetchCall is one in-flight fetch, shared by every caller that asked while it
+// ran: they wait on done and read the same answer.
+type indexFetchCall struct {
+	done      chan struct{}
+	installed bool
+	err       error
 }
 
 // LocalDataPlaneConfig wires a LocalDataPlane.
@@ -786,11 +812,14 @@ func (d *LocalDataPlane) ensureOwnIndex(ctx context.Context, kbID string, versio
 	if d.indexMgr == nil {
 		return nil
 	}
-	// Cheap route first: somebody else's artifact costs a round trip to install,
-	// against minutes to build.
-	if installed, err := d.FetchIndexFromPeers(ctx, kbID, versionID); err == nil && installed {
-		return nil
-	}
+	// The artifact on THIS node's disk is the cheaper and more authoritative answer,
+	// so it is asked FIRST (H9 of docs/code-review-2026-10-18.md). The order used to
+	// be the other way round, which meant a version that already had a READY artifact
+	// here still asked every replica for a copy on every EnsureIndex — every catch-up
+	// round, every query — and installed the first one that answered, re-downloading
+	// tens of megabytes and rewriting the file each time. IndexExists is what makes
+	// that unnecessary; it just has to run before the question goes out.
+	//
 	// It deliberately does not call TriggerBuild unconditionally: a build for a
 	// version whose artifact is already on disk is a FULL REBUILD — triggerBuild
 	// de-duplicates in-flight builds, not finished ones — so every catch-up round
@@ -802,6 +831,11 @@ func (d *LocalDataPlane) ensureOwnIndex(ctx context.Context, kbID string, versio
 		return fmt.Errorf("plane: ensureOwnIndex(%s, %d): check for an existing artifact: %w", kbID, versionID, err)
 	}
 	if exists {
+		return nil
+	}
+	// Nothing here: somebody else's artifact costs a round trip to install, against
+	// minutes to build.
+	if installed, err := d.FetchIndexFromPeers(ctx, kbID, versionID); err == nil && installed {
 		return nil
 	}
 	if err := d.indexMgr.TriggerBuild(ctx, kbID, versionID); err != nil {
@@ -2972,6 +3006,39 @@ func (d *LocalDataPlane) FetchIndexFromPeers(ctx context.Context, kbID string, v
 	if d.indexFetcher == nil || d.indexInstaller == nil || d.resolveReplicas == nil {
 		return false, nil // nothing to fetch with, or nobody to fetch from
 	}
+
+	// One fetch per version at a time, shared with everyone who asks meanwhile (H9 of
+	// docs/code-review-2026-10-18.md). Without this, N concurrent asks produced N
+	// downloads of the same artifact and N serialised rewrites of the same file.
+	key := fetchInflightKey{kbID: kbID, versionID: versionID}
+	d.indexFetchMu.Lock()
+	if call, ok := d.indexFetchInflight[key]; ok {
+		d.indexFetchMu.Unlock()
+		select {
+		case <-call.done:
+			return call.installed, call.err
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+	if d.indexFetchInflight == nil {
+		d.indexFetchInflight = make(map[fetchInflightKey]*indexFetchCall)
+	}
+	call := &indexFetchCall{done: make(chan struct{})}
+	d.indexFetchInflight[key] = call
+	d.indexFetchMu.Unlock()
+
+	call.installed, call.err = d.fetchIndexFromPeers(ctx, kbID, versionID)
+
+	d.indexFetchMu.Lock()
+	delete(d.indexFetchInflight, key)
+	d.indexFetchMu.Unlock()
+	close(call.done)
+	return call.installed, call.err
+}
+
+// fetchIndexFromPeers is the unshared body of FetchIndexFromPeers.
+func (d *LocalDataPlane) fetchIndexFromPeers(ctx context.Context, kbID string, versionID int64) (bool, error) {
 	peers, err := d.resolveReplicas(ctx)
 	if err != nil {
 		return false, fmt.Errorf("plane: FetchIndexFromPeers: resolve replicas: %w", err)
