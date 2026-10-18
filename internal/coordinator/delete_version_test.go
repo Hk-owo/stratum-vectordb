@@ -44,6 +44,7 @@ func buildDeleteVersionFixture(t *testing.T) (*DeleteVersionCoordinatorImpl, *ra
 	if err := w.WriteCommit(ctx, v1); err != nil {
 		t.Fatalf("commit v1: %v", err)
 	}
+	_ = rn.ProposeMarkVersionDataDurable(ctx, v1)
 	if err := rn.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v1 READY: %v", err)
 	}
@@ -57,6 +58,7 @@ func buildDeleteVersionFixture(t *testing.T) (*DeleteVersionCoordinatorImpl, *ra
 	if err := w.WriteCommit(ctx, v2); err != nil {
 		t.Fatalf("commit v2: %v", err)
 	}
+	_ = rn.ProposeMarkVersionDataDurable(ctx, v2)
 	if err := rn.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v2 READY: %v", err)
 	}
@@ -67,6 +69,7 @@ func buildDeleteVersionFixture(t *testing.T) (*DeleteVersionCoordinatorImpl, *ra
 	if err := w.WriteCommit(ctx, v3); err != nil {
 		t.Fatalf("commit v3: %v", err)
 	}
+	_ = rn.ProposeMarkVersionDataDurable(ctx, v3)
 	if err := rn.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v3 READY: %v", err)
 	}
@@ -254,6 +257,7 @@ func TestDeleteVersionCoordinator_KeepsRecordsSurvivorReads(t *testing.T) {
 	if err := w.WriteCommit(ctx, v1); err != nil {
 		t.Fatalf("commit v1: %v", err)
 	}
+	_ = rn.ProposeMarkVersionDataDurable(ctx, v1)
 	if err := rn.ProposeUpdateVersionStatus(ctx, v1, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v1 READY: %v", err)
 	}
@@ -264,6 +268,7 @@ func TestDeleteVersionCoordinator_KeepsRecordsSurvivorReads(t *testing.T) {
 	if err := w.WriteCommit(ctx, v2); err != nil {
 		t.Fatalf("commit v2: %v", err)
 	}
+	_ = rn.ProposeMarkVersionDataDurable(ctx, v2)
 	if err := rn.ProposeUpdateVersionStatus(ctx, v2, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v2 READY: %v", err)
 	}
@@ -274,6 +279,7 @@ func TestDeleteVersionCoordinator_KeepsRecordsSurvivorReads(t *testing.T) {
 	if err := w.WriteCommit(ctx, v3); err != nil {
 		t.Fatalf("commit v3: %v", err)
 	}
+	_ = rn.ProposeMarkVersionDataDurable(ctx, v3)
 	if err := rn.ProposeUpdateVersionStatus(ctx, v3, types.IndexStatusReady, 0); err != nil {
 		t.Fatalf("v3 READY: %v", err)
 	}
@@ -366,6 +372,7 @@ func TestDeleteVersionCoordinator_KeepsRecordsForLinearDeletion(t *testing.T) {
 		if err := w.WriteCommit(ctx, id); err != nil {
 			t.Fatalf("commit v%d: %v", id, err)
 		}
+		_ = rn.ProposeMarkVersionDataDurable(ctx, id)
 		if err := rn.ProposeUpdateVersionStatus(ctx, id, types.IndexStatusReady, 0); err != nil {
 			t.Fatalf("v%d READY: %v", id, err)
 		}
@@ -459,6 +466,7 @@ func TestDeleteVersionCoordinator_DeletesVersionBloomFiles(t *testing.T) {
 		if err := w.WriteCommit(ctx, id); err != nil {
 			t.Fatalf("commit v%d: %v", id, err)
 		}
+		_ = rn.ProposeMarkVersionDataDurable(ctx, id)
 		if err := rn.ProposeUpdateVersionStatus(ctx, id, types.IndexStatusReady, 0); err != nil {
 			t.Fatalf("v%d READY: %v", id, err)
 		}
