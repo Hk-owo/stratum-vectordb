@@ -110,6 +110,7 @@ type gcChunkStore struct {
 	mu      sync.Mutex
 	data    map[string]bool // "kbID|chunkID" -> present
 	deleted []string
+	flushes int
 }
 
 func newGCChunkStore() *gcChunkStore {
@@ -136,6 +137,13 @@ func (s *gcChunkStore) Delete(_ context.Context, kbID, chunkID string) error {
 }
 func (s *gcChunkStore) DeleteByKB(_ context.Context, kbID string) error { return nil }
 func (s *gcChunkStore) DiskUsage(_ context.Context) (uint64, error)     { return 0, nil }
+
+func (s *gcChunkStore) FlushWAL(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushes++
+	return nil
+}
 
 func TestChunkGarbageCollector(t *testing.T) {
 	ctx := context.Background()

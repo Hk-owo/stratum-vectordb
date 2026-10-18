@@ -163,6 +163,11 @@ type deleteTestChunkStore struct {
 	mu        sync.Mutex
 	deleted   []string
 	deleteErr error
+	// flushes counts FlushWAL calls, and flushesAfterDelete records the deleted
+	// count at each flush: the flow's ordering (flush AFTER the delete, before
+	// DELETE_COMPLETE) is only assertable through these.
+	flushes            int
+	flushesAfterDelete []int
 }
 
 func newDeleteTestChunkStore() *deleteTestChunkStore { return &deleteTestChunkStore{} }
@@ -183,6 +188,20 @@ func (s *deleteTestChunkStore) DeleteByKB(_ context.Context, kbID string) error 
 	return nil
 }
 func (s *deleteTestChunkStore) DiskUsage(_ context.Context) (uint64, error) { return 0, nil }
+
+func (s *deleteTestChunkStore) FlushWAL(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushes++
+	s.flushesAfterDelete = append(s.flushesAfterDelete, len(s.deleted))
+	return nil
+}
+
+func (s *deleteTestChunkStore) flushCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushes
+}
 
 // deleteTestChunkDocMapper tracks DeleteByKB calls.
 type deleteTestChunkDocMapper struct {

@@ -148,4 +148,19 @@ func (s *VecstoreChunkStore) DiskUsage(ctx context.Context) (uint64, error) {
 	return resp.GetBytes(), nil
 }
 
+// FlushWAL implements ChunkStore: one round trip to the vecstore, whose handler
+// runs RocksDB's FlushWAL(sync=true) and only answers once the device has
+// confirmed the bytes. Called immediately before the write path's WAL COMMIT,
+// so that record never becomes durable ahead of the vectors it vouches for.
+//
+// A failure here must fail the transaction rather than be logged and skipped: the
+// caller is about to make a durable claim about data that is not durable, which
+// is exactly the silent-loss window this RPC exists to close.
+func (s *VecstoreChunkStore) FlushWAL(ctx context.Context) error {
+	if _, err := s.client.FlushWAL(ctx, &vecstorepb.FlushWALRequest{}); err != nil {
+		return fmt.Errorf("chunkstore: FlushWAL: %w", err)
+	}
+	return nil
+}
+
 var _ ChunkStore = (*VecstoreChunkStore)(nil)

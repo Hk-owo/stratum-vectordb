@@ -296,6 +296,11 @@ type testChunkStore struct {
 	mu          sync.Mutex
 	data        map[string][]float32 // "kbID|chunkID" -> vector
 	existsCalls []string
+	// flushes counts FlushWAL calls and writtenAtFlush snapshots how many chunks
+	// existed at each one — the write path's durability ordering (flush after the
+	// chunk writes) is only observable through these.
+	flushes        int
+	writtenAtFlush []int
 }
 
 func newTestChunkStore() *testChunkStore {
@@ -320,6 +325,20 @@ func (s *testChunkStore) Exists(_ context.Context, kbID, chunkID string) (bool, 
 func (s *testChunkStore) Delete(_ context.Context, kbID, chunkID string) error { return nil }
 func (s *testChunkStore) DeleteByKB(_ context.Context, kbID string) error      { return nil }
 func (s *testChunkStore) DiskUsage(_ context.Context) (uint64, error)          { return 0, nil }
+
+func (s *testChunkStore) FlushWAL(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushes++
+	s.writtenAtFlush = append(s.writtenAtFlush, len(s.data))
+	return nil
+}
+
+func (s *testChunkStore) flushCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushes
+}
 
 func (s *testChunkStore) writtenCount() int {
 	s.mu.Lock()

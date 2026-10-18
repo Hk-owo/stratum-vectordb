@@ -48,6 +48,9 @@ class ChunkStorageServiceImpl final : public ::vecstore::ChunkStorageService::Se
   grpc::Status DiskUsage(grpc::ServerContext* context,
                           const ::vecstore::DiskUsageRequest* request,
                           ::vecstore::DiskUsageResponse* response) override;
+  grpc::Status FlushWAL(grpc::ServerContext* context,
+                         const ::vecstore::FlushWALRequest* request,
+                         ::vecstore::FlushWALResponse* response) override;
 
  private:
   ChunkStorage* storage_;  // not owned; outlives this service

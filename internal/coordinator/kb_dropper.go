@@ -68,6 +68,18 @@ func (d LocalKBDropper) DropKnowledgeBase(ctx context.Context, kbID string) erro
 	if err := d.ChunkStore.DeleteByKB(ctx, kbID); err != nil {
 		return fmt.Errorf("ChunkStore.DeleteByKB: %w", err)
 	}
+	// Make the vector deletion durable before this reclaim reports success. The
+	// delete flow's next steps end in WAL.WriteDeleteComplete, which is fsynced
+	// and says "this knowledge base's data is gone"; the vecstore deletes it
+	// describes are sync=false, so without this barrier a power loss can keep the
+	// completion record and resurrect every vector it claimed deleted. Nothing
+	// would clean them up afterwards: the knowledge base is gone from the
+	// metadata, so the orphan-chunk GC has no mapping left to notice them by.
+	//
+	// One flush for the whole knowledge base, not per chunk or per layer.
+	if err := d.ChunkStore.FlushWAL(ctx); err != nil {
+		return fmt.Errorf("ChunkStore.FlushWAL: %w", err)
+	}
 	if err := d.ChunkDocMapper.DeleteByKB(ctx, kbID); err != nil {
 		return fmt.Errorf("ChunkDocMapper.DeleteByKB: %w", err)
 	}

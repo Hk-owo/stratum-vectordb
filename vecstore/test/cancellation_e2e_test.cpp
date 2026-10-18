@@ -141,6 +141,7 @@ class BlockingChunkStorage final : public ChunkStorage {
     return inner_->DeleteByPrefix(prefix);
   }
   absl::StatusOr<uint64_t> DiskUsage() override { return inner_->DiskUsage(); }
+  absl::Status FlushWAL() override { return inner_->FlushWAL(); }
 
  private:
   ChunkStorage* inner_;

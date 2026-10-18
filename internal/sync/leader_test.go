@@ -58,6 +58,9 @@ func (f *fakeVecstore) Exists(context.Context, *vecstorepb.ExistsChunkRequest, .
 func (f *fakeVecstore) DiskUsage(context.Context, *vecstorepb.DiskUsageRequest, ...grpc.CallOption) (*vecstorepb.DiskUsageResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "not used in leader tests")
 }
+func (f *fakeVecstore) FlushWAL(context.Context, *vecstorepb.FlushWALRequest, ...grpc.CallOption) (*vecstorepb.FlushWALResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "not used in leader tests")
+}
 
 // captureStream is a DataSyncService_PullVersionDataServer that records
 // every sent SyncEntry instead of transmitting them.

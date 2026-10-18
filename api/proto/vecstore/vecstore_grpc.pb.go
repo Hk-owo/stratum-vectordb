@@ -32,6 +32,7 @@ const (
 	ChunkStorageService_Delete_FullMethodName         = "/vecstore.ChunkStorageService/Delete"
 	ChunkStorageService_DeleteByPrefix_FullMethodName = "/vecstore.ChunkStorageService/DeleteByPrefix"
 	ChunkStorageService_DiskUsage_FullMethodName      = "/vecstore.ChunkStorageService/DiskUsage"
+	ChunkStorageService_FlushWAL_FullMethodName       = "/vecstore.ChunkStorageService/FlushWAL"
 )
 
 // ChunkStorageServiceClient is the client API for ChunkStorageService service.
@@ -44,6 +45,15 @@ type ChunkStorageServiceClient interface {
 	Delete(ctx context.Context, in *DeleteChunkRequest, opts ...grpc.CallOption) (*DeleteChunkResponse, error)
 	DeleteByPrefix(ctx context.Context, in *DeleteByPrefixRequest, opts ...grpc.CallOption) (*DeleteByPrefixResponse, error)
 	DiskUsage(ctx context.Context, in *DiskUsageRequest, opts ...grpc.CallOption) (*DiskUsageResponse, error)
+	// FlushWAL makes every Write/Delete acknowledged before this call durable on
+	// stable storage. The Go side calls it once per write/delete transaction,
+	// immediately BEFORE the WAL record that says "this version's data has
+	// landed" (COMMIT / VERSION_DELETE_COMPLETE / DELETE_COMPLETE). Those records
+	// are fsynced themselves, so without this barrier a power loss could leave
+	// the record durable and the chunk vectors it vouches for gone — and recovery
+	// never replays a version whose COMMIT is present. See
+	// internal/plane/local_data_plane.go and Stratum_设计文档v14.md §3.3.
+	FlushWAL(ctx context.Context, in *FlushWALRequest, opts ...grpc.CallOption) (*FlushWALResponse, error)
 }
 
 type chunkStorageServiceClient struct {
@@ -114,6 +124,16 @@ func (c *chunkStorageServiceClient) DiskUsage(ctx context.Context, in *DiskUsage
 	return out, nil
 }
 
+func (c *chunkStorageServiceClient) FlushWAL(ctx context.Context, in *FlushWALRequest, opts ...grpc.CallOption) (*FlushWALResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FlushWALResponse)
+	err := c.cc.Invoke(ctx, ChunkStorageService_FlushWAL_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ChunkStorageServiceServer is the server API for ChunkStorageService service.
 // All implementations must embed UnimplementedChunkStorageServiceServer
 // for forward compatibility.
@@ -124,6 +144,15 @@ type ChunkStorageServiceServer interface {
 	Delete(context.Context, *DeleteChunkRequest) (*DeleteChunkResponse, error)
 	DeleteByPrefix(context.Context, *DeleteByPrefixRequest) (*DeleteByPrefixResponse, error)
 	DiskUsage(context.Context, *DiskUsageRequest) (*DiskUsageResponse, error)
+	// FlushWAL makes every Write/Delete acknowledged before this call durable on
+	// stable storage. The Go side calls it once per write/delete transaction,
+	// immediately BEFORE the WAL record that says "this version's data has
+	// landed" (COMMIT / VERSION_DELETE_COMPLETE / DELETE_COMPLETE). Those records
+	// are fsynced themselves, so without this barrier a power loss could leave
+	// the record durable and the chunk vectors it vouches for gone — and recovery
+	// never replays a version whose COMMIT is present. See
+	// internal/plane/local_data_plane.go and Stratum_设计文档v14.md §3.3.
+	FlushWAL(context.Context, *FlushWALRequest) (*FlushWALResponse, error)
 	mustEmbedUnimplementedChunkStorageServiceServer()
 }
 
@@ -151,6 +180,9 @@ func (UnimplementedChunkStorageServiceServer) DeleteByPrefix(context.Context, *D
 }
 func (UnimplementedChunkStorageServiceServer) DiskUsage(context.Context, *DiskUsageRequest) (*DiskUsageResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DiskUsage not implemented")
+}
+func (UnimplementedChunkStorageServiceServer) FlushWAL(context.Context, *FlushWALRequest) (*FlushWALResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method FlushWAL not implemented")
 }
 func (UnimplementedChunkStorageServiceServer) mustEmbedUnimplementedChunkStorageServiceServer() {}
 func (UnimplementedChunkStorageServiceServer) testEmbeddedByValue()                             {}
@@ -281,6 +313,24 @@ func _ChunkStorageService_DiskUsage_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ChunkStorageService_FlushWAL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FlushWALRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ChunkStorageServiceServer).FlushWAL(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ChunkStorageService_FlushWAL_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ChunkStorageServiceServer).FlushWAL(ctx, req.(*FlushWALRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ChunkStorageService_ServiceDesc is the grpc.ServiceDesc for ChunkStorageService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -311,6 +361,10 @@ var ChunkStorageService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DiskUsage",
 			Handler:    _ChunkStorageService_DiskUsage_Handler,
+		},
+		{
+			MethodName: "FlushWAL",
+			Handler:    _ChunkStorageService_FlushWAL_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

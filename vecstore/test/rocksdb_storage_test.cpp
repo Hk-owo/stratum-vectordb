@@ -159,6 +159,42 @@ TEST_F(RocksDBChunkStorageTest, PersistsAcrossReopen) {
   EXPECT_EQ(read.value(), (std::vector<float>{1.0f, 2.0f, 3.0f}));
 }
 
+// FlushWAL is the durability barrier the Go write path calls before its WAL
+// COMMIT: writes here are sync=false, so this is the only point at which a
+// version's vectors reach stable storage. A unit test cannot lose power, so what
+// it pins is that the call succeeds on a live database, that the writes it is
+// supposed to protect survive it (i.e. it is not something that resets or
+// truncates the WAL), and that the WAL stays replayable by a later open.
+TEST_F(RocksDBChunkStorageTest, FlushWALKeepsAcknowledgedWritesDurable) {
+  ASSERT_TRUE(storage_->Write("kb1#chunk1", {1.0f, 2.0f}).ok());
+  ASSERT_TRUE(storage_->Write("kb1#chunk2", {3.0f, 4.0f}).ok());
+
+  ASSERT_TRUE(storage_->FlushWAL().ok());
+
+  auto read = storage_->Read("kb1#chunk1");
+  ASSERT_TRUE(read.ok()) << read.status();
+  EXPECT_EQ(read.value(), (std::vector<float>{1.0f, 2.0f}));
+
+  // The flushed WAL has to be able to bring the data back on its own.
+  storage_.reset();
+  auto reopened_or = RocksDBChunkStorage::Open(test_dir_.string());
+  ASSERT_TRUE(reopened_or.ok()) << reopened_or.status();
+  storage_ = std::move(reopened_or.value());
+
+  auto recovered = storage_->ReadMulti({"kb1#chunk1", "kb1#chunk2"});
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_EQ(recovered.value().found.size(), 2u);
+  EXPECT_TRUE(recovered.value().missing.empty());
+}
+
+// A version whose chunks were all deduplicated away writes nothing, but the Go
+// side still flushes once per transaction — so "nothing to flush" must be OK, not
+// an error.
+TEST_F(RocksDBChunkStorageTest, FlushWALOnAnEmptyStoreSucceeds) {
+  auto flushed = storage_->FlushWAL();
+  ASSERT_TRUE(flushed.ok()) << flushed;
+}
+
 }  // namespace
 }  // namespace vecstore
 }  // namespace stratum

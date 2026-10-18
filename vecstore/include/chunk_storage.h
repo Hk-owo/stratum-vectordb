@@ -73,6 +73,22 @@ class ChunkStorage {
   // DiskUsage returns the approximate on-disk size in bytes used by the
   // storage. Used by GetSystemStatus's resource-usage snapshot.
   virtual absl::StatusOr<uint64_t> DiskUsage() = 0;
+
+  // FlushWAL makes every Write/Delete that already returned OK durable on
+  // stable storage, and returns only once it is.
+  //
+  // Why this exists: the Go side's WAL COMMIT (and the knowledge-base delete
+  // flow's DELETE_COMPLETE) are fsynced, and they are the durable statement "this
+  // version's chunk data has landed" — recovery treats a present COMMIT as
+  // proof that no replay is needed. Write/Delete alone do not order against
+  // that statement: a power loss can leave the COMMIT and drop the vectors it
+  // vouches for, silently, because chunk vectors are the only copy (the Go
+  // side stores none) and nothing reconciles them afterwards. The Go side
+  // calls FlushWAL once per transaction, just before writing that record, so
+  // the ordering the COMMIT claims is the ordering the disk actually has.
+  // Cheap enough to be per-transaction: one fsync amortised over a version's
+  // whole chunk set.
+  virtual absl::Status FlushWAL() = 0;
 };
 
 }  // namespace vecstore

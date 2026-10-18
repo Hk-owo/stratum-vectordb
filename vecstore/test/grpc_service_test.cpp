@@ -150,6 +150,39 @@ TEST_F(GrpcServiceTest, ChunkStorageDeleteByPrefix) {
   }
 }
 
+// FlushWAL is what the Go write path calls before the WAL COMMIT that claims
+// "this version's data has landed" (and what the delete flows call before
+// DELETE_COMPLETE). Over gRPC the property that matters is that the call reaches
+// the storage and answers honestly — an OK that did not flush would let the
+// COMMIT outlive the vectors it vouches for. Here: it succeeds on a live store,
+// and the writes it covered are still readable afterwards.
+TEST_F(GrpcServiceTest, ChunkStorageFlushWALCoversThePrecedingWrites) {
+  for (const std::string& key : {EncodeKey("kb1", "c1"), EncodeKey("kb1", "c2")}) {
+    grpc::ClientContext ctx;
+    ::vecstore::WriteChunkRequest req;
+    req.set_key(key);
+    req.add_vector(1.5f);
+    ::vecstore::WriteChunkResponse resp;
+    ASSERT_TRUE(chunk_stub_->Write(&ctx, req, &resp).ok());
+  }
+
+  grpc::ClientContext flush_ctx;
+  ::vecstore::FlushWALRequest flush_req;
+  ::vecstore::FlushWALResponse flush_resp;
+  const grpc::Status status = chunk_stub_->FlushWAL(&flush_ctx, flush_req, &flush_resp);
+  ASSERT_TRUE(status.ok()) << status.error_message();
+
+  for (const std::string& key : {EncodeKey("kb1", "c1"), EncodeKey("kb1", "c2")}) {
+    grpc::ClientContext ctx;
+    ::vecstore::ReadChunkRequest req;
+    req.set_key(key);
+    ::vecstore::ReadChunkResponse resp;
+    ASSERT_TRUE(chunk_stub_->Read(&ctx, req, &resp).ok());
+    ASSERT_EQ(resp.vector_size(), 1);
+    EXPECT_FLOAT_EQ(resp.vector(0), 1.5f);
+  }
+}
+
 // DeleteByPrefix("") is the one request that empties the whole chunk store: no
 // knowledge base is named, so the prefix scan has nothing to stop it. The
 // handler must refuse it — the vecstore listener is unauthenticated and bound

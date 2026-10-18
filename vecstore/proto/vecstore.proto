@@ -16,6 +16,15 @@ service ChunkStorageService {
   rpc Delete(DeleteChunkRequest) returns (DeleteChunkResponse);
   rpc DeleteByPrefix(DeleteByPrefixRequest) returns (DeleteByPrefixResponse);
   rpc DiskUsage(DiskUsageRequest) returns (DiskUsageResponse);
+  // FlushWAL makes every Write/Delete acknowledged before this call durable on
+  // stable storage. The Go side calls it once per transaction, immediately
+  // BEFORE the fsynced WAL record that vouches for those writes: COMMIT on the
+  // write path, DELETE_COMPLETE on the knowledge-base delete path. Without this
+  // barrier a power loss could leave the record durable and the chunk vectors it
+  // vouches for gone — and recovery never replays a version whose COMMIT is
+  // present. See internal/plane/local_data_plane.go and Stratum_设计文档v14.md
+  // §3.3.
+  rpc FlushWAL(FlushWALRequest) returns (FlushWALResponse);
 }
 
 service VectorIndexService {
@@ -93,6 +102,9 @@ message DeleteByPrefixResponse {}
 
 message DiskUsageRequest {}
 message DiskUsageResponse { uint64 bytes = 1; }
+
+message FlushWALRequest {}
+message FlushWALResponse {}
 
 message ChunkVectorProto {
   string chunk_id = 1;

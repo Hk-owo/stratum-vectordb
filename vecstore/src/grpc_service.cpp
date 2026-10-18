@@ -320,6 +320,26 @@ grpc::Status ChunkStorageServiceImpl::DiskUsage(
   });
 }
 
+// FlushWAL is the durability barrier the Go side calls before it writes the WAL
+// record that claims a version's (or a deletion's) chunk writes landed. It must
+// NOT be treated as advisory: answering OK without the data actually reaching
+// stable storage is precisely the failure this RPC was added to close (COMMIT
+// fsynced, vectors still in page cache, recovery then never replays the
+// version). Errors propagate.
+//
+// Cancellation is honoured on entry only, not during the fsync. A client that
+// gives up does not make the flush unnecessary — the bytes are already written
+// and the caller's next step depends on their durability — and gRPC would let
+// this handler run to completion regardless.
+grpc::Status ChunkStorageServiceImpl::FlushWAL(
+    grpc::ServerContext* context, const ::vecstore::FlushWALRequest* /*request*/,
+    ::vecstore::FlushWALResponse* /*response*/) {
+  if (context->IsCancelled()) {
+    return CancelledOnEntry("FlushWAL");
+  }
+  return Guard("FlushWAL", [&] { return ToGrpcStatus(storage_->FlushWAL()); });
+}
+
 // ---------------------------------------------------------------------------
 // VectorIndexServiceImpl
 // ---------------------------------------------------------------------------

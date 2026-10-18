@@ -39,4 +39,24 @@ type ChunkStore interface {
 	// chunk store (the C++ vecstore's RocksDB). Used by GetSystemStatus's
 	// resource-usage snapshot.
 	DiskUsage(ctx context.Context) (uint64, error)
+
+	// FlushWAL makes every Write/Delete that already returned success durable on
+	// stable storage.
+	//
+	// It exists to order the two stores against each other. Chunk vectors live in
+	// the vecstore's RocksDB and are written with sync=false; the durability
+	// record for a version ("this version's data has landed") is the Go-side WAL
+	// COMMIT, which IS fsynced. Writing COMMIT without first flushing the vector
+	// writes produces a COMMIT that vouches for writes still sitting in the OS
+	// page cache: a power loss then keeps the record and drops the data it
+	// describes, and recovery never replays a version whose COMMIT is present —
+	// and chunk vectors are the only copy (no PebbleDB duplication), so nothing
+	// notices afterwards. The knowledge-base delete flow has the same shape (the
+	// vectors are gone but DELETE_COMPLETE is not, so deleted content comes
+	// back).
+	//
+	// Call it once per transaction, immediately BEFORE writing that record. One
+	// flush covers a version's whole chunk set, so the cost is a single fsync
+	// amortised over the write.
+	FlushWAL(ctx context.Context) error
 }

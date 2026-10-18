@@ -1764,6 +1764,12 @@ type fanoutStages struct {
 // BEGIN (persisting the replay input) → the per-change storage writes →
 // COMMIT. Returns the version's document-ID set. st, when non-nil, receives the
 // per-stage split; callers that are not measuring pass nil.
+//
+// The storage step is also the durability barrier: by the time it returns, the
+// chunk vectors it wrote are flushed to the vecstore's stable storage (see
+// VersionWriteExecutor), so the COMMIT below — which is fsynced — cannot outlive
+// the data it claims. Writing the commit without that ordering is the silent
+// version of this bug: recovery trusts a present COMMIT and never replays.
 func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange, st *localStages) ([]string, error) {
 	if d.wal == nil || d.executor == nil {
 		return nil, fmt.Errorf("plane: WriteVersionData: the storage write transaction is not configured")
@@ -2078,7 +2084,8 @@ func (d *LocalDataPlane) finishVersionWrite(ctx context.Context, kbID string, ve
 
 // ResumeVersionWrite re-runs the storage writes and commits without writing a
 // second BEGIN: the transaction's BEGIN record is already durable (crash
-// recovery drove this path).
+// recovery drove this path). Same durability barrier as writeLocalTransaction —
+// the storage step flushes the chunk vectors before the COMMIT vouches for them.
 func (d *LocalDataPlane) ResumeVersionWrite(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error {
 	if d.wal == nil || d.executor == nil {
 		return fmt.Errorf("plane: ResumeVersionWrite: the storage write transaction is not configured")
@@ -2420,6 +2427,14 @@ type CursorStore interface {
 // deliberately does NOT frame the WAL transaction (BEGIN/COMMIT) — that
 // framing is what makes the transaction the storage layer's own, and it lives
 // in WriteVersionData.
+//
+// It DOES own the durability barrier between the two: when it returns success,
+// every storage write it made (chunk vectors included) is durable on stable
+// storage, so the COMMIT the caller writes afterwards is telling the truth.
+// The vecstore's writes are sync=false and the COMMIT is fsynced, so an
+// executor that skipped the flush would let a crash keep the COMMIT and drop
+// what it vouches for — and recovery never replays a version whose COMMIT is
+// present.
 type VersionWriteExecutor interface {
 	WriteVersionStorage(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) ([]string, error)
 }

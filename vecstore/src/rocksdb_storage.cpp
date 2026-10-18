@@ -105,6 +105,21 @@ absl::Status RocksDBChunkStorage::Write(const std::string& key,
   return ToAbslStatus(status);
 }
 
+// FlushWAL pushes the WAL out of the OS page cache and waits for the device to
+// confirm it. Writes here are sync=false (each chunk Put would otherwise pay its
+// own fsync), so this is the point where a version's vectors actually become
+// power-loss durable — and the Go side calls it right before the WAL record that
+// claims they did (see ChunkStorage::FlushWAL).
+//
+// NotSupported is a real failure here, not a no-op: it means this RocksDB was
+// opened without a WAL, so nothing on this path can make the writes durable, and
+// answering OK would let the caller's COMMIT claim durability that does not
+// exist. It surfaces as INTERNAL and fails the write — the safe direction (the
+// version is retried rather than silently committed).
+absl::Status RocksDBChunkStorage::FlushWAL() {
+  return ToAbslStatus(db_->FlushWAL(/*sync=*/true));
+}
+
 absl::StatusOr<std::vector<float>> RocksDBChunkStorage::Read(
     const std::string& key) {
   std::string raw;

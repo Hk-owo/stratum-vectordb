@@ -19,6 +19,7 @@ type MockChunkStore struct {
 	vectors map[string]map[string][]float32
 
 	writeCount int // number of Write calls, for dedup assertions
+	flushCount int // number of FlushWAL calls, for durability-ordering assertions
 }
 
 // NewMockChunkStore constructs an empty MockChunkStore.
@@ -69,6 +70,24 @@ func (s *MockChunkStore) DiskUsage(_ context.Context) (uint64, error) {
 	return 0, nil
 }
 
+// FlushWAL implements ChunkStore: the mock's "disk" is a map, so writes are
+// already as durable as they are ever going to get. It counts calls anyway,
+// because the ORDER of flush-before-commit is the property worth asserting in
+// tests of the write path.
+func (s *MockChunkStore) FlushWAL(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushCount++
+	return nil
+}
+
+// FlushCount returns how many times FlushWAL has been called.
+func (s *MockChunkStore) FlushCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.flushCount
+}
+
 // Read returns the stored vector for kbID + chunkID. Not part of the
 // ChunkStore interface (the real interface only exposes Exists, not Read,
 // at the Go layer — IndexManager reads chunk vectors via the C++ vecstore
@@ -103,6 +122,7 @@ func (s *MockChunkStore) Reset() {
 	defer s.mu.Unlock()
 	s.vectors = make(map[string]map[string][]float32)
 	s.writeCount = 0
+	s.flushCount = 0
 }
 
 var _ ChunkStore = (*MockChunkStore)(nil)

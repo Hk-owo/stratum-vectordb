@@ -18,7 +18,9 @@ import "context"
 //     version-document bloom files (VersionBloom.DeleteByKB); both
 //     ignore ErrNotExist
 //  3. DocStore.DeleteByKB
-//  4. ChunkStore.DeleteByKB
+//  4. ChunkStore.DeleteByKB, then ChunkStore.FlushWAL — the vector deletion has
+//     to be durable before step 8 vouches for it (step 8 is fsynced; the
+//     deletes are not)
 //  5. ChunkDocMapper.DeleteByKB
 //  6. VersionDocList.DeleteByKB
 //  7. RaftNode.ProposeRemoveKBMeta (ErrKnowledgeBaseNotFound treated as success)

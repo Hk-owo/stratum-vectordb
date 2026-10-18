@@ -77,7 +77,8 @@ type KBAnnouncementForgetter interface {
 //  2. IndexManager.DeleteFilesByKB (on-disk index files) + VersionBloom
 //     store's on-disk bloom files — missing files/dirs ignored
 //  3. DocStore.DeleteByKB
-//  4. ChunkStore.DeleteByKB
+//  4. ChunkStore.DeleteByKB, then ChunkStore.FlushWAL — the vector deletion has
+//     to be durable before step 8 vouches for it
 //  5. ChunkDocMapper.DeleteByKB
 //  6. VersionDocList.DeleteByKB
 //  7. RaftNode.ProposeRemoveKBMeta (ErrKnowledgeBaseNotFound treated as success)

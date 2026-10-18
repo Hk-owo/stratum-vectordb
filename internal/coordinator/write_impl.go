@@ -701,19 +701,23 @@ type docStages struct {
 // Why: storage_us is the largest piece of a write transaction's local half and
 // was one opaque number covering four unrelated steps — a control-plane metadata
 // read, the per-document split/embed/store, the version's full document-ID set,
-// and its bloom filter. Which dominates decides what to optimise.
+// and its bloom filter. Which dominates decides what to optimise. flush is the
+// vecstore WAL fsync that has to happen before the caller's COMMIT, counted
+// apart because it is the one stage whose cost does not scale with the write.
 type writeStorageStages struct {
 	getKB     time.Duration
 	documents time.Duration
 	docList   time.Duration
 	bloom     time.Duration
+	flush     time.Duration
 	docs      docStages
 }
 
 // WriteVersionStorage implements plane.VersionWriteExecutor: the storage-layer
-// steps of one write (steps 3-5): it resolves the KB metadata itself and
-// performs the per-change split/embed/writes plus the version document set and
-// bloom filter. It does
+// steps of one write (steps 3-5, plus the vecstore flush that has to precede the
+// caller's WAL COMMIT): it resolves the KB metadata itself and performs the
+// per-change split/embed/writes plus the version document set and bloom filter.
+// It does
 // NOT frame the WAL transaction (BEGIN/COMMIT) — the caller owns that framing,
 // which is what lets the storage layer's DataPlane run the transaction as its
 // own (Stratum_设计文档v13.md §7.12).
@@ -735,6 +739,7 @@ func (c *WriteCoordinatorImpl) WriteVersionStorage(ctx context.Context, kbID str
 			zap.Int64("documents_us", st.documents.Microseconds()),
 			zap.Int64("doclist_us", st.docList.Microseconds()),
 			zap.Int64("bloom_us", st.bloom.Microseconds()),
+			zap.Int64("flush_us", st.flush.Microseconds()),
 			zap.Int64("split_us", st.docs.splitUs.Load()),
 			zap.Int64("embed_us", st.docs.embedUs.Load()),
 			zap.Int64("embed_calls", st.docs.embedCalls.Load()),
@@ -758,7 +763,8 @@ func (c *WriteCoordinatorImpl) WriteVersionStorage(ctx context.Context, kbID str
 // writeVersionStorage executes the synchronous storage-layer steps of the
 // write path (3-5) for (kbID, versionID): per-change split/embed/write,
 // the version's full document-ID set, the version-document bloom filter,
-// and the WAL COMMIT. Shared by Execute and the crash-recovery replay;
+// and the vecstore WAL flush that must precede the caller's WAL COMMIT.
+// Shared by Execute and the crash-recovery replay;
 // every write is idempotent, so re-running it for an already-partially-
 // written version is always safe. Returns the version's sorted docIDs.
 func (c *WriteCoordinatorImpl) writeVersionStorage(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange, kbMeta types.KnowledgeBaseMeta, st *writeStorageStages) ([]string, error) {
@@ -790,6 +796,31 @@ func (c *WriteCoordinatorImpl) writeVersionStorage(ctx context.Context, kbID str
 			_ = err // non-fatal; read path rebuilds lazily
 		}
 		st.bloom = time.Since(stepStart)
+	}
+
+	// Last step before returning: the durability barrier for step 3's chunk
+	// writes, which the caller's WAL COMMIT is about to vouch for.
+	//
+	// The ordering is the whole point. COMMIT is fsynced, and it is the record
+	// that says "this version's data has landed" — recovery reads a present
+	// COMMIT as proof that no replay is needed. The vecstore writes that step 3
+	// issued are sync=false (one fsync per chunk would dominate the write), so
+	// without this call a power loss can keep the COMMIT and drop the vectors it
+	// vouches for. That loss is silent and permanent: chunk vectors are the only
+	// copy (the Go side stores none) and nothing reconciles a mapping that points
+	// at a vector that is no longer there. One FlushWAL covers the version's whole
+	// chunk set, so the cost is a single fsync amortised over every chunk in it.
+	//
+	// Failing here fails the write before the COMMIT is written, which is the safe
+	// direction: the version's VERSION_ID-without-COMMIT record makes it
+	// replayable, and the replay rewrites the chunks idempotently. Reporting
+	// success instead would be the same lie as committing unflushed data.
+	if c.cfg.ChunkStore != nil {
+		flushStart := time.Now()
+		if err := c.cfg.ChunkStore.FlushWAL(ctx); err != nil {
+			return nil, fmt.Errorf("coordinator: ChunkStore.FlushWAL for %s v%d: %w", kbID, versionID, err)
+		}
+		st.flush = time.Since(flushStart)
 	}
 
 	return docIDs, nil
