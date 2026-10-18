@@ -43,9 +43,11 @@ export const STAGES = {
  * 已经达成的等待读成"继续等"，一路空转到超时。
  *
  * 两种目标的取舍：
- *   · INDEX_READY —— 可查询，**也是激活版本的前置条件**。传完就能搜到。
- *   · DATA_DURABLE —— 只要多数派确认落盘。批量导入快得多，但那期间版本不可查、
- *     也不能激活（索引还在后台建）。
+ *   · DATA_DURABLE —— **默认**：只要多数派确认落盘。客户端能确认的事实就到这里，
+ *     再往后是索引，而那件事不归它管（索引是懒建的，§8.6(b)：没人查询就不建，
+ *     所以"等 INDEX_READY"在没有查询的情况下根本不会到来）。
+ *   · INDEX_READY —— 可查询，**也是激活版本的前置条件**。传完就能搜到；代价是
+ *     等待方必须先让它有被构建的理由（服务端收到一次 warmup 或查询）。
  */
 export type AwaitTargetKind = 'INDEX_READY' | 'DATA_DURABLE'
 
@@ -63,12 +65,14 @@ function isTargetReached(stage: string, target: AwaitTargetKind): boolean {
  * haveChanges = 本地是否还留着这批 changes（IndexedDB 里那条记录）。
  * 它决定 RESEND 还是 DISCARD——两者都是终局，但一个能救回数据，一个不能。
  *
- * target 默认 INDEX_READY：它是唯一能保证"传完就能搜到"的目标。
+ * target 默认 DATA_DURABLE：**数据落盘就是客户端能确认的完成**。曾经常量是
+ * INDEX_READY，但索引是按需构建的，客户端不查就没人建，于是这个默认值会让
+ * 首次导入稳定地空转到超时——等一个不会自己到来的东西。
  */
 export function decide(
   resp: AwaitVersionResponse,
   haveChanges: boolean,
-  target: AwaitTargetKind = 'INDEX_READY',
+  target: AwaitTargetKind = 'DATA_DURABLE',
 ): Decision {
   // 目标达成检查放最前：DATA_DURABLE 目标下，服务端到达 DURABLE 就算完成，
   // 不该再按"还差一个 READY"继续等下去。

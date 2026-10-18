@@ -28,7 +28,7 @@ describe('decide', () => {
     { name: 'ready 就是完成', stage: STAGES.indexReady, dataMissing: false, haveChanges: true, want: 'DONE' },
     { name: 'ready 且没有 changes 也是完成', stage: STAGES.indexReady, dataMissing: false, haveChanges: false, want: 'DONE' },
     { name: '还在写：等', stage: STAGES.dataPending, dataMissing: false, haveChanges: true, want: 'WAIT' },
-    { name: '数据已持久但没到目标：继续等', stage: STAGES.dataDurable, dataMissing: false, haveChanges: true, want: 'WAIT' },
+    { name: '数据已持久即完成（默认目标是数据落盘）', stage: STAGES.dataDurable, dataMissing: false, haveChanges: true, want: 'DONE' },
     { name: '索引失败：可重建，等', stage: STAGES.indexFailed, dataMissing: false, haveChanges: true, want: 'WAIT' },
     { name: '正在删除：放弃', stage: STAGES.deleting, dataMissing: false, haveChanges: true, want: 'DISCARD' },
     { name: '数据缺失但 changes 还在：重发', stage: STAGES.dataPending, dataMissing: true, haveChanges: true, want: 'RESEND' },
@@ -49,6 +49,16 @@ describe('decide', () => {
     for (const stage of [STAGES.dataDurable, STAGES.indexFailed, STAGES.indexReady]) {
       expect(decide(resp(stage, true), true)).toBe(decide(resp(stage, false), true))
     }
+  })
+
+  it('默认目标是 DATA_DURABLE：数据落盘就算完成，不等索引', () => {
+    // 这条钉的是默认值本身。客户端能确认的事实到数据为止；索引按需构建，
+    // 默认等它会让首次导入稳定地空转到超时。
+    expect(decide(resp(STAGES.dataDurable), true)).toBe('DONE')
+    // 服务端一次跳过头（已经 READY）当然也算达成。
+    expect(decide(resp(STAGES.indexReady), true)).toBe('DONE')
+    // 数据还没落地就仍然要等。
+    expect(decide(resp(STAGES.dataPending), true)).toBe('WAIT')
   })
 })
 

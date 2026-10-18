@@ -4,7 +4,7 @@ import { api, kbPath } from '../api/client'
 import type { ListVersionsResponse } from '../api/gen/knowledgebase'
 import { chainTail } from '../ingest/chainTail'
 import { resendPending } from '../pending/resend'
-import { loadUnsettled, removePending, type PendingWrite } from '../pending/store'
+import { refreshUnsettled, removePending, type PendingWrite } from '../pending/store'
 
 /**
  * 在途批次面板。
@@ -36,7 +36,10 @@ export function InFlightPanel() {
 
   async function refresh() {
     try {
-      setRows(await loadUnsettled())
+      // refreshUnsettled 而不是 loadUnsettled：它顺手更新退出判据读的那份同步
+      // 镜像（exit/activity.ts）。两处用同一个事实来源，就不会出现"面板说有、
+      // 退出拦截说没有"这种各读各的。
+      setRows(await refreshUnsettled())
       setError(null)
     } catch (err) {
       // 读不出来（隐私模式等）要说出来：静默空列表会被误读成"没有在途数据"，
@@ -57,7 +60,8 @@ export function InFlightPanel() {
       // parent 必须指向真正的链尾；若已分配过版本，服务端按同一个 key 复用，
       // parent 不参与分配。
       const vs = await api.get<ListVersionsResponse>(kbPath(w.knowledge_base_id, '/versions'))
-      const outcome = await resendPending(w, chainTail(vs.versions), {
+      const tail = chainTail(vs.versions)
+      const outcome = await resendPending(w, tail.kind === 'ok' ? tail.versionId : null, {
         onProgress: (stage) => setResults((p) => ({ ...p, [w.id]: `等待中 · ${stage}` })),
       })
 

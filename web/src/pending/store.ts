@@ -79,6 +79,42 @@ export async function loadUnsettled(): Promise<PendingWrite[]> {
   return (await loadPending()).filter((w) => !w.settled)
 }
 
+/**
+ * 未到局批次的**进程内镜像**。
+ *
+ * 为什么需要它：`beforeunload` 与 Tauri 的 `CloseRequested` 都不允许 await
+ * （`beforeunload` 根本不返回 Promise），而"这次退出要不要拦"必须当场回答。
+ * 直接从 IndexedDB / 桌面文件读是异步的，来不及；所以判据走这份缓存，启动时
+ * 与每次写记录后同步维护。
+ *
+ * 缓存为空**不**代表没有在途批次——只代表"这一次进程还没读过"。`ExitGuard`
+ * 挂载时会先 `refreshUnsettled()` 一次，别的地方改动记录也都会顺手更新它。
+ */
+let unsettledCache: PendingWrite[] = []
+
+/** 读一遍本机记录，返回未到局的那批，并把它作为新的缓存。 */
+export async function refreshUnsettled(): Promise<PendingWrite[]> {
+  const rows = await loadUnsettled()
+  unsettledCache = rows
+  return rows
+}
+
+/** 缓存的未到局批次（同步）。退出判据用它。 */
+export function cachedUnsettled(): readonly PendingWrite[] {
+  return unsettledCache
+}
+
+function cachePut(w: PendingWrite): void {
+  const rest = unsettledCache.filter((x) => x.id !== w.id)
+  unsettledCache = w.settled
+    ? rest
+    : [...rest, w].sort((a, b) => a.submitted_at.localeCompare(b.submitted_at))
+}
+
+function cacheDelete(id: string): void {
+  unsettledCache = unsettledCache.filter((x) => x.id !== id)
+}
+
 export async function getPending(id: string): Promise<PendingWrite | undefined> {
   if (isDesktop()) {
     return (await loadPending()).find((w) => w.id === id)
@@ -97,17 +133,21 @@ export async function getPending(id: string): Promise<PendingWrite | undefined> 
 export async function upsertPending(w: PendingWrite): Promise<void> {
   if (isDesktop()) {
     await desktop.upsertPending(toDesktop(w))
-    return
+  } else {
+    await run<IDBValidKey>(PENDING_STORE, 'readwrite', (s) => s.put(w))
   }
-  await run<IDBValidKey>(PENDING_STORE, 'readwrite', (s) => s.put(w))
+  // 落盘成功之后才更新镜像：反过来的话，写文件失败会让缓存声称"记下了"，
+  // 而退出判据正是靠它决定要不要拦。
+  cachePut(w)
 }
 
 export async function removePending(id: string): Promise<void> {
   if (isDesktop()) {
     await desktop.removePending(id)
-    return
+  } else {
+    await run<undefined>(PENDING_STORE, 'readwrite', (s) => s.delete(id) as IDBRequest<undefined>)
   }
-  await run<undefined>(PENDING_STORE, 'readwrite', (s) => s.delete(id) as IDBRequest<undefined>)
+  cacheDelete(id)
 }
 
 /**

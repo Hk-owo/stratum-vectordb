@@ -110,17 +110,32 @@ function withBase(path: string): string {
   return baseUrl + path
 }
 
-async function request<T>(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<T> {
+/** 每次请求可选的传输层开关。目前只有取消/超时：退出放弃必须能给自己设上限。 */
+export interface RequestOptions {
+  signal?: AbortSignal
+}
+
+async function request<T>(
+  method: 'GET' | 'POST' | 'PUT',
+  path: string,
+  body?: unknown,
+  opts?: RequestOptions,
+): Promise<T> {
   let res: Response
   try {
     res = await fetch(withBase(path), {
       method,
       headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: opts?.signal,
     })
   } catch (cause) {
     // fetch 只在网络层失败时抛（网关没起、连接被拒）。这与"网关回了错误"
     // 是两件事：前者多半是本地环境问题，后者是集群的真实答复。
+    //
+    // 取消（AbortSignal）也走这条路：对调用方而言"没等到答复"和"压根没送到"
+    // 是同一个未知，而**未知不能当成成功**——退出放弃靠这条区分"已放弃"和
+    // "没确认"，后者必须保留本机记录。
     throw new ApiError(0, 'Unreachable', cause instanceof Error ? cause.message : String(cause))
   }
 
@@ -138,7 +153,8 @@ async function request<T>(method: 'GET' | 'POST' | 'PUT', path: string, body?: u
 
 export const api = {
   get: <T>(path: string): Promise<T> => request<T>('GET', path),
-  post: <T>(path: string, body?: unknown): Promise<T> => request<T>('POST', path, body),
+  post: <T>(path: string, body?: unknown, opts?: RequestOptions): Promise<T> =>
+    request<T>('POST', path, body, opts),
   // PUT 只在 /ops/* 用得上（保存启动参数与 docker 集群参数），/api/* 的契约
   // 里没有它：那里的写操作都是"提交一件事"，不是"替换一份配置"。
   put: <T>(path: string, body?: unknown): Promise<T> => request<T>('PUT', path, body),

@@ -159,6 +159,23 @@ async function submitBatchWithRecovery(
       opts.onItem?.(it.docId, { status: 'awaiting', versionId: resp.version_id })
     }
 
+    // 3.5 只有目标真是索引时才需要这一步。索引按需构建（§8.6(b)：没人查询就不建），
+    //     所以"等 INDEX_READY"必须先让这个版本有被构建的理由，否则等的是不会自己
+    //     到来的状态——默认目标选 DATA_DURABLE 正是为了不靠这一步吃饭。
+    //
+    //     失败不终止：预热只是个推力，版本可能已经 READY，也可能被运维改判；
+    //     真实状态由下面的等待循环如实报出来。
+    if (opts.target === 'INDEX_READY') {
+      try {
+        await api.post(kbPath(kbId, '/warmup'), {
+          knowledge_base_id: kbId,
+          version_id: resp.version_id,
+        })
+      } catch {
+        // 忽略：等待循环会把 index_not_ready / FAILED 报成对应的 stage。
+      }
+    }
+
     // 4. 等就绪。判定全在 pending/decide.ts，这里只按它的结论行动。
     //    haveChanges 恒为 true：changes 就在我们手里（刚写进 IndexedDB 了）。
     const outcome = await awaitUntilTerminal(kbId, resp.version_id, {

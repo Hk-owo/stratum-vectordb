@@ -72,7 +72,8 @@ export function Versions({ kbId }: { kbId: string | null }) {
     setResending(w.id)
     setResendNote((p) => ({ ...p, [w.id]: '重发中…' }))
     try {
-      const outcome = await resendPending(w, chainTail(versions.data?.versions ?? []), {
+      const tail = chainTail(versions.data?.versions ?? [])
+      const outcome = await resendPending(w, tail.kind === 'ok' ? tail.versionId : null, {
         onProgress: (stage) => setResendNote((p) => ({ ...p, [w.id]: `等待中 · ${stage}` })),
       })
       // 只有真的落地才算"重发成功"——DISCARD 意味着数据找不回来，那是另一种结局，

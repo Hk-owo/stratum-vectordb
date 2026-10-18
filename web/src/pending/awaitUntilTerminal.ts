@@ -26,10 +26,13 @@ export interface AwaitOptions {
    */
   haveChanges: boolean
   /**
-   * 等到哪一步算数。默认 INDEX_READY。
+   * 等到哪一步算数。默认 DATA_DURABLE（数据落盘）。
    *
    * 它同时决定两件事，必须成对：发给服务端的 `AwaitTarget`，以及 `decide` 用哪套
    * 判据。只改一边就会出现"服务端说到了、前端说继续等"的空转。
+   *
+   * 选 INDEX_READY 的调用方必须先让索引有被构建的理由（warmup / 查询），否则
+   * 这个等待等的是一个不会自己到来的状态——索引是懒建的（§8.6(b)）。
    */
   target?: AwaitTargetKind
   /** 每问一次回调一次，用于界面上的进度显示。 */
@@ -67,7 +70,7 @@ export async function awaitUntilTerminal(
   opts: AwaitOptions,
 ): Promise<AwaitOutcome> {
   const maxTotalMs = opts.maxTotalMs ?? 10 * 60 * 1000
-  const target: AwaitTargetKind = opts.target ?? 'INDEX_READY'
+  const target: AwaitTargetKind = opts.target ?? 'DATA_DURABLE'
   const deadline = Date.now() + maxTotalMs
 
   let rounds = 0

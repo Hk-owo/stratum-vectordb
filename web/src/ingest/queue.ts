@@ -22,9 +22,9 @@ export type QueueStatus =
   | 'ready'
   /** 正在提交（CreateVersion）。 */
   | 'submitting'
-  /** 已提交，正在等就绪。 */
+  /** 已提交，正在等目标（默认：数据落盘）。 */
   | 'awaiting'
-  /** 已就绪（INDEX_READY）。 */
+  /** 数据已落盘（默认目标 DATA_DURABLE）；索引可能还在后台构建。 */
   | 'done'
   | 'error'
 

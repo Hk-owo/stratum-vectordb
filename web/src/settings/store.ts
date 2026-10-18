@@ -18,7 +18,12 @@ export interface Prefs {
   selected_kb_id: string | null
   top_k: number
   aggregation: string
-  /** 导入模式：true 表示按 AWAIT_TARGET_DATA_DURABLE 收口。 */
+  /**
+   * 导入模式：true 表示按 AWAIT_TARGET_DATA_DURABLE 收口（多数派落盘即完成）。
+   *
+   * **默认 true**：客户端能确认的事实到数据为止。索引按需构建（§8.6(b)），
+   * 没人查询就不建，所以"等索引 READY"在没有查询的情况下不会自己到来。
+   */
   durable_only: boolean
 }
 
@@ -27,7 +32,7 @@ export const DEFAULT_PREFS: Prefs = {
   selected_kb_id: null,
   top_k: 5,
   aggregation: 'AGGREGATION_METHOD_MEDIAN',
-  durable_only: false,
+  durable_only: true,
 }
 
 const KEY = 'stratum:prefs'

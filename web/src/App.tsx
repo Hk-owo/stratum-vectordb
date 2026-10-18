@@ -5,6 +5,7 @@ import { useHealth, useSystemStatus } from './api/queries'
 import { InFlightPanel } from './components/InFlightPanel'
 import { SettingsDialog } from './components/SettingsDialog'
 import { KbPicker } from './components/KbPicker'
+import { ExitGuard } from './exit/ExitGuard'
 import { loadPrefs, savePrefs } from './settings/store'
 import { Documents } from './pages/Documents'
 import { History } from './pages/History'
@@ -156,6 +157,9 @@ export default function App() {
 
         <InFlightPanel />
       </main>
+
+      {/* 退出拦截：桌面壳拦窗口关闭，浏览器拦 beforeunload。判据见 exit/activity.ts。 */}
+      <ExitGuard />
 
       <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>

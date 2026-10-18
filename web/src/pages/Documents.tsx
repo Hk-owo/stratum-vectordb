@@ -3,8 +3,9 @@ import { useEffect, useRef, useState } from 'react'
 import { ApiError } from '../api/client'
 import { appendHistory } from '../history/store'
 import { useKnowledgeBase, useRollbackVersion, useVersions } from '../api/queries'
+import { setQueuedFiles, setSubmitting } from '../exit/activity'
 import { submitBatches } from '../ingest/batch'
-import { chainTail } from '../ingest/chainTail'
+import { chainTail, describeNotReady } from '../ingest/chainTail'
 import { loadPrefs, savePrefs } from '../settings/store'
 import { docIdOf } from '../ingest/docid'
 import { sha256Hex } from '../ingest/hash'
@@ -151,12 +152,21 @@ export function Documents({ kbId }: { kbId: string | null }) {
     }
 
     setBusy(true)
+    // 退出拦截要知道"有一批正在飞"：这时版本号可能还没回来，放弃不一定干净，
+    // 所以提示里要单独说一句（exit/activity.ts 的 describeWork）。
+    setSubmitting(true)
     setNotice(null)
     try {
-      const parent = chainTail(versions.data?.versions ?? [])
+      // 链尾只看数据侧（见 ingest/chainTail.ts）。链尾还没落盘时**不能**提交：
+      // 退回更早的版本会被"父版本已有子版本"拒绝，以 0 为根则会凭空分叉。
+      const tail = chainTail(versions.data?.versions ?? [])
+      if (tail.kind === 'not-ready') {
+        setNotice(describeNotReady(tail))
+        return
+      }
       const summary = await submitBatches({
         kbId,
-        parentVersionId: parent,
+        parentVersionId: tail.kind === 'ok' ? tail.versionId : null,
         items: ready,
         target: durableOnly ? 'DATA_DURABLE' : 'INDEX_READY',
         onItem: patch,
@@ -187,17 +197,17 @@ export function Documents({ kbId }: { kbId: string | null }) {
       }
       // 提交 ≠ 发布：落地的版本如果不是当前**激活**版本，检索页就还看不到它。
       //
-      // 导入模式（等 DATA_DURABLE）下刻意不提激活：那个版本还没 READY，而激活一个
-      // 非 READY 版本会被服务端拒——摆一个点了就报错的按钮比不摆更糟。
+      // 数据落盘就能激活（服务端只看数据侧）：索引会在第一次检索时按需构建，
+      // 所以两种导入模式都可以提这一步——以前只有"等索引"模式敢提。
       const last = summary.lastVersionId
       const activeId = kb.data?.knowledge_base?.active_version_id
-      setPendingActivation(durableOnly || last === null || last === activeId ? null : last)
+      setPendingActivation(last === null || last === activeId ? null : last)
       setNotice(
         done > 0
           ? durableOnly
             ? `已落盘（多数派已确认）：${summary.versions.map((v) => `v${v}`).join('、')}。` +
-              '索引仍在后台构建，建好后才能在「版本」页激活并检索。'
-            : `已提交并落地：版本 ${summary.versions.map((v) => `v${v}`).join('、')}`
+              '索引仍待构建——要检索或激活，先去「版本」页预热。'
+            : `已落盘、索引已就绪：版本 ${summary.versions.map((v) => `v${v}`).join('、')}`
           : '没有任何批次落地，见队列里的状态',
       )
     } catch (err) {
@@ -207,8 +217,17 @@ export function Documents({ kbId }: { kbId: string | null }) {
       )
     } finally {
       setBusy(false)
+      setSubmitting(false)
     }
   }
+
+  // 还没提交的文件数：这些既没有本机记录、也没有版本号——退出即丢，且事后
+  // 无处可查。卸载时清零，因为切页会把队列一起丢掉（App 按页条件渲染）。
+  const queued = counts.pending + counts.parsing + counts.ready
+  useEffect(() => {
+    setQueuedFiles(queued)
+    return () => setQueuedFiles(0)
+  }, [queued])
 
   const disabled = kbId === null || busy
 
@@ -249,12 +268,13 @@ export function Documents({ kbId }: { kbId: string | null }) {
           onChange={(e) => toggleDurableOnly(e.target.checked)}
         />
         <span>
-          <strong>导入模式</strong>
+          <strong>只等落盘（默认）</strong>
           <span className="muted small">
             {' '}
-            每批只等到多数派确认落盘（<code>AWAIT_TARGET_DATA_DURABLE</code>），不等索引建完——
-            批量导入快得多。代价是那期间版本<strong>不可查也不能激活</strong>，要等索引在后台建好，
-            再到「版本」页激活。
+            每批只等到多数派确认落盘（<code>AWAIT_TARGET_DATA_DURABLE</code>），不追索引构建。
+            数据在不在是客户端能确认的事实；索引按需构建，什么时候建不由客户端决定
+            （§8.6(b)）。代价是那期间版本<strong>不可查也不能激活</strong>，要先去
+            「版本」页预热。取消勾选则每批提交后主动预热并等索引就绪——更慢，但传完就能搜到。
           </span>
         </span>
       </label>
@@ -290,8 +310,12 @@ export function Documents({ kbId }: { kbId: string | null }) {
       {pendingActivation !== null && (
         <div className="notice warn">
           <p style={{ margin: '0 0 8px' }}>
-            版本 <code>v{pendingActivation}</code> 已就绪，但<strong>还没有激活</strong>。
+            版本 <code>v{pendingActivation}</code> 的数据已落盘，但<strong>还没有激活</strong>。
             检索页默认查激活版本，所以现在还搜不到这批内容——<strong>提交只是写入，激活才是发布</strong>。
+          </p>
+          <p className="muted small" style={{ margin: '0 0 8px' }}>
+            激活后第一次检索会顺带把索引建起来（按需构建），所以第一次可能稍慢、
+            或返回一次"版本未就绪"——再查一次即可。
           </p>
           <button
             type="button"
