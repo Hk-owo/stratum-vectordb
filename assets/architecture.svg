@@ -63,7 +63,7 @@
   <text x="600" y="330" class="box-sub">拥有全部物理事实 · 不参与选举（元数据读自控制面）</text>
   <text x="600" y="356" class="body">文档（MVCC）· chunk（内容寻址）· 向量索引</text>
   <text x="600" y="378" class="body">IndexManager：每版本索引 LRU + 引用计数</text>
-  <text x="600" y="400" class="body"> + 异步构建池 + 保留 / 回收策略 + 索引分发</text>
+  <text x="600" y="400" class="body"> + 两级优先构建池 + owner 分片 + 按需拉取产物</text>
   <text x="600" y="422" class="body">PebbleDB：DocStore · ChunkDoc 映射 · VersionDoc</text>
   <text x="600" y="444" class="body">落后副本自愈：周期上报游标 → 追链补齐</text>
   <text x="600" y="466" class="body">周期 chunk GC · 每版本布隆过滤器 · 墓碑回收</text>
@@ -88,5 +88,5 @@
   <text x="60" y="686" class="body" fill="#6b7280">Search 持读锁贯穿（含 rerank 磁盘 IO），写锁保护构建 / 加载 / 重置 —— 杜绝 use-after-free 与错位结果</text>
   <text x="60" y="712" class="body" fill="#6b7280">量化把内存载荷压到 1 B/维，代价是粗筛省下的时间被 rerank 吃掉：它买的是内存，不是延迟</text>
 
-  <text x="40" y="768" class="note">图形化版本对应 README「架构」段；三层职责边界与两段检索语义见 local docs《Stratum_设计文档v13》§2.5 / §2.6 与 §7.0。数据与口径见 docs/stress-test-report.md。</text>
+  <text x="40" y="768" class="note">图形化版本对应 README「架构」段。</text>
 </svg>
