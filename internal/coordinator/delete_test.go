@@ -168,6 +168,9 @@ type deleteTestChunkStore struct {
 	// DELETE_COMPLETE) is only assertable through these.
 	flushes            int
 	flushesAfterDelete []int
+	// flushErr injects a failed flush: the delete flow must report it and must not
+	// write the fsynced DELETE_COMPLETE that claims the vectors are gone.
+	flushErr error
 }
 
 func newDeleteTestChunkStore() *deleteTestChunkStore { return &deleteTestChunkStore{} }
@@ -194,6 +197,9 @@ func (s *deleteTestChunkStore) FlushWAL(_ context.Context) error {
 	defer s.mu.Unlock()
 	s.flushes++
 	s.flushesAfterDelete = append(s.flushesAfterDelete, len(s.deleted))
+	if s.flushErr != nil {
+		return s.flushErr
+	}
 	return nil
 }
 

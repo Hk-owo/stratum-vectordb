@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"stratum/internal/bloom"
@@ -156,5 +157,95 @@ func TestDeleteCoordinator_FlushesVecstoreBeforeDeleteComplete(t *testing.T) {
 		if deleted == 0 {
 			t.Fatalf("flush #%d happened before the knowledge base's vectors were deleted", i+1)
 		}
+	}
+}
+
+// TestWriteCoordinator_FailedFlushFailsBeforeTheCommit is the other half of the
+// ordering above: if the flush fails, the transaction must fail. Writing the COMMIT
+// anyway would make a durable claim about vectors that never reached the device —
+// the silent loss the barrier exists to prevent — and recovery would never replay
+// the version, because the COMMIT is present.
+func TestWriteCoordinator_FailedFlushFailsBeforeTheCommit(t *testing.T) {
+	ds := newTestDocStore()
+	cdm := newTestChunkDocMapper()
+	vdl := newTestVersionDocList()
+	cs := newTestChunkStore()
+	flushErr := errors.New("vecstore: flush failed")
+	cs.flushErr = flushErr
+	ec := &testEmbedClient{}
+	im := newTestIndexManager()
+	rn := newTestRaftNode()
+	w := newOrderWAL(cs.flushCount)
+	chunkBF := bloom.NewMockBloomFilter()
+	splitter := &mockSplitter{windowSize: 100, overlapSize: 20}
+
+	rn.ProposeCreateKB(context.Background(), types.KnowledgeBaseMeta{
+		KBID: "kb-1", Name: "test",
+		ChunkWindowSize: 100, ChunkOverlapSize: 20,
+		EmbedConfig: types.EmbedConfig{ServiceAddr: "emb:8080", ModelID: "m1"},
+	})
+
+	coord := NewWriteCoordinatorImpl(WriteCoordinatorConfig{
+		MaxRetries:          2,
+		RetryBaseIntervalMS: 10,
+		WAL:                 w,
+		RaftNode:            rn,
+		Splitter:            splitter,
+		EmbedClient:         ec,
+		ChunkBloom:          chunkBF,
+		ChunkStore:          cs,
+		ChunkDocMapper:      cdm,
+		DocStore:            ds,
+		VersionDocList:      vdl,
+		IndexManager:        im,
+	})
+
+	changes := []types.DocChange{
+		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello world this is a test document"},
+	}
+	_, err := coord.Execute(context.Background(), "kb-1", 0, changes, "")
+	if !errors.Is(err, flushErr) {
+		t.Fatalf("Execute = %v, want the flush error", err)
+	}
+	if len(w.atCommit) != 0 {
+		t.Fatalf("WAL.WriteCommit was called %d time(s) after the vecstore flush failed, want 0: "+
+			"the COMMIT would vouch for vectors still in the page cache", len(w.atCommit))
+	}
+}
+
+// TestDeleteCoordinator_FailedFlushFailsBeforeDeleteComplete is the delete path's
+// version: the VERSION vectors are gone but the flush failed, so DELETE_COMPLETE
+// must not be written — a crash after it would resurrect the content.
+func TestDeleteCoordinator_FailedFlushFailsBeforeDeleteComplete(t *testing.T) {
+	rn := newDeleteTestRaftNode()
+	ds := newDeleteTestDocStore()
+	cs := newDeleteTestChunkStore()
+	flushErr := errors.New("vecstore: flush failed")
+	cs.flushErr = flushErr
+	cdm := newDeleteTestChunkDocMapper()
+	vdl := newDeleteTestVersionDocList()
+	im := newDeleteTestIndexManager()
+	w := newOrderWAL(cs.flushCount)
+
+	coord := NewDeleteCoordinatorImpl(DeleteCoordinatorConfig{
+		MaxRetries:          2,
+		RetryBaseIntervalMS: 10,
+		WAL:                 w,
+		RaftNode:            rn,
+		IndexManager:        im,
+		DocStore:            ds,
+		ChunkStore:          cs,
+		ChunkDocMapper:      cdm,
+		VersionDocList:      vdl,
+		SourceAnnouncements: &forgettingAnnouncements{},
+	})
+
+	err := coord.Execute(context.Background(), "kb-1")
+	if !errors.Is(err, flushErr) {
+		t.Fatalf("Execute = %v, want the flush error", err)
+	}
+	if len(w.atDeleteComplete) != 0 {
+		t.Fatalf("WAL.WriteDeleteComplete was called %d time(s) after the vecstore flush failed, want 0: "+
+			"the completion record would outlive the vectors it claims are gone", len(w.atDeleteComplete))
 	}
 }

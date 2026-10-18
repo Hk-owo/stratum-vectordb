@@ -83,4 +83,50 @@ func TestMockChunkStore(t *testing.T) {
 			t.Fatalf("WriteCount = %d, want 2 (MockChunkStore itself does not dedup; that's WriteCoordinator's job)", got)
 		}
 	})
+
+	// The flush barrier is what orders the vecstore against the fsynced WAL record,
+	// so the mock has to make those calls observable: tests of the write and delete
+	// paths assert on the count and on when it grew.
+	t.Run("FlushWAL is counted", func(t *testing.T) {
+		s := NewMockChunkStore()
+		if got := s.FlushCount(); got != 0 {
+			t.Fatalf("FlushCount = %d before any flush, want 0", got)
+		}
+		for i := 1; i <= 3; i++ {
+			if err := s.FlushWAL(ctx); err != nil {
+				t.Fatalf("FlushWAL: %v", err)
+			}
+			if got := s.FlushCount(); got != i {
+				t.Fatalf("FlushCount = %d after %d flush(es), want %d", got, i, i)
+			}
+		}
+	})
+
+	t.Run("DiskUsage reports no disk footprint", func(t *testing.T) {
+		s := NewMockChunkStore()
+		s.Write(ctx, "kb1", "c1", []float32{1, 2, 3})
+		usage, err := s.DiskUsage(ctx)
+		if err != nil {
+			t.Fatalf("DiskUsage: %v", err)
+		}
+		if usage != 0 {
+			t.Fatalf("DiskUsage = %d, want 0 (the mock's storage is a map)", usage)
+		}
+	})
+
+	t.Run("Reset clears vectors and both counters", func(t *testing.T) {
+		s := NewMockChunkStore()
+		s.Write(ctx, "kb1", "c1", []float32{1})
+		s.FlushWAL(ctx)
+		s.Reset()
+		if ok, _ := s.Exists(ctx, "kb1", "c1"); ok {
+			t.Fatal("Exists = true after Reset")
+		}
+		if got := s.WriteCount(); got != 0 {
+			t.Fatalf("WriteCount = %d after Reset, want 0", got)
+		}
+		if got := s.FlushCount(); got != 0 {
+			t.Fatalf("FlushCount = %d after Reset, want 0", got)
+		}
+	})
 }

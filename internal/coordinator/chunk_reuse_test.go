@@ -107,7 +107,7 @@ func TestWriteCoordinator_SkipsEmbedForChunksAlreadyStored(t *testing.T) {
 	if _, err := stack.coord.Execute(ctx, "kb-1", 0, changes, ""); err != nil {
 		t.Fatalf("first Execute: %v", err)
 	}
-	firstCalls := stack.embed.calls
+	firstCalls := stack.embed.calls.Load()
 	firstStored := stack.chunks.writtenCount()
 	if firstCalls == 0 {
 		t.Fatalf("the first write embedded nothing; the fixture cannot show a saving")
@@ -121,7 +121,7 @@ func TestWriteCoordinator_SkipsEmbedForChunksAlreadyStored(t *testing.T) {
 	if _, err := stack.coord.Execute(ctx, "kb-1", 1, changes, ""); err != nil {
 		t.Fatalf("second Execute: %v", err)
 	}
-	if got := stack.embed.calls - firstCalls; got != 0 {
+	if got := stack.embed.calls.Load() - firstCalls; got != 0 {
 		t.Errorf("embed was called %d extra time(s) for chunks the KB already held", got)
 	}
 	if got := stack.chunks.writtenCount(); got != firstStored {

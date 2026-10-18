@@ -1,0 +1,42 @@
+# Codecov 配置 —— 对应 .github/workflows/ci.yml 的「上传覆盖率到 Codecov」步骤。
+#
+# 判据只针对**手写代码**。被 ignore 的两处不是"没测"，而是"Go 的 coverage.out
+# 里本来就不该有"：
+#
+#   api/proto/**  protoc 生成的 *.pb.go。Go 测试不会去调用生成的消息类型与
+#                 Get*/Reset/ProtoReflect，所以这 1300+ 行在任何提交上都是 0%；
+#                 计入 patch 后，每次改 .proto 重新生成，都会凭空多出上百行
+#                 "未覆盖的新代码"，即使对应的服务端逻辑（C++ 侧 + gRPC 客户端）
+#                 有完整测试。这个项目的 C++ vecstore 另有 ctest 覆盖
+#                 （.github/workflows/vecstore-cpp.yml）。
+#
+#   web/**        前端的 TypeScript/TSX 由 vitest 覆盖，走的是前端自己的覆盖率
+#                 报告（见 web/ 的测试脚本），从来不会出现在 Go 的 coverage.out
+#                 里。不 ignore 的话，Codecov 只会看到"这些文件完全没有数据"。
+#
+# 忽略之后，patch 覆盖率回答的才是它该回答的问题：这次改动里手写的那部分有没有
+# 被测试碰到。project 也一并忽略，否则整体数字只是把生成代码按 0% 摊进分母。
+
+ignore:
+  - "api/proto/**"
+  - "web/**"
+
+coverage:
+  status:
+    project:
+      default:
+        # 不低于上一次上传，容忍 1% 抖动（并发/计时相关用例的覆盖率会小幅浮动）。
+        target: auto
+        threshold: 1%
+        informational: false
+    patch:
+      # 跟随项目覆盖率（ignore 之后的口径），不给"本提交新增的手写代码"留低于
+      # 项目均值的口子。
+      default:
+        target: auto
+        threshold: 0%
+        informational: false
+
+comment:
+  layout: "reach, diff, files"
+  behavior: default

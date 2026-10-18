@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -301,6 +302,9 @@ type testChunkStore struct {
 	// chunk writes) is only observable through these.
 	flushes        int
 	writtenAtFlush []int
+	// flushErr injects a failed flush: the write path must fail BEFORE the fsynced
+	// COMMIT, not vouch for vectors that never reached the device.
+	flushErr error
 }
 
 func newTestChunkStore() *testChunkStore {
@@ -331,6 +335,9 @@ func (s *testChunkStore) FlushWAL(_ context.Context) error {
 	defer s.mu.Unlock()
 	s.flushes++
 	s.writtenAtFlush = append(s.writtenAtFlush, len(s.data))
+	if s.flushErr != nil {
+		return s.flushErr
+	}
 	return nil
 }
 
@@ -362,12 +369,17 @@ func (s *testChunkStore) existsCallsFor(chunkID string) int {
 }
 
 // testEmbedClient is a simple deterministic embed client.
+//
+// calls is atomic because the write path embeds documents concurrently
+// (writeDocumentsConcurrently) and tests read the counter after Execute returns:
+// a plain int field here is a data race under -race, and the count is the thing
+// chunk-reuse tests assert on.
 type testEmbedClient struct {
-	calls int
+	calls atomic.Int64
 }
 
 func (e *testEmbedClient) Embed(_ context.Context, chunks []types.Chunk) (map[string][]float32, error) {
-	e.calls++
+	e.calls.Add(1)
 	out := make(map[string][]float32, len(chunks))
 	for _, ch := range chunks {
 		h := sha256.Sum256([]byte(ch.ChunkID))

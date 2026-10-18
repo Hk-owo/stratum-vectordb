@@ -396,3 +396,132 @@ func appendPartialRecordBytes(t *testing.T, path string) {
 		t.Fatalf("append partial record: %v", err)
 	}
 }
+
+// TestFileWAL_RepeatedRecordsAreNotAppendedTwice pins the idempotence every Write*
+// promises: a retry (after a timeout, a replay, a re-run of a delete flow) must cost
+// nothing and must not grow the log. The log is append-and-replay, so a duplicated
+// record is not just wasted space — Recover would report the same pending flow twice.
+//
+// The counter is the group-commit sequence number (how many records are in the log),
+// which is exactly the "did anything get appended" question; the on-disk size would
+// answer it too, but only indirectly.
+func TestFileWAL_RepeatedRecordsAreNotAppendedTwice(t *testing.T) {
+	ctx := context.Background()
+
+	writes := map[string]func(w *FileWAL) error{
+		"WriteCommit":            func(w *FileWAL) error { return w.WriteCommit(ctx, 9) },
+		"WriteDeleteMark":        func(w *FileWAL) error { return w.WriteDeleteMark(ctx, "kb1") },
+		"WriteDeleteComplete":    func(w *FileWAL) error { return w.WriteDeleteComplete(ctx, "kb1") },
+		"WriteVersionDeleteMark": func(w *FileWAL) error { return w.WriteVersionDeleteMark(ctx, "kb1", 7) },
+		"WriteVersionDeleteComplete": func(w *FileWAL) error {
+			return w.WriteVersionDeleteComplete(ctx, "kb1", 7)
+		},
+		"WriteCursor": func(w *FileWAL) error { return w.WriteCursor(ctx, "kb1", 5) },
+	}
+	for name, write := range writes {
+		t.Run(name, func(t *testing.T) {
+			w := newTestFileWAL(t)
+
+			before := w.appendedSeq.Load()
+			if err := write(w); err != nil {
+				t.Fatalf("%s #1: %v", name, err)
+			}
+			afterFirst := w.appendedSeq.Load()
+			if afterFirst != before+1 {
+				t.Fatalf("%s #1 appended %d record(s), want 1", name, afterFirst-before)
+			}
+
+			if err := write(w); err != nil {
+				t.Fatalf("%s #2 (idempotent repeat): %v", name, err)
+			}
+			if got := w.appendedSeq.Load(); got != afterFirst {
+				t.Fatalf("%s #2 appended %d record(s), want 0", name, got-afterFirst)
+			}
+
+			// The repeat has to leave a log that still replays to the same state.
+			if _, err := w.Recover(ctx); err != nil {
+				t.Fatalf("Recover: %v", err)
+			}
+		})
+	}
+
+	t.Run("WriteCursor does not move backwards", func(t *testing.T) {
+		w := newTestFileWAL(t)
+		if err := w.WriteCursor(ctx, "kb1", 5); err != nil {
+			t.Fatalf("WriteCursor(5): %v", err)
+		}
+		before := w.appendedSeq.Load()
+		if err := w.WriteCursor(ctx, "kb1", 4); err != nil {
+			t.Fatalf("WriteCursor(4): %v", err)
+		}
+		if got := w.appendedSeq.Load(); got != before {
+			t.Fatalf("WriteCursor(4) after WriteCursor(5) appended %d record(s), want 0", got-before)
+		}
+		cursors, err := w.RecoverCursors(ctx)
+		if err != nil {
+			t.Fatalf("RecoverCursors: %v", err)
+		}
+		if got := cursors["kb1"]; got != 5 {
+			t.Fatalf("cursor = %d, want 5 (it must not move backwards)", got)
+		}
+	})
+}
+
+// TestFileWAL_FailedAppendFailsClosed pins what a Write* does when the append itself
+// fails: report the error and poison the log. The second half is the part that is
+// easy to get wrong — a log that keeps accepting writes after a failed append can
+// leave a partial record behind, and a partial record silently discards every valid
+// record after it on the next start (callers of those records were already told the
+// write succeeded).
+//
+// The failure is injected by pointing the WAL at a read-only descriptor of its own
+// file: the append's Seek succeeds and its Write fails, which is the shape a full
+// disk takes. The rollback cannot succeed either (a read-only descriptor cannot be
+// truncated), so this exercises the fail-stop path rather than the clean one: the
+// log must refuse every later write, because the bytes of the failed record may
+// still be in the middle of the file.
+func TestFileWAL_FailedAppendFailsClosed(t *testing.T) {
+	ctx := context.Background()
+
+	writes := map[string]func(w *FileWAL) error{
+		"WriteBegin": func(w *FileWAL) error {
+			return w.WriteBegin(ctx, "kb1", 0, []types.DocChange{{Op: types.ChangeOpAdd, DocID: "d1", Content: "c"}})
+		},
+		"WriteCommit":                func(w *FileWAL) error { return w.WriteCommit(ctx, 1) },
+		"WriteDeleteMark":            func(w *FileWAL) error { return w.WriteDeleteMark(ctx, "kb1") },
+		"WriteDeleteComplete":        func(w *FileWAL) error { return w.WriteDeleteComplete(ctx, "kb1") },
+		"WriteVersionDeleteMark":     func(w *FileWAL) error { return w.WriteVersionDeleteMark(ctx, "kb1", 7) },
+		"WriteVersionDeleteComplete": func(w *FileWAL) error { return w.WriteVersionDeleteComplete(ctx, "kb1", 7) },
+		"WriteCursor":                func(w *FileWAL) error { return w.WriteCursor(ctx, "kb1", 3) },
+	}
+	for name, write := range writes {
+		t.Run(name, func(t *testing.T) {
+			// Not newTestFileWAL: its cleanup would close the descriptors a second time
+			// and the test swaps them on purpose.
+			path := tempWALPath(t)
+			w := mustOpenFileWAL(t, path)
+			original := w.file
+			readOnly, err := os.OpenFile(path, os.O_RDONLY, 0)
+			if err != nil {
+				t.Fatalf("open the log read-only: %v", err)
+			}
+			t.Cleanup(func() {
+				readOnly.Close()
+				original.Close()
+			})
+			w.file = readOnly
+
+			if err := write(w); err == nil {
+				t.Fatalf("%s on a log whose writes fail returned nil", name)
+			}
+			if w.broken == nil {
+				t.Fatalf("%s left the log usable after a failed append", name)
+			}
+			// And the log stays closed for business: a later write must not be told
+			// success by the in-memory index.
+			if err := w.WriteCommit(ctx, 2); err == nil {
+				t.Fatal("a poisoned log accepted a later write")
+			}
+		})
+	}
+}

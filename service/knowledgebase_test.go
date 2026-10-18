@@ -236,6 +236,42 @@ func TestKnowledgeBaseService_RollbackVersion(t *testing.T) {
 	}
 }
 
+// TestKnowledgeBaseService_RollbackVersion_RejectsVersionWithoutDurableData pins the
+// gate: publishing is not a data operation, but it must not point the default read
+// path at a version whose content never landed — the read would either miss it or
+// fail with something much less clear than this.
+func TestKnowledgeBaseService_RollbackVersion_RejectsVersionWithoutDurableData(t *testing.T) {
+	h := newKBSvcTestHarness()
+
+	createResp, err := h.svc.CreateKnowledgeBase(context.Background(), &pb.CreateKnowledgeBaseRequest{
+		Name:             "test-kb",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig: &pb.EmbedConfig{
+			ServiceAddr: "localhost:8080",
+			ModelId:     "test-model",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateKnowledgeBase failed: %v", err)
+	}
+
+	// A version that exists but whose data is still in flight (the state a version
+	// is in between CreateVersion and the COMMIT that vouches for its chunks).
+	v1, err := h.raftNode.ProposeCreateVersion(context.Background(), createResp.KnowledgeBaseId, 0)
+	if err != nil {
+		t.Fatalf("create v1: %v", err)
+	}
+
+	_, err = h.svc.RollbackVersion(context.Background(), &pb.RollbackVersionRequest{
+		KnowledgeBaseId: createResp.KnowledgeBaseId,
+		TargetVersionId: v1,
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("RollbackVersion on a version without durable data = %v, want FailedPrecondition", err)
+	}
+}
+
 func TestKnowledgeBaseService_CreateKnowledgeBase_Defaults(t *testing.T) {
 	h := newKBSvcTestHarness()
 
