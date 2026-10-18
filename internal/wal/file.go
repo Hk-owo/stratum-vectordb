@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"stratum/internal/types"
 )
@@ -197,14 +198,15 @@ func makeReplayKey(rec types.PendingRecord) replayKey {
 // on Open) tracking which versions/knowledge-bases have incomplete
 // flows.
 //
-// Every Write* call fsyncs before returning. This trades write throughput
-// for implementation simplicity and an easy-to-reason-about durability
-// guarantee (a successful Write* call means the record is durably on
-// disk) — consistent with the project's general preference for simpler,
-// more robust mechanisms over cleverness. Batching/group-commit is a
-// possible future optimization if write latency becomes a bottleneck;
-// not pursued here since no test or design-doc requirement currently
-// calls for it.
+// Every Write* call returns only once its record is durably on disk. That
+// guarantee is what the rest of the system leans on (a COMMIT that returns means
+// the version's data is vouched for), so it is kept exactly — but the fsyncs are
+// group-committed: a Write* appends its record under the log lock and then waits,
+// outside it, for the next fsync round to cover the record. Concurrent writers
+// therefore share one fsync instead of serialising N of them, which is the whole
+// cost of the write path when several knowledge bases are written at once.
+//
+// See awaitDurable for the protocol and for what a failed round means.
 type FileWAL struct {
 	mu   sync.Mutex
 	file *os.File
@@ -264,12 +266,60 @@ type FileWAL struct {
 	pendingVersionIDByKB map[string]int64
 
 	// broken is set when the log can no longer be trusted to append: a partial
-	// record could not be rolled back (see writeRecordLocked). Every later write
-	// fails with it, because appending after an unknown partial record only shows
-	// up on the next restart — as silently missing history.
+	// record could not be rolled back (see writeRecordLocked), or a group-commit
+	// fsync round failed. Every later write fails with it, because appending after
+	// an unknown partial record only shows up on the next restart — as silently
+	// missing history.
 	broken error
 
 	replayCounters map[replayKey]int
+
+	// --- group commit (awaitDurable) ---
+	//
+	// appended is the offset just past the last record written into the file. Only
+	// diagnostics and tests read it (published so the group-commit test can wait for
+	// writers to gather); durability is judged by seq, below.
+	appended atomic.Int64
+
+	// appendedSeq counts the records written into the log, so a writer can be told
+	// "your record is durable" without referring to a byte offset. Offsets alone
+	// cannot express that: Compact/DeleteByKB swap in a NEW file, whose offsets mean
+	// something else entirely, and a waiter holding an old offset would either be
+	// satisfied by an unrelated position or never be satisfied at all.
+	appendedSeq atomic.Uint64
+
+	// syncFor is the handle fsync rounds use: a copy of w.file the round can reach
+	// without taking mu. It is atomic because the round runs with mu released
+	// (holding it would serialise appends behind the fsync, which is the cost this
+	// exists to remove), while Compact/DeleteByKB replace the file under mu. The
+	// pointer identity is how a round notices the log was swapped under it.
+	syncFor atomic.Pointer[os.File]
+
+	// syncMu guards the round state below. Lock order is mu → syncMu, never the
+	// other way: a round holds syncMu with mu released, and every path that takes
+	// both (Compact's swap) takes mu first.
+	syncMu sync.Mutex
+	// syncCond broadcasts the end of a round (success or failure) and the log swap.
+	syncCond *sync.Cond
+	// syncing is true while one goroutine is inside Sync for the current file.
+	syncing bool
+	// syncGen counts completed rounds, so a waiter can tell "a round finished while
+	// I slept" from a spurious wakeup.
+	syncGen uint64
+	// durableSeq is the highest record sequence number known to be on stable
+	// storage. Monotone: a round only ever raises it, and a log swap raises it to
+	// "everything written so far" (the replacement file already holds those records
+	// and was synced before the rename).
+	durableSeq uint64
+	// syncErr is set by the first failed round and never cleared: after an fsync
+	// that did not reach the device, no later round on this log can be trusted to
+	// have covered earlier records either, so the log goes fail-stop (see broken).
+	syncErr error
+
+	// syncFile is the fsync call itself, as a field so tests can count rounds,
+	// stretch them (to make concurrent writers overlap on purpose) and make them
+	// fail.
+	syncFile func(*os.File) error
 }
 
 // NewFileWAL opens (creating if necessary) the WAL file at path, scans any
@@ -295,20 +345,37 @@ func NewFileWAL(path string) (*FileWAL, error) {
 		pendingVersionIDByKB: make(map[string]int64),
 		cursors:              make(map[string]int64),
 		replayCounters:       make(map[replayKey]int),
+		syncFile:             func(f *os.File) error { return f.Sync() },
 	}
+	w.syncCond = sync.NewCond(&w.syncMu)
+	w.syncFor.Store(f)
 
 	if err := w.rebuildIndex(); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("wal: rebuild index from %s: %w", path, err)
+	}
+	// Publish where appends will start. The records already in the file are durable
+	// by construction (rebuildIndex treats a short tail as the end of the log, and
+	// everything before it was fsynced by whoever wrote it), and they carry no
+	// sequence numbers, so nothing has to be marked durable here: the first new
+	// record gets seq 1 and its own round.
+	if end, err := f.Seek(0, io.SeekCurrent); err == nil {
+		w.appended.Store(end)
 	}
 
 	return w, nil
 }
 
 // Close releases the underlying file handle.
+//
+// mu is enough: a write releases mu only while it waits on a sync round, and that
+// wait is what the file handle is needed for. Closing between an append and its
+// round would leave the round syncing a closed descriptor, so the round is
+// drained first.
 func (w *FileWAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.drainSyncLocked()
 	return w.file.Close()
 }
 
@@ -542,8 +609,11 @@ func (w *FileWAL) applyRecordLocked(rec parsedRecord) {
 	}
 }
 
-// writeRecordLocked appends a single framed record to the file and
-// fsyncs before returning. Must be called with w.mu held.
+// writeRecordLocked appends a single framed record to the file and returns its
+// sequence number plus the offset just past it. Must be called with w.mu held; the
+// caller is responsible for calling awaitDurable on the returned sequence number
+// AFTER releasing mu, because making the record durable is what several writers
+// share (see awaitDurable).
 //
 // A record is three writes (header, payload, CRC). If any of them fails the file
 // is rewound to where the record started before the error is returned: recovery
@@ -551,9 +621,9 @@ func (w *FileWAL) applyRecordLocked(rec parsedRecord) {
 // record left in the middle of the log silently discards every valid record after
 // it — ones whose callers were already told the write succeeded (H6 of
 // docs/code-review-2026-10-18.md).
-func (w *FileWAL) writeRecordLocked(kind recordType, payload []byte) error {
+func (w *FileWAL) writeRecordLocked(kind recordType, payload []byte) (uint64, int64, error) {
 	if w.broken != nil {
-		return fmt.Errorf("wal: %s cannot accept writes: %w", w.path, w.broken)
+		return 0, 0, fmt.Errorf("wal: %s cannot accept writes: %w", w.path, w.broken)
 	}
 
 	header := make([]byte, recordHeaderLen)
@@ -567,17 +637,25 @@ func (w *FileWAL) writeRecordLocked(kind recordType, payload []byte) error {
 
 	start, err := w.file.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return fmt.Errorf("wal: %s: record start offset: %w", w.path, err)
+		return 0, 0, fmt.Errorf("wal: %s: record start offset: %w", w.path, err)
 	}
 	if err := w.appendRecord(header, payload, crcBytes); err != nil {
 		w.rewindTo(start)
-		return err
+		return 0, 0, err
 	}
-	return nil
+	// Read the end back from the file rather than computing it, so this value is
+	// whatever the kernel actually accepted.
+	end, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, 0, fmt.Errorf("wal: %s: record end offset: %w", w.path, err)
+	}
+	w.appended.Store(end)
+	return w.appendedSeq.Add(1), end, nil
 }
 
-// appendRecord performs the three writes of one record and the fsync. Split out
-// so writeRecordLocked can rewind on any of their failures.
+// appendRecord performs the three writes of one record. Split out so
+// writeRecordLocked can rewind on any of their failures. It deliberately does not
+// fsync: that is the group-commit round's job (awaitDurable).
 func (w *FileWAL) appendRecord(header, payload, crcBytes []byte) error {
 	if _, err := w.file.Write(header); err != nil {
 		return err
@@ -590,7 +668,7 @@ func (w *FileWAL) appendRecord(header, payload, crcBytes []byte) error {
 	if _, err := w.file.Write(crcBytes); err != nil {
 		return err
 	}
-	return w.file.Sync()
+	return nil
 }
 
 // rewindTo truncates the log back to start (dropping a partially written record)
@@ -607,48 +685,229 @@ func (w *FileWAL) rewindTo(start int64) {
 		w.broken = fmt.Errorf("reposition after rolling back partial record at offset %d: %w", start, err)
 		return
 	}
+	w.appended.Store(start)
 	// The truncate has to reach the disk, otherwise a restart can still see the
-	// partial record.
+	// partial record. This one is outside the group-commit rounds on purpose: it is
+	// a rollback, so it must not share a fsync with records that are being kept.
+	//
+	// No durability bookkeeping is needed here: the record that was rolled back has
+	// no waiter (its writer already has the error), and every earlier record keeps
+	// the sequence number it was given, so durableSeq stays a truthful — if
+	// conservative — statement about them.
 	if err := w.file.Sync(); err != nil {
 		w.broken = fmt.Errorf("sync after rolling back partial record at offset %d: %w", start, err)
 	}
 }
 
-func (w *FileWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int64, changes []types.DocChange) error {
+// awaitDurable blocks until the record with sequence number seq is known to be on
+// stable storage, and reports the error of the round that tried and failed.
+//
+// One goroutine at a time plays the leader: it reads the sequence number the file
+// has reached, syncs, and then records that everything up to it reached the device.
+// Writers that appended while the fsync was in flight are covered by it too, so N
+// concurrent writers cost one fsync instead of N — the whole point, since the fsync
+// is the write path's dominant cost once several knowledge bases are written at
+// once.
+//
+// Two orderings matter:
+//   - The leader reads appendedSeq BEFORE syncing. Anything appended after that
+//     read is not claimed to be durable by this round; its own writer leads (or
+//     joins) the next one.
+//   - Waiters are told "durable" by sequence number, never by byte offset. A log
+//     swap (Compact/DeleteByKB) brings in a different file whose offsets mean
+//     something else entirely; a sequence number stays meaningful across it, and
+//     adoptFileLocked marks every record written so far as durable because the
+//     replacement file already holds them and was synced before the rename.
+//
+// A round that fails poisons the log (syncErr, and broken through markBroken): an
+// fsync that did not reach the device says nothing about the records before it
+// either, and there is no way to tell which of the covered records are on disk. The
+// previous implementation could roll a single failed record back; with a round
+// covering several, refusing all of them — fail-stop — is the only safe answer.
+//
+// Must be called with mu released.
+func (w *FileWAL) awaitDurable(seq uint64) error {
+	w.syncMu.Lock()
+	for {
+		if w.syncErr != nil {
+			err := w.syncErr
+			w.syncMu.Unlock()
+			w.markBroken(fmt.Errorf("fsync round failed: %w", err))
+			return err
+		}
+		if w.durableSeq >= seq {
+			w.syncMu.Unlock()
+			return nil
+		}
+		if w.syncing {
+			gen := w.syncGen
+			for w.syncGen == gen && w.syncErr == nil {
+				w.syncCond.Wait()
+			}
+			continue
+		}
+
+		// Lead the round.
+		w.syncing = true
+		file := w.syncFor.Load()
+		target := w.appendedSeq.Load()
+		w.syncMu.Unlock()
+
+		var err error
+		if file == nil {
+			err = fmt.Errorf("wal: %s: no file to fsync", w.path)
+		} else {
+			err = w.syncFile(file)
+		}
+
+		w.syncMu.Lock()
+		w.syncing = false
+		if w.syncFor.Load() != file {
+			// Compact/DeleteByKB swapped the log while this round was syncing: the
+			// result describes a file that is no longer the log. adoptFileLocked has
+			// already marked everything written so far durable, so just start the
+			// question over against the new file.
+			w.finishRoundLocked()
+			continue
+		}
+		if err != nil {
+			w.syncErr = err
+		} else if target > w.durableSeq {
+			w.durableSeq = target
+		}
+		w.finishRoundLocked()
+	}
+}
+
+// finishRoundLocked publishes the end of a round: bump the generation (so waiters
+// can tell a finished round from a spurious wakeup) and wake everyone. Must be
+// called with syncMu held.
+func (w *FileWAL) finishRoundLocked() {
+	w.syncGen++
+	w.syncCond.Broadcast()
+}
+
+// adoptFileLocked points the group-commit machinery at a newly opened log file.
+// Called by Compact/DeleteByKB after the rename, with mu held.
+//
+// Every record written so far is marked durable: the replacement file holds those
+// records (compaction copies what it keeps, and the ones it drops were unreachable
+// — see Compact), and it was fsynced before being renamed into place. Without this
+// a waiter holding a sequence number from before the swap would wait for a round
+// against the old file that no longer exists.
+func (w *FileWAL) adoptFileLocked(f *os.File, size int64) {
+	w.syncMu.Lock()
+	w.syncFor.Store(f)
+	w.appended.Store(size)
+	if written := w.appendedSeq.Load(); written > w.durableSeq {
+		w.durableSeq = written
+	}
+	w.finishRoundLocked()
+	w.syncMu.Unlock()
+}
+
+// drainSyncLocked waits out an in-flight fsync round before the caller closes or
+// replaces the file. Must be called with mu held (and syncMu is taken second, in
+// the documented order).
+func (w *FileWAL) drainSyncLocked() {
+	w.syncMu.Lock()
+	defer w.syncMu.Unlock()
+	for w.syncing {
+		w.syncCond.Wait()
+	}
+}
+
+// markBroken records that no further append can be trusted. First error wins: it
+// names the failure that made the log unusable.
+func (w *FileWAL) markBroken(err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := w.writeRecordLocked(recordTypeBegin, encodeBeginPayload(kbID, parentVersionID, changes)); err != nil {
-		return fmt.Errorf("wal: WriteBegin: %w", err)
+	if w.broken == nil {
+		w.broken = err
 	}
-	// Remember it for the VERSION_ID that will bind to it (and, through
-	// beginDataByVersion, for a peer's later backfill request). Only after the
-	// record is durably written: an in-memory binding for a record that failed
-	// to land would be a lie.
-	//
-	// Per knowledge base, because writes to different KBs are concurrent now
-	// (M7 of docs/code-review-2026-09-24.md): a single slot would let this BEGIN
-	// bind to another KB's VERSION_ID.
-	bd := beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}
-	// A VERSION_ID may already be waiting for this BEGIN: under the dispatch
-	// topology the proposal — and therefore the apply that writes VERSION_ID —
-	// happens BEFORE the storage write that lands here (C5 of
-	// docs/code-review-2026-10-18.md). Binding it now is what keeps the replay
-	// input attached to the right version in that order too.
-	if versionID, ok := w.pendingVersionIDByKB[kbID]; ok {
-		w.beginDataByVersion[versionID] = bd
-		delete(w.pendingVersionIDByKB, kbID)
+}
+
+// appendDurable runs one record's write under the log lock and then waits, with
+// the lock released, for a group-commit round to cover it.
+//
+// fn returns 0 as the sequence number when there was nothing to write (the record
+// is already in the log — every Write* is idempotent). The lock is what makes the
+// append atomic against other writers and against Compact/DeleteByKB swapping the
+// file; the wait has to happen outside it, or the next writer could not append while
+// this one's fsync is in flight and there would be nothing to group.
+//
+// fn runs the in-memory index update too, before the wait. That is deliberate: the
+// update has to be inside the same critical section as the append (or the
+// idempotency check and the append could be split by another writer), and the
+// alternative — a second critical section after the wait — would let two writers
+// append the same record. The cost is that a failed round leaves the index claiming
+// a record that may not be durable; a failed round also poisons the log (see
+// awaitDurable), so those maps are never read again in that process, and the next
+// start rebuilds them from the file.
+func (w *FileWAL) appendDurable(fn func() (uint64, int64, error)) error {
+	w.mu.Lock()
+	// Checked here as well as in writeRecordLocked: a poisoned log must refuse even
+	// an idempotent repeat, otherwise a caller whose write failed would be told the
+	// second attempt "succeeded" by an entry the failed round put in the index.
+	if w.broken != nil {
+		err := w.broken
+		w.mu.Unlock()
+		return fmt.Errorf("wal: %s cannot accept writes: %w", w.path, err)
+	}
+	seq, _, err := fn()
+	w.mu.Unlock()
+	if err != nil || seq == 0 {
+		return err
+	}
+	return w.awaitDurable(seq)
+}
+
+// wrapWALErr prefixes err with a per-call message when there is one. It keeps the
+// Write* bodies to a single return statement, which is what makes the shared
+// appendDurable shape readable at each of the nine call sites.
+func wrapWALErr(err error, format string, args ...any) error {
+	if err == nil {
 		return nil
 	}
-	w.pendingBeginByKB[kbID] = bd
-	return nil
+	return fmt.Errorf(format, append(args, err)...)
+}
+
+// WriteBegin records a transaction's replay input: kbID, parentVersionID and the
+// full changes list, so a crash before COMMIT can replay the version from scratch.
+func (w *FileWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int64, changes []types.DocChange) error {
+	bd := beginData{kbID: kbID, parentVersionID: parentVersionID, changes: changes}
+	return wrapWALErr(w.appendDurable(func() (uint64, int64, error) {
+		seq, end, err := w.writeRecordLocked(recordTypeBegin, encodeBeginPayload(kbID, parentVersionID, changes))
+		if err != nil {
+			return 0, 0, err
+		}
+		// Remember it for the VERSION_ID that will bind to it (and, through
+		// beginDataByVersion, for a peer's later backfill request). The binding is
+		// made as soon as the record is in the file, before the fsync round: a
+		// failed round poisons the whole log (see awaitDurable), so there is no
+		// state in which this claim is read back after the record turned out not to
+		// be durable.
+		//
+		// Per knowledge base, because writes to different KBs are concurrent now
+		// (M7 of docs/code-review-2026-09-24.md): a single slot would let this BEGIN
+		// bind to another KB's VERSION_ID.
+		//
+		// A VERSION_ID may already be waiting for this BEGIN: under the dispatch
+		// topology the proposal — and therefore the apply that writes VERSION_ID —
+		// happens BEFORE the storage write that lands here (C5 of
+		// docs/code-review-2026-10-18.md). Binding it now is what keeps the replay
+		// input attached to the right version in that order too.
+		if versionID, ok := w.pendingVersionIDByKB[kbID]; ok {
+			w.beginDataByVersion[versionID] = bd
+			delete(w.pendingVersionIDByKB, kbID)
+		} else {
+			w.pendingBeginByKB[kbID] = bd
+		}
+		return seq, end, nil
+	}), "wal: WriteBegin: %w")
 }
 
 func (w *FileWAL) WriteVersionID(_ context.Context, kbID string, versionID int64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.versionIDsWritten[versionID] {
-		return nil // idempotent
-	}
 	// The record carries the knowledge base, so the BEGIN/VERSION_ID pairing is
 	// exact regardless of how two KBs' writes interleave on disk (M7 of
 	// docs/code-review-2026-09-24.md). Records written before this change carry only
@@ -657,98 +916,116 @@ func (w *FileWAL) WriteVersionID(_ context.Context, kbID string, versionID int64
 	payload := make([]byte, 8+len(kbID))
 	binary.BigEndian.PutUint64(payload[:8], uint64(versionID))
 	copy(payload[8:], kbID)
-	if err := w.writeRecordLocked(recordTypeVersionID, payload); err != nil {
-		return fmt.Errorf("wal: WriteVersionID(%d): %w", versionID, err)
-	}
-	w.versionIDsWritten[versionID] = true
-	// Bind the BEGIN record this transaction started with — the same pairing
-	// rebuildIndex performs when it replays the pair from disk. Without this, a
-	// version written by this process could not answer a peer's backfill
-	// request until the next restart.
-	//
-	// When no BEGIN is waiting, the write is in the other order (propose/apply
-	// first, storage write later: the dispatch topology), so THIS version waits
-	// for its BEGIN instead of the next version silently stealing the BEGIN that
-	// arrives afterwards (C5 of docs/code-review-2026-10-18.md).
-	if bd, ok := w.pendingBeginByKB[kbID]; ok {
-		w.beginDataByVersion[versionID] = bd
-		delete(w.pendingBeginByKB, kbID)
-		return nil
-	}
-	w.pendingVersionIDByKB[kbID] = versionID
-	return nil
+
+	return wrapWALErr(w.appendDurable(func() (uint64, int64, error) {
+		if w.versionIDsWritten[versionID] {
+			return 0, 0, nil // idempotent
+		}
+		seq, end, err := w.writeRecordLocked(recordTypeVersionID, payload)
+		if err != nil {
+			return 0, 0, err
+		}
+		w.versionIDsWritten[versionID] = true
+		// Bind the BEGIN record this transaction started with — the same pairing
+		// rebuildIndex performs when it replays the pair from disk. Without this, a
+		// version written by this process could not answer a peer's backfill
+		// request until the next restart.
+		//
+		// When no BEGIN is waiting, the write is in the other order (propose/apply
+		// first, storage write later: the dispatch topology), so THIS version waits
+		// for its BEGIN instead of the next version silently stealing the BEGIN that
+		// arrives afterwards (C5 of docs/code-review-2026-10-18.md).
+		if bd, ok := w.pendingBeginByKB[kbID]; ok {
+			w.beginDataByVersion[versionID] = bd
+			delete(w.pendingBeginByKB, kbID)
+		} else {
+			w.pendingVersionIDByKB[kbID] = versionID
+		}
+		return seq, end, nil
+	}), "wal: WriteVersionID(%d): %w", versionID)
 }
 
 func (w *FileWAL) WriteCommit(_ context.Context, versionID int64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.committedVersions[versionID] {
-		return nil // idempotent
-	}
 	payload := make([]byte, 8)
 	binary.BigEndian.PutUint64(payload, uint64(versionID))
-	if err := w.writeRecordLocked(recordTypeCommit, payload); err != nil {
-		return fmt.Errorf("wal: WriteCommit(%d): %w", versionID, err)
-	}
-	w.committedVersions[versionID] = true
-	return nil
+
+	return wrapWALErr(w.appendDurable(func() (uint64, int64, error) {
+		if w.committedVersions[versionID] {
+			return 0, 0, nil // idempotent
+		}
+		seq, end, err := w.writeRecordLocked(recordTypeCommit, payload)
+		if err != nil {
+			return 0, 0, err
+		}
+		w.committedVersions[versionID] = true
+		return seq, end, nil
+	}), "wal: WriteCommit(%d): %w", versionID)
 }
 
 func (w *FileWAL) WriteDeleteMark(_ context.Context, kbID string) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.deleteMarked[kbID] {
-		return nil // idempotent
-	}
-	if err := w.writeRecordLocked(recordTypeDeleteMark, []byte(kbID)); err != nil {
-		return fmt.Errorf("wal: WriteDeleteMark(%s): %w", kbID, err)
-	}
-	w.deleteMarked[kbID] = true
-	return nil
+	return wrapWALErr(w.appendDurable(func() (uint64, int64, error) {
+		if w.deleteMarked[kbID] {
+			return 0, 0, nil // idempotent
+		}
+		seq, end, err := w.writeRecordLocked(recordTypeDeleteMark, []byte(kbID))
+		if err != nil {
+			return 0, 0, err
+		}
+		w.deleteMarked[kbID] = true
+		return seq, end, nil
+	}), "wal: WriteDeleteMark(%s): %w", kbID)
 }
 
 func (w *FileWAL) WriteDeleteComplete(_ context.Context, kbID string) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.deleteCompleted[kbID] {
-		return nil // idempotent
-	}
-	if err := w.writeRecordLocked(recordTypeDeleteComplete, []byte(kbID)); err != nil {
-		return fmt.Errorf("wal: WriteDeleteComplete(%s): %w", kbID, err)
-	}
-	w.deleteCompleted[kbID] = true
-	return nil
+	return wrapWALErr(w.appendDurable(func() (uint64, int64, error) {
+		if w.deleteCompleted[kbID] {
+			return 0, 0, nil // idempotent
+		}
+		seq, end, err := w.writeRecordLocked(recordTypeDeleteComplete, []byte(kbID))
+		if err != nil {
+			return 0, 0, err
+		}
+		w.deleteCompleted[kbID] = true
+		return seq, end, nil
+	}), "wal: WriteDeleteComplete(%s): %w", kbID)
 }
 
 // WriteVersionDeleteMark records that a DeleteVersion flow has started.
 // Payload: 8-byte versionID + kbID. Idempotent per versionID.
 func (w *FileWAL) WriteVersionDeleteMark(_ context.Context, kbID string, versionID int64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if _, done := w.versionDeleteMarked[versionID]; done {
-		return nil // idempotent
-	}
-	if err := w.writeRecordLocked(recordTypeVersionDeleteMark, versionDeletePayload(versionID, kbID)); err != nil {
-		return fmt.Errorf("wal: WriteVersionDeleteMark(%s,%d): %w", kbID, versionID, err)
-	}
-	w.versionDeleteMarked[versionID] = kbID
-	return nil
+	// Built outside the closure: the payload is fixed for this call, and the closure
+	// may run more than once in principle (it does not today, but nothing about the
+	// helper depends on that).
+	payload := versionDeletePayload(versionID, kbID)
+	return wrapWALErr(w.appendDurable(func() (uint64, int64, error) {
+		if _, done := w.versionDeleteMarked[versionID]; done {
+			return 0, 0, nil // idempotent
+		}
+		seq, end, err := w.writeRecordLocked(recordTypeVersionDeleteMark, payload)
+		if err != nil {
+			return 0, 0, err
+		}
+		w.versionDeleteMarked[versionID] = kbID
+		return seq, end, nil
+	}), "wal: WriteVersionDeleteMark(%s,%d): %w", kbID, versionID)
 }
 
 // WriteVersionDeleteComplete records that the DeleteVersion cleanup for
 // versionID has finished. Payload: 8-byte versionID + kbID. Idempotent per
 // versionID.
 func (w *FileWAL) WriteVersionDeleteComplete(_ context.Context, kbID string, versionID int64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.versionDeleteDone[versionID] {
-		return nil // idempotent
-	}
-	if err := w.writeRecordLocked(recordTypeVersionDeleteComplete, versionDeletePayload(versionID, kbID)); err != nil {
-		return fmt.Errorf("wal: WriteVersionDeleteComplete(%s,%d): %w", kbID, versionID, err)
-	}
-	w.versionDeleteDone[versionID] = true
-	return nil
+	payload := versionDeletePayload(versionID, kbID)
+	return wrapWALErr(w.appendDurable(func() (uint64, int64, error) {
+		if w.versionDeleteDone[versionID] {
+			return 0, 0, nil // idempotent
+		}
+		seq, end, err := w.writeRecordLocked(recordTypeVersionDeleteComplete, payload)
+		if err != nil {
+			return 0, 0, err
+		}
+		w.versionDeleteDone[versionID] = true
+		return seq, end, nil
+	}), "wal: WriteVersionDeleteComplete(%s,%d): %w", kbID, versionID)
 }
 
 // versionDeletePayload encodes the version-delete record payload: 8-byte
@@ -835,16 +1112,17 @@ func decodeCursorPayload(payload []byte) (string, int64, error) {
 // exceed what the node actually holds, so it is written only AFTER the data it
 // describes has landed (see LocalDataPlane.advanceLocalVersion).
 func (w *FileWAL) WriteCursor(_ context.Context, kbID string, versionID int64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if versionID <= w.cursors[kbID] {
-		return nil // idempotent: the cursor is a scalar and only moves forward
-	}
-	if err := w.writeRecordLocked(recordTypeCursor, encodeCursorPayload(kbID, versionID)); err != nil {
-		return fmt.Errorf("wal: WriteCursor(%s, %d): %w", kbID, versionID, err)
-	}
-	w.cursors[kbID] = versionID
-	return nil
+	return wrapWALErr(w.appendDurable(func() (uint64, int64, error) {
+		if versionID <= w.cursors[kbID] {
+			return 0, 0, nil // idempotent: the cursor is a scalar and only moves forward
+		}
+		seq, end, err := w.writeRecordLocked(recordTypeCursor, encodeCursorPayload(kbID, versionID))
+		if err != nil {
+			return 0, 0, err
+		}
+		w.cursors[kbID] = versionID
+		return seq, end, nil
+	}), "wal: WriteCursor(%s, %d): %w", kbID, versionID)
 }
 
 // RecoverCursors returns the persisted cursor of every knowledge base this log

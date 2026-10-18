@@ -194,6 +194,11 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	// The swap. Reopening the original handle first would only add a window; the
 	// rename replaces the name atomically while the old file object keeps working
 	// for anyone mid-read.
+	//
+	// The group-commit round has to be drained first: it runs with mu released (so
+	// appends could still be grouped), and closing the handle under it would make it
+	// fsync a descriptor that is gone. Draining costs at most one fsync.
+	w.drainSyncLocked()
 	if err := w.file.Close(); err != nil {
 		return fmt.Errorf("wal: compact: close log: %w", err)
 	}
@@ -201,14 +206,23 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 		// The original is untouched; reopen it and report.
 		if f, rerr := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR, 0o644); rerr == nil {
 			w.file = f
+			if size, serr := f.Seek(0, io.SeekEnd); serr == nil {
+				w.adoptFileLocked(f, size)
+			}
 		}
 		return fmt.Errorf("wal: compact: swap in %s: %w", w.path, err)
 	}
 	committed = true
 
-	// Make the rename itself durable, so a crash cannot resurrect the old log.
+	// Make the rename itself durable, so a crash cannot resurrect the old log. A
+	// failure here is NOT reported before the handle is reopened: the file has already
+	// been swapped, and leaving w.file pointing at the closed descriptor would break
+	// every later append. The error is carried to the end of the function instead.
+	var dirSyncErr error
 	if dir, err := os.Open(filepath.Dir(w.path)); err == nil {
-		_ = dir.Sync()
+		if serr := dir.Sync(); serr != nil {
+			dirSyncErr = serr
+		}
 		_ = dir.Close()
 	}
 
@@ -216,11 +230,16 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	if err != nil {
 		return fmt.Errorf("wal: compact: reopen %s: %w", w.path, err)
 	}
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
 		f.Close()
 		return fmt.Errorf("wal: compact: seek %s: %w", w.path, err)
 	}
 	w.file = f
+	// The new file is a different file object: nothing may inherit the old one's
+	// durability claim, and waiters still blocked on the old log have to be woken so
+	// they can sync against this one.
+	w.adoptFileLocked(f, size)
 
 	// Trim the in-memory index to match what the log now holds: ChangesInRange
 	// must report a reclaimed version as MISSING, not as "here are the changes",
@@ -246,6 +265,14 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	// documents' full text — for every version that has NOT been reclaimed. That
 	// set is bounded by the reclaim watermark (which is why it is not a leak), and
 	// it is what answers a lagging peer's ChangesInRange without re-reading the log.
+	if dirSyncErr != nil {
+		// The rewrite itself is complete and the log is consistent; what failed is the
+		// rename's durability, so a power loss could still leave the OLD (longer, still
+		// valid) log in place. Surfaced rather than swallowed: a directory that cannot
+		// be synced means compaction never sticks, and that is worth an operator's
+		// attention instead of an unexplained steady state.
+		return fmt.Errorf("wal: compact: sync directory of %s: %w", w.path, dirSyncErr)
+	}
 	return nil
 }
 
@@ -352,7 +379,10 @@ func (w *FileWAL) DeleteByKB(ctx context.Context, kbID string) error {
 
 	// The swap. Reopening the original handle first would only add a window; the
 	// rename replaces the name atomically while the old file object keeps working for
-	// anyone mid-read.
+	// anyone mid-read. The group-commit round is drained first for the reason
+	// Compact documents: it fsyncs with mu released, so the handle cannot be closed
+	// under it.
+	w.drainSyncLocked()
 	if err := w.file.Close(); err != nil {
 		return fmt.Errorf("wal: delete by knowledge base: close log: %w", err)
 	}
@@ -360,14 +390,23 @@ func (w *FileWAL) DeleteByKB(ctx context.Context, kbID string) error {
 		// The original is untouched; reopen it and report.
 		if f, rerr := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR, 0o644); rerr == nil {
 			w.file = f
+			if size, serr := f.Seek(0, io.SeekEnd); serr == nil {
+				w.adoptFileLocked(f, size)
+			}
 		}
 		return fmt.Errorf("wal: delete by knowledge base: swap in %s: %w", w.path, err)
 	}
 	committed = true
 
-	// Make the rename itself durable, so a crash cannot resurrect the old log.
+	// Make the rename itself durable, so a crash cannot resurrect the old log. Like
+	// Compact, a failure is carried to the end of the function rather than returned
+	// here: the file has already been swapped, and bailing out now would leave w.file
+	// pointing at the closed descriptor.
+	var dirSyncErr error
 	if dir, err := os.Open(filepath.Dir(w.path)); err == nil {
-		_ = dir.Sync()
+		if serr := dir.Sync(); serr != nil {
+			dirSyncErr = serr
+		}
 		_ = dir.Close()
 	}
 
@@ -375,11 +414,15 @@ func (w *FileWAL) DeleteByKB(ctx context.Context, kbID string) error {
 	if err != nil {
 		return fmt.Errorf("wal: delete by knowledge base: reopen %s: %w", w.path, err)
 	}
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
 		f.Close()
 		return fmt.Errorf("wal: delete by knowledge base: seek %s: %w", w.path, err)
 	}
 	w.file = f
+	// A new file object: no durability claim carries over, and waiters blocked on the
+	// old log are woken to sync against this one.
+	w.adoptFileLocked(f, size)
 
 	// Trim the in-memory index to what the file now holds, so the next Recover,
 	// ChangesInRange and PendingRecords all agree with it.
@@ -406,6 +449,9 @@ func (w *FileWAL) DeleteByKB(ctx context.Context, kbID string) error {
 		if key.kbID == kbID {
 			delete(w.replayCounters, key)
 		}
+	}
+	if dirSyncErr != nil {
+		return fmt.Errorf("wal: delete by knowledge base: sync directory of %s: %w", w.path, dirSyncErr)
 	}
 	return nil
 }

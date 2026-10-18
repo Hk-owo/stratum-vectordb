@@ -189,7 +189,29 @@ func installFile(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("index: InstallIndex: rename %s -> %s: %w", tmp, path, err)
 	}
+	// The fsync above makes the artifact's CONTENTS durable; this makes its NAME
+	// durable. rename is atomic with respect to the directory entry, not with respect
+	// to a power loss: without the directory fsync the index file can be missing after
+	// a crash even though the rename returned success — while the metadata on the
+	// control layer already says READY for this version, so every query routed to this
+	// node fails until something rebuilds the artifact.
+	if err := syncDirOf(dir); err != nil {
+		return fmt.Errorf("index: InstallIndex: fsync %s: %w", dir, err)
+	}
 	return nil
+}
+
+// syncDirOf fsyncs a directory so renames inside it survive a power loss.
+func syncDirOf(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 // sidecarPath returns the on-disk path of (kbID, versionID)'s sidecar — the
