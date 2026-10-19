@@ -33,28 +33,73 @@ import (
 
 // --- helpers -------------------------------------------------------------
 
-// createKB provisions a knowledge base, trying every control node: creating one
-// may be accepted by a follower and forwarded, so any node can serve the call.
+// createKB provisions a knowledge base, retrying every control node until one accepts
+// it — or until ctx runs out.
+//
+// The retry is not belt-and-braces, it is the correctness of the fixture. A cluster
+// that is electing has no leader, and the station answers
+// `code = Unknown desc = router: no leader available`; the first version of this helper
+// made ONE pass over the nodes and failed the test on it. Measured on a CI run: nine
+// cases failed in setup within 20 ms of each other, all with that message, while the
+// very next case in the same suite passed — the election had finished.
+//
+// "Setup" has one legitimate transient failure and one legitimate permanent one, and the
+// difference is the code: Unavailable/Unknown/DeadlineExceeded mean "ask again", while
+// InvalidArgument (a malformed request) can never become true by waiting.
 func createKB(t *testing.T, ctx context.Context, label string) string {
 	t.Helper()
 	req := newKBRequest(label)
-	var lastErr error
-	for _, addr := range nodeAddrs {
-		kb, _, _, conn, err := dialNode(addr)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		resp, err := kb.CreateKnowledgeBase(ctx, req)
-		conn.Close()
-		if err == nil {
-			t.Logf("created KB %s for %s", resp.GetKnowledgeBaseId(), label)
-			return resp.GetKnowledgeBaseId()
-		}
-		lastErr = err
+	deadline := time.Now().Add(30 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
 	}
-	t.Fatalf("CreateKnowledgeBase never succeeded: %v", lastErr)
-	return ""
+	backoff := 100 * time.Millisecond
+
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		for _, addr := range nodeAddrs {
+			kb, _, _, conn, err := dialNode(addr)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			resp, err := kb.CreateKnowledgeBase(ctx, req)
+			conn.Close()
+			if err == nil {
+				t.Logf("created KB %s for %s (attempt %d)", resp.GetKnowledgeBaseId(), label, attempt)
+				return resp.GetKnowledgeBaseId()
+			}
+			if !isTransientSetupError(err) {
+				t.Fatalf("CreateKnowledgeBase: %v", err)
+			}
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("CreateKnowledgeBase never succeeded within %d attempt(s): %v", attempt, lastErr)
+		}
+		time.Sleep(backoff)
+		if backoff < 2*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// isTransientSetupError answers "may this setup call simply be retried?".
+//
+// Unknown is included on purpose: the router used to return a bare error for "no leader
+// available", which gRPC maps to Unknown. It now carries a named Unavailable sentinel, so
+// the arm is a compatibility one for clusters built before that change — and either way
+// the decision is made here, once, instead of by matching message text in every helper.
+func isTransientSetupError(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return true // a transport failure: the node may just be coming up
+	}
+	switch st.Code() {
+	case codes.Unavailable, codes.Unknown, codes.DeadlineExceeded, codes.ResourceExhausted, codes.Aborted:
+		return true
+	}
+	return false
 }
 
 // createVersionThroughControl submits a batch of changes and returns the

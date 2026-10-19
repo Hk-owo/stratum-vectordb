@@ -85,6 +85,17 @@ var (
 	// Reads are NOT refused by it. Below quorum a replica that still has the data
 	// can still serve, and this design keeps that trade-off (§2, non-goals).
 	ErrKBStorageDegraded = errors.New("knowledge base storage degraded")
+	// ErrNoLeaderYet is "this cluster has no leader right now": an election is in
+	// flight, or every control node refused the write. Unavailable — and therefore
+	// retryable — because the same call succeeds as soon as a leader exists.
+	//
+	// It has a wire name because the alternative was a bare message. Measured in the T4
+	// suite: every setup call failed with `code = Unknown desc = router: no leader
+	// available`, and neither the test nor the station could tell from that whether
+	// retrying was the right move — so a cluster that was merely electing looked exactly
+	// like one that had lost its metadata for good.
+	ErrNoLeaderYet = errors.New("no leader available")
+
 	// ErrStorageUnavailable is the cluster-wide counterpart: the storage layer as
 	// a whole is below quorum, so no knowledge base can be written. Retryable for
 	// the same reason as ErrKBStorageDegraded.
@@ -122,6 +133,7 @@ var sentinelNames = []struct {
 	{"index_load_timeout", ErrIndexLoadTimeout},
 	{"invalid_parent_version", ErrInvalidParentVersion},
 	{"kb_storage_degraded", ErrKBStorageDegraded},
+	{"no_leader_yet", ErrNoLeaderYet},
 	{"storage_unavailable", ErrStorageUnavailable},
 }
 
@@ -175,6 +187,7 @@ var grpcCodeMap = map[error]codes.Code{
 	// or a failover is in flight, and the caller should retry rather than treat
 	// the version as rejected. See the sentinel's comment.
 	ErrKBStorageDegraded:  codes.Unavailable,
+	ErrNoLeaderYet:        codes.Unavailable,
 	ErrStorageUnavailable: codes.Unavailable,
 }
 

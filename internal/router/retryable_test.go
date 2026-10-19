@@ -160,3 +160,25 @@ func TestIsRetryableErr_TheReasonSurvivesARegistryHop(t *testing.T) {
 		t.Fatal("precondition: the message does mention maintenance (the rule just must not rely on it)")
 	}
 }
+
+// "The cluster is electing" is retryable, and it has to be recognisable as such.
+//
+// Measured in the T4 suite: every setup call failed with
+// `code = Unknown desc = router: no leader available`, so the tests could not tell an
+// election in flight from a cluster that had lost its metadata for good — nine cases
+// failed in setup while the election was finishing, and the next case passed.
+func TestIsRetryableErr_NoLeaderYetIsRetryable(t *testing.T) {
+	err := stratumerrors.ToGRPCStatus(stratumerrors.ErrNoLeaderYet)
+	if got := isRetryableErr(err, true); !got {
+		t.Fatal("no_leader_yet must be retryable for a write: another attempt after the election succeeds")
+	}
+	if got := isRetryableErr(err, false); !got {
+		t.Fatal("no_leader_yet must be retryable for a read too")
+	}
+	if code := status.Code(err); code != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable (a caller must not need the message to know to retry)", code)
+	}
+	if reason := stratumerrors.ReasonOf(err); reason != "no_leader_yet" {
+		t.Fatalf("reason = %q, want no_leader_yet", reason)
+	}
+}

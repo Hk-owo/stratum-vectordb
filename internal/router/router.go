@@ -850,7 +850,10 @@ func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission 
 		// reached it.
 		return zero, fmt.Errorf("router: no leader available after %d attempt(s): %w", attempts, lastErr)
 	}
-	return zero, errors.New("router: no leader available")
+	// Named, not a bare errors.New: "the cluster is electing" is transient, and without a
+	// sentinel the caller sees `code = Unknown` and cannot know to retry — measured as a
+	// whole T4 suite failing in setup while the election finished.
+	return zero, fmt.Errorf("router: no leader available: %w", stratumerrors.ErrNoLeaderYet)
 }
 
 // loggerOrNop returns the configured logger, or a no-op one.
@@ -1114,4 +1117,7 @@ var retryableReasons = map[string]bool{
 	// already be serving the version — and the query path now asks for the build
 	// instead of only refusing, which is what makes the retry worth making.
 	"version_pending": true,
+	// No control node would take the write because the cluster has no leader yet — an
+	// election in flight. Retrying is the whole answer.
+	"no_leader_yet": true,
 }

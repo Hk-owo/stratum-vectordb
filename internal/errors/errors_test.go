@@ -29,6 +29,7 @@ func TestToGRPCStatus(t *testing.T) {
 		{"ErrInvalidArgument", ErrInvalidArgument, codes.InvalidArgument, false},
 		{"ErrIndexLoadTimeout", ErrIndexLoadTimeout, codes.DeadlineExceeded, false},
 		{"ErrInvalidParentVersion", ErrInvalidParentVersion, codes.InvalidArgument, false},
+		{"ErrNoLeaderYet", ErrNoLeaderYet, codes.Unavailable, false},
 		{"unknown error", errors.New("unknown"), codes.Internal, false},
 		{"nil", nil, codes.OK, true},
 	}

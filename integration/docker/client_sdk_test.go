@@ -42,12 +42,7 @@ func TestT4_ClientSDK_SubmitsRecordsAndReSends(t *testing.T) {
 	defer cancel()
 
 	c := dialTestClient(t)
-	kbID, err := c.CreateKnowledgeBase(ctx,
-		fmt.Sprintf("sdk-record-%d", time.Now().UnixNano()),
-		"http://stratum-embed:8080", "test-model")
-	if err != nil {
-		t.Fatalf("CreateKnowledgeBase: %v", err)
-	}
+	kbID := createKBThroughClient(t, ctx, c, fmt.Sprintf("sdk-record-%d", time.Now().UnixNano()))
 
 	w, err := c.Submit(ctx, kbID, []client.Change{
 		{Op: "ADD", DocID: "doc-1", Content: "客户端 SDK：提交、留档、重发。"},
@@ -105,12 +100,7 @@ func TestT4_ClientSDK_WaitsForReadinessAndDiscards(t *testing.T) {
 	defer cancel()
 
 	c := dialTestClient(t)
-	kbID, err := c.CreateKnowledgeBase(ctx,
-		fmt.Sprintf("sdk-wait-%d", time.Now().UnixNano()),
-		"http://stratum-embed:8080", "test-model")
-	if err != nil {
-		t.Fatalf("CreateKnowledgeBase: %v", err)
-	}
+	kbID := createKBThroughClient(t, ctx, c, fmt.Sprintf("sdk-wait-%d", time.Now().UnixNano()))
 
 	w, err := c.Submit(ctx, kbID, []client.Change{
 		{Op: "ADD", DocID: "doc-1", Content: "客户端 SDK：等就绪、拿决策。"},
@@ -170,5 +160,36 @@ func TestT4_ClientSDK_WaitsForReadinessAndDiscards(t *testing.T) {
 	}
 	if err := c.Discard(ctx, doomed.ID); err != nil {
 		t.Errorf("repeated Discard = %v, want it harmless (the server answers discarded=false)", err)
+	}
+}
+
+// createKBThroughClient is the SDK's own path to a knowledge base, with the same
+// election-tolerant retry the gRPC helpers use: the station has no leader to route to
+// while the cluster elects, and that is a wait, not a failure.
+func createKBThroughClient(t *testing.T, ctx context.Context, c *client.Client, name string) string {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	backoff := 100 * time.Millisecond
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		kbID, err := c.CreateKnowledgeBase(ctx, name, "http://stratum-embed:8080", "test-model")
+		if err == nil {
+			t.Logf("created KB %s for %s (attempt %d)", kbID, name, attempt)
+			return kbID
+		}
+		if !isTransientSetupError(err) {
+			t.Fatalf("CreateKnowledgeBase: %v", err)
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			t.Fatalf("CreateKnowledgeBase never succeeded within %d attempt(s): %v", attempt, lastErr)
+		}
+		time.Sleep(backoff)
+		if backoff < 2*time.Second {
+			backoff *= 2
+		}
 	}
 }
