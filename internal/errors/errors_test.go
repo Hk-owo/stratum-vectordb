@@ -20,6 +20,7 @@ func TestToGRPCStatus(t *testing.T) {
 		{"ErrVersionNotFound", ErrVersionNotFound, codes.NotFound, false},
 		{"ErrVersionPending", ErrVersionPending, codes.FailedPrecondition, false},
 		{"ErrVersionFailed", ErrVersionFailed, codes.FailedPrecondition, false},
+		{"ErrVersionDataFailed", ErrVersionDataFailed, codes.FailedPrecondition, false},
 		{"ErrVersionDeleting", ErrVersionDeleting, codes.FailedPrecondition, false},
 		{"ErrVersionIsActive", ErrVersionIsActive, codes.FailedPrecondition, false},
 		{"ErrKnowledgeBaseNotFound", ErrKnowledgeBaseNotFound, codes.NotFound, false},

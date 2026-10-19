@@ -16,6 +16,7 @@ import (
 	"stratum/internal/index"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
+	"stratum/internal/tombstone"
 	"stratum/internal/versiondoc"
 )
 
@@ -43,6 +44,13 @@ type storageStack struct {
 	ChunkSplitter  splitter.ChunkSplitter
 	IndexManager   *index.IndexManagerImpl
 	EmbedClient    *embed.HTTPEmbedClient
+
+	// Tombstones is this node's durable record of versions the control layer told
+	// it are deleted. It lives beside the other stores because it is storage-layer
+	// state: the reverse reconciliation can always re-derive the same answer from
+	// the control layer, but this is what refuses a late arrival on the landing
+	// path, with no round trip and no control tier reachable.
+	Tombstones *tombstone.PebbleStore
 }
 
 // buildStorageStack opens every local store under dataDir and wires the index
@@ -72,6 +80,11 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		return nil, fmt.Errorf("open VersionDocList: %w", err)
 	}
 
+	tombstones, err := tombstone.NewPebbleStore(dataDir + "/tombstone")
+	if err != nil {
+		return nil, fmt.Errorf("open Tombstones: %w", err)
+	}
+
 	chunkStore, err := chunkstore.NewVecstoreChunkStore(cfg.VecstoreGRPCAddr)
 	if err != nil {
 		return nil, fmt.Errorf("connect to vecstore at %s: %w", cfg.VecstoreGRPCAddr, err)
@@ -82,6 +95,7 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		ChunkDocMapper: cdm,
 		VersionDocList: vd,
 		ChunkStore:     chunkStore,
+		Tombstones:     tombstones,
 		EmbedClient:    embed.NewHTTPEmbedClient(cfg.EmbedServiceAddr, 30*time.Second),
 	}
 
@@ -239,6 +253,11 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 func (s *storageStack) Close() {
 	if s == nil {
 		return
+	}
+	// A close failure here has nothing to act on at shutdown: Pebble replays its log
+	// on the next open, so the table's contents survive regardless.
+	if s.Tombstones != nil {
+		_ = s.Tombstones.Close()
 	}
 	if s.ChunkStore != nil {
 		s.ChunkStore.Close()

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -54,7 +55,32 @@ type Follower struct {
 	// handshake. Zero means DefaultPullDialTimeout. Tests set it to prove the
 	// bound does not leak onto the transfer (see PullVersionData).
 	pullDialTimeout time.Duration
+
+	// tombstones is this node's record of versions it has been told are deleted.
+	// A pull runs on the receiving side, so it is the one place a version whose
+	// metadata no longer exists can still be recognised — the source cannot know
+	// that this node already brought it up to date past the deletion.
+	// Optional: without it a pull of such a version writes it back and the reverse
+	// reconciliation finds it later.
+	tombstones VersionTombstoneReader
 }
+
+// SetVersionTombstones wires this node's record of deleted versions.
+//
+// A setter rather than a constructor argument, like the other optional halves of
+// this type: the store is assembled after the follower in every assembly.
+func (f *Follower) SetVersionTombstones(t VersionTombstoneReader) {
+	f.tombstones = t
+}
+
+// errVersionTombstoned reports that a version was refused because this node knows
+// it is deleted. Nothing is broken and the version will never be wanted again, so
+// callers in this package treat it as "no work" rather than as a failure.
+//
+// The landing paths in internal/plane check the table themselves before they get
+// here (that is where the skip belongs — the cursor must not move), so this is the
+// last line rather than the first.
+var errVersionTombstoned = errors.New("sync: version was deleted on this node")
 
 // DefaultPullDialTimeout bounds the connection handshake of a pull.
 const DefaultPullDialTimeout = 15 * time.Second
@@ -217,6 +243,25 @@ func NewFollower(
 // version's data reaches, so building here meant every replica built every
 // version, which is the cost lazy construction exists to remove.
 func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID string, versionID int64) error {
+	// Refused before the connection is made: this node was told the version is
+	// deleted, so pulling it would write data back that the deletion already
+	// reclaimed. The refusal is a RETURN VALUE rather than a silent success because
+	// the caller must not advance this node's cursor over a version it does not
+	// hold — VersionTombstoned is how it tells this apart from "the pull worked".
+	if f.tombstones != nil {
+		if kbGone, err := f.tombstones.ContainsKB(ctx, kbID); err == nil && kbGone {
+			return fmt.Errorf("sync: pull %s v%d from %s: %w", kbID, versionID, leaderAddr, errVersionTombstoned)
+		}
+		gone, err := f.tombstones.Contains(ctx, kbID, versionID)
+		switch {
+		case err != nil:
+			// Unreadable is not "alive": the pull proceeds, and the reverse
+			// reconciliation covers anything it lets through.
+		case gone:
+			return fmt.Errorf("sync: pull %s v%d from %s: %w", kbID, versionID, leaderAddr, errVersionTombstoned)
+		}
+	}
+
 	// The connection HANDSHAKE gets its own bound; the TRANSFER does not.
 	//
 	// grpc.WithBlock() waits for the connection to be established, so a peer that

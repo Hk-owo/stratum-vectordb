@@ -173,12 +173,24 @@ func (d *LocalDataPlane) ReconcileDeletedVersions(ctx context.Context, meta Meta
 // DefaultDeletedReconcileInterval is how often the periodic reverse reconciliation
 // looks for local leftovers of deleted versions.
 //
-// Five minutes, following the other disk-hygiene passes (chunk GC, WAL reclamation,
-// build-residue sweep). What this pass leaks is SPACE and nothing else — a leftover is
-// unreachable phantom data, because every query goes through the control layer's
-// judgement — so it belongs to the housekeeping cadence rather than to the
-// terminal-reclaim queue's minute.
-const DefaultDeletedReconcileInterval = 5 * time.Minute
+// An hour, and it USED to be five minutes. What changed is that this pass is no
+// longer what makes a deletion timely:
+//
+//   - the tombstone table (internal/tombstone) is written the moment this node is
+//     told, refuses data on every landing path, and retries its own unfinished
+//     reclaims every 30 s (StartDeletedVersionRetry) — so "I was told and something
+//     went wrong" is repaired without asking anyone;
+//   - what this pass alone can answer is the case that table cannot know: a node
+//     NEVER told (unreachable when the broadcast ran, or absent through a topology
+//     change) has no entry, and the only way to find its leftovers is to compare
+//     what it holds against the control layer's live chain.
+//
+// That comparison is the one judgement with no retention and no gaps, so it stays —
+// an hour is slow enough to be housekeeping and fast enough that a node nobody told
+// does not hold phantom bytes for a working day. What it leaks until then is SPACE
+// and nothing else: a leftover is unreachable phantom data, because every query goes
+// through the control layer's judgement.
+const DefaultDeletedReconcileInterval = time.Hour
 
 // StartDeletedVersionReconcile runs the reverse reconciliation on a cadence until ctx
 // ends, skipping every pass in which nothing local has changed.
@@ -196,6 +208,12 @@ const DefaultDeletedReconcileInterval = 5 * time.Minute
 // the honest price of not having to decide WHICH landing could have left a leftover.
 // That price is bounded by what this node holds — the pass reads its own version list
 // and asks one range per knowledge base — not by what the knowledge base ever had.
+//
+// NOTE the blind spot this leaves, and why it is now affordable: "an idle node pays
+// nothing" also means a deletion the CONTROL LAYER performed on an idle node waits for
+// the next landing or the next restart. That window is what the tombstone table covers
+// (the notification is recorded locally when it arrives and retried every 30 s), so this
+// pass is free to be the slow, authoritative answer instead of the fast one.
 //
 // The action is the startup pass's, unchanged: ReconcileDeletedVersions is idempotent
 // end to end. The opt-in is NOT, and deliberately — `reconcile.deleted_versions`
@@ -224,17 +242,21 @@ func (d *LocalDataPlane) StartDeletedVersionReconcile(ctx context.Context, meta 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if !d.takeDeletedReconcileDirty() {
-					continue
-				}
-				reclaimed, err := d.ReconcileDeletedVersions(ctx, meta)
+				start := time.Now()
+				// The INCREMENTAL path runs every pass: it is one small read, and it is
+				// what makes a deletion known without re-reading a whole range. Whether
+				// the live-chain judgement also runs is ReconcileDeletions' decision —
+				// on a dirty local set, on a forced full pass, or whenever the log
+				// cannot serve this node.
+				res, err := d.ReconcileDeletions(ctx, meta)
 				if err != nil {
-					d.logger.Warn("plane: periodic reconcile of deleted versions did not finish; the next pass retries it",
+					d.logger.Warn("plane: periodic deletion sweep did not finish; the next pass retries it",
 						zap.Error(err))
 				}
-				if reclaimed > 0 {
-					d.logger.Info("plane: periodic reconcile reclaimed local leftovers of deleted versions",
-						zap.Int("versions", reclaimed))
+				d.logDeletionSweep(res, time.Since(start))
+				if res.Reclaimed > 0 {
+					d.logger.Info("plane: periodic deletion sweep reclaimed local leftovers",
+						zap.Int("versions", res.Reclaimed), zap.String("source", res.Source))
 				}
 			}
 		}
@@ -261,6 +283,19 @@ func reconcileJitter(interval time.Duration) time.Duration {
 // takeDeletedReconcileDirty consumes the dirty flag. Read-and-clear in one hold: two
 // passes must not both act on the same change — harmless, since the action is
 // idempotent, but it would double the work for nothing.
+// peekDeletedReconcileDirty reports whether the local holdings changed since the last
+// reverse reconciliation, WITHOUT consuming the flag.
+//
+// The flag's consumer is the live-chain pass, and only it: a local landing is a reason
+// to compare this node's set against the live chain, not a reason to read an
+// incremental log that cannot describe a late push. Peeking first is what lets the
+// sweep choose a path without stealing the trigger from the path that needs it.
+func (d *LocalDataPlane) peekDeletedReconcileDirty() bool {
+	d.versionMu.RLock()
+	defer d.versionMu.RUnlock()
+	return d.deletedReconcileDirty
+}
+
 func (d *LocalDataPlane) takeDeletedReconcileDirty() bool {
 	d.versionMu.Lock()
 	defer d.versionMu.Unlock()

@@ -739,7 +739,13 @@ func verifyFollowerPull(ctx context.Context, n *realNode, kbID string, versionID
 // asynchronous and may transiently serve an empty index).
 func waitQueryDoc(t *testing.T, n *realNode, kbID string, versionID int64, vec []float32, docID string) *pb.QueryResult {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	// 60 s, matching waitVersionReady's patience and for the same reason: this helper
+	// waits for ONE node to converge, and a node that has just installed a snapshot has
+	// to pull every version's document set afterwards — under load that legitimately
+	// outlives 20 s, and the failure it produced ("version 6's document set is not on
+	// this replica yet") says the system was still converging, not wrong. Measured:
+	// 4/15 runs tripped the 20 s bound, none of them with a served-but-wrong answer.
+	deadline := time.Now().Add(60 * time.Second)
 	backoff := 50 * time.Millisecond
 
 	// The query is issued here rather than through queryTolerant so that the
@@ -756,6 +762,14 @@ func waitQueryDoc(t *testing.T, n *realNode, kbID string, versionID int64, vec [
 		})
 		switch {
 		case err != nil && isTransientQueryError(err):
+			lastErr, lastResults = err, nil
+		case err != nil && isNotYetAppliedHere(err):
+			// A node that has just restarted answers NotFound for a knowledge base or
+			// version it has not applied YET. That is not "it does not exist" — it is
+			// "this replica has not caught up", which is exactly what this helper waits
+			// for (the same lesson as §H: a cluster-level fact must not be used to judge
+			// whether THIS node has converged). The deadline below still fails a version
+			// or knowledge base that really is gone.
 			lastErr, lastResults = err, nil
 		case err != nil:
 			t.Fatalf("node %d: Query(kb=%s, v=%d): %v", n.nodeID, kbID, versionID, err)
@@ -1115,6 +1129,22 @@ func isTransientQueryError(err error) bool {
 		}
 	}
 	return false
+}
+
+// isNotYetAppliedHere reports whether err is "this replica has not applied that
+// metadata yet" — NotFound for the knowledge base or the version.
+//
+// It is deliberately NOT folded into isTransientQueryError: that function answers a
+// cluster-level question ("should the caller try another node?"), where NotFound is
+// permanent. Here the question is per-node and time-bounded ("has this node caught
+// up?"), and a restarted node answers NotFound until its apply loop reaches the entry.
+func isNotYetAppliedHere(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.NotFound {
+		return false
+	}
+	msg := strings.ToLower(st.Message())
+	return strings.Contains(msg, "knowledge base not found") || strings.Contains(msg, "version not found")
 }
 
 func findResult(results []*pb.QueryResult, docID string) *pb.QueryResult {

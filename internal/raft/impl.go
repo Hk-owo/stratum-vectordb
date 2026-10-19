@@ -50,6 +50,30 @@ import (
 // and may retry.
 var errSuperseded = errors.New("raft: proposal superseded by a different leader's entry at the same index")
 
+// errApplyTimeout is returned to a Propose* call whose entry was appended and then
+// never applied within proposeApplyTimeout. The entry may still commit later, so
+// this is "unknown outcome", not "failed" — callers must be safe to retry (see the
+// note in proposeAndWait).
+var errApplyTimeout = errors.New("raft: proposal appended but not applied within the wait budget; its outcome is unknown")
+
+const (
+	// proposalApplyPoll is how often a waiting proposal re-checks that it can still
+	// commit at all. The granularity is the one this cluster already uses to notice
+	// anything (takeoverTimeout in the service layer): fast enough that a leadership
+	// change unblocks a waiting caller before a request deadline does, slow enough
+	// that a burst of waiters costs nothing.
+	proposalApplyPoll = 200 * time.Millisecond
+
+	// defaultProposeApplyTimeout bounds how long a Propose* call waits for its entry
+	// to be applied. Generous on purpose: an apply is normally sub-millisecond, and
+	// the cases that legitimately take longer (snapshot install, a slow disk behind
+	// the apply loop) must not be turned into failures. What this bound exists for
+	// is the case with no other exit — a leader that lost quorum and still believes
+	// it leads — where waiting forever means one stuck proposal holds its caller
+	// (and, through the build pool, a node's shutdown) indefinitely.
+	defaultProposeApplyTimeout = 60 * time.Second
+)
+
 // PeerConfig identifies one other cluster member's Raft RPC address.
 type PeerConfig struct {
 	ID          int64
@@ -77,6 +101,21 @@ type Config struct {
 	HeartbeatInterval  time.Duration
 	ElectionTimeoutMin time.Duration
 	ElectionTimeoutMax time.Duration
+
+	// DeletedLogLimit bounds the control layer's deletion log — the bounded record a
+	// storage node consumes incrementally (see RaftNodeImpl.DeletionsSince). Zero
+	// means defaultDeletedLogLimit.
+	//
+	// It is a trade: a bigger log means a node can fall further behind before it has
+	// to re-judge from the live chain, and every entry rides in each snapshot.
+	DeletedLogLimit int
+
+	// ProposeApplyTimeout bounds how long one Propose* call waits for its entry to
+	// be applied before reporting an UNKNOWN outcome (see errApplyTimeout). Zero
+	// means defaultProposeApplyTimeout. A smaller value makes a node give up sooner
+	// on a proposal whose leader has lost quorum; it does not make this node stop
+	// waiting for leadership changes, which is polled separately.
+	ProposeApplyTimeout time.Duration
 }
 
 // pendingProposal tracks a single in-flight Propose* call waiting for its
@@ -129,6 +168,10 @@ type RaftNodeImpl struct {
 
 	applyLoopDone chan struct{}
 	callbackWG    sync.WaitGroup
+
+	// proposeApplyTimeout bounds one Propose* call's wait for its entry to be
+	// applied (Config.ProposeApplyTimeout, or defaultProposeApplyTimeout).
+	proposeApplyTimeout time.Duration
 
 	// onVersionCreated is an optional callback invoked after a cmdCreateVersion
 	// is applied on this node — on EVERY applier, the proposer included. It is a
@@ -222,13 +265,15 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 	impl := &RaftNodeImpl{
 		raft:          rf,
 		wal:           cfg.WAL,
-		sm:            newStateMachine(),
+		sm:            newStateMachineWithDeletedLogLimit(cfg.DeletedLogLimit),
 		logger:        logger,
 		persister:     persister,
 		applyCh:       applyCh,
 		pending:       make(map[uint64]*pendingProposal),
 		settled:       make(map[uint64]settledResult),
 		applyLoopDone: make(chan struct{}),
+
+		proposeApplyTimeout: cfg.ProposeApplyTimeout,
 	}
 
 	// Restore the state machine from any persisted snapshot (taken
@@ -286,7 +331,33 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 func (impl *RaftNodeImpl) Stop() {
 	impl.raft.Stop()
 	<-impl.applyLoopDone
+	// Nobody is left to settle a waiter: the apply loop has exited, so an entry
+	// that has not been applied by now never will be on this node. A caller whose
+	// context has no deadline — every build-complete callback is one, it reports
+	// with context.Background() — would otherwise block for the rest of the
+	// process's life, which is exactly how "stop a node" turned into a hang that
+	// only the test binary's timeout ended (integration
+	// TestRealStack_ThreeNodeCluster_FaultTolerance parked for 9 minutes in
+	// index.IndexManagerImpl.Close → buildPool.Close → this waiter).
+	impl.failAllPending(kvraft.ErrStopped)
 	impl.callbackWG.Wait()
+}
+
+// failAllPending settles every waiter as failed and empties the table. Used by
+// Stop: after the apply loop is gone, waiting is no longer a thing that can
+// succeed, and telling the callers is the difference between a shutdown and a
+// deadlock.
+func (impl *RaftNodeImpl) failAllPending(err error) {
+	impl.pendingMu.Lock()
+	pending := impl.pending
+	impl.pending = make(map[uint64]*pendingProposal)
+	impl.pendingMu.Unlock()
+
+	for _, p := range pending {
+		// resultCh is buffered (size 1), so this never blocks even if the waiter
+		// gave up on its own (ctx cancellation, apply budget) a moment ago.
+		p.resultCh <- applyResult{Err: err}
+	}
 }
 
 // SetOnVersionCreated registers a callback that is invoked when a
@@ -673,15 +744,72 @@ func (impl *RaftNodeImpl) proposeAndWait(ctx context.Context, cmd command) (appl
 	impl.pending[index] = &pendingProposal{term: term, resultCh: resultCh}
 	impl.pendingMu.Unlock()
 
-	select {
-	case res := <-resultCh:
-		return res, nil
-	case <-ctx.Done():
-		impl.pendingMu.Lock()
-		delete(impl.pending, index)
-		impl.pendingMu.Unlock()
-		return applyResult{}, ctx.Err()
+	// The wait below is bounded twice, and both bounds exist for the same reason:
+	// waiting for an apply that cannot happen must not outlive the reason to wait.
+	//
+	//   - a poll that gives up as soon as THIS node stops being the leader at the
+	//     term it proposed in. A stale leader — one that has not yet heard from the
+	//     new one — can append entries forever and never commit any of them, and
+	//     nothing else in this call would ever notice. This is the common case and
+	//     it resolves in one poll interval;
+	//   - an absolute budget for the rest: a leader that still believes it leads
+	//     but has lost quorum keeps appending without committing, and no signal
+	//     available here distinguishes it from a slow apply.
+	//
+	// Giving up is reported as "the outcome is unknown", never as "it failed": the
+	// entry may still commit later. Every caller in this package is safe on that
+	// reading because the writes carry their own idempotency (a CreateVersion under
+	// the same client_request_id returns the same version; a status report is a
+	// set, not an increment).
+	poll := time.NewTicker(proposalApplyPoll)
+	defer poll.Stop()
+	budget := impl.proposeApplyTimeout
+	if budget <= 0 {
+		budget = defaultProposeApplyTimeout
 	}
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case res := <-resultCh:
+			return res, nil
+		case <-ctx.Done():
+			impl.forgetPending(index)
+			return applyResult{}, ctx.Err()
+		case <-impl.applyLoopDone:
+			// The apply loop is gone, so nothing can settle this waiter any more.
+			// Checked here and not only in Stop because both shutdown orders are
+			// real: a node may stop kvraft before this layer, and Stop may race a
+			// proposal that is already in the table.
+			impl.forgetPending(index)
+			return applyResult{Err: kvraft.ErrStopped}, nil
+		case <-poll.C:
+			if termNow := impl.raft.Term(); termNow != term || !impl.raft.IsLeader() {
+				impl.logger.Debug("proposal abandoned: this node is no longer the leader at the term it proposed in",
+					zap.Uint64("index", index),
+					zap.Uint64("proposed_term", term),
+					zap.Uint64("current_term", termNow))
+				impl.forgetPending(index)
+				return applyResult{Err: errSuperseded}, nil
+			}
+		case <-deadline.C:
+			impl.logger.Warn("proposal abandoned: appended but not applied within the budget; its outcome is unknown",
+				zap.Uint64("index", index),
+				zap.Uint64("term", term),
+				zap.Duration("budget", budget))
+			impl.forgetPending(index)
+			return applyResult{}, errApplyTimeout
+		}
+	}
+}
+
+// forgetPending removes one waiter from the table. Safe when it is already gone
+// (the apply side or Stop settled it first).
+func (impl *RaftNodeImpl) forgetPending(index uint64) {
+	impl.pendingMu.Lock()
+	delete(impl.pending, index)
+	impl.pendingMu.Unlock()
 }
 
 // settledResult is an applied entry's outcome kept for a proposer that has not
@@ -995,6 +1123,54 @@ func (impl *RaftNodeImpl) VersionLiveness(_ context.Context, kbID string, fromEx
 		alive = append(alive, id)
 	}
 	return alive, impl.sm.nextVersionID - 1, nil
+}
+
+// DeletionsSince answers a consumer's incremental read of the bounded deletion log:
+// every entry after afterSeq, up to limit of them, plus the three facts the caller
+// needs to interpret what it got.
+//
+// latest is the log's current sequence number, oldest the sequence of its oldest
+// retained entry (0 when the log is empty). A caller whose afterSeq is older than
+// oldest cannot be served incrementally — entries it has not seen are already gone —
+// and that is what truncated means at the consumer's end. The three are returned
+// together, from one lock hold, because they must agree: reading "latest" and "the
+// entries" separately could hand back a sequence number newer than the entries it
+// describes, and a consumer would then advance its watermark past entries it never
+// received.
+//
+// epoch identifies the state machine that minted these sequence numbers. A rebuilt
+// cluster mints a new one, and a consumer that sees a different epoch must treat its
+// watermark as void rather than as "I am ahead" — the two look identical on the
+// sequence alone.
+//
+// Not on the RaftNode interface, for the same reason VersionLiveness is not: its
+// consumer is the storage layer's reconciliation, and a shape without a state
+// machine answers it through RemoteRaftNode.
+func (impl *RaftNodeImpl) DeletionsSince(_ context.Context, afterSeq int64, limit int) ([]types.DeletedVersion, int64, int64, string, error) {
+	impl.sm.mu.RLock()
+	defer impl.sm.mu.RUnlock()
+
+	latest := impl.sm.deletedSeq
+	epoch := impl.sm.deletedEpoch
+	var oldest int64
+	if len(impl.sm.deletedLog) > 0 {
+		oldest = impl.sm.deletedLog[0].Seq
+	}
+
+	if afterSeq >= latest || len(impl.sm.deletedLog) == 0 {
+		return nil, latest, oldest, epoch, nil
+	}
+	out := make([]types.DeletedVersion, 0, limit)
+	for _, entry := range impl.sm.deletedLog {
+		if entry.Seq <= afterSeq {
+			continue
+		}
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		out = append(out, entry)
+	}
+	return out, latest, oldest, epoch, nil
 }
 
 // DeletingVersionIDs answers "which of this knowledge base's versions are still marked

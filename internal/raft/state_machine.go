@@ -3,7 +3,9 @@ package raft
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -50,15 +52,93 @@ type stateMachine struct {
 	// landed (Stratum_设计文档v13.md §7.12). Entries live exactly as long as
 	// the version metadata they point at.
 	versionsByRequest map[string]int64
+
+	// deletedEpoch / deletedSeq / deletedLog are the BOUNDED deletion log a
+	// storage node consumes incrementally (see RaftNodeImpl.DeletionsSince).
+	//
+	// It is a removal record, which this system deliberately removed once before
+	// (docs/known-gaps.md §B: a record is history, pruning can drop it, and a
+	// leftover whose evidence was pruned is invisible forever). What makes it
+	// acceptable now is that it is NOT the judgement: the live-chain read
+	// (VersionLiveness) stays and remains the authority, so a consumer that falls
+	// behind the log, or a node that never had a watermark at all, falls back to it
+	// and loses nothing. The log only spares a consumer from re-reading a whole
+	// range when nothing was deleted.
+	//
+	// deletedEpoch changes when the state machine is created anew (a rebuilt
+	// cluster). A consumer's watermark is (epoch, seq): the epoch is what tells
+	// "your sequence numbers are from another cluster" apart from "you are reading a
+	// replica that is behind" — without it a rebuilt cluster's seq=0 would look like
+	// an ordinary lagging read forever.
+	deletedEpoch    string
+	deletedSeq      int64
+	deletedLog      []types.DeletedVersion
+	deletedLogLimit int
+}
+
+// deletedLogLimit bounds the deletion log. A thousand deletions an hour for ten
+// hours, i.e. enough that a consumer polling on any sane cadence never falls behind
+// it — and small enough that a snapshot carries ~300 KB of it. A consumer that DOES
+// fall behind is told so (truncated) and re-judges from the live chain.
+const defaultDeletedLogLimit = 10_000
+
+// deletedLogLimit returns the effective bound.
+func (sm *stateMachine) deletedLogLimitOrDefault() int {
+	if sm.deletedLogLimit > 0 {
+		return sm.deletedLogLimit
+	}
+	return defaultDeletedLogLimit
 }
 
 func newStateMachine() *stateMachine {
+	return newStateMachineWithDeletedLogLimit(0)
+}
+
+// newStateMachineWithDeletedLogLimit builds a state machine whose deletion log keeps
+// at most limit entries (0 = defaultDeletedLogLimit).
+func newStateMachineWithDeletedLogLimit(limit int) *stateMachine {
 	return &stateMachine{
 		kbs:               make(map[string]types.KnowledgeBaseMeta),
 		versions:          make(map[int64]types.VersionMeta),
 		versionsByKB:      make(map[string][]int64),
 		nextVersionID:     1,
+		deletedEpoch:      newDeletionEpoch(),
+		deletedLogLimit:   limit,
 		versionsByRequest: make(map[string]int64),
+	}
+}
+
+// newDeletionEpoch mints the identity of one state machine's deletion log. Random
+// rather than derived: the whole point is to be different in a rebuilt cluster, and
+// a counter or a timestamp can collide with the previous life.
+func newDeletionEpoch() string {
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		// No randomness means no way to tell "another cluster" apart from "a lagging
+		// replica", which is the difference between a full re-judge and a skip. A
+		// fixed value would make it silently wrong, so refuse to guess.
+		panic(fmt.Sprintf("raft: no randomness for the deletion epoch: %v", err))
+	}
+	return hex.EncodeToString(suffix[:])
+}
+
+// recordDeletion appends one completed deletion to the bounded log. Must be called
+// with sm.mu held.
+func (sm *stateMachine) recordDeletion(kbID string, versionID int64) {
+	sm.deletedSeq++
+	sm.deletedLog = append(sm.deletedLog, types.DeletedVersion{
+		Seq:       sm.deletedSeq,
+		KBID:      kbID,
+		VersionID: versionID,
+	})
+	limit := sm.deletedLogLimitOrDefault()
+	if over := len(sm.deletedLog) - limit; over > 0 {
+		// Copy rather than reslice: reslicing would keep the trimmed entries (and
+		// their strings) reachable from the backing array for as long as the log
+		// lives.
+		kept := make([]types.DeletedVersion, limit)
+		copy(kept, sm.deletedLog[over:])
+		sm.deletedLog = kept
 	}
 }
 
@@ -109,6 +189,12 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		}
 		delete(sm.versionsByKB, cmd.KBID)
 		sm.dropRequestMappings(cmd.KBID, 0)
+		// ONE entry for the whole knowledge base, never one per version: a KB can hold
+		// hundreds of thousands of versions, and appending them would flush the bounded
+		// log (and everything a consumer had not yet read) in a single apply. The entry
+		// names the KB itself — VersionID 0 — and the consumer's reclaim is the KB-wide
+		// prefix delete.
+		sm.recordDeletion(cmd.KBID, 0)
 		return applyResult{}
 
 	case cmdCreateVersion:
@@ -655,6 +741,9 @@ func (sm *stateMachine) applyRemoveVersionMeta(cmd command) applyResult {
 		}
 	}
 	sm.dropRequestMappings(cmd.KBID, cmd.VersionID)
+	// The one moment a version stops existing: recorded so a storage node can learn
+	// about it incrementally (see DeletionsSince).
+	sm.recordDeletion(cmd.KBID, cmd.VersionID)
 	return applyResult{}
 }
 
@@ -850,6 +939,14 @@ type snapshotState struct {
 	VersionsByKB      map[string][]int64
 	NextVersionID     int64
 	VersionsByRequest map[string]int64
+	// The deletion log travels with the snapshot: a node restored from it must be
+	// able to answer a consumer's incremental read. Losing it is survivable (an empty
+	// log with a live sequence reads as "truncated", which sends the consumer back to
+	// the live chain), which is why it is a plain field rather than a durability
+	// mechanism of its own.
+	DeletedEpoch string
+	DeletedSeq   int64
+	DeletedLog   []types.DeletedVersion
 }
 
 // deepCopy returns a stable copy of the current state machine under RLock.
@@ -883,6 +980,9 @@ func (sm *stateMachine) deepCopy() snapshotState {
 		VersionsByKB:      versionsByKB,
 		NextVersionID:     sm.nextVersionID,
 		VersionsByRequest: versionsByRequest,
+		DeletedEpoch:      sm.deletedEpoch,
+		DeletedSeq:        sm.deletedSeq,
+		DeletedLog:        append([]types.DeletedVersion(nil), sm.deletedLog...),
 	}
 }
 
@@ -916,6 +1016,15 @@ func (sm *stateMachine) restore(data []byte) error {
 	sm.versionsByKB = snap.VersionsByKB
 	sm.nextVersionID = snap.NextVersionID
 	sm.versionsByRequest = snap.VersionsByRequest
+	sm.deletedEpoch = snap.DeletedEpoch
+	sm.deletedSeq = snap.DeletedSeq
+	sm.deletedLog = snap.DeletedLog
+	if sm.deletedEpoch == "" {
+		// A snapshot written before the log existed. Mint a fresh epoch rather than
+		// reusing "": consumers compare epochs, and an empty one must not read as "the
+		// same cluster".
+		sm.deletedEpoch = newDeletionEpoch()
+	}
 	if sm.kbs == nil {
 		sm.kbs = make(map[string]types.KnowledgeBaseMeta)
 	}

@@ -21,9 +21,22 @@ import (
 // status code, and one to sentinelNames so the identity survives a process
 // boundary.
 var (
-	ErrVersionNotFound       = errors.New("version not found")
-	ErrVersionPending        = errors.New("version is pending")   // storage-layer write for the version still in progress; not queryable
-	ErrVersionFailed         = errors.New("version index failed") // index build failed; not queryable
+	ErrVersionNotFound = errors.New("version not found")
+	ErrVersionPending  = errors.New("version is pending")   // storage-layer write for the version still in progress; not queryable
+	ErrVersionFailed   = errors.New("version index failed") // index build failed; not queryable
+	// ErrVersionDataFailed is the DATA side's terminal verdict reaching a READER
+	// (Stratum_设计文档v13.md §10.1b): the version's data will never arrive, so
+	// nothing will ever make it queryable.
+	//
+	// Deliberately not ErrVersionPending, which every reader retries: a version
+	// settled on the data side stays PENDING on the index side by construction
+	// (the two halves settle independently), so a reader that only looked at
+	// IndexStatus would answer "still writing, ask again" for a write that was
+	// declared lost — and a retryable answer to an unrecoverable state is how a
+	// caller polls until its deadline without learning anything. The move is a NEW
+	// write under a NEW key; AwaitVersion reports the same state as
+	// DATA_FAILED_PERMANENT.
+	ErrVersionDataFailed     = errors.New("version data will never arrive")
 	ErrVersionDeleting       = errors.New("version is being deleted")
 	ErrVersionIsActive       = errors.New("version is the active version")
 	ErrKnowledgeBaseNotFound = errors.New("knowledge base not found")
@@ -95,6 +108,7 @@ var sentinelNames = []struct {
 	{"version_not_found", ErrVersionNotFound},
 	{"version_pending", ErrVersionPending},
 	{"version_failed", ErrVersionFailed},
+	{"version_data_failed", ErrVersionDataFailed},
 	{"version_deleting", ErrVersionDeleting},
 	{"version_is_active", ErrVersionIsActive},
 	{"version_not_pending", ErrVersionNotPending},
@@ -143,6 +157,7 @@ var grpcCodeMap = map[error]codes.Code{
 	ErrVersionNotFound:           codes.NotFound,
 	ErrVersionPending:            codes.FailedPrecondition,
 	ErrVersionFailed:             codes.FailedPrecondition,
+	ErrVersionDataFailed:         codes.FailedPrecondition,
 	ErrVersionDeleting:           codes.FailedPrecondition,
 	ErrVersionIsActive:           codes.FailedPrecondition,
 	ErrVersionNotPending:         codes.FailedPrecondition,

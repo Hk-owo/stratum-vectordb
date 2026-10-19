@@ -429,7 +429,66 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
+
+	// The data side's terminal verdict comes FIRST — before the PENDING branch and
+	// before the index checks — because the two halves of a version settle
+	// independently (§10.1b): a version whose data was declared lost is still
+	// PENDING on the index side, so a reader that only looked at IndexStatus would
+	// answer "still writing, ask again" for a write that is never coming. Every
+	// retryable answer is a reason for the station to try another replica and for
+	// the caller to keep polling, and none of that can ever help here.
+	if targetVersion.DataStatus == types.DataStatusFailedPermanent {
+		return nil, stratumerrors.ToGRPCStatus(fmt.Errorf(
+			"%w: %s: version %d's data was declared lost, so it will never be queryable (write it again under a new client_request_id)",
+			stratumerrors.ErrVersionDataFailed, kbID, versionID))
+	}
+
+	// Search: get multi × topK chunk results for aggregation headroom.
+	//
+	// Sized here rather than immediately before the search because §8.6b's scan
+	// below spends the same budget: an answer from the chunks has to return the
+	// candidate set the index would have, or one version's answers differ in
+	// recall depending on whether its index happened to be built.
+	searchTopK := topK * 3
+	if searchTopK < 10 {
+		searchTopK = 10
+	}
+	if searchTopK > 1000 {
+		searchTopK = 1000
+	}
+
+	// searchResults carries this request's candidate set. It no longer comes from
+	// exactly one call: a PENDING version can be answered by a scan (§8.6b), so
+	// resolved records that the set is already decided — possibly by an error the
+	// shared handling further down still has to classify.
+	var (
+		searchResults []types.SearchResult
+		searchErr     error
+		resolved      bool
+	)
+
 	if targetVersion.IndexStatus == types.IndexStatusPending {
+		// The PENDING gate reads the DATA side, which is the point of §8.6(b): a
+		// version is answerable when its data is there, not when an index nobody
+		// has asked for has been built. IndexStatus stays PENDING from creation
+		// until a build reports READY, so it covers two very different states —
+		// "the write has not landed" and "the data is durable, the index is a
+		// read-side product that does not exist yet" — and only the first one has
+		// to be refused. RollbackVersion (service/knowledgebase.go) and the state
+		// machine's delete and parent gates already read the data side; this gate
+		// was the last one still reading the index side.
+		//
+		// With the data durable, TrySearch answers immediately for a version below
+		// BruteForceMaxChunks and reports "not now" above it. NOT WAITING is the
+		// requirement here: Search waits out a build, so a version whose index
+		// nobody has built yet would turn a microsecond scan into a
+		// load_wait_timeout. Small versions are exactly the case §8.6b exists for,
+		// and refusing them made every caller pay a build plus a retry for an
+		// answer that was already sitting in the chunks.
+		//
+		// Everything the scan cannot answer falls through to the refusal path
+		// below, whose reasoning is unchanged:
+		//
 		// A PENDING version is not a dead end: §8.6b builds its index lazily, and
 		// THIS request is the "somebody is waiting for it" signal that the lazy
 		// path exists for. Refusing without asking for the build is what made
@@ -442,68 +501,83 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		// Triggering rather than waiting is deliberate: the build runs off this
 		// request (the caller keeps its own deadline), and every retry the station
 		// or the client makes gets a finished index.
-		// docs/index-owner-sharding-plan.md §4.2: the two-step rule for a node that
-		// has been asked for a version. First ask whether a PEER already built this
-		// artifact — installing it is a round trip, building it is minutes — and
-		// fall back to building here if nobody has one.
-		//
-		// Building is the ORDINARY path for the first query after a version is
-		// created: at that point nobody has the artifact. The router decides which
-		// nodes are asked at all (§5), so this runs on the versions a caller
-		// actually wants and nowhere else.
-		if s.indexFetcher != nil {
-			fetched, fetchErr := s.indexFetcher.FetchIndexFromPeers(ctx, kbID, versionID)
-			if fetchErr != nil {
-				s.logger.Debug("query: asking peers for the index artifact failed",
-					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(fetchErr))
-			} else if fetched {
-				// The artifact is on this node's disk and loaded — InstallIndex does
-				// both. This request was already decided against the index state read
-				// above, so it refuses; but the refusal is now index_not_ready rather
-				// than version_pending, because the version is no longer waiting on
-				// anything. The station's retry lands on a replica that has the index.
-				return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrIndexNotReady)
+		if targetVersion.DataStatus == types.DataStatusDurable {
+			scanStart := time.Now()
+			scanned, answered, scanErr := s.indexManager.TrySearch(ctx, kbID, versionID, req.Vector, searchTopK)
+			stageSearch = time.Since(scanStart)
+			if answered {
+				// Includes the refusal case: answered=true travels with an error
+				// when the scan reached a verdict (this replica lacks the vectors,
+				// the version is being deleted, the index is in maintenance). The
+				// shared handling below passes that through, after the same
+				// empty-version test the index path gets.
+				searchResults, searchErr, resolved = scanned, scanErr, true
 			}
 		}
-		if err := s.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
-			s.logger.Debug("query: could not trigger a lazy build for a PENDING version",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		if !resolved {
+			// docs/index-owner-sharding-plan.md §4.2: the two-step rule for a node that
+			// has been asked for a version. First ask whether a PEER already built this
+			// artifact — installing it is a round trip, building it is minutes — and
+			// fall back to building here if nobody has one.
+			//
+			// Building is the ORDINARY path for the first query after a version is
+			// created: at that point nobody has the artifact. The router decides which
+			// nodes are asked at all (§5), so this runs on the versions a caller
+			// actually wants and nowhere else.
+			if s.indexFetcher != nil {
+				fetched, fetchErr := s.indexFetcher.FetchIndexFromPeers(ctx, kbID, versionID)
+				if fetchErr != nil {
+					s.logger.Debug("query: asking peers for the index artifact failed",
+						zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(fetchErr))
+				} else if fetched {
+					// The artifact is on this node's disk and loaded — InstallIndex does
+					// both. This request was already decided against the index state read
+					// above, so it refuses; but the refusal is now index_not_ready rather
+					// than version_pending, because the version is no longer waiting on
+					// anything. The station's retry lands on a replica that has the index.
+					return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrIndexNotReady)
+				}
+			}
+			if err := s.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
+				s.logger.Debug("query: could not trigger a lazy build for a PENDING version",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+			}
+			// The refusal carries the index_not_ready sentinel, and that matters more
+			// than the wording: a bare status.Error here has no wire name, so the
+			// station's isRetryableErr reads it as terminal — it returns the error
+			// WITHOUT trying the replica whose index IS ready, and records the replica
+			// it just refused as failed. Measured: three rounds of that left every
+			// storage node circuit-broken ("router: every node for this layer is
+			// circuit-broken") and spent the test's whole 180 s window on it, while a
+			// sibling replica was serving the same version the whole time.
+			//
+			// Same gRPC code as before (FailedPrecondition), so callers see no change;
+			// what changes is that "another replica may have it" is now sayable.
+			//
+			// ErrVersionPending rather than ErrIndexNotReady: both are retryable wire
+			// names, but this one names the actual state ("the version's write is still
+			// in progress"), which is what someone reading a log wants to know.
+			return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionPending)
 		}
-		// The refusal carries the index_not_ready sentinel, and that matters more
-		// than the wording: a bare status.Error here has no wire name, so the
-		// station's isRetryableErr reads it as terminal — it returns the error
-		// WITHOUT trying the replica whose index IS ready, and records the replica
-		// it just refused as failed. Measured: three rounds of that left every
-		// storage node circuit-broken ("router: every node for this layer is
-		// circuit-broken") and spent the test's whole 180 s window on it, while a
-		// sibling replica was serving the same version the whole time.
-		//
-		// Same gRPC code as before (FailedPrecondition), so callers see no change;
-		// what changes is that "another replica may have it" is now sayable.
-		//
-		// ErrVersionPending rather than ErrIndexNotReady: both are retryable wire
-		// names, but this one names the actual state ("the version's write is still
-		// in progress"), which is what someone reading a log wants to know.
-		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionPending)
 	}
 	if targetVersion.IndexStatus.IsFailed() {
-		return nil, status.Error(codes.FailedPrecondition, "version index is FAILED")
+		// Named, not a bare status.Error: the gRPC code was always
+		// FailedPrecondition, but without a wire name the station cannot classify
+		// it and a caller cannot branch on it — the same reason the PENDING branch
+		// above spells out its sentinel. FAILED and FAILED_PERMANENT travel as the
+		// same reason (both are "this version's index is not usable and no retry of
+		// THIS node helps"); the status in the message says which.
+		return nil, stratumerrors.ToGRPCStatus(fmt.Errorf("%w: %s: version %d's index is %s",
+			stratumerrors.ErrVersionFailed, kbID, versionID, targetVersion.IndexStatus))
 	}
 
-	// Search: get multi × topK chunk results for aggregation headroom.
-	searchTopK := topK * 3
-	if searchTopK < 10 {
-		searchTopK = 10
+	if !resolved {
+		searchStart := time.Now()
+		searchResults, searchErr = s.indexManager.Search(ctx, kbID, versionID, req.Vector, searchTopK)
+		stageSearch = time.Since(searchStart)
 	}
-	if searchTopK > 1000 {
-		searchTopK = 1000
-	}
-
-	searchStart := time.Now()
-	searchResults, err := s.indexManager.Search(ctx, kbID, versionID, req.Vector, searchTopK)
-	stageSearch = time.Since(searchStart)
 	candidateCount = len(searchResults)
-	if err != nil {
+	if searchErr != nil {
 		// An empty version (no documents) has no index entry, so Search
 		// reports ErrIndexNotReady. Treat a genuinely empty version as an
 		// empty result set rather than an error.
@@ -514,10 +588,10 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		// finished catching up indistinguishable from a version with no documents: the
 		// caller gets a well-formed answer with nothing in it, and no reason to ask
 		// another node.
-		if errors.Is(err, stratumerrors.ErrIndexNotReady) && targetVersion.DocIDSetHash == types.EmptyDocIDSetHash {
+		if errors.Is(searchErr, stratumerrors.ErrIndexNotReady) && targetVersion.DocIDSetHash == types.EmptyDocIDSetHash {
 			return &pb.QueryResponse{Results: nil, VersionId: versionID}, nil
 		}
-		return nil, stratumerrors.ToGRPCStatus(err)
+		return nil, stratumerrors.ToGRPCStatus(searchErr)
 	}
 
 	// Filter by threshold.

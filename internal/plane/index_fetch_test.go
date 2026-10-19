@@ -395,6 +395,12 @@ func (s *existingArtifactIndexStore) Search(context.Context, string, int64, []fl
 	return nil, nil
 }
 
+// TrySearch reports "cannot answer right now": an empty answer would read as "no
+// matches" to the query path (§9.1 risk 1).
+func (s *existingArtifactIndexStore) TrySearch(context.Context, string, int64, []float32, int) ([]types.SearchResult, bool, error) {
+	return nil, false, nil
+}
+
 func (s *existingArtifactIndexStore) TriggerBuild(context.Context, string, int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

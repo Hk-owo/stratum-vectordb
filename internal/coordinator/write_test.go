@@ -412,6 +412,13 @@ func (im *testIndexManager) Search(_ context.Context, kbID string, versionID int
 	return nil, nil
 }
 
+// TrySearch reports "cannot answer right now" rather than an empty answer: this
+// stub holds no chunks, and an empty result would be indistinguishable from a
+// version with no matches (§9.1 risk 1).
+func (im *testIndexManager) TrySearch(_ context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, bool, error) {
+	return nil, false, nil
+}
+
 func (im *testIndexManager) TriggerBuild(_ context.Context, kbID string, versionID int64) error {
 	im.mu.Lock()
 	defer im.mu.Unlock()

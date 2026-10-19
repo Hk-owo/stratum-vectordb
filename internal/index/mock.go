@@ -199,12 +199,19 @@ func (m *MockIndexManager) Search(ctx context.Context, kbID string, versionID in
 	}
 	defer m.release(key)
 
+	return rankVectors(idx.vectors, vector, topK), nil
+}
+
+// rankVectors scores every chunk vector against vector and returns the topK.
+// Shared by Search and TrySearch so the mock has one ranking implementation, the
+// same way the real manager has one searchLoaded.
+func rankVectors(vectors map[string][]float32, vector []float32, topK int) []types.SearchResult {
 	type scored struct {
 		chunkID string
 		score   float32
 	}
-	results := make([]scored, 0, len(idx.vectors))
-	for chunkID, v := range idx.vectors {
+	results := make([]scored, 0, len(vectors))
+	for chunkID, v := range vectors {
 		results = append(results, scored{chunkID: chunkID, score: cosineSimilarity(vector, v)})
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].score > results[j].score })
@@ -216,7 +223,63 @@ func (m *MockIndexManager) Search(ctx context.Context, kbID string, versionID in
 	for i, r := range results {
 		out[i] = types.SearchResult{ChunkID: r.chunkID, Score: r.score}
 	}
-	return out, nil
+	return out
+}
+
+// TrySearch satisfies IndexManager: it answers from the in-memory index when
+// there is one, and otherwise by scanning the version's chunks through the
+// injected data-source callbacks — never waiting for a build, exactly like the
+// real implementation's §8.6b path.
+//
+// The mock's "index" is already a scan, so the interesting difference is the one
+// the query path depends on: no acquire, therefore no load_wait_timeout and no
+// ErrIndexNotReady just because nothing has been built for the version.
+func (m *MockIndexManager) TrySearch(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, bool, error) {
+	key := indexKey{kbID, versionID}
+
+	m.mu.Lock()
+	idx, loaded := m.loaded[key]
+	if loaded {
+		idx.refCount++
+		idx.lastAccess = time.Now()
+	}
+	m.mu.Unlock()
+	if loaded {
+		defer m.release(key)
+		return rankVectors(idx.vectors, vector, topK), true, nil
+	}
+
+	if m.listDocIDs == nil || m.listChunkIDsByDocs == nil || m.readChunkVector == nil {
+		return nil, false, nil
+	}
+	docIDs, err := m.listDocIDs(ctx, kbID, versionID)
+	if err != nil {
+		return nil, false, fmt.Errorf("index: ListDocIDs: %w", err)
+	}
+	chunkIDs, err := m.listChunkIDsByDocs(ctx, kbID, docIDs)
+	if err != nil {
+		return nil, false, fmt.Errorf("index: ListChunkIDsByDocs: %w", err)
+	}
+	if len(chunkIDs) == 0 {
+		// Nothing to scan: reported the way an unbuilt index always has been, so
+		// callers' handling of a genuinely empty version still applies.
+		return nil, true, stratumerrors.ErrIndexNotReady
+	}
+	vectors := make(map[string][]float32, len(chunkIDs))
+	for _, chunkID := range chunkIDs {
+		v, readErr := m.readChunkVector(ctx, kbID, chunkID)
+		if readErr != nil {
+			continue // the same tolerance the real scan shows
+		}
+		vectors[chunkID] = v
+	}
+	if len(vectors) == 0 {
+		// Not one vector readable: this replica does not hold the data, which is
+		// a retryable refusal rather than an empty answer.
+		return nil, true, fmt.Errorf("%w: %s: none of the version %d's %d chunks could be read",
+			stratumerrors.ErrIndexNotReady, kbID, versionID, len(chunkIDs))
+	}
+	return rankVectors(vectors, vector, topK), true, nil
 }
 
 // acquire loads (if needed) and pins (ref count += 1) the index for key,

@@ -582,6 +582,12 @@ func (m *reconcileIndexMgr) TriggerBuild(_ context.Context, _ string, versionID 
 func (m *reconcileIndexMgr) Search(_ context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) {
 	return nil, nil
 }
+
+// TrySearch reports "cannot answer right now": this stub exists for reconcile, and
+// an empty answer here would read as "no matches" to the query path.
+func (m *reconcileIndexMgr) TrySearch(_ context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, bool, error) {
+	return nil, false, nil
+}
 func (m *reconcileIndexMgr) RegisterBuildCallback(cb index.BuildCompleteCallback) {}
 func (m *reconcileIndexMgr) RecordInterest(_ string, _ int64)                     {}
 func (m *reconcileIndexMgr) Evict(_ context.Context, kbID string, versionID int64) error {

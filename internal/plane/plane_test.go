@@ -163,6 +163,12 @@ func (s *stubIndexStore) Search(context.Context, string, int64, []float32, int) 
 	return nil, nil
 }
 
+// TrySearch reports "cannot answer right now": this stub holds no chunks, and an
+// empty answer would read as "no matches" to the query path (§9.1 risk 1).
+func (s *stubIndexStore) TrySearch(context.Context, string, int64, []float32, int) ([]types.SearchResult, bool, error) {
+	return nil, false, nil
+}
+
 func (s *stubIndexStore) TriggerBuild(_ context.Context, _ string, versionID int64) error {
 	s.triggered = append(s.triggered, versionID)
 	return nil

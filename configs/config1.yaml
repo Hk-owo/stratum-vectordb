@@ -25,6 +25,9 @@ raft:
   peers:
     - id: 1
       addr: "localhost:8000"
+  # 控制层**有界删除日志**的条数上限；<= 0 用默认的 10000。存储节点靠它做增量对账：
+  # 调大 ⇒ 节点可以落后更久才必须回退全量活链读；代价是每条都随 raft 快照往返。
+  deleted_log_limit: 0
 
 storage:
   data_dir: "/var/lib/stratum/node1"
@@ -64,9 +67,18 @@ reconcile:
   # 操作，不需要任何故障。默认 true 是同一个理由的加强版：只看启动的节点会把这类
   # 数据一直带到下一次重启。
   deleted_versions_periodic: true
-  # 那一趟的间隔秒数；<= 0 用默认的 300（5 分钟）。只在 periodic 打开时读。
-  # 这一档与 chunk GC / WAL 回收 / 构建残留回收一致：它泄漏的只是空间。
+  # **上一次完整活链对账**允许的最大年龄（秒）；<= 0 用默认的 86400（24 小时）。
+  # 增量路径不得把它无限期推后：日志描述不了"晚到 push 留下的残留"，而那是这条兜底
+  # 唯一能发现的东西。名字沿用旧语义（它过去就是这个间隔）。
   deleted_versions_interval_s: 0
+  # 增量快路径：每个 tick 只读控制层的**有界删除日志**，而不是每个 KB 一次区间活链读。
+  # 默认 true，且**独立于** deleted_versions_periodic：两条路成本不同，只想要便宜那条
+  # 是完全合理的部署。日志服务不了的情形（截断 / 纪元不符 / 无水位）才会回退全量。
+  deleted_versions_incremental: true
+  # 增量 tick 的间隔秒数；<= 0 用默认的 60。
+  deleted_versions_incremental_interval_s: 0
+  # 单次增量读的页大小；<= 0 用默认的 512。控制层日志上限 10 000 条 ⇒ 最多 20 页。
+  deleted_versions_log_page: 0
 
 index_manager:
   lru_capacity: 16

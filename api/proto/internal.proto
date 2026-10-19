@@ -37,7 +37,62 @@ service InternalService {
   // (docs/known-gaps.md §B), while these are properties of the current state — nothing to
   // keep, nothing to prune, and no window in which the evidence can disappear. A storage
   // node has no state machine of its own, so this is how it judges its own leftovers.
+  //
+  // DeletionsSince below IS a removal record, and the difference is what it is allowed to
+  // decide: nothing. It is a bounded accelerator that spares a consumer from re-reading a
+  // range when nothing was deleted; every judgement that DELETES DATA still comes from
+  // this call, which is why a consumer that falls behind the log loses no correctness,
+  // only the saving.
   rpc VersionLiveness(VersionLivenessRequest) returns (VersionLivenessResponse);
+
+  // DeletionsSince is the INCREMENTAL read of the bounded deletion log: entries after
+  // after_seq, plus the three facts a consumer needs to interpret them (latest_seq,
+  // oldest_seq, epoch).
+  //
+  // It exists to spare a storage node from re-reading a whole version range when
+  // nothing was deleted — not to replace VersionLiveness, which stays the authority.
+  // A consumer that cannot be served incrementally (its watermark is older than
+  // oldest_seq, or the epoch differs) is expected to fall back to the live-chain read
+  // and lose nothing: the log is a removal record, and removal records are history
+  // that pruning can drop (see VersionLiveness's note), which is exactly why nothing
+  // is allowed to depend on this read alone.
+  //
+  // Sequence numbers are assigned at apply time and identical on every replica, so a
+  // consumer's watermark is comparable across the control tier. The epoch identifies
+  // the state machine that minted them: a rebuilt cluster mints a new one, and a
+  // consumer that sees a different epoch must void its watermark rather than read the
+  // difference as "I am ahead".
+  rpc DeletionsSince(DeletionsSinceRequest) returns (DeletionsSinceResponse);
+}
+
+message DeletionsSinceRequest {
+  // after_seq is the consumer's watermark: only entries with a greater seq come back.
+  int64 after_seq = 1;
+  // limit caps one page. 0 means the server's own page size.
+  int32 limit = 2;
+}
+
+message DeletionsSinceResponse {
+  repeated DeletedVersionEntry entries = 1;
+  // latest_seq is the log's current sequence number (0 when nothing was ever
+  // deleted). Equal to the consumer's watermark means "nothing new".
+  int64 latest_seq = 2;
+  // oldest_seq is the sequence of the oldest RETAINED entry, or 0 when the log is
+  // empty. A consumer whose watermark is below it (or equal to 0 while latest_seq is
+  // above it, i.e. the log itself is empty but sequence numbers exist) has fallen
+  // past the retained window and must re-judge from the live chain.
+  int64 oldest_seq = 3;
+  // epoch identifies the state machine that minted these sequence numbers.
+  string epoch = 4;
+}
+
+message DeletedVersionEntry {
+  int64 seq = 1;
+  string knowledge_base_id = 2;
+  // version_id is the removed version. 0 names the knowledge base ITSELF: a whole-KB
+  // deletion removes the KB and every version in one apply, so it is one entry (never
+  // one per version) and the reclaim is the KB-wide prefix delete.
+  int64 version_id = 3;
 }
 
 message VersionLivenessRequest {

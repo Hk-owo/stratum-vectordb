@@ -14,6 +14,7 @@ func TestNameByNameRoundTripEverySentinel(t *testing.T) {
 		ErrVersionNotFound,
 		ErrVersionPending,
 		ErrVersionFailed,
+		ErrVersionDataFailed,
 		ErrVersionDeleting,
 		ErrVersionIsActive,
 		ErrKnowledgeBaseNotFound,

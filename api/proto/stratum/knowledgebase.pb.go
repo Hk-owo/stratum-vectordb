@@ -40,7 +40,13 @@ const (
 type IndexStatus int32
 
 const (
-	IndexStatus_INDEX_STATUS_PENDING          IndexStatus = 0 // metadata allocated, storage-layer write in progress; not queryable
+	// The index has not been built and reported READY yet. That covers BOTH halves
+	// of a write — "the storage-layer write is in progress" and "the data is
+	// durable, the index is a read-side product nobody has built" — so it does not
+	// by itself mean "not queryable": a version is queryable once its DATA is
+	// durable (DATA_STATUS), because a small one is answered by scanning its chunks
+	// until a build catches up (§8.6(b)).
+	IndexStatus_INDEX_STATUS_PENDING          IndexStatus = 0
 	IndexStatus_INDEX_STATUS_READY            IndexStatus = 1 // index build complete; queryable
 	IndexStatus_INDEX_STATUS_FAILED           IndexStatus = 2 // build failed; RebuildIndex can re-trigger
 	IndexStatus_INDEX_STATUS_FAILED_PERMANENT IndexStatus = 3 // retry budget spent or unrecoverable; only an operator can retry or abandon it

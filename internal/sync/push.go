@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -110,6 +111,13 @@ type PushHandler struct {
 
 	// dropper reclaims a version's physical data on request (v13 §10.6).
 	dropper VersionDataDropper
+
+	// tombstones is this node's record of versions it has been told are deleted.
+	// Two jobs: DeleteVersionData writes it (before reclaiming), and the landing
+	// paths read it to refuse a version whose metadata no longer exists anywhere
+	// else. Optional: without it a late push is written and only the reverse
+	// reconciliation ever notices.
+	tombstones VersionTombstones
 
 	// watcher is the §7.3 takeover hook: this node received a version, so it
 	// should be ready to stand up for it if the coordinator goes quiet.
@@ -316,6 +324,46 @@ func WithVersionDataDropper(d VersionDataDropper) PushHandlerOption {
 	return func(h *PushHandler) { h.dropper = d }
 }
 
+// VersionTombstoneReader answers "does this node already know the version was
+// deleted?" — the one question every landing path asks before writing anything.
+//
+// It is deliberately a LOCAL question with a local answer. After a deletion
+// completes its metadata row is gone, so a late push or a backfill running behind
+// arrives with nothing at the control layer that could name it; the receiving
+// node is the only one that can still refuse it, and only if it kept a record
+// (internal/tombstone).
+type VersionTombstoneReader interface {
+	Contains(ctx context.Context, kbID string, versionID int64) (bool, error)
+	// ContainsKB reports whether the whole knowledge base is known deleted. A version
+	// of a deleted KB has no entry of its own — the KB-level entry is what refuses it.
+	ContainsKB(ctx context.Context, kbID string) (bool, error)
+}
+
+// VersionTombstoneRecorder is the write half: the deletion path records what it
+// was told, and marks it finished once this node's own reclaim succeeds.
+//
+// Both writes travel through the same value because they have to agree about
+// what an entry MEANS — "told, not cleaned up yet" refuses data exactly like
+// "cleaned up" does, which is why Note is called before the reclaim rather than
+// after it.
+type VersionTombstoneRecorder interface {
+	Note(ctx context.Context, kbID string, versionID int64, at time.Time) error
+	MarkDone(ctx context.Context, kbID string, versionID int64, at time.Time) error
+}
+
+// VersionTombstones is what the receive side needs from this node's table.
+type VersionTombstones interface {
+	VersionTombstoneReader
+	VersionTombstoneRecorder
+}
+
+// WithVersionTombstones wires this node's record of deleted versions. Optional,
+// and a node without one behaves exactly as it did before the table existed:
+// late arrivals are written and the reverse reconciliation finds them later.
+func WithVersionTombstones(t VersionTombstones) PushHandlerOption {
+	return func(h *PushHandler) { h.tombstones = t }
+}
+
 // VersionWriteWatcher is the §7.3 takeover hook. The receiving side tells the
 // storage layer "I have just taken delivery of version V", and the storage
 // layer watches for the coordinator's confirmation — announcing the version
@@ -395,6 +443,12 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 
 	var kbID string
 	var versionID int64
+	// deletedHere records that this node already knows the version is gone. The
+	// rest of the stream is drained and the call closes SUCCESSFULLY: the sender has
+	// nothing to fix, and an error would make it retry a version that cannot be
+	// wanted again. Nothing of it is written, and this node does not claim it — no
+	// cursor move, no bloom rebuild, no takeover timer.
+	deletedHere := false
 	for {
 		entry, err := stream.Recv()
 		if err == io.EOF {
@@ -403,15 +457,51 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 		if err != nil {
 			return err
 		}
-		if err := h.follower.applyEntry(ctx, entry); err != nil {
-			return fmt.Errorf("sync: push apply (%s v%d): %w", entry.GetKbId(), entry.GetVersionId(), err)
-		}
-		// Only some entry types carry version_id (chunk records do not), so
-		// take the last non-zero one rather than the last record's value.
+		// Only some entry types carry version_id (chunk records do not), so take the
+		// last non-zero one rather than the last record's value. Recorded before the
+		// check below, because the FIRST frame is what names the version.
 		kbID = entry.GetKbId()
 		if v := entry.GetVersionId(); v != 0 {
 			versionID = v
 		}
+		if !deletedHere && versionID != 0 && h.tombstones != nil {
+			if kbGone, kbErr := h.tombstones.ContainsKB(ctx, kbID); kbErr == nil && kbGone {
+				deletedHere = true
+				h.logger.Info("sync: refusing a pushed version of a knowledge base this node knows was deleted",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+			}
+		}
+		if !deletedHere && versionID != 0 && h.tombstones != nil {
+			gone, tombErr := h.tombstones.Contains(ctx, kbID, versionID)
+			switch {
+			case tombErr != nil:
+				// "I could not read the table" is not "the version is alive". An
+				// unreadable answer must not silently turn into a refusal (the push is
+				// a legitimate arrival in every case but the one it could not check),
+				// and it must not be silent either — the reverse reconciliation still
+				// covers this node, which is exactly what that pass is for.
+				h.logger.Warn("sync: could not read the tombstone table; accepting the pushed version",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(tombErr))
+			case gone:
+				deletedHere = true
+				h.logger.Info("sync: refusing a pushed version this node knows was deleted",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+			}
+		}
+		if deletedHere {
+			continue
+		}
+		if err := h.follower.applyEntry(ctx, entry); err != nil {
+			return fmt.Errorf("sync: push apply (%s v%d): %w", entry.GetKbId(), entry.GetVersionId(), err)
+		}
+	}
+
+	if deletedHere {
+		return stream.SendAndClose(&pb.PushVersionDataResponse{
+			KnowledgeBaseId: kbID,
+			VersionId:       versionID,
+			AcceptorId:      h.nodeID,
+		})
 	}
 
 	if kbID != "" {
@@ -722,8 +812,28 @@ func (h *PushHandler) DeleteVersionData(ctx context.Context, req *pb.DeleteVersi
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"sync: DeleteVersionData(%s v%d): no version-data dropper is wired on this node, so it cannot reclaim the version and must not be reported as cleaned up", kbID, versionID)
 	}
+
+	// Record the deletion BEFORE reclaiming the bytes. The two orders differ in one
+	// window that matters, and it is the whole reason this table exists: a crash or a
+	// failed reclaim in between leaves either "told, not cleaned up" — resumed by this
+	// node's own retry loop, and already refusing data — or "cleaned up, not recorded",
+	// which is the state a late push re-lands data into with nothing left to notice it.
+	if h.tombstones != nil {
+		if err := h.tombstones.Note(ctx, kbID, versionID, time.Now()); err != nil {
+			return nil, status.Errorf(codes.Internal, "sync: DeleteVersionData(%s v%d): record the tombstone: %v", kbID, versionID, err)
+		}
+	}
 	if err := h.dropper.DropVersionStorage(ctx, kbID, versionID); err != nil {
 		return nil, status.Errorf(codes.Internal, "sync: DeleteVersionData(%s v%d): %v", kbID, versionID, err)
+	}
+	if h.tombstones != nil {
+		// A failure here leaves the entry PENDING, which is the conservative side: the
+		// reclaim already succeeded, so the retry loop's next attempt is an idempotent
+		// prefix delete over nothing.
+		if err := h.tombstones.MarkDone(ctx, kbID, versionID, time.Now()); err != nil {
+			h.logger.Warn("sync: could not mark a tombstone done; the retry loop finishes it",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		}
 	}
 	// The version's data is gone here, so any §8.5 announcement pointing at
 	// this node is stale: drop it, or a later pull would aim at a peer that no

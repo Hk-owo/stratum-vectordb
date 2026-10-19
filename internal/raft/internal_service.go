@@ -43,6 +43,34 @@ func (s *InternalServiceServer) VersionLiveness(ctx context.Context, req *pb.Ver
 	}, nil
 }
 
+// DeletionsSince serves the incremental read of the bounded deletion log.
+//
+// No leader requirement, for the same reason VersionLiveness has none: the log is
+// replicated state applied in the same order everywhere, so any node holding it
+// answers consistently. A caller that reaches a replica which has not yet applied a
+// newer entry simply gets a smaller latest_seq — which is why a consumer must read
+// "my watermark is ahead of latest_seq" as "this replica is behind" (skip) rather
+// than as "the cluster rolled back", and why the epoch travels alongside.
+func (s *InternalServiceServer) DeletionsSince(ctx context.Context, req *pb.DeletionsSinceRequest) (*pb.DeletionsSinceResponse, error) {
+	entries, latest, oldest, epoch, err := s.node.DeletionsSince(ctx, req.GetAfterSeq(), int(req.GetLimit()))
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	out := &pb.DeletionsSinceResponse{
+		LatestSeq: latest,
+		OldestSeq: oldest,
+		Epoch:     epoch,
+	}
+	for _, entry := range entries {
+		out.Entries = append(out.Entries, &pb.DeletedVersionEntry{
+			Seq:             entry.Seq,
+			KnowledgeBaseId: entry.KBID,
+			VersionId:       entry.VersionID,
+		})
+	}
+	return out, nil
+}
+
 // Propose decodes a forwarded command and runs it through this node's Raft.
 //
 // A node that is not the leader answers with a redirect (leader_id) instead of

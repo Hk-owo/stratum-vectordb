@@ -392,6 +392,35 @@ func (h *querySvcHarness) setupQueryableKB(t *testing.T, docChunks map[string][]
 	return kbID, vID
 }
 
+// setupDurableDataWithoutIndex creates a version whose DATA has landed while its
+// index has not been built — the PENDING state §8.6b exists for, and the one every
+// freshly written version is in until somebody's query builds an index.
+//
+// The distinction that matters: DataStatus is promoted to DURABLE and IndexStatus
+// is left at its zero value (PENDING).
+func (h *querySvcHarness) setupDurableDataWithoutIndex(t *testing.T, docChunks map[string][]string) (string, int64) {
+	t.Helper()
+	ctx := context.Background()
+
+	kbID := "kb-test"
+	_ = h.raftNode.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID: kbID, Name: "test",
+		ChunkWindowSize: 512, ChunkOverlapSize: 64,
+		EmbedConfig: types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
+	})
+	vID, _ := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
+	_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, vID)
+
+	for docID, chunkIDs := range docChunks {
+		for _, cid := range chunkIDs {
+			h.chunkMapper.Write(ctx, kbID, cid, docID)
+		}
+		h.versionDocs.Write(ctx, kbID, vID, docID)
+		h.docStore.Write(ctx, kbID, docID, vID, []byte("content of "+docID))
+	}
+	return kbID, vID
+}
+
 func TestQueryService_VersionIsolation(t *testing.T) {
 	h := newQuerySvcHarness(t)
 	ctx := context.Background()
@@ -534,7 +563,12 @@ func TestQueryService_BloomFilterFalsePositive(t *testing.T) {
 	}
 }
 
-func TestQueryService_PendingVersionRejected(t *testing.T) {
+// A version whose write has not landed is refused, and the refusal asks for the
+// build that will answer the retry. PENDING covers two states now, and this is the
+// one that still has to be refused: no durable data means a scan would read a
+// half-written document set. The other state — data durable, index not built — is
+// answered from the chunks below.
+func TestQueryService_PendingWriteWithoutDurableDataIsRejected(t *testing.T) {
 	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
@@ -545,7 +579,7 @@ func TestQueryService_PendingVersionRejected(t *testing.T) {
 		EmbedConfig: types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
 	})
 	vID, _ := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
-	// Leave as PENDING — do NOT update to READY.
+	// PENDING on both sides — the write has not been confirmed durable.
 
 	_, err := h.svc.Query(ctx, &pb.QueryRequest{
 		KnowledgeBaseId: kbID,
@@ -560,6 +594,9 @@ func TestQueryService_PendingVersionRejected(t *testing.T) {
 	if st.Code() != codes.FailedPrecondition {
 		t.Errorf("expected FailedPrecondition, got %v", st.Code())
 	}
+	if reason := stratumerrors.ReasonOf(err); reason != "version_pending" {
+		t.Errorf("reason = %q, want version_pending: the caller has to be able to tell \"still writing\" from \"too large to scan\"", reason)
+	}
 
 	// Refusing is only half of it: the request must also ASK for the build.
 	// Otherwise PENDING is permanent — the query that would trigger the lazy
@@ -567,6 +604,192 @@ func TestQueryService_PendingVersionRejected(t *testing.T) {
 	if got := h.indexMgr.TriggeredBuilds(); len(got) != 1 || got[0] != vID {
 		t.Errorf("TriggeredBuilds = %v, want [%d] — a PENDING version must ask for its lazy build",
 			got, vID)
+	}
+}
+
+// The case §8.6b exists for, and the one this path used to refuse: data durable,
+// no index built, version small enough to scan. The answer comes from the chunks
+// immediately instead of costing a build plus a retry.
+func TestQueryService_PendingVersionWithDurableDataIsAnsweredByScan(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+	})
+
+	resp, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err != nil {
+		t.Fatalf("Query on a PENDING version with durable data: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].DocId != "doc-a" {
+		t.Fatalf("results = %+v, want doc-a answered from the version's chunks", resp.Results)
+	}
+	if resp.VersionId != vID {
+		t.Errorf("VersionId = %d, want %d", resp.VersionId, vID)
+	}
+}
+
+// Answering from a scan must not turn "this replica has none of the data" into
+// "nothing matches" — the §9.1 risk 1 failure in its worst form, because an empty
+// answer is not retryable and the caller never learns to ask another replica. The
+// data is durable on a quorum, not on every replica.
+func TestQueryService_PendingVersionWhoseDataIsNotHereIsNotAnEmptyResult(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	// Durable, but this replica holds no document set for the version.
+	kbID, vID := h.setupDurableDataWithoutIndex(t, nil)
+
+	_, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err == nil {
+		t.Fatal("an empty result here would read as \"no matches\"; this replica cannot serve the version")
+	}
+	if reason := stratumerrors.ReasonOf(err); reason != "index_not_ready" {
+		t.Errorf("reason = %q, want index_not_ready: the station has to be able to retry another replica", reason)
+	}
+}
+
+// The other side of the same test: a version whose document set is PROVABLY empty
+// is answered with no results, not an error. The committed digest is what tells
+// the two apart.
+func TestQueryService_PendingEmptyVersionAnswersWithNoResults(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, nil)
+	// The control layer committed the empty set's digest: "no documents" rather
+	// than "this replica has not received them".
+	if err := h.raftNode.ProposeUpdateVersionSummary(ctx, vID, types.EmptyDocIDSetHash); err != nil {
+		t.Fatalf("ProposeUpdateVersionSummary: %v", err)
+	}
+
+	resp, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err != nil {
+		t.Fatalf("a provably empty version must answer with no results: %v", err)
+	}
+	if len(resp.Results) != 0 {
+		t.Errorf("results = %+v, want none", resp.Results)
+	}
+}
+
+// A version whose DATA side was declared lost is terminal, and the reader has to
+// say so. It is still PENDING on the index side by construction (§10.1b settles
+// one side at a time), so answering version_pending would send the station to
+// every other replica and the caller into a retry loop for a write that is never
+// coming — the one state where a retryable answer is actively misleading.
+func TestQueryService_DataSideTerminalVerdictIsNotRetryable(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+	})
+	if err := h.raftNode.ProposeMarkVersionFailedPermanent(ctx, kbID, vID, types.FailureSideData, "retry budget exhausted", 3); err != nil {
+		t.Fatalf("ProposeMarkVersionFailedPermanent: %v", err)
+	}
+
+	_, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a version whose data was declared lost")
+	}
+	if code := status.Code(err); code != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", code)
+	}
+	if reason := stratumerrors.ReasonOf(err); reason != "version_data_failed" {
+		t.Errorf("reason = %q, want version_data_failed: \"still writing\" would send the caller into a retry loop that cannot end", reason)
+	}
+	if got := h.indexMgr.TriggeredBuilds(); len(got) != 0 {
+		t.Errorf("TriggeredBuilds = %v, want none — a version whose data will never arrive needs no index", got)
+	}
+}
+
+// An index-side failure is terminal too, and it now carries a wire name so a
+// caller can branch on it instead of matching on a message.
+func TestQueryService_IndexSideFailureCarriesItsWireName(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+	})
+	h.raftNode.ProposeUpdateVersionStatus(ctx, vID, types.IndexStatusFailed, 0)
+
+	_, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a FAILED index")
+	}
+	if reason := stratumerrors.ReasonOf(err); reason != "version_failed" {
+		t.Errorf("reason = %q, want version_failed", reason)
+	}
+}
+
+// scanRefusingIndexManager stands in for a version above BruteForceMaxChunks: the
+// scan is not the cheaper option, so TrySearch reports "not now" and the query
+// path falls back to its refusal.
+type scanRefusingIndexManager struct {
+	*index.MockIndexManager
+}
+
+func (m *scanRefusingIndexManager) TrySearch(context.Context, string, int64, []float32, int) ([]types.SearchResult, bool, error) {
+	return nil, false, nil
+}
+
+// Answering from a scan is an optimisation, not a promise: above the size
+// threshold the caller still gets the retryable refusal, and the build it asked
+// for then has to be requested.
+func TestQueryService_PendingVersionTooLargeToScanStaysRetryable(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	refusing := &scanRefusingIndexManager{MockIndexManager: h.indexMgr}
+	h.svc.indexManager = refusing
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+	})
+
+	_, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err == nil {
+		t.Fatal("expected an error when the version is too large to scan and no index exists")
+	}
+	if code := status.Code(err); code != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", code)
+	}
+	if reason := stratumerrors.ReasonOf(err); reason != "version_pending" {
+		t.Errorf("reason = %q, want version_pending", reason)
+	}
+	if got := h.indexMgr.TriggeredBuilds(); len(got) != 1 || got[0] != vID {
+		t.Errorf("TriggeredBuilds = %v, want [%d] — the version still needs its build", got, vID)
 	}
 }
 

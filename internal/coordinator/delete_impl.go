@@ -134,6 +134,18 @@ func (c *DeleteCoordinatorImpl) Execute(ctx context.Context, kbID string) error 
 			VersionBloom:   c.cfg.VersionBloom,
 		}
 	}
+	// A failed reclaim ABORTS the deletion, and it stays that way for the whole-KB
+	// path even though the per-version path was decoupled (see
+	// DeleteVersionCoordinatorImpl.deleteOne). Two reasons:
+	//
+	//   - the reclaim here is a persistence barrier, not just a broadcast: it drops
+	//     vectors through the vecstore, and "the completion record must not outlive the
+	//     vectors it claims are gone" is a durability rule this flow enforces
+	//     (TestDeleteCoordinator_FailedFlushFailsBeforeDeleteComplete);
+	//   - a knowledge base deletion is rare and operator-driven, so the cost of
+	//     aborting — the KB stays in DELETING and the sweeper retries it every minute —
+	//     is affordable, while the cost of getting it wrong on the version path (a
+	//     permanently unreachable candidate) was paid continuously.
 	if err := c.retry(ctx, func() error {
 		return dropper.DropKnowledgeBase(ctx, kbID)
 	}); err != nil {

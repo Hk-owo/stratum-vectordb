@@ -34,6 +34,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	InternalService_Propose_FullMethodName         = "/stratum.InternalService/Propose"
 	InternalService_VersionLiveness_FullMethodName = "/stratum.InternalService/VersionLiveness"
+	InternalService_DeletionsSince_FullMethodName  = "/stratum.InternalService/DeletionsSince"
 )
 
 // InternalServiceClient is the client API for InternalService service.
@@ -59,7 +60,31 @@ type InternalServiceClient interface {
 	// (docs/known-gaps.md §B), while these are properties of the current state — nothing to
 	// keep, nothing to prune, and no window in which the evidence can disappear. A storage
 	// node has no state machine of its own, so this is how it judges its own leftovers.
+	//
+	// DeletionsSince below IS a removal record, and the difference is what it is allowed to
+	// decide: nothing. It is a bounded accelerator that spares a consumer from re-reading a
+	// range when nothing was deleted; every judgement that DELETES DATA still comes from
+	// this call, which is why a consumer that falls behind the log loses no correctness,
+	// only the saving.
 	VersionLiveness(ctx context.Context, in *VersionLivenessRequest, opts ...grpc.CallOption) (*VersionLivenessResponse, error)
+	// DeletionsSince is the INCREMENTAL read of the bounded deletion log: entries after
+	// after_seq, plus the three facts a consumer needs to interpret them (latest_seq,
+	// oldest_seq, epoch).
+	//
+	// It exists to spare a storage node from re-reading a whole version range when
+	// nothing was deleted — not to replace VersionLiveness, which stays the authority.
+	// A consumer that cannot be served incrementally (its watermark is older than
+	// oldest_seq, or the epoch differs) is expected to fall back to the live-chain read
+	// and lose nothing: the log is a removal record, and removal records are history
+	// that pruning can drop (see VersionLiveness's note), which is exactly why nothing
+	// is allowed to depend on this read alone.
+	//
+	// Sequence numbers are assigned at apply time and identical on every replica, so a
+	// consumer's watermark is comparable across the control tier. The epoch identifies
+	// the state machine that minted them: a rebuilt cluster mints a new one, and a
+	// consumer that sees a different epoch must void its watermark rather than read the
+	// difference as "I am ahead".
+	DeletionsSince(ctx context.Context, in *DeletionsSinceRequest, opts ...grpc.CallOption) (*DeletionsSinceResponse, error)
 }
 
 type internalServiceClient struct {
@@ -90,6 +115,16 @@ func (c *internalServiceClient) VersionLiveness(ctx context.Context, in *Version
 	return out, nil
 }
 
+func (c *internalServiceClient) DeletionsSince(ctx context.Context, in *DeletionsSinceRequest, opts ...grpc.CallOption) (*DeletionsSinceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeletionsSinceResponse)
+	err := c.cc.Invoke(ctx, InternalService_DeletionsSince_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // InternalServiceServer is the server API for InternalService service.
 // All implementations must embed UnimplementedInternalServiceServer
 // for forward compatibility.
@@ -113,7 +148,31 @@ type InternalServiceServer interface {
 	// (docs/known-gaps.md §B), while these are properties of the current state — nothing to
 	// keep, nothing to prune, and no window in which the evidence can disappear. A storage
 	// node has no state machine of its own, so this is how it judges its own leftovers.
+	//
+	// DeletionsSince below IS a removal record, and the difference is what it is allowed to
+	// decide: nothing. It is a bounded accelerator that spares a consumer from re-reading a
+	// range when nothing was deleted; every judgement that DELETES DATA still comes from
+	// this call, which is why a consumer that falls behind the log loses no correctness,
+	// only the saving.
 	VersionLiveness(context.Context, *VersionLivenessRequest) (*VersionLivenessResponse, error)
+	// DeletionsSince is the INCREMENTAL read of the bounded deletion log: entries after
+	// after_seq, plus the three facts a consumer needs to interpret them (latest_seq,
+	// oldest_seq, epoch).
+	//
+	// It exists to spare a storage node from re-reading a whole version range when
+	// nothing was deleted — not to replace VersionLiveness, which stays the authority.
+	// A consumer that cannot be served incrementally (its watermark is older than
+	// oldest_seq, or the epoch differs) is expected to fall back to the live-chain read
+	// and lose nothing: the log is a removal record, and removal records are history
+	// that pruning can drop (see VersionLiveness's note), which is exactly why nothing
+	// is allowed to depend on this read alone.
+	//
+	// Sequence numbers are assigned at apply time and identical on every replica, so a
+	// consumer's watermark is comparable across the control tier. The epoch identifies
+	// the state machine that minted them: a rebuilt cluster mints a new one, and a
+	// consumer that sees a different epoch must void its watermark rather than read the
+	// difference as "I am ahead".
+	DeletionsSince(context.Context, *DeletionsSinceRequest) (*DeletionsSinceResponse, error)
 	mustEmbedUnimplementedInternalServiceServer()
 }
 
@@ -129,6 +188,9 @@ func (UnimplementedInternalServiceServer) Propose(context.Context, *ProposeReque
 }
 func (UnimplementedInternalServiceServer) VersionLiveness(context.Context, *VersionLivenessRequest) (*VersionLivenessResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method VersionLiveness not implemented")
+}
+func (UnimplementedInternalServiceServer) DeletionsSince(context.Context, *DeletionsSinceRequest) (*DeletionsSinceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeletionsSince not implemented")
 }
 func (UnimplementedInternalServiceServer) mustEmbedUnimplementedInternalServiceServer() {}
 func (UnimplementedInternalServiceServer) testEmbeddedByValue()                         {}
@@ -187,6 +249,24 @@ func _InternalService_VersionLiveness_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _InternalService_DeletionsSince_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeletionsSinceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServiceServer).DeletionsSince(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InternalService_DeletionsSince_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServiceServer).DeletionsSince(ctx, req.(*DeletionsSinceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // InternalService_ServiceDesc is the grpc.ServiceDesc for InternalService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -201,6 +281,10 @@ var InternalService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "VersionLiveness",
 			Handler:    _InternalService_VersionLiveness_Handler,
+		},
+		{
+			MethodName: "DeletionsSince",
+			Handler:    _InternalService_DeletionsSince_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -37,6 +37,7 @@ import (
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
 	stratumsync "stratum/internal/sync"
+	"stratum/internal/tombstone"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 	"stratum/internal/wal"
@@ -216,6 +217,7 @@ func main() {
 			WAL:                walImpl,
 			Logger:             logger.Named("raft"),
 			MaxLogLength:       cfg.MaxLogLength,
+			DeletedLogLimit:    cfg.DeletedLogLimit,
 			HeartbeatInterval:  cfg.HeartbeatInterval,
 			ElectionTimeoutMin: cfg.ElectionTimeoutMin,
 			ElectionTimeoutMax: cfg.ElectionTimeoutMax,
@@ -254,6 +256,9 @@ func main() {
 	var chunkSplitter splitter.ChunkSplitter
 	var indexMgr *index.IndexManagerImpl
 	var embedClient *embed.HTTPEmbedClient
+	// versionTombstones is this node's durable record of versions the control layer
+	// told it are deleted. Nil on a control node (no storage, nothing to refuse).
+	var versionTombstones *tombstone.PebbleStore
 
 	// docs/storage-node-state-machine-plan.md §3: this node's own state, in one
 	// place. Created only where there is storage — a control node keeps none, so
@@ -282,6 +287,7 @@ func main() {
 		ds, cdm, vd, chunkStore = stack.DocStore, stack.ChunkDocMapper, stack.VersionDocList, stack.ChunkStore
 		chunkBloom, vBloomStore = stack.ChunkBloom, stack.VersionBloom
 		chunkSplitter, indexMgr, embedClient = stack.ChunkSplitter, stack.IndexManager, stack.EmbedClient
+		versionTombstones = stack.Tombstones
 		logger.Info("storage layer initialized", zap.String("role", string(cfg.Role)))
 
 		// The stack is open, so startup reconciliation is what this node is
@@ -751,6 +757,11 @@ func main() {
 		// the version, so one built before the data arrived is empty — and an empty filter
 		// answers "nothing matched", with no error, for data this node holds in full.
 		syncFollower.SetVersionBloom(vBloomStore)
+		// A pull runs on the receiving side, so it is where a version whose metadata
+		// no longer exists anywhere can still be recognised (see
+		// LocalDataPlane.SetVersionTombstones for the reconciliation it does NOT
+		// replace).
+		syncFollower.SetVersionTombstones(versionTombstones)
 	}
 
 	// DataPlane owns "does this node need the version's data, and where from"
@@ -834,7 +845,18 @@ func main() {
 		CursorQuerier: stratumsync.NewLocalVersionQuerier(stratumsync.PresenceCheckerConfig{}),
 		// §10.6: a permanently failed version's data is reclaimed locally and
 		// on every candidate replica.
-		DataDropper:        writeCoord,
+		DataDropper: writeCoord,
+		// A whole-KB deletion is ONE entry in the control layer's deletion log
+		// (version 0), so its reclaim needs the KB-level dropper. Without it the
+		// entry stays owed and is reported as such rather than silently dropped.
+		KBDropper: coordinator.LocalKBDropper{
+			IndexManager:   indexMgr,
+			DocStore:       ds,
+			ChunkStore:     chunkStore,
+			ChunkDocMapper: cdm,
+			VersionDocList: vd,
+			VersionBloom:   vBloomStore,
+		},
 		CleanupBroadcaster: stratumsync.NewVersionDataCleaner(stratumsync.PresenceCheckerConfig{}),
 		// §7.3: a replica that received a version stands ready to announce it
 		// if the coordinator's confirmation never arrives.
@@ -866,6 +888,17 @@ func main() {
 		// pulling each version in full. Same dialer config as the other
 		// peer-facing helpers.
 		ChangesFetcher: stratumsync.NewVersionChangesPuller(stratumsync.PresenceCheckerConfig{}),
+		// The control layer's bounded deletion log, read incrementally. Both shapes
+		// answer it (a voter from its own state machine, a storage node through the
+		// internal service), so the assertion succeeds for either role; a shape that
+		// did not would simply leave the sweep on the live-chain path.
+		Deletions: deletionLogSource(rn),
+		// The three knobs that used to be constants. They are one deployment's
+		// judgement about the trade between "how far may a node fall behind" and "how
+		// much does a sweep cost", so they belong in the config file.
+		DeletionLogPage:       cfg.ReconcileDeletionsLogPage,
+		ChainReconcileMaxAge:  time.Duration(cfg.ReconcileDeletedVersionsIntervalS) * time.Second,
+		DisableChainReconcile: !cfg.ReconcileDeletedVersionsPeriodic,
 		Verify: func(ctx context.Context, kbID string, versionID int64) bool {
 			return verifyVersionPull(ctx, rn, vd, kbID, versionID)
 		},
@@ -934,6 +967,15 @@ func main() {
 	// One plane serves both paths: the write path runs its storage transaction
 	// through it, and the read/sync path resolves pulls through it.
 	writeCoord.SetDataPlane(dataPlane)
+
+	// The tombstone table: the landing paths refuse a version this node already
+	// knows was deleted, and its own retry loop finishes a reclaim that a crash or a
+	// failure left unfinished — neither of which needs the control tier. Unwired on
+	// a node with no store, which is the behaviour before this table existed.
+	if versionTombstones != nil {
+		dataPlane.SetVersionTombstones(versionTombstones)
+		dataPlane.StartDeletedVersionRetry(ctx, 0, 0)
+	}
 
 	// The pull path is the third: it is what knows a version's records have
 	// landed here, and this plane is what owns the cursor §9.3(2) reads. Wired
@@ -1057,9 +1099,15 @@ func main() {
 			// that matter, because a push that outlived the delete meant to remove it
 			// needs no failure at all (§B). It skips every pass in which nothing local
 			// changed, so an idle node pays nothing.
-			if cfg.ReconcileDeletedVersionsPeriodic {
+			// Started when EITHER path is on, and paced by the incremental interval:
+			// one tick is "read the log, and re-judge only if something says you must"
+			// (a local landing, a truncated log, the full-pass age). The periodic
+			// switch now gates just the re-judge half, because the two halves have
+			// different costs and wanting the cheap one alone is a reasonable
+			// deployment.
+			if cfg.ReconcileDeletionsIncremental || cfg.ReconcileDeletedVersionsPeriodic {
 				dataPlane.StartDeletedVersionReconcile(ctx, rn,
-					time.Duration(cfg.ReconcileDeletedVersionsIntervalS)*time.Second)
+					time.Duration(cfg.ReconcileDeletionsIncrementalIntervalS)*time.Second)
 			}
 		}
 	}
@@ -1405,7 +1453,11 @@ func main() {
 			// docs/data-source-holders-fallback-plan.md: and the holders, which the
 			// reporter mirrors so its data-source lookup can answer without dialling —
 			// that lookup may run on the Raft apply path, where it cannot ask.
-			stratumsync.WithHolders(dataVersionRegistry)),
+			stratumsync.WithHolders(dataVersionRegistry),
+			// The landing path's last line: a version this node already knows was
+			// deleted is drained and refused here rather than written, so a late push
+			// cannot re-land data whose metadata is gone. nil on a node with no table.
+			tombstoneOption(versionTombstones)),
 		// docs/index-owner-sharding-plan.md §7: the export half of the fetch.
 		// Without it a peer asking this node for an artifact gets "this node does
 		// not export index artifacts", every fetch fails, and every node falls
@@ -1658,6 +1710,26 @@ func (r replicaPusher) PushVersion(ctx context.Context, targetAddr, kbID string,
 // question from "did this build fail". Routing build failures through it set a
 // retryable FAILED with no budget behind it — so nothing ever reached a verdict
 // for the index side, and a build that kept failing simply kept reporting.
+// deletionLogSource narrows a raft node to the incremental deletion-log read, or nil
+// when this shape cannot answer it. The sweep treats nil as "no log reachable" and
+// stays on the live-chain path, which is the behaviour before the log existed.
+func deletionLogSource(rn raft.RaftNode) plane.DeletionLogSource {
+	if src, ok := rn.(plane.DeletionLogSource); ok {
+		return src
+	}
+	return nil
+}
+
+// tombstoneOption returns the receive side's tombstone option, or nil when this
+// node keeps no table. NewPushHandler skips nil options, which keeps the call site
+// free of a branch wrapped around a single argument.
+func tombstoneOption(t *tombstone.PebbleStore) stratumsync.PushHandlerOption {
+	if t == nil {
+		return nil
+	}
+	return stratumsync.WithVersionTombstones(t)
+}
+
 func reportIndexStatus(ctx context.Context, cp plane.ControlPlane, kbID string, versionID int64, status types.IndexStatus) error {
 	switch status {
 	case types.IndexStatusReady:
@@ -2127,6 +2199,11 @@ type appConfig struct {
 	// requested; 0 = kvraft default (1000).
 	MaxLogLength uint64
 
+	// DeletedLogLimit bounds the control layer's deletion log (raft.deleted_log_limit,
+	// 0 = 10 000). A bigger log lets a storage node fall further behind before it has
+	// to re-judge from the live chain; every entry rides in each snapshot.
+	DeletedLogLimit int
+
 	// ControlPlaneFailureBudget is the global default for how many failed
 	// attempts a version tolerates before the control layer declares it
 	// FAILED_PERMANENT (Stratum_设计文档v13.md §10.1), from
@@ -2271,9 +2348,22 @@ type appConfig struct {
 	// boot carries that data until its next restart.
 	ReconcileDeletedVersionsPeriodic bool
 
-	// ReconcileDeletedVersionsIntervalS paces that pass. <= 0 takes the plane's
-	// default (5 minutes). Only read when the periodic pass is on.
+	// ReconcileDeletedVersionsIntervalS is how old the last FULL live-chain pass may
+	// get before the next sweep is forced to run one (<= 0 takes the plane's default,
+	// 24 hours). It used to pace the periodic pass itself; the tick is now
+	// ReconcileDeletionsIncrementalIntervalS, because the passes have different costs.
 	ReconcileDeletedVersionsIntervalS int
+
+	// ReconcileDeletionsIncremental turns on the incremental fast path: one small read
+	// of the control layer's bounded deletion log per tick instead of a per-KB range
+	// scan (reconcile.deleted_versions_incremental, ON by default).
+	ReconcileDeletionsIncremental bool
+	// ReconcileDeletionsIncrementalIntervalS paces that tick (<= 0 takes the plane's
+	// default, 60 s). Only read when the incremental path is on.
+	ReconcileDeletionsIncrementalIntervalS int
+	// ReconcileDeletionsLogPage caps one incremental read (<= 0 takes the plane's
+	// default, 512).
+	ReconcileDeletionsLogPage int
 
 	// IndexServingReplicaMin is how many OTHER replicas must be serving a version
 	// before this node takes itself out of service to collect it
@@ -2389,6 +2479,11 @@ type fileConfig struct {
 		// Exposed so large-volume deployments (or snapshot tests) can
 		// tune compaction frequency without a code change.
 		MaxLogLength int64 `yaml:"max_log_length"`
+		// DeletedLogLimit bounds the bounded deletion log a storage node consumes
+		// incrementally (0 = 10 000 entries). Raising it lets a node fall further
+		// behind before it must re-read a whole version range; it also grows each
+		// snapshot.
+		DeletedLogLimit int `yaml:"deleted_log_limit"`
 	} `yaml:"raft"`
 
 	// ControlPlane carries the control layer's own knobs. Today that is the
@@ -2433,9 +2528,19 @@ type fileConfig struct {
 		// DeletedVersionsPeriodic does the same while the node runs. Independent of
 		// the start-up switch; also on by default.
 		DeletedVersionsPeriodic bool `yaml:"deleted_versions_periodic"`
-		// DeletedVersionsIntervalS paces the periodic pass (<= 0 means the plane's
-		// 5 minutes). Ignored unless DeletedVersionsPeriodic is set.
+		// DeletedVersionsIntervalS is how old the last FULL live-chain pass may get
+		// before the sweep forces another one (<= 0 means the plane's 24 hours).
 		DeletedVersionsIntervalS int `yaml:"deleted_versions_interval_s"`
+		// DeletedVersionsIncremental turns on the incremental fast path — one small
+		// read of the control layer's bounded deletion log per tick, instead of a
+		// per-KB range scan. On by default, and INDEPENDENT of the periodic switch:
+		// the two have different costs, and wanting the cheap one without the
+		// expensive one is a reasonable deployment.
+		DeletedVersionsIncremental bool `yaml:"deleted_versions_incremental"`
+		// DeletedVersionsIncrementalIntervalS paces that tick (<= 0 means 60 s).
+		DeletedVersionsIncrementalIntervalS int `yaml:"deleted_versions_incremental_interval_s"`
+		// DeletedVersionsLogPage caps one incremental read (<= 0 means 512).
+		DeletedVersionsLogPage int `yaml:"deleted_versions_log_page"`
 	} `yaml:"reconcile"`
 
 	IndexManager struct {
@@ -2587,6 +2692,9 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.Raft.ElectionTimeoutMaxMS != 0 {
 		cfg.ElectionTimeoutMax = time.Duration(fc.Raft.ElectionTimeoutMaxMS) * time.Millisecond
 	}
+	if fc.Raft.DeletedLogLimit > 0 {
+		cfg.DeletedLogLimit = fc.Raft.DeletedLogLimit
+	}
 	if fc.Raft.MaxLogLength > 0 {
 		cfg.MaxLogLength = uint64(fc.Raft.MaxLogLength)
 	}
@@ -2695,6 +2803,13 @@ func loadConfig(path string) (appConfig, error) {
 	}
 	cfg.ReconcileDeletedVersions = fc.Reconcile.DeletedVersions
 	cfg.ReconcileDeletedVersionsPeriodic = fc.Reconcile.DeletedVersionsPeriodic
+	cfg.ReconcileDeletionsIncremental = fc.Reconcile.DeletedVersionsIncremental
+	if fc.Reconcile.DeletedVersionsIncrementalIntervalS > 0 {
+		cfg.ReconcileDeletionsIncrementalIntervalS = fc.Reconcile.DeletedVersionsIncrementalIntervalS
+	}
+	if fc.Reconcile.DeletedVersionsLogPage > 0 {
+		cfg.ReconcileDeletionsLogPage = fc.Reconcile.DeletedVersionsLogPage
+	}
 	cfg.ReconcileDeletedVersionsIntervalS = fc.Reconcile.DeletedVersionsIntervalS
 	if fc.IndexManager.ServingReplicaMin != 0 {
 		cfg.IndexServingReplicaMin = fc.IndexManager.ServingReplicaMin
@@ -2820,6 +2935,7 @@ func defaultConfig() appConfig {
 		// On by default too — see the field comments for why this pair differs from
 		// every other irreversibility switch in this file.
 		ReconcileDeletedVersionsPeriodic: true,
+		ReconcileDeletionsIncremental:    true,
 		// 0 => the plane's default interval (5 minutes).
 		ReconcileDeletedVersionsIntervalS: 0,
 		IndexServingReplicaMin:            0,

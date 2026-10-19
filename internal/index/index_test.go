@@ -661,6 +661,106 @@ func TestIndexManager_SearchLargeUnbuiltVersionDoesNotScan(t *testing.T) {
 	}
 }
 
+// §8.6b from the query path's side: TrySearch answers a version whose index
+// nobody has built yet, without waiting for one.
+func TestIndexManager_TrySearchAnswersASmallUnbuiltVersion(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {1, 0}})
+
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: 5 * time.Second})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	results, answered, err := im.TrySearch(context.Background(), "kb-1", 1, []float32{1, 0}, 2)
+	if err != nil {
+		t.Fatalf("TrySearch on a small unbuilt version: %v", err)
+	}
+	if !answered {
+		t.Fatal("answered = false, want a scan to answer a version below BruteForceMaxChunks")
+	}
+	if len(results) != 1 || results[0].ChunkID != "chunk-x" {
+		t.Fatalf("results = %+v, want the version's one chunk", results)
+	}
+}
+
+// The other half of the same rule: above the threshold, scanning costs about what
+// building costs, so TrySearch says "not now" instead of waiting. Reporting that
+// rather than blocking is the difference from Search.
+func TestIndexManager_TrySearchDoesNotWaitForAnOversizedVersion(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"c1", "c2"}, map[string][]float32{
+		"c1": {1, 0}, "c2": {0, 1},
+	})
+
+	im := NewIndexManager(IndexManagerConfig{
+		LRUCapacity:         4,
+		LoadWaitTimeout:     time.Minute, // a wait would hang the test
+		BruteForceMaxChunks: 1,           // two chunks: over the threshold
+	})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	start := time.Now()
+	results, answered, err := im.TrySearch(context.Background(), "kb-1", 1, []float32{1, 0}, 2)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("TrySearch must report \"not now\" with no error, got %v", err)
+	}
+	if answered {
+		t.Errorf("answered = true, want false for an over-threshold version (results=%+v)", results)
+	}
+	if len(results) != 0 {
+		t.Errorf("results = %+v, want none", results)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("TrySearch took %s: it must not wait for a build (LoadWaitTimeout is a minute)", elapsed)
+	}
+}
+
+// An index that IS in memory is preferred over scanning: it is the cheaper answer
+// and the exact one, and a version's artifact can be loaded before the control
+// layer has been told the build finished — the very window the query path asks in.
+func TestIndexManager_TrySearchUsesTheLoadedIndexInsteadOfScanning(t *testing.T) {
+	vc := newMockVectorIndexClient()
+	vc.searchFn = func(string, int64, []float32, int) ([]types.SearchResult, error) {
+		return []types.SearchResult{{ChunkID: "from-index", Score: 0.9}}, nil
+	}
+	ds := newDocSource()
+	ds.addDoc(1, "doc-1", []string{"chunk-x"}, map[string][]float32{"chunk-x": {1, 0}})
+
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 4, LoadWaitTimeout: 5 * time.Second})
+	im.vectorIndexClient = vc
+	im.listDocIDs = ds.ListDocIDs
+	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+	im.readChunkVector = ds.ReadChunkVector
+
+	if err := im.TriggerBuild(context.Background(), "kb-1", 1); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !im.IsLoaded("kb-1", 1) {
+		if time.Now().After(deadline) {
+			t.Fatal("the index was never loaded, so this test cannot tell the two paths apart")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	results, answered, err := im.TrySearch(context.Background(), "kb-1", 1, []float32{1, 0}, 2)
+	if err != nil {
+		t.Fatalf("TrySearch: %v", err)
+	}
+	if !answered || len(results) != 1 || results[0].ChunkID != "from-index" {
+		t.Fatalf("results = %+v (answered=%v), want the answer the vector index gave", results, answered)
+	}
+}
+
 // §8.6a: deciding "is this version cold?" is a question about query
 // traffic, so the record must survive in-memory eviction and be dropped
 // only when the version/KB is really gone.

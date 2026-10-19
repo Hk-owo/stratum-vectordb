@@ -187,16 +187,35 @@ type LocalDataPlane struct {
 	// included (1 = no replication). fanOut needs it to tell an expected empty
 	// target list from a broken one; see the field of the same name on
 	// LocalDataPlaneConfig.
-	replicaCount   int
-	cursorQuerier  CursorQuerier
-	dropper        VersionDataDropper
-	cleaner        VersionDataCleaner
-	presence       VersionPresenceQuerier
-	digest         VersionDigest
-	confirmer      WriteConfirmer
-	indexReader    IndexReader
-	indexFetcher   IndexFetcher
-	indexInstaller IndexInstaller
+	replicaCount  int
+	cursorQuerier CursorQuerier
+	dropper       VersionDataDropper
+	cleaner       VersionDataCleaner
+	// tombstones is this node's record of deletions it was told about (see
+	// SetVersionTombstones). Read on every landing path, drained by
+	// StartDeletedVersionRetry, and the home of this node's watermark into the
+	// control layer's deletion log.
+	tombstones VersionTombstones
+	// kbDropper reclaims a whole knowledge base locally. Needed by the retry loop
+	// because a KB deletion is ONE log entry (version 0), not one per version.
+	kbDropper KBStorageDropper
+	// deletions is the control layer's bounded deletion log, read incrementally. Nil
+	// means no log is reachable and ReconcileDeletions always takes the live-chain path.
+	deletions       DeletionLogSource
+	deletionLogPage int
+	// chainReconcileEnabled gates the periodic FULL pass; see the config field.
+	chainReconcileEnabled bool
+	// lastChainReconcile is when the last FULL live-chain pass ran, and
+	// chainReconcileMaxAge bounds how long the incremental path may keep it away.
+	// In-memory: a restart forces a full pass, which is the safe direction.
+	lastChainReconcile   time.Time
+	chainReconcileMaxAge time.Duration
+	presence             VersionPresenceQuerier
+	digest               VersionDigest
+	confirmer            WriteConfirmer
+	indexReader          IndexReader
+	indexFetcher         IndexFetcher
+	indexInstaller       IndexInstaller
 	// pullIdleTimeout / pullMaxDuration bound the EnsureIndex pull loop by
 	// PROGRESS and by an absolute ceiling respectively (see the loop's comment).
 	// Zero means the Default* constants; the config carries them so a test can
@@ -347,6 +366,21 @@ type LocalDataPlaneConfig struct {
 	// rather than guessing.
 	LocalVersions LocalVersionLister
 	Liveness      VersionLivenessLister
+	// KBDropper reclaims a whole knowledge base's physical data on this node. Used by
+	// the deletion retry loop for KB-level entries (version 0).
+	KBDropper KBStorageDropper
+	// Deletions is the control layer's bounded deletion log, read incrementally.
+	// Optional: without it every deletion sweep takes the live-chain path.
+	Deletions DeletionLogSource
+	// DeletionLogPage caps one incremental read (0 = DefaultDeletionLogPage).
+	DeletionLogPage int
+	// ChainReconcileMaxAge bounds how long the incremental path may keep the full
+	// live-chain pass away (0 = 24h).
+	ChainReconcileMaxAge time.Duration
+	// DisableChainReconcile forbids the periodic full pass entirely. The start-up
+	// sweep and this node's own tombstone retries still run; what goes away is the
+	// reconciliation that finds leftovers nobody told this node about.
+	DisableChainReconcile bool
 	// ResolveReplicas lists the *other* replicas that should hold a written
 	// version. Nil (or an empty list) means "no replication": the local write
 	// is the whole quorum — the single-node and test default. It doubles as
@@ -432,37 +466,42 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		state = nodestate.New(nodestate.Options{Logger: logger.Named("nodestate")})
 	}
 	return &LocalDataPlane{
-		indexMgr:         cfg.IndexManager,
-		puller:           cfg.Puller,
-		changesFetcher:   cfg.ChangesFetcher,
-		localVersions:    cfg.LocalVersions,
-		liveness:         cfg.Liveness,
-		verify:           cfg.Verify,
-		resolve:          cfg.Resolve,
-		wal:              cfg.WAL,
-		cursorWAL:        cfg.CursorWAL,
-		executor:         cfg.Executor,
-		control:          cfg.Control,
-		pusher:           cfg.Pusher,
-		resolveReplicas:  cfg.ResolveReplicas,
-		replicaCount:     cfg.ReplicaCount,
-		cursorQuerier:    cfg.CursorQuerier,
-		dropper:          cfg.DataDropper,
-		cleaner:          cfg.CleanupBroadcaster,
-		presence:         cfg.Presence,
-		digest:           cfg.Digest,
-		confirmer:        cfg.Confirmer,
-		indexReader:      cfg.IndexReader,
-		indexFetcher:     cfg.IndexFetcher,
-		indexInstaller:   cfg.IndexInstaller,
-		selfDataSyncAddr: cfg.SelfDataSyncAddr,
-		pullIdleTimeout:  cfg.PullIdleTimeout,
-		pullMaxDuration:  cfg.PullMaxDuration,
-		limiter:          newWriteLimiter(cfg.MaxInFlightWrites),
-		state:            state,
-		logger:           logger,
-		pendingTakeovers: make(map[string]*takeoverWatch),
-		cursorPending:    make(map[string]int64),
+		indexMgr:              cfg.IndexManager,
+		puller:                cfg.Puller,
+		changesFetcher:        cfg.ChangesFetcher,
+		localVersions:         cfg.LocalVersions,
+		liveness:              cfg.Liveness,
+		kbDropper:             cfg.KBDropper,
+		deletions:             cfg.Deletions,
+		deletionLogPage:       cfg.DeletionLogPage,
+		chainReconcileEnabled: !cfg.DisableChainReconcile,
+		chainReconcileMaxAge:  cfg.ChainReconcileMaxAge,
+		verify:                cfg.Verify,
+		resolve:               cfg.Resolve,
+		wal:                   cfg.WAL,
+		cursorWAL:             cfg.CursorWAL,
+		executor:              cfg.Executor,
+		control:               cfg.Control,
+		pusher:                cfg.Pusher,
+		resolveReplicas:       cfg.ResolveReplicas,
+		replicaCount:          cfg.ReplicaCount,
+		cursorQuerier:         cfg.CursorQuerier,
+		dropper:               cfg.DataDropper,
+		cleaner:               cfg.CleanupBroadcaster,
+		presence:              cfg.Presence,
+		digest:                cfg.Digest,
+		confirmer:             cfg.Confirmer,
+		indexReader:           cfg.IndexReader,
+		indexFetcher:          cfg.IndexFetcher,
+		indexInstaller:        cfg.IndexInstaller,
+		selfDataSyncAddr:      cfg.SelfDataSyncAddr,
+		pullIdleTimeout:       cfg.PullIdleTimeout,
+		pullMaxDuration:       cfg.PullMaxDuration,
+		limiter:               newWriteLimiter(cfg.MaxInFlightWrites),
+		state:                 state,
+		logger:                logger,
+		pendingTakeovers:      make(map[string]*takeoverWatch),
+		cursorPending:         make(map[string]int64),
 	}
 }
 
@@ -545,6 +584,14 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 	// measured on the 3+3 cluster, storage2 held v4 and v7 with no index and built
 	// neither, while all three replicas reported the data present. So the index
 	// half is checked separately, below.
+	// Known deleted here: there is nothing to fetch and nothing to serve. Asked
+	// again (the catch-up loop, a query's background pull), it stays a no-op — and
+	// crucially it does not fall through to the pull below, which would write the
+	// version's records back and move the cursor onto a version this node does not
+	// hold (its metadata is gone).
+	if d.skipIfDeleted(ctx, kbID, versionID, "EnsureIndex") {
+		return nil
+	}
 	if d.localVersionOf(kbID) >= versionID {
 		return d.ensureOwnIndex(ctx, kbID, versionID)
 	}
@@ -864,6 +911,11 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 	// whole cost: measured on the 3+3 cluster, a run of N
 	// versions built all N, most of them for versions nothing had ever queried.
 	if d.localVersionOf(kbID) >= versionID {
+		return nil
+	}
+	// Checked before resolving: for a version this node knows was deleted there is
+	// nothing to fetch and no source worth asking about.
+	if d.skipIfDeleted(ctx, kbID, versionID, "FetchVersionData") {
 		return nil
 	}
 	addr, ok, err := d.resolve(ctx, kbID, versionID)
@@ -1277,6 +1329,14 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 		// they are being filled so the chain is unbroken, not so they can be
 		// served. Building each of them would be the eager behaviour §8.6(b)
 		// removed, multiplied by the size of the gap.
+		if d.skipIfDeleted(ctx, kbID, v, "backfill") {
+			// The gap's version is one this node knows was deleted: it must not be
+			// replayed, and the cursor must not step over a version whose records are
+			// not here. Leaving the cursor below it is what keeps "the cursor is where
+			// my history is unbroken" true; the reconciliation is what later confirms
+			// the deletion from the control layer's side.
+			continue
+		}
 		if err := d.puller.PullVersionData(ctx, source, kbID, v); err != nil {
 			return fmt.Errorf("plane: backfill %s v%d from %s (local cursor %d): %w", kbID, v, source, local, err)
 		}
@@ -1314,6 +1374,13 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 // is unreadable to every node.
 func (d *LocalDataPlane) transferFullState(ctx context.Context, sourceAddr, kbID string, local, versionID, deletedVersion int64) error {
 	snapshot := versionID
+	if d.skipIfDeleted(ctx, kbID, snapshot, "backfill full-state") {
+		// The snapshot version itself is one this node knows was deleted, so there is
+		// no state to transfer: a removal happened after the deletion this transfer was
+		// begun for, and the caller has to re-judge the gap (the next pass does).
+		return fmt.Errorf("plane: backfill %s from %s: the snapshot version v%d is itself known deleted here",
+			kbID, sourceAddr, snapshot)
+	}
 	if err := d.puller.PullVersionData(ctx, sourceAddr, kbID, snapshot); err != nil {
 		return fmt.Errorf("plane: backfill %s from %s: v%d was deleted (local cursor %d) and the full-state transfer of v%d failed: %w",
 			kbID, sourceAddr, deletedVersion, local, snapshot, err)
@@ -1831,6 +1898,14 @@ func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string,
 //     in §10.1's terminal verdict. A node that merely cannot fetch someone else's
 //     history must not be able to declare that version permanently failed.
 func (d *LocalDataPlane) ApplyBackfillChanges(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error {
+	// A version this node knows was deleted is not replayed: the delta path can still
+	// be served a deleted version's BEGIN record (the source's WAL keeps it until
+	// every replica reports a cursor past it), and writing it here would resurrect
+	// data whose metadata is gone. Skipping is not advancing — the cursor stays where
+	// it is, and the caller's own deleted-version check already refuses such a gap.
+	if d.skipIfDeleted(ctx, kbID, versionID, "backfill delta") {
+		return nil
+	}
 	// writeLocalTransaction advances the cursor itself, so there is nothing else to
 	// do here: the version counts as held once its data is in the stores.
 	if _, err := d.writeLocalTransaction(ctx, kbID, versionID, parentVersionID, changes, nil); err != nil {

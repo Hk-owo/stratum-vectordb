@@ -246,9 +246,12 @@ func Decide(resp *pb.AwaitVersionResponse, haveChanges bool) Decision {
 		// nobody has queried waits for a state the design does not produce.
 		//
 		// This used to return WAIT, on the reasoning that a caller who asked for
-		// READY wanted to be able to read. It still does — and it can: querying the
-		// version builds the index on demand (service/query.go), as does
-		// WarmupVersion for a caller that wants that cost paid up front.
+		// READY wanted to be able to read. It still does — and it can: the version
+		// is queryable as soon as its DATA is durable, because §8.6(b)'s scan
+		// answers a version whose index nobody has built yet (service/query.go,
+		// index.TrySearch). A version above the scan threshold answers that first
+		// query with a retryable version_pending and builds meanwhile; WarmupVersion
+		// is for a caller that wants that cost paid up front.
 		return DecisionDone
 
 	default:

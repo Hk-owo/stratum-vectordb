@@ -433,6 +433,42 @@ func (r *RemoteRaftNode) VersionLiveness(ctx context.Context, kbID string, fromE
 	return alive, lastAllocated, kbScopedError(err)
 }
 
+// DeletionsSince implements the incremental deletion-log read through the internal
+// service (see InternalService.DeletionsSince).
+//
+// A storage node has no log of its own, so this is how it learns what was deleted
+// since its watermark. The answer is advisory, never authoritative: the caller falls
+// back to VersionLiveness whenever the log cannot serve it (watermark past the
+// retained window, epoch mismatch), which is what keeps a removal record from becoming
+// something correctness depends on.
+func (r *RemoteRaftNode) DeletionsSince(ctx context.Context, afterSeq int64, limit int) ([]types.DeletedVersion, int64, int64, string, error) {
+	var entries []types.DeletedVersion
+	var latest, oldest int64
+	var epoch string
+	err := r.readAtAnyControl(ctx, func(ctx context.Context, conn *grpc.ClientConn) error {
+		resp, err := pb.NewInternalServiceClient(conn).DeletionsSince(ctx, &pb.DeletionsSinceRequest{
+			AfterSeq: afterSeq,
+			Limit:    int32(limit),
+		})
+		if err != nil {
+			return err
+		}
+		latest = resp.GetLatestSeq()
+		oldest = resp.GetOldestSeq()
+		epoch = resp.GetEpoch()
+		entries = entries[:0]
+		for _, e := range resp.GetEntries() {
+			entries = append(entries, types.DeletedVersion{
+				Seq:       e.GetSeq(),
+				KBID:      e.GetKnowledgeBaseId(),
+				VersionID: e.GetVersionId(),
+			})
+		}
+		return nil
+	})
+	return entries, latest, oldest, epoch, kbScopedError(err)
+}
+
 // LastVersionID implements RaftNode. A storage node has no local state machine, and
 // "the highest id" has no narrow form (there is no bound to push down), so this walks
 // the chain. That is acceptable because of WHO calls it: ChainTail answers the leader's

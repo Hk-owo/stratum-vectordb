@@ -45,20 +45,15 @@ func TestDeleteKnowledgeBase_VoicesACleanupThatDidNotFinish(t *testing.T) {
 		t.Error("the mark landed, so the RPC should still report success")
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("cleanup never ran")
-	}
-
-	warns := logs.All()
-	if len(warns) != 1 {
-		t.Fatalf("got %d warning(s), want exactly 1", len(warns))
-	}
+	// 等**日志**，不等 Execute 返回：service 是在 Execute 回来之后才写这一行的
+	// （`defer close(done)` 先于它发生），所以 done 只说明"跑过"，不说明"说出来了"。
+	// 按 done 判读会间歇性读到 0 条——`-race` 下几乎必现，而这跟被测行为无关。
+	warns := waitForWarns(t, logs, 1)
 	// 关键：带上原因。没有它，DELETING 这个状态对运维是不可行动的。
 	if got := warns[0].ContextMap()["error"]; got != boom.Error() {
 		t.Errorf("the warning did not carry the cause: error=%v, want %q", got, boom.Error())
 	}
+	<-done
 }
 
 func TestDeleteVersion_VoicesACleanupThatDidNotFinish(t *testing.T) {
@@ -83,19 +78,11 @@ func TestDeleteVersion_VoicesACleanupThatDidNotFinish(t *testing.T) {
 		t.Fatalf("DeleteVersion: %v", err)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("cleanup never ran")
-	}
-
-	warns := logs.All()
-	if len(warns) != 1 {
-		t.Fatalf("got %d warning(s), want exactly 1", len(warns))
-	}
+	warns := waitForWarns(t, logs, 1)
 	if got := warns[0].ContextMap()["error"]; got != boom.Error() {
 		t.Errorf("the warning did not carry the cause: error=%v, want %q", got, boom.Error())
 	}
+	<-done
 }
 
 // 清理成功时不该有噪音。这条钉住的是"别把日志加过头"——一个每次删库都响的
@@ -126,5 +113,30 @@ func TestDeleteKnowledgeBase_QuietWhenCleanupSucceeds(t *testing.T) {
 
 	if n := logs.Len(); n != 0 {
 		t.Errorf("a successful cleanup logged %d line(s), want 0", n)
+	}
+}
+
+// waitForWarns waits until the observer holds at least want warnings and returns
+// them, failing the test if that never happens.
+//
+// It exists because these handlers report ASYNCHRONOUSLY: the cleanup runs on its
+// own goroutine and its warning is written after Execute returns. A test that waits
+// for Execute (a `defer close(done)` inside the fake) and then reads the log is
+// racing the log line it is asserting on — measured as `got 0 warning(s)` under
+// -race, which says nothing about the behaviour under test.
+func waitForWarns(t *testing.T, logs *observer.ObservedLogs, want int) []observer.LoggedEntry {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := logs.All(); len(got) >= want {
+			if len(got) != want {
+				t.Fatalf("got %d warning(s), want exactly %d", len(got), want)
+			}
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("got %d warning(s), want %d — the cleanup's outcome was never voiced", len(logs.All()), want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

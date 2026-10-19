@@ -60,6 +60,14 @@ func TestIsRetryableErr_DecidesOnTheSentinelNotTheCode(t *testing.T) {
 			err:  stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionFailed),
 			want: false,
 		},
+		{
+			// Terminal: the DATA side was declared lost. Ask another replica and it
+			// answers the same thing, because the verdict is replicated — the caller
+			// has to write again under a new client_request_id.
+			name: "version data failed",
+			err:  stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionDataFailed),
+			want: false,
+		},
 	}
 
 	for _, tc := range cases {

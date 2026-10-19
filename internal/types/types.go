@@ -9,8 +9,12 @@ package types
 type IndexStatus int
 
 const (
-	// IndexStatusPending means metadata has been allocated and storage-layer
-	// writes are in progress; the version is not queryable yet.
+	// IndexStatusPending means the index has not been built and reported READY.
+	// It covers BOTH halves of a write — "the storage-layer write is still in
+	// progress" and "the data is durable, the index is a read-side product nobody
+	// has built yet" — so it is not by itself "not queryable": queryability is
+	// the DATA side's question (DataStatus). A PENDING version whose data has
+	// landed is answered by §8.6b's scan until a build catches up.
 	IndexStatusPending IndexStatus = iota
 	// IndexStatusReady means the index build completed; the version is queryable.
 	IndexStatusReady
@@ -356,6 +360,28 @@ func (m KnowledgeBaseMeta) Chunking() ChunkParams {
 		avgBits = DefaultChunkAvgBits
 	}
 	return CDCChunkParams(minSize, maxSize, avgBits)
+}
+
+// DeletedVersion is one entry in the control layer's BOUNDED deletion log: a
+// version that has finished being deleted, with the sequence number it was
+// recorded at.
+//
+// VersionID == 0 names the knowledge base itself — "this whole KB was removed" —
+// and exists because a KB deletion does not go through the per-version path: the
+// apply removes the KB and every version in one step, so without a KB-level entry
+// no storage node would ever be told, and a replica that was unreachable while the
+// deletion ran keeps the KB's bytes with nothing left that could name them (the KB
+// is gone from the metadata, so the live-chain judgement cannot see it either).
+//
+// Seq is a monotonically increasing counter assigned at apply time, identical on
+// every replica. It is what a consumer's watermark is expressed in, and it is
+// deliberately NOT a timestamp: two deletions in the same millisecond, a clock that
+// steps backwards, or two control nodes with skewed clocks would each turn "give me
+// everything after X" into a silently lossy query.
+type DeletedVersion struct {
+	Seq       int64
+	KBID      string
+	VersionID int64
 }
 
 // VersionMeta is version metadata stored in the Raft state machine.

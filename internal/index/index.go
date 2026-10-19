@@ -92,6 +92,23 @@ type IndexManager interface {
 	// read path.
 	Search(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error)
 
+	// TrySearch answers a query from what this node can serve RIGHT NOW: the
+	// in-memory index if there is one, the artifact on disk if it loads, and
+	// otherwise a scan of the version's chunks (§8.6b). Unlike Search it never
+	// waits for a build.
+	//
+	// answered=false (always with a nil error) means "not now, and scanning is
+	// not the cheaper option either" — the version is above BruteForceMaxChunks
+	// or none of its vectors could be read. The caller decides what that means;
+	// the query path refuses with version_pending, because the build it just
+	// asked for will answer a retry.
+	//
+	// It exists so a PENDING version's small-size case can be served instead of
+	// waited out: Search's answer to "no index" is to block until one appears,
+	// which is right for a READY version and wrong for one whose index nobody has
+	// built yet (§8.6(b)).
+	TrySearch(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, bool, error)
+
 	// TriggerBuild asynchronously builds the index for (kbID, versionID).
 	// It returns once the build has been scheduled, not once it
 	// completes; completion is reported via the registered
