@@ -20,6 +20,13 @@
 ignore:
   - "api/proto/**"
   - "web/**"
+  # *_test.go 永远不在 coverage.out 里（Go 只记录被测包的源码），所以"只改测试"的提交
+  # 会被算成"新增 0% 覆盖"。实测：e7e6123 只改了 integration/e2e_test.go（修的却是一个
+  # 真问题），codecov/patch 报 0.00% of diff hit (target 70.36%)。
+  - "**/*_test.go"
+  # integration 包没有非测试源文件，它的 profile 是 [no statements]：该目录下任何改动
+  # 都没有覆盖数据可言，与上一条同一个理由。
+  - "integration/**"
 
 coverage:
   status:
@@ -36,6 +43,16 @@ coverage:
         target: auto
         threshold: 0%
         informational: false
+        # 把"不产生覆盖数据"的路径从 patch 门禁里排掉。
+        #
+        # 注意这两条必须写在这里，而不只是写在 ignore 里：ignore 是"解析上传报告时排除
+        # 路径"，而 Go 的 coverage.out 里**本来就没有** *_test.go —— 报告里没有的东西，
+        # ignore 排不掉，Codecov 仍会按 git diff 把它们算成"新增 0% 覆盖"。实测：
+        # e7e6123 只改了 integration/e2e_test.go，codecov/patch 报 0.00% of diff hit
+        # (target 70.36%)，而它修的却是一个真问题；2d7e835 改了源码 + 测试则是 91.80%。
+        paths:
+          - "!**/*_test.go"
+          - "!integration/**"
 
 comment:
   layout: "reach, diff, files"
