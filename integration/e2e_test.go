@@ -780,6 +780,16 @@ func waitQueryDoc(t *testing.T, n *realNode, kbID string, versionID int64, vec [
 				return r
 			}
 		}
+		// A node whose CURSOR already covers the version but whose versiondoc is empty can
+		// never converge: EnsureIndex short-circuits on "cursor >= versionID", so no path
+		// will fetch the records again. Waiting out the deadline turns a one-second
+		// diagnosis into a minute of CI time — measured on
+		// TestRealStack_ThreeNodeCluster_SnapshotPipeline, which spent 85 s on exactly this
+		// state.
+		if stalled, why := stalledLocally(n, kbID, versionID); stalled {
+			t.Fatalf("node %d cannot converge on v%d (%s); query for %s last failed with: %v; local state: %s",
+				n.nodeID, versionID, why, docID, lastErr, describeLocalState(n, kbID, versionID, docID))
+		}
 		if time.Now().After(deadline) {
 			t.Fatalf("node %d: query never returned %s on v%d; last results: %+v; last error: %v; local state: %s",
 				n.nodeID, docID, versionID, lastResults, lastErr, describeLocalState(n, kbID, versionID, docID))
@@ -800,6 +810,15 @@ func describeLocalState(n *realNode, kbID string, versionID int64, queryDoc stri
 	ctx := context.Background()
 	docs, derr := n.versionDoc.ListDocIDs(ctx, kbID, versionID)
 	indexData, sidecar := indexFileOf(n.baseDir, kbID, versionID)
+
+	// The DATA CURSOR is what decides whether this node will ever fetch the version
+	// again: EnsureIndex short-circuits on "cursor >= versionID", so a cursor at or above
+	// the version with an empty versiondoc is a node that will never look again. Printing
+	// it turns "it never converged" into a statement about which invariant broke.
+	cursor := int64(-1)
+	if n.indexDistributor != nil {
+		cursor = n.indexDistributor.LocalVersionOf(kbID)
+	}
 
 	status := "version unknown"
 	if versions, err := n.raftNode.ListVersions(ctx, kbID); err == nil {
@@ -846,7 +865,8 @@ func describeLocalState(n *realNode, kbID string, versionID int64, queryDoc stri
 		}
 	}
 
-	return fmt.Sprintf("versiondoc=%d (err=%v), index_file=%d bytes (sidecar=%d), %s, direct_search=%d results (err=%v) %v, chunk_vectors_readable=%d/%d dim=%d, version_bloom_hits=%d/%d (err=%v)",
+	base := fmt.Sprintf("cursor=%d, ", cursor)
+	return base + fmt.Sprintf("versiondoc=%d (err=%v), index_file=%d bytes (sidecar=%d), %s, direct_search=%d results (err=%v) %v, chunk_vectors_readable=%d/%d dim=%d, version_bloom_hits=%d/%d (err=%v)",
 		len(docs), derr, len(indexData), len(sidecar), status, len(direct), searchErr, directDocs, readable, total, dim, bloomHits, len(docs), bloomErr)
 }
 
@@ -1560,4 +1580,30 @@ func TestRealStack_TwoNodeReplication(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("follower still has KB %s after leader-side deletion", kbID)
+}
+
+// stalledLocally reports whether this node is in a state it cannot leave: its data
+// cursor already covers the version (so EnsureIndex will never fetch it again) while the
+// version's document set is empty.
+//
+// The two facts must be true together to call it stalled: "no documents yet" is the
+// ordinary state of a version that is still being pulled.
+func stalledLocally(n *realNode, kbID string, versionID int64) (bool, string) {
+	if n.indexDistributor == nil {
+		return false, ""
+	}
+	cursor := n.indexDistributor.LocalVersionOf(kbID)
+	if cursor < versionID {
+		return false, ""
+	}
+	docs, err := n.versionDoc.ListDocIDs(context.Background(), kbID, versionID)
+	if err != nil {
+		// An unreadable set is not an empty one; leave the ordinary timeout to report it.
+		return false, ""
+	}
+	if len(docs) > 0 {
+		return false, ""
+	}
+	return true, fmt.Sprintf("cursor=%d already covers v%d but its versiondoc is empty, "+
+		"so EnsureIndex will never fetch it again", cursor, versionID)
 }
