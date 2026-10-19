@@ -224,6 +224,13 @@ type realNode struct {
 	// what a replica received rather than what it built.
 	indexDistributor *plane.LocalDataPlane
 
+	// pullFailure records the last reason a snapshot-covered version's data failed to
+	// arrive here, so a failing test can print WHY instead of only "it never got here".
+	// The node's logger is a Nop (it is built before a *testing.T exists), which is why
+	// this is a field rather than a log line.
+	pullFailureMu stdsync.Mutex
+	pullFailure   map[string]string
+
 	// dataSources is the §8.5 announcement table this node reads when it needs
 	// a version's data. In production the write path's plane fills it (a writer
 	// announces itself with its §7.3 confirmation); this stack's write path is
@@ -649,14 +656,30 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 			n.indexDistributor.MarkVersionContiguous(kbID, versionID)
 			return
 		}
-		deadline := time.Now().Add(15 * time.Second)
+		// The budget is the FIXTURE's patience, and it is the same 60 s waitQueryDoc
+		// uses to wait for the same convergence — anything shorter makes the two
+		// disagree about how long this stack is allowed to take.
+		//
+		// 15 s was too short, and the cost was silent: this callback is the ONLY thing
+		// that pulls a snapshot-covered version's records on a restarted node (the
+		// plane here is the index-distribution one, it has no puller), so when the
+		// budget ran out nothing retried — the version's data simply never arrived and
+		// a query waited out its own timeout instead. Measured on
+		// TestRealStack_ThreeNodeCluster_SnapshotPipeline: cursor=5, versiondoc=0, v6
+		// index=READY data=DATA_DURABLE, 85 s per failing run.
+		deadline := time.Now().Add(60 * time.Second)
 		backoff := 50 * time.Millisecond
+		var lastPullErr error
 		for {
 			// Resolved per attempt, not once: a non-leader coordinator's
 			// announcement (§8.5) arrives after this callback starts, so an
 			// early attempt legitimately falls back to the leader and fails.
 			if addr := sourceAddrFor(ctx, n, kbID, versionID, addrByID); addr != "" {
-				_ = syncFollower.PullVersionData(ctx, addr, kbID, versionID)
+				if err := syncFollower.PullVersionData(ctx, addr, kbID, versionID); err != nil {
+					lastPullErr = err
+				}
+			} else {
+				lastPullErr = fmt.Errorf("no source address yet for v%d", versionID)
 			}
 			if verifyFollowerPull(ctx, n, kbID, versionID) {
 				// Held, so the cursor may move — see the note above.
@@ -664,9 +687,13 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 				return
 			}
 			if time.Now().After(deadline) {
+				// Kept where a failing test can report it: the logger here is a Nop (the
+				// node is built before any *testing.T is in scope), so a message alone
+				// would vanish exactly when it is needed.
+				n.rememberPullFailure(kbID, versionID, lastPullErr)
 				n.logger.Warn("sync pull did not converge",
 					zap.Int64("node_id", n.nodeID), zap.String("kb_id", kbID),
-					zap.Int64("version_id", versionID))
+					zap.Int64("version_id", versionID), zap.Error(lastPullErr))
 				return
 			}
 			time.Sleep(backoff)
@@ -819,6 +846,7 @@ func describeLocalState(n *realNode, kbID string, versionID int64, queryDoc stri
 	if n.indexDistributor != nil {
 		cursor = n.indexDistributor.LocalVersionOf(kbID)
 	}
+	pullFailure := n.pullFailureOf(kbID, versionID)
 
 	status := "version unknown"
 	if versions, err := n.raftNode.ListVersions(ctx, kbID); err == nil {
@@ -865,7 +893,7 @@ func describeLocalState(n *realNode, kbID string, versionID int64, queryDoc stri
 		}
 	}
 
-	base := fmt.Sprintf("cursor=%d, ", cursor)
+	base := fmt.Sprintf("cursor=%d, pull_failure=%q, ", cursor, pullFailure)
 	return base + fmt.Sprintf("versiondoc=%d (err=%v), index_file=%d bytes (sidecar=%d), %s, direct_search=%d results (err=%v) %v, chunk_vectors_readable=%d/%d dim=%d, version_bloom_hits=%d/%d (err=%v)",
 		len(docs), derr, len(indexData), len(sidecar), status, len(direct), searchErr, directDocs, readable, total, dim, bloomHits, len(docs), bloomErr)
 }
@@ -1580,6 +1608,27 @@ func TestRealStack_TwoNodeReplication(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("follower still has KB %s after leader-side deletion", kbID)
+}
+
+// rememberPullFailure keeps the reason a version's data did not arrive.
+func (n *realNode) rememberPullFailure(kbID string, versionID int64, err error) {
+	n.pullFailureMu.Lock()
+	defer n.pullFailureMu.Unlock()
+	if n.pullFailure == nil {
+		n.pullFailure = make(map[string]string)
+	}
+	reason := "no error recorded"
+	if err != nil {
+		reason = err.Error()
+	}
+	n.pullFailure[fmt.Sprintf("%s/v%d", kbID, versionID)] = reason
+}
+
+// pullFailureOf returns the recorded reason, or "" when none was recorded.
+func (n *realNode) pullFailureOf(kbID string, versionID int64) string {
+	n.pullFailureMu.Lock()
+	defer n.pullFailureMu.Unlock()
+	return n.pullFailure[fmt.Sprintf("%s/v%d", kbID, versionID)]
 }
 
 // stalledLocally reports whether this node is in a state it cannot leave: its data
