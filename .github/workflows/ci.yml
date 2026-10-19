@@ -49,8 +49,44 @@ jobs:
       - name: 构建
         run: go build ./...
 
+      # 分两步，因为两类用例的**整包耗时**差一个数量级，而 -timeout 是**每个包**的预算：
+      #
+      #   - 非 integration：28 个包，最慢的包 8s，整条命令约 40s。180s 是给慢机器的余量，
+      #     同时也是"卡住"时的上限——越短越早暴露（ThreeNodeCluster_FaultTolerance 卡 9
+      #     分钟那次，就是整包超时把其余用例的结果一起吞掉）。
+      #   - integration：实测 60–120s，并且包含真实集群的收敛等待（TestRealStack_* 里有
+      #     20–125s 的守门等待）。塞在 180s 里只剩几十秒余量，一次慢轮就整包超时。
+      #
+      # 覆盖率仍合成一份 coverage.out 交给 Codecov。实测：非 integration 的 profile 已经
+      # 覆盖了全部源文件（12368 行），integration 那份是 `[no statements]`（该包没有非测试
+      # 源文件）—— 所以拆分对 Codecov 的口径没有影响（合并后 go tool cover 得 56.4%，
+      # 与拆分前一次跑完全相同）。integration 仍带 -coverprofile，是为了将来 integration
+      # 包真的有了源文件时不必再改这里。
       - name: 单元测试(含覆盖率)
-        run: go test ./... -timeout 180s -count=1 -covermode=atomic -coverprofile=coverage.out
+        run: |
+          go test $(go list ./... | grep -v '/integration') \
+            -timeout 180s -count=1 -covermode=atomic -coverprofile=coverage-unit.out
+
+      - name: 集成测试(真实栈，含覆盖率)
+        run: |
+          go test ./integration/ \
+            -timeout 600s -count=1 -covermode=atomic -coverprofile=coverage-integration.out
+
+      - name: 合并覆盖率
+        # always(): 集成测试红了也要把单元测试的覆盖率交上去，否则 Codecov 看到的
+        # 是"这次提交没测过"，而不是"集成测试失败"。集成测试红 = 这一步红，覆盖率照传。
+        if: always()
+        run: |
+          if [ -f coverage-unit.out ]; then
+            head -1 coverage-unit.out > coverage.out
+            tail -n +2 coverage-unit.out >> coverage.out
+            if [ -f coverage-integration.out ]; then
+              tail -n +2 coverage-integration.out >> coverage.out
+            fi
+          else
+            echo "没有 coverage-unit.out —— 单元测试那一步没产出覆盖率" >&2
+            exit 1
+          fi
 
       # 覆盖率同时写进 job summary(免登录可读)与 Codecov(徽章 + 逐行视图)。
       # 上传失败不判 CI 红:未配 CODECOV_TOKEN 时会退化成 tokenless 上传,
