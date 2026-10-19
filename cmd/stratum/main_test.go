@@ -31,6 +31,7 @@ func TestLoadConfig_OverlaysDefaults(t *testing.T) {
   raft_addr: "0.0.0.0:8001"
 
 raft:
+  deleted_log_limit: 4096
   peers:
     - id: 1
       addr: "node1:8000"
@@ -71,6 +72,12 @@ bloom_filter:
 
 gc:
   sweep_interval_s: 1234
+
+reconcile:
+  deleted_versions_incremental: true
+  deleted_versions_incremental_interval_s: 90
+  deleted_versions_log_page: 256
+  deleted_versions_interval_s: 7200
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -105,6 +112,9 @@ gc:
 	if cfg.Peers[1].ID != 2 || cfg.Peers[1].RaftAddr != "node2:8001" || cfg.Peers[1].ServiceAddr != "node2:7001" {
 		t.Errorf("Peers[1] = %+v", cfg.Peers[1])
 	}
+	if cfg.DeletedLogLimit != 4096 {
+		t.Errorf("DeletedLogLimit = %d, want the configured 4096", cfg.DeletedLogLimit)
+	}
 	if cfg.IndexLRUCapacity != 32 {
 		t.Errorf("IndexLRUCapacity = %d, want 32", cfg.IndexLRUCapacity)
 	}
@@ -122,6 +132,21 @@ gc:
 	}
 	if cfg.GCSweepIntervalSec != 1234 {
 		t.Errorf("GCSweepIntervalSec = %d, want 1234", cfg.GCSweepIntervalSec)
+	}
+	// The deletion sweep's knobs. They used to be constants, and the interval's MEANING
+	// changed with them (it now bounds how old the last full live-chain pass may get), so
+	// an operator's value has to arrive intact.
+	if !cfg.ReconcileDeletionsIncremental {
+		t.Error("ReconcileDeletionsIncremental = false, want the configured true")
+	}
+	if cfg.ReconcileDeletionsIncrementalIntervalS != 90 {
+		t.Errorf("ReconcileDeletionsIncrementalIntervalS = %d, want 90", cfg.ReconcileDeletionsIncrementalIntervalS)
+	}
+	if cfg.ReconcileDeletionsLogPage != 256 {
+		t.Errorf("ReconcileDeletionsLogPage = %d, want 256", cfg.ReconcileDeletionsLogPage)
+	}
+	if cfg.ReconcileDeletedVersionsIntervalS != 7200 {
+		t.Errorf("ReconcileDeletedVersionsIntervalS = %d, want 7200", cfg.ReconcileDeletedVersionsIntervalS)
 	}
 }
 

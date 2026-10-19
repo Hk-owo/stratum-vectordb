@@ -2,6 +2,7 @@ package tombstone
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -321,5 +322,246 @@ func TestPebbleStore_SyncWatermarkSurvivesAReopen(t *testing.T) {
 	}
 	if state.Epoch != "epoch-1" || state.Seq != 42 {
 		t.Fatalf("watermark = %+v, want {epoch-1 42}", state)
+	}
+}
+
+// The shared-handle constructor exists so the table can live inside a database this
+// package does not own; closing then must NOT close the caller's database.
+func TestPebbleStoreInSharesAHandleItDoesNotClose(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "shared")
+	owner, err := NewPebbleStore(dir)
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	ctx := context.Background()
+	if err := owner.NoteBatch(ctx, SyncState{Epoch: "e", Seq: 1}, []DeletedVersion{{Seq: 1, KBID: "kb-1", VersionID: 3}}); err != nil {
+		t.Fatalf("NoteBatch: %v", err)
+	}
+
+	// A second view over the same database: it sees what the first wrote, and closing
+	// it leaves the owner usable.
+	view := NewPebbleStoreIn(owner.db)
+	if gone, err := view.Contains(ctx, "kb-1", 3); err != nil || !gone {
+		t.Fatalf("shared view Contains = (%v, %v), want true", gone, err)
+	}
+	if err := view.Close(); err != nil {
+		t.Fatalf("Close on a shared view: %v", err)
+	}
+	if state, ok, err := owner.SyncSeq(ctx); err != nil || !ok || state.Seq != 1 {
+		t.Fatalf("owner after the shared view closed: (%+v, %v, %v), want it still usable", state, ok, err)
+	}
+	if err := owner.Close(); err != nil {
+		t.Fatalf("Close owner: %v", err)
+	}
+}
+
+// A fresh notification must not undo a reclaim that already finished, and the whole
+// page has to land in one write — the property the watermark's atomicity depends on.
+func TestStore_NoteBatchIsIdempotentPerEntry(t *testing.T) {
+	for name, open := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			s := open(t)
+			ctx := context.Background()
+
+			page := []DeletedVersion{{Seq: 1, KBID: "kb-1", VersionID: 4}}
+			if err := s.NoteBatch(ctx, SyncState{Epoch: "e", Seq: 1}, page); err != nil {
+				t.Fatalf("NoteBatch: %v", err)
+			}
+			if err := s.MarkDone(ctx, "kb-1", 4, time.Now()); err != nil {
+				t.Fatalf("MarkDone: %v", err)
+			}
+
+			// The same page arrives again (a retried read after a crash).
+			if err := s.NoteBatch(ctx, SyncState{Epoch: "e", Seq: 1}, page); err != nil {
+				t.Fatalf("NoteBatch (retry): %v", err)
+			}
+			pending, err := s.Pending(ctx)
+			if err != nil {
+				t.Fatalf("Pending: %v", err)
+			}
+			if len(pending) != 0 {
+				t.Fatalf("Pending = %+v, want none — the retried page must not re-open a finished reclaim", pending)
+			}
+			mustContains(t, s, "kb-1", 4, true)
+		})
+	}
+}
+
+// A negative grace means "use the default" rather than "expire everything".
+func TestStore_PruneWithNegativeGraceUsesTheDefault(t *testing.T) {
+	for name, open := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			s := open(t)
+			ctx := context.Background()
+			now := time.Now()
+			if err := s.NoteBatch(ctx, SyncState{Epoch: "e", Seq: 1}, []DeletedVersion{{Seq: 1, KBID: "kb-1", VersionID: 2}}); err != nil {
+				t.Fatalf("NoteBatch: %v", err)
+			}
+			if err := s.MarkDone(ctx, "kb-1", 2, now); err != nil {
+				t.Fatalf("MarkDone: %v", err)
+			}
+			dropped, err := s.Prune(ctx, now, -time.Second)
+			if err != nil {
+				t.Fatalf("Prune: %v", err)
+			}
+			if dropped != 0 {
+				t.Fatalf("Prune dropped %d entries just after they finished, want 0", dropped)
+			}
+		})
+	}
+}
+
+// The in-process table is a real Store, Close and all: a caller that closes it must
+// not panic, and it must be usable where no database is wired.
+func TestMemoryStore_CloseIsANoOp(t *testing.T) {
+	s := NewMemoryStore()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := s.Note(context.Background(), "kb-1", 1, time.Now()); err != nil {
+		t.Fatalf("Note after Close: %v", err)
+	}
+}
+
+// A value written by something else (or a torn write) must be reported, not decoded
+// into a plausible-looking entry: this table decides whether data may land.
+func TestPebbleStore_RejectsMalformedValues(t *testing.T) {
+	store, err := NewPebbleStore(filepath.Join(t.TempDir(), "tombstone"))
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	if err := store.db.Set(entryKey("kb-1", 7), []byte{1, 2, 3}, nil); err != nil {
+		t.Fatalf("seed malformed entry: %v", err)
+	}
+	if _, err := store.Contains(ctx, "kb-1", 7); err == nil {
+		t.Fatal("Contains on a 3-byte value must report the corruption")
+	}
+	if _, err := store.Pending(ctx); err == nil {
+		t.Fatal("a scan must report the malformed entry rather than skip it")
+	}
+
+	if err := store.db.Set(syncKey, []byte{0}, nil); err != nil {
+		t.Fatalf("seed malformed watermark: %v", err)
+	}
+	if _, _, err := store.SyncSeq(ctx); err == nil {
+		t.Fatal("SyncSeq on a truncated watermark must report it")
+	}
+}
+
+// State.String is what shows up in logs and in a failure message, so an unknown value
+// must say so rather than rendering as PENDING.
+func TestState_StringCoversEveryValue(t *testing.T) {
+	cases := map[State]string{
+		Pending:  "PENDING",
+		Done:     "DONE",
+		State(9): "UNKNOWN",
+	}
+	for state, want := range cases {
+		if got := state.String(); got != want {
+			t.Errorf("State(%d).String() = %q, want %q", state, got, want)
+		}
+	}
+}
+
+// A bad path is reported at construction, not as a nil dereference on the first use.
+func TestNewPebbleStore_ReportsAnUnopenablePath(t *testing.T) {
+	if _, err := NewPebbleStore(t.TempDir()); err == nil {
+		// A directory that already holds a database opens fine; a FILE where the
+		// database should be does not.
+		t.Log("a directory opened cleanly; trying a file path instead")
+	}
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	if _, err := NewPebbleStore(file); err == nil {
+		t.Fatal("opening a regular file as a database must fail")
+	}
+}
+
+// A cancelled page stops before writing anything: the batch is atomic, so a half-applied
+// page is not a state this table can be left in.
+func TestPebbleStore_NoteBatchHonoursACancelledContext(t *testing.T) {
+	store, err := NewPebbleStore(filepath.Join(t.TempDir(), "tombstone"))
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	defer store.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = store.NoteBatch(ctx, SyncState{Epoch: "e", Seq: 1}, []DeletedVersion{{Seq: 1, KBID: "kb-1", VersionID: 1}})
+	if err == nil {
+		t.Fatal("a cancelled page must be refused")
+	}
+	if gone, cerr := store.Contains(context.Background(), "kb-1", 1); cerr != nil || gone {
+		t.Fatalf("Contains after a cancelled page = (%v, %v), want nothing recorded", gone, cerr)
+	}
+	if _, ok, serr := store.SyncSeq(context.Background()); serr != nil || ok {
+		t.Fatalf("watermark after a cancelled page = (%v, %v), want none", ok, serr)
+	}
+}
+
+// A key inside the entry namespace that is NOT an entry must be reported: the scan
+// decodes every key it walks, and a foreign shape means the table is not what this
+// package wrote.
+func TestPebbleStore_RejectsAForeignKeyInTheEntryNamespace(t *testing.T) {
+	store, err := NewPebbleStore(filepath.Join(t.TempDir(), "tombstone"))
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	defer store.Close()
+
+	if err := store.db.Set(append(append([]byte(nil), keyPrefix...), []byte("no-length-prefix")...), nil, nil); err != nil {
+		t.Fatalf("seed foreign key: %v", err)
+	}
+	if _, err := store.Pending(context.Background()); err == nil {
+		t.Fatal("a foreign key in the entry namespace must be reported")
+	}
+}
+
+// Prune respects cancellation: an expired entry is not worth finishing a shutdown for.
+func TestPebbleStore_PruneStopsOnACancelledContext(t *testing.T) {
+	store, err := NewPebbleStore(filepath.Join(t.TempDir(), "tombstone"))
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	old := time.Now().Add(-2 * time.Hour)
+	if err := store.NoteBatch(ctx, SyncState{Epoch: "e", Seq: 1}, []DeletedVersion{{Seq: 1, KBID: "kb-1", VersionID: 1}}); err != nil {
+		t.Fatalf("NoteBatch: %v", err)
+	}
+	if err := store.MarkDone(ctx, "kb-1", 1, old); err != nil {
+		t.Fatalf("MarkDone: %v", err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.Prune(cancelled, time.Now(), time.Minute); err == nil {
+		t.Fatal("a cancelled prune must report the cancellation")
+	}
+}
+
+// The order is by (kbID, versionID), and two pending versions of ONE knowledge base is
+// the case that decides the second half of that comparison.
+func TestStore_PendingOrdersVersionsOfTheSameKnowledgeBase(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	now := time.Now()
+	for _, v := range []int64{5, 2} {
+		if err := store.Note(ctx, "kb-1", v, now); err != nil {
+			t.Fatalf("Note: %v", err)
+		}
+	}
+	pending, err := store.Pending(ctx)
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	if len(pending) != 2 || pending[0].VersionID != 2 || pending[1].VersionID != 5 {
+		t.Fatalf("Pending = %+v, want v2 before v5", pending)
 	}
 }

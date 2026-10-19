@@ -636,6 +636,18 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		vBloomErr error
 	)
 	if idsErr != nil {
+		// A document set that does not hash to the committed digest is this replica
+		// being INCOMPLETE, not an answer: filtering search hits against it drops the
+		// ones whose documents have not arrived yet, and the caller gets a well-formed
+		// result with matches silently missing. Refused retryably instead, so the station
+		// asks a replica that can serve the version.
+		//
+		// Other read failures (the store itself) keep the older, conservative treatment:
+		// filtering is SKIPPED rather than applied to an empty set, because "the set is
+		// unavailable" must not read as "no document is in this version".
+		if errors.Is(idsErr, stratumerrors.ErrIndexNotReady) {
+			return nil, stratumerrors.ToGRPCStatus(idsErr)
+		}
 		vBloomErr = idsErr
 	}
 

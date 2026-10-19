@@ -40,6 +40,10 @@ type fakeControlNode struct {
 	deletedErr  error
 	clusterResp *pb.GetClusterStatusResponse
 
+	// The deletion log's answer, and an injectable failure for it.
+	deletionsResp *pb.DeletionsSinceResponse
+	deletionsErr  error
+
 	// listReq is the last request that arrived through the ListVersions RPC, so a
 	// caller's narrowing can be asserted on the wire: the ranged reads travel that
 	// same RPC, which is the whole point of the bounds being request fields.

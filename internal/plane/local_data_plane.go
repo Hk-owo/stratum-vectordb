@@ -1841,6 +1841,20 @@ func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string,
 	if d.wal == nil || d.executor == nil {
 		return nil, fmt.Errorf("plane: WriteVersionData: the storage write transaction is not configured")
 	}
+	// Refused BEFORE the WAL BEGIN, and that ordering is the point: a coordinator that
+	// is still writing a version the control layer has already deleted would otherwise
+	// resurrect it locally (the coordinator is a storage node too, so its own local write
+	// goes through here), and it would then report the version durable — writing a row
+	// for metadata that no longer exists.
+	//
+	// NOTE the small window this leaves: the deletion can land between this check and the
+	// write, and the two do not share a lock. That is accepted — the window is
+	// microseconds wide, and the tombstone table's retry loop plus the reverse
+	// reconciliation both reclaim what slips through.
+	if d.skipIfDeleted(ctx, kbID, versionID, "WriteVersionData") {
+		return nil, fmt.Errorf("%w: %s v%d is known deleted on this node, so the write is abandoned",
+			stratumerrors.ErrVersionDeleting, kbID, versionID)
+	}
 	beginStart := time.Now()
 	err := d.wal.WriteBegin(ctx, kbID, parentVersionID, changes)
 	if st != nil {
@@ -2164,6 +2178,15 @@ func (d *LocalDataPlane) finishVersionWrite(ctx context.Context, kbID string, ve
 func (d *LocalDataPlane) ResumeVersionWrite(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error {
 	if d.wal == nil || d.executor == nil {
 		return fmt.Errorf("plane: ResumeVersionWrite: the storage write transaction is not configured")
+	}
+	// Crash recovery is the other way a deleted version comes back: the WAL holds a
+	// BEGIN (or a version id) for a write that never reached COMMIT, and if that version
+	// was deleted while this node was down, replaying it would write the whole batch
+	// back under metadata that no longer exists. Refused here for the same reason as the
+	// live path.
+	if d.skipIfDeleted(ctx, kbID, versionID, "ResumeVersionWrite") {
+		return fmt.Errorf("%w: %s v%d is known deleted on this node, so its replay is abandoned",
+			stratumerrors.ErrVersionDeleting, kbID, versionID)
 	}
 	docIDs, err := d.executor.WriteVersionStorage(ctx, kbID, parentVersionID, versionID, changes)
 	if err != nil {

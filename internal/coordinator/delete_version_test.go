@@ -2,13 +2,16 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"stratum/internal/bloom"
 	"stratum/internal/docstore"
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/raft"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
@@ -515,5 +518,76 @@ func TestDeleteVersionCoordinator_DeletesVersionBloomFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(bloomFile(v1)); err != nil {
 		t.Errorf("v1 bloom file should survive cleanup: %v", err)
+	}
+}
+
+// failingVersionDropper refuses every reclaim, standing in for a candidate replica that
+// cannot be reached.
+type failingVersionDropper struct{ err error }
+
+func (f failingVersionDropper) DropVersion(context.Context, string, int64) error { return f.err }
+
+var _ VersionStorageDropper = failingVersionDropper{}
+
+// A reclaim that reaches nobody must no longer keep the version in DELETING.
+//
+// The deletion is COMPLETE once the metadata is gone: removing it appends one entry to
+// the control layer's bounded deletion log, so every storage node learns the version is
+// gone and its own tombstone retry finishes the reclaim. What used to happen instead —
+// a permanently unreachable candidate holding the version in DELETING forever, with the
+// delete sweeper re-broadcasting every minute — was the cost of the metadata being the
+// last thing that named the bytes.
+func TestDeleteVersionCoordinator_CompletesWhenTheReclaimFails(t *testing.T) {
+	ctx := context.Background()
+	w := wal.NewMockWAL()
+	rn := raft.NewMockRaftNode(w)
+	kbID := "kb-1"
+	if err := rn.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
+		KBID: kbID, Name: "test", ChunkWindowSize: 512, ChunkOverlapSize: 64,
+		EmbedConfig: types.EmbedConfig{ServiceAddr: "x", ModelID: "m1"},
+	}); err != nil {
+		t.Fatalf("create KB: %v", err)
+	}
+	versionID, err := rn.ProposeCreateVersion(ctx, kbID, 0)
+	if err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+	// DeleteVersion admits only a version whose write settled: DURABLE data and a READY
+	// index, which is the state a real deletion always starts from.
+	_ = rn.ProposeMarkVersionDataDurable(ctx, versionID)
+	if err := rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, 0); err != nil {
+		t.Fatalf("version READY: %v", err)
+	}
+	if _, err := rn.ProposeMarkVersionDeleting(ctx, kbID, versionID, types.VersionDeleteSubtree); err != nil {
+		t.Fatalf("mark deleting: %v", err)
+	}
+
+	boom := errors.New("replica unreachable")
+	coord := NewDeleteVersionCoordinatorImpl(DeleteVersionCoordinatorConfig{
+		MaxRetries:          1,
+		RetryBaseIntervalMS: 1,
+		WAL:                 w,
+		RaftNode:            rn,
+		IndexManager:        newDeleteTestIndexManager(),
+		DocStore:            docstore.NewMockDocStore(),
+		VersionDocList:      versiondoc.NewMockVersionDocList(),
+		Dropper:             failingVersionDropper{err: boom},
+	})
+
+	err = coord.Execute(ctx, kbID)
+	if err == nil {
+		t.Fatal("the un-reclaimed replica must still be reported")
+	}
+	if !strings.Contains(err.Error(), "not reclaimed everywhere") {
+		t.Fatalf("err = %v, want the 'not reclaimed everywhere' wording", err)
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want it to wrap the reclaim failure", err)
+	}
+
+	// And the version is GONE from the metadata: that is what completes the deletion and
+	// what tells every other node.
+	if _, gerr := rn.GetVersion(ctx, kbID, versionID); !errors.Is(gerr, stratumerrors.ErrVersionNotFound) {
+		t.Fatalf("GetVersion after the deletion = %v, want ErrVersionNotFound", gerr)
 	}
 }

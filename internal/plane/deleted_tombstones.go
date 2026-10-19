@@ -81,6 +81,13 @@ const (
 	// chainDisabled is the reason string for "a re-judge was needed but this node is
 	// not allowed to run one".
 	chainDisabled = "chain-disabled"
+	// maxDeletionPagesPerSweep bounds one pass's pagination. A bulk deletion larger than
+	// this is finished by the following ticks; the bound is what keeps one pass from
+	// growing without limit while a busy cluster keeps deleting.
+	maxDeletionPagesPerSweep = 8
+	// noEntryAfter asks for the log's WINDOW without any entries: every real sequence
+	// number is <= it.
+	noEntryAfter = int64(1<<62 - 1)
 )
 
 // page returns the configured page size.
@@ -313,55 +320,69 @@ func (d *LocalDataPlane) ReconcileDeletions(ctx context.Context, meta MetadataLi
 		return d.reconcileFromChain(ctx, meta, res, "chain-reconcile-due")
 	}
 
-	// 2. One incremental read.
-	entries, latest, oldest, epoch, err := d.deletions.DeletionsSince(ctx, state.Seq, d.deletionPage())
-	if err != nil {
-		// A control tier that cannot be read now says nothing about the next pass; the
-		// chain path would need the same tier.
-		return res, err
-	}
-	res.LatestSeq = latest
-	res.Truncated = latest > state.Seq && (oldest == 0 || oldest > state.Seq+1)
-
-	switch {
-	case epoch != state.Epoch:
-		if !d.chainReconcileEnabled {
-			res.Source, res.Fallback = "skipped", chainDisabled
-			return res, nil
+	// 2. Page through the log until it is drained (bounded — see
+	// maxDeletionPagesPerSweep). One page per tick would let a bulk deletion take many
+	// minutes to become visible; draining a bounded number per tick keeps each pass
+	// short while making the backlog converge in one.
+	page := d.deletionPage()
+	for pages := 0; pages < maxDeletionPagesPerSweep; pages++ {
+		entries, latest, oldest, epoch, err := d.deletions.DeletionsSince(ctx, state.Seq, page)
+		if err != nil {
+			// A control tier that cannot be read now says nothing about the next pass;
+			// the chain path would need the same tier.
+			return res, err
 		}
-		return d.reconcileFromChain(ctx, meta, res, deletionLogEpochMismatch)
-	case res.Truncated:
-		if !d.chainReconcileEnabled {
-			res.Source, res.Fallback = "skipped", chainDisabled
-			return res, nil
-		}
-		return d.reconcileFromChain(ctx, meta, res, "log-truncated")
-	case state.Seq > latest:
-		// This replica has applied fewer entries than this node already consumed. Not a
-		// rollback (the epoch matched) — just a lagging reader. Skip, keep the
-		// watermark, and let the forced full pass bound how long this can go on.
-		res.Source = "skipped"
-		res.BehindLeader = true
-		return res, nil
-	case len(entries) == 0:
-		res.Source = "skipped"
-		return res, nil
-	}
+		res.LatestSeq = latest
 
-	// 3. Record the page, then drain it.
-	res.Source = "incremental"
-	res.Entries = len(entries)
-	batch := make([]tombstone.DeletedVersion, 0, len(entries))
-	for _, entry := range entries {
-		batch = append(batch, tombstone.DeletedVersion{Seq: entry.Seq, KBID: entry.KBID, VersionID: entry.VersionID})
+		truncated := latest > state.Seq && (oldest == 0 || oldest > state.Seq+1)
+		if truncated || epoch != state.Epoch {
+			res.Truncated = truncated
+			reason := deletionLogEpochMismatch
+			if truncated {
+				reason = "log-truncated"
+			}
+			if !d.chainReconcileEnabled {
+				res.Source, res.Fallback = "skipped", chainDisabled
+				return res, nil
+			}
+			return d.reconcileFromChain(ctx, meta, res, reason)
+		}
+
+		if state.Seq > latest {
+			// This replica has applied fewer entries than this node already consumed. Not
+			// a rollback (the epoch matched) — just a lagging reader. Skip and keep the
+			// watermark; the forced full pass bounds how long this can go on.
+			if res.Entries == 0 {
+				res.Source = "skipped"
+				res.BehindLeader = true
+			}
+			break
+		}
+		if len(entries) == 0 {
+			if res.Entries == 0 {
+				res.Source = "skipped"
+			}
+			break
+		}
+
+		res.Source = "incremental"
+		res.Entries += len(entries)
+		batch := make([]tombstone.DeletedVersion, 0, len(entries))
+		for _, entry := range entries {
+			batch = append(batch, tombstone.DeletedVersion{Seq: entry.Seq, KBID: entry.KBID, VersionID: entry.VersionID})
+		}
+		next := tombstone.SyncState{Epoch: epoch, Seq: entries[len(entries)-1].Seq}
+		if err := d.tombstones.NoteBatch(ctx, next, batch); err != nil {
+			// Nothing of this page was recorded (the batch is atomic), so the watermark
+			// did not move either: the next pass re-reads the same page.
+			return res, err
+		}
+		state, res.LocalSeq = next, next.Seq
+
+		if len(entries) < page {
+			break // the log is drained
+		}
 	}
-	next := tombstone.SyncState{Epoch: epoch, Seq: entries[len(entries)-1].Seq}
-	if err := d.tombstones.NoteBatch(ctx, next, batch); err != nil {
-		// Nothing was recorded (the batch is atomic), so the watermark did not move
-		// either: the next pass re-reads the same page.
-		return res, err
-	}
-	res.LocalSeq = next.Seq
 
 	reclaimed, err := d.RetryPendingDeletions(ctx, tombstone.DefaultGrace)
 	res.Reclaimed = reclaimed
@@ -376,6 +397,21 @@ func (d *LocalDataPlane) reconcileFromChain(ctx context.Context, meta MetadataLi
 	// Consume the trigger now that the pass it exists for is running.
 	d.takeDeletedReconcileDirty()
 
+	// Snapshot the log's position BEFORE judging, and align to THIS value afterwards.
+	//
+	// The order is the whole point (the same reason a watch starts at the resource
+	// version a list returned): a deletion that completes WHILE this pass runs is not in
+	// its judgement — the version was still alive when the pass read the chain — so
+	// aligning to a position read AFTERWARDS would skip it. Snapshotting first leaves
+	// that deletion above the watermark, where the next incremental read finds it.
+	var aligned tombstone.SyncState
+	var haveAligned bool
+	if d.deletions != nil {
+		if _, latest, _, epoch, err := d.deletions.DeletionsSince(ctx, noEntryAfter, 1); err == nil && epoch != "" {
+			aligned, haveAligned = tombstone.SyncState{Epoch: epoch, Seq: latest}, true
+		}
+	}
+
 	leftovers, leftoversErr := d.DeletedVersionLeftovers(ctx, meta)
 	res.KnowledgeBases = len(leftovers)
 	reclaimed := 0
@@ -385,20 +421,19 @@ func (d *LocalDataPlane) reconcileFromChain(ctx context.Context, meta MetadataLi
 	}
 	res.Reclaimed = reclaimed
 
-	// Align the watermark even when some reclaim failed: the judgement COVERED those
-	// versions (it named them), and a failed reclaim is already remembered as PENDING in
-	// the table, which is what the retry loop drains. Not aligning would re-read a range
-	// whose answer is already known.
-	if d.deletions != nil {
-		if _, latest, _, epoch, err := d.deletions.DeletionsSince(ctx, 0, 0); err == nil && epoch != "" {
-			state, hasState, serr := d.tombstones.SyncSeq(ctx)
-			if serr == nil && (!hasState || epoch != state.Epoch || latest > state.Seq) {
-				// One entry, no deletions to record: the watermark alone moves.
-				if err := d.tombstones.NoteBatch(ctx, tombstone.SyncState{Epoch: epoch, Seq: latest}, nil); err != nil {
-					d.logger.Warn("plane: could not align the deletion watermark after a full reconcile", zap.Error(err))
-				} else {
-					res.LocalSeq = latest
-				}
+	// Align to the position snapshotted BEFORE the pass. Aligning even when some
+	// reclaim failed is deliberate: the judgement COVERED those versions (it named
+	// them), and a failed reclaim is already remembered as PENDING in the table, which
+	// is what the retry loop drains. Not aligning would re-read a range whose answer is
+	// already known.
+	if haveAligned {
+		state, hasState, serr := d.tombstones.SyncSeq(ctx)
+		if serr == nil && (!hasState || aligned.Epoch != state.Epoch || aligned.Seq > state.Seq) {
+			// No entries to record: the watermark alone moves.
+			if err := d.tombstones.NoteBatch(ctx, aligned, nil); err != nil {
+				d.logger.Warn("plane: could not align the deletion watermark after a full reconcile", zap.Error(err))
+			} else {
+				res.LocalSeq = aligned.Seq
 			}
 		}
 	}

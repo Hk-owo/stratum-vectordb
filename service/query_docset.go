@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
+	stratumerrors "stratum/internal/errors"
 	stratinternalsync "stratum/internal/sync"
 	"stratum/internal/versiondoc"
 )
@@ -78,9 +80,24 @@ func (c *docSetCache) lookup(ctx context.Context, store versiondoc.VersionDocLis
 		docs[id] = struct{}{}
 	}
 
-	// Verified against the control layer's digest, the set is the authoritative
-	// one for this version and can be reused. Anything else is left uncached.
-	if digest != "" && stratinternalsync.ComputeDocIDSetHash(ids) == digest {
+	// A set that does NOT hash to the committed digest is this replica's data being
+	// incomplete, not an answer. Filtering search hits against it drops the ones whose
+	// documents have not arrived yet, and the caller then gets a well-formed result with
+	// matches silently missing — the §9.1 risk 1 failure in its quietest form. So it is
+	// refused as retryable instead, which is what lets the station ask a replica that
+	// does have the version.
+	//
+	// "" is not a mismatch: no digest has been committed yet (an empty version, or a
+	// missed propose), and treating that as a corruption verdict would refuse versions
+	// that are perfectly fine.
+	if digest != "" {
+		if got := stratinternalsync.ComputeDocIDSetHash(ids); got != digest {
+			return nil, nil, fmt.Errorf(
+				"%w: %s: version %d's document set does not match the committed digest on this replica",
+				stratumerrors.ErrIndexNotReady, kbID, versionID)
+		}
+		// Verified against the control layer's digest, the set is the authoritative one
+		// for this version and can be reused.
 		c.put(kbID, versionID, docSetEntry{ids: ids, docs: docs, digest: digest})
 	}
 	return ids, docs, nil

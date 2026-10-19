@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"testing"
 
+	stratumerrors "stratum/internal/errors"
 	stratinternalsync "stratum/internal/sync"
 	"stratum/internal/versiondoc"
 )
@@ -97,7 +99,9 @@ func TestDocSetCache_ReusesAVerifiedSet(t *testing.T) {
 
 // TestDocSetCache_DoesNotCacheAnUnverifiedRead is the safety property: a read that
 // does NOT hash to the committed digest is not the version's set (the replica is
-// missing data, or has stale data), and caching it would answer wrongly forever.
+// missing data, or has stale data). It is REFUSED retryably, and it is never cached —
+// caching it would answer wrongly forever, and returning it would filter search hits
+// against a set that is not the version's.
 //
 // 撤掉即变红: caching unconditionally would make calls 1 instead of 2.
 func TestDocSetCache_DoesNotCacheAnUnverifiedRead(t *testing.T) {
@@ -108,8 +112,8 @@ func TestDocSetCache_DoesNotCacheAnUnverifiedRead(t *testing.T) {
 	var c docSetCache
 
 	for i := 0; i < 3; i++ {
-		if _, _, err := c.lookup(ctx, src, "kb-1", 7, "digest-that-does-not-match"); err != nil {
-			t.Fatalf("lookup %d: %v", i, err)
+		if _, _, err := c.lookup(ctx, src, "kb-1", 7, "digest-that-does-not-match"); !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+			t.Fatalf("lookup %d = %v, want ErrIndexNotReady", i, err)
 		}
 	}
 	if src.calls != 3 {
@@ -154,12 +158,11 @@ func TestDocSetCache_AnEarlyEmptyReadNeverSticks(t *testing.T) {
 	src := &stagedVDL{stages: [][]string{nil, full}}
 	var c docSetCache
 
-	ids, _, err := c.lookup(ctx, src, "kb-1", 7, digest)
-	if err != nil {
-		t.Fatalf("lookup 1: %v", err)
-	}
-	if len(ids) != 0 {
-		t.Fatalf("first read = %v, want the empty set the unstaged replica really has", ids)
+	// The early read is refused, not returned: an empty set that does not hash to the
+	// committed digest is "this replica is incomplete", and a caller must not filter
+	// against it.
+	if _, _, err := c.lookup(ctx, src, "kb-1", 7, digest); !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+		t.Fatalf("lookup 1 = %v, want ErrIndexNotReady", err)
 	}
 
 	ids, docs, err := c.lookup(ctx, src, "kb-1", 7, digest)
@@ -194,8 +197,10 @@ func TestDocSetCache_ADifferentDigestMisses(t *testing.T) {
 	if _, _, err := c.lookup(ctx, src, "kb-1", 7, stratinternalsync.ComputeDocIDSetHash(ids)); err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
-	if _, _, err := c.lookup(ctx, src, "kb-1", 7, "some-other-digest"); err != nil {
-		t.Fatalf("lookup with a different digest: %v", err)
+	// A digest the local set does not hash to is a refusal (this replica cannot serve
+	// the version), and it must not be cached either.
+	if _, _, err := c.lookup(ctx, src, "kb-1", 7, "some-other-digest"); !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+		t.Fatalf("lookup with a different digest = %v, want ErrIndexNotReady", err)
 	}
 	if src.calls != 2 {
 		t.Fatalf("a different digest must miss; got %d reads, want 2", src.calls)
