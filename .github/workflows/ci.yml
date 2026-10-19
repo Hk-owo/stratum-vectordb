@@ -200,7 +200,24 @@ jobs:
       - name: 运行 T4 集群容错测试
         env:
           STRATUM_T4_NODE_SERVICES: stratum-node-control1,stratum-node-control2,stratum-node-control3
-        run: go test ./integration/docker/... -tags=docker -v -timeout 900s -skip 'TestT4_DataVolume'
+        # 失败时把每个失败用例最后 80 行输出写成 error 注解：注解可以通过 checks API
+        # 读到，而原始日志下载在某些环境里拿不到。
+        run: |
+          set -o pipefail
+          status=0
+          go test ./integration/docker/... -tags=docker -v -timeout 900s -skip 'TestT4_DataVolume' 2>&1 | tee t4.log || status=$?
+          if [[ $status -ne 0 ]]; then
+            esc() { sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}'; }
+            fails=$(grep -oE -- '--- FAIL: [^ ]+' t4.log | awk '{print $3}' | sort -u)
+            if [[ -z "$fails" ]]; then
+              echo "::error title=T4 (no FAIL line)::$(tail -n 80 t4.log | esc)"
+            fi
+            for t in $fails; do
+              body=$(awk -v t="$t" '$0 ~ "=== RUN   "t"$" {on=1} on {print} $0 ~ "--- FAIL: "t" " {on=0}' t4.log | tail -n 80 | esc)
+              echo "::error title=$t::$body"
+            done
+          fi
+          exit $status
 
       - name: 清理集群
         if: always()
