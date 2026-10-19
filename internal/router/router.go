@@ -848,7 +848,7 @@ func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission 
 		// and the message now says what actually went wrong. "no leader
 		// available" alone is wrong anyway — the leader was found and the write
 		// reached it.
-		return zero, fmt.Errorf("router: no leader available after %d attempt(s): %w", attempts, lastErr)
+		return zero, noLeaderAfter(fmt.Sprintf("router: no leader available after %d attempt(s)", attempts), lastErr)
 	}
 	// Named, not a bare errors.New: "the cluster is electing" is transient, and without a
 	// sentinel the caller sees `code = Unknown` and cannot know to retry — measured as a
@@ -1024,9 +1024,24 @@ func tryAll[T any](r *Router, ctx context.Context, fn func(idx int, ctx context.
 		return zero, errors.New("router: every control node is circuit-broken")
 	}
 	if lastErr != nil {
-		return zero, fmt.Errorf("router: no leader available (tried every node): %w", lastErr)
+		return zero, noLeaderAfter("router: no leader available (tried every node)", lastErr)
 	}
-	return zero, errors.New("router: no leader available")
+	return zero, fmt.Errorf("router: no leader available: %w", stratumerrors.ErrNoLeaderYet)
+}
+
+// noLeaderAfter is the error for "every attempt failed in a retryable way".
+//
+// When the last attempt's error already carries a reason (storage_unavailable, say),
+// that reason IS the diagnosis and is kept as the identity. When it carries none — a
+// bare Unavailable from a node that is down, or "not leader" mid-election — the
+// identity is ErrNoLeaderYet, because that is what the caller has to act on: the
+// cluster may be electing, ask again. The last error stays wrapped either way, so the
+// message and errors.Is still reach it.
+func noLeaderAfter(msg string, lastErr error) error {
+	if stratumerrors.ReasonOf(lastErr) != "" {
+		return fmt.Errorf("%s: %w", msg, lastErr)
+	}
+	return fmt.Errorf("%s: %w (last error: %w)", msg, stratumerrors.ErrNoLeaderYet, lastErr)
 }
 
 // isRetryableErr reports whether a forwarded call should retry on another node.

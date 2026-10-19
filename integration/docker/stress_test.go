@@ -178,12 +178,17 @@ func writeChanges(t *testing.T, ctx context.Context, addr, kbID string, parent i
 // end it, with room for the election that produces a new leader in the first place.
 const storageGateSettleWait = 90 * time.Second
 
-// storageGateRefusal reports whether err is the storage gate declining a write
-// because it cannot see a quorum of the required replicas — the retryable verdict
-// writeChanges waits out, as opposed to any other failure.
+// storageGateRefusal reports whether err is a refusal writeChanges waits out, as
+// opposed to any other failure: the storage gate declining a write because it cannot
+// see a quorum of the required replicas, or the control layer having no leader yet.
+//
+// no_leader_yet belongs here for the same reason as the gate's verdicts: it is a
+// statement about where the cluster is right now (an election in flight, typically
+// right after a test killed or restarted a node), not about the request. Treating it as
+// fatal failed whole cases on CI in the seconds an election takes.
 func storageGateRefusal(err error) bool {
 	switch stratumerrors.ReasonOf(err) {
-	case reasonStorageUnavailable, reasonKBStorageDegraded:
+	case reasonStorageUnavailable, reasonKBStorageDegraded, reasonNoLeaderYet:
 		return true
 	}
 	return false

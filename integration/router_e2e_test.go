@@ -73,7 +73,12 @@ func TestRouter_ThreeNodeCluster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("router listen: %v", err)
 	}
-	routerGS := grpc.NewServer()
+	// Same boundary as cmd/stratum-router: the Router's sentinels must reach the client
+	// with their reason, not as code = Unknown.
+	routerGS := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(router.WireErrorsUnary()),
+		grpc.ChainStreamInterceptor(router.WireErrorsStream()),
+	)
 	pb.RegisterKnowledgeBaseServiceServer(routerGS, router.NewKBServer(rt))
 	pb.RegisterQueryServiceServer(routerGS, router.NewQueryServer(rt))
 	pb.RegisterAdminServiceServer(routerGS, router.NewAdminServer(rt))

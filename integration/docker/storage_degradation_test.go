@@ -18,12 +18,13 @@ import (
 	stratumerrors "stratum/internal/errors"
 )
 
-// The two wire names a storage refusal can carry. They are strings here rather
+// The wire names a retryable write refusal can carry. They are strings here rather
 // than an import of the errors package because this is what crosses the wire — and
 // the test asserts on the wire, not on a shared constant.
 const (
 	reasonKBStorageDegraded  = "kb_storage_degraded"
 	reasonStorageUnavailable = "storage_unavailable"
+	reasonNoLeaderYet        = "no_leader_yet"
 )
 
 // createVersionOnce asks ONE control node for a version and returns whatever comes

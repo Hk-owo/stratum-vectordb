@@ -139,8 +139,14 @@ func main() {
 		// (translating and grading calls, reading its route table), and it is the
 		// process in front of everything: a panic here is a panic for every client,
 		// so it gets the same recovery the nodes have (service/recovery.go).
-		grpc.ChainUnaryInterceptor(service.RecoveryUnary(logger.Sugar().Errorf)),
-		grpc.ChainStreamInterceptor(service.RecoveryStream(logger.Sugar().Errorf)),
+		//
+		// WireErrors* sits inside the recovery so that it sees every handler's own
+		// error: the Router's sentinels (e.g. "no leader available") are plain Go errors,
+		// and without it they cross this boundary as `code = Unknown` with no reason —
+		// a transient election then looks permanent to every caller that decides on the
+		// reason (internal/router/wire_errors.go).
+		grpc.ChainUnaryInterceptor(service.RecoveryUnary(logger.Sugar().Errorf), router.WireErrorsUnary()),
+		grpc.ChainStreamInterceptor(service.RecoveryStream(logger.Sugar().Errorf), router.WireErrorsStream()),
 	)
 	pb.RegisterKnowledgeBaseServiceServer(gs, router.NewKBServer(rt))
 	pb.RegisterQueryServiceServer(gs, router.NewQueryServer(rt))
