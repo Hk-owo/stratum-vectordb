@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -106,16 +107,24 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	// single slot would pair the wrong two records and drop a live transaction's
 	// replay input.
 	pending := make(map[string]*rawRecord)
+	// readOffset tracks where the record being read starts, so a damaged one can be
+	// reported by offset and, more importantly, so the tail can be told from damage
+	// in the middle (damageIsInTheMiddle).
+	var readOffset int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		rec, raw, err := readRawRecord(reader)
 		if err != nil {
-			// A truncated or corrupt tail is where the log ends; everything read so
-			// far is the valid log.
+			if derr := damageRefusesRewrite("wal: compact", w.path, in, readOffset, err); derr != nil {
+				return derr
+			}
+			// The log ends here as far as this rewrite is concerned: everything read
+			// so far is the valid log, and the replacement file simply holds less.
 			break
 		}
+		readOffset += int64(len(raw.raw))
 
 		switch rec.kind {
 		case recordTypeBegin:
@@ -344,16 +353,21 @@ func (w *FileWAL) DeleteByKB(ctx context.Context, kbID string) error {
 	defer in.Close()
 	reader := bufio.NewReader(in)
 
+	var readOffset int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		rec, raw, err := readRawRecord(reader)
 		if err != nil {
-			// A truncated or corrupt tail is where the log ends; everything read so
+			if derr := damageRefusesRewrite("wal: delete by knowledge base", w.path, in, readOffset, err); derr != nil {
+				return derr
+			}
+			// The tail a crashed write left behind ends the log; everything read so
 			// far is the valid log.
 			break
 		}
+		readOffset += int64(len(raw.raw))
 		// raw.kbID is filled for BEGIN (its payload carries one); rec.kbID for every
 		// other type that has a knowledge base at all.
 		if raw.kbID == kbID || rec.kbID == kbID {
@@ -508,6 +522,10 @@ func takePendingBegin(pending map[string]*rawRecord, kbID string) *rawRecord {
 	return nil
 }
 
+// readRawRecord is readRecord for the rewrite paths: the same framing, the same
+// validation, the same payload decoding (decodeRecord), plus the exact bytes the
+// record occupied so compaction can copy it without re-encoding a payload it did
+// not author.
 func readRawRecord(r *bufio.Reader) (parsedRecord, *rawRecord, error) {
 	header := make([]byte, recordHeaderLen)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -515,7 +533,7 @@ func readRawRecord(r *bufio.Reader) (parsedRecord, *rawRecord, error) {
 	}
 	payloadLen := binary.BigEndian.Uint32(header[1:5])
 	if payloadLen > maxSanePayload {
-		return parsedRecord{}, nil, fmt.Errorf("wal: implausible payload length %d", payloadLen)
+		return parsedRecord{}, nil, fmt.Errorf("%w: implausible payload length %d", ErrLogCorrupt, payloadLen)
 	}
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
@@ -529,53 +547,38 @@ func readRawRecord(r *bufio.Reader) (parsedRecord, *rawRecord, error) {
 	gotCRC := crc32.ChecksumIEEE(header)
 	gotCRC = crc32.Update(gotCRC, crc32.IEEETable, payload)
 	if gotCRC != wantCRC {
-		return parsedRecord{}, nil, fmt.Errorf("wal: checksum mismatch")
+		return parsedRecord{}, nil, fmt.Errorf("%w: checksum mismatch", ErrLogCorrupt)
 	}
 
-	rec := parsedRecord{kind: recordType(header[0])}
+	rec, err := decodeRecord(recordType(header[0]), payload)
+	if err != nil {
+		return parsedRecord{}, nil, err
+	}
 	raw := &rawRecord{raw: append(append(append([]byte{}, header...), payload...), crcBytes...)}
 	switch rec.kind {
 	case recordTypeBegin:
-		bd, err := decodeBeginPayload(payload)
-		if err != nil {
-			return parsedRecord{}, nil, fmt.Errorf("wal: corrupt BEGIN payload: %w", err)
-		}
-		rec.begin = bd
-		raw.kbID = bd.kbID
-	case recordTypeVersionID:
-		// 8 bytes from records written before the payload carried the knowledge base
-		// (M7 of docs/code-review-2026-09-24.md); more is versionID + raw kbID bytes.
-		if len(payload) < 8 {
-			return parsedRecord{}, nil, fmt.Errorf("wal: malformed versionID payload length %d", len(payload))
-		}
-		rec.versionID = int64(binary.BigEndian.Uint64(payload[:8]))
-		rec.kbID = string(payload[8:])
+		raw.kbID = rec.begin.kbID
+	case recordTypeVersionID, recordTypeCursor:
 		raw.kbID = rec.kbID
-	case recordTypeCommit:
-		if len(payload) != 8 {
-			return parsedRecord{}, nil, fmt.Errorf("wal: malformed versionID payload length %d", len(payload))
-		}
-		rec.versionID = int64(binary.BigEndian.Uint64(payload))
-	case recordTypeDeleteMark, recordTypeDeleteComplete:
-		rec.kbID = string(payload)
-	case recordTypeVersionDeleteMark, recordTypeVersionDeleteComplete:
-		if len(payload) < 8 {
-			return parsedRecord{}, nil, fmt.Errorf("wal: malformed version-delete payload length %d", len(payload))
-		}
-		rec.versionID = int64(binary.BigEndian.Uint64(payload[:8]))
-		rec.kbID = string(payload[8:])
-	case recordTypeCursor:
-		kbID, versionID, err := decodeCursorPayload(payload)
-		if err != nil {
-			return parsedRecord{}, nil, err
-		}
-		rec.kbID = kbID
-		rec.versionID = versionID
-		raw.kbID = kbID
-	default:
-		return parsedRecord{}, nil, fmt.Errorf("wal: unknown record type 0x%02x", rec.kind)
 	}
 	return rec, raw, nil
+}
+
+// damageRefusesRewrite is the rewrite paths' half of the reader's rule (see
+// damageIsInTheMiddle). A rewrite copies the records it reads into a fresh file and
+// swaps it in with an atomic rename, so ending the log at damage is worse here than
+// at startup: the original is replaced, and every record behind the damage is gone
+// with no copy left to recover it from. It therefore refuses damage in the middle
+// and a record it cannot interpret alike, and returns nil only for a tail a crashed
+// write could have left behind.
+func damageRefusesRewrite(op, path string, f *os.File, recordStart int64, cause error) error {
+	if errors.Is(cause, ErrUnknownRecord) {
+		return fmt.Errorf("%s: %s: record at offset %d: %w", op, path, recordStart, cause)
+	}
+	if err := damageIsInTheMiddle(path, f, recordStart, cause); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return nil
 }
 
 // maxCursorByKB returns the highest CURSOR value recorded per knowledge base. It
@@ -583,8 +586,10 @@ func readRawRecord(r *bufio.Reader) (parsedRecord, *rawRecord, error) {
 // each knowledge base and drops the rest (the value is a scalar, so an older
 // record says nothing the newer one does not).
 //
-// A corrupt or truncated tail simply ends the scan, exactly as it ends every
-// other reader of this log: everything before it is the valid log.
+// It obeys the same rule as the rewrite itself (damageRefusesRewrite): a tail a
+// crash left behind ends the scan, because everything before it is the valid log,
+// while damage in the middle refuses the compaction rather than letting the scan
+// answer a question about a log that is not fully readable.
 func (w *FileWAL) maxCursorByKB() (map[string]int64, error) {
 	in, err := os.Open(w.path)
 	if err != nil {
@@ -594,11 +599,16 @@ func (w *FileWAL) maxCursorByKB() (map[string]int64, error) {
 
 	out := make(map[string]int64)
 	reader := bufio.NewReader(in)
+	var readOffset int64
 	for {
-		rec, _, err := readRawRecord(reader)
+		rec, raw, err := readRawRecord(reader)
 		if err != nil {
+			if derr := damageRefusesRewrite("wal: compact", w.path, in, readOffset, err); derr != nil {
+				return nil, derr
+			}
 			break
 		}
+		readOffset += int64(len(raw.raw))
 		if rec.kind != recordTypeCursor {
 			continue
 		}

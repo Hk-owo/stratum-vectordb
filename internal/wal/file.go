@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -70,6 +71,26 @@ const (
 // still protects against a corrupt length prefix claiming a multi-GB
 // payload and forcing a huge allocation.
 const maxSanePayload = 1 << 26 // 64 MiB
+
+// ErrLogCorrupt reports a log damaged in a way no interrupted write can explain:
+// a record whose frame reads back in full but does not check out, with intact
+// records behind it. The frame is [type][len][payload][crc] and the checksum is
+// written last, so a write cut short by a crash stops before the checksum instead
+// of producing a wrong one — which means those bytes changed on disk after they
+// were written (failing media, bit rot, another process writing the same path).
+// Opening or rewriting such a log fails rather than truncating at the damage,
+// because the records behind it were often already acknowledged to their callers.
+//
+// It is exported so the startup path can tell this apart from an ordinary I/O
+// failure: the remedy is an operator's decision, not a retry.
+var ErrLogCorrupt = errors.New("wal: log is corrupt")
+
+// ErrUnknownRecord reports a record whose framing and checksum are both valid but
+// whose type tag this build does not understand — a log written by a newer
+// binary. Deliberately separate from ErrLogCorrupt: the log is in perfect
+// condition and truncating it would destroy healthy records, so the remedy is to
+// run the matching version, not to inspect the device.
+var ErrUnknownRecord = errors.New("wal: unsupported record type")
 
 // beginData is the replay input persisted inside a BEGIN record. The
 // recovery path for a VERSION_ID-without-COMMIT record needs the original
@@ -435,6 +456,21 @@ func (w *FileWAL) rebuildIndex() error {
 	for {
 		rec, recLen, err := readRecord(r)
 		if err != nil {
+			if errors.Is(err, ErrUnknownRecord) {
+				// The record checked out — its checksum is valid — this build just
+				// cannot say what it means. Cutting the log there would delete records
+				// that are in perfect condition, so the log stays as it is and the
+				// node refuses to start until it runs a binary that understands it.
+				return fmt.Errorf("wal: %s: record at offset %d: %w", w.path, validEnd, err)
+			}
+			// Otherwise it is either the tail of a write a crash cut short (cut it
+			// away, as before) or damage in the middle (refuse: the records behind it
+			// may already have been acknowledged, and the peers may hold the other
+			// half of the changes they describe). Only the rest of the file can say
+			// which, so ask it.
+			if derr := damageIsInTheMiddle(w.path, w.file, validEnd, err); derr != nil {
+				return derr
+			}
 			break // incomplete/corrupt trailing record, or clean EOF: stop here
 		}
 		switch rec.kind {
@@ -496,9 +532,14 @@ type parsedRecord struct {
 
 // readRecord reads and validates a single record from r, returning the
 // decoded record and its total on-disk length (header + payload + CRC).
-// Returns an error — without distinguishing the cause further, since
-// every cause is handled identically by the caller (stop reading) — if
-// the stream ends before a complete, checksum-valid record is available.
+//
+// A failure means one of two very different things, and the caller has to tell
+// them apart — see damageIsInTheMiddle and ErrUnknownRecord:
+//
+//   - a short read: the file ends before the record does, which is what a write
+//     cut short by a crash leaves behind;
+//   - a record whose frame reads back in full but does not check out, or a length
+//     prefix that cannot be trusted: the bytes changed after they were written.
 func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 	header := make([]byte, recordHeaderLen)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -513,7 +554,7 @@ func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 	// maxSanePayload) is generous enough for legitimate BEGIN records
 	// carrying a full changes list.
 	if payloadLen > maxSanePayload {
-		return parsedRecord{}, 0, fmt.Errorf("wal: implausible payload length %d, treating as corrupt trailing record", payloadLen)
+		return parsedRecord{}, 0, fmt.Errorf("%w: implausible payload length %d", ErrLogCorrupt, payloadLen)
 	}
 
 	payload := make([]byte, payloadLen)
@@ -530,15 +571,32 @@ func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 	gotCRC := crc32.ChecksumIEEE(header)
 	gotCRC = crc32.Update(gotCRC, crc32.IEEETable, payload)
 	if gotCRC != wantCRC {
-		return parsedRecord{}, 0, fmt.Errorf("wal: checksum mismatch, treating as corrupt trailing record")
+		return parsedRecord{}, 0, fmt.Errorf("%w: checksum mismatch", ErrLogCorrupt)
 	}
 
+	rec, err := decodeRecord(kind, payload)
+	if err != nil {
+		return parsedRecord{}, 0, err
+	}
+	totalLen := int64(recordHeaderLen) + int64(payloadLen) + int64(recordCRCLen)
+	return rec, totalLen, nil
+}
+
+// decodeRecord interprets a record's payload. Shared by the recovery reader, the
+// compaction rewriter and the damage scan on purpose: the scan's verdict ("there
+// is another readable record behind the damage") is only trustworthy if it is
+// asking the same question recovery answers.
+//
+// Errors wrap ErrLogCorrupt for a payload whose shape is wrong and return
+// ErrUnknownRecord for a type tag this build does not know — the second is not
+// damage, since the checksum over those bytes is valid.
+func decodeRecord(kind recordType, payload []byte) (parsedRecord, error) {
 	rec := parsedRecord{kind: kind}
 	switch kind {
 	case recordTypeBegin:
 		bd, err := decodeBeginPayload(payload)
 		if err != nil {
-			return parsedRecord{}, 0, fmt.Errorf("wal: corrupt BEGIN payload: %w", err)
+			return parsedRecord{}, fmt.Errorf("%w: corrupt BEGIN payload: %w", ErrLogCorrupt, err)
 		}
 		rec.begin = bd
 	case recordTypeVersionID:
@@ -546,36 +604,113 @@ func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 		// base; more is the version id followed by the kbID's raw bytes (M7 of
 		// docs/code-review-2026-09-24.md).
 		if len(payload) < 8 {
-			return parsedRecord{}, 0, fmt.Errorf("wal: malformed versionID payload length %d", len(payload))
+			return parsedRecord{}, fmt.Errorf("%w: malformed versionID payload length %d", ErrLogCorrupt, len(payload))
 		}
 		rec.versionID = int64(binary.BigEndian.Uint64(payload[:8]))
 		rec.kbID = string(payload[8:])
 	case recordTypeCommit:
 		if len(payload) != 8 {
-			return parsedRecord{}, 0, fmt.Errorf("wal: malformed versionID payload length %d", len(payload))
+			return parsedRecord{}, fmt.Errorf("%w: malformed commit payload length %d", ErrLogCorrupt, len(payload))
 		}
 		rec.versionID = int64(binary.BigEndian.Uint64(payload))
 	case recordTypeDeleteMark, recordTypeDeleteComplete:
 		rec.kbID = string(payload)
 	case recordTypeVersionDeleteMark, recordTypeVersionDeleteComplete:
 		if len(payload) < 8 {
-			return parsedRecord{}, 0, fmt.Errorf("wal: malformed version-delete payload length %d", len(payload))
+			return parsedRecord{}, fmt.Errorf("%w: malformed version-delete payload length %d", ErrLogCorrupt, len(payload))
 		}
 		rec.versionID = int64(binary.BigEndian.Uint64(payload[:8]))
 		rec.kbID = string(payload[8:])
 	case recordTypeCursor:
 		kbID, versionID, err := decodeCursorPayload(payload)
 		if err != nil {
-			return parsedRecord{}, 0, err
+			return parsedRecord{}, fmt.Errorf("%w: %w", ErrLogCorrupt, err)
 		}
 		rec.kbID = kbID
 		rec.versionID = versionID
 	default:
-		return parsedRecord{}, 0, fmt.Errorf("wal: unknown record type 0x%02x", kind)
+		return parsedRecord{}, fmt.Errorf("%w: 0x%02x", ErrUnknownRecord, byte(kind))
 	}
+	return rec, nil
+}
 
-	totalLen := int64(recordHeaderLen) + int64(payloadLen) + int64(recordCRCLen)
-	return rec, totalLen, nil
+// maxDamageScan bounds how much of the log damageIsInTheMiddle will read while
+// looking for an intact record behind the damage — and doubles as the proof that
+// there is one. A write path that is interrupted is interrupted once, and one
+// record is at most maxSanePayload long, so a crashed write can leave at most one
+// unterminated record behind: anything longer than that cannot be its tail, which
+// means the log continues past the damage. The rest is read whole because a record
+// that long has to fit inside the scanned window for the scan to recognise it.
+const maxDamageScan = maxSanePayload + recordHeaderLen + recordCRCLen
+
+// damageIsInTheMiddle decides what a failed record read at recordStart means for
+// the log. It returns an error wrapping ErrLogCorrupt when readable records still
+// follow that point — damage in the middle, where truncating would delete records
+// that were already acknowledged — and nil when nothing readable follows, which is
+// the tail a crashed write leaves behind and which recovery may cut away.
+//
+// Neither the read error nor the position answers this on its own. A torn write
+// stops before the checksum, so it shows up as a short read; a length prefix
+// damaged into pointing past the end of the file shows up the same way. What
+// separates them is whether good records are still behind the damage, and finding
+// those means scanning byte by byte, because the framing is precisely what cannot
+// be trusted.
+//
+// The asymmetry decides the bias: a false positive costs a refusal to start, which
+// an operator clears in a minute, while a false negative costs every record after
+// the damage. So any offset whose record parses and checks out counts as a
+// survivor, including the ones that only look like one.
+func damageIsInTheMiddle(path string, f *os.File, recordStart int64, cause error) error {
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("wal: %s: inspect the log after a damaged record at offset %d: %w", path, recordStart, err)
+	}
+	from := recordStart + 1
+	rest := info.Size() - from
+	if rest <= 0 {
+		return nil
+	}
+	if rest > maxDamageScan {
+		return fmt.Errorf("%w: %s: record at offset %d does not check out (%v) with %d bytes behind it",
+			ErrLogCorrupt, path, recordStart, cause, rest)
+	}
+	buf := make([]byte, rest)
+	if _, err := io.ReadFull(io.NewSectionReader(f, from, rest), buf); err != nil {
+		return fmt.Errorf("wal: %s: read the log after a damaged record at offset %d: %w", path, recordStart, err)
+	}
+	if off, ok := findRecordIn(buf); ok {
+		return fmt.Errorf("%w: %s: record at offset %d does not check out (%v), but the log continues at offset %d",
+			ErrLogCorrupt, path, recordStart, cause, from+int64(off))
+	}
+	return nil
+}
+
+// findRecordIn returns the first offset in data at which a complete, checksum-
+// valid, interpretable record begins. It answers the only question the damage scan
+// has: is there anything readable left in here?
+func findRecordIn(data []byte) (int, bool) {
+	for off := 0; off+recordHeaderLen+recordCRCLen <= len(data); off++ {
+		payloadLen := int(binary.BigEndian.Uint32(data[off+1 : off+5]))
+		if payloadLen > maxSanePayload {
+			continue
+		}
+		body := off + recordHeaderLen
+		end := body + payloadLen + recordCRCLen
+		if end > len(data) {
+			continue
+		}
+		wantCRC := binary.BigEndian.Uint32(data[end-recordCRCLen : end])
+		gotCRC := crc32.ChecksumIEEE(data[off:body])
+		gotCRC = crc32.Update(gotCRC, crc32.IEEETable, data[body:body+payloadLen])
+		if gotCRC != wantCRC {
+			continue
+		}
+		if _, err := decodeRecord(recordType(data[off]), data[body:body+payloadLen]); err != nil {
+			continue
+		}
+		return off, true
+	}
+	return 0, false
 }
 
 // applyRecordLocked updates the in-memory idempotency-tracking maps to
