@@ -1106,3 +1106,35 @@ func TestQueryService_PendingVersionWithALocalArtifactSkipsThePeerAsk(t *testing
 		t.Fatalf("peer asks = %d, want 0: the artifact is already here", fetcher.calls)
 	}
 }
+
+// A durable version too large to scan reaches BOTH branches: the two-step rule above the
+// scan, and the refusal below it. The peers must be asked once, not twice — the second
+// round trip re-resolves the replicas and re-asks every one of them.
+func TestQueryService_PendingVersionTooLargeToScanAsksPeersOnce(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	fetcher := &recordingIndexFetcher{}
+	h.svc.SetIndexFetcher(fetcher)
+	refusing := &scanRefusingIndexManager{MockIndexManager: h.indexMgr}
+	h.svc.indexManager = refusing
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+	})
+
+	_, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err == nil {
+		t.Fatal("expected the refusal for a version too large to scan")
+	}
+	if fetcher.calls != 1 {
+		t.Fatalf("peer asks = %d, want exactly 1 across both branches", fetcher.calls)
+	}
+	if reason := stratumerrors.ReasonOf(err); reason != "version_pending" {
+		t.Fatalf("reason = %q, want version_pending", reason)
+	}
+}

@@ -514,6 +514,13 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		// Triggering rather than waiting is deliberate: the build runs off this
 		// request (the caller keeps its own deadline), and every retry the station
 		// or the client makes gets a finished index.
+		// peerAsked records that the two-step rule already ran above, so the refusal path
+		// below does not ask the same peers a second time. It matters for the one flow that
+		// reaches both: a durable version too large to scan (TrySearch answers "not now"),
+		// which then falls through to the refusal. The fetch is de-duplicated per version
+		// inside the plane, but a SECOND round trip after the first one finished is not
+		// free — it re-resolves the replicas and re-asks every one of them.
+		peerAsked := false
 		if targetVersion.DataStatus == types.DataStatusDurable {
 			// §4.2's two-step rule, and it has to come BEFORE the scan.
 			//
@@ -526,6 +533,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 			// (free, and TrySearch's loadFromDisk will pick it up), then a peer's (one round
 			// trip), and only then building (minutes).
 			if s.indexFetcher != nil && !s.hasLocalIndexArtifact(ctx, kbID, versionID) {
+				peerAsked = true
 				fetched, fetchErr := s.indexFetcher.FetchIndexFromPeers(ctx, kbID, versionID)
 				switch {
 				case fetchErr != nil:
@@ -560,7 +568,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 			// created: at that point nobody has the artifact. The router decides which
 			// nodes are asked at all (§5), so this runs on the versions a caller
 			// actually wants and nowhere else.
-			if s.indexFetcher != nil {
+			if s.indexFetcher != nil && !peerAsked {
 				fetched, fetchErr := s.indexFetcher.FetchIndexFromPeers(ctx, kbID, versionID)
 				if fetchErr != nil {
 					s.logger.Debug("query: asking peers for the index artifact failed",
