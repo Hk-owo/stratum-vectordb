@@ -49,6 +49,17 @@ func (im *IndexManagerImpl) bruteForceMaxChunks() int {
 // is the cheaper option (§8.6b). answered=false means the caller should build
 // and wait instead.
 func (im *IndexManagerImpl) tryBruteForce(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) (bool, []types.SearchResult, error) {
+	return im.tryBruteForceWith(ctx, kbID, versionID, vector, topK, true)
+}
+
+// tryBruteForceWith is tryBruteForce with the build scheduling made explicit.
+//
+// schedule=false is for a caller that runs the two-step rule (§4.2: this node's artifact,
+// then a peer's, then a build) itself, on its own schedule — service/query.go's PENDING
+// path does exactly that. Leaving the build here as well would schedule it twice, and a
+// second build for a finished artifact is a FULL REBUILD (triggerBuild de-duplicates
+// in-flight builds, not finished ones).
+func (im *IndexManagerImpl) tryBruteForceWith(ctx context.Context, kbID string, versionID int64, vector []float32, topK int, schedule bool) (bool, []types.SearchResult, error) {
 	// Deletion tombstones come first, exactly as they do on the load path: a
 	// KB or version being deleted must not become queryable again just because
 	// a scan can answer without an index.
@@ -73,11 +84,14 @@ func (im *IndexManagerImpl) tryBruteForce(ctx context.Context, kbID string, vers
 		return false, nil, nil // large: building is the better deal
 	}
 
-	// Schedule the build regardless: this version will be queried again, and
-	// the scan is a bridge to it, not a replacement.
-	if err := im.TriggerBuild(ctx, kbID, versionID); err != nil {
-		im.logger.Warn("index: could not schedule a lazy build after a scan",
-			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	// The scan is a bridge to a real index, not a replacement: this version will be
+	// queried again. Unless the CALLER owns that step (schedule=false) — see
+	// tryBruteForceWith.
+	if schedule {
+		if err := im.TriggerBuild(ctx, kbID, versionID); err != nil {
+			im.logger.Warn("index: could not schedule a lazy build after a scan",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		}
 	}
 	im.logger.Info("index: answering by scanning a version whose index is not built yet",
 		zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("chunks", len(chunkIDs)))

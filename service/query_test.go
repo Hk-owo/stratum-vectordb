@@ -601,6 +601,10 @@ func TestQueryService_PendingWriteWithoutDurableDataIsRejected(t *testing.T) {
 	// Refusing is only half of it: the request must also ASK for the build.
 	// Otherwise PENDING is permanent — the query that would trigger the lazy
 	// build is the one being refused, so nothing ever gets built.
+	//
+	// It happens in the background now (nothing on this path is allowed to put a peer
+	// download or a build in the caller's latency), so wait for it.
+	h.waitForWarmup(t)
 	if got := h.indexMgr.TriggeredBuilds(); len(got) != 1 || got[0] != vID {
 		t.Errorf("TriggeredBuilds = %v, want [%d] — a PENDING version must ask for its lazy build",
 			got, vID)
@@ -788,6 +792,7 @@ func TestQueryService_PendingVersionTooLargeToScanStaysRetryable(t *testing.T) {
 	if reason := stratumerrors.ReasonOf(err); reason != "version_pending" {
 		t.Errorf("reason = %q, want version_pending", reason)
 	}
+	h.waitForWarmup(t)
 	if got := h.indexMgr.TriggeredBuilds(); len(got) != 1 || got[0] != vID {
 		t.Errorf("TriggeredBuilds = %v, want [%d] — the version still needs its build", got, vID)
 	}
@@ -1024,23 +1029,55 @@ func errString(err error) string {
 }
 
 // recordingIndexFetcher records the peer asks, so a case can assert the ORDER the query
-// path uses: peers before building (§4.2), not after.
+// path uses: peers before building (§4.2) — and that neither happens on the request.
 type recordingIndexFetcher struct {
+	mu        sync.Mutex
 	calls     int
 	installed bool
 	err       error
+	// block, when non-nil, holds the fetch until the test releases it: that is how a case
+	// proves the QUERY does not wait for the warm-up.
+	block chan struct{}
 }
 
 func (f *recordingIndexFetcher) FetchIndexFromPeers(context.Context, string, int64) (bool, error) {
+	f.mu.Lock()
 	f.calls++
+	block := f.block
+	f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
 	return f.installed, f.err
 }
 
-// A PENDING version with durable data asks the peers BEFORE the scan schedules a local
-// build. The scan is a bridge, not a replacement (§8.6b), and "every replica builds its
-// own copy" is exactly what owner sharding exists to prevent
-// (docs/index-owner-sharding-plan.md §4.2).
-func TestQueryService_PendingVersionAsksPeersBeforeBuilding(t *testing.T) {
+func (f *recordingIndexFetcher) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// waitForWarmup waits until the service has no index warm-up in flight.
+func (h *querySvcHarness) waitForWarmup(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		h.svc.pullMu.Lock()
+		n := len(h.svc.indexWarmups)
+		h.svc.pullMu.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the background index warm-up never finished")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A PENDING version with durable data is answered from the scan, and the index's two-step
+// rule (§4.2) runs BEHIND that answer: peers first, then a local build.
+func TestQueryService_PendingVersionWarmsTheIndexBehindTheAnswer(t *testing.T) {
 	h := newQuerySvcHarness(t)
 	fetcher := &recordingIndexFetcher{}
 	h.svc.SetIndexFetcher(fetcher)
@@ -1062,18 +1099,18 @@ func TestQueryService_PendingVersionAsksPeersBeforeBuilding(t *testing.T) {
 	if len(resp.Results) != 1 || resp.Results[0].DocId != "doc-a" {
 		t.Fatalf("results = %+v, want doc-a answered from the scan", resp.Results)
 	}
-	if fetcher.calls != 1 {
-		t.Fatalf("peer asks = %d, want exactly 1 before the scan schedules a build", fetcher.calls)
+
+	h.waitForWarmup(t)
+	if got := fetcher.count(); got != 1 {
+		t.Fatalf("peer asks = %d, want exactly 1", got)
 	}
-	// The scan still schedules the local build — it is a bridge, and by now the peers
-	// have been asked and had nothing.
 	if got := h.indexMgr.TriggeredBuilds(); len(got) != 1 || got[0] != vID {
-		t.Fatalf("TriggeredBuilds = %v, want [%d]", got, vID)
+		t.Fatalf("TriggeredBuilds = %v, want [%d] (the scan is a bridge, so a build follows)", got, vID)
 	}
 }
 
-// The other half: when this node already has the artifact, asking a peer is pure waste.
-func TestQueryService_PendingVersionWithALocalArtifactSkipsThePeerAsk(t *testing.T) {
+// The other half: when this node already has the artifact, the warm-up asks nobody.
+func TestQueryService_PendingVersionWithALocalArtifactAsksNoPeer(t *testing.T) {
 	h := newQuerySvcHarness(t)
 	fetcher := &recordingIndexFetcher{}
 	h.svc.SetIndexFetcher(fetcher)
@@ -1082,7 +1119,6 @@ func TestQueryService_PendingVersionWithALocalArtifactSkipsThePeerAsk(t *testing
 	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
 		"doc-a": {"chunk-1"},
 	})
-	// Build it here first, so IndexExists answers true (the mock reports "loaded").
 	if err := h.indexMgr.TriggerBuild(ctx, kbID, vID); err != nil {
 		t.Fatalf("TriggerBuild: %v", err)
 	}
@@ -1102,20 +1138,19 @@ func TestQueryService_PendingVersionWithALocalArtifactSkipsThePeerAsk(t *testing
 	}); err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if fetcher.calls != 0 {
-		t.Fatalf("peer asks = %d, want 0: the artifact is already here", fetcher.calls)
+	h.waitForWarmup(t)
+	if got := fetcher.count(); got != 0 {
+		t.Fatalf("peer asks = %d, want 0: the artifact is already here", got)
 	}
 }
 
-// A durable version too large to scan reaches BOTH branches: the two-step rule above the
-// scan, and the refusal below it. The peers must be asked once, not twice — the second
-// round trip re-resolves the replicas and re-asks every one of them.
+// A durable version too large to scan reaches BOTH paths (the scan's "not now" and the
+// refusal). The warm-up is one per version, so the peers are asked once, not twice.
 func TestQueryService_PendingVersionTooLargeToScanAsksPeersOnce(t *testing.T) {
 	h := newQuerySvcHarness(t)
 	fetcher := &recordingIndexFetcher{}
 	h.svc.SetIndexFetcher(fetcher)
-	refusing := &scanRefusingIndexManager{MockIndexManager: h.indexMgr}
-	h.svc.indexManager = refusing
+	h.svc.indexManager = &scanRefusingIndexManager{MockIndexManager: h.indexMgr}
 	ctx := context.Background()
 
 	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
@@ -1131,10 +1166,47 @@ func TestQueryService_PendingVersionTooLargeToScanAsksPeersOnce(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the refusal for a version too large to scan")
 	}
-	if fetcher.calls != 1 {
-		t.Fatalf("peer asks = %d, want exactly 1 across both branches", fetcher.calls)
-	}
 	if reason := stratumerrors.ReasonOf(err); reason != "version_pending" {
 		t.Fatalf("reason = %q, want version_pending", reason)
+	}
+	h.waitForWarmup(t)
+	if got := fetcher.count(); got != 1 {
+		t.Fatalf("peer asks = %d, want exactly 1 for one version", got)
+	}
+}
+
+// The point of doing it in the background: a slow or blocked peer fetch must not appear in
+// the query's latency. The scan answers, the request returns, and the warm-up is still
+// running behind it.
+func TestQueryService_PendingVersionDoesNotWaitForTheWarmUp(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	release := make(chan struct{})
+	fetcher := &recordingIndexFetcher{block: release}
+	h.svc.SetIndexFetcher(fetcher)
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+	})
+
+	start := time.Now()
+	resp, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	elapsed := time.Since(start)
+	close(release) // let the warm-up finish so the test can clean up
+	h.waitForWarmup(t)
+
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].DocId != "doc-a" {
+		t.Fatalf("results = %+v, want doc-a", resp.Results)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("Query took %s while the peer fetch was blocked: the warm-up must not be on the request", elapsed)
 	}
 }

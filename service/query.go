@@ -70,8 +70,9 @@ type QueryServiceImpl struct {
 	// each (M1 of docs/code-review-2026-09-24.md). Guarded by pullMu and created
 	// lazily by beginPull: a node that never answers a lagging query never needs
 	// the map at all.
-	pullMu sync.Mutex
-	pulls  map[pullKey]bool
+	pullMu       sync.Mutex
+	pulls        map[pullKey]bool
+	indexWarmups map[indexWarmupKey]bool
 }
 
 // pullKey identifies one in-flight catch-up: this node's history for one
@@ -140,7 +141,7 @@ func (s *QueryServiceImpl) SetIndexFetcher(f IndexFetcher) {
 // disk, which makes asking a peer pointless.
 //
 // A failed probe answers false and is not fatal: the fetch it enables is harmless, and
-// the scan after it still answers the query.
+// it is off the request anyway.
 func (s *QueryServiceImpl) hasLocalIndexArtifact(ctx context.Context, kbID string, versionID int64) bool {
 	if s.indexManager == nil {
 		return false
@@ -148,6 +149,78 @@ func (s *QueryServiceImpl) hasLocalIndexArtifact(ctx context.Context, kbID strin
 	exists, err := s.indexManager.IndexExists(ctx, kbID, versionID)
 	return err == nil && exists
 }
+
+// indexWarmupKey identifies one version's background index warm-up.
+type indexWarmupKey struct {
+	kbID      string
+	versionID int64
+}
+
+// warmIndexInBackground brings a version's index up to date BEHIND the request that
+// asked for it: this node's artifact first, then a peer's, then building (§4.2's
+// order, the same one plane.ensureOwnIndex uses).
+//
+// It is asynchronous because the alternative was measured into the query's latency.
+// Doing the fetch inline traded a millisecond scan for a download plus a disk write plus
+// a load into the vector store — hundreds of megabytes for a large version — to spare
+// the NEXT query a cost it would have paid anyway. The bridge (§8.6b) exists precisely
+// so the current request does not have to wait for the permanent answer.
+//
+// It runs on its own context, like startBackgroundPull and for the same reason: tied to
+// the caller's ctx, the work is cancelled by the very deadline that made the caller ask.
+// One warm-up per (kb, version) is in flight at a time — N concurrent queries on the same
+// fresh version would otherwise each download the same artifact.
+func (s *QueryServiceImpl) warmIndexInBackground(kbID string, versionID int64) {
+	if s.indexManager == nil {
+		return
+	}
+	key := indexWarmupKey{kbID: kbID, versionID: versionID}
+	s.pullMu.Lock()
+	if s.indexWarmups == nil {
+		s.indexWarmups = make(map[indexWarmupKey]bool)
+	}
+	if s.indexWarmups[key] {
+		s.pullMu.Unlock()
+		return
+	}
+	s.indexWarmups[key] = true
+	s.pullMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.pullMu.Lock()
+			delete(s.indexWarmups, key)
+			s.pullMu.Unlock()
+		}()
+
+		// Its own budget: long enough for a peer download and a build, and independent of
+		// any single caller's deadline.
+		ctx, cancel := context.WithTimeout(context.Background(), indexWarmupBudget)
+		defer cancel()
+
+		if s.hasLocalIndexArtifact(ctx, kbID, versionID) {
+			return // nothing to do: TrySearch's loadFromDisk already uses it
+		}
+		if s.indexFetcher != nil {
+			fetched, fetchErr := s.indexFetcher.FetchIndexFromPeers(ctx, kbID, versionID)
+			if fetchErr != nil {
+				s.logger.Debug("query: background ask for a peer's index artifact failed",
+					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(fetchErr))
+			} else if fetched {
+				return // installed and loaded; the next query answers from it
+			}
+		}
+		if err := s.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
+			s.logger.Debug("query: could not schedule a lazy build for a PENDING version",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		}
+	}()
+}
+
+// indexWarmupBudget bounds one background warm-up. Five minutes: a peer download of a
+// large artifact plus a build of the same version, which is the same order as the index
+// manager's own build budget.
+const indexWarmupBudget = 5 * time.Minute
 
 // startBackgroundPull brings this node's history up to versionID, unless an
 // identical pull is already running.
@@ -514,38 +587,17 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		// Triggering rather than waiting is deliberate: the build runs off this
 		// request (the caller keeps its own deadline), and every retry the station
 		// or the client makes gets a finished index.
-		// peerAsked records that the two-step rule already ran above, so the refusal path
-		// below does not ask the same peers a second time. It matters for the one flow that
-		// reaches both: a durable version too large to scan (TrySearch answers "not now"),
-		// which then falls through to the refusal. The fetch is de-duplicated per version
-		// inside the plane, but a SECOND round trip after the first one finished is not
-		// free — it re-resolves the replicas and re-asks every one of them.
-		peerAsked := false
 		if targetVersion.DataStatus == types.DataStatusDurable {
-			// §4.2's two-step rule, and it has to come BEFORE the scan.
+			// Answer from whatever this node can serve RIGHT NOW, and let the index be
+			// brought up to date BEHIND the answer.
 			//
-			// The scan below answers the query either way, but it is also what schedules a
-			// build (index.tryBruteForce's "the scan is a bridge, not a replacement"). Doing
-			// that first made every replica that answered a PENDING query build its own copy
-			// — precisely what owner sharding exists to prevent
-			// (docs/index-owner-sharding-plan.md §4.2). The order used here is the one
-			// plane.ensureOwnIndex already uses: an artifact on THIS node's disk first
-			// (free, and TrySearch's loadFromDisk will pick it up), then a peer's (one round
-			// trip), and only then building (minutes).
-			if s.indexFetcher != nil && !s.hasLocalIndexArtifact(ctx, kbID, versionID) {
-				peerAsked = true
-				fetched, fetchErr := s.indexFetcher.FetchIndexFromPeers(ctx, kbID, versionID)
-				switch {
-				case fetchErr != nil:
-					s.logger.Debug("query: asking peers for the index artifact failed",
-						zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(fetchErr))
-				case fetched:
-					// Installed and loaded, so the TrySearch right below answers from the
-					// index instead of scanning — and no build is scheduled here at all.
-					s.logger.Debug("query: installed a peer's artifact for a PENDING version",
-						zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
-				}
-			}
+			// The index's two-step rule (§4.2: this node's artifact, then a peer's, then
+			// building) must not be paid for by THIS request. Installing a peer's artifact
+			// is a download plus a disk write plus a load into the vector store — hundreds
+			// of megabytes for a large version — while the scan that answers right now is
+			// an O(chunks) pass measured in milliseconds. Putting the fetch in front of the
+			// scan therefore traded a millisecond answer for a second-long one, to save a
+			// cost the NEXT query would have paid anyway. So: scan first, warm up after.
 			scanStart := time.Now()
 			scanned, answered, scanErr := s.indexManager.TrySearch(ctx, kbID, versionID, req.Vector, searchTopK)
 			stageSearch = time.Since(scanStart)
@@ -556,36 +608,23 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 				// shared handling below passes that through, after the same
 				// empty-version test the index path gets.
 				searchResults, searchErr, resolved = scanned, scanErr, true
+				// The scan is a bridge, not a replacement (§8.6b): the next query should
+				// find an index. Off the request, de-duplicated, and a no-op when the
+				// artifact is already here.
+				s.warmIndexInBackground(kbID, versionID)
 			}
 		}
 		if !resolved {
-			// docs/index-owner-sharding-plan.md §4.2: the two-step rule for a node that
-			// has been asked for a version. First ask whether a PEER already built this
-			// artifact — installing it is a round trip, building it is minutes — and
-			// fall back to building here if nobody has one.
+			// Nothing could be served now, so the work moves BEHIND the refusal: one
+			// de-duplicated background warm-up applies the index's two-step rule (§4.2 —
+			// this node's artifact, then a peer's, then building) while this request answers
+			// with a retryable refusal.
 			//
-			// Building is the ORDINARY path for the first query after a version is
-			// created: at that point nobody has the artifact. The router decides which
-			// nodes are asked at all (§5), so this runs on the versions a caller
-			// actually wants and nowhere else.
-			if s.indexFetcher != nil && !peerAsked {
-				fetched, fetchErr := s.indexFetcher.FetchIndexFromPeers(ctx, kbID, versionID)
-				if fetchErr != nil {
-					s.logger.Debug("query: asking peers for the index artifact failed",
-						zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(fetchErr))
-				} else if fetched {
-					// The artifact is on this node's disk and loaded — InstallIndex does
-					// both. This request was already decided against the index state read
-					// above, so it refuses; but the refusal is now index_not_ready rather
-					// than version_pending, because the version is no longer waiting on
-					// anything. The station's retry lands on a replica that has the index.
-					return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrIndexNotReady)
-				}
-			}
-			if err := s.indexManager.TriggerBuild(ctx, kbID, versionID); err != nil {
-				s.logger.Debug("query: could not trigger a lazy build for a PENDING version",
-					zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
-			}
+			// Building is the ORDINARY outcome for the first query after a version is
+			// created: at that point nobody has the artifact. The router decides which nodes
+			// are asked at all (§5), so this runs on the versions a caller actually wants
+			// and nowhere else.
+			s.warmIndexInBackground(kbID, versionID)
 			// The refusal carries the index_not_ready sentinel, and that matters more
 			// than the wording: a bare status.Error here has no wire name, so the
 			// station's isRetryableErr reads it as terminal — it returns the error

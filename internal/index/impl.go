@@ -864,6 +864,11 @@ func (im *IndexManagerImpl) searchLoaded(ctx context.Context, key indexKey, vect
 // path schedules a build as its own bridge, which is the only build this asks
 // for.
 //
+// It does NOT schedule a build. The two-step rule that decides "ask a peer, then build"
+// (docs/index-owner-sharding-plan.md §4.2) belongs to the caller, which can run it off the
+// request: doing it here as well would build twice, and a build for an artifact that is
+// already finished is a full rebuild.
+//
 // The three outcomes, and what a caller does with each:
 //
 //   - (results, true, nil)   — answered now.
@@ -917,7 +922,10 @@ func (im *IndexManagerImpl) TrySearch(ctx context.Context, kbID string, versionI
 		// whether a build happens to be running (see Search's note on the same
 		// branch). Too large to scan: the build in flight is the answer, and
 		// waiting for it is the caller's decision rather than ours.
-		answered, results, err := im.tryBruteForce(ctx, kbID, versionID, vector, topK)
+		//
+		// No build is scheduled from here: a build is ALREADY in flight, and the caller
+		// owns the "then build" step anyway (see the TrySearch doc comment).
+		answered, results, err := im.tryBruteForceWith(ctx, kbID, versionID, vector, topK, false)
 		return results, answered, err
 
 	default:
@@ -926,7 +934,7 @@ func (im *IndexManagerImpl) TrySearch(ctx context.Context, kbID string, versionI
 		// .tmp+rename discipline, and a missing one is the normal state for a
 		// lazily-built version rather than an error.
 		if loadErr := im.loadFromDisk(ctx, kbID, versionID); loadErr != nil {
-			answered, results, err := im.tryBruteForce(ctx, kbID, versionID, vector, topK)
+			answered, results, err := im.tryBruteForceWith(ctx, kbID, versionID, vector, topK, false)
 			return results, answered, err
 		}
 	}
