@@ -70,9 +70,8 @@ type QueryServiceImpl struct {
 	// each (M1 of docs/code-review-2026-09-24.md). Guarded by pullMu and created
 	// lazily by beginPull: a node that never answers a lagging query never needs
 	// the map at all.
-	pullMu       sync.Mutex
-	pulls        map[pullKey]bool
-	indexWarmups map[indexWarmupKey]bool
+	pullMu sync.Mutex
+	pulls  map[pullKey]bool
 }
 
 // pullKey identifies one in-flight catch-up: this node's history for one
@@ -150,49 +149,30 @@ func (s *QueryServiceImpl) hasLocalIndexArtifact(ctx context.Context, kbID strin
 	return err == nil && exists
 }
 
-// indexWarmupKey identifies one version's background index warm-up.
-type indexWarmupKey struct {
-	kbID      string
-	versionID int64
-}
-
 // warmIndexInBackground brings a version's index up to date BEHIND the request that
-// asked for it: this node's artifact first, then a peer's, then building (§4.2's
-// order, the same one plane.ensureOwnIndex uses).
+// asked for it: this node's artifact first, then a peer's, then building (§4.2's order,
+// the same one plane.ensureOwnIndex uses).
 //
 // It is asynchronous because the alternative was measured into the query's latency.
 // Doing the fetch inline traded a millisecond scan for a download plus a disk write plus
-// a load into the vector store — hundreds of megabytes for a large version — to spare
-// the NEXT query a cost it would have paid anyway. The bridge (§8.6b) exists precisely
-// so the current request does not have to wait for the permanent answer.
+// a load into the vector store — hundreds of megabytes for a large version — to spare the
+// NEXT query a cost it would have paid anyway. The bridge (§8.6b) exists precisely so the
+// current request does not have to wait for the permanent answer.
+//
+// No de-duplication HERE, deliberately: both steps it ends in already de-duplicate per
+// version — plane.FetchIndexFromPeers shares one in-flight download per version, and
+// index.triggerBuild ignores a version whose build is already running. A table here would
+// save a few short-lived goroutines at the price of being a second place that has to be
+// right about "same version"; either way N concurrent queries yield at most one peer ask
+// and one build.
 //
 // It runs on its own context, like startBackgroundPull and for the same reason: tied to
 // the caller's ctx, the work is cancelled by the very deadline that made the caller ask.
-// One warm-up per (kb, version) is in flight at a time — N concurrent queries on the same
-// fresh version would otherwise each download the same artifact.
 func (s *QueryServiceImpl) warmIndexInBackground(kbID string, versionID int64) {
 	if s.indexManager == nil {
 		return
 	}
-	key := indexWarmupKey{kbID: kbID, versionID: versionID}
-	s.pullMu.Lock()
-	if s.indexWarmups == nil {
-		s.indexWarmups = make(map[indexWarmupKey]bool)
-	}
-	if s.indexWarmups[key] {
-		s.pullMu.Unlock()
-		return
-	}
-	s.indexWarmups[key] = true
-	s.pullMu.Unlock()
-
 	go func() {
-		defer func() {
-			s.pullMu.Lock()
-			delete(s.indexWarmups, key)
-			s.pullMu.Unlock()
-		}()
-
 		// Its own budget: long enough for a peer download and a build, and independent of
 		// any single caller's deadline.
 		ctx, cancel := context.WithTimeout(context.Background(), indexWarmupBudget)

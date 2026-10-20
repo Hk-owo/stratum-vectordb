@@ -604,10 +604,9 @@ func TestQueryService_PendingWriteWithoutDurableDataIsRejected(t *testing.T) {
 	//
 	// It happens in the background now (nothing on this path is allowed to put a peer
 	// download or a build in the caller's latency), so wait for it.
-	h.waitForWarmup(t)
-	if got := h.indexMgr.TriggeredBuilds(); len(got) != 1 || got[0] != vID {
-		t.Errorf("TriggeredBuilds = %v, want [%d] — a PENDING version must ask for its lazy build",
-			got, vID)
+	waitFor(t, "the scheduled build", func() bool { return len(h.indexMgr.TriggeredBuilds()) == 1 })
+	if got := h.indexMgr.TriggeredBuilds(); got[0] != vID {
+		t.Errorf("TriggeredBuilds = %v, want [%d] — a PENDING version must ask for its lazy build", got, vID)
 	}
 }
 
@@ -792,8 +791,8 @@ func TestQueryService_PendingVersionTooLargeToScanStaysRetryable(t *testing.T) {
 	if reason := stratumerrors.ReasonOf(err); reason != "version_pending" {
 		t.Errorf("reason = %q, want version_pending", reason)
 	}
-	h.waitForWarmup(t)
-	if got := h.indexMgr.TriggeredBuilds(); len(got) != 1 || got[0] != vID {
+	waitFor(t, "the scheduled build", func() bool { return len(h.indexMgr.TriggeredBuilds()) == 1 })
+	if got := h.indexMgr.TriggeredBuilds(); got[0] != vID {
 		t.Errorf("TriggeredBuilds = %v, want [%d] — the version still needs its build", got, vID)
 	}
 }
@@ -1057,19 +1056,15 @@ func (f *recordingIndexFetcher) count() int {
 	return f.calls
 }
 
-// waitForWarmup waits until the service has no index warm-up in flight.
-func (h *querySvcHarness) waitForWarmup(t *testing.T) {
+// waitFor polls cond until it holds. The index warm-up runs off the request (there is no
+// in-flight table to watch — both of its steps de-duplicate per version themselves), so a
+// case has to wait on the EFFECT it is asserting rather than on the task itself.
+func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
-	for {
-		h.svc.pullMu.Lock()
-		n := len(h.svc.indexWarmups)
-		h.svc.pullMu.Unlock()
-		if n == 0 {
-			return
-		}
+	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatal("the background index warm-up never finished")
+			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -1100,7 +1095,7 @@ func TestQueryService_PendingVersionWarmsTheIndexBehindTheAnswer(t *testing.T) {
 		t.Fatalf("results = %+v, want doc-a answered from the scan", resp.Results)
 	}
 
-	h.waitForWarmup(t)
+	waitFor(t, "the peer ask", func() bool { return fetcher.count() == 1 })
 	if got := fetcher.count(); got != 1 {
 		t.Fatalf("peer asks = %d, want exactly 1", got)
 	}
@@ -1138,7 +1133,9 @@ func TestQueryService_PendingVersionWithALocalArtifactAsksNoPeer(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	h.waitForWarmup(t)
+	// Negative confirmation: the warm-up's first step is the local check, so a short wait
+	// is enough for it to have decided. Nothing else in it can be observed.
+	time.Sleep(200 * time.Millisecond)
 	if got := fetcher.count(); got != 0 {
 		t.Fatalf("peer asks = %d, want 0: the artifact is already here", got)
 	}
@@ -1169,7 +1166,7 @@ func TestQueryService_PendingVersionTooLargeToScanAsksPeersOnce(t *testing.T) {
 	if reason := stratumerrors.ReasonOf(err); reason != "version_pending" {
 		t.Fatalf("reason = %q, want version_pending", reason)
 	}
-	h.waitForWarmup(t)
+	waitFor(t, "the peer ask", func() bool { return fetcher.count() == 1 })
 	if got := fetcher.count(); got != 1 {
 		t.Fatalf("peer asks = %d, want exactly 1 for one version", got)
 	}
@@ -1198,7 +1195,6 @@ func TestQueryService_PendingVersionDoesNotWaitForTheWarmUp(t *testing.T) {
 	})
 	elapsed := time.Since(start)
 	close(release) // let the warm-up finish so the test can clean up
-	h.waitForWarmup(t)
 
 	if err != nil {
 		t.Fatalf("Query: %v", err)
