@@ -610,6 +610,8 @@ func (m *reconcileIndexMgr) Search(_ context.Context, kbID string, versionID int
 
 // TrySearch reports "cannot answer right now": this stub exists for reconcile, and
 // an empty answer here would read as "no matches" to the query path.
+func (m *reconcileIndexMgr) Resident(string, int64) bool { return false }
+
 func (m *reconcileIndexMgr) TrySearch(_ context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, bool, error) {
 	return nil, false, nil
 }

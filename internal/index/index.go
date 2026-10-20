@@ -153,6 +153,17 @@ type IndexManager interface {
 	// recovery uses, marked deprecated there for the same §4 reason.)
 	IndexExists(ctx context.Context, kbID string, versionID int64) (bool, error)
 
+	// Resident reports whether this node already has (kbID, versionID)'s index in
+	// hand or on its way: loaded in memory, or a build/load in flight. It is the
+	// in-memory half of "is there anything to do" that IndexExists cannot answer —
+	// a build writes its artifact only when it finishes, so during the build the
+	// disk says "absent" while the work is already happening.
+	//
+	// The query path's background warm-up checks it first, so a PENDING version
+	// queried repeatedly during its build does not ask every peer again on each
+	// query (FetchIndexFromPeers only shares asks that overlap in time).
+	Resident(kbID string, versionID int64) bool
+
 	// Evict removes a single version's index from memory (if loaded; a
 	// no-op otherwise).
 	Evict(ctx context.Context, kbID string, versionID int64) error

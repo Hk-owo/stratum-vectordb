@@ -159,17 +159,19 @@ func (s *QueryServiceImpl) hasLocalIndexArtifact(ctx context.Context, kbID strin
 // NEXT query a cost it would have paid anyway. The bridge (§8.6b) exists precisely so the
 // current request does not have to wait for the permanent answer.
 //
-// No de-duplication HERE, deliberately: both steps it ends in already de-duplicate per
-// version — plane.FetchIndexFromPeers shares one in-flight download per version, and
-// index.triggerBuild ignores a version whose build is already running. A table here would
-// save a few short-lived goroutines at the price of being a second place that has to be
-// right about "same version"; either way N concurrent queries yield at most one peer ask
-// and one build.
+// Resident comes first, before any goroutine is spawned. The two steps the warm-up ends
+// in de-duplicate only work that OVERLAPS in time — plane.FetchIndexFromPeers shares one
+// in-flight download, index.triggerBuild ignores a build already running — and the disk
+// check cannot see a build until it finishes writing. So without it, a PENDING version
+// queried throughout a minutes-long build asked every peer again on every query, and a
+// peer that finished its own build meanwhile got its artifact installed over the build
+// in flight here. "Loaded or loading" is the index manager's own record of "already in
+// hand", which is the right granularity; no separate table is kept here.
 //
 // It runs on its own context, like startBackgroundPull and for the same reason: tied to
 // the caller's ctx, the work is cancelled by the very deadline that made the caller ask.
 func (s *QueryServiceImpl) warmIndexInBackground(kbID string, versionID int64) {
-	if s.indexManager == nil {
+	if s.indexManager == nil || s.indexManager.Resident(kbID, versionID) {
 		return
 	}
 	go func() {
@@ -540,86 +542,63 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		// until a build reports READY, so it covers two very different states —
 		// "the write has not landed" and "the data is durable, the index is a
 		// read-side product that does not exist yet" — and only the first one has
-		// to be refused. RollbackVersion (service/knowledgebase.go) and the state
-		// machine's delete and parent gates already read the data side; this gate
-		// was the last one still reading the index side.
+		// to be refused.
 		//
-		// With the data durable, TrySearch answers immediately for a version below
-		// BruteForceMaxChunks and reports "not now" above it. NOT WAITING is the
-		// requirement here: Search waits out a build, so a version whose index
-		// nobody has built yet would turn a microsecond scan into a
-		// load_wait_timeout. Small versions are exactly the case §8.6b exists for,
-		// and refusing them made every caller pay a build plus a retry for an
-		// answer that was already sitting in the chunks.
+		// The plan, in order:
 		//
-		// Everything the scan cannot answer falls through to the refusal path
-		// below, whose reasoning is unchanged:
+		//   1. Data not durable → refuse, and do NOT warm. A build reads whatever
+		//      documents and chunks are here, and build() does not check the data
+		//      side, so warming now could produce an index over part of the write,
+		//      report it READY and persist it — after which IndexExists answers
+		//      "present" and nothing ever repairs it (a peer could even fetch it).
+		//      Nothing is lost by waiting: the first query after the data turns
+		//      durable takes step 2 and warms then.
+		//   2. TrySearch: the loaded index, the artifact on disk, or — at or below
+		//      BruteForceMaxChunks — a scan (§8.6b). It never waits for a build.
+		//      - A clean answer: serve it, and warm the index BEHIND it. The scan is
+		//        a bridge, not a replacement.
+		//      - A verdict (answered with an error: the version is deleted or in
+		//        maintenance, it has no chunks, or this replica lacks its vectors):
+		//        hand it to the shared classification below and do NOT warm. None
+		//        of those is cured by a build; most would make one wrong (a
+		//        tombstoned version marked BUILDING, a build that fails on vectors
+		//        this replica does not have yet, a peer round per query for an
+		//        empty version that will never have an artifact).
+		//   3. Not answerable now (too large to scan): warm, and refuse retryably.
+		//      The station moves on to the next candidate, which under owner
+		//      sharding is another owner that may already hold the index; by the
+		//      time it comes back here the warm-up has made progress.
 		//
-		// A PENDING version is not a dead end: §8.6b builds its index lazily, and
-		// THIS request is the "somebody is waiting for it" signal that the lazy
-		// path exists for. Refusing without asking for the build is what made
-		// PENDING permanent — the very query that would have triggered the build
-		// was the one being refused, so a version whose eager build was slow,
-		// queued or dropped never got a second chance. Measured: TestTwoTier's
-		// `version is PENDING` never cleared inside its 180 s window, while the
-		// same version was READY and servable minutes later.
+		// Why refusing still has to warm: THIS request is the "somebody is waiting
+		// for it" signal §8.6b's lazy build exists for. Refusing without asking for
+		// the build is what once made PENDING permanent (TestTwoTier's `version is
+		// PENDING` never cleared inside its 180 s window).
 		//
-		// Triggering rather than waiting is deliberate: the build runs off this
-		// request (the caller keeps its own deadline), and every retry the station
-		// or the client makes gets a finished index.
-		if targetVersion.DataStatus == types.DataStatusDurable {
-			// Answer from whatever this node can serve RIGHT NOW, and let the index be
-			// brought up to date BEHIND the answer.
-			//
-			// The index's two-step rule (§4.2: this node's artifact, then a peer's, then
-			// building) must not be paid for by THIS request. Installing a peer's artifact
-			// is a download plus a disk write plus a load into the vector store — hundreds
-			// of megabytes for a large version — while the scan that answers right now is
-			// an O(chunks) pass measured in milliseconds. Putting the fetch in front of the
-			// scan therefore traded a millisecond answer for a second-long one, to save a
-			// cost the NEXT query would have paid anyway. So: scan first, warm up after.
-			scanStart := time.Now()
-			scanned, answered, scanErr := s.indexManager.TrySearch(ctx, kbID, versionID, req.Vector, searchTopK)
-			stageSearch = time.Since(scanStart)
-			if answered {
-				// Includes the refusal case: answered=true travels with an error
-				// when the scan reached a verdict (this replica lacks the vectors,
-				// the version is being deleted, the index is in maintenance). The
-				// shared handling below passes that through, after the same
-				// empty-version test the index path gets.
-				searchResults, searchErr, resolved = scanned, scanErr, true
-				// The scan is a bridge, not a replacement (§8.6b): the next query should
-				// find an index. Off the request, de-duplicated, and a no-op when the
-				// artifact is already here.
-				s.warmIndexInBackground(kbID, versionID)
-			}
+		// Why the warm-up is never on the request: it applies the index's two-step
+		// rule (§4.2: this node's artifact, then a peer's, then building), and a
+		// peer install is a download plus a disk write plus a load into the vector
+		// store — seconds for a large version, against a millisecond scan.
+		//
+		// The refusal carries a named, retryable sentinel. A bare status.Error has no
+		// wire name, so the station's isRetryableErr reads it as terminal and never
+		// tries the replica whose index IS ready (measured: that left every storage
+		// node circuit-broken while a sibling was serving the version).
+		// ErrVersionPending rather than ErrIndexNotReady because it names the state.
+		if targetVersion.DataStatus != types.DataStatusDurable {
+			return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionPending)
 		}
-		if !resolved {
-			// Nothing could be served now, so the work moves BEHIND the refusal: one
-			// de-duplicated background warm-up applies the index's two-step rule (§4.2 —
-			// this node's artifact, then a peer's, then building) while this request answers
-			// with a retryable refusal.
-			//
-			// Building is the ORDINARY outcome for the first query after a version is
-			// created: at that point nobody has the artifact. The router decides which nodes
-			// are asked at all (§5), so this runs on the versions a caller actually wants
-			// and nowhere else.
+
+		scanStart := time.Now()
+		scanned, answered, scanErr := s.indexManager.TrySearch(ctx, kbID, versionID, req.Vector, searchTopK)
+		stageSearch = time.Since(scanStart)
+		switch {
+		case answered && scanErr == nil:
+			searchResults, resolved = scanned, true
 			s.warmIndexInBackground(kbID, versionID)
-			// The refusal carries the index_not_ready sentinel, and that matters more
-			// than the wording: a bare status.Error here has no wire name, so the
-			// station's isRetryableErr reads it as terminal — it returns the error
-			// WITHOUT trying the replica whose index IS ready, and records the replica
-			// it just refused as failed. Measured: three rounds of that left every
-			// storage node circuit-broken ("router: every node for this layer is
-			// circuit-broken") and spent the test's whole 180 s window on it, while a
-			// sibling replica was serving the same version the whole time.
-			//
-			// Same gRPC code as before (FailedPrecondition), so callers see no change;
-			// what changes is that "another replica may have it" is now sayable.
-			//
-			// ErrVersionPending rather than ErrIndexNotReady: both are retryable wire
-			// names, but this one names the actual state ("the version's write is still
-			// in progress"), which is what someone reading a log wants to know.
+		case answered:
+			searchResults, searchErr, resolved = scanned, scanErr, true
+		default:
+			s.warmIndexInBackground(kbID, versionID)
 			return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrVersionPending)
 		}
 	}

@@ -2068,6 +2068,15 @@ func (im *IndexManagerImpl) IndexExists(ctx context.Context, kbID string, versio
 	return resp.GetExists(), nil
 }
 
+// Resident implements IndexManager: loaded, or a build/load in flight.
+func (im *IndexManagerImpl) Resident(kbID string, versionID int64) bool {
+	key := indexKey{kbID, versionID}
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	_, loaded := im.loaded[key]
+	return loaded || im.loading[key]
+}
+
 // loadFromDisk restores (kbID, versionID)'s index from its persisted file
 // via the vecstore Load RPC and marks it loaded (respecting the LRU
 // capacity). Safe to call concurrently: if a load/build finished while the

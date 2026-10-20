@@ -563,13 +563,14 @@ func TestQueryService_BloomFilterFalsePositive(t *testing.T) {
 	}
 }
 
-// A version whose write has not landed is refused, and the refusal asks for the
-// build that will answer the retry. PENDING covers two states now, and this is the
-// one that still has to be refused: no durable data means a scan would read a
-// half-written document set. The other state — data durable, index not built — is
-// answered from the chunks below.
+// A version whose write has not landed is refused — and, unlike every other refusal on
+// this path, NOT warmed. A build reads whatever documents and chunks happen to be here, so
+// building now could persist an index over part of the write and report it READY, after
+// which nothing repairs it. The first query after the data turns durable warms instead.
 func TestQueryService_PendingWriteWithoutDurableDataIsRejected(t *testing.T) {
 	h := newQuerySvcHarness(t)
+	fetcher := &recordingIndexFetcher{}
+	h.svc.SetIndexFetcher(fetcher)
 	ctx := context.Background()
 
 	kbID := "kb-test"
@@ -598,16 +599,7 @@ func TestQueryService_PendingWriteWithoutDurableDataIsRejected(t *testing.T) {
 		t.Errorf("reason = %q, want version_pending: the caller has to be able to tell \"still writing\" from \"too large to scan\"", reason)
 	}
 
-	// Refusing is only half of it: the request must also ASK for the build.
-	// Otherwise PENDING is permanent — the query that would trigger the lazy
-	// build is the one being refused, so nothing ever gets built.
-	//
-	// It happens in the background now (nothing on this path is allowed to put a peer
-	// download or a build in the caller's latency), so wait for it.
-	waitFor(t, "the scheduled build", func() bool { return len(h.indexMgr.TriggeredBuilds()) == 1 })
-	if got := h.indexMgr.TriggeredBuilds(); got[0] != vID {
-		t.Errorf("TriggeredBuilds = %v, want [%d] — a PENDING version must ask for its lazy build", got, vID)
-	}
+	assertNoWarmUp(t, h, fetcher)
 }
 
 // The case §8.6b exists for, and the one this path used to refuse: data durable,
@@ -1205,4 +1197,93 @@ func TestQueryService_PendingVersionDoesNotWaitForTheWarmUp(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Fatalf("Query took %s while the peer fetch was blocked: the warm-up must not be on the request", elapsed)
 	}
+}
+
+// assertNoWarmUp is the negative confirmation shared by the cases where the query path
+// must leave the index alone. The warm-up runs off the request, so a short wait is what
+// gives a wrongly-started one the time to show up.
+func assertNoWarmUp(t *testing.T, h *querySvcHarness, fetcher *recordingIndexFetcher) {
+	t.Helper()
+	time.Sleep(200 * time.Millisecond)
+	if got := fetcher.count(); got != 0 {
+		t.Errorf("peer asks = %d, want 0", got)
+	}
+	if got := h.indexMgr.TriggeredBuilds(); len(got) != 0 {
+		t.Errorf("TriggeredBuilds = %v, want none", got)
+	}
+}
+
+// A scan that reaches a VERDICT is passed through without warming: none of those states is
+// cured by an index, and some would be made worse by trying (a build over vectors this
+// replica does not hold yet; a peer round on every query of a version that will never have
+// an artifact). Both empty-looking cases are covered: provably empty, and "not here yet".
+func TestQueryService_PendingVersionScanVerdictDoesNotWarm(t *testing.T) {
+	t.Run("provably empty", func(t *testing.T) {
+		h := newQuerySvcHarness(t)
+		fetcher := &recordingIndexFetcher{}
+		h.svc.SetIndexFetcher(fetcher)
+		ctx := context.Background()
+
+		kbID, vID := h.setupDurableDataWithoutIndex(t, nil)
+		if err := h.raftNode.ProposeUpdateVersionSummary(ctx, vID, types.EmptyDocIDSetHash); err != nil {
+			t.Fatalf("ProposeUpdateVersionSummary: %v", err)
+		}
+		if _, err := h.svc.Query(ctx, &pb.QueryRequest{
+			KnowledgeBaseId: kbID, VersionId: &vID,
+			Vector: []float32{0.1, 0.2, 0.3, 0.4}, TopK: 10,
+		}); err != nil {
+			t.Fatalf("a provably empty version must answer with no results: %v", err)
+		}
+		assertNoWarmUp(t, h, fetcher)
+	})
+	t.Run("data not on this replica", func(t *testing.T) {
+		h := newQuerySvcHarness(t)
+		fetcher := &recordingIndexFetcher{}
+		h.svc.SetIndexFetcher(fetcher)
+		ctx := context.Background()
+
+		kbID, vID := h.setupDurableDataWithoutIndex(t, nil)
+		_, err := h.svc.Query(ctx, &pb.QueryRequest{
+			KnowledgeBaseId: kbID, VersionId: &vID,
+			Vector: []float32{0.1, 0.2, 0.3, 0.4}, TopK: 10,
+		})
+		if reason := stratumerrors.ReasonOf(err); reason != "index_not_ready" {
+			t.Fatalf("reason = %q, want index_not_ready", reason)
+		}
+		assertNoWarmUp(t, h, fetcher)
+	})
+}
+
+// residentIndexManager reports the version as already in hand — a build in flight, whose
+// artifact is not on disk yet — and cannot answer it now (too large to scan).
+type residentIndexManager struct {
+	scanRefusingIndexManager
+}
+
+func (m *residentIndexManager) Resident(string, int64) bool { return true }
+
+// While this node is already building the version, repeated queries must not ask the
+// peers again: FetchIndexFromPeers shares only asks that overlap, and the disk check
+// cannot see a build until it finishes, so without the residency check every query of a
+// minutes-long build was a fresh round to every replica.
+func TestQueryService_PendingVersionBeingBuiltHereAsksNoPeer(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	fetcher := &recordingIndexFetcher{}
+	h.svc.SetIndexFetcher(fetcher)
+	h.svc.indexManager = &residentIndexManager{scanRefusingIndexManager{MockIndexManager: h.indexMgr}}
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+	})
+	for i := 0; i < 3; i++ {
+		_, err := h.svc.Query(ctx, &pb.QueryRequest{
+			KnowledgeBaseId: kbID, VersionId: &vID,
+			Vector: []float32{0.1, 0.2, 0.3, 0.4}, TopK: 10,
+		})
+		if reason := stratumerrors.ReasonOf(err); reason != "version_pending" {
+			t.Fatalf("query %d: reason = %q, want version_pending", i, reason)
+		}
+	}
+	assertNoWarmUp(t, h, fetcher)
 }
