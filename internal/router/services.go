@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	pb "stratum/api/proto/stratum"
+	stratumerrors "stratum/internal/errors"
 )
 
 // KBServer re-exposes KnowledgeBaseService on the router. Every call is
@@ -21,55 +22,55 @@ func NewKBServer(r *Router) *KBServer {
 }
 
 func (s *KBServer) CreateKnowledgeBase(ctx context.Context, req *pb.CreateKnowledgeBaseRequest) (*pb.CreateKnowledgeBaseResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_CreateKnowledgeBase_FullMethodName, "", func(idx int, ctx context.Context) (*pb.CreateKnowledgeBaseResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.KnowledgeBaseService_CreateKnowledgeBase_FullMethodName, "", func(idx int, ctx context.Context) (*pb.CreateKnowledgeBaseResponse, error) {
 		return s.r.kbs[idx].CreateKnowledgeBase(ctx, req)
-	})
+	}))
 }
 
 func (s *KBServer) DeleteKnowledgeBase(ctx context.Context, req *pb.DeleteKnowledgeBaseRequest) (*pb.DeleteKnowledgeBaseResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_DeleteKnowledgeBase_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.DeleteKnowledgeBaseResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.KnowledgeBaseService_DeleteKnowledgeBase_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.DeleteKnowledgeBaseResponse, error) {
 		return s.r.kbs[idx].DeleteKnowledgeBase(ctx, req)
-	})
+	}))
 }
 
 func (s *KBServer) CreateVersion(ctx context.Context, req *pb.CreateVersionRequest) (*pb.CreateVersionResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_CreateVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.CreateVersionResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.KnowledgeBaseService_CreateVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.CreateVersionResponse, error) {
 		return s.r.kbs[idx].CreateVersion(ctx, req)
-	})
+	}))
 }
 
 func (s *KBServer) ListVersions(ctx context.Context, req *pb.ListVersionsRequest) (*pb.ListVersionsResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_ListVersions_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ListVersionsResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.KnowledgeBaseService_ListVersions_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ListVersionsResponse, error) {
 		return s.r.kbs[idx].ListVersions(ctx, req)
-	})
+	}))
 }
 
 // AwaitVersion is a read: it holds no state, so the station may spread repeated
 // calls across nodes, and a caller that reconnects lands wherever it lands.
 func (s *KBServer) AwaitVersion(ctx context.Context, req *pb.AwaitVersionRequest) (*pb.AwaitVersionResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_AwaitVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.AwaitVersionResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.KnowledgeBaseService_AwaitVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.AwaitVersionResponse, error) {
 		return s.r.kbs[idx].AwaitVersion(ctx, req)
-	})
+	}))
 }
 
 func (s *KBServer) RollbackVersion(ctx context.Context, req *pb.RollbackVersionRequest) (*pb.RollbackVersionResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_RollbackVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.RollbackVersionResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.KnowledgeBaseService_RollbackVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.RollbackVersionResponse, error) {
 		return s.r.kbs[idx].RollbackVersion(ctx, req)
-	})
+	}))
 }
 
 func (s *KBServer) DeleteVersion(ctx context.Context, req *pb.DeleteVersionRequest) (*pb.DeleteVersionResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_DeleteVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.DeleteVersionResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.KnowledgeBaseService_DeleteVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.DeleteVersionResponse, error) {
 		return s.r.kbs[idx].DeleteVersion(ctx, req)
-	})
+	}))
 }
 
 // DiscardVersion is a write: it removes replicated metadata, so it goes to the
 // leader like every other proposal.
 func (s *KBServer) DiscardVersion(ctx context.Context, req *pb.DiscardVersionRequest) (*pb.DiscardVersionResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_DiscardVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.DiscardVersionResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.KnowledgeBaseService_DiscardVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.DiscardVersionResponse, error) {
 		return s.r.kbs[idx].DiscardVersion(ctx, req)
-	})
+	}))
 }
 
 func (s *KBServer) ListKnowledgeBases(ctx context.Context, req *pb.ListKnowledgeBasesRequest) (*pb.ListKnowledgeBasesResponse, error) {
@@ -116,9 +117,9 @@ func (s *KBServer) keepVisibleKnowledgeBases(ctx context.Context, resp *pb.ListK
 }
 
 func (s *KBServer) GetKnowledgeBase(ctx context.Context, req *pb.GetKnowledgeBaseRequest) (*pb.GetKnowledgeBaseResponse, error) {
-	return Forward(s.r, ctx, pb.KnowledgeBaseService_GetKnowledgeBase_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.GetKnowledgeBaseResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.KnowledgeBaseService_GetKnowledgeBase_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.GetKnowledgeBaseResponse, error) {
 		return s.r.kbs[idx].GetKnowledgeBase(ctx, req)
-	})
+	}))
 }
 
 // QueryServer re-exposes QueryService on the router. Queries are
@@ -236,27 +237,27 @@ func (s *AdminServer) HealthCheck(ctx context.Context, req *pb.HealthCheckReques
 }
 
 func (s *AdminServer) GetSystemStatus(ctx context.Context, req *pb.GetSystemStatusRequest) (*pb.GetSystemStatusResponse, error) {
-	return Forward(s.r, ctx, pb.AdminService_GetSystemStatus_FullMethodName, "", func(idx int, ctx context.Context) (*pb.GetSystemStatusResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.AdminService_GetSystemStatus_FullMethodName, "", func(idx int, ctx context.Context) (*pb.GetSystemStatusResponse, error) {
 		return s.r.admins[idx].GetSystemStatus(ctx, req)
-	})
+	}))
 }
 
 func (s *AdminServer) GetClusterStatus(ctx context.Context, req *pb.GetClusterStatusRequest) (*pb.GetClusterStatusResponse, error) {
-	return Forward(s.r, ctx, pb.AdminService_GetClusterStatus_FullMethodName, "", func(idx int, ctx context.Context) (*pb.GetClusterStatusResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.AdminService_GetClusterStatus_FullMethodName, "", func(idx int, ctx context.Context) (*pb.GetClusterStatusResponse, error) {
 		return s.r.admins[idx].GetClusterStatus(ctx, req)
-	})
+	}))
 }
 
 func (s *AdminServer) RebuildIndex(ctx context.Context, req *pb.RebuildIndexRequest) (*pb.RebuildIndexResponse, error) {
-	return Forward(s.r, ctx, pb.AdminService_RebuildIndex_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.RebuildIndexResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.AdminService_RebuildIndex_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.RebuildIndexResponse, error) {
 		return s.r.admins[idx].RebuildIndex(ctx, req)
-	})
+	}))
 }
 
 func (s *AdminServer) WarmupVersion(ctx context.Context, req *pb.WarmupVersionRequest) (*pb.WarmupVersionResponse, error) {
-	return Forward(s.r, ctx, pb.AdminService_WarmupVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.WarmupVersionResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.AdminService_WarmupVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.WarmupVersionResponse, error) {
 		return s.r.admins[idx].WarmupVersion(ctx, req)
-	})
+	}))
 }
 
 // ListFailedVersions proxies the operator's work queue (§10.1). The knowledge base
@@ -294,14 +295,31 @@ func (s *AdminServer) ListFailedVersions(ctx context.Context, req *pb.ListFailed
 // write to replicated metadata, so it goes through the same Forward as the other
 // operator RPCs and inherits their retry semantics.
 func (s *AdminServer) ForceRetryVersion(ctx context.Context, req *pb.ForceRetryVersionRequest) (*pb.ForceRetryVersionResponse, error) {
-	return Forward(s.r, ctx, pb.AdminService_ForceRetryVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ForceRetryVersionResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.AdminService_ForceRetryVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ForceRetryVersionResponse, error) {
 		return s.r.admins[idx].ForceRetryVersion(ctx, req)
-	})
+	}))
 }
 
 // ForceAbandonVersion proxies an operator's abandonment of a terminated version.
 func (s *AdminServer) ForceAbandonVersion(ctx context.Context, req *pb.ForceAbandonVersionRequest) (*pb.ForceAbandonVersionResponse, error) {
-	return Forward(s.r, ctx, pb.AdminService_ForceAbandonVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ForceAbandonVersionResponse, error) {
+	return forwarded(Forward(s.r, ctx, pb.AdminService_ForceAbandonVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ForceAbandonVersionResponse, error) {
 		return s.r.admins[idx].ForceAbandonVersion(ctx, req)
-	})
+	}))
+}
+
+// forwarded keeps a forwarded call's error identity on the wire.
+//
+// gRPC maps a PLAIN error to codes.Unknown, and that erased exactly the distinction this
+// package depends on: measured in the T4 run, CreateVersion answered
+// `code = Unknown desc = router: no leader available: no leader available` — the router
+// had wrapped the named no_leader_yet sentinel, and the server boundary relabelled it, so
+// neither the test nor any client could tell "the cluster is electing" (retry) from a
+// real failure. ToGRPCStatus is the single conversion point; it also PASSES THROUGH an
+// error that is already a status (what a backend node returned), so a NotFound from the
+// control tier keeps its code.
+func forwarded[T any](resp T, err error) (T, error) {
+	if err != nil {
+		return resp, stratumerrors.ToGRPCStatus(err)
+	}
+	return resp, nil
 }

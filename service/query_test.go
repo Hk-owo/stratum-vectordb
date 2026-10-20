@@ -1022,3 +1022,87 @@ func errString(err error) string {
 	}
 	return err.Error()
 }
+
+// recordingIndexFetcher records the peer asks, so a case can assert the ORDER the query
+// path uses: peers before building (§4.2), not after.
+type recordingIndexFetcher struct {
+	calls     int
+	installed bool
+	err       error
+}
+
+func (f *recordingIndexFetcher) FetchIndexFromPeers(context.Context, string, int64) (bool, error) {
+	f.calls++
+	return f.installed, f.err
+}
+
+// A PENDING version with durable data asks the peers BEFORE the scan schedules a local
+// build. The scan is a bridge, not a replacement (§8.6b), and "every replica builds its
+// own copy" is exactly what owner sharding exists to prevent
+// (docs/index-owner-sharding-plan.md §4.2).
+func TestQueryService_PendingVersionAsksPeersBeforeBuilding(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	fetcher := &recordingIndexFetcher{}
+	h.svc.SetIndexFetcher(fetcher)
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+	})
+
+	resp, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].DocId != "doc-a" {
+		t.Fatalf("results = %+v, want doc-a answered from the scan", resp.Results)
+	}
+	if fetcher.calls != 1 {
+		t.Fatalf("peer asks = %d, want exactly 1 before the scan schedules a build", fetcher.calls)
+	}
+	// The scan still schedules the local build — it is a bridge, and by now the peers
+	// have been asked and had nothing.
+	if got := h.indexMgr.TriggeredBuilds(); len(got) != 1 || got[0] != vID {
+		t.Fatalf("TriggeredBuilds = %v, want [%d]", got, vID)
+	}
+}
+
+// The other half: when this node already has the artifact, asking a peer is pure waste.
+func TestQueryService_PendingVersionWithALocalArtifactSkipsThePeerAsk(t *testing.T) {
+	h := newQuerySvcHarness(t)
+	fetcher := &recordingIndexFetcher{}
+	h.svc.SetIndexFetcher(fetcher)
+	ctx := context.Background()
+
+	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+	})
+	// Build it here first, so IndexExists answers true (the mock reports "loaded").
+	if err := h.indexMgr.TriggerBuild(ctx, kbID, vID); err != nil {
+		t.Fatalf("TriggerBuild: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !h.indexMgr.IsLoaded(kbID, vID) {
+		if time.Now().After(deadline) {
+			t.Fatal("the local build never landed, so this case cannot tell the two paths apart")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if _, err := h.svc.Query(ctx, &pb.QueryRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       &vID,
+		Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+		TopK:            10,
+	}); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if fetcher.calls != 0 {
+		t.Fatalf("peer asks = %d, want 0: the artifact is already here", fetcher.calls)
+	}
+}

@@ -26,6 +26,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "stratum/api/proto/stratum"
 	stratumerrors "stratum/internal/errors"
 )
@@ -158,7 +161,7 @@ func writeChanges(t *testing.T, ctx context.Context, addr, kbID string, parent i
 		if err == nil {
 			return resp.VersionId
 		}
-		if !storageGateRefusal(err) || !time.Now().Before(deadline) {
+		if !waitableWriteRefusal(err) || !time.Now().Before(deadline) {
 			t.Fatalf("CreateVersion(%d changes) failed: %v", len(changes), err)
 		}
 		t.Logf("CreateVersion(%d changes) refused as %q; the gate's verdict is rebuilt from "+
@@ -192,6 +195,28 @@ func storageGateRefusal(err error) bool {
 		return true
 	}
 	return false
+}
+
+// waitableWriteRefusal answers "may this refusal simply be waited out?".
+//
+// Two families qualify, and they are different facts:
+//
+//   - the storage gate's verdict (see storageGateRefusal): it is rebuilt from periodic
+//     replica reports, so waiting is how it clears;
+//   - the router having no usable control node right now (no_leader_yet): an election in
+//     flight, or every candidate briefly circuit-broken after a burst of work.
+//
+// The second family is why this helper exists. Measured in this suite: during
+// TestT4_GCPressure's 1000-change write the router answered
+// `router: no leader available` and the helper above did not recognise it, so the write
+// died on the first refusal while the cluster was merely rotating its leader view.
+func waitableWriteRefusal(err error) bool {
+	if storageGateRefusal(err) {
+		return true
+	}
+	// The wire name is the contract; the code is the fallback for a peer built before
+	// no_leader_yet existed (the station used to answer codes.Unknown for it).
+	return stratumerrors.ReasonOf(err) == "no_leader_yet" || status.Code(err) == codes.Unavailable
 }
 
 // rollbackTo points the knowledge base's active version at versionID.

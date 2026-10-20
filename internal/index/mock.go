@@ -273,6 +273,12 @@ func (m *MockIndexManager) TrySearch(ctx context.Context, kbID string, versionID
 		}
 		vectors[chunkID] = v
 	}
+	// The scan is a BRIDGE, not a replacement (§8.6b), and the real tryBruteForce
+	// schedules the build before answering. The mock has to do the same, or a test that
+	// asserts "a scanned answer still leaves a build scheduled" passes against a lie.
+	if err := m.TriggerBuild(ctx, kbID, versionID); err != nil {
+		return nil, true, err
+	}
 	if len(vectors) == 0 {
 		// Not one vector readable: this replica does not hold the data, which is
 		// a retryable refusal rather than an empty answer.

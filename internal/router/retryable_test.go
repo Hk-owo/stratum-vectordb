@@ -2,6 +2,7 @@ package router
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -180,5 +181,36 @@ func TestIsRetryableErr_NoLeaderYetIsRetryable(t *testing.T) {
 	}
 	if reason := stratumerrors.ReasonOf(err); reason != "no_leader_yet" {
 		t.Fatalf("reason = %q, want no_leader_yet", reason)
+	}
+}
+
+// The station's server boundary must not erase the identity the Router attached.
+//
+// gRPC maps a PLAIN error to codes.Unknown, which is what the T4 run saw:
+// `code = Unknown desc = router: no leader available: no leader available` — the Router
+// had wrapped the named sentinel and the boundary relabelled it, so no client could tell
+// an election from a broken cluster.
+func TestForwarded_KeepsTheWireIdentity(t *testing.T) {
+	_, err := forwarded(0, fmt.Errorf("router: no leader available: %w", stratumerrors.ErrNoLeaderYet))
+	if code := status.Code(err); code != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable", code)
+	}
+	if reason := stratumerrors.ReasonOf(err); reason != "no_leader_yet" {
+		t.Fatalf("reason = %q, want no_leader_yet", reason)
+	}
+	if _, ok := err.(interface{ GRPCStatus() *status.Status }); !ok {
+		t.Fatalf("err = %T, want a gRPC status so the server sends the code, not Unknown", err)
+	}
+}
+
+// A success passes through untouched, and a backend node's own status keeps its code:
+// relabelling a NotFound as Internal is the same loss from the other direction.
+func TestForwarded_PassesThroughSuccessAndBackendStatus(t *testing.T) {
+	if got, err := forwarded("ok", nil); err != nil || got != "ok" {
+		t.Fatalf("forwarded(ok, nil) = (%v, %v), want (ok, nil)", got, err)
+	}
+	backend := status.Error(codes.NotFound, "knowledge base not found")
+	if _, err := forwarded(0, backend); status.Code(err) != codes.NotFound {
+		t.Fatalf("code = %v, want the backend's NotFound", status.Code(err))
 	}
 }

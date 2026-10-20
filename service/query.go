@@ -136,6 +136,19 @@ func (s *QueryServiceImpl) SetIndexFetcher(f IndexFetcher) {
 	s.indexFetcher = f
 }
 
+// hasLocalIndexArtifact reports whether this node already has the version's index on
+// disk, which makes asking a peer pointless.
+//
+// A failed probe answers false and is not fatal: the fetch it enables is harmless, and
+// the scan after it still answers the query.
+func (s *QueryServiceImpl) hasLocalIndexArtifact(ctx context.Context, kbID string, versionID int64) bool {
+	if s.indexManager == nil {
+		return false
+	}
+	exists, err := s.indexManager.IndexExists(ctx, kbID, versionID)
+	return err == nil && exists
+}
+
 // startBackgroundPull brings this node's history up to versionID, unless an
 // identical pull is already running.
 //
@@ -502,6 +515,29 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		// request (the caller keeps its own deadline), and every retry the station
 		// or the client makes gets a finished index.
 		if targetVersion.DataStatus == types.DataStatusDurable {
+			// §4.2's two-step rule, and it has to come BEFORE the scan.
+			//
+			// The scan below answers the query either way, but it is also what schedules a
+			// build (index.tryBruteForce's "the scan is a bridge, not a replacement"). Doing
+			// that first made every replica that answered a PENDING query build its own copy
+			// — precisely what owner sharding exists to prevent
+			// (docs/index-owner-sharding-plan.md §4.2). The order used here is the one
+			// plane.ensureOwnIndex already uses: an artifact on THIS node's disk first
+			// (free, and TrySearch's loadFromDisk will pick it up), then a peer's (one round
+			// trip), and only then building (minutes).
+			if s.indexFetcher != nil && !s.hasLocalIndexArtifact(ctx, kbID, versionID) {
+				fetched, fetchErr := s.indexFetcher.FetchIndexFromPeers(ctx, kbID, versionID)
+				switch {
+				case fetchErr != nil:
+					s.logger.Debug("query: asking peers for the index artifact failed",
+						zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(fetchErr))
+				case fetched:
+					// Installed and loaded, so the TrySearch right below answers from the
+					// index instead of scanning — and no build is scheduled here at all.
+					s.logger.Debug("query: installed a peer's artifact for a PENDING version",
+						zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
+				}
+			}
 			scanStart := time.Now()
 			scanned, answered, scanErr := s.indexManager.TrySearch(ctx, kbID, versionID, req.Vector, searchTopK)
 			stageSearch = time.Since(scanStart)
