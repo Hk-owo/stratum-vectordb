@@ -411,6 +411,15 @@ func (m *MockIndexManager) IndexExists(_ context.Context, kbID string, versionID
 	return ok, nil
 }
 
+// Resident implements IndexManager: loaded, or a build in flight.
+func (m *MockIndexManager) Resident(kbID string, versionID int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := indexKey{kbID, versionID}
+	_, loaded := m.loaded[key]
+	return loaded || m.loading[key]
+}
+
 func (m *MockIndexManager) Evict(_ context.Context, kbID string, versionID int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

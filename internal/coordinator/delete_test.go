@@ -307,6 +307,8 @@ func (im *deleteTestIndexManager) Search(_ context.Context, kbID string, version
 
 // TrySearch reports "cannot answer right now": an empty answer would read as "no
 // matches" to the query path (§9.1 risk 1).
+func (im *deleteTestIndexManager) Resident(string, int64) bool { return false }
+
 func (im *deleteTestIndexManager) TrySearch(_ context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, bool, error) {
 	return nil, false, nil
 }
