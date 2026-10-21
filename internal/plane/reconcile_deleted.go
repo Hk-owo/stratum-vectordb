@@ -170,61 +170,55 @@ func (d *LocalDataPlane) ReconcileDeletedVersions(ctx context.Context, meta Meta
 	return reclaimed, firstErr
 }
 
-// DefaultDeletedReconcileInterval is how often the periodic reverse reconciliation
-// looks for local leftovers of deleted versions.
+// DefaultDeletionSweepInterval paces the periodic deletion sweep.
 //
-// An hour, and it USED to be five minutes. What changed is that this pass is no
-// longer what makes a deletion timely:
+// A minute, and the number follows the WORK one tick does, not the deletion's
+// urgency: a tick is one small read of the control layer's bounded deletion log
+// (ReconcileDeletions rule 2), and the live-chain pass — the expensive half — runs only
+// when something forces it (a local landing, a truncated log, no watermark, or
+// ChainReconcileMaxAge). It used to be an hour, from when a tick WAS a per-knowledge-base
+// range scan; leaving it there made the incremental path a decoration, because a
+// deletion the log could have served waited an hour to be read.
 //
-//   - the tombstone table (internal/tombstone) is written the moment this node is
-//     told, refuses data on every landing path, and retries its own unfinished
-//     reclaims every 30 s (StartDeletedVersionRetry) — so "I was told and something
-//     went wrong" is repaired without asking anyone;
-//   - what this pass alone can answer is the case that table cannot know: a node
-//     NEVER told (unreachable when the broadcast ran, or absent through a topology
-//     change) has no entry, and the only way to find its leftovers is to compare
-//     what it holds against the control layer's live chain.
-//
-// That comparison is the one judgement with no retention and no gaps, so it stays —
-// an hour is slow enough to be housekeeping and fast enough that a node nobody told
-// does not hold phantom bytes for a working day. What it leaks until then is SPACE
-// and nothing else: a leftover is unreachable phantom data, because every query goes
-// through the control layer's judgement.
-const DefaultDeletedReconcileInterval = time.Hour
+// This is the interval `reconcile.deleted_versions_incremental_interval_s` documents
+// (<= 0 takes it), and the sweep's own re-judge half is bounded separately by
+// ChainReconcileMaxAge (24 h).
+const DefaultDeletionSweepInterval = time.Minute
 
-// StartDeletedVersionReconcile runs the reverse reconciliation on a cadence until ctx
-// ends, skipping every pass in which nothing local has changed.
+// StartDeletedVersionReconcile runs the deletion sweep on a cadence until ctx ends.
+// Each tick is ReconcileDeletions: one incremental read, plus whatever the rule decides
+// is due (a forced live-chain pass, and the local drain of deleted bytes still owed).
 //
 // Why a cadence: the startup pass only sees leftovers that exist at boot, and the ones
 // that matter are created at RUNTIME — the late push that outlived the delete meant to
 // remove it (§B's source ③) needs no failure at all, so "restart the node and see" is
 // not a discovery mechanism.
 //
-// Why only after a change: the judgement compares what this node HOLDS against what the
-// control layer has, and the local side cannot move without advanceLocalVersion running
-// (every landing path — write, pull, push, backfill, drop — goes through it, including
-// the early return, which is the late-push case). An idle node therefore has nothing new
-// to find and pays nothing; a node being written to pays one pass per interval, which is
-// the honest price of not having to decide WHICH landing could have left a leftover.
-// That price is bounded by what this node holds — the pass reads its own version list
-// and asks one range per knowledge base — not by what the knowledge base ever had.
+// The two halves of a tick have different switches on purpose:
+//   - the INCREMENTAL read is `reconcile.deleted_versions_incremental`, and it is cheap
+//     enough to run on every tick — it is what makes a deletion known without re-reading
+//     a whole range;
+//   - the FULL live-chain re-judge is `reconcile.deleted_versions_periodic` (through
+//     DisableChainReconcile), and it is the half that costs a range scan per knowledge
+//     base. It compares what this node HOLDS against the control layer's live chain,
+//     which is the one judgement with no retention and no gaps — the only thing that can
+//     name a node nobody ever told.
 //
-// NOTE the blind spot this leaves, and why it is now affordable: "an idle node pays
-// nothing" also means a deletion the CONTROL LAYER performed on an idle node waits for
-// the next landing or the next restart. That window is what the tombstone table covers
-// (the notification is recorded locally when it arrives and retried every 30 s), so this
-// pass is free to be the slow, authoritative answer instead of the fast one.
+// NOTE the blind spot the split leaves: a deletion performed while this node is idle
+// waits for the next landing or the next restart. That window is what the tombstone table
+// covers (the notification is recorded locally when it arrives and retried every 30 s),
+// so this pass is free to be the slow, authoritative answer instead of the fast one.
 //
-// The action is the startup pass's, unchanged: ReconcileDeletedVersions is idempotent
-// end to end. The opt-in is NOT, and deliberately — `reconcile.deleted_versions`
-// governs the start-up sweep and `reconcile.deleted_versions_periodic` governs this one,
-// because "clean up what is lying around at boot" and "keep recovering what appears
-// while running" are different decisions about the same irreversible action.
+// The reclaim itself is idempotent end to end, but the opt-in is separate by design:
+// `reconcile.deleted_versions` governs the start-up sweep and
+// `reconcile.deleted_versions_periodic` governs this one, because "clean up what is lying
+// around at boot" and "keep recovering what appears while running" are different
+// decisions about the same irreversible action.
 //
-// A non-positive interval takes DefaultDeletedReconcileInterval.
+// A non-positive interval takes DefaultDeletionSweepInterval.
 func (d *LocalDataPlane) StartDeletedVersionReconcile(ctx context.Context, meta MetadataLister, interval time.Duration) {
 	if interval <= 0 {
-		interval = DefaultDeletedReconcileInterval
+		interval = DefaultDeletionSweepInterval
 	}
 	go func() {
 		// Phase first, ticker second — see reconcileJitter. The start-up sweep has

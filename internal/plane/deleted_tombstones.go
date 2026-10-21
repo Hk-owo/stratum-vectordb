@@ -102,7 +102,15 @@ func (d *LocalDataPlane) deletionPage() int {
 // operator has not switched it off, and enough time has passed since the last one for
 // THIS trigger's patience.
 func (d *LocalDataPlane) chainAvailable(minAge time.Duration) bool {
-	if !d.chainReconcileEnabled {
+	return d.chainAvailableTo(d.chainReconcileEnabled, minAge)
+}
+
+// chainAvailableTo is chainAvailable with the operator's switch supplied by the caller,
+// so a pass authorised differently — the start-up pass, which belongs to
+// reconcile.deleted_versions rather than to the periodic switch — can ask the same
+// question. The pacing is identical; only who said "yes" changes.
+func (d *LocalDataPlane) chainAvailableTo(allowChain bool, minAge time.Duration) bool {
+	if !allowChain {
 		return false
 	}
 	if d.lastChainReconcile.IsZero() {
@@ -284,6 +292,47 @@ func (e errorString) Error() string { return string(e) }
 // The chain path always finishes by aligning the watermark, because the live-chain
 // judgement has just covered exactly what the log had pruned away.
 func (d *LocalDataPlane) ReconcileDeletions(ctx context.Context, meta MetadataLister) (DeletionSweepResult, error) {
+	return d.reconcileDeletions(ctx, meta, d.chainReconcileEnabled)
+}
+
+// ReconcileDeletionsAtStartup is the START-UP pass: the same rule, with the live-chain
+// fallback unconditionally available.
+//
+// Why it is authorised differently from the periodic pass:
+//
+//   - DisableChainReconcile (reconcile.deleted_versions_periodic) is a decision about the
+//     PERIODIC full pass — "do not re-scan a whole range every tick". The start-up pass is
+//     a separate decision, made by reconcile.deleted_versions, and callers only take this
+//     path when that one is on.
+//   - It is also the only pass that can ESTABLISH a watermark on this node. Without one
+//     every read falls back to the chain (rule 1 of ReconcileDeletions), so honouring the
+//     periodic switch here would leave a node that wants only the cheap incremental path
+//     with no way to ever reach it.
+//
+// Running it at boot is what makes the tombstone table's cross-restart bookkeeping whole:
+// the pass drains entries a crash left PENDING and aligns the watermark, so the first
+// periodic tick reads one page instead of repeating the full live-chain scan. The old
+// start-up call did neither — it reclaimed, but left the watermark untouched, so the next
+// tick scanned the same range again.
+func (d *LocalDataPlane) ReconcileDeletionsAtStartup(ctx context.Context, meta MetadataLister) (DeletionSweepResult, error) {
+	if d.tombstones == nil {
+		// No table wired: the sweep still runs, it just cannot record what it finds or
+		// retry it later. Falling back to the live-chain judgement keeps
+		// `reconcile.deleted_versions` meaning what it says — the table is an
+		// accelerator and a cross-restart ledger, never the authorisation. Returning an
+		// empty result instead would make the setting silently inert on a node whose
+		// table failed to open.
+		reclaimed, err := d.ReconcileDeletedVersions(ctx, meta)
+		return DeletionSweepResult{Source: "chain", Fallback: "no-tombstone-table", Reclaimed: reclaimed}, err
+	}
+	return d.reconcileDeletions(ctx, meta, true)
+}
+
+// reconcileDeletions is the shared body. allowChain is the ONLY thing the two entry
+// points disagree about: the periodic pass takes the operator's switch
+// (chainReconcileEnabled), the start-up pass is authorised by reconcile.deleted_versions
+// and therefore always allows the fallback.
+func (d *LocalDataPlane) reconcileDeletions(ctx context.Context, meta MetadataLister, allowChain bool) (DeletionSweepResult, error) {
 	var res DeletionSweepResult
 	if d.tombstones == nil {
 		return res, nil
@@ -302,7 +351,7 @@ func (d *LocalDataPlane) ReconcileDeletions(ctx context.Context, meta MetadataLi
 	//   - there is no watermark, so this node cannot be served incrementally at all and
 	//     must not be told "you are up to date";
 	//   - the last full pass is older than the bound.
-	if d.peekDeletedReconcileDirty() && d.chainAvailable(defaultChainReconcileMinAge) {
+	if d.peekDeletedReconcileDirty() && d.chainAvailableTo(allowChain, defaultChainReconcileMinAge) {
 		return d.reconcileFromChain(ctx, meta, res, "local-holdings-changed")
 	}
 	if !hasState || d.deletions == nil {
@@ -310,13 +359,13 @@ func (d *LocalDataPlane) ReconcileDeletions(ctx context.Context, meta MetadataLi
 		if d.deletions == nil {
 			reason = "no-deletion-log"
 		}
-		if !d.chainReconcileEnabled {
+		if !allowChain {
 			res.Source, res.Fallback = "skipped", chainDisabled
 			return res, nil
 		}
 		return d.reconcileFromChain(ctx, meta, res, reason)
 	}
-	if d.chainAvailable(d.maxChainReconcileAge()) {
+	if d.chainAvailableTo(allowChain, d.maxChainReconcileAge()) {
 		return d.reconcileFromChain(ctx, meta, res, "chain-reconcile-due")
 	}
 
@@ -341,7 +390,7 @@ func (d *LocalDataPlane) ReconcileDeletions(ctx context.Context, meta MetadataLi
 			if truncated {
 				reason = "log-truncated"
 			}
-			if !d.chainReconcileEnabled {
+			if !allowChain {
 				res.Source, res.Fallback = "skipped", chainDisabled
 				return res, nil
 			}

@@ -563,36 +563,6 @@ func main() {
 		Dropper:             versionDropper,
 	})
 
-	// --- WAL crash recovery ---
-	// Replays interrupted transactions now that the coordinator layer can
-	// execute them. Three record kinds are handled:
-	//   - DeleteMark:      resume the interrupted DeleteKnowledgeBase flow.
-	//   - VersionDelete:   resume the interrupted DeleteVersion flow.
-	//   - VersionWrite:    replay the version's storage writes from the
-	//     transaction input persisted in the WAL's BEGIN record. A record
-	//     without local transaction input (applied by a follower, or a
-	//     legacy WAL) cannot be replayed here — the node's data integrity
-	//     for it is restored by Raft log replay + DataSync instead — so it
-	//     is surfaced via the replay counter for operators.
-	//
-	// A record that still cannot be replayed (after bounded in-process
-	// retries) is skipped and counted, never fatal: it stays in the WAL
-	// for the next restart and the node keeps starting up. See the policy
-	// comment above runCrashRecovery.
-	// Replaying interrupted transactions is storage-layer work: every record it
-	// resumes (a version write, a delete) drives a storage coordinator. A control
-	// node has none, so running this there dereferences nil and — since it runs
-	// during startup — crash-loops the process. That is not a hypothetical: two
-	// control nodes were killed and restarted by the fault-injection tests, both
-	// came back into a restart loop, the cluster lost quorum, and every test
-	// after it timed out waiting for a leader.
-	//
-	// Its WAL is not idle on a control node: Raft's own records live there. What
-	// must not happen is treating those as storage transactions to resume.
-	if storageLocal {
-		runCrashRecovery(ctx, logger, records, writeCoord, deleteCoord, deleteVersionCoord, walImpl)
-	}
-
 	// --- Index status reconcile (derive state from disk facts) ---
 	// The authoritative fact for "this version's index is built and
 	// durable" is the persisted index file on disk (written by Save after
@@ -1038,6 +1008,46 @@ func main() {
 		return err
 	}
 
+	// --- WAL crash recovery ---
+	// Replays the interrupted transactions the scan at the top of main() found. Three
+	// record kinds are handled:
+	//   - DeleteMark:      resume the interrupted DeleteKnowledgeBase flow.
+	//   - VersionDelete:   resume the interrupted DeleteVersion flow.
+	//   - VersionWrite:    replay the version's storage writes from the transaction
+	//     input persisted in the WAL's BEGIN record. A record without local
+	//     transaction input (applied by a follower, or a legacy WAL) cannot be
+	//     replayed here — the node's data integrity for it is restored by Raft log
+	//     replay + DataSync instead — so it is surfaced via the replay counter for
+	//     operators.
+	//
+	// A record that still cannot be replayed (after bounded in-process retries) is
+	// skipped and counted, never fatal: it stays in the WAL for the next restart and
+	// the node keeps starting up. See runCrashRecovery's own comment.
+	//
+	// WHERE this sits is part of the contract, not an accident of assembly order. Both
+	// halves of the replay reach for state wired just above:
+	//
+	//   - The version-write replay runs through the DATA PLANE
+	//     (WriteCoordinator.ReplayVersionStorageWrites → LocalDataPlane.ResumeVersionWrite).
+	//     Run it before SetDataPlane and the coordinator falls back to the private plane
+	//     NewWriteCoordinatorImpl builds for itself: no tombstone table, no fan-out
+	//     targets, no state machine. The replay then re-writes a version this node knows
+	//     was deleted (the tombstone check answers "no table, so no"), and reports it
+	//     durable without telling any replica.
+	//   - A delete replay resolves the deferred droppers (kbDropper / versionDropper).
+	//     Resolving them early CACHES the arm built from a nil data plane, so every
+	//     later delete would carry a dead broadcast half.
+	//
+	// Replaying is also storage-layer work: a control node drives no storage coordinator,
+	// and running this there dereferences nil. Since it runs during startup the failure
+	// mode is a crash loop — in the fault-injection tests that cost the cluster its
+	// quorum and timed out every test after it. Its WAL is not idle on a control node
+	// (Raft's own records live there); what must not happen is treating those as storage
+	// transactions to resume.
+	if storageLocal {
+		runCrashRecovery(ctx, logger, records, writeCoord, deleteCoord, deleteVersionCoord, walImpl)
+	}
+
 	// Startup maintenance across the contract: the storage layer trims index
 	// files by the retention policy, then reconciles — and the control layer
 	// promotes versions whose READY proposal was lost
@@ -1073,18 +1083,32 @@ func main() {
 			logger.Info("startup: queued terminal versions for local reclaim", zap.Int("versions", n))
 		}
 
-		// §B/§C: a version whose metadata is gone while its bytes are still here —
-		// the leftover that no metadata-keyed path can name. The scan is read-only
-		// and always runs, so the problem becomes VISIBLE; reclaiming is opt-in
-		// because it is irreversible and runs once per start-up.
+		// §B/§C: the deletion reconciliation, once, at boot.
+		//
+		// It goes through ReconcileDeletionsAtStartup — the same rule the periodic
+		// sweep runs — instead of straight to ReconcileDeletedVersions (the live-chain
+		// judgement alone), because the start-up pass is the one that can establish this
+		// node's watermark into the control layer's deletion log. The old call reclaimed
+		// but left the watermark untouched, so the first periodic tick found no
+		// watermark, fell back to the full live-chain scan, and repeated exactly the work
+		// the start-up pass had just done. It also drains the tombstone entries a crash
+		// left PENDING, which is the one piece of deletion debt only this node can name.
+		//
+		// The read-only half stays read-only: with the sweep switched off the scan still
+		// runs, so the leftovers are VISIBLE, and nothing is reclaimed.
 		if liveness != nil {
 			if cfg.ReconcileDeletedVersions {
-				reclaimed, err := dataPlane.ReconcileDeletedVersions(ctx, rn)
+				res, err := dataPlane.ReconcileDeletionsAtStartup(ctx, rn)
 				if err != nil {
-					logger.Warn("startup: reclaiming local leftovers of deleted versions did not finish", zap.Error(err))
+					logger.Warn("startup: the deletion reconciliation did not finish; the periodic sweep retries it", zap.Error(err))
 				}
-				if reclaimed > 0 {
-					logger.Info("startup: reclaimed local leftovers of deleted versions", zap.Int("versions", reclaimed))
+				if res.Reclaimed > 0 {
+					logger.Info("startup: reclaimed local leftovers of deleted versions",
+						zap.Int("versions", res.Reclaimed), zap.String("source", res.Source))
+				} else {
+					logger.Info("startup: deletion reconciliation found nothing to reclaim",
+						zap.String("source", res.Source), zap.String("fallback", res.Fallback),
+						zap.Int64("watermark", res.LocalSeq))
 				}
 			} else if leftovers, err := dataPlane.DeletedVersionLeftovers(ctx, rn); err != nil {
 				logger.Warn("startup: could not scan for local leftovers of deleted versions", zap.Error(err))
@@ -1097,14 +1121,13 @@ func main() {
 			// the sweep above answers "what is lying around at boot", this one "what
 			// keeps appearing while running" — and the runtime leftovers are the ones
 			// that matter, because a push that outlived the delete meant to remove it
-			// needs no failure at all (§B). It skips every pass in which nothing local
-			// changed, so an idle node pays nothing.
-			// Started when EITHER path is on, and paced by the incremental interval:
-			// one tick is "read the log, and re-judge only if something says you must"
-			// (a local landing, a truncated log, the full-pass age). The periodic
-			// switch now gates just the re-judge half, because the two halves have
-			// different costs and wanting the cheap one alone is a reasonable
-			// deployment.
+			// needs no failure at all (§B).
+			// Started when EITHER path is on, and paced by the incremental interval: one
+			// tick is one bounded read of the deletion log plus whatever that asks for (a
+			// forced live-chain re-judge on a local landing, a truncated log, or the
+			// full-pass age) and the local drain of bytes still owed. The periodic switch
+			// gates only the re-judge half, because the two halves cost very differently
+			// and wanting the cheap one alone is a reasonable deployment.
 			if cfg.ReconcileDeletionsIncremental || cfg.ReconcileDeletedVersionsPeriodic {
 				dataPlane.StartDeletedVersionReconcile(ctx, rn,
 					time.Duration(cfg.ReconcileDeletionsIncrementalIntervalS)*time.Second)
