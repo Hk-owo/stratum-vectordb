@@ -38,18 +38,28 @@ func TestLocalDataPlane_StartupSweepAlignsEvenWithThePeriodicPassOff(t *testing.
 		t.Fatalf("watermark = (%v, %+v), want (true, {e1 9}) — the start-up pass must align it", ok, state)
 	}
 
-	// The contrast that gives the case its meaning: the PERIODIC pass under the same
-	// configuration has no way to establish a watermark, so it declines rather than
-	// pretending the node is up to date.
-	other := newSweepPlane(t, tombstone.NewMemoryStore(), &fakeDeletionLog{latest: 9, oldest: 1, epoch: "e1"})
+	// The contrast that gives the case its meaning: the switch still governs the
+	// ACTIVITY-DRIVEN full pass. With a watermark in place and a local landing pending, a
+	// periodic pass would normally re-judge — with the switch off it must not, and the
+	// trigger has to stay pending for when the floor expires.
+	other := newSweepPlane(t, tombstone.NewMemoryStore(), &fakeDeletionLog{latest: 3, oldest: 1, epoch: "e1"})
+	if err := other.tombstones.(*tombstone.MemoryStore).NoteBatch(ctx,
+		tombstone.SyncState{Epoch: "e1", Seq: 3}, nil); err != nil {
+		t.Fatalf("NoteBatch: %v", err)
+	}
 	other.lastChainReconcile = time.Time{}
 	other.chainReconcileEnabled = false
+	other.noteHoldingsChanged()
+
 	periodic, err := other.ReconcileDeletions(ctx, sweepMeta())
 	if err != nil {
 		t.Fatalf("ReconcileDeletions: %v", err)
 	}
-	if periodic.Source != "skipped" || periodic.Fallback != chainDisabled {
-		t.Fatalf("periodic res = %+v, want skipped with chain-disabled", periodic)
+	if periodic.Source == "chain" {
+		t.Fatalf("periodic res = %+v, want no full pass — the switch is off", periodic)
+	}
+	if !other.peekDeletedReconcileDirty() {
+		t.Fatal("the trigger must still be pending: the pass that would consume it did not run")
 	}
 }
 

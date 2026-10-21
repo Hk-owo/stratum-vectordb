@@ -3,6 +3,7 @@ package plane
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 // It answers "who could serve version V" from the reported cursors — the one
@@ -107,5 +108,34 @@ func TestDataVersionRegistry_RecordCopiesTheMap(t *testing.T) {
 
 	if cursor, _ := reg.Cursor(1, "kb-1"); cursor != 5 {
 		t.Errorf("Cursor(1, kb-1) = %d, want 5 — the report must be a snapshot", cursor)
+	}
+}
+
+// A node that stopped reporting is not a candidate any more. Without this the registry —
+// which is never pruned — names a dead node forever, and the station pays a probe per
+// breaker cooldown on it before failing over.
+//
+// The rule is the write side's (Degrade), applied to the read side, and the window is the
+// same 15 s so the two tiers agree on "live".
+func TestDataVersionRegistry_HoldersSkipNodesThatWentSilent(t *testing.T) {
+	reg := NewDataVersionRegistry()
+	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 5})
+	reg.Record(2, "10.0.0.2:7000", map[string]int64{"kb-1": 5})
+
+	// Reach into the registry the way a long silence would: node 2's last report predates
+	// the window, node 1's does not.
+	reg.mu.Lock()
+	reg.byNode[2].reportedAt = time.Now().Add(-2 * DefaultStorageSilenceWindow)
+	reg.mu.Unlock()
+
+	got := reg.Holders("kb-1", 5)
+	if len(got) != 1 || got[0].NodeID != 1 {
+		t.Fatalf("Holders = %v, want only node 1 — a silent node must not stay a candidate", got)
+	}
+
+	// The filter is about silence, not about holdings: asking with a window wider than the
+	// silence brings node 2 back, which is what a caller with a different tolerance wants.
+	if got := reg.holdersAt("kb-1", 5, time.Now(), time.Hour); len(got) != 2 {
+		t.Fatalf("holdersAt(window=1h) = %v, want both nodes", got)
 	}
 }

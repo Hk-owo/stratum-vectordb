@@ -73,11 +73,38 @@ func (r *DataVersionRegistry) Record(nodeID int64, address string, dataVersions 
 // reaches versionID for kbID, each with the address it reported. A node that has
 // never reported is simply absent — which is why an empty result means "no one I
 // have heard from", never "no one has it".
+//
+// A node SILENT for longer than DefaultStorageSilenceWindow is left out. This is the read
+// side's counterpart of the write side's rule in Degrade: the registry is never pruned by
+// age, so a node that died keeps its last report forever, and "who should I ask to serve
+// V" would keep naming it. Without the filter the station spends one probe per breaker
+// cooldown (5 s) on a node nobody is going to hear from again, and every one of those
+// probes is a client request that has to fail over first.
+//
+// The window is deliberately the SAME 15 s (three report intervals) the write side uses,
+// so the two tiers agree on what "live" means. Freshness is still not this answer's job:
+// the version credential on the forwarded query is what makes a stale holder refuse.
+//
+// It remains SOFT state, and the filter must not be read as "that node does not have the
+// version" — only as "nobody has heard from it lately". A node that comes back reports
+// again and is a candidate on the next refresh.
 func (r *DataVersionRegistry) Holders(kbID string, versionID int64) []Holder {
+	return r.holdersAt(kbID, versionID, time.Now(), DefaultStorageSilenceWindow)
+}
+
+// holdersAt is Holders with the clock and the window supplied, so the age rule can be
+// tested without sleeping.
+func (r *DataVersionRegistry) holdersAt(kbID string, versionID int64, now time.Time, window time.Duration) []Holder {
+	if window <= 0 {
+		window = DefaultStorageSilenceWindow
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var holders []Holder
 	for nodeID, data := range r.byNode {
+		if now.Sub(data.reportedAt) > window {
+			continue
+		}
 		if cursor, ok := data.cursors[kbID]; ok && cursor >= versionID {
 			holders = append(holders, Holder{NodeID: nodeID, Address: data.address})
 		}

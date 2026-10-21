@@ -291,6 +291,14 @@ func (e errorString) Error() string { return string(e) }
 //
 // The chain path always finishes by aligning the watermark, because the live-chain
 // judgement has just covered exactly what the log had pruned away.
+//
+// allowChain gates rule 0 only — the ACTIVITY-DRIVEN full pass (a local landing, or the
+// max age going by). Rules 1 and 2's fallbacks are CORRECTNESS: when the log cannot serve
+// this node (no watermark, truncated, epoch mismatch) the chain pass runs whatever the
+// switch says, because leaving it off would mean the node never converges and never
+// establishes the watermark that would make the incremental path usable. The switch, in
+// other words, decides whether this node looks for leftovers on its own initiative — not
+// whether it may see the deletions the log cannot describe.
 func (d *LocalDataPlane) ReconcileDeletions(ctx context.Context, meta MetadataLister) (DeletionSweepResult, error) {
 	return d.reconcileDeletions(ctx, meta, d.chainReconcileEnabled)
 }
@@ -354,16 +362,24 @@ func (d *LocalDataPlane) reconcileDeletions(ctx context.Context, meta MetadataLi
 	if d.peekDeletedReconcileDirty() && d.chainAvailableTo(allowChain, defaultChainReconcileMinAge) {
 		return d.reconcileFromChain(ctx, meta, res, "local-holdings-changed")
 	}
-	if !hasState || d.deletions == nil {
-		reason := "no-watermark"
-		if d.deletions == nil {
-			reason = "no-deletion-log"
-		}
+	if d.deletions == nil {
+		// No log to read at all. Here the full pass is the only mechanism that exists, so
+		// the periodic switch decides — there is no "the log cannot serve this node" case
+		// to outweigh it.
 		if !allowChain {
 			res.Source, res.Fallback = "skipped", chainDisabled
 			return res, nil
 		}
-		return d.reconcileFromChain(ctx, meta, res, reason)
+		return d.reconcileFromChain(ctx, meta, res, "no-deletion-log")
+	}
+	if !hasState {
+		// A log this node cannot be served from (no watermark yet, or one a rebuilt table
+		// lost) is exactly what the rollback exists for, so it runs REGARDLESS of the
+		// periodic switch. Honouring the switch here would be a trap: every incremental
+		// read falls back to the chain, the fallback is off, and the node can never
+		// establish the watermark that would make the incremental path work — it would sit
+		// at skipped(chain-disabled) forever while deletions never reach it.
+		return d.reconcileFromChain(ctx, meta, res, "no-watermark")
 	}
 	if d.chainAvailableTo(allowChain, d.maxChainReconcileAge()) {
 		return d.reconcileFromChain(ctx, meta, res, "chain-reconcile-due")
@@ -390,10 +406,11 @@ func (d *LocalDataPlane) reconcileDeletions(ctx context.Context, meta MetadataLi
 			if truncated {
 				reason = "log-truncated"
 			}
-			if !allowChain {
-				res.Source, res.Fallback = "skipped", chainDisabled
-				return res, nil
-			}
+			// Same rule as the missing watermark above: the log cannot serve this node, so
+			// the rollback runs whatever the periodic switch says. Leaving it to the switch
+			// made "only the cheap incremental path" a node that stops converging the first
+			// time the log is truncated or the epoch changes — and it would stay that way
+			// until the next restart re-aligned the watermark.
 			return d.reconcileFromChain(ctx, meta, res, reason)
 		}
 

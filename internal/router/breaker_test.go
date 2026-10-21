@@ -2,11 +2,14 @@ package router
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"time"
+
+	stratumerrors "stratum/internal/errors"
 )
 
 // TestBreaker_TripsAfterRepeatedFailures pins the closed→open edge and the
@@ -153,9 +156,15 @@ func TestForward_AllNodesBrokenIsAnErrorRatherThanASilentSuccess(t *testing.T) {
 		r.storageBreakers[0].record(now, false)
 	}
 
-	if _, err := Forward(r, context.Background(), "/stratum.QueryService/Query", "",
-		func(idx int, _ context.Context) (int, error) { return idx, nil }); err == nil {
+	_, err := Forward(r, context.Background(), "/stratum.QueryService/Query", "",
+		func(idx int, _ context.Context) (int, error) { return idx, nil })
+	if err == nil {
 		t.Fatal("expected an error when every node is circuit-broken")
+	}
+	// The caller's retry decision rides on the identity, not the message: without the
+	// sentinel this crossed the station as codes.Unknown and read as terminal.
+	if !errors.Is(err, stratumerrors.ErrStorageUnavailable) {
+		t.Fatalf("err = %v, want it to wrap ErrStorageUnavailable", err)
 	}
 }
 

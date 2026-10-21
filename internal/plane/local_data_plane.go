@@ -377,9 +377,13 @@ type LocalDataPlaneConfig struct {
 	// ChainReconcileMaxAge bounds how long the incremental path may keep the full
 	// live-chain pass away (0 = 24h).
 	ChainReconcileMaxAge time.Duration
-	// DisableChainReconcile forbids the periodic full pass entirely. The start-up
-	// sweep and this node's own tombstone retries still run; what goes away is the
-	// reconciliation that finds leftovers nobody told this node about.
+	// DisableChainReconcile switches off the ACTIVITY-DRIVEN full pass: the
+	// reconciliation that finds leftovers nobody told this node about, on a local landing
+	// or once ChainReconcileMaxAge has gone by. The start-up sweep and this node's own
+	// tombstone retries still run, and so does the rollback the incremental path needs
+	// when the log cannot serve this node (no watermark, truncated, epoch mismatch) —
+	// that is correctness, not cadence, and honouring the switch there would leave such a
+	// node permanently unable to converge.
 	DisableChainReconcile bool
 	// ResolveReplicas lists the *other* replicas that should hold a written
 	// version. Nil (or an empty list) means "no replication": the local write

@@ -941,7 +941,7 @@ func forwardRead[T any](r *Router, ctx context.Context, trace readTrace, candida
 	}()
 
 	if len(candidates) == 0 {
-		return zero, errors.New("router: no node can serve this request")
+		return zero, unavailableFor(trace.layer, "no node can serve this request")
 	}
 	n := len(candidates)
 	rrStart := int(r.rr.Add(1)-1) % n
@@ -989,9 +989,30 @@ func forwardRead[T any](r *Router, ctx context.Context, trace readTrace, candida
 		}
 	}
 	if admitted == 0 {
-		return zero, errors.New("router: every node for this layer is circuit-broken")
+		return zero, unavailableFor(trace.layer, "every node for this layer is circuit-broken")
 	}
-	return zero, errors.New("router: all nodes unavailable")
+	return zero, unavailableFor(trace.layer, "all nodes unavailable")
+}
+
+// unavailableFor names the "nobody could take this call" family on the wire, so the
+// caller's retry decision survives the station boundary.
+//
+// Why the sentinel is required rather than nice to have: these three exits used to be
+// plain Go errors, so the interceptor had no name to restore and every one of them crossed
+// the boundary as codes.Unknown with no ErrorInfo. A client that decides on the reason (as
+// this codebase's own callers do) then treats "the storage layer is briefly unreachable"
+// as terminal — the same failure cf8a250 fixed for the forwarded-node case, left in place
+// on the fallback path.
+//
+// Which sentinel depends on which layer failed: the storage layer's absence is
+// ErrStorageUnavailable, the control layer's is ErrNoLeaderYet (an election, or no leader
+// known). Both are codes.Unavailable and both are in retryableReasons, which is the point.
+func unavailableFor(layer, detail string) error {
+	sentinel := stratumerrors.ErrStorageUnavailable
+	if layer == "control" {
+		sentinel = stratumerrors.ErrNoLeaderYet
+	}
+	return fmt.Errorf("%w: %s", sentinel, detail)
 }
 
 // tryAll runs fn against every node until one succeeds. Used as the
@@ -1021,7 +1042,7 @@ func tryAll[T any](r *Router, ctx context.Context, fn func(idx int, ctx context.
 		}
 	}
 	if admitted == 0 {
-		return zero, errors.New("router: every control node is circuit-broken")
+		return zero, unavailableFor("control", "every control node is circuit-broken")
 	}
 	if lastErr != nil {
 		return zero, noLeaderAfter("router: no leader available (tried every node)", lastErr)

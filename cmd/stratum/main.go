@@ -2403,6 +2403,12 @@ type appConfig struct {
 	// actually appear are the RUNTIME ones. A push that outlived the delete meant to
 	// remove it needs no failure at all (§B's source ③), so a node that only looks at
 	// boot carries that data until its next restart.
+	//
+	// It gates the ACTIVITY-DRIVEN full pass, not the rollback the incremental path needs
+	// when the log cannot serve this node (no watermark, truncated, epoch mismatch): that
+	// rollback runs whatever this says. Gating it too would leave a
+	// "only the cheap incremental path" deployment permanently at skipped(chain-disabled)
+	// — every incremental read falls back to a pass that is switched off.
 	ReconcileDeletedVersionsPeriodic bool
 
 	// ReconcileDeletedVersionsIntervalS is how old the last FULL live-chain pass may

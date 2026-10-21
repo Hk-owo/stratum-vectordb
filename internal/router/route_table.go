@@ -59,6 +59,13 @@ type routeSnapshot struct {
 	// An absent or empty entry means the leader named no holder — which is
 	// "nobody I have heard from", never "nobody has it" (the aggregate is soft
 	// state). Servable treats it as "no narrowing", not as "nothing can serve".
+	//
+	// The leader already leaves out nodes silent for longer than its 15 s window
+	// (DataVersionRegistry.Holders), so a crashed storage node stops being a candidate at
+	// the next refresh instead of being probed once per breaker cooldown. That is a
+	// narrowing, not a verdict: the version credential on the forwarded query is what
+	// makes a stale holder refuse, so an empty set here is still "ask anyone", never "no
+	// one has it".
 	servable map[string]map[int]bool
 
 	// expected[kbID] is the version that knowledge base should currently be

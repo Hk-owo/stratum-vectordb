@@ -339,14 +339,15 @@ func TestLocalDataPlane_DeletionSweepHoldsTheChainTriggerUntilTheFloorExpires(t 
 	}
 }
 
-// With the periodic pass switched off, a re-judge is reported rather than performed.
-func TestLocalDataPlane_DeletionSweepReportsWhenTheChainIsDisabled(t *testing.T) {
+// With the periodic pass switched off AND no deletion log wired, the full pass is the
+// only mechanism that exists — so the switch is what decides, and the pass reports it.
+func TestLocalDataPlane_DeletionSweepReportsWhenThereIsNoLogAndTheChainIsOff(t *testing.T) {
 	store := tombstone.NewMemoryStore()
 	ctx := context.Background()
 	if err := store.NoteBatch(ctx, tombstone.SyncState{Epoch: "e2", Seq: 2}, nil); err != nil {
 		t.Fatalf("NoteBatch: %v", err)
 	}
-	dp := newSweepPlane(t, store, &fakeDeletionLog{latest: 9, oldest: 5, epoch: "different"})
+	dp := newSweepPlane(t, store, nil) // no DeletionLogSource at all
 	dp.chainReconcileEnabled = false
 
 	res, err := dp.ReconcileDeletions(ctx, sweepMeta())
@@ -355,6 +356,44 @@ func TestLocalDataPlane_DeletionSweepReportsWhenTheChainIsDisabled(t *testing.T)
 	}
 	if res.Source != "skipped" || res.Fallback != chainDisabled {
 		t.Fatalf("res = %+v, want skipped with the chain-disabled reason", res)
+	}
+}
+
+// A log that cannot serve this node is CORRECTNESS, not cadence: truncated entries or a
+// different epoch mean the incremental path is blind, so the rollback runs even with the
+// periodic pass switched off.
+//
+// The alternative — honouring the switch — made "only the cheap incremental path" a
+// deployment that stops converging the first time the log is truncated, and stays that way
+// until a restart re-aligns the watermark. That is the trap this pins shut.
+func TestLocalDataPlane_DeletionSweepIgnoresTheSwitchWhenTheLogCannotServe(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		log  *fakeDeletionLog
+		want string
+	}{
+		// oldest must reach the watermark for the read NOT to look truncated: this case is
+		// about the epoch alone.
+		{"epoch-mismatch", &fakeDeletionLog{latest: 9, oldest: 1, epoch: "different"}, deletionLogEpochMismatch},
+		{"log-truncated", &fakeDeletionLog{latest: 9, oldest: 5, epoch: "e2"}, "log-truncated"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := tombstone.NewMemoryStore()
+			ctx := context.Background()
+			if err := store.NoteBatch(ctx, tombstone.SyncState{Epoch: "e2", Seq: 2}, nil); err != nil {
+				t.Fatalf("NoteBatch: %v", err)
+			}
+			dp := newSweepPlane(t, store, tc.log)
+			dp.chainReconcileEnabled = false
+
+			res, err := dp.ReconcileDeletions(ctx, sweepMeta())
+			if err != nil {
+				t.Fatalf("ReconcileDeletions: %v", err)
+			}
+			if res.Source != "chain" || res.Fallback != tc.want {
+				t.Fatalf("res = %+v, want the chain with fallback %q — the switch does not gate this", res, tc.want)
+			}
+		})
 	}
 }
 

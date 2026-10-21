@@ -15,6 +15,7 @@ import (
 
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/authmeta"
+	stratumerrors "stratum/internal/errors"
 )
 
 func notLeaderErr() error {
@@ -242,8 +243,27 @@ func TestForwardRead_AllDown(t *testing.T) {
 	_, err := forwardRead(r, context.Background(), readTrace{}, allIndexes(3), nil, nil, func(idx int, ctx context.Context) (string, error) {
 		return "", unavailableErr()
 	})
-	if err == nil || err.Error() != "router: all nodes unavailable" {
-		t.Errorf("err = %v, want 'router: all nodes unavailable'", err)
+	if err == nil || !strings.Contains(err.Error(), "all nodes unavailable") {
+		t.Errorf("err = %v, want '...all nodes unavailable'", err)
+	}
+	// The identity has to survive the station's boundary, or a reason-based client reads
+	// "the storage layer is briefly unreachable" as terminal (codes.Unknown).
+	if !errors.Is(err, stratumerrors.ErrStorageUnavailable) {
+		t.Errorf("err = %v, want it to wrap ErrStorageUnavailable", err)
+	}
+	if got := stratumerrors.Name(err); got != "storage_unavailable" {
+		t.Errorf("wire name = %q, want storage_unavailable", got)
+	}
+}
+
+// The control layer's "nobody answered" is an election, not a storage outage, so it
+// travels as ErrNoLeaderYet — both are Unavailable, but the name is what a caller reads.
+func TestForwardRead_AllDownOnTheControlLayerNamesTheElection(t *testing.T) {
+	r := &Router{controlAddrs: []string{"a"}}
+	_, err := forwardRead(r, context.Background(), readTrace{layer: "control"}, allIndexes(1), nil, nil,
+		func(int, context.Context) (string, error) { return "", unavailableErr() })
+	if !errors.Is(err, stratumerrors.ErrNoLeaderYet) {
+		t.Fatalf("err = %v, want it to wrap ErrNoLeaderYet", err)
 	}
 }
 
