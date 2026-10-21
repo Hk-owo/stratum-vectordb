@@ -36,4 +36,22 @@ import "context"
 type DeleteVersionCoordinator interface {
 	// Execute runs the full cleanup for every Deleting version of kbID.
 	Execute(ctx context.Context, kbID string) error
+
+	// ResumeVersionDelete finishes ONE version's deletion, named by a WAL record,
+	// without requiring the version to still be marked Deleting.
+	//
+	// That difference is the whole reason it exists. Execute discovers its work from
+	// the metadata ("list the versions marked Deleting"), so a crash between
+	// ProposeRemoveVersionMeta and WriteVersionDeleteComplete leaves a record whose
+	// version is no longer there to be discovered: the record is replayed on every
+	// restart and can never be completed. The steps below are the same ones deleteOne
+	// takes, in the same order, with two additions the crash path needs:
+	//
+	//   - the tombstone is recorded FIRST (before any bytes are touched), the same
+	//     order the receive side uses (sync.PushHandler.DeleteVersionData). A node that
+	//     crashed mid-deletion has to refuse a late push for that version, and "the
+	//     metadata is already gone" is exactly when nothing else would stop it.
+	//   - the metadata removal is idempotent by contract (an absent version succeeds),
+	//     so the record completes even when the version was removed before the crash.
+	ResumeVersionDelete(ctx context.Context, kbID string, versionID int64) error
 }

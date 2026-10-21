@@ -543,11 +543,16 @@ const (
 	// requiring callers to discover it through a separate accessor.
 	PendingRecordTypeVersionWrite
 	// PendingRecordTypeVersionDelete indicates a DeleteVersion flow that
-	// wrote its delete mark but never reached the delete-complete record:
-	// the versions in the state machine are marked Deleting but the
-	// background cleanup may not have finished. Recovery re-runs the
-	// DeleteVersion cleanup for the affected (kbID, versionID), which is
-	// idempotent end-to-end.
+	// wrote its delete mark but never reached the delete-complete record: the
+	// background cleanup may not have finished, and the version's metadata may
+	// already be gone (the crash can land after the removal, before the
+	// completion record).
+	//
+	// Recovery therefore finishes that ONE version by name
+	// (DeleteVersionCoordinator.ResumeVersionDelete: tombstone first, then the
+	// reclaim, then the idempotent metadata removal) instead of discovering
+	// work from the Deleting flag — a version removed before the crash carries
+	// no flag left to discover.
 	PendingRecordTypeVersionDelete
 )
 

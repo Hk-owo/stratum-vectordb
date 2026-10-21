@@ -2992,6 +2992,19 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 		unknown := make(map[int64]bool)
 		var onDisk []int64
 		for _, v := range versions {
+			// A version under deletion is not a candidate for anything here: the deletion
+			// flow owns its bytes right now (usually having dropped the artifact already),
+			// so counting it as durable would report READY for a version that is about to
+			// stop existing, and scheduling a build below would race the reclaim for the
+			// same files. The metadata is what names the work, so leaving it out costs
+			// nothing: the deletion removes the metadata.
+			//
+			// Skipping it is only safe because the version is unqueryable while Deleting
+			// (visibility is the control layer's judgement), so no reader is waiting on an
+			// artifact this reconcile declined to build.
+			if v.Deleting {
+				continue
+			}
 			// FAILED is retryable — RebuildIndex may trigger another attempt — but
 			// FAILED_PERMANENT is the control layer's terminal verdict (§10.1):
 			// nothing re-triggers it, and its data may already have been reclaimed
@@ -3024,6 +3037,13 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 		retentionCutoff := retentionCutoffOf(onDisk, retentionCount)
 
 		for _, v := range versions {
+			// Same skip as the presence scan above: a version under deletion is not a
+			// rebuild candidate, and its metadata (which the deletion removes) is what names
+			// the work. Without this, a restart during a deletion gives the version a fresh
+			// build that competes with the reclaim for the same artifact.
+			if v.Deleting {
+				continue
+			}
 			if v.IndexStatus.IsFailed() ||
 				v.DataStatus == types.DataStatusFailedPermanent {
 				continue

@@ -234,8 +234,11 @@ func TestRunCrashRecovery(t *testing.T) {
 	if got := dc.Calls(); len(got) != 1 || got[0] != "kb-del" {
 		t.Errorf("DeleteCoordinator calls = %v, want [kb-del]", got)
 	}
+	if got := dvc.ResumeCalls(); len(got) != 1 || got[0] != (coordinator.VersionDeleteResume{KBID: "kb-vdel", VersionID: 7}) {
+		t.Errorf("DeleteVersionCoordinator resume calls = %v, want [{kb-vdel 7}]", got)
+	}
 	if got := dvc.Calls(); len(got) != 1 || got[0] != "kb-vdel" {
-		t.Errorf("DeleteVersionCoordinator calls = %v, want [kb-vdel]", got)
+		t.Errorf("DeleteVersionCoordinator calls = %v, want [kb-vdel] — the sibling sweep still runs", got)
 	}
 	replays := wc.ReplayCalls()
 	if len(replays) != 1 {
@@ -272,6 +275,7 @@ func TestRunCrashRecovery_ReplayFailuresSkipped(t *testing.T) {
 	// (bumping the replay counter) and keep going, never aborting.
 	dc.SetExecuteResult(errors.New("boom"))
 	dvc.SetExecuteResult(errors.New("boom"))
+	dvc.SetResumeResult(errors.New("boom"))
 	wc.SetReplayResult(errors.New("embed down"))
 
 	records := []types.PendingRecord{
@@ -290,8 +294,12 @@ func TestRunCrashRecovery_ReplayFailuresSkipped(t *testing.T) {
 	if got := dc.Calls(); len(got) != crashReplayMaxAttempts {
 		t.Errorf("DeleteCoordinator calls = %v, want %d retries of kb-del", got, crashReplayMaxAttempts)
 	}
-	if got := dvc.Calls(); len(got) != crashReplayMaxAttempts {
-		t.Errorf("DeleteVersionCoordinator calls = %v, want %d retries of kb-vdel", got, crashReplayMaxAttempts)
+	if got := dvc.ResumeCalls(); len(got) != crashReplayMaxAttempts {
+		t.Errorf("DeleteVersionCoordinator resume calls = %v, want %d retries of {kb-vdel, 7}", got, crashReplayMaxAttempts)
+	}
+	if got := dvc.Calls(); len(got) != 0 {
+		t.Errorf("DeleteVersionCoordinator Execute calls = %v, want none: the record's own resume never finished, "+
+			"so the sibling sweep must not run", got)
 	}
 	if got := wc.ReplayCalls(); len(got) != crashReplayMaxAttempts {
 		t.Errorf("ReplayVersionStorageWrites calls = %v, want %d retries of kb-w", got, crashReplayMaxAttempts)

@@ -231,7 +231,20 @@ type MockDeleteVersionCoordinator struct {
 	nextErr     error
 	executeFunc func(ctx context.Context, kbID string) error
 
-	calls []string // kbIDs passed to Execute, in call order
+	// resumeErr / resumeFunc are kept separate from the Execute pair: a test that wants
+	// "everything fails" has to say so for both, and one that exercises the crash path
+	// should not have its sibling scan (Execute) silently configured by the same knob.
+	resumeErr  error
+	resumeFunc func(ctx context.Context, kbID string, versionID int64) error
+
+	calls       []string // kbIDs passed to Execute, in call order
+	resumeCalls []VersionDeleteResume
+}
+
+// VersionDeleteResume records one ResumeVersionDelete call.
+type VersionDeleteResume struct {
+	KBID      string
+	VersionID int64
 }
 
 // NewMockDeleteVersionCoordinator constructs a MockDeleteVersionCoordinator
@@ -253,6 +266,20 @@ func (c *MockDeleteVersionCoordinator) Execute(ctx context.Context, kbID string)
 	return err
 }
 
+// ResumeVersionDelete records the call and returns the configured result.
+func (c *MockDeleteVersionCoordinator) ResumeVersionDelete(ctx context.Context, kbID string, versionID int64) error {
+	c.mu.Lock()
+	c.resumeCalls = append(c.resumeCalls, VersionDeleteResume{KBID: kbID, VersionID: versionID})
+	fn := c.resumeFunc
+	err := c.resumeErr
+	c.mu.Unlock()
+
+	if fn != nil {
+		return fn(ctx, kbID, versionID)
+	}
+	return err
+}
+
 // SetExecuteResult configures the error returned by subsequent Execute
 // calls, overriding any SetExecuteFunc configuration.
 func (c *MockDeleteVersionCoordinator) SetExecuteResult(err error) {
@@ -269,11 +296,34 @@ func (c *MockDeleteVersionCoordinator) SetExecuteFunc(fn func(ctx context.Contex
 	c.executeFunc = fn
 }
 
+// SetResumeResult configures the error returned by subsequent ResumeVersionDelete
+// calls, overriding any SetResumeFunc configuration.
+func (c *MockDeleteVersionCoordinator) SetResumeResult(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.resumeErr = err
+	c.resumeFunc = nil
+}
+
+// SetResumeFunc configures a full custom ResumeVersionDelete implementation.
+func (c *MockDeleteVersionCoordinator) SetResumeFunc(fn func(ctx context.Context, kbID string, versionID int64) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.resumeFunc = fn
+}
+
 // Calls returns every kbID passed to Execute so far, in call order.
 func (c *MockDeleteVersionCoordinator) Calls() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.calls...)
+}
+
+// ResumeCalls returns every ResumeVersionDelete call so far, in call order.
+func (c *MockDeleteVersionCoordinator) ResumeCalls() []VersionDeleteResume {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]VersionDeleteResume(nil), c.resumeCalls...)
 }
 
 var _ DeleteVersionCoordinator = (*MockDeleteVersionCoordinator)(nil)

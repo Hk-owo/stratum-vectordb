@@ -561,6 +561,10 @@ func main() {
 		VersionDocList:      vd,
 		VersionBloom:        vBloomStore,
 		Dropper:             versionDropper,
+		// The crash-recovery half of the deletion: a resumed version delete records the
+		// tombstone BEFORE touching bytes, so a late push for that version is refused on
+		// a node that crashed mid-deletion. Optional like the table itself.
+		Tombstones: tombstoneRecorder(versionTombstones),
 	})
 
 	// --- Index status reconcile (derive state from disk facts) ---
@@ -1743,6 +1747,19 @@ func deletionLogSource(rn raft.RaftNode) plane.DeletionLogSource {
 	return nil
 }
 
+// tombstoneRecorder returns the delete-version coordinator's tombstone recorder, or nil
+// when this node keeps no table.
+//
+// The nil has to be an untyped interface nil: handing back the nil *PebbleStore would
+// give the coordinator a NON-nil interface holding a nil pointer, and the first call
+// would dereference it.
+func tombstoneRecorder(t *tombstone.PebbleStore) coordinator.VersionTombstoneRecorder {
+	if t == nil {
+		return nil
+	}
+	return t
+}
+
 // tombstoneOption returns the receive side's tombstone option, or nil when this
 // node keeps no table. NewPushHandler skips nil options, which keeps the call site
 // free of a branch wrapped around a single argument.
@@ -1827,11 +1844,28 @@ func runCrashRecovery(
 		case types.PendingRecordTypeVersionDelete:
 			logger.Info("crash recovery: resuming interrupted version deletion",
 				zap.String("kb_id", rec.KBID), zap.Int64("version_id", rec.VersionID))
-			if err := replayCoordinatorCall(ctx, func() error { return dvc.Execute(ctx, rec.KBID) }); err != nil {
+			// Two calls, on purpose, and the order matters:
+			//
+			//   - ResumeVersionDelete finishes THIS record. It does not discover its work
+			//     from the metadata, which is what makes it the only path that can pay a
+			//     debt whose version was already removed before the crash (Execute lists
+			//     Deleting versions, so for that case it finds nothing and the record is
+			//     replayed on every restart, forever). It also writes the tombstone first.
+			//   - Execute still covers the SIBLINGS: versions marked Deleting whose own
+			//     record was never written (the crash landed between the mark and
+			//     deleteOne's WriteVersionDeleteMark). Those are not this record's debt,
+			//     so a failure there is reported without counting this record as unpaid.
+			if err := replayCoordinatorCall(ctx, func() error {
+				return dvc.ResumeVersionDelete(ctx, rec.KBID, rec.VersionID)
+			}); err != nil {
 				logger.Warn("crash recovery: skipping version-deletion resume after retries exhausted",
 					zap.String("kb_id", rec.KBID), zap.Int64("version_id", rec.VersionID), zap.Error(err))
 				w.IncrementReplayCounter(rec)
 				continue
+			}
+			if err := replayCoordinatorCall(ctx, func() error { return dvc.Execute(ctx, rec.KBID) }); err != nil {
+				logger.Warn("crash recovery: the sibling sweep after a version-deletion resume did not finish",
+					zap.String("kb_id", rec.KBID), zap.Error(err))
 			}
 
 		case types.PendingRecordTypeVersionWrite:

@@ -2,7 +2,9 @@ package coordinator
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"stratum/internal/bloom"
 	"stratum/internal/docstore"
@@ -33,6 +35,24 @@ type DeleteVersionCoordinatorConfig struct {
 	// happens wherever the bytes are (Stratum_设计文档v13.md §7.0).
 	// nil falls back to a LocalVersionDropper built from the fields above.
 	Dropper VersionStorageDropper
+
+	// Tombstones is this node's record of deletions it has been TOLD about
+	// (internal/tombstone). Optional; without it a resumed deletion still reclaims the
+	// bytes but leaves no local note that the version is gone.
+	//
+	// Only ResumeVersionDelete uses it, and the asymmetry is deliberate: the live path
+	// learns about a deletion from the control layer (the notification carries the
+	// tombstone write on the receive side), while a crash-recovery replay is the one path
+	// where this node concludes the version is gone with no message to answer.
+	Tombstones VersionTombstoneRecorder
+}
+
+// VersionTombstoneRecorder is the slice of internal/tombstone this package needs: two
+// calls, declared here so the store's full contract (watermarks, paging, pruning) stays
+// the plane's business.
+type VersionTombstoneRecorder interface {
+	Note(ctx context.Context, kbID string, versionID int64, at time.Time) error
+	MarkDone(ctx context.Context, kbID string, versionID int64, at time.Time) error
 }
 
 // DeleteVersionCoordinatorImpl is the real DeleteVersionCoordinator
@@ -87,16 +107,7 @@ func (c *DeleteVersionCoordinatorImpl) deleteOne(ctx context.Context, kbID strin
 	// nodes holding its bytes are the ones that reclaim them
 	// (Stratum_设计文档v13.md §7.0、§11 阶段 ④). The visibility anchor is
 	// applied by that side, since it is the one holding the records.
-	dropper := c.cfg.Dropper
-	if dropper == nil {
-		dropper = LocalVersionDropper{
-			IndexManager:   c.cfg.IndexManager,
-			DocStore:       c.cfg.DocStore,
-			VersionDocList: c.cfg.VersionDocList,
-			VersionBloom:   c.cfg.VersionBloom,
-			Metadata:       c.cfg.RaftNode,
-		}
-	}
+	dropper := c.dropperFor()
 	// A failed reclaim no longer BLOCKS the deletion, because removing the metadata is
 	// now what tells every storage node the version is gone (the apply appends one
 	// entry to the bounded deletion log, and each node's tombstone retry finishes the
@@ -132,6 +143,90 @@ func (c *DeleteVersionCoordinatorImpl) deleteOne(ctx context.Context, kbID strin
 			kbID, versionID, dropErr)
 	}
 	return nil
+}
+
+// dropperFor resolves where a reclaim has to happen. The configured dropper wins; the
+// local one is built from the fields above when nothing was wired, so the all-in-one
+// deployment is unchanged (see Dropper's comment).
+func (c *DeleteVersionCoordinatorImpl) dropperFor() VersionStorageDropper {
+	if c.cfg.Dropper != nil {
+		return c.cfg.Dropper
+	}
+	return LocalVersionDropper{
+		IndexManager:   c.cfg.IndexManager,
+		DocStore:       c.cfg.DocStore,
+		VersionDocList: c.cfg.VersionDocList,
+		VersionBloom:   c.cfg.VersionBloom,
+		Metadata:       c.cfg.RaftNode,
+	}
+}
+
+// ResumeVersionDelete implements DeleteVersionCoordinator: the crash-recovery path for
+// ONE version, named by a WAL record. See the interface comment for why it exists and
+// how it differs from Execute.
+//
+// The steps are deleteOne's, with the tombstone FIRST — nothing else would refuse a late
+// push once the metadata is gone — and with the same failure policy: a reclaim that
+// reaches nobody does not keep the record owed, because removing the metadata is what
+// tells every storage node the version is gone.
+func (c *DeleteVersionCoordinatorImpl) ResumeVersionDelete(ctx context.Context, kbID string, versionID int64) error {
+	if versionID <= 0 {
+		return fmt.Errorf("delete-version: resume %s: invalid version id %d", kbID, versionID)
+	}
+
+	// Step 1: WAL delete mark (idempotent) — what keeps the record recoverable if this
+	// pass itself dies before the completion below.
+	if err := c.cfg.WAL.WriteVersionDeleteMark(ctx, kbID, versionID); err != nil {
+		return fmt.Errorf("delete-version: WAL.WriteVersionDeleteMark(%s,%d): %w", kbID, versionID, err)
+	}
+
+	// Step 2: the tombstone, before any byte is touched. A failure is reported but does
+	// not stop the deletion: refusing to reclaim because the local table cannot be
+	// written would leave bytes for a version nobody can name afterwards, which is the
+	// outcome this table exists to prevent.
+	var tombstoneErr error
+	if c.cfg.Tombstones != nil {
+		if err := c.cfg.Tombstones.Note(ctx, kbID, versionID, time.Now()); err != nil {
+			tombstoneErr = fmt.Errorf("delete-version: record the tombstone for %s v%d: %w", kbID, versionID, err)
+		}
+	}
+
+	// Steps 3-6: reclaim wherever the bytes are. Not fatal — see deleteOne.
+	dropper := c.dropperFor()
+	dropErr := c.retry(ctx, func() error {
+		return dropper.DropVersion(ctx, kbID, versionID)
+	})
+
+	// Step 7: remove the metadata. Idempotent by contract (an absent version succeeds),
+	// which is exactly what lets this record complete when the crash happened after this
+	// step — the case Execute cannot reach.
+	if err := c.retry(ctx, func() error {
+		return c.cfg.RaftNode.ProposeRemoveVersionMeta(ctx, kbID, versionID)
+	}); err != nil {
+		return fmt.Errorf("delete-version: ProposeRemoveVersionMeta(%s,%d): %w", kbID, versionID, err)
+	}
+
+	// Step 8: WAL delete complete (idempotent). This is what stops Recover from handing
+	// the record back on the next restart.
+	if err := c.cfg.WAL.WriteVersionDeleteComplete(ctx, kbID, versionID); err != nil {
+		return fmt.Errorf("delete-version: WAL.WriteVersionDeleteComplete(%s,%d): %w", kbID, versionID, err)
+	}
+
+	// A succeeded reclaim leaves nothing owed, so the entry stops being PENDING and the
+	// 30 s retry loop never sees it. MarkDone on an entry that was never noted is a
+	// no-op, so a failed Note above does not make this wrong.
+	if dropErr == nil && c.cfg.Tombstones != nil {
+		if err := c.cfg.Tombstones.MarkDone(ctx, kbID, versionID, time.Now()); err != nil {
+			tombstoneErr = fmt.Errorf("delete-version: mark the tombstone done for %s v%d: %w", kbID, versionID, err)
+		}
+	}
+
+	var cause error
+	if dropErr != nil {
+		cause = fmt.Errorf("delete-version: %s v%d is deleted, but its data was not reclaimed everywhere (%w); each node finishes it from the deletion log",
+			kbID, versionID, dropErr)
+	}
+	return errors.Join(cause, tombstoneErr)
 }
 
 // retry executes fn with exponential backoff up to MaxRetries times.

@@ -187,3 +187,45 @@ func TestRetentionCutoffOf(t *testing.T) {
 		}
 	}
 }
+
+// A version under deletion is not reconciled at all: not reported durable, not given a
+// build. The deletion flow owns its bytes, and its metadata is what names the work, so
+// there is nothing here to repair — while building it would compete with the reclaim for
+// the same artifact and could re-report READY for a version about to disappear.
+//
+// It is deliberately NOT a "skip because failed" case: the version is perfectly healthy,
+// which is exactly why it would otherwise qualify (v1 is the active version, v2 is
+// PENDING — the two kinds reconcile gives a head start to).
+func TestReconcileIndexes_SkipsVersionsUnderDeletion(t *testing.T) {
+	meta := &stubMeta{
+		kbs: []types.KnowledgeBaseMeta{{KBID: "kb-1", ActiveVersionID: 1}},
+		versions: map[string][]types.VersionMeta{
+			"kb-1": {
+				// ACTIVE and READY: every other rule in this file would give it a head start.
+				{VersionID: 1, KBID: "kb-1", IndexStatus: types.IndexStatusReady, Deleting: true},
+				// PENDING and missing: the writer-waiting case — but the version is going away.
+				{VersionID: 2, KBID: "kb-1", IndexStatus: types.IndexStatusPending, Deleting: true},
+				// The control: PENDING, alive, so reconcile must still schedule it.
+				{VersionID: 3, KBID: "kb-1", IndexStatus: types.IndexStatusPending},
+			},
+		},
+	}
+	// v1's artifact is on disk; a Deleting version must not be reported durable from it.
+	store := &stubIndexStore{exists: map[int64]bool{1: true}}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{IndexManager: store})
+
+	durable, err := dp.ReconcileIndexes(context.Background(), meta, 0)
+	if err != nil {
+		t.Fatalf("ReconcileIndexes: %v", err)
+	}
+
+	if len(store.triggered) != 1 || store.triggered[0] != 3 {
+		t.Fatalf("triggered = %v, want only [3]: a version under deletion gets no head start", store.triggered)
+	}
+	for _, ref := range durable {
+		if ref.VersionID == 1 || ref.VersionID == 2 {
+			t.Fatalf("durable = %+v, want no version under deletion — reporting READY for one "+
+				"contradicts the deletion that is removing it", durable)
+		}
+	}
+}
