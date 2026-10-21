@@ -138,4 +138,10 @@ func TestDataVersionRegistry_HoldersSkipNodesThatWentSilent(t *testing.T) {
 	if got := reg.holdersAt("kb-1", 5, time.Now(), time.Hour); len(got) != 2 {
 		t.Fatalf("holdersAt(window=1h) = %v, want both nodes", got)
 	}
+
+	// A non-positive window means the default, not "no filter": a caller cannot switch the
+	// rule off by passing zero.
+	if got := reg.holdersAt("kb-1", 5, time.Now(), 0); len(got) != 1 || got[0].NodeID != 1 {
+		t.Fatalf("holdersAt(window=0) = %v, want the default window applied (node 2 still silent)", got)
+	}
 }

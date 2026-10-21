@@ -696,3 +696,22 @@ func TestLocalDataPlane_StartDeletedVersionRetryDefaultsAndStops(t *testing.T) {
 	dp.dropper = nil
 	dp.StartDeletedVersionRetry(context.Background(), time.Millisecond, time.Millisecond)
 }
+
+// With a deletion log wired and the periodic pass switched ON, "no log to read" cannot
+// happen — but the fallback still has to be reachable when the caller wired a source that
+// reports nothing. This is the fourth reason the chain runs, and the one the switch does
+// gate is "there is no log at all".
+func TestLocalDataPlane_DeletionSweepWithoutALogStillJudgesWhenTheChainIsOn(t *testing.T) {
+	store := tombstone.NewMemoryStore()
+	ctx := context.Background()
+	dp := newSweepPlane(t, store, nil) // no DeletionLogSource
+	dp.chainReconcileEnabled = true
+
+	res, err := dp.ReconcileDeletions(ctx, sweepMeta())
+	if err != nil {
+		t.Fatalf("ReconcileDeletions: %v", err)
+	}
+	if res.Source != "chain" || res.Fallback != "no-deletion-log" {
+		t.Fatalf("res = %+v, want the chain with fallback no-deletion-log", res)
+	}
+}

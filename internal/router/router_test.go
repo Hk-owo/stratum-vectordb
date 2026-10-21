@@ -587,3 +587,36 @@ func TestForward_StampsTheInternalMarkWithoutTheCredential(t *testing.T) {
 		t.Error("the caller's credential must not be forwarded downstream")
 	}
 }
+
+// No candidates at all is still "nobody could take this call", and it has to say so with an
+// identity the caller can act on rather than a bare string.
+func TestForwardRead_NoCandidatesIsUnavailableAndNamed(t *testing.T) {
+	r := &Router{}
+	_, err := forwardRead(r, context.Background(), readTrace{layer: "storage"}, nil, nil, nil,
+		func(int, context.Context) (string, error) { return "never", nil })
+	if err == nil || !errors.Is(err, stratumerrors.ErrStorageUnavailable) {
+		t.Fatalf("err = %v, want it to wrap ErrStorageUnavailable", err)
+	}
+	if got := stratumerrors.Name(err); got != "storage_unavailable" {
+		t.Fatalf("wire name = %q, want storage_unavailable", got)
+	}
+}
+
+// tryAll's "every control node is circuit-broken" exit carries the same identity: the
+// cluster is electing, ask again — not a terminal failure.
+func TestTryAll_AllControlNodesBrokenIsNamed(t *testing.T) {
+	cfg := defaultBreakerConfig
+	r := &Router{
+		controlAddrs:    []string{"c1"},
+		controlBreakers: []*breaker{newBreaker(cfg)},
+	}
+	now := time.Now()
+	for i := 0; i <= cfg.minSamples; i++ {
+		r.controlBreakers[0].record(now, false)
+	}
+
+	_, err := tryAll(r, context.Background(), func(int, context.Context) (int, error) { return 0, nil })
+	if err == nil || !errors.Is(err, stratumerrors.ErrNoLeaderYet) {
+		t.Fatalf("err = %v, want it to wrap ErrNoLeaderYet", err)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"stratum/internal/index"
 	"stratum/internal/plane"
 	"stratum/internal/raft"
+	"stratum/internal/tombstone"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -645,4 +646,53 @@ func (m *reconcileIndexMgr) LoadedCount() int             { return 0 }
 // this one; for this implementation it is the same build as TriggerBuild.
 func (m *reconcileIndexMgr) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
 	return m.TriggerBuild(ctx, kbID, versionID)
+}
+
+// The recorder has to hand the coordinator an INTERFACE nil when this node keeps no table.
+// A nil *PebbleStore wrapped in the interface would be non-nil, and the first call would
+// dereference it.
+func TestTombstoneRecorderKeepsNilUnwrapped(t *testing.T) {
+	if got := tombstoneRecorder(nil); got != nil {
+		t.Fatalf("tombstoneRecorder(nil) = %v, want a nil interface", got)
+	}
+
+	store, err := tombstone.NewPebbleStore(filepath.Join(t.TempDir(), "tombstone"))
+	if err != nil {
+		t.Fatalf("NewPebbleStore: %v", err)
+	}
+	defer store.Close()
+	if got := tombstoneRecorder(store); got == nil {
+		t.Fatal("tombstoneRecorder(store) = nil, want the store")
+	}
+}
+
+// A sibling-sweep failure is not this record's debt: the targeted resume already wrote the
+// completion record, so the WAL must not report the version as still pending.
+func TestRunCrashRecovery_SiblingSweepFailureKeepsTheRecordPaid(t *testing.T) {
+	ctx := context.Background()
+	logger := zap.NewNop()
+
+	wc := coordinator.NewMockWriteCoordinator()
+	dc := coordinator.NewMockDeleteCoordinator()
+	dvc := coordinator.NewMockDeleteVersionCoordinator()
+	w := wal.NewMockWAL()
+
+	dvc.SetExecuteResult(errors.New("sibling sweep is stuck"))
+
+	records := []types.PendingRecord{
+		{Type: types.PendingRecordTypeVersionDelete, KBID: "kb-vdel", VersionID: 7},
+	}
+
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
+
+	if got := dvc.ResumeCalls(); len(got) != 1 || got[0].VersionID != 7 {
+		t.Fatalf("resume calls = %+v, want one for {kb-vdel, 7}", got)
+	}
+	// The scan still runs (and retries), but it is not what the record was waiting for.
+	if got := dvc.Calls(); len(got) != crashReplayMaxAttempts {
+		t.Errorf("Execute calls = %v, want %d retries of the sibling sweep", got, crashReplayMaxAttempts)
+	}
+	if got := w.GetReplayCounters(); len(got) != 0 {
+		t.Errorf("replay counters = %+v, want none: the record itself was paid", got)
+	}
 }

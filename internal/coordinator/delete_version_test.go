@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -589,5 +590,45 @@ func TestDeleteVersionCoordinator_CompletesWhenTheReclaimFails(t *testing.T) {
 	// what tells every other node.
 	if _, gerr := rn.GetVersion(ctx, kbID, versionID); !errors.Is(gerr, stratumerrors.ErrVersionNotFound) {
 		t.Fatalf("GetVersion after the deletion = %v, want ErrVersionNotFound", gerr)
+	}
+}
+
+// The mock's resume surface is what the crash-recovery tests drive, so its two
+// configuration paths and its call log are pinned here rather than assumed.
+func TestMockDeleteVersionCoordinator_ResumeIsConfigurableAndRecorded(t *testing.T) {
+	ctx := context.Background()
+	m := NewMockDeleteVersionCoordinator()
+
+	if err := m.ResumeVersionDelete(ctx, "kb-1", 3); err != nil {
+		t.Fatalf("default ResumeVersionDelete = %v, want nil", err)
+	}
+
+	boom := errors.New("boom")
+	m.SetResumeResult(boom)
+	if err := m.ResumeVersionDelete(ctx, "kb-1", 4); !errors.Is(err, boom) {
+		t.Fatalf("ResumeVersionDelete = %v, want the configured result", err)
+	}
+
+	// A function override wins over the configured result, and clearing the result is what
+	// makes the two independent.
+	m.SetResumeFunc(func(_ context.Context, kbID string, versionID int64) error {
+		if kbID != "kb-1" || versionID != 5 {
+			t.Errorf("resume func got (%s, %d), want (kb-1, 5)", kbID, versionID)
+		}
+		return nil
+	})
+	if err := m.ResumeVersionDelete(ctx, "kb-1", 5); err != nil {
+		t.Fatalf("ResumeVersionDelete = %v, want the func's nil", err)
+	}
+
+	want := []VersionDeleteResume{{KBID: "kb-1", VersionID: 3}, {KBID: "kb-1", VersionID: 4}, {KBID: "kb-1", VersionID: 5}}
+	if got := m.ResumeCalls(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ResumeCalls = %+v, want %+v", got, want)
+	}
+
+	// Setting a result again must drop the function, or the override would be sticky.
+	m.SetResumeResult(nil)
+	if err := m.ResumeVersionDelete(ctx, "kb-1", 6); err != nil {
+		t.Fatalf("ResumeVersionDelete = %v, want nil after SetResumeResult(nil)", err)
 	}
 }

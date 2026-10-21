@@ -196,3 +196,136 @@ func TestDeleteVersionCoordinator_ResumeRefusesAVersionlessRecord(t *testing.T) 
 		t.Fatalf("events = %v, want nothing written for an invalid id", events)
 	}
 }
+
+// failingWAL hides one write behind an error, so the resume's step failures can be
+// exercised without a broken store. Embedding the interface forwards everything else.
+type failingWAL struct {
+	wal.WAL
+	markErr     error
+	completeErr error
+}
+
+func (w failingWAL) WriteVersionDeleteMark(ctx context.Context, kbID string, versionID int64) error {
+	if w.markErr != nil {
+		return w.markErr
+	}
+	return w.WAL.WriteVersionDeleteMark(ctx, kbID, versionID)
+}
+
+func (w failingWAL) WriteVersionDeleteComplete(ctx context.Context, kbID string, versionID int64) error {
+	if w.completeErr != nil {
+		return w.completeErr
+	}
+	return w.WAL.WriteVersionDeleteComplete(ctx, kbID, versionID)
+}
+
+// failingRemoveMeta refuses the metadata removal, standing in for a control tier that
+// cannot be reached at that step.
+type failingRemoveMeta struct {
+	raft.RaftNode
+	err error
+}
+
+func (n failingRemoveMeta) ProposeRemoveVersionMeta(context.Context, string, int64) error {
+	return n.err
+}
+
+// failingMarkDone refuses the bookkeeping that follows a successful reclaim.
+type failingMarkDone struct {
+	VersionTombstoneRecorder
+	err error
+}
+
+func (t failingMarkDone) MarkDone(context.Context, string, int64, time.Time) error { return t.err }
+
+// A resume that cannot even write its own mark must not touch a byte: the record stays
+// exactly where it was, which is the state the next restart retries from.
+func TestDeleteVersionCoordinator_ResumeStopsBeforeTheReclaimWhenTheMarkFails(t *testing.T) {
+	ctx := context.Background()
+	base := wal.NewMockWAL()
+	rn := raft.NewMockRaftNode(base)
+	var events []string
+	markErr := errors.New("wal is read-only")
+
+	cfg := resumeConfig(base, rn, &events, nil, tombstone.NewMemoryStore())
+	cfg.WAL = failingWAL{WAL: base, markErr: markErr}
+	coord := NewDeleteVersionCoordinatorImpl(cfg)
+
+	if err := coord.ResumeVersionDelete(ctx, "kb-1", 3); !errors.Is(err, markErr) {
+		t.Fatalf("ResumeVersionDelete = %v, want the mark failure", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events = %v, want nothing written — not even the tombstone", events)
+	}
+}
+
+// The metadata removal is what makes the record completable, so a failure there must leave
+// the record in the WAL for the next restart instead of writing a completion it did not earn.
+func TestDeleteVersionCoordinator_ResumeKeepsTheRecordWhenTheMetadataRemovalFails(t *testing.T) {
+	ctx := context.Background()
+	w := wal.NewMockWAL()
+	var events []string
+	removeErr := errors.New("no leader")
+
+	cfg := resumeConfig(w, raft.NewMockRaftNode(w), &events, nil, tombstone.NewMemoryStore())
+	cfg.RaftNode = failingRemoveMeta{RaftNode: cfg.RaftNode, err: removeErr}
+	coord := NewDeleteVersionCoordinatorImpl(cfg)
+
+	if err := coord.ResumeVersionDelete(ctx, "kb-1", 8); !errors.Is(err, removeErr) {
+		t.Fatalf("ResumeVersionDelete = %v, want the metadata-removal failure", err)
+	}
+	records, rerr := w.Recover(ctx)
+	if rerr != nil {
+		t.Fatalf("Recover: %v", rerr)
+	}
+	var found bool
+	for _, rec := range records {
+		if rec.Type == types.PendingRecordTypeVersionDelete && rec.VersionID == 8 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the record must stay pending: without the completion record the next restart has to retry it")
+	}
+}
+
+// A completion record that cannot be written is reported; the bytes are gone either way.
+func TestDeleteVersionCoordinator_ResumeReportsAFailedCompletionRecord(t *testing.T) {
+	ctx := context.Background()
+	base := wal.NewMockWAL()
+	var events []string
+	completeErr := errors.New("disk full")
+
+	cfg := resumeConfig(base, raft.NewMockRaftNode(base), &events, nil, tombstone.NewMemoryStore())
+	cfg.WAL = failingWAL{WAL: base, completeErr: completeErr}
+	coord := NewDeleteVersionCoordinatorImpl(cfg)
+
+	if err := coord.ResumeVersionDelete(ctx, "kb-1", 5); !errors.Is(err, completeErr) {
+		t.Fatalf("ResumeVersionDelete = %v, want the completion failure", err)
+	}
+}
+
+// MarkDone is bookkeeping: failing it is reported, but the deletion itself is done.
+func TestDeleteVersionCoordinator_ResumeReportsAFailedMarkDone(t *testing.T) {
+	ctx := context.Background()
+	w := wal.NewMockWAL()
+	var events []string
+	doneErr := errors.New("tombstone store is read-only")
+
+	cfg := resumeConfig(w, raft.NewMockRaftNode(w), &events, nil, tombstone.NewMemoryStore())
+	cfg.Tombstones = failingMarkDone{VersionTombstoneRecorder: cfg.Tombstones, err: doneErr}
+	coord := NewDeleteVersionCoordinatorImpl(cfg)
+
+	if err := coord.ResumeVersionDelete(ctx, "kb-1", 6); !errors.Is(err, doneErr) {
+		t.Fatalf("ResumeVersionDelete = %v, want the mark-done failure reported", err)
+	}
+	records, rerr := w.Recover(ctx)
+	if rerr != nil {
+		t.Fatalf("Recover: %v", rerr)
+	}
+	for _, rec := range records {
+		if rec.Type == types.PendingRecordTypeVersionDelete {
+			t.Fatalf("Recover still reports %+v: the deletion is complete, only the bookkeeping failed", rec)
+		}
+	}
+}
