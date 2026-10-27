@@ -191,7 +191,11 @@ bloom_filter:
 
 gc:
   version_retention_count: 50
-  sweep_interval_s: 300
+  # 孤儿 chunk 回收的主触发是"删除版本"（DeleteVersion 流程的清理里就地判定），
+  # 这里的周期 sweep 只是兜底：捡那些没有任何删除事件能再命名的残留（例如写路径
+  # 在向量写与映射写之间崩溃留下的孤儿映射）。所以默认给到 1 小时——每轮它是
+  # 每 KB 一次整链读 + 一次全量 chunk 映射扫描。
+  sweep_interval_s: 3600
 
 # 主动落后追赶（docs/active-lag-detection-design.md）。节点每 5 秒向控制 leader 上报
 # 自己的游标，leader 在响应里捎带每 KB 的「链尾」（已提交的最新版本）；本节点若发现

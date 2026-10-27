@@ -66,6 +66,14 @@ type WriteCoordinatorConfig struct {
 	VersionDocList versiondoc.VersionDocList
 	IndexManager   index.IndexManager
 
+	// ChunkReclaimer reclaims the chunk vectors a deleted version was the last
+	// live referent of (the event-driven half of the orphan-chunk GC). Optional:
+	// DropVersionStorage runs it BEFORE dropping the version's document list, which
+	// is what names the candidate chunks, and reports its failure like any other
+	// layer's — the version's tombstone stays PENDING on the receiving node, so its
+	// retry loop runs this again.
+	ChunkReclaimer VersionChunkReclaimer
+
 	// DataPlane runs the storage layer's write transaction (BEGIN → storage
 	// writes → COMMIT) and reports its outcome back up
 	// (control-data-separation-design.md §5.1; the split write path of
@@ -608,6 +616,17 @@ func (c *WriteCoordinatorImpl) ReplayVersionStorageWrites(ctx context.Context, k
 // Idempotent: both deletes are prefix scans, so a version that never arrived
 // here is a no-op rather than an error.
 func (c *WriteCoordinatorImpl) DropVersionStorage(ctx context.Context, kbID string, versionID int64) error {
+	// Chunk vectors first, while the version's document set still names them. This
+	// is where a chunk can become an orphan at all (the version that referenced it
+	// is going away), so it belongs here rather than only in the periodic sweep;
+	// the order is also what makes a FAILURE retryable, since the retry (the
+	// tombstone's PENDING entry, or the delete flow's own backoff) needs the
+	// document list to find the candidates again.
+	if c.cfg.ChunkReclaimer != nil {
+		if err := c.cfg.ChunkReclaimer.ReclaimVersionChunks(ctx, kbID, versionID); err != nil {
+			return fmt.Errorf("coordinator: DropVersionStorage: chunk reclaim %s v%d: %w", kbID, versionID, err)
+		}
+	}
 	// Each store is optional because this runs on nodes that hold none of the
 	// data. A control-role node has no local docstore and no version-doc list:
 	// its job is to ASK the nodes that do (§7.13.2, "asking rather than

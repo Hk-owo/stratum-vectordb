@@ -182,6 +182,13 @@ type LocalVersionDropper struct {
 	DocStore       docstore.DocStore
 	VersionDocList versiondoc.VersionDocList
 
+	// ChunkReclaimer reclaims the chunk vectors this version was the last live
+	// referent of. It runs BEFORE VersionDocList.DeleteByVersion, because the
+	// version's document set is what names the candidate chunks; a failure leaves
+	// that set in place so the flow's retry can run it again. Nil skips it (a node
+	// with no chunk store).
+	ChunkReclaimer VersionChunkReclaimer
+
 	// VersionBloom may be nil when the filter store is not wired; its file is
 	// then left for the next whole-KB delete.
 	VersionBloom *bloom.VersionBloomStore
@@ -205,6 +212,17 @@ var _ VersionStorageDropper = LocalVersionDropper{}
 // contract call is worth that, and it is what lets the whole step travel to
 // another node.
 func (d LocalVersionDropper) DropVersion(ctx context.Context, kbID string, versionID int64) error {
+	// Chunk vectors first — while the version's document set still names them.
+	// This is the moment a chunk can become an orphan (the version that referenced
+	// it is going away), so it is also where the reclaim belongs; the periodic
+	// sweep is only a safety net for leftovers. Ordering matters for the RETRY as
+	// well as for correctness: returning here leaves VersionDocList intact, so the
+	// next attempt still knows which chunks to judge.
+	if d.ChunkReclaimer != nil {
+		if err := d.ChunkReclaimer.ReclaimVersionChunks(ctx, kbID, versionID); err != nil {
+			return fmt.Errorf("ReclaimVersionChunks: %w", err)
+		}
+	}
 	if err := d.IndexManager.Discard(ctx, kbID, versionID); err != nil {
 		return fmt.Errorf("IndexManager.Discard: %w", err)
 	}

@@ -36,6 +36,12 @@ type DeleteVersionCoordinatorConfig struct {
 	// nil falls back to a LocalVersionDropper built from the fields above.
 	Dropper VersionStorageDropper
 
+	// ChunkReclaimer reclaims the chunk vectors this version was the last live
+	// referent of. It is handed to the fallback LocalVersionDropper; a configured
+	// Dropper receives it through its own wiring (for a split deployment that is
+	// the receiving node's DropVersionStorage). Optional.
+	ChunkReclaimer VersionChunkReclaimer
+
 	// Tombstones is this node's record of deletions it has been TOLD about
 	// (internal/tombstone). Optional; without it a resumed deletion still reclaims the
 	// bytes but leaves no local note that the version is gone.
@@ -158,6 +164,7 @@ func (c *DeleteVersionCoordinatorImpl) dropperFor() VersionStorageDropper {
 		VersionDocList: c.cfg.VersionDocList,
 		VersionBloom:   c.cfg.VersionBloom,
 		Metadata:       c.cfg.RaftNode,
+		ChunkReclaimer: c.cfg.ChunkReclaimer,
 	}
 }
 

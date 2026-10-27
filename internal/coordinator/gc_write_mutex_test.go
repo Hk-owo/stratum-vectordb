@@ -176,10 +176,40 @@ func (r *gcWriteRaftNode) ProposeMarkKBDeleting(_ context.Context, _ string) err
 func (r *gcWriteRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, _ string) error { return nil }
 func (r *gcWriteRaftNode) ProposeRemoveKBMeta(_ context.Context, _ string) error       { return nil }
 func (r *gcWriteRaftNode) ProposeRollback(_ context.Context, _ string, _ int64) error  { return nil }
-func (r *gcWriteRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string, _ int64, _ types.VersionDeleteMode) ([]int64, error) {
-	return nil, nil
+
+// ProposeMarkVersionDeleting mirrors the state machine closely enough for these
+// tests: it flags the target (SUBTREE: the target and its descendants) Deleting
+// and leaves the metadata in place.
+func (r *gcWriteRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var marked []int64
+	for i := range r.versions[kbID] {
+		v := &r.versions[kbID][i]
+		if v.VersionID != versionID && (mode != types.VersionDeleteSubtree || v.ParentVersionID != versionID) {
+			continue
+		}
+		if v.Deleting {
+			continue
+		}
+		v.Deleting = true
+		marked = append(marked, v.VersionID)
+	}
+	return marked, nil
 }
-func (r *gcWriteRaftNode) ProposeRemoveVersionMeta(_ context.Context, _ string, _ int64) error {
+
+// ProposeRemoveVersionMeta drops the version from the chain, which is what makes
+// it stop being "live" for the GC's liveness judgement.
+func (r *gcWriteRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := r.versions[kbID][:0]
+	for _, v := range r.versions[kbID] {
+		if v.VersionID != versionID {
+			kept = append(kept, v)
+		}
+	}
+	r.versions[kbID] = kept
 	return nil
 }
 
@@ -275,7 +305,7 @@ func gcTestKBMeta(kbID string) types.KnowledgeBaseMeta {
 // newNode builds a write coordinator and an orphan-chunk GC for one
 // knowledge base, both wired to the harness's single mutex — exactly the
 // wiring cmd/stratum/main.go performs in production.
-func (h *gcMutexHarness) newNode(t *testing.T, kbID string, cs chunkstore.ChunkStore) (*WriteCoordinatorImpl, *ChunkGarbageCollectorImpl) {
+func (h *gcMutexHarness) newNode(t *testing.T, kbID string, cs chunkstore.ChunkStore) (*WriteCoordinatorImpl, *ChunkGarbageCollectorImpl, *gcWriteRaftNode) {
 	t.Helper()
 	rn := newGCWriteRaftNode()
 	if err := rn.ProposeCreateKB(context.Background(), gcTestKBMeta(kbID)); err != nil {
@@ -306,15 +336,18 @@ func (h *gcMutexHarness) newNode(t *testing.T, kbID string, cs chunkstore.ChunkS
 		DocStore:         h.ds,
 		ChunkStore:       cs,
 	})
-	return coord, gc
+	return coord, gc, rn
 }
 
 // seedOrphanChunk runs the real write path twice: it adds doc-1 with
-// content, then deletes doc-1. That leaves content's chunks referenced
-// only by a dead document — a reclaim candidate — and returns the version
-// to use as the parent of the next write, plus the chunk IDs content
-// mapped to.
-func seedOrphanChunk(t *testing.T, coord WriteCoordinator, cdm chunkdoc.ChunkDocMapper, kbID, content string) (parentVersion int64, chunkIDs []string) {
+// content, then deletes doc-1, and finally deletes the version that still
+// contained doc-1 — the DeleteVersion flow, i.e. the step that makes the
+// document's chunks genuinely unreachable. Until that version is gone it is
+// still live and queryable, so its chunks are NOT orphans.
+//
+// It returns the version to use as the parent of the next write, plus the chunk
+// IDs content mapped to.
+func seedOrphanChunk(t *testing.T, coord WriteCoordinator, rn *gcWriteRaftNode, cdm chunkdoc.ChunkDocMapper, kbID, content string) (parentVersion int64, chunkIDs []string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -338,6 +371,17 @@ func seedOrphanChunk(t *testing.T, coord WriteCoordinator, cdm chunkdoc.ChunkDoc
 	}, "")
 	if err != nil {
 		t.Fatalf("seed delete doc-1: %v", err)
+	}
+
+	// Delete v1 itself, the way the DeleteVersion flow ends: mark it Deleting,
+	// then remove its metadata once the cleanup finished. Only now does the doc's
+	// chunk lose its last live referent — v2 stays live (SINGLE re-parents it), and
+	// it holds the tombstone.
+	if _, err := rn.ProposeMarkVersionDeleting(ctx, kbID, v1, types.VersionDeleteSingle); err != nil {
+		t.Fatalf("seed mark v%d deleting: %v", v1, err)
+	}
+	if err := rn.ProposeRemoveVersionMeta(ctx, kbID, v1); err != nil {
+		t.Fatalf("seed remove v%d meta: %v", v1, err)
 	}
 	return parentVersion, chunkIDs
 }
@@ -388,9 +432,9 @@ func TestGC_SharedWriteMu_BlocksConcurrentWriteDuringReclaim(t *testing.T) {
 
 	h := newGCMutexHarness(t)
 	cs := newGatedChunkStore()
-	coord, gc := h.newNode(t, kbID, cs)
+	coord, gc, rn := h.newNode(t, kbID, cs)
 
-	parent, chunkIDs := seedOrphanChunk(t, coord, h.cdm, kbID, content)
+	parent, chunkIDs := seedOrphanChunk(t, coord, rn, h.cdm, kbID, content)
 	chunkID := chunkIDs[0]
 
 	// Sweep in the background; it parks inside ChunkStore.Delete while
@@ -454,9 +498,9 @@ func TestGC_SharedWriteMu_WriteAfterReclaim_RebuildsChunk(t *testing.T) {
 
 	h := newGCMutexHarness(t)
 	cs := newGCChunkStore()
-	coord, gc := h.newNode(t, kbID, cs)
+	coord, gc, rn := h.newNode(t, kbID, cs)
 
-	parent, chunkIDs := seedOrphanChunk(t, coord, h.cdm, kbID, content)
+	parent, chunkIDs := seedOrphanChunk(t, coord, rn, h.cdm, kbID, content)
 	chunkID := chunkIDs[0]
 
 	// Nothing else running: the orphan is reclaimed outright.
@@ -500,9 +544,9 @@ func TestGC_SharedWriteMu_ConcurrentWriteAndSweep_KeepsLiveChunk(t *testing.T) {
 		content := fmt.Sprintf("shared body for round %d", i)
 
 		cs := newGCChunkStore()
-		coord, gc := h.newNode(t, kbID, cs)
+		coord, gc, rn := h.newNode(t, kbID, cs)
 
-		parent, chunkIDs := seedOrphanChunk(t, coord, h.cdm, kbID, content)
+		parent, chunkIDs := seedOrphanChunk(t, coord, rn, h.cdm, kbID, content)
 		chunkID := chunkIDs[0]
 
 		var wg sync.WaitGroup

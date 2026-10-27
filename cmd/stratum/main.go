@@ -440,6 +440,28 @@ func main() {
 		indexMgrIface = indexMgr
 	}
 
+	// --- Orphan-chunk garbage collector ---
+	// The sweep is a storage-layer task (it walks this node's chunk mappings), and
+	// its PRIMARY trigger is now the delete flow rather than the timer: a chunk can
+	// only become an orphan when the version that referenced it is deleted, so
+	// LocalVersionDropper.DropVersion and WriteCoordinatorImpl.DropVersionStorage
+	// call ReclaimVersionChunks while the version's document set still names the
+	// candidates. The periodic sweep stays as a safety net (default: hourly) for
+	// leftovers that no deletion event can name any more.
+	//
+	// Built here, ahead of the coordinators, so both delete paths can be handed the
+	// same value; Run starts further down on the nodes that hold storage.
+	gcImpl := coordinator.NewChunkGarbageCollectorImpl(coordinator.ChunkGarbageCollectorConfig{
+		SweepIntervalSec: cfg.GCSweepIntervalSec,
+		Locks:            kbLocks, // same set as WriteCoordinatorConfig.Locks
+		RaftNode:         rn,
+		ChunkDocMapper:   chunkDocIface,
+		DocStore:         docStoreIface,
+		ChunkStore:       chunkStoreIface,
+		VersionDocList:   versionDocIface,
+	})
+	gcImpl.SetLogger(logger.Named("gc"))
+
 	writeCoord := coordinator.NewWriteCoordinatorImpl(coordinator.WriteCoordinatorConfig{
 		MaxRetries:          cfg.WriteMaxRetries,
 		RetryBaseIntervalMS: cfg.WriteRetryBaseMS,
@@ -455,6 +477,9 @@ func main() {
 		DocStore:            docStoreIface,
 		VersionDocList:      versionDocIface,
 		IndexManager:        indexMgrIface,
+		// The event-driven half of the chunk GC: a deleted version's chunks go when
+		// its document set still names them (see DropVersionStorage).
+		ChunkReclaimer: gcImpl,
 		// §7.13.2: a committed write is handed to the coordinator the control
 		// layer picks, instead of being run by whoever accepted it. The dispatcher
 		// is built further down (it needs the data plane), so the call goes through
@@ -547,6 +572,7 @@ func main() {
 				VersionDocList: vd,
 				VersionBloom:   vBloomStore,
 				Metadata:       rn,
+				ChunkReclaimer: gcImpl,
 			})
 		}
 		return droppers
@@ -588,19 +614,10 @@ func main() {
 	// sees the post-retention disk facts (the active version is protected
 	// from dropping).
 
-	// --- Orphan-chunk garbage collector ---
-	// The orphan-chunk sweep is a storage-layer task: it walks this node's
-	// chunk mappings and reclaims what no version references.
+	// --- Orphan-chunk garbage collector (periodic safety net) ---
+	// Built above; only the loop starts here, and only on a node that holds the
+	// mappings. The delete flow's ReclaimVersionChunks does the real work.
 	if storageLocal {
-		gcImpl := coordinator.NewChunkGarbageCollectorImpl(coordinator.ChunkGarbageCollectorConfig{
-			SweepIntervalSec: cfg.GCSweepIntervalSec,
-			Locks:            kbLocks, // same set as WriteCoordinatorConfig.Locks
-			RaftNode:         rn,
-			ChunkDocMapper:   cdm,
-			DocStore:         ds,
-			ChunkStore:       chunkStore,
-		})
-		gcImpl.SetLogger(logger.Named("gc"))
 		go gcImpl.Run(ctx)
 	}
 
@@ -3016,7 +3033,7 @@ func defaultConfig() appConfig {
 		BloomExpectedItems:     1_000_000,
 		BloomFalsePositiveRate: 0.01,
 
-		GCSweepIntervalSec: 300,
+		GCSweepIntervalSec: 3600,
 	}
 }
 

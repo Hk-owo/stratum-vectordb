@@ -172,13 +172,14 @@ func TestChunkGarbageCollector(t *testing.T) {
 	})
 
 	t.Run("orphan chunk reclaimed when every referencing doc is deleted", func(t *testing.T) {
-		// chunk-orphan maps to doc-dead; doc-dead was deleted at version 2
-		// (tombstone), so the chunk is unreachable from any live version.
+		// chunk-orphan maps to doc-dead, which NO live version of kb-1 can read:
+		// v1 never contained it (its content belonged to a version that has since
+		// been deleted — the DeleteVersion cleanup already reclaimed those
+		// records) and v2 holds the tombstone. Deleting it at v2 alone would NOT
+		// be enough: v1 is still live and queryable, and a rebuild of v1's index
+		// reads this chunk back (TestChunkGC_KeepsChunkReferencedByOlderLiveVersion).
 		if err := cdm.Write(ctx, "kb-1", "chunk-orphan", "doc-dead"); err != nil {
 			t.Fatalf("cdm.Write: %v", err)
-		}
-		if err := ds.Write(ctx, "kb-1", "doc-dead", 1, []byte("live at v1")); err != nil {
-			t.Fatalf("ds.Write v1: %v", err)
 		}
 		if err := ds.Write(ctx, "kb-1", "doc-dead", 2, nil); err != nil { // tombstone
 			t.Fatalf("ds.Write tombstone: %v", err)
@@ -326,11 +327,9 @@ func TestChunkGarbageCollector_StaleSnapshotRace_DeletesCommittedData(t *testing
 	ds := newTestDocStore()
 	cs := newGCChunkStore()
 
-	// V1: doc alive with content. V2: doc deleted (tombstone). The GC's
-	// version view is (V1, V2), so the doc is dead at maxVersion = V2.
-	if err := ds.Write(ctx, kbID, docID, 1, []byte("v1-content")); err != nil {
-		t.Fatalf("ds.Write v1: %v", err)
-	}
+	// The GC's version view is (V1, V2), and the doc is dead in BOTH of them:
+	// v1 never contained it (its content belonged to an already deleted version)
+	// and v2 holds the tombstone. So the chunk is a reclaim candidate.
 	if err := ds.Write(ctx, kbID, docID, 2, nil); err != nil { // tombstone
 		t.Fatalf("ds.Write tombstone: %v", err)
 	}
@@ -428,9 +427,8 @@ func TestChunkGarbageCollector_ReclaimBeforeConcurrentWrite_Recovers(t *testing.
 	ds := newTestDocStore()
 	cs := newGCChunkStore()
 
-	if err := ds.Write(ctx, kbID, docID, 1, []byte("v1-content")); err != nil {
-		t.Fatalf("ds.Write v1: %v", err)
-	}
+	// Dead in BOTH live versions: v1 never contained it (its content belonged to
+	// an already deleted version) and v2 holds the tombstone.
 	if err := ds.Write(ctx, kbID, docID, 2, nil); err != nil { // tombstone
 		t.Fatalf("ds.Write tombstone: %v", err)
 	}
