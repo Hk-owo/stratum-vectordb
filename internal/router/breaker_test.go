@@ -213,3 +213,55 @@ func TestBreaker_NodeLevelFailuresDoTripIt(t *testing.T) {
 		})
 	}
 }
+
+// tripped returns a breaker that has just opened.
+func tripped(cfg breakerConfig, now time.Time) *breaker {
+	b := newBreaker(cfg)
+	for i := 0; i < cfg.minSamples; i++ {
+		b.record(now, false)
+	}
+	return b
+}
+
+// TestBreaker_ExternalProbeSpendsNoClientRequest: past the cooldown an open breaker
+// still refuses, because the prober is the one that finds out.
+func TestBreaker_ExternalProbeSpendsNoClientRequest(t *testing.T) {
+	now := time.Now()
+	b := tripped(defaultBreakerConfig, now)
+	b.useExternalProbe()
+
+	later := now.Add(defaultBreakerConfig.cooldown + time.Second)
+	if b.allow(later) {
+		t.Fatal("an externally probed breaker must not admit a client request")
+	}
+	if b.needsProbe(now) {
+		t.Error("no probe is due before the cooldown has elapsed")
+	}
+	if !b.needsProbe(later) {
+		t.Fatal("a probe is due once the cooldown has elapsed")
+	}
+
+	b.probeResult(later, false)
+	if b.needsProbe(later) {
+		t.Error("a failed probe must start a new cooldown")
+	}
+	if b.allow(later) {
+		t.Error("a failed probe must leave the breaker open")
+	}
+
+	b.probeResult(later, true)
+	if !b.allow(later) {
+		t.Error("a successful probe must close the breaker")
+	}
+}
+
+// TestBreaker_ProbeResultIgnoredWhenNotOpen: a late probe must not disturb a breaker a
+// real call has since moved on.
+func TestBreaker_ProbeResultIgnoredWhenNotOpen(t *testing.T) {
+	b := newBreaker(defaultBreakerConfig)
+	b.useExternalProbe()
+	b.probeResult(time.Now(), false)
+	if !b.allow(time.Now()) {
+		t.Fatal("a closed breaker must stay closed through a failed probe")
+	}
+}

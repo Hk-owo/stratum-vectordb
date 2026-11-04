@@ -38,6 +38,11 @@ type breaker struct {
 	window  []outcome
 	probes  int // half-open admissions consumed
 	probing bool
+
+	// externalProbe hands recovery to a background prober: an open breaker then stays
+	// open until probeResult closes it, so no client request is spent finding out
+	// whether the node is back.
+	externalProbe bool
 }
 
 // outcome is one call's result as the breaker sees it.
@@ -112,7 +117,7 @@ func (b *breaker) allow(now time.Time) bool {
 	case breakerClosed:
 		return true
 	case breakerOpen:
-		if now.Sub(b.opened) < b.cfg.cooldown {
+		if b.externalProbe || now.Sub(b.opened) < b.cfg.cooldown {
 			return false
 		}
 		b.state = breakerHalfOpen
@@ -201,11 +206,48 @@ func (b *breaker) record(now time.Time, success bool) {
 func (b *breaker) stateNow(now time.Time) breakerState {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.state == breakerOpen && now.Sub(b.opened) >= b.cfg.cooldown {
+	if !b.externalProbe && b.state == breakerOpen && now.Sub(b.opened) >= b.cfg.cooldown {
 		b.state = breakerHalfOpen
 		b.probes = 0
 	}
 	return b.state
+}
+
+// useExternalProbe hands this breaker's recovery to a background prober. Only the
+// component that actually runs one may call this: without it an open breaker would
+// never close again.
+func (b *breaker) useExternalProbe() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.externalProbe = true
+	if b.state == breakerHalfOpen {
+		b.tripLocked(time.Now())
+	}
+}
+
+// needsProbe reports whether an open breaker has waited out its cooldown.
+func (b *breaker) needsProbe(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.state == breakerOpen && now.Sub(b.opened) >= b.cfg.cooldown
+}
+
+// probeResult feeds a background probe back: success closes the breaker, and failure
+// starts a new cooldown.
+func (b *breaker) probeResult(now time.Time, healthy bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state != breakerOpen {
+		return
+	}
+	if !healthy {
+		b.opened = now
+		return
+	}
+	b.state = breakerClosed
+	b.window = nil
+	b.probes = 0
+	b.probing = false
 }
 
 func (b *breaker) tripLocked(now time.Time) {

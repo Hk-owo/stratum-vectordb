@@ -17,7 +17,6 @@ func tableWithVerdicts(verdicts map[string]degradationVerdict) *RouteTable {
 	table := NewRouteTable(nil, time.Minute, nil)
 	table.mu.Lock()
 	table.snapshot = routeSnapshot{
-		servable:    map[string]map[int]bool{},
 		expected:    map[string]int64{},
 		degradation: verdicts,
 	}

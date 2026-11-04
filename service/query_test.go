@@ -904,6 +904,11 @@ func TestQueryService_RefusesAStaleNodeForAFreshnessCredential(t *testing.T) {
 	if msg := err.Error(); !strings.Contains(msg, "5") || !strings.Contains(msg, "7") {
 		t.Errorf("error should name both the local and required version, got: %v", err)
 	}
+	// And the cursor has to be readable without parsing that message: it is what the
+	// station remembers to avoid asking this node again straight away.
+	if cursor, ok := stratumerrors.ReplicaCursorOf(err); !ok || cursor != 5 {
+		t.Errorf("refusal carries cursor %d/%v, want 5/true", cursor, ok)
+	}
 }
 
 // TestQueryService_AsksForAPullWhenItIsBehind: refusing a freshness credential

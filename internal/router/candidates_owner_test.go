@@ -1,32 +1,31 @@
 package router
 
 import (
+	"context"
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/owner"
 )
 
-// shardedRouter builds a Router over three storage nodes with a routing table
-// that says all three hold kb-1, and the knowledge base serves version 5.
+// shardedRouter builds a Router over three storage nodes whose knowledge base serves
+// version 5.
 func shardedRouter(inactiveK int) *Router {
 	addrs := []string{"node-1:7000", "node-2:7000", "node-3:7000"}
 	rt := &RouteTable{
-		ready: true,
-		snapshot: routeSnapshot{
-			servable: map[string]map[int]bool{
-				"kb-1": {0: true, 1: true, 2: true},
-			},
-			expected: map[string]int64{"kb-1": 5},
-		},
+		ready:    true,
+		snapshot: routeSnapshot{expected: map[string]int64{"kb-1": 5}},
 	}
 	return &Router{
-		controlAddrs:       append([]string(nil), addrs...),
-		storageAddrs:       append([]string(nil), addrs...),
-		storageIndexByAddr: map[string]int{"node-1:7000": 0, "node-2:7000": 1, "node-3:7000": 2},
-		routes:             rt,
-		ownerInactiveK:     inactiveK,
+		controlAddrs:    append([]string(nil), addrs...),
+		storageAddrs:    append([]string(nil), addrs...),
+		routes:          rt,
+		lag:             newLagRecords(time.Minute),
+		ownerInactiveK:  inactiveK,
+		storageBreakers: []*breaker{newBreaker(defaultBreakerConfig), newBreaker(defaultBreakerConfig), newBreaker(defaultBreakerConfig)},
 	}
 }
 
@@ -36,86 +35,81 @@ func sortedInts(in []int) []int {
 	return out
 }
 
-// TestCandidates_NarrowsToOwnersThatAlsoHold is the whole point of the change
-// that R3 asks for: a read goes to the version's index OWNERS, not to every
-// holder the round-robin happens to reach.
-func TestCandidates_NarrowsToOwnersThatAlsoHold(t *testing.T) {
-	r := shardedRouter(2)
-
-	got := sortedInts(r.candidates("kb-1", 7, 3))
-
-	// The expected set, computed the same way the router computes it: the k=2
-	// owner set for v7, restricted to the holders.
-	want := []int{}
-	for _, addr := range owner.Owners("kb-1", 7, r.storageAddrs, 2) {
-		if idx, ok := r.storageIndexByAddr[addr]; ok {
-			want = append(want, idx)
+// ownerIndexes computes the k=2 owners of v7 the way the router does.
+func ownerIndexes(r *Router, versionID int64, k int) (owners []int, other int) {
+	inSet := map[string]bool{}
+	for _, addr := range owner.Owners("kb-1", versionID, r.storageAddrs, k) {
+		inSet[addr] = true
+	}
+	for i, addr := range r.storageAddrs {
+		if inSet[addr] {
+			owners = append(owners, i)
+		} else {
+			other = i
 		}
 	}
-	sort.Ints(want)
+	return owners, other
+}
 
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("candidates = %v, want %v (the k=2 owners for v7)", got, want)
+// TestRouteTiers_OwnersFirstThenEveryoneElse: a read goes to the version's index owners,
+// which is what keeps every node's LRU from holding the same working set. The other
+// replicas stay reachable behind them, because an owner can be behind while they hold
+// the data.
+func TestRouteTiers_OwnersFirstThenEveryoneElse(t *testing.T) {
+	r := shardedRouter(2)
+	owners, other := ownerIndexes(r, 7, 2)
+
+	tiers := r.routeTiers("kb-1", 7, 3, time.Now())
+
+	if len(tiers) != 2 {
+		t.Fatalf("tiers = %v, want owners then the rest", tiers)
 	}
-	if len(got) != 2 {
-		t.Fatalf("candidates = %v, want exactly the 2 owners — a shrinking candidate set is the point", got)
+	if got := sortedInts(tiers[0]); !reflect.DeepEqual(got, owners) {
+		t.Errorf("first tier = %v, want the k=2 owners %v", got, owners)
+	}
+	if !reflect.DeepEqual(tiers[1], []int{other}) {
+		t.Errorf("second tier = %v, want the non-owner [%d]", tiers[1], other)
 	}
 }
 
-// TestCandidates_ActiveVersionKeepsEveryHolder: the version the knowledge base
-// serves may be asked of any replica, so its owner set is everyone. That is not a
-// special rule in the intersection — it is k = everyone for that one version.
-func TestCandidates_ActiveVersionKeepsEveryHolder(t *testing.T) {
+// TestRouteTiers_ActiveVersionAsksEveryReplica: any replica may be asked for the version
+// the knowledge base serves, so its owner set is everyone and there is no fallback tier.
+func TestRouteTiers_ActiveVersionAsksEveryReplica(t *testing.T) {
 	r := shardedRouter(2)
 
-	// Version 5 is the expected (active) version per the routing table.
-	got := sortedInts(r.candidates("kb-1", 5, 3))
-	want := []int{0, 1, 2}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("candidates for the ACTIVE version = %v, want %v — every holder must stay eligible", got, want)
+	tiers := r.routeTiers("kb-1", 5, 3, time.Now())
+
+	if len(tiers) != 1 || !reflect.DeepEqual(sortedInts(tiers[0]), []int{0, 1, 2}) {
+		t.Fatalf("tiers for the ACTIVE version = %v, want one tier of every replica", tiers)
 	}
 }
 
-// TestCandidates_ShardingOffIsUnchanged: with no sharding configured, the
-// candidate set is exactly what it was before — every holder. A deployment that
-// has not opted in must not be able to tell this code exists.
-func TestCandidates_ShardingOffIsUnchanged(t *testing.T) {
+// TestRouteTiers_ShardingOffIsOneTier: a deployment that has not opted in to sharding
+// sees plain round-robin over every node.
+func TestRouteTiers_ShardingOffIsOneTier(t *testing.T) {
 	r := shardedRouter(0)
 
-	got := sortedInts(r.candidates("kb-1", 7, 3))
-	want := []int{0, 1, 2}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("candidates with sharding off = %v, want %v", got, want)
+	tiers := r.routeTiers("kb-1", 7, 3, time.Now())
+
+	if len(tiers) != 1 || !reflect.DeepEqual(sortedInts(tiers[0]), []int{0, 1, 2}) {
+		t.Fatalf("tiers with sharding off = %v, want one tier of every node", tiers)
 	}
 }
 
-// TestCandidates_FallsBackToHoldersWhenNoOwnerHoldsIt: an owner set that no
-// holder belongs to means the owner view and the holder view disagree — a
-// topology change, or a stale aggregate. Serving from a holder is still correct
-// (the freshness credential is what guarantees the answer), and refusing would
-// turn a topology change into an outage.
-func TestCandidates_FallsBackToHoldersWhenNoOwnerHoldsIt(t *testing.T) {
+// TestRouteTiers_NoRouteTableIsOneTier: a station with routing disabled keeps round-robin.
+func TestRouteTiers_NoRouteTableIsOneTier(t *testing.T) {
 	r := shardedRouter(2)
-	// Only node-1 holds kb-1, and make it the one node that is NOT an owner for
-	// v7 by shrinking the holder set until it excludes the owner set.
-	owners := owner.Owners("kb-1", 7, r.storageAddrs, 2)
-	holder := 0
-	for i, addr := range r.storageAddrs {
-		if addr != owners[0] && addr != owners[1] {
-			holder = i
-		}
-	}
-	r.routes.snapshot.servable["kb-1"] = map[int]bool{holder: true}
+	r.routes = nil
 
-	got := r.candidates("kb-1", 7, 3)
-	if !reflect.DeepEqual(got, []int{holder}) {
-		t.Fatalf("candidates = %v, want [%d] — a holder that is not an owner must still serve rather than nothing", got, holder)
+	tiers := r.routeTiers("kb-1", 7, 3, time.Now())
+
+	if len(tiers) != 1 || len(tiers[0]) != 3 {
+		t.Fatalf("tiers with no route table = %v, want one tier of every node", tiers)
 	}
 }
 
-// TestOwnersOf_ActiveVersionIsNotSharded pins the k choice itself, separately
-// from the intersection: the active version gets k = everyone, everything else
-// gets OwnerInactiveK.
+// TestOwnersOf_ActiveVersionIsNotSharded pins the k choice itself: the active version
+// gets k = everyone, everything else gets OwnerInactiveK.
 func TestOwnersOf_ActiveVersionIsNotSharded(t *testing.T) {
 	r := shardedRouter(2)
 
@@ -127,22 +121,143 @@ func TestOwnersOf_ActiveVersionIsNotSharded(t *testing.T) {
 	}
 }
 
-// TestCandidates_PinnedVersionUsesItsOwnOwnerSet is R1: the candidates follow the
-// version the CALLER named. Narrowing a pinned read by the active version would
-// select exactly the nodes least likely to still hold the one that was asked for.
-func TestCandidates_PinnedVersionUsesItsOwnOwnerSet(t *testing.T) {
-	r := shardedRouter(2)
+// TestRouteTiers_BehindNodeGoesLast: a recent refusal moves a node behind everyone else,
+// but only for versions above its recorded cursor, and it is never ruled out: the record
+// is a hint, and the node may have caught up since.
+func TestRouteTiers_BehindNodeGoesLast(t *testing.T) {
+	r := shardedRouter(0)
+	now := time.Now()
+	r.lag.note("kb-1", 1, 6, now)
 
-	// Without a pin the credential would be the active version (5) and every
-	// holder would qualify; with a pin it must be the pinned version's owners.
-	unpinned := sortedInts(r.candidates("kb-1", 5, 3))
-	pinned := sortedInts(r.candidates("kb-1", 7, 3))
-
-	if reflect.DeepEqual(unpinned, pinned) {
-		t.Fatalf("pinned and unpinned candidate sets are identical (%v); this test cannot "+
-			"distinguish them, so it proves nothing", pinned)
+	tiers := r.routeTiers("kb-1", 7, 3, now)
+	if len(tiers) != 2 || !reflect.DeepEqual(tiers[1], []int{1}) {
+		t.Fatalf("tiers = %v, want node 1 in a last tier of its own", tiers)
 	}
-	if len(pinned) != 2 {
-		t.Fatalf("pinned candidates = %v, want the pinned version's 2 owners", pinned)
+
+	// Version 6 is within what the node holds, so the record says nothing about it.
+	if tiers := r.routeTiers("kb-1", 6, 3, now); len(tiers) != 1 || len(tiers[0]) != 3 {
+		t.Errorf("tiers for a version the node holds = %v, want every node in one tier", tiers)
+	}
+	// Another knowledge base is not affected.
+	if tiers := r.routeTiers("kb-2", 7, 3, now); len(tiers) != 1 || len(tiers[0]) != 3 {
+		t.Errorf("tiers for another knowledge base = %v, want every node in one tier", tiers)
+	}
+}
+
+// TestRouteTiers_ExpiredRecordRestoresTheRoute: after the record expires the node is
+// back on its normal route, which is how a node that caught up returns to service.
+func TestRouteTiers_ExpiredRecordRestoresTheRoute(t *testing.T) {
+	r := shardedRouter(0)
+	now := time.Now()
+	r.lag.note("kb-1", 1, 6, now)
+
+	tiers := r.routeTiers("kb-1", 7, 3, now.Add(2*time.Minute))
+	if len(tiers) != 1 || len(tiers[0]) != 3 {
+		t.Fatalf("tiers after the record expired = %v, want every node in one tier", tiers)
+	}
+}
+
+// TestRouteTiers_EveryNodeBehindStillAsksThem: when every node has a record, the query
+// is still sent. A hint must never turn into a refusal.
+func TestRouteTiers_EveryNodeBehindStillAsksThem(t *testing.T) {
+	r := shardedRouter(0)
+	now := time.Now()
+	for idx := 0; idx < 3; idx++ {
+		r.lag.note("kb-1", idx, 1, now)
+	}
+
+	tiers := r.routeTiers("kb-1", 7, 3, now)
+	if len(tiers) != 1 || len(tiers[0]) != 3 {
+		t.Fatalf("tiers with every node behind = %v, want every node still asked", tiers)
+	}
+}
+
+// refusal is what a replica behind the required version sends over the wire.
+func refusal(have, want int64) error {
+	return stratumerrors.ToGRPCStatus(&stratumerrors.ReplicaBehindError{KBID: "kb-1", Have: have, Want: want})
+}
+
+// TestForward_RefusalFallsThroughToANonOwnerAndIsRemembered is the whole flow: every
+// owner is behind, a non-owner has the data, and the next query does not repeat the
+// wasted round trips.
+func TestForward_RefusalFallsThroughToANonOwnerAndIsRemembered(t *testing.T) {
+	r := shardedRouter(2)
+	owners, other := ownerIndexes(r, 7, 2)
+	isOwner := map[int]bool{owners[0]: true, owners[1]: true}
+
+	var asked []int
+	query := func(idx int, _ context.Context) (int, error) {
+		asked = append(asked, idx)
+		if isOwner[idx] {
+			return 0, refusal(3, 7)
+		}
+		return idx, nil
+	}
+
+	got, err := Forward(r, context.Background(), "/stratum.QueryService/Query", "kb-1", query, WithPinnedVersion(7))
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	if got != other {
+		t.Fatalf("answered by node %d, want the non-owner %d", got, other)
+	}
+	if len(asked) != 3 || asked[2] != other {
+		t.Fatalf("asked %v, want both owners and then the non-owner", asked)
+	}
+
+	asked = nil
+	if _, err := Forward(r, context.Background(), "/stratum.QueryService/Query", "kb-1", query, WithPinnedVersion(7)); err != nil {
+		t.Fatalf("second Forward: %v", err)
+	}
+	if !reflect.DeepEqual(asked, []int{other}) {
+		t.Errorf("second query asked %v, want only node %d: the refusals were not remembered", asked, other)
+	}
+}
+
+// TestForward_AnswerFromABehindNodeIsStillAnAnswer: when nobody else can answer, the
+// nodes with records get asked, and one that caught up in the meantime serves.
+func TestForward_AnswerFromABehindNodeIsStillAnAnswer(t *testing.T) {
+	r := shardedRouter(0)
+	now := time.Now()
+	for idx := 0; idx < 3; idx++ {
+		r.lag.note("kb-1", idx, 1, now)
+	}
+
+	got, err := Forward(r, context.Background(), "/stratum.QueryService/Query", "kb-1",
+		func(idx int, _ context.Context) (string, error) { return "ok", nil }, WithPinnedVersion(7))
+	if err != nil || got != "ok" {
+		t.Fatalf("Forward = %q, %v; want the behind node's answer", got, err)
+	}
+}
+
+// TestForward_NonRetryableErrorStopsTheTiers: a terminal answer is the answer. Falling
+// through to the next tier would ask everyone the same doomed question.
+func TestForward_NonRetryableErrorStopsTheTiers(t *testing.T) {
+	r := shardedRouter(2)
+	calls := 0
+
+	_, err := Forward(r, context.Background(), "/stratum.QueryService/Query", "kb-1",
+		func(int, context.Context) (int, error) {
+			calls++
+			return 0, stratumerrors.ToGRPCStatus(stratumerrors.ErrKnowledgeBaseNotFound)
+		}, WithPinnedVersion(7))
+
+	if err == nil || calls != 1 {
+		t.Fatalf("calls = %d, err = %v; want one call and its error", calls, err)
+	}
+}
+
+// TestForward_OtherFailuresAreNotRecordedAsLag: only a refusal carrying a cursor says a
+// node is behind. A connection failure belongs to the breaker.
+func TestForward_OtherFailuresAreNotRecordedAsLag(t *testing.T) {
+	r := shardedRouter(0)
+
+	_, _ = Forward(r, context.Background(), "/stratum.QueryService/Query", "kb-1",
+		func(int, context.Context) (int, error) {
+			return 0, stratumerrors.ToGRPCStatus(stratumerrors.ErrIndexNotReady)
+		}, WithPinnedVersion(7))
+
+	if tiers := r.routeTiers("kb-1", 7, 3, time.Now()); len(tiers) != 1 || len(tiers[0]) != 3 {
+		t.Fatalf("tiers = %v, want no node marked behind", tiers)
 	}
 }

@@ -436,14 +436,14 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 				s.startBackgroundPull(kbID, want)
 			}
 			if have = s.localVersion.LocalVersionOf(kbID); have < want {
-				// Wrapped, not replaced: the wire name keeps it retryable for a
-				// caller with another replica to ask, while the message keeps the
-				// diagnosis — how far behind this node is and behind what. A bare
+				// The wire name keeps it retryable for a caller with another replica
+				// to ask, the message keeps the diagnosis, and the structured cursor
+				// lets the station remember how far behind this node is. A bare
 				// sentinel throws away the only information that makes the refusal
 				// actionable (see TestQueryService_RefusesAStaleNodeForAFreshness…).
-				return nil, stratumerrors.ToGRPCStatus(fmt.Errorf(
-					"%w: %s: local history reaches version %d, below the required %d",
-					stratumerrors.ErrIndexNotReady, kbID, have, want))
+				return nil, stratumerrors.ToGRPCStatus(&stratumerrors.ReplicaBehindError{
+					KBID: kbID, Have: have, Want: want,
+				})
 			}
 		}
 	}
