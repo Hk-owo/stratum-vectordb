@@ -6,7 +6,7 @@ import "sync"
 // takeover hook when this node BECOMES the leader — the one transition that
 // invalidates leadership-scoped soft state.
 //
-// Why a hook rather than exposing the raw check: §7.13.4's aggregate is per-term.
+// Why a hook rather than exposing the raw check: the heartbeat record is per-term.
 // A node that keeps a predecessor's reports would answer "who holds version V"
 // from evidence it never received, and that answer decides where data is fetched
 // from. Clearing on the false→true edge is the narrowest correct point — while a

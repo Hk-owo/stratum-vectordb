@@ -128,11 +128,11 @@ func indexDirOf(i int) string { return storageDataDir(i) + "/index" }
 // version id.
 //
 // A storage-gate refusal is waited out rather than fatal. That verdict is soft
-// state built from the storage nodes' periodic cursor reports (the window is
+// state built from the storage nodes' periodic heartbeats (the window is
 // plane.DefaultStorageSilenceWindow, 15s, and the gate documents its own refusal
 // as retryable for exactly that reason). The window it covers is real, not
 // theoretical: a control leader that has just taken over starts from an empty
-// aggregate, and until the storage nodes' reports land, ANY node that has reported
+// record, and until the storage nodes' heartbeats land, ANY node that has reported
 // makes the verdict a KNOWABLE "nobody required is answering" rather than §3.3's
 // fail-open "unknown" — the control nodes report too, and they hold no data. A
 // write attempted inside that window is refused with storage_unavailable although

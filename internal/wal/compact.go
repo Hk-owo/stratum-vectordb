@@ -292,9 +292,9 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 // mappings, version doc lists, index and bloom files) is reclaimed by
 // DeleteCoordinator, and the WAL is the one it left out. That is invisible while a
 // knowledge base is alive, because its recorded changes are reclaimed by watermark —
-// but the watermark is computed from replicas reporting a cursor, and a DELETED
-// knowledge base has no replicas reporting one, so `ReclaimableChangesThrough` answers
-// "unknown" forever and every BEGIN record it left behind (each carrying the full text
+// but the watermark is computed from replicas' cursors, and a DELETED knowledge base
+// has no replica holding one, so `ReclaimChanges` finds it blocked forever and every
+// BEGIN record it left behind (each carrying the full text
 // of the documents it changed) stays on disk for good.
 //
 // Shape follows Compact: rewrite beside the original, sync, swap in with one atomic

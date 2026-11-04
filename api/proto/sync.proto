@@ -48,17 +48,15 @@ service DataSyncService {
   // as if those versions changed nothing.
   rpc PullVersionChanges(PullVersionChangesRequest) returns (stream VersionChanges);
 
-  // ReportDataVersions is the storage layer's periodic status report to the
-  // control leader (§7.13.4): "for each knowledge base, my contiguous data cursor
-  // has reached version N". The leader keeps the aggregate in memory and answers
-  // "which nodes hold version V" from it — an authoritative view of where data
-  // lives that is refreshed every interval, instead of a snapshot taken once and
-  // stale from that moment on.
+  // Heartbeat is a storage node's periodic "I am alive" to the control leader. The leader
+  // keeps when each node last spoke, in memory, and judges storage redundancy from that.
+  // It stays the same size however many knowledge bases exist, which is why it carries no
+  // cursors: whoever needs a node's cursor asks that node (LocalVersion).
   //
-  // accepted=false tells the reporter it reached a non-leader: it re-resolves the
-  // leader and tries again next interval (§7.13.1's pattern), rather than the
-  // system growing a second forwarding path.
-  rpc ReportDataVersions(ReportDataVersionsRequest) returns (ReportDataVersionsResponse);
+  // accepted=false tells the reporter it reached a non-leader: it re-resolves the leader
+  // and tries again next interval (§7.13.1's pattern), rather than the system growing a
+  // second forwarding path.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
   // GetChainTails returns the tail of every knowledge base's version chain. A node calls
   // it when a heartbeat's chain_generation differs from the one it last pulled at, so the
@@ -263,72 +261,20 @@ message VersionChanges {
   repeated DocChange changes = 3;
 }
 
-message ReportDataVersionsRequest {
+message HeartbeatRequest {
+  reserved 2, 3;
+  reserved "data_versions", "address";
   int64 node_id = 1;
-  // knowledge_base_id -> the highest version this node holds contiguously. Only
-  // the cursor is reported, not the data: the aggregate answers "who could serve
-  // version V", which is exactly what a cursor comparison decides.
-  map<string, int64> data_versions = 2;
-
-  // address is this node's storage-layer gRPC address. The leader records it
-  // alongside the cursors so GetDataVersionHolders can hand consumers something
-  // they can dial, instead of every consumer growing its own id→address map.
-  string address = 3;
-
 }
 
-message ReportDataVersionsResponse {
+message HeartbeatResponse {
+  reserved 3, 4, 5;
+  reserved "reclaimable", "chain_tails", "holders";
   // accepted is false when the receiving node is not the control leader, so the
-  // reporter knows to re-resolve rather than assume the report landed.
+  // reporter knows to re-resolve rather than assume the heartbeat landed.
   bool accepted = 1;
   // node_id identifies the responder.
   int64 node_id = 2;
-  // reclaimable carries back, per knowledge base, the highest version whose recorded
-  // changes may be discarded (§7.5). It rides this response deliberately: the
-  // watermark needs the leader's global view, and the node that must act on it is the
-  // one that WROTE the data — which under §7.13.2 need not be the leader. Piggy-
-  // backing on the report every node already sends avoids inventing an RPC for it.
-  //
-  // A knowledge base absent from this map has no known watermark: keep everything.
-  map<string, int64> reclaimable = 3;
-  // chain_tails carries back, per knowledge base, the version at the TAIL of the
-  // replicated chain: the newest version the control layer has accepted. A node
-  // whose own contiguous cursor is behind it has fallen behind and MAY start
-  // catching up — whether, when and how fast are the node's own decisions
-  // (docs/active-lag-detection-design.md), which is what keeps this from becoming
-  // a broadcast storm. It rides this response for the same reason reclaimable
-  // does: the tail is the leader's global view, and the node that must act on it
-  // already talks to the leader every interval.
-  //
-  // Deliberately the chain tail, NOT the active version: a node is not "behind"
-  // merely because it has not switched to the newest version. Being on an older
-  // version is a routing choice; missing the chain is a missing data fact — the
-  // same distinction §7.9 draws for the epoch payload.
-  //
-  // A knowledge base absent from this map means "unknown" — no signal — not
-  // "nothing to catch up".
-  map<string, int64> chain_tails = 4;
-  // holders carries back, per knowledge base, which nodes reported holding it and
-  // the address each reported for itself (§7.13.4) — the same aggregate the service
-  // station's route table reads, now with a second consumer.
-  //
-  // It rides this response because the answer is "who can give me this data", and
-  // the askers are the data nodes — the ones this report already comes from. A
-  // node's data-source lookup may run on the Raft apply path, where dialling is not
-  // allowed (see §8.5), so it cannot ask for itself; it reads a mirror, and THIS is
-  // what fills that mirror.
-  //
-  // The map is keyed by knowledge base, and unlike reclaimable/chain_tails the
-  // leader fills it for every knowledge base it knows about, not only for the ones
-  // the reporter named. That is the whole point: a node that missed a whole chain
-  // names nothing (its own state is empty), and the leader naming its chains is how
-  // it learns there is something to be behind on.
-  //
-  // An absent knowledge base is "the leader said nothing", never "nobody holds it":
-  // the aggregate is soft state, scoped to a leadership term, refreshed every
-  // interval.
-  map<string, HolderList> holders = 5;
-
   // chain_generation changes whenever any knowledge base's chain tail may have. A node
   // that last pulled at a different generation calls GetChainTails. Absent means this
   // leader offers no signal.
@@ -355,15 +301,6 @@ message GetChainTailsResponse {
   map<string, int64> chain_tails = 2;
   // generation is the generation these tails are at least as new as.
   ChainGeneration generation = 3;
-}
-
-// HolderList is one knowledge base's holders, in ascending node-id order so a
-// caller's choice is reproducible.
-//
-// A message wrapper rather than a bare repeated field because proto does not allow
-// repeated inside a map value.
-message HolderList {
-  repeated string addresses = 1;
 }
 
 enum SyncEntryType {

@@ -60,23 +60,18 @@ type LocalControlPlane struct {
 	// SetFailureBudget. Absent means "use failureBudget".
 	kbBudgets map[string]int32
 
-	// dataVersions is the leader's §7.13.4 aggregate of the storage layer's
-	// cursor reports, and leaderGate answers whether this node is the one whose
-	// aggregate is authoritative. Both nil on a node that does not lead: the
-	// view is simply unavailable there, which callers must be able to tell apart
-	// from "nobody holds it".
-	dataVersions *DataVersionRegistry
-	leaderGate   *LeaderGate
+	// liveness is the leader's record of the storage nodes' heartbeats, and leaderGate
+	// answers whether this node is the one whose record is authoritative. Both nil on a
+	// node that does not lead: the verdict is simply unavailable there.
+	liveness   *LivenessRegistry
+	leaderGate *LeaderGate
 
-	// requiredReplicas lists the node IDs that must hold a version before the WAL
-	// records behind it may be discarded (§7.5). It comes from the cluster
-	// topology, never from the aggregate: deriving "who should have it" from
-	// "who has reported" would let a node that is merely silent drop out of the
-	// requirement, and the reclaim verdict would then be derived from the very
-	// reports it is supposed to be checked against.
+	// requiredReplicas lists the node IDs a write must reach. It comes from the cluster
+	// topology, never from who has sent a heartbeat: deriving "who should have it" from
+	// "who has spoken" would let a node that is merely silent drop out of the requirement.
 	requiredReplicas func() ([]int64, error)
 
-	// silenceWindow is how long a required replica may go without reporting
+	// silenceWindow is how long a required replica may go without a heartbeat
 	// before the redundancy verdict stops counting it as live
 	// (docs/storage-degradation-signal-plan.md §3.2). It is the verdict's
 	// hysteresis: see Degrade. Zero means DefaultStorageSilenceWindow.
@@ -86,21 +81,17 @@ type LocalControlPlane struct {
 // ControlPlaneOption configures a LocalControlPlane.
 type ControlPlaneOption func(*LocalControlPlane)
 
-// WithDataVersionView wires the leader's §7.13.4 cursor aggregate, so the control
-// plane can answer "which nodes hold version V". The gate is consulted on every
-// query rather than at construction: leadership moves, and a node that has just
-// taken over has an empty aggregate (LeaderGate clears it on takeover) — answering
-// from it is correct, whereas answering from a predecessor's would not be.
-func WithDataVersionView(reg *DataVersionRegistry, gate *LeaderGate) ControlPlaneOption {
+// WithLivenessView wires the leader's record of the storage nodes' heartbeats, so the
+// control plane can judge storage redundancy. Passing the gate alongside it is what makes
+// the record per-term: taking over clears it.
+func WithLivenessView(reg *LivenessRegistry, gate *LeaderGate) ControlPlaneOption {
 	return func(c *LocalControlPlane) {
-		c.dataVersions = reg
+		c.liveness = reg
 		c.leaderGate = gate
 	}
 }
 
-// WithRequiredReplicas wires the replica set a version must reach before the WAL
-// changes behind it become reclaimable (§7.5). Optional: without it the reclaimable
-// watermark stays unavailable, which is the conservative answer.
+// WithRequiredReplicas wires the replica set a write must reach.
 func WithRequiredReplicas(fn func() ([]int64, error)) ControlPlaneOption {
 	return func(c *LocalControlPlane) {
 		c.requiredReplicas = fn
@@ -412,28 +403,10 @@ func (c *LocalControlPlane) promoteDurableData(ctx context.Context, kbID string,
 	return nil
 }
 
-// DataVersionHolders answers "which nodes hold version V of kbID", from the
-// leader's §7.13.4 aggregate of the storage layer's cursor reports. ok=false means
-// the answer is UNAVAILABLE — this node is not the leader, or no aggregate is
-// wired — and is emphatically not "nobody has it": the two lead to opposite
-// actions, since the second would justify deleting data (§10.6) that a healthy
-// node in fact holds.
-//
-// A non-empty result is still only "these nodes reported a cursor reaching V". It
-// is a routing hint: fetch from one of them rather than from a peer that never
-// reached V. It is never evidence for a destructive decision — that needs each
-// node's own confirmation.
-func (c *LocalControlPlane) DataVersionHolders(kbID string, versionID int64) ([]Holder, bool) {
-	if c.dataVersions == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
-		return nil, false
-	}
-	return c.dataVersions.Holders(kbID, versionID), true
-}
-
 // WithStorageSilenceWindow sets how long a required replica may go without
 // reporting before the redundancy verdict stops counting it live
 // (docs/storage-degradation-signal-plan.md §3.2). Non-positive values keep
-// DefaultStorageSilenceWindow, which is three report intervals.
+// DefaultStorageSilenceWindow, which is three heartbeat intervals.
 func WithStorageSilenceWindow(d time.Duration) ControlPlaneOption {
 	return func(c *LocalControlPlane) {
 		if d > 0 {
@@ -447,7 +420,7 @@ func WithStorageSilenceWindow(d time.Duration) ControlPlaneOption {
 //
 // ok=false means the judgement cannot be made — this node is not the control
 // leader, no replica topology is wired, the topology cannot be read, or the
-// aggregate has folded no report yet. Every one of those means the same thing to
+// record holds no heartbeat yet. Every one of those means the same thing to
 // a caller: ALLOW. This is an expression-layer signal rather than a correctness
 // gate, so "cannot tell" must not become a refusal — see Degradation.Known and
 // the plan's §3.3 (fail-open).
@@ -460,10 +433,10 @@ func WithStorageSilenceWindow(d time.Duration) ControlPlaneOption {
 // is carried only so the diagnosis names the knowledge base it was asked about.
 //
 // The verdict is soft state and can be stale in either direction, so a refusal
-// must be retryable: the aggregate moves with the periodic reports, and the caller's
+// must be retryable: the record moves with the heartbeats, and the caller's
 // next attempt is the one that gets the authoritative answer (§4.3).
 func (c *LocalControlPlane) StorageDegradation(kbID string) (StorageState, string, bool) {
-	if c.dataVersions == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
+	if c.liveness == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
 		return StorageHealthy, "storage redundancy unknown: not the control leader", false
 	}
 	if c.requiredReplicas == nil {
@@ -472,11 +445,11 @@ func (c *LocalControlPlane) StorageDegradation(kbID string) (StorageState, strin
 	required, err := c.requiredReplicas()
 	if err != nil {
 		// An unreadable topology is "unknown", never "unavailable": §3.3 lists it
-		// beside the empty aggregate for exactly that reason.
+		// beside the empty record for exactly that reason.
 		return StorageHealthy, fmt.Sprintf(
 			"storage redundancy unknown: read replica topology: %v", err), false
 	}
-	d := c.dataVersions.Degrade(required, time.Now(), c.effectiveSilenceWindow())
+	d := c.liveness.Degrade(required, time.Now(), c.effectiveSilenceWindow())
 	if !d.Known {
 		return StorageHealthy, d.Detail, false
 	}
@@ -577,7 +550,7 @@ func (c *LocalControlPlane) ChainTails(ctx context.Context) (map[string]int64, e
 }
 
 // effectiveSilenceWindow resolves the configured silence window, defaulting it exactly
-// the way DataVersionRegistry.Degrade does.
+// the way LivenessRegistry.Degrade does.
 func (c *LocalControlPlane) effectiveSilenceWindow() time.Duration {
 	if c.silenceWindow <= 0 {
 		return DefaultStorageSilenceWindow

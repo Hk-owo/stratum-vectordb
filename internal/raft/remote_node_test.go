@@ -164,8 +164,8 @@ func newRemoteNode(t *testing.T, nodes map[int64]*fakeControlNode) (*RemoteRaftN
 // --- role ---
 
 // TestRemoteRaftNode_IsNeverLeader pins the one answer a storage node must not
-// get wrong: it is not a Raft member, so it never leads. The §7.13.4 leader
-// gate and DataVersionHolders both read this, and both would misbehave if it
+// get wrong: it is not a Raft member, so it never leads. The leader gate and the
+// redundancy verdict both read this, and both would misbehave if it
 // ever claimed leadership.
 func TestRemoteRaftNode_IsNeverLeader(t *testing.T) {
 	node, cleanup := newRemoteNode(t, map[int64]*fakeControlNode{1: {}})

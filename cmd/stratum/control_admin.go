@@ -18,15 +18,13 @@ import (
 // on control nodes therefore made the one call that needs the control group
 // unreachable from outside it.
 //
-// Measured: a storage node's cursor reporter (internal/sync's
-// DataVersionReporter) resolves the leader through GetClusterStatus, and every
+// Measured: a storage node's heartbeat (internal/sync's Heartbeater) resolves the leader through GetClusterStatus, and every
 // attempt failed with
 //
 //	Unimplemented: unknown service stratum.AdminService
 //
-// so §7.13.4's periodic report never left the node — taking the chain tails
-// (lag catch-up), the "who holds version V" holder view, and the station's read
-// routing with it.
+// so the periodic heartbeat never left the node — taking the chain tails (lag catch-up)
+// and the redundancy verdict with it.
 //
 // Embedding UnimplementedAdminServiceServer keeps the rest of the surface
 // honest: those methods answer Unimplemented here, which is exactly what "this
@@ -48,7 +46,7 @@ func newControlAdminService(nodeID int64, rn raft.RaftNode) *controlAdminService
 //
 // The leader id is what the routing layer resolves into the leader's gRPC
 // address, so this is the call every storage node makes to find the node its
-// cursor report must reach.
+// heartbeat must reach.
 func (s *controlAdminService) GetClusterStatus(ctx context.Context, _ *pb.GetClusterStatusRequest) (*pb.GetClusterStatusResponse, error) {
 	cluster, err := s.raftNode.GetClusterStatus(ctx)
 	if err != nil {

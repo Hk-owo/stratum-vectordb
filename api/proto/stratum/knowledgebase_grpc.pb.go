@@ -45,7 +45,6 @@ const (
 	KnowledgeBaseService_DiscardVersion_FullMethodName        = "/stratum.KnowledgeBaseService/DiscardVersion"
 	KnowledgeBaseService_ListKnowledgeBases_FullMethodName    = "/stratum.KnowledgeBaseService/ListKnowledgeBases"
 	KnowledgeBaseService_GetKnowledgeBase_FullMethodName      = "/stratum.KnowledgeBaseService/GetKnowledgeBase"
-	KnowledgeBaseService_GetDataVersionHolders_FullMethodName = "/stratum.KnowledgeBaseService/GetDataVersionHolders"
 	KnowledgeBaseService_GetStorageDegradation_FullMethodName = "/stratum.KnowledgeBaseService/GetStorageDegradation"
 )
 
@@ -79,16 +78,6 @@ type KnowledgeBaseServiceClient interface {
 	DiscardVersion(ctx context.Context, in *DiscardVersionRequest, opts ...grpc.CallOption) (*DiscardVersionResponse, error)
 	ListKnowledgeBases(ctx context.Context, in *ListKnowledgeBasesRequest, opts ...grpc.CallOption) (*ListKnowledgeBasesResponse, error)
 	GetKnowledgeBase(ctx context.Context, in *GetKnowledgeBaseRequest, opts ...grpc.CallOption) (*GetKnowledgeBaseResponse, error)
-	// GetDataVersionHolders answers "which nodes reported holding kbID at or past
-	// versionID" — the §3.1 question the service station's route table asks. It
-	// reads the control leader's in-memory §7.13.4 aggregate, which is SOFT state:
-	// an empty answer means "no node I have heard from", never "no node has it".
-	//
-	// It belongs on this control-layer service rather than on DataSyncService
-	// because of who asks and who answers: the station already holds a control
-	// connection (ListKnowledgeBases is how it learns the target version), while
-	// the reporters are the data nodes.
-	GetDataVersionHolders(ctx context.Context, in *GetDataVersionHoldersRequest, opts ...grpc.CallOption) (*GetDataVersionHoldersResponse, error)
 	// GetStorageDegradation answers whether the storage layer can still meet a write's
 	// durability contract, from the replicas' heartbeats on the control leader. The
 	// station polls it once per route refresh: with one cluster-wide replica topology the
@@ -204,16 +193,6 @@ func (c *knowledgeBaseServiceClient) GetKnowledgeBase(ctx context.Context, in *G
 	return out, nil
 }
 
-func (c *knowledgeBaseServiceClient) GetDataVersionHolders(ctx context.Context, in *GetDataVersionHoldersRequest, opts ...grpc.CallOption) (*GetDataVersionHoldersResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetDataVersionHoldersResponse)
-	err := c.cc.Invoke(ctx, KnowledgeBaseService_GetDataVersionHolders_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *knowledgeBaseServiceClient) GetStorageDegradation(ctx context.Context, in *GetStorageDegradationRequest, opts ...grpc.CallOption) (*GetStorageDegradationResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetStorageDegradationResponse)
@@ -254,16 +233,6 @@ type KnowledgeBaseServiceServer interface {
 	DiscardVersion(context.Context, *DiscardVersionRequest) (*DiscardVersionResponse, error)
 	ListKnowledgeBases(context.Context, *ListKnowledgeBasesRequest) (*ListKnowledgeBasesResponse, error)
 	GetKnowledgeBase(context.Context, *GetKnowledgeBaseRequest) (*GetKnowledgeBaseResponse, error)
-	// GetDataVersionHolders answers "which nodes reported holding kbID at or past
-	// versionID" — the §3.1 question the service station's route table asks. It
-	// reads the control leader's in-memory §7.13.4 aggregate, which is SOFT state:
-	// an empty answer means "no node I have heard from", never "no node has it".
-	//
-	// It belongs on this control-layer service rather than on DataSyncService
-	// because of who asks and who answers: the station already holds a control
-	// connection (ListKnowledgeBases is how it learns the target version), while
-	// the reporters are the data nodes.
-	GetDataVersionHolders(context.Context, *GetDataVersionHoldersRequest) (*GetDataVersionHoldersResponse, error)
 	// GetStorageDegradation answers whether the storage layer can still meet a write's
 	// durability contract, from the replicas' heartbeats on the control leader. The
 	// station polls it once per route refresh: with one cluster-wide replica topology the
@@ -308,9 +277,6 @@ func (UnimplementedKnowledgeBaseServiceServer) ListKnowledgeBases(context.Contex
 }
 func (UnimplementedKnowledgeBaseServiceServer) GetKnowledgeBase(context.Context, *GetKnowledgeBaseRequest) (*GetKnowledgeBaseResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetKnowledgeBase not implemented")
-}
-func (UnimplementedKnowledgeBaseServiceServer) GetDataVersionHolders(context.Context, *GetDataVersionHoldersRequest) (*GetDataVersionHoldersResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetDataVersionHolders not implemented")
 }
 func (UnimplementedKnowledgeBaseServiceServer) GetStorageDegradation(context.Context, *GetStorageDegradationRequest) (*GetStorageDegradationResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetStorageDegradation not implemented")
@@ -516,24 +482,6 @@ func _KnowledgeBaseService_GetKnowledgeBase_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
-func _KnowledgeBaseService_GetDataVersionHolders_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetDataVersionHoldersRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(KnowledgeBaseServiceServer).GetDataVersionHolders(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: KnowledgeBaseService_GetDataVersionHolders_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(KnowledgeBaseServiceServer).GetDataVersionHolders(ctx, req.(*GetDataVersionHoldersRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _KnowledgeBaseService_GetStorageDegradation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetStorageDegradationRequest)
 	if err := dec(in); err != nil {
@@ -598,10 +546,6 @@ var KnowledgeBaseService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetKnowledgeBase",
 			Handler:    _KnowledgeBaseService_GetKnowledgeBase_Handler,
-		},
-		{
-			MethodName: "GetDataVersionHolders",
-			Handler:    _KnowledgeBaseService_GetDataVersionHolders_Handler,
 		},
 		{
 			MethodName: "GetStorageDegradation",

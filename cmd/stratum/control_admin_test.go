@@ -26,10 +26,10 @@ func (r clusterStatusRaftNode) ProposeRetryVersion(context.Context, string, int6
 }
 
 // A control node must be able to answer GetClusterStatus. It is the only node
-// that has the Raft view, and every storage node's cursor reporter resolves the
+// that has the Raft view, and every storage node's heartbeat resolves the
 // leader through exactly this call. Leaving AdminService unregistered on control
 // nodes made it answer "Unimplemented: unknown service stratum.AdminService", so
-// §7.13.4's report never left the storage node — and the chain tails (lag
+// the heartbeat never left the storage node — and the chain tails (lag
 // catch-up), the holder view and the station's read routing went with it.
 func TestControlAdminService_GetClusterStatusReportsTheRaftView(t *testing.T) {
 	rn := clusterStatusRaftNode{status: types.ClusterStatus{

@@ -11,8 +11,8 @@ import (
 	"stratum/internal/nodestate"
 )
 
-// LagCatchup turns the chain tails the control leader carries back on this node's
-// periodic cursor report into an occasional background catch-up
+// LagCatchup turns the chain tails this node learns through its heartbeat into an
+// occasional background catch-up
 // (docs/active-lag-detection-design.md).
 //
 // The trade it is built around:
@@ -46,7 +46,7 @@ type LagCatchup struct {
 	mu sync.Mutex
 
 	// tails is the latest chain-tail mirror the leader carried back, per knowledge
-	// base. Catch-up itself does not need to remember it (every report repeats it),
+	// base. Catch-up itself does not need to remember it (every heartbeat repeats it),
 	// but §8.6(d)'s tombstone scan does: "the versions with nothing after them" is
 	// exactly this map, and reading it here costs no RPC that is not already made.
 	//
@@ -71,9 +71,8 @@ func (l *LagCatchup) storeTails(tails map[string]int64) {
 // base — the versions with nothing after them.
 //
 // It exists for §8.6(d)'s tombstone scan, which needs those versions and would
-// otherwise have to ask the control layer again for a fact this node is handed every
-// report interval. A copy, for the same reason storeTails copies: the caller must not
-// be able to mutate the mirror, and the next report may replace it at any moment.
+// otherwise have to ask the control layer again for a fact this node already holds. A copy, for the same reason storeTails copies: the caller must not
+// be able to mutate the mirror, and the next heartbeat may replace it at any moment.
 //
 // An empty result means "not told yet", never "no chains" — the same reading the
 // chain_tails field documents, and the reason a caller must not treat absence as a
@@ -95,7 +94,7 @@ func (l *LagCatchup) ChainTails() map[string]int64 {
 type LagCatchupConfig struct {
 	// MinLagVersions is how far behind the tail a knowledge base must be before it
 	// counts as left behind; 1 means "any gap". Raising it trades a slower reaction
-	// for fewer wake-ups on ordinary write races, where a report can overlap the
+	// for fewer wake-ups on ordinary write races, where a pull can overlap the
 	// version being committed.
 	MinLagVersions int64
 
@@ -173,12 +172,12 @@ func NewLagCatchup(cfg LagCatchupConfig) *LagCatchup {
 	return &LagCatchup{cfg: cfg}
 }
 
-// SetChainTails implements sync.ChainTailSink: it is handed the tails the leader
-// carried back on this node's latest cursor report.
+// SetChainTails implements sync.ChainTailSink: it is handed the latest tails on every
+// accepted heartbeat, whether or not they changed.
 //
 // A knowledge base is picked up when its own cursor is at least MinLagVersions behind
 // the tail, it is not already catching up, and there is room under the concurrency
-// bound. Anything skipped is simply reconsidered on the next report — the signal
+// bound. Anything skipped is simply reconsidered on the next heartbeat — the signal
 // repeats every interval by construction, so nothing needs a queue of its own.
 //
 // NOTE: this used to iterate in a sorted order (furthest behind first). That was
@@ -216,7 +215,7 @@ func (l *LagCatchup) SetChainTails(tails map[string]int64) {
 	started := 0
 	for kbID, tail := range tails {
 		if l.cfg.NodeState.CatchingUpCount() >= maxKBs {
-			// Out of room: the rest wait for the next report, which is a few
+			// Out of room: the rest wait for the next heartbeat, which is a few
 			// seconds away by construction.
 			return
 		}
@@ -229,7 +228,7 @@ func (l *LagCatchup) SetChainTails(tails map[string]int64) {
 		if cursor[kbID]+l.lagThreshold() > tail {
 			continue // not behind enough to act on
 		}
-		// Declared while l.mu is held, so one report's decision to run a
+		// Declared while l.mu is held, so one heartbeat's decision to run a
 		// catch-up and the declaration of it are a single step. The state machine
 		// never calls back into this component, so this cannot deadlock.
 		l.cfg.NodeState.MarkCatchingUp(kbID, true)

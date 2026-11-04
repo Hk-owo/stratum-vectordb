@@ -39,7 +39,7 @@ const (
 	DataSyncService_ExecuteVersionWrite_FullMethodName = "/stratum.DataSyncService/ExecuteVersionWrite"
 	DataSyncService_PullVersionData_FullMethodName     = "/stratum.DataSyncService/PullVersionData"
 	DataSyncService_PullVersionChanges_FullMethodName  = "/stratum.DataSyncService/PullVersionChanges"
-	DataSyncService_ReportDataVersions_FullMethodName  = "/stratum.DataSyncService/ReportDataVersions"
+	DataSyncService_Heartbeat_FullMethodName           = "/stratum.DataSyncService/Heartbeat"
 	DataSyncService_GetChainTails_FullMethodName       = "/stratum.DataSyncService/GetChainTails"
 	DataSyncService_PushVersionData_FullMethodName     = "/stratum.DataSyncService/PushVersionData"
 	DataSyncService_VersionPresence_FullMethodName     = "/stratum.DataSyncService/VersionPresence"
@@ -77,17 +77,15 @@ type DataSyncServiceClient interface {
 	// the caller must fall back to a full state transfer rather than apply the range
 	// as if those versions changed nothing.
 	PullVersionChanges(ctx context.Context, in *PullVersionChangesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[VersionChanges], error)
-	// ReportDataVersions is the storage layer's periodic status report to the
-	// control leader (§7.13.4): "for each knowledge base, my contiguous data cursor
-	// has reached version N". The leader keeps the aggregate in memory and answers
-	// "which nodes hold version V" from it — an authoritative view of where data
-	// lives that is refreshed every interval, instead of a snapshot taken once and
-	// stale from that moment on.
+	// Heartbeat is a storage node's periodic "I am alive" to the control leader. The leader
+	// keeps when each node last spoke, in memory, and judges storage redundancy from that.
+	// It stays the same size however many knowledge bases exist, which is why it carries no
+	// cursors: whoever needs a node's cursor asks that node (LocalVersion).
 	//
-	// accepted=false tells the reporter it reached a non-leader: it re-resolves the
-	// leader and tries again next interval (§7.13.1's pattern), rather than the
-	// system growing a second forwarding path.
-	ReportDataVersions(ctx context.Context, in *ReportDataVersionsRequest, opts ...grpc.CallOption) (*ReportDataVersionsResponse, error)
+	// accepted=false tells the reporter it reached a non-leader: it re-resolves the leader
+	// and tries again next interval (§7.13.1's pattern), rather than the system growing a
+	// second forwarding path.
+	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	// GetChainTails returns the tail of every knowledge base's version chain. A node calls
 	// it when a heartbeat's chain_generation differs from the one it last pulled at, so the
 	// heartbeat itself stays the same size however many knowledge bases there are.
@@ -185,10 +183,10 @@ func (c *dataSyncServiceClient) PullVersionChanges(ctx context.Context, in *Pull
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type DataSyncService_PullVersionChangesClient = grpc.ServerStreamingClient[VersionChanges]
 
-func (c *dataSyncServiceClient) ReportDataVersions(ctx context.Context, in *ReportDataVersionsRequest, opts ...grpc.CallOption) (*ReportDataVersionsResponse, error) {
+func (c *dataSyncServiceClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ReportDataVersionsResponse)
-	err := c.cc.Invoke(ctx, DataSyncService_ReportDataVersions_FullMethodName, in, out, cOpts...)
+	out := new(HeartbeatResponse)
+	err := c.cc.Invoke(ctx, DataSyncService_Heartbeat_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -305,17 +303,15 @@ type DataSyncServiceServer interface {
 	// the caller must fall back to a full state transfer rather than apply the range
 	// as if those versions changed nothing.
 	PullVersionChanges(*PullVersionChangesRequest, grpc.ServerStreamingServer[VersionChanges]) error
-	// ReportDataVersions is the storage layer's periodic status report to the
-	// control leader (§7.13.4): "for each knowledge base, my contiguous data cursor
-	// has reached version N". The leader keeps the aggregate in memory and answers
-	// "which nodes hold version V" from it — an authoritative view of where data
-	// lives that is refreshed every interval, instead of a snapshot taken once and
-	// stale from that moment on.
+	// Heartbeat is a storage node's periodic "I am alive" to the control leader. The leader
+	// keeps when each node last spoke, in memory, and judges storage redundancy from that.
+	// It stays the same size however many knowledge bases exist, which is why it carries no
+	// cursors: whoever needs a node's cursor asks that node (LocalVersion).
 	//
-	// accepted=false tells the reporter it reached a non-leader: it re-resolves the
-	// leader and tries again next interval (§7.13.1's pattern), rather than the
-	// system growing a second forwarding path.
-	ReportDataVersions(context.Context, *ReportDataVersionsRequest) (*ReportDataVersionsResponse, error)
+	// accepted=false tells the reporter it reached a non-leader: it re-resolves the leader
+	// and tries again next interval (§7.13.1's pattern), rather than the system growing a
+	// second forwarding path.
+	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	// GetChainTails returns the tail of every knowledge base's version chain. A node calls
 	// it when a heartbeat's chain_generation differs from the one it last pulled at, so the
 	// heartbeat itself stays the same size however many knowledge bases there are.
@@ -374,8 +370,8 @@ func (UnimplementedDataSyncServiceServer) PullVersionData(*PullVersionDataReques
 func (UnimplementedDataSyncServiceServer) PullVersionChanges(*PullVersionChangesRequest, grpc.ServerStreamingServer[VersionChanges]) error {
 	return status.Errorf(codes.Unimplemented, "method PullVersionChanges not implemented")
 }
-func (UnimplementedDataSyncServiceServer) ReportDataVersions(context.Context, *ReportDataVersionsRequest) (*ReportDataVersionsResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ReportDataVersions not implemented")
+func (UnimplementedDataSyncServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Heartbeat not implemented")
 }
 func (UnimplementedDataSyncServiceServer) GetChainTails(context.Context, *GetChainTailsRequest) (*GetChainTailsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetChainTails not implemented")
@@ -459,20 +455,20 @@ func _DataSyncService_PullVersionChanges_Handler(srv interface{}, stream grpc.Se
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type DataSyncService_PullVersionChangesServer = grpc.ServerStreamingServer[VersionChanges]
 
-func _DataSyncService_ReportDataVersions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReportDataVersionsRequest)
+func _DataSyncService_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartbeatRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(DataSyncServiceServer).ReportDataVersions(ctx, in)
+		return srv.(DataSyncServiceServer).Heartbeat(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: DataSyncService_ReportDataVersions_FullMethodName,
+		FullMethod: DataSyncService_Heartbeat_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DataSyncServiceServer).ReportDataVersions(ctx, req.(*ReportDataVersionsRequest))
+		return srv.(DataSyncServiceServer).Heartbeat(ctx, req.(*HeartbeatRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -597,8 +593,8 @@ var DataSyncService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DataSyncService_ExecuteVersionWrite_Handler,
 		},
 		{
-			MethodName: "ReportDataVersions",
-			Handler:    _DataSyncService_ReportDataVersions_Handler,
+			MethodName: "Heartbeat",
+			Handler:    _DataSyncService_Heartbeat_Handler,
 		},
 		{
 			MethodName: "GetChainTails",

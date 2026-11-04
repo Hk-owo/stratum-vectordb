@@ -108,13 +108,6 @@ type Router struct {
 	conns        []*grpc.ClientConn
 	kbs          []pb.KnowledgeBaseServiceClient // control layer
 
-	// storageIndexByAddr maps a storage node's reported address to this station's
-	// connection index for it. The leader's aggregate identifies holders by the
-	// address each node reported for itself; turning that into a candidate means
-	// matching it against the addresses this station dials, which are the same
-	// list (storage.nodes in the config, -storage-nodes here).
-	storageIndexByAddr map[string]int
-
 	// logger records the background refreshes' failures. A refresh failure is
 	// expected and survivable (the previous snapshot stands), so it must be
 	// visible without being alarming — hence Debug for a KB that could not be
@@ -149,9 +142,8 @@ type Router struct {
 	// deployment gets a disabled signer, which stamps nothing.
 	mark *authmeta.Signer
 
-	// syncs are the storage layer's data-plane clients: the station asks them
-	// for cursors to build the routing table (§9.3(1)), using the §7.6 query
-	// rather than a new interface.
+	// syncs are the storage layer's data-plane clients: the station asks them whether a
+	// circuit-broken node is back (probeOpenBreakers).
 	syncs []pb.DataSyncServiceClient
 
 	// routes is the station's local cache of each knowledge base's expected version
@@ -184,25 +176,18 @@ func NewRouter(cfg Config) (*Router, error) {
 		storage = cfg.Addrs
 	}
 	r := &Router{
-		controlAddrs:       append([]string(nil), cfg.Addrs...),
-		storageAddrs:       append([]string(nil), storage...),
-		storageIndexByAddr: make(map[string]int, len(storage)),
-		auth:               cfg.Auth,
-		mark:               cfg.Mark,
-		logger:             cfg.Logger,
-		ownerInactiveK:     cfg.OwnerInactiveK,
-		priority:           newIndexPriority(cfg.OwnerPriorityHalfLife, nil),
-		controlInflight:    newInflight(len(cfg.Addrs)),
-		storageInflight:    newInflight(len(storage)),
+		controlAddrs:    append([]string(nil), cfg.Addrs...),
+		storageAddrs:    append([]string(nil), storage...),
+		auth:            cfg.Auth,
+		mark:            cfg.Mark,
+		logger:          cfg.Logger,
+		ownerInactiveK:  cfg.OwnerInactiveK,
+		priority:        newIndexPriority(cfg.OwnerPriorityHalfLife, nil),
+		controlInflight: newInflight(len(cfg.Addrs)),
+		storageInflight: newInflight(len(storage)),
 	}
 	if r.logger == nil {
 		r.logger = zap.NewNop()
-	}
-	// Indexed by position in storage, which is the order the storage clients are
-	// built in below — so an address the leader names resolves to the same node
-	// this station would dial for it.
-	for idx, addr := range storage {
-		r.storageIndexByAddr[addr] = idx
 	}
 	dial := func(addrs []string) error {
 		for _, a := range addrs {
@@ -335,14 +320,9 @@ func (r *Router) probeOnce(ctx context.Context) {
 	}
 }
 
-// refreshRouteSnapshot observes the cluster once, by asking the control layer
-// both halves of the question: which knowledge bases exist and what version each
-// should be served at, and which storage nodes the leader's §7.13.4 aggregate
-// says hold that version (§3.1, §4.3(1)).
-//
-// The leader that can answer either question is whichever one is leading — any
-// control node holds the log, but only the leader folds the cursor reports, so
-// the holders query is retried across the control set like any other read.
+// refreshRouteSnapshot observes the cluster once: which knowledge bases exist and what
+// version each should be served at, and the storage layer's redundancy verdict. One RPC
+// for each, however many knowledge bases there are.
 func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error) {
 	// Everything the refresh sends to the control layer carries the internal mark.
 	//

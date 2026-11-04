@@ -102,14 +102,15 @@ Stratum 只做 RAG 管线的**存储与检索层**；聊天历史、会话与 pr
 
 ### 6. 落后副本自愈 + 读的新鲜度凭证
 
-- 存储节点每 5 秒上报游标，leader 在响应里捎带每个知识库的链尾；落后节点在后台先补数据、再补索引。缺口能逐版本重放时走 WAL 增量，缺口里含已删除版本时退回全量状态传输。这里**没有开关**，能调的只是节奏（滞后阈值、抖动、并发上限）。
-- 数据源解析有四层兜底：本地注册表 → leader → 游标探测 → 控制层下发的 holders 镜像（心跳捎带，查表即得，绝不在 Raft apply 路径上发 RPC）。
+- 存储节点每 5 秒发一次固定大小的心跳，响应里只带 `chain_generation`；它变化时节点才拉一次链尾。落后节点在后台先补数据、再补索引。缺口能逐版本重放时走 WAL 增量，缺口里含已删除版本时退回全量状态传输。这里**没有开关**，能调的只是节奏（滞后阈值、抖动、并发上限）。
+- 数据源解析有四层兜底：本地注册表 → leader → 游标探测 → 落后节点探测 peer 游标后写入的本地缓存（查表即得，绝不在 Raft apply 路径上发 RPC）。
 - 服务站转发查询时附上"应看到的最低版本"，存储节点游标不够就拒——**把"悄悄返回过时结果"变成显式失败**，再换一个达标副本。
+- 服务站路由不依赖任何节点上报：先问版本的 owner（哈希算出），都失败再问其余节点。拒绝里带着节点游标，服务站记 3 秒，这期间把它排到最后而不是剔除，记录丢了最多多一次往返。
 
 ### 7. 存储退化是显式信号：写拒绝、读照常
 
 - 副本低于 quorum 时写入返回 `kb_storage_degraded` / `storage_unavailable`（可重试），读照常服务，查询响应带 `storage_degraded` 位，只读客户端无需先撞一次写失败才知道。
-- 判据复用已有的周期上报，**判不出时一律放行**：leader 换届瞬间变成写熔断是不可接受的。
+- 判据来自周期心跳，**判不出时一律放行**：leader 换届瞬间变成写熔断是不可接受的。
 - 两道门：服务站转发前拦一次（省掉往返），控制面在提交 Raft 前再拦一次（不浪费版本号与日志），两处报同一个错误名。
 
 ### 8. 可选的量化两段式检索
@@ -237,7 +238,7 @@ scripts/cluster.sh --topology two-tier up
 - **新子版本的文档集校验**：用元数据中父版本的 `doc_id_set_hash` 校验继承的文档集，不一致返回可重试错误，避免把"本节点读不到父版本"当成"父版本没有文档"。
 - **判死后的回收**：每个 Raft 成员从自己的 apply 得知终态后本地清理（广播只是尽力而为的一次性通知），启动时再扫一次补回。不参与 Raft 的纯存储节点只有"检测者就地清"与"重启时扫一次"两条路径；残留只占空间、不影响正确性。
 - **删除的收敛**：节点收到删除通知时先写本地墓碑表再清字节（两态都拒收数据、失败 30 秒重试，跨重启有效），控制层另有一份**有界删除日志**供节点增量读取；启动那一趟同时对齐水位，所以下一次 tick 只读一页日志。没有收到通知的节点由"活链全量判据"兜底（无保留期、无空白）。
-- **数据侧终态推进**：存储节点的数据游标随上报上行，控制层据此把版本从 PENDING 提升为 DURABLE（只提升仍存在且非删除中的版本）。
+- **数据侧终态推进**：存储节点重启对账后上报可宣称的游标，控制层据此把版本从 PENDING 提升为 DURABLE（只提升仍存在且非删除中的版本）。
 - **增量追赶的退化条件**：缺口中只要含已确认删除的版本就整段退回全量状态传输——跳过被删版本继续重放会丢文档，因为那些版本的文档集要由已不存在的父版本推出。元数据读不到时不退化。
 
 </details>
@@ -317,7 +318,7 @@ Protobuf 定义在 `api/proto/`：三个对外服务，加三个只供节点间�
 | `DeleteVersion` | `SUBTREE` / `SINGLE` / `ANCESTORS` 三种模式，活跃与 PENDING 版本不可删 |
 | `AwaitVersion` | 等待版本达到 `DATA_DURABLE` 或 `INDEX_READY`；"还没好"正常返回 `stage` + `retry_after_ms`；事件驱动；带 `data_missing` |
 | `DiscardVersion` | 放弃一个从未落地的 PENDING 版本，清掉幂等键映射 |
-| `GetDataVersionHolders` | 哪些节点报过持有该版本（软状态），附带存储退化判定与诊断 |
+| `GetStorageDegradation` | 存储层能否满足写入的持久性要求（软状态），附带诊断；判不出时返回 unknown |
 
 **QueryService**
 
@@ -342,7 +343,7 @@ Protobuf 定义在 `api/proto/`：三个对外服务，加三个只供节点间�
 | 服务 | RPC |
 |---|---|
 | `InternalService` | `Propose`：把已编码的 Raft 命令交给 leader，非 leader 回传 `leader_id` |
-| `DataSyncService` | `ExecuteVersionWrite`（执行已提交版本的写事务）· `PushVersionData` / `PullVersionData` / `PullVersionChanges`（全量与增量传输）· `LocalVersion` / `VersionPresence`（游标与持有探测）· `ReportDataVersions`（周期上报，响应捎带链尾与 holders 镜像）· `DeleteVersionData`（物理回收，无法执行时以错误回答）· `ConfirmVersionWrite` · `FetchIndexData`（按需拉取索引产物） |
+| `DataSyncService` | `ExecuteVersionWrite`（执行已提交版本的写事务）· `PushVersionData` / `PullVersionData` / `PullVersionChanges`（全量与增量传输）· `LocalVersion` / `VersionPresence`（游标与持有探测）· `Heartbeat`（周期心跳，响应捎带 `chain_generation`）· `GetChainTails`（按需拉取链尾）· `DeleteVersionData`（物理回收，无法执行时以错误回答）· `ConfirmVersionWrite` · `FetchIndexData`（按需拉取索引产物） |
 | vecstore（C++） | 索引构建、加载、检索与 chunk 向量存储 |
 
 </details>

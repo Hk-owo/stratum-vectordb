@@ -78,9 +78,9 @@ var _ RaftNode = (*RemoteRaftNode)(nil)
 // IsLeader always answers false, and that is the correct answer rather than a
 // stub: a storage node is not a Raft member, so it can never be the leader.
 //
-// The callers that read it agree: the §7.13.4 leader gate must not reset a
-// leader's aggregate on a storage node, and DataVersionHolders must report
-// "unknown" (not "nobody holds it") when asked off the leader.
+// The callers that read it agree: the leader gate must not reset a leader's heartbeat
+// record on a storage node, and the redundancy verdict must report "unknown" when asked
+// off the leader.
 func (r *RemoteRaftNode) IsLeader() bool { return false }
 
 // --- proposals (forwarded to whichever control node leads) ---
@@ -471,8 +471,8 @@ func (r *RemoteRaftNode) DeletionsSince(ctx context.Context, afterSeq int64, lim
 
 // LastVersionID implements RaftNode. A storage node has no local state machine, and
 // "the highest id" has no narrow form (there is no bound to push down), so this walks
-// the chain. That is acceptable because of WHO calls it: ChainTail answers the leader's
-// cursor report, so the caller is a control node — whose own shape answers O(1). A
+// the chain. That is acceptable because of WHO calls it: ChainTails answers a node's
+// pull at the leader, so the caller is a control node — whose own shape answers O(1). A
 // storage node never takes this path.
 func (r *RemoteRaftNode) LastVersionID(ctx context.Context, kbID string) (int64, error) {
 	versions, err := r.ListVersions(ctx, kbID)

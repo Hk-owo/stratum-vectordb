@@ -11,17 +11,9 @@ import (
 	pb "stratum/api/proto/stratum"
 )
 
-// DefaultDataVersionReportInterval is how often a node reposts its cursors. It is
-// a freshness/latency trade: the report is soft state (§7.13.4), so nothing
-// breaks if one is lost, and a shorter interval only costs heartbeats.
-const DefaultDataVersionReportInterval = 5 * time.Second
-
-// DataVersionSource reports this node's contiguous cursors, keyed by knowledge
-// base — the storage layer's answer to "what do I actually hold". An empty map is
-// meaningful and is still sent: it is how a node that lost its data says so, and
-// suppressing it would leave the leader's aggregate describing versions this node
-// no longer has.
-type DataVersionSource func() map[string]int64
+// DefaultHeartbeatInterval is how often a node tells the control leader it is alive. The
+// heartbeat is soft state, so nothing breaks if one is lost.
+const DefaultHeartbeatInterval = 5 * time.Second
 
 // LeaderAddrResolver returns the current control leader's address, and whether one
 // is known. It is called every interval rather than cached: a leader change must
@@ -29,30 +21,20 @@ type DataVersionSource func() map[string]int64
 // re-resolving instead of growing a forwarding path).
 type LeaderAddrResolver func(ctx context.Context) (string, bool, error)
 
-// DataVersionReporterConfig configures a DataVersionReporter.
-type DataVersionReporterConfig struct {
-	// NodeID identifies this node in the report. The receiver records on this
+// HeartbeaterConfig configures a Heartbeater.
+type HeartbeaterConfig struct {
+	// NodeID identifies this node in the heartbeat. The receiver records on this
 	// value, so it must be the node's own ID, never one taken from elsewhere.
 	NodeID int64
 
-	// SelfAddr is this node's storage-layer gRPC address, reported alongside the
-	// cursors. The leader's aggregate hands it back to consumers (the station's
-	// route table) so they can dial the holder directly; without it every consumer
-	// would need its own node-id→address map. Optional: an empty value means
-	// "unknown", and holders are then reported without one.
-	SelfAddr string
-
-	// DataVersions supplies the cursors to report. Required.
-	DataVersions DataVersionSource
-
 	// ResolveLeader finds the control leader. Required: with no leader known the
-	// report is simply skipped for this interval.
+	// heartbeat is simply skipped for this interval.
 	ResolveLeader LeaderAddrResolver
 
-	// Interval overrides the report period. Zero uses the default.
+	// Interval overrides the heartbeat period. Zero uses the default.
 	Interval time.Duration
 
-	// Logger is optional: reporting failures are expected (leader elections,
+	// Logger is optional: failed heartbeats are expected (leader elections,
 	// restarts) and are logged at debug so they cannot be mistaken for faults.
 	Logger *zap.Logger
 
@@ -60,37 +42,37 @@ type DataVersionReporterConfig struct {
 	// listener. Optional.
 	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 
-	// ChainTails receives the chain tails the leader carries back on each response:
-	// per knowledge base, the newest version the control layer has accepted. It is
-	// the signal a node uses to notice it has fallen behind
+	// ChainTails receives the chain tails on every accepted heartbeat: per knowledge
+	// base, the newest version the control layer has accepted. It is the signal a node uses to notice it has fallen behind
 	// (docs/active-lag-detection-design.md). Optional: without it this node keeps the
 	// lazy recovery it has always had. *plane.LagCatchup implements it.
 	ChainTails ChainTailSink
 }
 
-// ChainTailSink receives the chain tails a control leader published on a report's
-// response: per knowledge base, the version at the tail of the replicated chain
-// (docs/active-lag-detection-design.md). What it does with them — and whether it does
-// anything at all — is its own decision. Declared here for the same reason
-// LeaderWatermarkSink is: plane imports this package.
+// ChainTailSink receives the chain tails: per knowledge base, the version at the tail of
+// the replicated chain (docs/active-lag-detection-design.md). What it does with them — and
+// whether it does anything at all — is its own decision. Declared here because plane
+// imports this package.
 type ChainTailSink interface {
 	SetChainTails(tails map[string]int64)
 }
 
-// DataVersionReporter periodically tells the control leader which versions this
-// node holds (§7.13.4). It owns no state: each report is a complete statement read
-// fresh from the storage layer, so a missed report costs nothing and the next one
-// corrects everything.
-type DataVersionReporter struct {
+// Heartbeater periodically tells the control leader this node is alive, and learns from
+// the answer when the chain tails have moved.
+type Heartbeater struct {
 	nodeID        int64
-	selfAddr      string
-	dataVersions  DataVersionSource
 	resolveLeader LeaderAddrResolver
 	interval      time.Duration
 	logger        *zap.Logger
 	dial          func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 
-	// chainTails receives the chain tails the leader carries back: per knowledge
+	// conn is the connection to the leader last resolved, reused between heartbeats so a
+	// beat every few seconds does not cost a new connection each time. Only Run's
+	// goroutine touches it.
+	conn     *grpc.ClientConn
+	connAddr string
+
+	// chainTails receives the chain tails on every accepted heartbeat: per knowledge
 	// base, the newest version the control layer has accepted
 	// (docs/active-lag-detection-design.md). A sink decides for itself what to do
 	// with them — including nothing.
@@ -100,20 +82,18 @@ type DataVersionReporter struct {
 	tailsGeneration *pb.ChainGeneration
 }
 
-// NewDataVersionReporter returns a reporter that dials leaders directly.
-func NewDataVersionReporter(cfg DataVersionReporterConfig) *DataVersionReporter {
+// NewHeartbeater returns a heartbeater that dials leaders directly.
+func NewHeartbeater(cfg HeartbeaterConfig) *Heartbeater {
 	dial := cfg.Dial
 	if dial == nil {
 		dial = NewPresenceChecker(PresenceCheckerConfig{}).dial
 	}
 	interval := cfg.Interval
 	if interval <= 0 {
-		interval = DefaultDataVersionReportInterval
+		interval = DefaultHeartbeatInterval
 	}
-	return &DataVersionReporter{
+	return &Heartbeater{
 		nodeID:        cfg.NodeID,
-		selfAddr:      cfg.SelfAddr,
-		dataVersions:  cfg.DataVersions,
 		resolveLeader: cfg.ResolveLeader,
 		interval:      interval,
 		logger:        cfg.Logger,
@@ -122,10 +102,10 @@ func NewDataVersionReporter(cfg DataVersionReporterConfig) *DataVersionReporter 
 	}
 }
 
-// Run reports until ctx is done. Failures never stop the loop: a report that did
-// not land says nothing about the data, and the next interval sends the whole
-// view again.
-func (r *DataVersionReporter) Run(ctx context.Context) {
+// Run sends heartbeats until ctx is done. Failures never stop the loop: a heartbeat that
+// did not land says nothing about the data, and the next interval tries again.
+func (r *Heartbeater) Run(ctx context.Context) {
+	defer r.closeConn()
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 	for {
@@ -134,48 +114,48 @@ func (r *DataVersionReporter) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := r.ReportOnce(ctx); err != nil && r.logger != nil && ctx.Err() == nil {
-				r.logger.Debug("sync: data-version report did not land; retrying next interval", zap.Error(err))
+				r.logger.Debug("sync: heartbeat did not land; retrying next interval", zap.Error(err))
 			}
 		}
 	}
 }
 
-// ReportOnce sends one report. A nil return means either "the leader recorded
-// it" or "there is no leader to report to right now" — both are ordinary states,
-// not failures. An error means the report did not land and the next interval
-// should try again.
-func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
-	if r.dataVersions == nil || r.resolveLeader == nil {
+// ReportOnce sends one heartbeat. A nil return means either "the leader recorded it" or
+// "there is no leader to report to right now" — both are ordinary states, not failures.
+// An error means it did not land and the next interval should try again.
+//
+// The whole beat is bounded by one interval, so a leader that stops answering cannot
+// stall the loop.
+func (r *Heartbeater) ReportOnce(ctx context.Context) error {
+	if r.resolveLeader == nil {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, r.interval)
+	defer cancel()
+
 	addr, ok, err := r.resolveLeader(ctx)
 	if err != nil {
-		return fmt.Errorf("sync: resolve control leader for data-version report: %w", err)
+		return fmt.Errorf("sync: resolve control leader for heartbeat: %w", err)
 	}
 	if !ok || addr == "" {
 		// No leader during an election: nothing to report to, and nothing broken.
 		return nil
 	}
 
-	conn, err := r.dial(ctx, addr)
+	conn, err := r.connTo(ctx, addr)
 	if err != nil {
-		return fmt.Errorf("sync: dial leader %s for data-version report: %w", addr, err)
+		return fmt.Errorf("sync: dial leader %s for heartbeat: %w", addr, err)
 	}
-	defer func() { _ = conn.Close() }()
 
 	client := pb.NewDataSyncServiceClient(conn)
-	resp, err := client.ReportDataVersions(ctx, &pb.ReportDataVersionsRequest{
-		NodeId:       r.nodeID,
-		Address:      r.selfAddr,
-		DataVersions: r.dataVersions(),
-	})
+	resp, err := client.Heartbeat(ctx, &pb.HeartbeatRequest{NodeId: r.nodeID})
 	if err != nil {
-		return fmt.Errorf("sync: ReportDataVersions at %s: %w", addr, err)
+		return fmt.Errorf("sync: Heartbeat at %s: %w", addr, err)
 	}
 	if !resp.GetAccepted() {
 		// The node we reached is not the leader. Its answer is not an error on the
-		// wire, but the report did not land: the next interval re-resolves.
-		return fmt.Errorf("sync: data-version report at %s was not accepted (node %d is not the control leader)",
+		// wire, but the heartbeat did not land: the next interval re-resolves.
+		return fmt.Errorf("sync: heartbeat at %s was not accepted (node %d is not the control leader)",
 			addr, resp.GetNodeId())
 	}
 
@@ -187,6 +167,28 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 	return nil
 }
 
+// connTo returns the connection to addr, reusing the last one when the leader has not
+// moved. gRPC reconnects it on its own, so a failed call does not need a new one.
+func (r *Heartbeater) connTo(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+	if r.conn != nil && r.connAddr == addr {
+		return r.conn, nil
+	}
+	r.closeConn()
+	conn, err := r.dial(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	r.conn, r.connAddr = conn, addr
+	return conn, nil
+}
+
+func (r *Heartbeater) closeConn() {
+	if r.conn != nil {
+		_ = r.conn.Close()
+		r.conn, r.connAddr = nil, ""
+	}
+}
+
 // syncChainTails pulls the tails when the leader's generation differs from the one this
 // node last pulled at, and hands the sink the latest tails either way.
 //
@@ -195,7 +197,7 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 // coming whether or not anything changed. It costs a local comparison, not a network trip.
 //
 // A failed pull keeps the old generation, so the next heartbeat tries again.
-func (r *DataVersionReporter) syncChainTails(ctx context.Context, client pb.DataSyncServiceClient, generation *pb.ChainGeneration) {
+func (r *Heartbeater) syncChainTails(ctx context.Context, client pb.DataSyncServiceClient, generation *pb.ChainGeneration) {
 	if generation != nil && !sameGeneration(generation, r.tailsGeneration) {
 		resp, err := client.GetChainTails(ctx, &pb.GetChainTailsRequest{})
 		switch {

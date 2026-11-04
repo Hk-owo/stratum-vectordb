@@ -189,17 +189,6 @@ service KnowledgeBaseService {
   rpc ListKnowledgeBases(ListKnowledgeBasesRequest) returns (ListKnowledgeBasesResponse);
   rpc GetKnowledgeBase(GetKnowledgeBaseRequest) returns (GetKnowledgeBaseResponse);
 
-  // GetDataVersionHolders answers "which nodes reported holding kbID at or past
-  // versionID" — the §3.1 question the service station's route table asks. It
-  // reads the control leader's in-memory §7.13.4 aggregate, which is SOFT state:
-  // an empty answer means "no node I have heard from", never "no node has it".
-  //
-  // It belongs on this control-layer service rather than on DataSyncService
-  // because of who asks and who answers: the station already holds a control
-  // connection (ListKnowledgeBases is how it learns the target version), while
-  // the reporters are the data nodes.
-  rpc GetDataVersionHolders(GetDataVersionHoldersRequest) returns (GetDataVersionHoldersResponse);
-
   // GetStorageDegradation answers whether the storage layer can still meet a write's
   // durability contract, from the replicas' heartbeats on the control leader. The
   // station polls it once per route refresh: with one cluster-wide replica topology the
@@ -402,77 +391,3 @@ message GetKnowledgeBaseResponse {
   KnowledgeBaseInfo knowledge_base = 1;
 }
 
-// DataVersionHolder is one node the leader's aggregate believes holds a version.
-message DataVersionHolder {
-  int64 node_id = 1;
-
-  // address is the node's storage-layer gRPC address, as the node itself
-  // reported it. It is carried here so a consumer can act on the answer
-  // directly: the station has to forward to an address, and node ids alone would
-  // force a second id→address map onto every consumer.
-  string address = 2;
-}
-
-message GetDataVersionHoldersRequest {
-  string knowledge_base_id = 1;
-
-  // version_id is the version that must be servable. A node whose reported
-  // cursor reaches it is a holder; a node that has never reported is absent —
-  // which is why an empty answer is not "nobody has it".
-  int64 version_id = 2;
-}
-
-message GetDataVersionHoldersResponse {
-  // Ascending by node_id, so a caller's choice is reproducible rather than
-  // dependent on map iteration order.
-  repeated DataVersionHolder holders = 1;
-
-  // known is false when the answering node is not the control leader: its
-  // aggregate is empty only because it has never folded a report. The caller
-  // should re-resolve the leader rather than read the empty list as a fact.
-  bool known = 2;
-
-  // degraded reports whether fewer than a quorum of the replicas that must hold
-  // a version are live, so a WRITE for this knowledge base cannot reach its
-  // durability target (docs/storage-degradation-signal-plan.md §3).
-  //
-  // It rides this response because the station already polls this RPC on every
-  // route refresh (§4.2): no new channel and no new collection, since the
-  // control leader's §7.13.4 aggregate already holds every input the verdict
-  // needs.
-  bool degraded = 3;
-
-  // degradation_known is the same discipline as `known` above: false means
-  // "no information", which is neither healthy nor unavailable. Callers MUST
-  // allow the write when it is false — the verdict is soft state, so a
-  // leadership change (an empty aggregate) must not become a write outage.
-  // A caller that ignores this and reads a zero `degraded` as authoritative
-  // still ends up right, because failing open is the default.
-  bool degradation_known = 4;
-
-  // degradation_detail is the diagnosis a refusal should carry: how many
-  // replicas are live, the quorum they must reach, and how long the silent ones
-  // have been quiet. Empty when degradation_known is false.
-  string degradation_detail = 5;
-
-  // storage_unavailable is the cluster-tier half of the same answer: NOT ONE of
-  // the replicas that must hold a version is live.
-  //
-  // It is strictly narrower than `degraded`, and the three states are:
-  //   degraded=false, storage_unavailable=false  → a quorum is live
-  //   degraded=true,  storage_unavailable=false  → short of a quorum, but someone answers
-  //   degraded=false, storage_unavailable=true   → nobody answers at all
-  // A caller deciding whether a WRITE can land must therefore check both; a caller
-  // reporting "how bad is it" can treat either as unhealthy.
-  //
-  // Why a separate field rather than one tri-state: the two produce different
-  // refusals (kb_storage_degraded vs storage_unavailable), and whoever reads an
-  // error should be able to tell "the storage layer is gone" from "it is one
-  // replica short" (docs/storage-degradation-signal-plan.md §4.1).
-  //
-  // It fires only in the extreme today, because there is one cluster-wide replica
-  // topology: no knowledge base could be in this state while another is not
-  // (§3.1, §12.3). Per-KB placement (§10.2) is what would make the distinction
-  // routine. Like `degraded`, it is only meaningful when degradation_known.
-  bool storage_unavailable = 6;
-}
