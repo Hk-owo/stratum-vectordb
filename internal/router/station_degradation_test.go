@@ -32,11 +32,11 @@ func (s stubAdminClient) HealthCheck(context.Context, *pb.HealthCheckRequest, ..
 }
 
 // The summary is what the station's cluster-level answers are built from, so its
-// three-way answer has to be right: degraded, healthy, and "no verdict at all".
+// three-way answer has to be right: unhealthy, healthy, and "no verdict at all".
 func TestRouteTable_DegradationSummary(t *testing.T) {
 	t.Run("no verdict in the snapshot is unknown, not healthy", func(t *testing.T) {
-		if _, _, known := tableWithVerdicts(nil).DegradationSummary(); known {
-			t.Error("a snapshot holding no verdicts cannot summarize them")
+		if _, _, known := tableWithVerdict(nil).DegradationSummary(); known {
+			t.Error("a snapshot holding no verdict cannot summarize it")
 		}
 	})
 
@@ -46,51 +46,33 @@ func TestRouteTable_DegradationSummary(t *testing.T) {
 		}
 	})
 
-	t.Run("every KB healthy", func(t *testing.T) {
-		table := tableWithVerdicts(map[string]degradationVerdict{
-			"kb-1": {degraded: false, detail: "3 of 3 required replicas live, quorum is 2"},
-		})
+	t.Run("healthy", func(t *testing.T) {
+		table := tableWithVerdict(&degradationVerdict{detail: "3 of 3 required replicas live, quorum is 2"})
 		degraded, _, known := table.DegradationSummary()
 		if !known || degraded {
 			t.Errorf("summary = (degraded=%v, known=%v), want (false, true)", degraded, known)
 		}
 	})
 
-	t.Run("one degraded KB is enough", func(t *testing.T) {
-		table := tableWithVerdicts(map[string]degradationVerdict{
-			"kb-ok":  {degraded: false},
-			"kb-bad": {degraded: true, detail: "1 of 3 required replicas live, below the quorum of 2"},
-		})
+	t.Run("below quorum", func(t *testing.T) {
+		table := tableWithVerdict(&degradationVerdict{degraded: true, detail: "1 of 3 required replicas live, below the quorum of 2"})
 		degraded, detail, known := table.DegradationSummary()
 		if !known || !degraded {
 			t.Fatalf("summary = (degraded=%v, known=%v), want (true, true)", degraded, known)
 		}
 		if detail != "1 of 3 required replicas live, below the quorum of 2" {
-			t.Errorf("detail = %q, want the degraded KB's diagnosis", detail)
-		}
-	})
-
-	t.Run("the answer does not depend on map iteration order", func(t *testing.T) {
-		table := tableWithVerdicts(map[string]degradationVerdict{
-			"kb-a": {degraded: true, detail: "a"},
-			"kb-b": {degraded: true, detail: "b"},
-		})
-		_, first, _ := table.DegradationSummary()
-		for i := 0; i < 20; i++ {
-			if _, again, _ := table.DegradationSummary(); again != first {
-				t.Fatalf("summary changed between calls: %q then %q — an operator would chase a ghost", first, again)
-			}
+			t.Errorf("detail = %q, want the leader's diagnosis", detail)
 		}
 	})
 }
 
 // queryStation wires a station in front of one stub storage node.
-func queryStation(t *testing.T, verdicts map[string]degradationVerdict, resp *pb.QueryResponse) *QueryServer {
+func queryStation(t *testing.T, verdict *degradationVerdict, resp *pb.QueryResponse) *QueryServer {
 	t.Helper()
 	return NewQueryServer(&Router{
 		storageAddrs: []string{"stub:1"},
 		querys:       []pb.QueryServiceClient{stubQueryClient{resp: resp}},
-		routes:       tableWithVerdicts(verdicts),
+		routes:       tableWithVerdict(verdict),
 	})
 }
 
@@ -98,19 +80,17 @@ func queryStation(t *testing.T, verdicts map[string]degradationVerdict, resp *pb
 // is below quorum. Without this the only way to find out is a write failing.
 func TestQueryServer_ReportsStorageDegradationOnTheReadResponse(t *testing.T) {
 	cases := map[string]struct {
-		verdicts map[string]degradationVerdict
-		want     bool
+		verdict *degradationVerdict
+		want    bool
 	}{
-		"below quorum": {map[string]degradationVerdict{
-			"kb-1": {degraded: true, detail: "1 of 3 required replicas live"},
-		}, true},
-		"healthy":                     {map[string]degradationVerdict{"kb-1": {degraded: false}}, false},
+		"below quorum":                {&degradationVerdict{degraded: true, detail: "1 of 3 required replicas live"}, true},
+		"healthy":                     {&degradationVerdict{}, false},
 		"no verdict at all (unknown)": {nil, false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			// The stub's response is built fresh per case: the injection mutates it.
-			resp, err := queryStation(t, tc.verdicts, &pb.QueryResponse{VersionId: 7}).
+			resp, err := queryStation(t, tc.verdict, &pb.QueryResponse{VersionId: 7}).
 				Query(context.Background(), &pb.QueryRequest{KnowledgeBaseId: "kb-1"})
 			if err != nil {
 				t.Fatalf("Query failed: %v", err)
@@ -128,16 +108,14 @@ func TestQueryServer_ReportsStorageDegradationOnTheReadResponse(t *testing.T) {
 // HealthCheck is where a probe looks, and the storage verdict is the one thing the
 // answering node cannot know.
 func TestAdminServer_HealthCheckCarriesTheStorageDiagnosis(t *testing.T) {
-	station := func(nodeDetails string, verdicts map[string]degradationVerdict) *AdminServer {
+	station := func(nodeDetails string, verdict *degradationVerdict) *AdminServer {
 		return NewAdminServer(&Router{
 			storageAddrs: []string{"stub:1"},
 			admins:       []pb.AdminServiceClient{stubAdminClient{health: &pb.HealthCheckResponse{Details: nodeDetails}}},
-			routes:       tableWithVerdicts(verdicts),
+			routes:       tableWithVerdict(verdict),
 		})
 	}
-	belowQuorum := map[string]degradationVerdict{
-		"kb-1": {degraded: true, detail: "1 of 3 required replicas live, below the quorum of 2"},
-	}
+	belowQuorum := &degradationVerdict{degraded: true, detail: "1 of 3 required replicas live, below the quorum of 2"}
 
 	check := func(t *testing.T, s *AdminServer, want string) {
 		t.Helper()
@@ -167,7 +145,7 @@ func TestAdminServer_HealthCheckCarriesTheStorageDiagnosis(t *testing.T) {
 	})
 
 	t.Run("healthy and unknown both leave the node's answer alone", func(t *testing.T) {
-		check(t, station("ok", map[string]degradationVerdict{"kb-1": {degraded: false}}), "ok")
+		check(t, station("ok", &degradationVerdict{}), "ok")
 		check(t, station("ok", nil), "ok")
 	})
 }

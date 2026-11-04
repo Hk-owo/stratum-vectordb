@@ -191,6 +191,30 @@ func (s *KnowledgeBaseServiceImpl) GetDataVersionHolders(ctx context.Context, re
 	return resp, nil
 }
 
+// GetStorageDegradation answers the station's write gate: can the storage layer still
+// meet a write's durability contract?
+//
+// Not an error when this node cannot judge: known=false sends the station to the next
+// control node, and if none can judge, the write is allowed.
+func (s *KnowledgeBaseServiceImpl) GetStorageDegradation(context.Context, *pb.GetStorageDegradationRequest) (*pb.GetStorageDegradationResponse, error) {
+	resp := &pb.GetStorageDegradationResponse{}
+	if s.storageGate == nil {
+		return resp, nil
+	}
+	degraded, detail, ok := s.storageGate.StorageDegraded("")
+	if !ok {
+		return resp, nil
+	}
+	resp.Known = true
+	resp.Degraded = degraded
+	resp.Detail = detail
+	if unavailable, unavailableDetail, ok := s.storageGate.StorageUnavailable(""); ok && unavailable {
+		resp.StorageUnavailable = true
+		resp.Detail = unavailableDetail
+	}
+	return resp, nil
+}
+
 // checkStorageWritable refuses a write whose durability contract the storage
 // layer cannot currently meet (docs/storage-degradation-signal-plan.md §4.3).
 //

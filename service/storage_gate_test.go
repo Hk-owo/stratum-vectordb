@@ -318,3 +318,44 @@ func TestAdminService_HealthCheckSaysNothingWhenTheVerdictIsUnknown(t *testing.T
 		t.Errorf("details = %q; an unknown verdict must report nothing", resp.GetDetails())
 	}
 }
+
+// The station's write gate reads this RPC, so its three answers have to stay apart:
+// healthy, each failure tier, and "this node cannot judge".
+func TestKnowledgeBaseService_GetStorageDegradation(t *testing.T) {
+	ask := func(t *testing.T, gate StorageDegradationSource) *pb.GetStorageDegradationResponse {
+		t.Helper()
+		h := newKBSvcTestHarness()
+		if gate != nil {
+			h.svc.SetStorageDegradationSource(gate)
+		}
+		resp, err := h.svc.GetStorageDegradation(context.Background(), &pb.GetStorageDegradationRequest{})
+		if err != nil {
+			t.Fatalf("GetStorageDegradation failed: %v", err)
+		}
+		return resp
+	}
+
+	t.Run("no gate wired is unknown", func(t *testing.T) {
+		if ask(t, nil).GetKnown() {
+			t.Error("a node with no gate cannot judge")
+		}
+	})
+	t.Run("a node that cannot judge says so", func(t *testing.T) {
+		resp := ask(t, &stubStorageGate{known: false, detail: "not the control leader"})
+		if resp.GetKnown() || resp.GetDetail() != "" {
+			t.Errorf("resp = %+v, want unknown with no detail", resp)
+		}
+	})
+	t.Run("short of a quorum", func(t *testing.T) {
+		resp := ask(t, &stubStorageGate{known: true, degraded: true, detail: "1 of 3"})
+		if !resp.GetKnown() || !resp.GetDegraded() || resp.GetStorageUnavailable() || resp.GetDetail() != "1 of 3" {
+			t.Errorf("resp = %+v, want the degraded tier", resp)
+		}
+	})
+	t.Run("nobody answering", func(t *testing.T) {
+		resp := ask(t, &stubStorageGate{known: true, unavailable: true, detail: "none live"})
+		if !resp.GetKnown() || resp.GetDegraded() || !resp.GetStorageUnavailable() || resp.GetDetail() != "none live" {
+			t.Errorf("resp = %+v, want the unavailable tier", resp)
+		}
+	})
+}

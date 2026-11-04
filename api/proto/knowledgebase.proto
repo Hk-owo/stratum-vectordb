@@ -199,6 +199,29 @@ service KnowledgeBaseService {
   // connection (ListKnowledgeBases is how it learns the target version), while
   // the reporters are the data nodes.
   rpc GetDataVersionHolders(GetDataVersionHoldersRequest) returns (GetDataVersionHoldersResponse);
+
+  // GetStorageDegradation answers whether the storage layer can still meet a write's
+  // durability contract, from the replicas' heartbeats on the control leader. The
+  // station polls it once per route refresh: with one cluster-wide replica topology the
+  // verdict is the same for every knowledge base, so it takes no knowledge base.
+  rpc GetStorageDegradation(GetStorageDegradationRequest) returns (GetStorageDegradationResponse);
+}
+
+message GetStorageDegradationRequest {}
+
+message GetStorageDegradationResponse {
+  // known=false means this node cannot judge: it is not the control leader, or no
+  // heartbeat has arrived yet. It is neither healthy nor unavailable, and a caller MUST
+  // allow the write: the verdict is soft state, so a leadership change must not become
+  // a write outage.
+  bool known = 1;
+  // degraded: fewer than a quorum of the required replicas are live, but someone answers.
+  bool degraded = 2;
+  // storage_unavailable: not one required replica is live. Exclusive with degraded, so
+  // the two refusals (kb_storage_degraded, storage_unavailable) stay distinguishable.
+  bool storage_unavailable = 3;
+  // detail is the diagnosis a refusal carries. Empty when known is false.
+  string detail = 4;
 }
 
 message CreateKnowledgeBaseRequest {

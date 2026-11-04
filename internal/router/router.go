@@ -354,10 +354,7 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 	// trying to avoid, and it was live until this mark was added.
 	ctx = r.mark.Stamp(ctx)
 
-	snap := routeSnapshot{
-		expected:    map[string]int64{},
-		degradation: map[string]degradationVerdict{},
-	}
+	snap := routeSnapshot{expected: map[string]int64{}}
 
 	// The control layer is the authority on what exists and what version should
 	// be visible; any control node can answer, they share the log.
@@ -387,107 +384,37 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 		snap.expected[kb.GetKnowledgeBaseId()] = kb.GetActiveVersionId()
 	}
 
-	// Per knowledge base, ask which nodes reported holding its expected version,
-	// and whether a write for it can still reach quorum.
+	// The redundancy verdict is one question per refresh, not one per knowledge base:
+	// with a single cluster-wide replica topology every knowledge base shares it.
 	//
-	// A KB whose query fails, or whose answer comes from a non-leader, is simply
-	// left out: Servable then does not narrow for it, which is the same answer it
-	// gives before the first refresh, and the write gate reads a missing verdict
-	// as unknown — which allows. The freshness credential still rides the
-	// forwarded query, so nothing about correctness depends on this succeeding.
-	for kbID, version := range snap.expected {
-		answer, err := r.versionHolders(ctx, kbID, version)
-		if err != nil {
-			r.loggerOrNop().Debug("route table: holders query failed; leaving the KB unnarrowed",
-				zap.String("kb_id", kbID), zap.Int64("version", version), zap.Error(err))
-			continue
-		}
-		// Only a KNOWN verdict is recorded. An absent entry is what makes the
-		// write gate allow, so storing a zero-valued "healthy" for an unknown
-		// answer would launder missing information into a clean bill of health.
-		if answer.degradationKnown {
-			snap.degradation[kbID] = degradationVerdict{
-				degraded:    answer.degraded,
-				unavailable: answer.unavailable,
-				detail:      answer.detail,
-			}
-		}
-	}
+	// A failed query, or an answer from a node that cannot judge, leaves the verdict
+	// unknown, and the write gate reads unknown as allow. The freshness credential still
+	// rides the forwarded query, so nothing about correctness depends on this succeeding.
+	snap.degradation, snap.degradationKnown = r.storageDegradation(ctx)
 	return snap, nil
 }
 
-// holdersAnswer is one control node's answer to the holders question: the storage
-// addresses that reported holding the version, plus the leader's redundancy
-// verdict for the knowledge base.
-//
-// Both ride one response because both come from one aggregate
-// (docs/storage-degradation-signal-plan.md §4.2), and because the station needs
-// them on one schedule: the write gate reads the verdict, the route table reads
-// the addresses, and a single refresh keeps the two consistent with each other.
-type holdersAnswer struct {
-	// addrs are the storage addresses the leader named for this version.
-	addrs []string
-
-	// degraded / unavailable / detail carry the redundancy verdict: the two
-	// failure tiers and the diagnosis, straight off the wire. They become a
-	// degradationVerdict in the snapshot, which is what the write gate reads.
-	degraded    bool
-	unavailable bool
-	detail      string
-
-	// degradationKnown is false when the leader reported no verdict: an older
-	// peer that predates the field, or a leader whose replica topology is not
-	// wired. That is emphatically not "not degraded" — see
-	// RouteTable.Degradation.
-	degradationKnown bool
-}
-
-// versionHolders asks the control layer which nodes hold kbID at version, and
-// returns them together with the leader's redundancy verdict for the knowledge
-// base.
-//
-// ok=false from the leader is not an error: it means the node we reached is not
-// the leader and has folded no reports, so the empty answer carries no
-// information. Returning it as a failure is what makes the caller leave the KB
-// unnarrowed instead of recording "no holders", which Servable would otherwise
-// have to interpret.
-//
-// A non-leader's verdict is skipped along with its holder list, for the same
-// reason it is skipped for the list: an empty aggregate has no verdict to give,
-// and the caller moves on to the node that has one.
-func (r *Router) versionHolders(ctx context.Context, kbID string, version int64) (holdersAnswer, error) {
+// storageDegradation asks the control layer for the storage layer's redundancy verdict.
+// Only the leader can judge, so the question goes round the control set until a node can.
+func (r *Router) storageDegradation(ctx context.Context) (degradationVerdict, bool) {
 	var lastErr error
 	for i := range r.kbs {
-		resp, err := r.kbs[i].GetDataVersionHolders(ctx, &pb.GetDataVersionHoldersRequest{
-			KnowledgeBaseId: kbID,
-			VersionId:       version,
-		})
+		resp, err := r.kbs[i].GetStorageDegradation(ctx, &pb.GetStorageDegradationRequest{})
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		if !resp.GetKnown() {
-			lastErr = errors.New("router: holders answer came from a non-leader")
 			continue
 		}
-		answer := holdersAnswer{
-			addrs:            make([]string, 0, len(resp.GetHolders())),
-			degraded:         resp.GetDegraded(),
-			unavailable:      resp.GetStorageUnavailable(),
-			detail:           resp.GetDegradationDetail(),
-			degradationKnown: resp.GetDegradationKnown(),
-		}
-		for _, h := range resp.GetHolders() {
-			if h.GetAddress() != "" {
-				answer.addrs = append(answer.addrs, h.GetAddress())
-			}
-		}
-		return answer, nil
+		return degradationVerdict{
+			degraded:    resp.GetDegraded(),
+			unavailable: resp.GetStorageUnavailable(),
+			detail:      resp.GetDetail(),
+		}, true
 	}
-	if lastErr == nil {
-		lastErr = errors.New("router: no control node answered the holders query")
-	}
-	return holdersAnswer{}, lastErr
+	r.loggerOrNop().Debug("route table: no control node could judge storage redundancy", zap.Error(lastErr))
+	return degradationVerdict{}, false
 }
 
 // routeTiers orders a storage-layer call's nodes into the tiers it tries them in:
@@ -719,8 +646,7 @@ func WithPinnedVersion(versionID int64) ForwardOption {
 // The control layer checks again regardless, because a request can reach it
 // without passing a station at all.
 //
-// Unknown ALWAYS allows: no verdict for the KB, an unwired table, or a KB the
-// snapshot never saw. The snapshot is periodic and what it carries is soft state,
+// Unknown ALWAYS allows: no verdict in the snapshot, or an unwired table. The snapshot is periodic and what it carries is soft state,
 // so it can be wrong in either direction — which is why the refusal is retryable
 // (both sentinels are codes.Unavailable) and why this signal never decides
 // correctness, only fails earlier and with a reason the caller can read.
@@ -732,7 +658,7 @@ func (r *Router) writeGate(kbID string) error {
 	if r.routes == nil || kbID == "" {
 		return nil
 	}
-	verdict, known := r.routes.Degradation(kbID)
+	verdict, known := r.routes.Degradation()
 	if !known || !verdict.unhealthy() {
 		return nil
 	}
@@ -740,7 +666,7 @@ func (r *Router) writeGate(kbID string) error {
 	if verdict.unavailable {
 		sentinel = stratumerrors.ErrStorageUnavailable
 	}
-	return stratumerrors.ToGRPCStatus(fmt.Errorf("%w: %s", sentinel, verdict.detail))
+	return stratumerrors.ToGRPCStatus(fmt.Errorf("%w: %s: %s", sentinel, kbID, verdict.detail))
 }
 
 // budgetSlice bounds one attempt's share of the client's remaining deadline

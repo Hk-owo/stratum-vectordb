@@ -2,7 +2,6 @@ package router
 
 import (
 	"context"
-	"sort"
 	"sync"
 	"time"
 
@@ -45,21 +44,21 @@ type routeSnapshot struct {
 	// credential on a forwarded query.
 	expected map[string]int64
 
-	// degradation[kbID] is the control leader's redundancy verdict for that
-	// knowledge base (docs/storage-degradation-signal-plan.md §4.3): whether a
-	// write for it can still reach a quorum of the replicas that must hold it.
+	// degradation is the control leader's redundancy verdict
+	// (docs/storage-degradation-signal-plan.md §4.3): whether a write can still reach a
+	// quorum of the replicas that must hold it. There is one replica topology for the
+	// whole cluster, so there is one verdict rather than one per knowledge base.
 	//
-	// An absent entry means the leader reported no verdict for this KB, which is
-	// "no information": never "healthy", never "unavailable". The write gate lets
-	// the write through on absence — see Degradation.
-	degradation map[string]degradationVerdict
+	// degradationKnown=false is "no information": never "healthy", never "unavailable".
+	// The write gate lets the write through then — see Degradation.
+	degradation      degradationVerdict
+	degradationKnown bool
 }
 
-// degradationVerdict is one knowledge base's redundancy verdict as the leader
-// reported it.
+// degradationVerdict is the redundancy verdict as the leader reported it.
 //
 // degraded and unavailable are mutually exclusive on the wire — they are the two
-// failure tiers of the same judgement (see GetDataVersionHoldersResponse in
+// failure tiers of the same judgement (see GetStorageDegradationResponse in
 // knowledgebase.proto) — and are kept as two fields rather than one tri-state
 // because that is what the leader sends.
 type degradationVerdict struct {
@@ -78,72 +77,42 @@ func (v degradationVerdict) unhealthy() bool {
 	return v.degraded || v.unavailable
 }
 
-// Degradation reports whether the last snapshot says a write for kbID cannot
-// reach quorum, which failure tier it is, and the leader's diagnosis.
+// Degradation reports the last snapshot's verdict on whether a write can reach quorum,
+// which failure tier it is, and the leader's diagnosis.
 //
-// known=false means this station holds no verdict for the KB: no successful
-// refresh yet, the KB was absent from the last one, or the leader answered no
-// verdict for it (a follower, an unwired replica topology). A caller MUST allow
-// the write then. The verdict is soft state — a leadership change empties the
-// leader's aggregate — so "cannot tell" has to fall in the harmless direction,
-// or a failover becomes a write outage (§3.3, §4.3).
-func (t *RouteTable) Degradation(kbID string) (verdict degradationVerdict, known bool) {
+// known=false means this station holds no verdict: no successful refresh yet, or the
+// leader answered none (a follower, an unwired replica topology). A caller MUST allow the
+// write then. The verdict is soft state — a leadership change empties the leader's view —
+// so "cannot tell" has to fall in the harmless direction, or a failover becomes a write
+// outage (§3.3, §4.3).
+func (t *RouteTable) Degradation() (verdict degradationVerdict, known bool) {
 	if t == nil {
 		return degradationVerdict{}, false
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if !t.ready {
+	if !t.ready || !t.snapshot.degradationKnown {
 		return degradationVerdict{}, false
 	}
-	verdict, ok := t.snapshot.degradation[kbID]
-	if !ok {
-		return degradationVerdict{}, false
-	}
-	return verdict, true
+	return t.snapshot.degradation, true
 }
 
-// DegradationSummary reports whether ANY knowledge base in the last snapshot
-// cannot be written — either failure tier — with that verdict's diagnosis.
-//
-// It answers the station's cluster-level questions: the `storage_degraded` flag on
-// a read response, and the storage line HealthCheck appends. Both ask "is the
-// storage layer unhealthy", where BOTH tiers are a yes — the distinction between
-// "short a quorum" and "nobody answering" is worth naming on a refusal (§4.1), but
+// DegradationSummary answers the station's cluster-level questions: the
+// `storage_degraded` flag on a read response, and the storage line HealthCheck appends.
+// Both ask "is the storage layer unhealthy", where BOTH tiers are a yes — the distinction
+// between "short a quorum" and "nobody answering" is worth naming on a refusal (§4.1), but
 // not worth hiding from a caller asking whether things are well.
 //
-// With a single cluster-wide replica topology every KB shares the verdict
-// (docs/storage-degradation-signal-plan.md §3.1), so "some KB is unhealthy" and
-// "the storage layer is unhealthy" are the same statement; per-KB placement
-// (§10.2) is what would make the difference meaningful, and this method is where
-// it would have to be drawn.
-//
-// known=false means the snapshot holds no verdict at all — no successful refresh
-// yet, or the leader reported none — and callers must read it as "report
-// nothing", never as "healthy".
+// known=false means the caller must report nothing, never "healthy".
 func (t *RouteTable) DegradationSummary() (unhealthy bool, detail string, known bool) {
-	if t == nil {
+	verdict, known := t.Degradation()
+	if !known {
 		return false, "", false
 	}
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if !t.ready || len(t.snapshot.degradation) == 0 {
-		return false, "", false
+	if !verdict.unhealthy() {
+		return false, "", true
 	}
-	// Sorted so the answer does not depend on map iteration order: a station
-	// answering two identical requests with two different diagnoses would be a
-	// debugging trap.
-	kbs := make([]string, 0, len(t.snapshot.degradation))
-	for kbID := range t.snapshot.degradation {
-		kbs = append(kbs, kbID)
-	}
-	sort.Strings(kbs)
-	for _, kbID := range kbs {
-		if verdict := t.snapshot.degradation[kbID]; verdict.unhealthy() {
-			return true, verdict.detail, true
-		}
-	}
-	return false, "", true
+	return true, verdict.detail, true
 }
 
 // NewRouteTable returns a table refreshed by refresh every interval.
