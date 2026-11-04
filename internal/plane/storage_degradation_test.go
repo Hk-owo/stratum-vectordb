@@ -216,12 +216,26 @@ func TestDataVersionRegistry_DegradeUnknownIsNotUnavailable(t *testing.T) {
 	})
 }
 
+// degradationFixture wires a leader-side control plane with an aggregate and a replica
+// set. The gate is primed first: the first IsLeader() of a new term clears the aggregate,
+// so the tests record their reports afterwards, which is also what happens in production.
+func degradationFixture(t *testing.T, required ...int64) (*LocalControlPlane, *DataVersionRegistry) {
+	t.Helper()
+	reg := NewDataVersionRegistry()
+	gate := NewLeaderGate(func() bool { return true }, reg.Reset)
+	c := NewLocalControlPlane(nil,
+		WithDataVersionView(reg, gate),
+		WithRequiredReplicas(func() ([]int64, error) { return required, nil }))
+	gate.IsLeader()
+	return c, reg
+}
+
 // StorageDegradation is the verdict behind the leader gate and the topology hook,
 // so the ways of NOT being able to judge it are checked through that entry point
 // too — that is the one the write gates actually call.
 func TestLocalControlPlane_StorageDegradation(t *testing.T) {
 	t.Run("below quorum, and the diagnosis names the knowledge base", func(t *testing.T) {
-		c, reg := reclaimFixture(t, 1, 2, 3)
+		c, reg := degradationFixture(t, 1, 2, 3)
 		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
 
 		state, detail, ok := c.StorageDegradation("kb-1")
@@ -294,7 +308,7 @@ func TestLocalControlPlane_StorageDegradation(t *testing.T) {
 // here keeps the simplification deliberate rather than a surprise on the day per-KB
 // placement lands (§10.2).
 func TestLocalControlPlane_StorageDegradationIgnoresTheKnowledgeBase(t *testing.T) {
-	c, reg := reclaimFixture(t, 1, 2)
+	c, reg := degradationFixture(t, 1, 2)
 	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
 
 	busyState, _, busyOK := c.StorageDegradation("kb-1")

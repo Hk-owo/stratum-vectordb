@@ -114,25 +114,21 @@ func (s *AdminServiceImpl) SetGCPressureReporter(r GCPressureReporter) {
 	s.gcPressure = r
 }
 
-// ReclaimBlockedReplica names one required replica that keeps a knowledge base's §7.5
-// reclaim watermark unavailable, and why. It mirrors plane.ReclaimBlocker rather than
-// importing it, for the reason StorageDegradationSource mirrors the redundancy verdict
-// instead of reusing plane's enum: the service layer carries the answer, and the plane's
-// vocabulary does not cross that boundary.
+// ReclaimBlockedReplica names one replica that kept a knowledge base's §7.5 reclaim
+// watermark unavailable, and why. It mirrors plane.ReclaimBlocker rather than importing
+// it, for the reason StorageDegradationSource mirrors the redundancy verdict instead of
+// reusing plane's enum: the service layer carries the answer, and the plane's vocabulary
+// does not cross that boundary.
 type ReclaimBlockedReplica struct {
-	NodeID int64
-	// Reason is one of three stable wire names (see the ReclaimBlocker message in
-	// admin.proto): "never_reported", "no_cursor_for_kb" or "stale".
+	Address string
+	// Reason is one of two stable wire names (see the ReclaimBlocker message in
+	// admin.proto): "unreachable" or "no_cursor_for_kb".
 	Reason string
-	// Reached is its last reported cursor for this knowledge base, 0 when it has none.
-	Reached int64
-	// ReportedAt is when that report arrived; the zero time means it has never reported.
-	ReportedAt time.Time
 }
 
-// ReclaimDiagnosticsSource answers "which required replicas keep this knowledge base's
-// reclaim watermark unavailable". Optional: a node that does not lead cannot answer, and
-// a node with no control plane has nothing to ask.
+// ReclaimDiagnosticsSource answers "which replicas kept this knowledge base's reclaim
+// watermark unavailable on this node's last pass". ok=false means the node has not judged
+// yet.
 type ReclaimDiagnosticsSource interface {
 	ReclaimBlockedReplicas(kbID string) ([]ReclaimBlockedReplica, bool)
 }
@@ -351,9 +347,9 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 			// apart about what "waiting for a human" means.
 			failedPermanent = append(failedPermanent, failedVersionsOf(versions)...)
 
-			// §7.5: which required replicas keep THIS knowledge base's reclaim watermark
-			// unavailable. Asked per knowledge base, because the inputs are per knowledge
-			// base: a replica can report others and say nothing about this one.
+			// §7.5: which replicas kept THIS knowledge base's reclaim watermark unavailable
+			// on this node's last pass. Per knowledge base, because the inputs are: a
+			// replica can hold others and nothing of this one.
 			if s.reclaimDiag != nil {
 				if blockers, ok := s.reclaimDiag.ReclaimBlockedReplicas(kb.KBID); ok {
 					reclaimJudgeable = true
@@ -479,19 +475,7 @@ func reclaimBlockedKB(kbID string, blockers []ReclaimBlockedReplica) *pb.Reclaim
 	}
 	out := &pb.ReclaimBlockedKB{KbId: kbID, Blockers: make([]*pb.ReclaimBlocker, 0, len(blockers))}
 	for _, b := range blockers {
-		// Age, not a timestamp: the reader wants "how stale", and the clock that matters is
-		// the one that stamped the report. -1 means "never reported", the convention the
-		// field's own comment documents.
-		ageMS := int64(-1)
-		if !b.ReportedAt.IsZero() {
-			ageMS = time.Since(b.ReportedAt).Milliseconds()
-		}
-		out.Blockers = append(out.Blockers, &pb.ReclaimBlocker{
-			NodeId:          b.NodeID,
-			Reason:          b.Reason,
-			ReachedVersion:  b.Reached,
-			LastReportAgeMs: ageMS,
-		})
+		out.Blockers = append(out.Blockers, &pb.ReclaimBlocker{Address: b.Address, Reason: b.Reason})
 	}
 	return out
 }

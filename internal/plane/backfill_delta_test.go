@@ -148,8 +148,8 @@ func TestLocalDataPlane_BackfillWithoutFetcherIsUnchanged(t *testing.T) {
 // A gap whose deltas are all present but which holds a version the metadata no
 // longer has must be rejected as a whole, NOT replayed. The source can still be
 // serving that version's delta — a BEGIN record leaves its WAL only once every
-// replica that should hold the version has reported a cursor past it
-// (ReclaimableChangesThrough), so while some replica is behind, a DELETED version's
+// replica that should hold the version has a cursor past it (ReclaimChanges), so
+// while some replica is behind, a DELETED version's
 // changes are still readable. Replaying them would write that version's data on a
 // node whose metadata says the version is gone, and nothing would later name that
 // data as removable. The gap goes to the same full-state transfer that already

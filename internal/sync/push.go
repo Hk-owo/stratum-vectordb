@@ -164,12 +164,6 @@ type PushHandler struct {
 	dataVersions DataVersionRecorder
 	isLeader     func() bool
 
-	// watermarks, when set, supplies the §7.5 reclaim watermarks this node carries
-	// back on the report's response. The reporter is the node that may need to act on
-	// them, and under §7.13.2 it need not be the leader — so the leader sends them
-	// rather than waiting to be asked.
-	watermarks ReclaimWatermarkSource
-
 	// chainTails, when set, supplies the version at the TAIL of each knowledge
 	// base's replicated chain — the newest version the control layer has accepted.
 	// A reporter whose own cursor is behind it has fallen behind and may start
@@ -184,13 +178,6 @@ type PushHandler struct {
 	// it because its data-source lookup may run on the Raft apply path, where it
 	// cannot ask (docs/data-source-holders-fallback-plan.md).
 	holders HolderSource
-}
-
-// ReclaimWatermarkSource answers "how far can this knowledge base's recorded changes
-// be discarded?" (v13 §7.5). *plane.LocalControlPlane implements it. Declared here,
-// rather than importing plane, because plane imports this package.
-type ReclaimWatermarkSource interface {
-	ReclaimableChangesThrough(kbID string) (int64, bool)
 }
 
 // ChainTailSource answers "what is the newest version the control layer has accepted
@@ -255,15 +242,6 @@ func WithDataVersionAggregator(rec DataVersionRecorder, isLeader func() bool) Pu
 		h.dataVersions = rec
 		h.isLeader = isLeader
 	}
-}
-
-// WithReclaimWatermarks wires the source of the §7.5 watermarks carried back on a
-// report's response. It is separate from WithDataVersionAggregator because the two
-// answer different questions: the aggregator decides whether to KEEP reports, this
-// decides what to tell reporters they may DISCARD. A leader normally passes itself
-// for both.
-func WithReclaimWatermarks(src ReclaimWatermarkSource) PushHandlerOption {
-	return func(h *PushHandler) { h.watermarks = src }
 }
 
 // WithChainTails wires the source of the chain tails carried back on a report's
@@ -657,22 +635,7 @@ func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 
 	// §2: an owner set is a pure function of (kbID, versionID) and the member set,
 	resp := &pb.ReportDataVersionsResponse{Accepted: true, NodeId: h.nodeID}
-	// Carry back the watermarks for the knowledge bases this reporter just told us
-	// about: those are the ones it holds data for, and hence whose changes could be
-	// sitting in its WAL. Nothing is sent for a knowledge base whose watermark cannot
-	// be established — absent means "keep everything".
-	if h.watermarks != nil {
-		reclaimable := make(map[string]int64)
-		for kbID := range req.GetDataVersions() {
-			if watermark, ok := h.watermarks.ReclaimableChangesThrough(kbID); ok {
-				reclaimable[kbID] = watermark
-			}
-		}
-		if len(reclaimable) > 0 {
-			resp.Reclaimable = reclaimable
-		}
-	}
-	// And the chain tails and holder lists, for every knowledge base this leader
+	// Carry back the chain tails and holder lists, for every knowledge base this leader
 	// knows about — NOT merely the ones this reporter named.
 	//
 	// That difference is the point. A node that missed a whole chain names it in no

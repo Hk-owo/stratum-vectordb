@@ -189,8 +189,11 @@ type LocalDataPlane struct {
 	// LocalDataPlaneConfig.
 	replicaCount  int
 	cursorQuerier CursorQuerier
-	dropper       VersionDataDropper
-	cleaner       VersionDataCleaner
+
+	// reclaimDiag is what the last WAL reclaim pass found blocking each knowledge base.
+	reclaimDiag reclaimDiagnosis
+	dropper     VersionDataDropper
+	cleaner     VersionDataCleaner
 	// tombstones is this node's record of deletions it was told about (see
 	// SetVersionTombstones). Read on every landing path, drained by
 	// StartDeletedVersionRetry, and the home of this node's watermark into the

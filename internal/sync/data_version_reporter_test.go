@@ -15,27 +15,6 @@ type recordingRecorder struct {
 	reports []map[string]int64
 }
 
-// fixedWatermarks is a ReclaimWatermarkSource with a fixed table.
-type fixedWatermarks struct {
-	watermarks map[string]int64
-}
-
-func (w *fixedWatermarks) ReclaimableChangesThrough(kbID string) (int64, bool) {
-	v, ok := w.watermarks[kbID]
-	return v, ok
-}
-
-// recordingSink captures what a leader carried back.
-type recordingSink struct {
-	calls   int
-	lastOne map[string]int64
-}
-
-func (s *recordingSink) SetLeaderWatermarks(watermarks map[string]int64) {
-	s.calls++
-	s.lastOne = watermarks
-}
-
 func (r *recordingRecorder) Record(nodeID int64, address string, dataVersions map[string]int64) {
 	r.nodes = append(r.nodes, nodeID)
 	r.reports = append(r.reports, dataVersions)
@@ -213,87 +192,6 @@ func TestDataVersionReporter_ResolverFailureIsRetryable(t *testing.T) {
 	})
 	if err := r.ReportOnce(context.Background()); err == nil {
 		t.Error("a resolver error must surface as a retryable failure")
-	}
-}
-
-// The leader carries back a watermark for each knowledge base the reporter mentioned —
-// those are the ones whose changes could be sitting in the reporter's WAL.
-func TestPushHandler_ReportDataVersions_CarriesWatermarksBack(t *testing.T) {
-	rec := &recordingRecorder{}
-	marks := &fixedWatermarks{watermarks: map[string]int64{"kb-1": 8}}
-	_, _, addr := startPushServer(t, 7,
-		WithDataVersionAggregator(rec, func() bool { return true }),
-		WithReclaimWatermarks(marks))
-
-	resp, err := dialSyncServer(t, addr).ReportDataVersions(context.Background(), &pb.ReportDataVersionsRequest{
-		NodeId:       3,
-		DataVersions: map[string]int64{"kb-1": 8, "kb-2": 4},
-	})
-	if err != nil {
-		t.Fatalf("ReportDataVersions: %v", err)
-	}
-	if got := resp.GetReclaimable()["kb-1"]; got != 8 {
-		t.Errorf("reclaimable[kb-1] = %d, want 8", got)
-	}
-	// kb-2 has no watermark, so it must be absent — an unknown must not travel as a
-	// default value, or the reporter would reclaim changes it cannot justify.
-	if _, present := resp.GetReclaimable()["kb-2"]; present {
-		t.Error("kb-2 has no watermark and must not be sent")
-	}
-}
-
-// An accepted report stores what the leader carried back; that is what lets a node
-// which writes data — and therefore does not lead — learn the watermark.
-func TestDataVersionReporter_StoresWatermarksFromAnAcceptedReport(t *testing.T) {
-	rec := &recordingRecorder{}
-	marks := &fixedWatermarks{watermarks: map[string]int64{"kb-1": 8}}
-	_, _, addr := startPushServer(t, 7,
-		WithDataVersionAggregator(rec, func() bool { return true }),
-		WithReclaimWatermarks(marks))
-
-	sink := &recordingSink{}
-	r := NewDataVersionReporter(DataVersionReporterConfig{
-		NodeID:       3,
-		DataVersions: func() map[string]int64 { return map[string]int64{"kb-1": 8} },
-		ResolveLeader: func(context.Context) (string, bool, error) {
-			return addr, true, nil
-		},
-		Watermarks: sink,
-	})
-	if err := r.ReportOnce(context.Background()); err != nil {
-		t.Fatalf("ReportOnce: %v", err)
-	}
-	if sink.calls != 1 {
-		t.Fatalf("sink calls = %d, want 1", sink.calls)
-	}
-	if sink.lastOne["kb-1"] != 8 {
-		t.Errorf("stored watermarks = %v, want kb-1:8", sink.lastOne)
-	}
-}
-
-// A refused report must NOT move the watermarks: a stale or wrong-node answer cannot
-// be allowed to decide what may be discarded.
-func TestDataVersionReporter_RefusedReportDoesNotMoveWatermarks(t *testing.T) {
-	rec := &recordingRecorder{}
-	// A non-leader: it declines.
-	_, _, addr := startPushServer(t, 7,
-		WithDataVersionAggregator(rec, func() bool { return false }),
-		WithReclaimWatermarks(&fixedWatermarks{watermarks: map[string]int64{"kb-1": 8}}))
-
-	sink := &recordingSink{}
-	r := NewDataVersionReporter(DataVersionReporterConfig{
-		NodeID:       3,
-		DataVersions: func() map[string]int64 { return map[string]int64{"kb-1": 8} },
-		ResolveLeader: func(context.Context) (string, bool, error) {
-			return addr, true, nil
-		},
-		Watermarks: sink,
-	})
-	if err := r.ReportOnce(context.Background()); err == nil {
-		t.Fatal("a declined report must be reported as not landed")
-	}
-	if sink.calls != 0 {
-		t.Errorf("sink calls = %d, want 0: a refused answer must not move the watermarks", sink.calls)
 	}
 }
 

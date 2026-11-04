@@ -331,12 +331,11 @@ func main() {
 		// service.
 		plane.WithNodeID(cfg.NodeID),
 		plane.WithDataVersionView(dataVersionRegistry, dataVersionGate),
-		// §7.5: the replica set a version must reach before the WAL changes behind
-		// it become reclaimable. It comes from the cluster topology — never from the
-		// aggregate — so a node that is merely silent cannot drop out of the
-		// requirement. Assigned further down (once peerAddrByID exists) and read
-		// through this closure, so the assembly order does not matter; until then it
-		// reports no topology, which yields no watermark, i.e. "keep the changes".
+		// The replica set a write must reach, for the redundancy verdict. It comes from
+		// the cluster topology — never from who has reported — so a node that is merely
+		// silent cannot drop out of the requirement. Assigned further down (once
+		// peerAddrByID exists) and read through this closure, so the assembly order does
+		// not matter.
 		plane.WithRequiredReplicas(func() ([]int64, error) {
 			if requiredReplicaIDs == nil {
 				return nil, errors.New("stratum: replica topology not assembled yet")
@@ -716,10 +715,10 @@ func main() {
 		})
 	}
 
-	// §7.5: which nodes must hold a version before its WAL changes become
-	// reclaimable. The static peer list (cfg.Peers) is the right source: "should
-	// hold it" is a deployment fact, not a runtime observation — deriving it from
-	// who has reported would let a silent node silently leave the requirement.
+	// Which nodes a write must reach. The static peer list (cfg.Peers) is the right
+	// source: "should hold it" is a deployment fact, not a runtime observation —
+	// deriving it from who has reported would let a silent node silently leave the
+	// requirement.
 	requiredReplicaIDs = func() ([]int64, error) {
 		// Same source rule as resolveReplicaAddrs: the declared storage group
 		// when there is one, every Raft member otherwise.
@@ -1424,10 +1423,9 @@ func main() {
 		// verdict is unknown on a node that does not lead, and unknown reports
 		// nothing rather than vouching for storage it cannot see.
 		adminSvc.SetStorageDegradationSource(versionHolderSource{controlPlane})
-		// §7.5: "which required replica is holding this knowledge base's reclaim watermark
-		// still" — the one thing the watermark's own answer cannot carry, and the state
-		// that otherwise stops both pruning and WAL reclamation silently.
-		adminSvc.SetReclaimDiagnosticsSource(reclaimDiagnosticsSource{controlPlane})
+		// §7.5: "which replica kept this knowledge base's reclaim watermark unavailable" —
+		// the state that otherwise stops WAL reclamation silently.
+		adminSvc.SetReclaimDiagnosticsSource(reclaimDiagnosticsSource{dataPlane})
 		// docs/storage-node-state-machine-plan.md §6: surface this node's own
 		// phase and its not-at-rest versions through the existing admin entry
 		// points. Inside this branch the machine always exists — the typed-nil
@@ -1486,13 +1484,10 @@ func main() {
 			// leadership term, so a new leader never answers "who holds V" from
 			// reports it never received.
 			stratumsync.WithDataVersionAggregator(dataVersionRegistry, dataVersionGate.IsLeader),
-			// §7.5: carry the reclaim watermark back on each accepted report, so the
-			// node that WROTE the data can discard its recorded changes even when it
-			// is not the leader (§7.13.2).
-			stratumsync.WithReclaimWatermarks(controlPlane),
-			// docs/active-lag-detection-design.md: and the chain tail, for the same
-			// reason — the leader is the only one that knows where the chain ends, and
-			// the reporter is the one that must decide whether it has fallen behind.
+			// docs/active-lag-detection-design.md: carry the chain tail back on each
+			// accepted report — the leader is the only one that knows where the chain
+			// ends, and the reporter is the one that must decide whether it has fallen
+			// behind.
 			stratumsync.WithChainTails(controlPlane),
 			// docs/data-source-holders-fallback-plan.md: and the holders, which the
 			// reporter mirrors so its data-source lookup can answer without dialling —
@@ -1638,9 +1633,6 @@ func main() {
 		ResolveLeader: resolveControlLeader,
 		// The same fingerprint, so the leader and this node can each tell whether
 		// the other computes owner sets over the same replica set.
-		// §7.5: store the watermarks the leader carries back, so this node's WAL can
-		// be reclaimed even when this node is not the leader.
-		Watermarks: controlPlane,
 		// And the chain tails, which are what tell this node it has fallen behind.
 		ChainTails: chainTails,
 		// And the control leader's answer to "who holds this version", which the
@@ -1652,9 +1644,8 @@ func main() {
 
 	// §7.5: reclaim the WAL's recorded changes once every replica holds the versions
 	// behind them. This is a background loop on purpose — compacting rewrites a file,
-	// and nothing on the apply path may block on it. Each pass asks the control plane
-	// for the watermarks (locally as leader, or as carried back on the report), so a
-	// node that writes data reclaims even when it does not lead.
+	// and nothing on the apply path may block on it. Each pass asks the replicas
+	// themselves how far they have reached.
 	go plane.NewWALReclaimer(plane.WALReclaimerConfig{
 		Reclaimer: dataPlane,
 		Logger:    logger,
@@ -3037,38 +3028,25 @@ func defaultConfig() appConfig {
 	}
 }
 
-// reclaimDiagnosticsSource adapts the control plane's watermark diagnosis
-// (plane.ReclaimBlocker) to the shape the admin service consumes
-// (service.ReclaimBlockedReplica). It is bridged here for the same reason
-// versionHolderSource bridges the holder types: service does not import plane, so the two
-// type systems meet in this one place.
-//
-// The diagnosis is what turns "the reclaim watermark is unknown" into "node 4 has not
-// reported since…", which is the difference between a stuck knowledge base an operator can
-// act on and one they can only wonder about.
+// reclaimDiagnosticsSource adapts the data plane's reclaim diagnosis
+// (plane.ReclaimBlocker) to the shape the admin service reports
+// (service.ReclaimBlockedReplica). It is bridged here because service does not import
+// plane, the same reason versionHolderSource exists.
 type reclaimDiagnosticsSource struct {
-	cp *plane.LocalControlPlane
+	dp *plane.LocalDataPlane
 }
 
-// ReclaimBlockedReplicas reports which required replicas keep kbID's reclaim watermark
-// unavailable, and why.
-//
-// ok=false means this node cannot answer at all (it does not lead): the admin service
-// reports that as "judgement unavailable", never as "nothing is blocked", because those
-// two lead an operator to opposite conclusions.
+// ReclaimBlockedReplicas reports which replicas kept kbID's reclaim watermark unavailable
+// on this node's last pass. ok=false means no pass has judged anything yet: the admin
+// service reports that as "judgement unavailable", never as "nothing is blocked".
 func (s reclaimDiagnosticsSource) ReclaimBlockedReplicas(kbID string) ([]service.ReclaimBlockedReplica, bool) {
-	blockers, ok := s.cp.ReclaimBlockers(kbID)
+	blockers, ok := s.dp.ReclaimBlockers(kbID)
 	if !ok {
 		return nil, false
 	}
 	out := make([]service.ReclaimBlockedReplica, 0, len(blockers))
 	for _, b := range blockers {
-		out = append(out, service.ReclaimBlockedReplica{
-			NodeID:     b.NodeID,
-			Reason:     b.Reason,
-			Reached:    b.Reached,
-			ReportedAt: b.ReportedAt,
-		})
+		out = append(out, service.ReclaimBlockedReplica{Address: b.Address, Reason: b.Reason})
 	}
 	return out, true
 }

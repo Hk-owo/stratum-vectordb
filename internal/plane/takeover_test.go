@@ -60,10 +60,6 @@ func (c *takeoverControl) ReportVersionFailure(context.Context, string, int64, t
 	return false, nil
 }
 
-// ReclaimableChangesThrough defaults to "unknown": every stub must keep the data,
-// because that is the only safe answer when the judgement cannot be made.
-func (c *takeoverControl) ReclaimableChangesThrough(string) (int64, bool) { return 0, false }
-
 var _ ControlPlane = (*takeoverControl)(nil)
 
 // stubPresence answers per-peer "do you hold it?".

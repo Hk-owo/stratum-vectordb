@@ -128,15 +128,4 @@ type ControlPlane interface {
 	// is absent from durableVersions. The invariant it enforces is
 	// "control-layer state never runs ahead of storage-layer data".
 	ReportEpoch(ctx context.Context, epoch uint64, dataVersions map[string]int64, indexReadyVersions map[string][]int64) error
-
-	// ReclaimableChangesThrough reports the highest version V whose recorded
-	// changes may be discarded, because every replica that should hold it has
-	// reported a cursor reaching V (v13 §7.5). ok=false means "unknown" — not the
-	// leader, no aggregate wired, or some replica has not reported — and every one
-	// of those answers means the same thing: keep the data.
-	//
-	// It is on this interface because the storage layer is what PHYSICALLY reclaims
-	// (the WAL is its own file), while the judgement is global: only the leader holds
-	// the reports, so a node asks its control layer rather than computing it locally.
-	ReclaimableChangesThrough(kbID string) (int64, bool)
 }

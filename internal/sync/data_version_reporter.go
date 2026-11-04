@@ -60,11 +60,6 @@ type DataVersionReporterConfig struct {
 	// listener. Optional.
 	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 
-	// Watermarks receives the §7.5 reclaim watermarks the leader carries back on each
-	// response. Optional: without it this node never learns them and simply keeps all
-	// its recorded changes. *plane.LocalControlPlane implements it.
-	Watermarks LeaderWatermarkSink
-
 	// ChainTails receives the chain tails the leader carries back on each response:
 	// per knowledge base, the newest version the control layer has accepted. It is
 	// the signal a node uses to notice it has fallen behind
@@ -83,14 +78,6 @@ type DataVersionReporterConfig struct {
 	// interval to the only node that has the aggregate. There is nothing to ask
 	// for: the answer comes back with everything else.
 	Holders HoldersSink
-}
-
-// LeaderWatermarkSink receives the watermarks a control leader published on a report's
-// response (v13 §7.5): per knowledge base, the highest version whose recorded changes
-// may be discarded. Declared here, rather than importing plane, because plane imports
-// this package.
-type LeaderWatermarkSink interface {
-	SetLeaderWatermarks(watermarks map[string]int64)
 }
 
 // ChainTailSink receives the chain tails a control leader published on a report's
@@ -132,7 +119,6 @@ type DataVersionReporter struct {
 	interval      time.Duration
 	logger        *zap.Logger
 	dial          func(ctx context.Context, addr string) (*grpc.ClientConn, error)
-	watermarks    LeaderWatermarkSink
 
 	// chainTails receives the chain tails the leader carries back: per knowledge
 	// base, the newest version the control layer has accepted
@@ -163,7 +149,6 @@ func NewDataVersionReporter(cfg DataVersionReporterConfig) *DataVersionReporter 
 		interval:      interval,
 		logger:        cfg.Logger,
 		dial:          dial,
-		watermarks:    cfg.Watermarks,
 		chainTails:    cfg.ChainTails,
 		holders:       cfg.Holders,
 	}
@@ -225,15 +210,8 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 			addr, resp.GetNodeId())
 	}
 
-	// An accepted report carries the leader's reclaim watermarks back (§7.5). Storing
-	// them is what lets a node that WRITES data — which under §7.13.2 need not be the
-	// leader — learn how far it may discard its recorded changes. Only an accepted
-	// response updates them: a stale or refused answer must not move the watermarks.
-	if r.watermarks != nil {
-		r.watermarks.SetLeaderWatermarks(resp.GetReclaimable())
-	}
-	// The same accepted response carries the chain tails back. Like the watermarks,
-	// only an accepted answer may act on this node: a stale or refused response says
+	// An accepted response carries the chain tails back. Only an accepted answer may
+	// act on this node: a stale or refused response says
 	// nothing about where the chain is. What the sink does with them is its decision
 	// — an unwired or disabled sink simply does nothing
 	// (docs/active-lag-detection-design.md).
@@ -250,8 +228,7 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 		if r.logger != nil {
 			r.logger.Debug("sync: data-version report landed",
 				zap.Int("reported_kbs", len(r.dataVersions())),
-				zap.Int("chain_tails", len(resp.GetChainTails())),
-				zap.Int("reclaimable", len(resp.GetReclaimable())))
+				zap.Int("chain_tails", len(resp.GetChainTails())))
 		}
 		r.chainTails.SetChainTails(resp.GetChainTails())
 	}
