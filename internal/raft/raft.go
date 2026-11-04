@@ -177,8 +177,8 @@ type RaftNode interface {
 	// when the knowledge base has no versions. Unknown kbID → ErrKnowledgeBaseNotFound.
 	//
 	// It is the EXTREME-VALUE read, and it exists because a caller that only needs
-	// the chain's tail must not pull the whole chain to find its maximum: the §7.5
-	// lag signal asks for the tail once per knowledge base on EVERY cursor report.
+	// the chain's tail must not pull the whole chain to find its maximum: the lag signal
+	// asks for the tail of every knowledge base each time the chain generation moves.
 	// The control node answers in O(1) — the version set is kept in allocation order,
 	// so its last element is the highest surviving id — and the remote shape falls
 	// back to a whole-chain read, which is correct but not cheap (only a leader asks,

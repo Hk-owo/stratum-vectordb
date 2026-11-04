@@ -10,6 +10,8 @@ package errors
 
 import (
 	"errors"
+	"fmt"
+	"strconv"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
@@ -224,6 +226,12 @@ func ToGRPCStatus(err error) error {
 		return nil
 	}
 	if reason := Name(err); reason != "" {
+		var behind *ReplicaBehindError
+		if errors.As(err, &behind) {
+			return statusWithMetadata(grpcCodeOf(err), err.Error(), reason, map[string]string{
+				localVersionMetadataKey: strconv.FormatInt(behind.Have, 10),
+			})
+		}
 		return statusWithReason(grpcCodeOf(err), err.Error(), reason)
 	}
 	// Checked with errors.As against the GRPCStatus interface rather than
@@ -253,12 +261,67 @@ func grpcCodeOf(err error) codes.Code {
 // status, so failing to attach is not an error: the reason is an improvement,
 // not a requirement.
 func statusWithReason(code codes.Code, msg, reason string) error {
+	return statusWithMetadata(code, msg, reason, nil)
+}
+
+// statusWithMetadata is statusWithReason plus structured facts about the failure.
+func statusWithMetadata(code codes.Code, msg, reason string, metadata map[string]string) error {
 	st := status.New(code, msg)
-	detailed, err := st.WithDetails(&errdetails.ErrorInfo{Reason: reason})
+	detailed, err := st.WithDetails(&errdetails.ErrorInfo{Reason: reason, Metadata: metadata})
 	if err != nil {
 		return st.Err()
 	}
 	return detailed.Err()
+}
+
+// localVersionMetadataKey carries a refusing replica's contiguous cursor on the wire.
+const localVersionMetadataKey = "local_version"
+
+// ReplicaBehindError is a replica refusing a query because its contiguous history
+// has not reached the version the caller requires. It is an ErrIndexNotReady, so it
+// stays retryable on another replica; the cursor is what lets the caller remember how
+// far behind this replica was instead of asking it again straight away.
+type ReplicaBehindError struct {
+	KBID string
+	Have int64
+	Want int64
+}
+
+func (e *ReplicaBehindError) Error() string {
+	return fmt.Sprintf("%v: %s: local history reaches version %d, below the required %d",
+		ErrIndexNotReady, e.KBID, e.Have, e.Want)
+}
+
+// Unwrap keeps the sentinel reachable, which is what gives the error its wire name.
+func (e *ReplicaBehindError) Unwrap() error { return ErrIndexNotReady }
+
+// ReplicaCursorOf reads the cursor a refusing replica attached to a gRPC status. ok is
+// false for every other error, including an older replica's refusal that carries the
+// reason without the cursor.
+func ReplicaCursorOf(err error) (int64, bool) {
+	if err == nil {
+		return 0, false
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return 0, false
+	}
+	for _, detail := range st.Details() {
+		info, ok := detail.(*errdetails.ErrorInfo)
+		if !ok {
+			continue
+		}
+		raw, ok := info.GetMetadata()[localVersionMetadataKey]
+		if !ok {
+			return 0, false
+		}
+		cursor, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil {
+			return 0, false
+		}
+		return cursor, true
+	}
+	return 0, false
 }
 
 // ReasonOf returns the sentinel name a gRPC status carries as ErrorInfo, or ""

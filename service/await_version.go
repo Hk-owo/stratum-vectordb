@@ -264,17 +264,6 @@ func (s *KnowledgeBaseServiceImpl) probeDataMissing(ctx context.Context, v types
 		return false
 	}
 
-	// §12 item 2, the cheap half: the control leader's aggregate is what the
-	// replicas themselves reported, so a NAMED holder settles the question without
-	// probing anyone. An EMPTY answer does not settle the opposite — it means
-	// "nobody I have heard from" (§3.1) — so the probe below stays as the
-	// fallback, and a node that is not the leader (ok == false) skips straight to
-	// it.
-	if s.versionHolders != nil {
-		if holders, ok := s.versionHolders.DataVersionHolders(v.KBID, v.VersionID); ok && len(holders) > 0 {
-			return false
-		}
-	}
 	return s.probeCache.lookupOrProbe(ctx, v, s.replicas(), s.presence)
 }
 

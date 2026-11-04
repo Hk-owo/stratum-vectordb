@@ -2,7 +2,6 @@ package integration_test
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
@@ -18,46 +17,31 @@ import (
 	"stratum/internal/wal"
 )
 
-// startWatermarkServer hosts just the DataSyncService's report endpoint, wired the way
-// a control leader wires it: it aggregates reports AND carries the reclaim watermarks
-// back (§7.5). It is separate from a realNode because this case is about the watermark
-// round trip, not about the whole node.
-func startWatermarkServer(t *testing.T, nodeID int64, control plane.ControlPlane, isLeader func() bool) string {
+// startCursorServer hosts just the DataSyncService's cursor endpoint, the way a replica
+// answers "how far has your history reached".
+func startCursorServer(t *testing.T, nodeID int64, cursors stratumsync.LocalVersionReporter) string {
 	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	srv := grpc.NewServer()
-	handler := stratumsync.NewPushHandler(nil, nodeID,
-		stratumsync.WithDataVersionAggregator(discardRecorder{}, isLeader),
-		stratumsync.WithReclaimWatermarks(control))
-	pb.RegisterDataSyncServiceServer(srv, handler)
+	pb.RegisterDataSyncServiceServer(srv, stratumsync.NewPushHandler(nil, nodeID, stratumsync.WithLocalVersion(cursors)))
 	go srv.Serve(lis)
 	t.Cleanup(srv.Stop)
 	return lis.Addr().String()
 }
 
-// discardRecorder satisfies the aggregator; this case drives the reclaim side.
-type discardRecorder struct{}
+// fixedCursor is a replica whose history reached a fixed version.
+type fixedCursor int64
 
-func (discardRecorder) Record(int64, string, map[string]int64) {}
+func (c fixedCursor) LocalVersionOf(string) int64 { return int64(c) }
 
-// KnowledgeBases is the aggregator's second half: the leader names every chain
-// it knows about, so a reporter that missed one entirely still learns there is
-// something to be behind on. This case discards everything, so it knows nothing.
-func (discardRecorder) KnowledgeBases() []string { return nil }
-
-// TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack is the point of
-// the watermark round trip: the node whose WAL grows is the one that WROTE the data, and
-// under §7.13.2 that need not be the leader. It therefore cannot compute the watermark
-// locally — it learns it from the leader's response to the report it already sends.
-//
-// The case runs three real nodes to get a real leader and two real followers, then acts
-// out exactly that shape on one follower: changes accumulate in its WAL, the watermark
-// arrives by回传, and the committed-and-reclaimed versions must disappear from the log
-// while newer ones stay.
-func TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack(t *testing.T) {
+// TestRealStack_NonLeaderWriterReclaimsItsWALFromItsPeersCursors: the node whose WAL grows
+// is the one that WROTE the data, and under §7.13.2 that need not be the leader. It asks
+// the replicas how far they have reached over a real gRPC connection, and the
+// committed-and-reclaimed versions must disappear from the log while newer ones stay.
+func TestRealStack_NonLeaderWriterReclaimsItsWALFromItsPeersCursors(t *testing.T) {
 	// Two nodes are enough: one leads, one is "not the leader". Keeping this case light
 	// matters — it competes for vecstore subprocesses and ports with every other
 	// integration case, and an oversized fixture makes the whole package flaky.
@@ -119,65 +103,20 @@ func TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack(t *te
 		t.Fatalf("WriteVersionID(v4): %v", err)
 	}
 
-	// --- The leader's side: it holds the reports and computes the watermark. ---
-	leaderRegistry := plane.NewDataVersionRegistry()
-	leaderGate := plane.NewLeaderGate(func() bool { return true }, leaderRegistry.Reset)
-	leaderGate.IsLeader() // prime the takeover clear
-	requiredIDs := []int64{n1.nodeID, n2.nodeID}
-	leaderControl := plane.NewLocalControlPlane(leader.raftNode,
-		plane.WithDataVersionView(leaderRegistry, leaderGate),
-		plane.WithRequiredReplicas(func() ([]int64, error) { return requiredIDs, nil }))
-
-	// Every replica reports a cursor that reaches v3 but not v4: so v3 and below are
-	// reclaimable, v4 is not.
-	for _, id := range requiredIDs {
-		leaderRegistry.Record(id, fmt.Sprintf("10.0.0.%d:7000", id), map[string]int64{kbID: v1 + 2})
-	}
-	watermark, ok := leaderControl.ReclaimableChangesThrough(kbID)
-	if !ok || watermark != v1+2 {
-		t.Fatalf("leader watermark = (%d, %v), want (%d, true)", watermark, ok, v1+2)
-	}
-
-	addr := startWatermarkServer(t, leader.nodeID, leaderControl, func() bool { return true })
-
-	// --- The writer's side: not the leader, so it cannot judge for itself. ---
-	writerRegistry := plane.NewDataVersionRegistry()
-	writerGate := plane.NewLeaderGate(func() bool { return false }, nil)
-	writerControl := plane.NewLocalControlPlane(writer.raftNode,
-		plane.WithDataVersionView(writerRegistry, writerGate))
-	if _, ok := writerControl.ReclaimableChangesThrough(kbID); ok {
-		t.Fatal("a non-leader must not be able to judge the watermark locally")
-	}
-
-	reporter := stratumsync.NewDataVersionReporter(stratumsync.DataVersionReporterConfig{
-		NodeID:       writer.nodeID,
-		DataVersions: func() map[string]int64 { return map[string]int64{kbID: v1 + 2} },
-		ResolveLeader: func(context.Context) (string, bool, error) {
-			return addr, true, nil
-		},
-		Watermarks: writerControl,
-		Logger:     zap.NewNop(),
-	})
-	if err := reporter.ReportOnce(ctx); err != nil {
-		t.Fatalf("ReportOnce: %v", err)
-	}
-
-	// After the round trip the writer CAN judge — from what the leader carried back.
-	watermark, ok = writerControl.ReclaimableChangesThrough(kbID)
-	if !ok || watermark != v1+2 {
-		t.Fatalf("writer watermark after the round trip = (%d, %v), want (%d, true)", watermark, ok, v1+2)
-	}
+	// The peer's history reaches v3 but not v4: so v3 and below are reclaimable, v4 is not.
+	peer := startCursorServer(t, leader.nodeID, fixedCursor(v1+2))
 
 	// --- Reclaim, through the storage layer's own path. ---
 	executor := &d2Executor{}
 	dp := plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
-		WAL:      writer.fileWAL,
-		Executor: executor,
-		Control:  writerControl,
-		Logger:   zap.NewNop(),
+		WAL:             writer.fileWAL,
+		Executor:        executor,
+		CursorQuerier:   stratumsync.NewLocalVersionQuerier(stratumsync.PresenceCheckerConfig{}),
+		ResolveReplicas: func(context.Context) ([]string, error) { return []string{peer}, nil },
+		Logger:          zap.NewNop(),
 	})
-	// No cursor needs seeding: the reclaim scope comes from the WAL's own contents,
-	// not from what this node tracks.
+	// This node's own history reaches further than the peer's, so the peer decides.
+	dp.MarkVersionContiguous(kbID, v1+3)
 	used, err := dp.ReclaimChanges(ctx)
 	if err != nil {
 		t.Fatalf("ReclaimChanges: %v", err)
@@ -200,7 +139,7 @@ func TestRealStack_NonLeaderWriterReclaimsItsWALAfterTheWatermarkComesBack(t *te
 	}
 	for _, v := range []int64{v1 + 1, v1 + 2} {
 		if _, ok := reclaimed[v]; ok {
-			t.Errorf("v%d survived reclamation although every replica reported holding it", v)
+			t.Errorf("v%d survived reclamation although every replica holds it", v)
 		}
 	}
 	// The uncommitted one MUST survive: its replay input is the only repair for a crash.

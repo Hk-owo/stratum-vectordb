@@ -425,88 +425,26 @@ export interface GetKnowledgeBaseResponse {
   knowledge_base: KnowledgeBaseInfo | undefined;
 }
 
-/** DataVersionHolder is one node the leader's aggregate believes holds a version. */
-export interface DataVersionHolder {
-  node_id: string;
-  /**
-   * address is the node's storage-layer gRPC address, as the node itself
-   * reported it. It is carried here so a consumer can act on the answer
-   * directly: the station has to forward to an address, and node ids alone would
-   * force a second id→address map onto every consumer.
-   */
-  address: string;
+export interface GetStorageDegradationRequest {
 }
 
-export interface GetDataVersionHoldersRequest {
-  knowledge_base_id: string;
+export interface GetStorageDegradationResponse {
   /**
-   * version_id is the version that must be servable. A node whose reported
-   * cursor reaches it is a holder; a node that has never reported is absent —
-   * which is why an empty answer is not "nobody has it".
-   */
-  version_id: string;
-}
-
-export interface GetDataVersionHoldersResponse {
-  /**
-   * Ascending by node_id, so a caller's choice is reproducible rather than
-   * dependent on map iteration order.
-   */
-  holders: DataVersionHolder[];
-  /**
-   * known is false when the answering node is not the control leader: its
-   * aggregate is empty only because it has never folded a report. The caller
-   * should re-resolve the leader rather than read the empty list as a fact.
+   * known=false means this node cannot judge: it is not the control leader, or no
+   * heartbeat has arrived yet. It is neither healthy nor unavailable, and a caller MUST
+   * allow the write: the verdict is soft state, so a leadership change must not become
+   * a write outage.
    */
   known: boolean;
-  /**
-   * degraded reports whether fewer than a quorum of the replicas that must hold
-   * a version are live, so a WRITE for this knowledge base cannot reach its
-   * durability target (docs/storage-degradation-signal-plan.md §3).
-   *
-   * It rides this response because the station already polls this RPC on every
-   * route refresh (§4.2): no new channel and no new collection, since the
-   * control leader's §7.13.4 aggregate already holds every input the verdict
-   * needs.
-   */
+  /** degraded: fewer than a quorum of the required replicas are live, but someone answers. */
   degraded: boolean;
   /**
-   * degradation_known is the same discipline as `known` above: false means
-   * "no information", which is neither healthy nor unavailable. Callers MUST
-   * allow the write when it is false — the verdict is soft state, so a
-   * leadership change (an empty aggregate) must not become a write outage.
-   * A caller that ignores this and reads a zero `degraded` as authoritative
-   * still ends up right, because failing open is the default.
-   */
-  degradation_known: boolean;
-  /**
-   * degradation_detail is the diagnosis a refusal should carry: how many
-   * replicas are live, the quorum they must reach, and how long the silent ones
-   * have been quiet. Empty when degradation_known is false.
-   */
-  degradation_detail: string;
-  /**
-   * storage_unavailable is the cluster-tier half of the same answer: NOT ONE of
-   * the replicas that must hold a version is live.
-   *
-   * It is strictly narrower than `degraded`, and the three states are:
-   *   degraded=false, storage_unavailable=false  → a quorum is live
-   *   degraded=true,  storage_unavailable=false  → short of a quorum, but someone answers
-   *   degraded=false, storage_unavailable=true   → nobody answers at all
-   * A caller deciding whether a WRITE can land must therefore check both; a caller
-   * reporting "how bad is it" can treat either as unhealthy.
-   *
-   * Why a separate field rather than one tri-state: the two produce different
-   * refusals (kb_storage_degraded vs storage_unavailable), and whoever reads an
-   * error should be able to tell "the storage layer is gone" from "it is one
-   * replica short" (docs/storage-degradation-signal-plan.md §4.1).
-   *
-   * It fires only in the extreme today, because there is one cluster-wide replica
-   * topology: no knowledge base could be in this state while another is not
-   * (§3.1, §12.3). Per-KB placement (§10.2) is what would make the distinction
-   * routine. Like `degraded`, it is only meaningful when degradation_known.
+   * storage_unavailable: not one required replica is live. Exclusive with degraded, so
+   * the two refusals (kb_storage_degraded, storage_unavailable) stay distinguishable.
    */
   storage_unavailable: boolean;
+  /** detail is the diagnosis a refusal carries. Empty when known is false. */
+  detail: string;
 }
 
 export interface KnowledgeBaseService {
@@ -541,15 +479,10 @@ export interface KnowledgeBaseService {
   ListKnowledgeBases(request: ListKnowledgeBasesRequest): Promise<ListKnowledgeBasesResponse>;
   GetKnowledgeBase(request: GetKnowledgeBaseRequest): Promise<GetKnowledgeBaseResponse>;
   /**
-   * GetDataVersionHolders answers "which nodes reported holding kbID at or past
-   * versionID" — the §3.1 question the service station's route table asks. It
-   * reads the control leader's in-memory §7.13.4 aggregate, which is SOFT state:
-   * an empty answer means "no node I have heard from", never "no node has it".
-   *
-   * It belongs on this control-layer service rather than on DataSyncService
-   * because of who asks and who answers: the station already holds a control
-   * connection (ListKnowledgeBases is how it learns the target version), while
-   * the reporters are the data nodes.
+   * GetStorageDegradation answers whether the storage layer can still meet a write's
+   * durability contract, from the replicas' heartbeats on the control leader. The
+   * station polls it once per route refresh: with one cluster-wide replica topology the
+   * verdict is the same for every knowledge base, so it takes no knowledge base.
    */
-  GetDataVersionHolders(request: GetDataVersionHoldersRequest): Promise<GetDataVersionHoldersResponse>;
+  GetStorageDegradation(request: GetStorageDegradationRequest): Promise<GetStorageDegradationResponse>;
 }

@@ -1,25 +1,29 @@
 package router
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	pb "stratum/api/proto/stratum"
 	stratumerrors "stratum/internal/errors"
 )
 
-// tableWithVerdicts takes one successful snapshot carrying the given verdicts,
-// which is the state the background refresh leaves behind.
-func tableWithVerdicts(verdicts map[string]degradationVerdict) *RouteTable {
+// tableWithVerdict takes one successful snapshot carrying the given verdict (nil means
+// the leader gave none), which is the state the background refresh leaves behind.
+func tableWithVerdict(verdict *degradationVerdict) *RouteTable {
 	table := NewRouteTable(nil, time.Minute, nil)
 	table.mu.Lock()
-	table.snapshot = routeSnapshot{
-		servable:    map[string]map[int]bool{},
-		expected:    map[string]int64{},
-		degradation: verdicts,
+	table.snapshot = routeSnapshot{expected: map[string]int64{}}
+	if verdict != nil {
+		table.snapshot.degradation = *verdict
+		table.snapshot.degradationKnown = true
 	}
 	table.ready = true
 	table.mu.Unlock()
@@ -30,8 +34,8 @@ func tableWithVerdicts(verdicts map[string]degradationVerdict) *RouteTable {
 // reach quorum is refused before the control-layer round trip that would find out
 // the same thing more slowly.
 func TestRouter_WriteGateRefusesWhenTheSnapshotSaysDegraded(t *testing.T) {
-	r := &Router{routes: tableWithVerdicts(map[string]degradationVerdict{
-		"kb-1": {degraded: true, detail: "1 of 3 required replicas live, below the quorum of 2"},
+	r := &Router{routes: tableWithVerdict(&degradationVerdict{
+		degraded: true, detail: "1 of 3 required replicas live, below the quorum of 2",
 	})}
 
 	err := r.writeGate("kb-1")
@@ -53,8 +57,8 @@ func TestRouter_WriteGateRefusesWhenTheSnapshotSaysDegraded(t *testing.T) {
 // The station names the extreme tier the same way the control layer would, so a
 // client sees one error for one fault whichever gate caught it (§4.1).
 func TestRouter_WriteGateNamesTheClusterTier(t *testing.T) {
-	r := &Router{routes: tableWithVerdicts(map[string]degradationVerdict{
-		"kb-1": {unavailable: true, detail: "no required replica is live (the quorum is 2)"},
+	r := &Router{routes: tableWithVerdict(&degradationVerdict{
+		unavailable: true, detail: "no required replica is live (the quorum is 2)",
 	})}
 
 	err := r.writeGate("kb-1")
@@ -76,19 +80,17 @@ func TestRouter_WriteGateNamesTheClusterTier(t *testing.T) {
 // soft state, so "cannot tell" must fall in the harmless direction or a failover
 // becomes a write outage (§3.3).
 func TestRouter_WriteGateAllowsEverythingItCannotJudge(t *testing.T) {
-	table := tableWithVerdicts(map[string]degradationVerdict{
-		"kb-1":  {degraded: true, detail: "1 of 3 required replicas live"},
-		"kb-ok": {degraded: false, detail: "3 of 3 required replicas live, quorum is 2"},
-	})
+	healthy := tableWithVerdict(&degradationVerdict{detail: "3 of 3 required replicas live, quorum is 2"})
+	degraded := tableWithVerdict(&degradationVerdict{degraded: true, detail: "1 of 3 required replicas live"})
 
 	cases := map[string]struct {
 		router *Router
 		kbID   string
 	}{
-		"a healthy verdict":           {&Router{routes: table}, "kb-ok"},
-		"a KB the snapshot never saw": {&Router{routes: table}, "kb-never-seen"},
-		"no route table at all":       {&Router{}, "kb-1"},
-		"no knowledge base named":     {&Router{routes: table}, ""},
+		"a healthy verdict":       {&Router{routes: healthy}, "kb-1"},
+		"no verdict at all":       {&Router{routes: tableWithVerdict(nil)}, "kb-1"},
+		"no route table at all":   {&Router{}, "kb-1"},
+		"no knowledge base named": {&Router{routes: degraded}, ""},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -108,36 +110,34 @@ func TestRouter_WriteGateAllowsBeforeTheFirstRefresh(t *testing.T) {
 	}
 }
 
-// The verdict reaches the gate through the snapshot, and only a KNOWN verdict is
-// recorded: a missing entry is what keeps the gate open.
+// The verdict reaches the gate through the snapshot, and only a KNOWN verdict counts:
+// no verdict is what keeps the gate open.
 func TestRouteTable_Degradation(t *testing.T) {
-	table := tableWithVerdicts(map[string]degradationVerdict{
-		"kb-1": {degraded: true, detail: "1 of 3 required replicas live"},
-	})
+	table := tableWithVerdict(&degradationVerdict{degraded: true, detail: "1 of 3 required replicas live"})
 
-	verdict, known := table.Degradation("kb-1")
+	verdict, known := table.Degradation()
 	if !known || !verdict.degraded || verdict.unavailable || verdict.detail != "1 of 3 required replicas live" {
-		t.Errorf("Degradation(kb-1) = (%+v, %v), want the degraded verdict", verdict, known)
+		t.Errorf("Degradation = (%+v, %v), want the degraded verdict", verdict, known)
 	}
 	if !verdict.unhealthy() {
-		t.Error("a KB short of quorum cannot be written")
+		t.Error("a storage layer short of quorum cannot be written")
 	}
 
-	if _, known := table.Degradation("kb-other"); known {
-		t.Error("a KB the snapshot never saw has no verdict, and absence is not a clean bill of health")
+	if _, known := tableWithVerdict(nil).Degradation(); known {
+		t.Error("no verdict in the snapshot is not a clean bill of health")
 	}
 }
 
 // The two tiers travel as two fields, and both are "cannot write" — the write gate
 // is what turns the difference into a different sentinel.
 func TestRouteTable_VerdictTiers(t *testing.T) {
-	table := tableWithVerdicts(map[string]degradationVerdict{
-		"kb-gone": {unavailable: true, detail: "no required replica is live (the quorum is 2)"},
+	table := tableWithVerdict(&degradationVerdict{
+		unavailable: true, detail: "no required replica is live (the quorum is 2)",
 	})
 
-	verdict, known := table.Degradation("kb-gone")
+	verdict, known := table.Degradation()
 	if !known {
-		t.Fatal("the snapshot carries a verdict for this KB")
+		t.Fatal("the snapshot carries a verdict")
 	}
 	if verdict.degraded {
 		t.Error("degraded must stay false when nobody at all is answering: the tiers are exclusive on the wire")
@@ -151,5 +151,34 @@ func TestRouteTable_VerdictTiers(t *testing.T) {
 	unhealthy, detail, known := table.DegradationSummary()
 	if !known || !unhealthy || detail == "" {
 		t.Errorf("DegradationSummary = (%v, %q, %v), want the unavailable tier reported as unhealthy", unhealthy, detail, known)
+	}
+}
+
+type stubKBClient struct {
+	pb.KnowledgeBaseServiceClient
+	resp *pb.GetStorageDegradationResponse
+	err  error
+}
+
+func (s stubKBClient) GetStorageDegradation(context.Context, *pb.GetStorageDegradationRequest, ...grpc.CallOption) (*pb.GetStorageDegradationResponse, error) {
+	return s.resp, s.err
+}
+
+// Only the leader can judge, so the question goes round the control set until someone can,
+// and a set where nobody can leaves the verdict unknown rather than healthy.
+func TestRouter_StorageDegradationAsksUntilSomeoneCanJudge(t *testing.T) {
+	cannot := stubKBClient{resp: &pb.GetStorageDegradationResponse{}}
+	down := stubKBClient{err: errors.New("unreachable")}
+	leader := stubKBClient{resp: &pb.GetStorageDegradationResponse{Known: true, Degraded: true, Detail: "1 of 3"}}
+
+	r := &Router{kbs: []pb.KnowledgeBaseServiceClient{down, cannot, leader}}
+	verdict, known := r.storageDegradation(context.Background())
+	if !known || !verdict.degraded || verdict.detail != "1 of 3" {
+		t.Errorf("verdict = (%+v, %v), want the leader's", verdict, known)
+	}
+
+	r = &Router{kbs: []pb.KnowledgeBaseServiceClient{down, cannot}}
+	if _, known := r.storageDegradation(context.Background()); known {
+		t.Error("nobody could judge, so the verdict must be unknown")
 	}
 }

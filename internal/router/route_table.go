@@ -2,32 +2,20 @@ package router
 
 import (
 	"context"
-	"sort"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 )
 
-// RouteTable is the service station's routing cache (§9.3(1)): which storage
-// nodes can serve which knowledge base at which version.
+// RouteTable is the service station's cache of what the control layer knows and a
+// forwarded call needs: the version each knowledge base should be served at, which the
+// station stamps on a query as the freshness credential (§9.3(2)), and the storage
+// layer's redundancy verdict for the write gate.
 //
-// It is filled from the CONTROL layer, not by probing storage nodes: the leader
-// already folds every node's periodic §7.13.4 cursor report into an in-memory
-// aggregate, and answers "which nodes reported holding version V" from it
-// (GetDataVersionHolders, §3.1). Reading that is what §4.3(1) asks for —
-// "refreshed asynchronously from the control layer, not asking it on every
-// query".
-//
-// The alternative — each station probing every storage node for its cursor, per
-// knowledge base, every interval — is the duplication §2.2 keeps out of this
-// design: a second view of where data is, maintained on its own schedule, free
-// to disagree with the leader's. The station would be answering "who has V"
-// differently from the one component whose job that is.
-//
-// The same refresh also collects the version each KB should currently be served
-// at, which the station stamps on a forwarded query as the freshness credential
-// (§9.3(2)).
+// WHERE a query goes is not in here. The owner set is a pure function of the version and
+// the member list, and a node that cannot serve the version refuses by its own cursor,
+// so the station computes the first and learns the second from refusals (Router.routeTiers).
 //
 // Refreshing is periodic and asynchronous by design: §9.3(1) says the table is
 // refreshed in the background rather than consulted per query, so a query costs
@@ -51,47 +39,26 @@ type RouteTable struct {
 
 // routeSnapshot is one observation of the cluster.
 type routeSnapshot struct {
-	// servable[kbID] is the set of storage-node indexes the control leader
-	// reported holding that knowledge base at or past its expected version.
-	// Indexed by this station's own connection order, resolved from the address
-	// each holder reported.
-	//
-	// An absent or empty entry means the leader named no holder — which is
-	// "nobody I have heard from", never "nobody has it" (the aggregate is soft
-	// state). Servable treats it as "no narrowing", not as "nothing can serve".
-	//
-	// The leader already leaves out nodes silent for longer than its 15 s window
-	// (DataVersionRegistry.Holders), so a crashed storage node stops being a candidate at
-	// the next refresh instead of being probed once per breaker cooldown. That is a
-	// narrowing, not a verdict: the version credential on the forwarded query is what
-	// makes a stale holder refuse, so an empty set here is still "ask anyone", never "no
-	// one has it".
-	servable map[string]map[int]bool
-
 	// expected[kbID] is the version that knowledge base should currently be
 	// served at — the control layer's answer, which becomes the freshness
 	// credential on a forwarded query.
 	expected map[string]int64
 
-	// degradation[kbID] is the control leader's redundancy verdict for that
-	// knowledge base (docs/storage-degradation-signal-plan.md §4.3): whether a
-	// write for it can still reach a quorum of the replicas that must hold it.
+	// degradation is the control leader's redundancy verdict
+	// (docs/storage-degradation-signal-plan.md §4.3): whether a write can still reach a
+	// quorum of the replicas that must hold it. There is one replica topology for the
+	// whole cluster, so there is one verdict rather than one per knowledge base.
 	//
-	// It rides the same refresh as `servable` because the leader answers both
-	// from one aggregate, on the RPC this station already polls (§4.2) — no new
-	// channel and no second collection.
-	//
-	// An absent entry means the leader reported no verdict for this KB, which is
-	// "no information": never "healthy", never "unavailable". The write gate lets
-	// the write through on absence — see Degradation.
-	degradation map[string]degradationVerdict
+	// degradationKnown=false is "no information": never "healthy", never "unavailable".
+	// The write gate lets the write through then — see Degradation.
+	degradation      degradationVerdict
+	degradationKnown bool
 }
 
-// degradationVerdict is one knowledge base's redundancy verdict as the leader
-// reported it.
+// degradationVerdict is the redundancy verdict as the leader reported it.
 //
 // degraded and unavailable are mutually exclusive on the wire — they are the two
-// failure tiers of the same judgement (see GetDataVersionHoldersResponse in
+// failure tiers of the same judgement (see GetStorageDegradationResponse in
 // knowledgebase.proto) — and are kept as two fields rather than one tri-state
 // because that is what the leader sends.
 type degradationVerdict struct {
@@ -110,72 +77,42 @@ func (v degradationVerdict) unhealthy() bool {
 	return v.degraded || v.unavailable
 }
 
-// Degradation reports whether the last snapshot says a write for kbID cannot
-// reach quorum, which failure tier it is, and the leader's diagnosis.
+// Degradation reports the last snapshot's verdict on whether a write can reach quorum,
+// which failure tier it is, and the leader's diagnosis.
 //
-// known=false means this station holds no verdict for the KB: no successful
-// refresh yet, the KB was absent from the last one, or the leader answered no
-// verdict for it (a follower, an unwired replica topology). A caller MUST allow
-// the write then. The verdict is soft state — a leadership change empties the
-// leader's aggregate — so "cannot tell" has to fall in the harmless direction,
-// or a failover becomes a write outage (§3.3, §4.3).
-func (t *RouteTable) Degradation(kbID string) (verdict degradationVerdict, known bool) {
+// known=false means this station holds no verdict: no successful refresh yet, or the
+// leader answered none (a follower, an unwired replica topology). A caller MUST allow the
+// write then. The verdict is soft state — a leadership change empties the leader's view —
+// so "cannot tell" has to fall in the harmless direction, or a failover becomes a write
+// outage (§3.3, §4.3).
+func (t *RouteTable) Degradation() (verdict degradationVerdict, known bool) {
 	if t == nil {
 		return degradationVerdict{}, false
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if !t.ready {
+	if !t.ready || !t.snapshot.degradationKnown {
 		return degradationVerdict{}, false
 	}
-	verdict, ok := t.snapshot.degradation[kbID]
-	if !ok {
-		return degradationVerdict{}, false
-	}
-	return verdict, true
+	return t.snapshot.degradation, true
 }
 
-// DegradationSummary reports whether ANY knowledge base in the last snapshot
-// cannot be written — either failure tier — with that verdict's diagnosis.
-//
-// It answers the station's cluster-level questions: the `storage_degraded` flag on
-// a read response, and the storage line HealthCheck appends. Both ask "is the
-// storage layer unhealthy", where BOTH tiers are a yes — the distinction between
-// "short a quorum" and "nobody answering" is worth naming on a refusal (§4.1), but
+// DegradationSummary answers the station's cluster-level questions: the
+// `storage_degraded` flag on a read response, and the storage line HealthCheck appends.
+// Both ask "is the storage layer unhealthy", where BOTH tiers are a yes — the distinction
+// between "short a quorum" and "nobody answering" is worth naming on a refusal (§4.1), but
 // not worth hiding from a caller asking whether things are well.
 //
-// With a single cluster-wide replica topology every KB shares the verdict
-// (docs/storage-degradation-signal-plan.md §3.1), so "some KB is unhealthy" and
-// "the storage layer is unhealthy" are the same statement; per-KB placement
-// (§10.2) is what would make the difference meaningful, and this method is where
-// it would have to be drawn.
-//
-// known=false means the snapshot holds no verdict at all — no successful refresh
-// yet, or the leader reported none — and callers must read it as "report
-// nothing", never as "healthy".
+// known=false means the caller must report nothing, never "healthy".
 func (t *RouteTable) DegradationSummary() (unhealthy bool, detail string, known bool) {
-	if t == nil {
+	verdict, known := t.Degradation()
+	if !known {
 		return false, "", false
 	}
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if !t.ready || len(t.snapshot.degradation) == 0 {
-		return false, "", false
+	if !verdict.unhealthy() {
+		return false, "", true
 	}
-	// Sorted so the answer does not depend on map iteration order: a station
-	// answering two identical requests with two different diagnoses would be a
-	// debugging trap.
-	kbs := make([]string, 0, len(t.snapshot.degradation))
-	for kbID := range t.snapshot.degradation {
-		kbs = append(kbs, kbID)
-	}
-	sort.Strings(kbs)
-	for _, kbID := range kbs {
-		if verdict := t.snapshot.degradation[kbID]; verdict.unhealthy() {
-			return true, verdict.detail, true
-		}
-	}
-	return false, "", true
+	return true, verdict.detail, true
 }
 
 // NewRouteTable returns a table refreshed by refresh every interval.
@@ -231,8 +168,8 @@ func (t *RouteTable) Refresh(ctx context.Context) {
 	if t == nil || t.refresh == nil {
 		return
 	}
-	// Bounded, because the work is per storage node per knowledge base and one
-	// node that never answers must not hold the snapshot open indefinitely.
+	// Bounded, because one control node that never answers must not hold the
+	// snapshot open indefinitely.
 	rctx, cancel := context.WithTimeout(ctx, refreshTimeout)
 	defer cancel()
 
@@ -245,59 +182,6 @@ func (t *RouteTable) Refresh(ctx context.Context) {
 	t.snapshot = snap
 	t.ready = true
 	t.mu.Unlock()
-}
-
-// Servable returns the storage node indexes the leader reported holding kbID at
-// or past minVersion, in ascending order.
-//
-// A minVersion of 0 means "no credential": every node qualifies, because there
-// is nothing to be fresh about.
-//
-// NOTE on what the result now IS: it is the set of nodes that HOLD the version,
-// which Router.candidates then intersects with the version's index OWNERS
-// (docs/index-owner-sharding-plan.md §5.1). It is therefore a filter input, not
-// the final candidate set — the holders are necessary but not sufficient once
-// sharding is on. Reading it as "these are the nodes we will try" is still
-// correct with sharding off, which is the default.
-//
-// Before the first successful refresh it also returns every node, and it does the
-// same whenever the leader named no holder for the KB. Both are deliberate and
-// for the same reason: the aggregate is soft state, so an empty answer means "not
-// known" rather than "nothing can serve". Refusing queries on that basis would
-// turn a warm-up — or a KB whose reports have not arrived yet — into an outage.
-// What protects the caller from a stale answer is not this list but the freshness
-// credential on the request: a node that does not hold the version cannot answer
-// it at all.
-func (t *RouteTable) Servable(kbID string, minVersion int64, nodeCount int) []int {
-	if t == nil || minVersion <= 0 {
-		return allIndexes(nodeCount)
-	}
-
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if !t.ready {
-		return allIndexes(nodeCount)
-	}
-
-	set := t.snapshot.servable[kbID]
-	if len(set) == 0 {
-		return allIndexes(nodeCount)
-	}
-	out := make([]int, 0, len(set))
-	for idx := range set {
-		if idx >= 0 && idx < nodeCount {
-			out = append(out, idx)
-		}
-	}
-	if len(out) == 0 {
-		// Every holder the leader named is one this station has no connection to.
-		// Fall back rather than fail: the credential still gates correctness, and
-		// "the station's node list and the leader's differ" is a deployment fact,
-		// not a reason to refuse reads.
-		return allIndexes(nodeCount)
-	}
-	sort.Ints(out)
-	return out
 }
 
 // ExpectedVersion returns the version the control layer says kbID should be

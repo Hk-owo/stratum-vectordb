@@ -125,3 +125,31 @@ func TestToGRPCStatus_LocalSentinelWinsOverIncomingStatus(t *testing.T) {
 		t.Errorf("unrecognized error code = %v, want %v", st.Code(), codes.Internal)
 	}
 }
+
+// TestReplicaBehindError_CursorSurvivesTheWire: the refusal keeps its retryable wire
+// name and carries the cursor as a structured fact.
+func TestReplicaBehindError_CursorSurvivesTheWire(t *testing.T) {
+	err := ToGRPCStatus(&ReplicaBehindError{KBID: "kb-1", Have: 3, Want: 7})
+
+	if got := ReasonOf(err); got != Name(ErrIndexNotReady) {
+		t.Errorf("reason = %q, want the index_not_ready wire name", got)
+	}
+	if cursor, ok := ReplicaCursorOf(err); !ok || cursor != 3 {
+		t.Errorf("cursor = %d/%v, want 3/true", cursor, ok)
+	}
+	if !strings.Contains(err.Error(), "local history reaches version 3, below the required 7") {
+		t.Errorf("message %q lost the diagnosis", err.Error())
+	}
+}
+
+func TestReplicaCursorOf_OnlyAnsweredByACursor(t *testing.T) {
+	for name, err := range map[string]error{
+		"nil":          nil,
+		"plain":        errors.New("boom"),
+		"reason alone": ToGRPCStatus(ErrIndexNotReady),
+	} {
+		if _, ok := ReplicaCursorOf(err); ok {
+			t.Errorf("%s: reported a cursor it does not carry", name)
+		}
+	}
+}

@@ -59,7 +59,7 @@ func TestClientFacingClassifiesTheTwoKindOfTraffic(t *testing.T) {
 	}
 	internal := []string{
 		"/stratum.DataSyncService/PushVersionData",
-		"/stratum.DataSyncService/ReportDataVersions",
+		"/stratum.DataSyncService/Heartbeat",
 		"/stratum.DataSyncService/LocalVersion",
 		"/stratum.InternalService/Propose",
 	}
@@ -95,7 +95,7 @@ func TestAuthGate_GatesClientFacingCallsOnly(t *testing.T) {
 
 	for _, m := range []string{
 		"/stratum.DataSyncService/PushVersionData",
-		"/stratum.DataSyncService/ReportDataVersions",
+		"/stratum.DataSyncService/Heartbeat",
 		"/stratum.InternalService/Propose",
 	} {
 		if _, err := gate(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: m}, handler); err != nil {

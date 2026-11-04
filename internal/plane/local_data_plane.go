@@ -189,8 +189,11 @@ type LocalDataPlane struct {
 	// LocalDataPlaneConfig.
 	replicaCount  int
 	cursorQuerier CursorQuerier
-	dropper       VersionDataDropper
-	cleaner       VersionDataCleaner
+
+	// reclaimDiag is what the last WAL reclaim pass found blocking each knowledge base.
+	reclaimDiag reclaimDiagnosis
+	dropper     VersionDataDropper
+	cleaner     VersionDataCleaner
 	// tombstones is this node's record of deletions it was told about (see
 	// SetVersionTombstones). Read on every landing path, drained by
 	// StartDeletedVersionRetry, and the home of this node's watermark into the
@@ -1192,14 +1195,11 @@ func (d *LocalDataPlane) installPersistedCursor(kbID string, versionID int64) {
 	d.state.InstallCursor(kbID, versionID)
 }
 
-// DataVersionsSnapshot returns a copy of every knowledge base's contiguous
-// cursor — the whole view a node reports to the control leader (§7.13.4).
+// DataVersionsSnapshot returns a copy of every knowledge base's contiguous cursor, which
+// the lag catch-up compares against the chain tails.
 //
-// A copy, not the live map: the caller may encode it, retry it, or hold it across
-// a tick, and a concurrent write must not mutate what was already reported.
-// Knowledge bases with no local data are absent rather than zero, so the receiver
-// can tell "reported 0" from "never reported" — a distinction §7.13.4's aggregate
-// depends on.
+// A copy, not the live map: the caller may hold it across a tick, and a concurrent write
+// must not mutate it. Knowledge bases with no local data are absent rather than zero.
 func (d *LocalDataPlane) DataVersionsSnapshot() map[string]int64 {
 	return d.state.Cursors()
 }
@@ -1428,8 +1428,8 @@ var errBackfillGapIncomplete = errors.New("backfill: the gap cannot be replayed 
 //
 //   - the metadata records the version as REMOVED. This is the case the delta
 //     path alone cannot see, and it is not hypothetical: a version's BEGIN record
-//     leaves the source's WAL only once every replica that should hold it has
-//     reported a cursor past it (ReclaimableChangesThrough), so for as long as some
+//     leaves the source's WAL only once every replica that should hold it has a
+//     cursor past it (ReclaimChanges), so for as long as some
 //     replica is behind — the very situation a backfill runs in — a DELETED
 //     version's delta is still served. Replaying it would write that version's data
 //     on a node whose metadata says the version is gone, and nothing would later
@@ -1561,6 +1561,39 @@ func (d *LocalDataPlane) pickTransferSource(ctx context.Context, kbID string, ne
 		}
 	}
 	return "", false
+}
+
+// PeerHolders asks the replicas how far they have reached for kbID, and returns the
+// furthest version anyone reached with the peers that reached it. Those peers hold every
+// version below it too, since a cursor is a contiguous prefix.
+//
+// ok=false means no peer holds anything it could say so about: a silent peer is not
+// evidence of anything, so it is skipped rather than held against the answer.
+func (d *LocalDataPlane) PeerHolders(ctx context.Context, kbID string) (version int64, addrs []string, ok bool) {
+	if d.cursorQuerier == nil || d.resolveReplicas == nil {
+		return 0, nil, false
+	}
+	peers, err := d.resolveReplicas(ctx)
+	if err != nil {
+		return 0, nil, false
+	}
+	for _, peer := range peers {
+		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
+		cancel()
+		if err != nil || cursor <= 0 || cursor < version {
+			continue
+		}
+		if cursor > version {
+			version, addrs = cursor, addrs[:0]
+		}
+		addrs = append(addrs, peer)
+	}
+	if len(addrs) == 0 {
+		return 0, nil, false
+	}
+	sort.Strings(addrs)
+	return version, addrs, true
 }
 
 // Search runs a vector query against versionID's index.
@@ -2553,8 +2586,8 @@ type MetadataLister interface {
 	ListVersionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error)
 	// LastVersionID is the extreme-value read: the highest version id still in
 	// kbID's metadata (0 when it has none). ChainTail needs exactly this, once per
-	// knowledge base on every cursor report, so it must not be a whole-chain read on
-	// the shape that serves it most (see RaftNode.LastVersionID).
+	// knowledge base on every pull of the chain tails, so it must not be a whole-chain
+	// read on the shape that serves it most (see RaftNode.LastVersionID).
 	LastVersionID(ctx context.Context, kbID string) (int64, error)
 }
 

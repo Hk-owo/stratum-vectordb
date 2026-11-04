@@ -2,6 +2,7 @@ package plane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -59,28 +60,18 @@ type LocalControlPlane struct {
 	// SetFailureBudget. Absent means "use failureBudget".
 	kbBudgets map[string]int32
 
-	// dataVersions is the leader's §7.13.4 aggregate of the storage layer's
-	// cursor reports, and leaderGate answers whether this node is the one whose
-	// aggregate is authoritative. Both nil on a node that does not lead: the
-	// view is simply unavailable there, which callers must be able to tell apart
-	// from "nobody holds it".
-	dataVersions *DataVersionRegistry
-	leaderGate   *LeaderGate
+	// liveness is the leader's record of the storage nodes' heartbeats, and leaderGate
+	// answers whether this node is the one whose record is authoritative. Both nil on a
+	// node that does not lead: the verdict is simply unavailable there.
+	liveness   *LivenessRegistry
+	leaderGate *LeaderGate
 
-	// leaderWatermarks are the watermarks the control leader carried back on a
-	// report's response — the fallback for a node that writes data but does not lead
-	// (see ReclaimableChangesThrough). Guarded by mu.
-	leaderWatermarks map[string]int64
-
-	// requiredReplicas lists the node IDs that must hold a version before the WAL
-	// records behind it may be discarded (§7.5). It comes from the cluster
-	// topology, never from the aggregate: deriving "who should have it" from
-	// "who has reported" would let a node that is merely silent drop out of the
-	// requirement, and the reclaim verdict would then be derived from the very
-	// reports it is supposed to be checked against.
+	// requiredReplicas lists the node IDs a write must reach. It comes from the cluster
+	// topology, never from who has sent a heartbeat: deriving "who should have it" from
+	// "who has spoken" would let a node that is merely silent drop out of the requirement.
 	requiredReplicas func() ([]int64, error)
 
-	// silenceWindow is how long a required replica may go without reporting
+	// silenceWindow is how long a required replica may go without a heartbeat
 	// before the redundancy verdict stops counting it as live
 	// (docs/storage-degradation-signal-plan.md §3.2). It is the verdict's
 	// hysteresis: see Degrade. Zero means DefaultStorageSilenceWindow.
@@ -90,21 +81,17 @@ type LocalControlPlane struct {
 // ControlPlaneOption configures a LocalControlPlane.
 type ControlPlaneOption func(*LocalControlPlane)
 
-// WithDataVersionView wires the leader's §7.13.4 cursor aggregate, so the control
-// plane can answer "which nodes hold version V". The gate is consulted on every
-// query rather than at construction: leadership moves, and a node that has just
-// taken over has an empty aggregate (LeaderGate clears it on takeover) — answering
-// from it is correct, whereas answering from a predecessor's would not be.
-func WithDataVersionView(reg *DataVersionRegistry, gate *LeaderGate) ControlPlaneOption {
+// WithLivenessView wires the leader's record of the storage nodes' heartbeats, so the
+// control plane can judge storage redundancy. Passing the gate alongside it is what makes
+// the record per-term: taking over clears it.
+func WithLivenessView(reg *LivenessRegistry, gate *LeaderGate) ControlPlaneOption {
 	return func(c *LocalControlPlane) {
-		c.dataVersions = reg
+		c.liveness = reg
 		c.leaderGate = gate
 	}
 }
 
-// WithRequiredReplicas wires the replica set a version must reach before the WAL
-// changes behind it become reclaimable (§7.5). Optional: without it the reclaimable
-// watermark stays unavailable, which is the conservative answer.
+// WithRequiredReplicas wires the replica set a write must reach.
 func WithRequiredReplicas(fn func() ([]int64, error)) ControlPlaneOption {
 	return func(c *LocalControlPlane) {
 		c.requiredReplicas = fn
@@ -416,28 +403,10 @@ func (c *LocalControlPlane) promoteDurableData(ctx context.Context, kbID string,
 	return nil
 }
 
-// DataVersionHolders answers "which nodes hold version V of kbID", from the
-// leader's §7.13.4 aggregate of the storage layer's cursor reports. ok=false means
-// the answer is UNAVAILABLE — this node is not the leader, or no aggregate is
-// wired — and is emphatically not "nobody has it": the two lead to opposite
-// actions, since the second would justify deleting data (§10.6) that a healthy
-// node in fact holds.
-//
-// A non-empty result is still only "these nodes reported a cursor reaching V". It
-// is a routing hint: fetch from one of them rather than from a peer that never
-// reached V. It is never evidence for a destructive decision — that needs each
-// node's own confirmation.
-func (c *LocalControlPlane) DataVersionHolders(kbID string, versionID int64) ([]Holder, bool) {
-	if c.dataVersions == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
-		return nil, false
-	}
-	return c.dataVersions.Holders(kbID, versionID), true
-}
-
 // WithStorageSilenceWindow sets how long a required replica may go without
 // reporting before the redundancy verdict stops counting it live
 // (docs/storage-degradation-signal-plan.md §3.2). Non-positive values keep
-// DefaultStorageSilenceWindow, which is three report intervals.
+// DefaultStorageSilenceWindow, which is three heartbeat intervals.
 func WithStorageSilenceWindow(d time.Duration) ControlPlaneOption {
 	return func(c *LocalControlPlane) {
 		if d > 0 {
@@ -451,7 +420,7 @@ func WithStorageSilenceWindow(d time.Duration) ControlPlaneOption {
 //
 // ok=false means the judgement cannot be made — this node is not the control
 // leader, no replica topology is wired, the topology cannot be read, or the
-// aggregate has folded no report yet. Every one of those means the same thing to
+// record holds no heartbeat yet. Every one of those means the same thing to
 // a caller: ALLOW. This is an expression-layer signal rather than a correctness
 // gate, so "cannot tell" must not become a refusal — see Degradation.Known and
 // the plan's §3.3 (fail-open).
@@ -464,10 +433,10 @@ func WithStorageSilenceWindow(d time.Duration) ControlPlaneOption {
 // is carried only so the diagnosis names the knowledge base it was asked about.
 //
 // The verdict is soft state and can be stale in either direction, so a refusal
-// must be retryable: the aggregate moves with the periodic reports, and the caller's
+// must be retryable: the record moves with the heartbeats, and the caller's
 // next attempt is the one that gets the authoritative answer (§4.3).
 func (c *LocalControlPlane) StorageDegradation(kbID string) (StorageState, string, bool) {
-	if c.dataVersions == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
+	if c.liveness == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
 		return StorageHealthy, "storage redundancy unknown: not the control leader", false
 	}
 	if c.requiredReplicas == nil {
@@ -476,11 +445,11 @@ func (c *LocalControlPlane) StorageDegradation(kbID string) (StorageState, strin
 	required, err := c.requiredReplicas()
 	if err != nil {
 		// An unreadable topology is "unknown", never "unavailable": §3.3 lists it
-		// beside the empty aggregate for exactly that reason.
+		// beside the empty record for exactly that reason.
 		return StorageHealthy, fmt.Sprintf(
 			"storage redundancy unknown: read replica topology: %v", err), false
 	}
-	d := c.dataVersions.Degrade(required, time.Now(), c.effectiveSilenceWindow())
+	d := c.liveness.Degrade(required, time.Now(), c.effectiveSilenceWindow())
 	if !d.Known {
 		return StorageHealthy, d.Detail, false
 	}
@@ -524,239 +493,67 @@ func (c *LocalControlPlane) StorageUnavailable(kbID string) (unavailable bool, d
 	return ok && state == StorageUnavailable, detail, ok
 }
 
-// ReclaimableChangesThrough reports the highest version V such that the WAL changes
-// for every version up to V may be discarded (§7.5): each required replica has
-// reported a contiguous cursor reaching V, so the delta has served every peer that
-// was supposed to need it.
+// chainGenerationSource is the part of a Raft node that can name the state of the chain
+// tails. Only the shape that holds the log has it, which is the only shape that leads.
+type chainGenerationSource interface {
+	ChainGeneration() (term, seq uint64)
+}
+
+// ChainGeneration names the current state of the chain tails, so a node can tell whether
+// it has to pull them again. ok=false means this node offers no signal.
 //
-// ok=false means the watermark is NOT KNOWN — this node is not the leader, no
-// aggregate or replica set is wired, the topology cannot be read, or at least one
-// required replica has not reported (or has stopped reporting for longer than the
-// silence window — see localReclaimable). Every one of those resolves to "do not
-// reclaim", which is why they share one answer: a CRASH is the failure mode, and
-// the only safe response to "I cannot prove it is safe" is to keep the data.
-//
-// Note that this is a policy input, not an instruction: reclaiming is irreversible
-// (a node that later needs the gap must fall back to a full state transfer), so the
-// caller decides, and the caller is expected to be conservative.
-func (c *LocalControlPlane) ReclaimableChangesThrough(kbID string) (int64, bool) {
-	// WHICH source is admissible depends on who this node is, and the two are not
-	// interchangeable.
-	//
-	// While this node LEADS, its own aggregate is the only admissible source: "I cannot
-	// compute it" is an answer in itself, and a value carried back on a report's
-	// response is not a substitute for it. That value was computed from evidence this
-	// term may never have received — which is why LeaderGate clears the aggregate on
-	// takeover — and consulting it here would also SELF-PERPETUATE: this node's own
-	// report response carries the answer back in and SetLeaderWatermarks replaces the
-	// map wholesale, so a stale number would keep re-justifying itself for as long as a
-	// required replica stays away.
-	//
-	// A node that WRITES data but does not lead has no authoritative view at all, so
-	// what the leader sent is the only thing it can use. Staleness there is bounded by
-	// one report interval, and a gap it later turns out to need falls back to a
-	// full-state transfer (§6.4).
-	if c.leads() {
-		return c.localReclaimable(kbID)
+// It is read BEFORE the tails it describes wherever the two travel together, so tails
+// are always at least as new as the generation they came with: at worst a node pulls
+// once more than it had to, and it can never miss a change.
+func (c *LocalControlPlane) ChainGeneration() (term, seq uint64, ok bool) {
+	src, isSource := c.rn.(chainGenerationSource)
+	if !isSource {
+		return 0, 0, false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	watermark, ok := c.leaderWatermarks[kbID]
-	return watermark, ok
+	term, seq = src.ChainGeneration()
+	return term, seq, true
 }
 
-// leads reports whether this node's own aggregate is the authoritative view — the one
-// question that decides which watermark source is admissible
-// (ReclaimableChangesThrough). It is deliberately the only place that asks, so a
-// judgement cannot be assembled from two different terms.
-func (c *LocalControlPlane) leads() bool {
-	return c.leaderGate != nil && c.leaderGate.IsLeader()
-}
-
-// ChainTail answers "what is the newest version the control layer has accepted for
-// this knowledge base?" — the tail a node compares its own cursor against to decide
+// ChainTails answers "what is the newest version the control layer has accepted?" for
+// every knowledge base — the tails a node compares its own cursors against to decide
 // whether it has fallen behind (docs/active-lag-detection-design.md).
 //
-// It reads the replicated metadata directly, so this is the leader's answer and
-// nobody else's: a follower's metadata view can lag, and a lagging tail would tell a
-// node it is fine when it is not. Callers must treat false as "no signal", never as
-// "nothing to catch up".
-func (c *LocalControlPlane) ChainTail(kbID string) (int64, bool) {
+// It reads the replicated metadata directly, so this is the leader's answer and nobody
+// else's: a follower's metadata view can lag, and a lagging tail would tell a node it is
+// fine when it is not. The list comes from the metadata rather than from any node's
+// report because a node that missed a whole chain has nothing to report about it, and this
+// is how it learns there is something to be behind on.
+//
+// A knowledge base whose tail cannot be read, or which has no versions, is left out:
+// absence is "no signal", never "nothing to catch up".
+func (c *LocalControlPlane) ChainTails(ctx context.Context) (map[string]int64, error) {
 	if c.rn == nil {
-		c.logger.Debug("plane: chain tail: no metadata source wired", zap.String("kb_id", kbID))
-		return 0, false
+		return nil, errors.New("plane: chain tails: no metadata source wired")
 	}
-	// The EXTREME VALUE, not the chain: this runs once per knowledge base on EVERY
-	// cursor report, so a whole-chain read here was paid per report for one number.
-	// The control node answers in O(1) (see RaftNode.LastVersionID).
-	tail, err := c.rn.LastVersionID(context.Background(), kbID)
-	if err != nil || tail <= 0 {
-		c.logger.Debug("plane: chain tail unavailable",
-			zap.String("kb_id", kbID), zap.Int64("tail", tail), zap.Error(err))
-		return 0, false
+	kbs, err := c.rn.ListKnowledgeBases(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("plane: chain tails: list knowledge bases: %w", err)
 	}
-	c.logger.Debug("plane: chain tail", zap.String("kb_id", kbID), zap.Int64("tail", tail))
-	return tail, true
-}
-
-// ReclaimBlocker names one required replica that keeps a knowledge base's reclaim
-// watermark unavailable, and why. It is the diagnosis the bare "unknown" answer cannot
-// carry: pruning and WAL reclaim both stop silently on it, and the question an operator
-// asks is always "which node, and since when"
-// (LocalControlPlane.ReclaimBlockers).
-type ReclaimBlocker struct {
-	NodeID int64
-	// Reason is one of the ReclaimBlocker* constants below.
-	Reason string
-	// Reached is the replica's last reported cursor for this knowledge base. It is 0
-	// wherever there is no such cursor to quote (never reported, or reported nothing
-	// about this knowledge base) — which is why Reason has to travel with it.
-	Reached int64
-	// ReportedAt is when its last report arrived, on the leader's clock, or the zero time
-	// when it has never reported.
-	ReportedAt time.Time
-}
-
-// The reasons a required replica blocks the watermark. Stable strings, because they
-// travel to an operator-facing status response.
-const (
-	// ReclaimBlockerNeverReported: it has told the leader nothing at all.
-	ReclaimBlockerNeverReported = "never_reported"
-	// ReclaimBlockerNoCursor: it reports, but said nothing about this knowledge base.
-	// That is not the same as reporting zero, and only this knowledge base is affected.
-	ReclaimBlockerNoCursor = "no_cursor_for_kb"
-	// ReclaimBlockerStale: its last report is older than the silence window, so its cursor
-	// is no longer evidence of what it holds now.
-	ReclaimBlockerStale = "stale"
-)
-
-// reclaimState is the single evaluation behind both the local watermark and its
-// diagnosis, so the two cannot drift apart: the minimum cursor over the required
-// replicas, plus every replica that keeps that minimum from meaning anything.
-// localReclaimable and ReclaimBlockers are its two readings — the first wants the number
-// (or "keep the data"), the second wants to be able to say why.
-//
-// FRESHNESS is part of the judgement, and it is the same one StorageDegradation makes
-// (ReportedAt against silenceWindow): a cursor is evidence from the term it was reported
-// in, and it keeps being counted until something replaces it — while reporting is the
-// only thing that replaces it. A replica that swapped its disk, was paused, or was
-// partitioned away therefore does not move this watermark: its OLD cursor stays in the
-// aggregate, and pruning keeps advancing through versions it may still ask about. The
-// window is three report intervals (DefaultStorageSilenceWindow against the reporter's
-// DefaultDataVersionReportInterval), so an ordinary missed report (an election, a
-// restart) cannot be mistaken for a silent replica; three consecutive ones can.
-func (c *LocalControlPlane) reclaimState(kbID string) (int64, []ReclaimBlocker, bool) {
-	if c.dataVersions == nil || c.requiredReplicas == nil || !c.leads() {
-		return 0, nil, false
-	}
-	required, err := c.requiredReplicas()
-	if err != nil || len(required) == 0 {
-		return 0, nil, false
-	}
-
-	// One clock reading for the whole comparison, for the reason Degrade takes now as a
-	// parameter: the evaluation has to be consistent with itself.
-	now := time.Now()
-	window := c.effectiveSilenceWindow()
-
-	// The watermark is the *minimum* across replicas: the slowest replica decides,
-	// because a version is only safe to forget once every peer that needs the delta
-	// has it. A replica that has never reported makes the whole answer unknown
-	// rather than excepting it — its silence is not evidence that it does not need
-	// the changes.
-	watermark := int64(-1)
-	var blockers []ReclaimBlocker
-	for _, nodeID := range required {
-		cursor, hasCursor := c.dataVersions.Cursor(nodeID, kbID)
-		at, seen := c.dataVersions.ReportedAt(nodeID)
-		switch {
-		case !seen:
-			blockers = append(blockers, ReclaimBlocker{NodeID: nodeID, Reason: ReclaimBlockerNeverReported})
-			continue
-		case !hasCursor:
-			blockers = append(blockers, ReclaimBlocker{
-				NodeID: nodeID, Reason: ReclaimBlockerNoCursor, ReportedAt: at,
-			})
-			continue
-		case now.Sub(at) > window:
-			// Someone who should hold this knowledge base has stopped saying so. Its last
-			// cursor is not evidence that it is caught up NOW, and this is the one place
-			// that can notice: the value never falls out of the aggregate on its own.
-			blockers = append(blockers, ReclaimBlocker{
-				NodeID: nodeID, Reason: ReclaimBlockerStale, Reached: cursor, ReportedAt: at,
-			})
+	tails := make(map[string]int64, len(kbs))
+	for _, kb := range kbs {
+		// The extreme value, not the chain: the control node answers in O(1) (see
+		// RaftNode.LastVersionID).
+		tail, err := c.rn.LastVersionID(ctx, kb.KBID)
+		if err != nil || tail <= 0 {
+			c.logger.Debug("plane: chain tail unavailable",
+				zap.String("kb_id", kb.KBID), zap.Int64("tail", tail), zap.Error(err))
 			continue
 		}
-		if watermark < 0 || cursor < watermark {
-			watermark = cursor
-		}
+		tails[kb.KBID] = tail
 	}
-	return watermark, blockers, true
-}
-
-// localReclaimable computes the watermark from this node's own authoritative view.
-// Callers must have established that this node LEADS (see leads) — the identity question
-// is asked there, once, so it cannot be answered from two different terms. It answers
-// false whenever some required replica's cursor is unknown or some required replica has
-// gone quiet; every such answer means "keep the data".
-//
-// The cost, stated plainly: a required replica that stays quiet WITHOUT being removed
-// from the topology holds this watermark — and the WAL reclaim that reads it — still for
-// as long as it is gone. That is the conservative direction (it keeps data), and the
-// remedy is a deployment action: drop the node from storage.nodes. ReclaimBlockers is how
-// that state is meant to become visible rather than merely endured.
-func (c *LocalControlPlane) localReclaimable(kbID string) (int64, bool) {
-	watermark, blockers, ok := c.reclaimState(kbID)
-	if !ok || len(blockers) > 0 || watermark < 0 {
-		return 0, false
-	}
-	return watermark, true
-}
-
-// ReclaimBlockers reports which required replicas keep kbID's watermark unavailable, and
-// why — the diagnosis ReclaimableChangesThrough's bare "unknown" cannot carry.
-//
-// ok=false means the question cannot be put HERE at all (this node does not lead, or no
-// aggregate/topology is wired), and that is NOT the same answer as an empty list: empty
-// means every required replica is reporting and fresh, so the watermark IS available,
-// while ok=false means nobody here can tell. A caller that shows this to an operator has
-// to keep the two apart, or a follower's inability to answer reads as a clean bill of
-// health.
-func (c *LocalControlPlane) ReclaimBlockers(kbID string) ([]ReclaimBlocker, bool) {
-	_, blockers, ok := c.reclaimState(kbID)
-	return blockers, ok
+	return tails, nil
 }
 
 // effectiveSilenceWindow resolves the configured silence window, defaulting it exactly
-// the way DataVersionRegistry.Degrade does — so the redundancy judgement and the reclaim
-// judgement cannot disagree about when a report stopped counting.
+// the way LivenessRegistry.Degrade does.
 func (c *LocalControlPlane) effectiveSilenceWindow() time.Duration {
 	if c.silenceWindow <= 0 {
 		return DefaultStorageSilenceWindow
 	}
 	return c.silenceWindow
-}
-
-// SetLeaderWatermarks records the watermarks the control leader carried back on a
-// report's response. It is only consulted when this node cannot judge locally (see
-// ReclaimableChangesThrough), i.e. on a node that writes data but does not lead. There
-// is deliberately no identity check here: a leading node still STORES what arrives, it
-// simply never reads it. Storing is not what makes a value admissible, and keeping that
-// decision in one place (ReclaimableChangesThrough) is what stops the two sources from
-// being blended.
-//
-// Staleness is safe in the only direction that matters here: a reported watermark was
-// true when the leader computed it, and cursors never move backwards, so a stale value
-// is never HIGHER than the current truth — it reclaims less than it could, never more.
-// (A leader change empties the new leader's aggregate, so the value can also go down;
-// discarding changes the previous leader had justified remains correct, and a replica
-// that later turns out to need one falls back to a full-state transfer by §6.4.)
-func (c *LocalControlPlane) SetLeaderWatermarks(watermarks map[string]int64) {
-	next := make(map[string]int64, len(watermarks))
-	for kbID, version := range watermarks {
-		next[kbID] = version
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.leaderWatermarks = next
 }

@@ -169,16 +169,14 @@ func envDuration(key string, def time.Duration) time.Duration {
 //
 //	① §8.5 table      miss: the writer's confirmation never reached this node
 //	                  (it was down), and nothing replays it;
-//	② holders mirror  miss at first — it is filled from the control leader's
-//	                  aggregate, which arrives on the report RESPONSE, so one report
-//	                  interval is all it takes;
+//	② holders cache   miss at first — the node's catch-up fills it by asking its
+//	                  peers, and a heartbeat is all it takes to start one;
 //	③ leader fallback reaches the CONTROL leader, which in this topology exports no
 //	                  data at all ("PullVersionData: this node exports no data").
 //
 // So "the stranded node got the data" has exactly one explanation left: layer ② was
 // consulted and answered. No push can account for it — the builders shipped v2 while
-// the node was down and never retry — and nothing queries the node (it is not in
-// the station's route table, precisely because it reports a low cursor).
+// the node was down and never retry.
 //
 // WHY THE CLUSTER NEEDS lag_catchup: a restarting replica's reconcile rebuilds
 // missing INDEXES; it does not fetch data, and it gives its head start only to

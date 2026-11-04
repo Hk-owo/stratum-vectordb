@@ -23,8 +23,8 @@ import (
 // UnimplementedDataSyncServiceServer makes a forgotten method compile, register
 // and serve as Unimplemented. Four methods were missing that way —
 // ExecuteVersionWrite (§7.13.2 dispatch), ConfirmVersionWrite (§7.3 takeover
-// stand-down), PullVersionChanges (§7.5 catch-up) and ReportDataVersions
-// (§7.13.4 cursor aggregation) — and each one took a feature down silently.
+// stand-down), PullVersionChanges (§7.5 catch-up) and Heartbeat
+// (the storage redundancy verdict) — and each one took a feature down silently.
 // Reflection cannot catch it (an embedded method is promoted into the type's
 // method set, so it looks present), which is why this calls the wire instead.
 //
@@ -100,8 +100,12 @@ func TestNodeHandler_ForwardsEveryDataSyncMethod(t *testing.T) {
 			_, err := client.ConfirmVersionWrite(ctx, &pb.ConfirmVersionWriteRequest{})
 			return err
 		}},
-		{"ReportDataVersions", func() error {
-			_, err := client.ReportDataVersions(ctx, &pb.ReportDataVersionsRequest{})
+		{"GetChainTails", func() error {
+			_, err := client.GetChainTails(ctx, &pb.GetChainTailsRequest{})
+			return err
+		}},
+		{"Heartbeat", func() error {
+			_, err := client.Heartbeat(ctx, &pb.HeartbeatRequest{})
 			return err
 		}},
 		{"VersionPresence", func() error {

@@ -31,9 +31,8 @@ import (
 //     for — visible only as warnings.
 //   - PullVersionChanges: a lagging peer could not replay recorded deltas (§7.5)
 //     and had to pull each version in full.
-//   - ReportDataVersions: storage nodes could not report their cursors, leaving
-//     the §7.13.4 aggregate empty — the leader's answer to "who holds version V"
-//     was permanently "unknown".
+//   - Heartbeat: storage nodes could not say they were alive, leaving the leader's
+//     redundancy verdict permanently "unknown".
 //
 // testdata/… covers this: a test drives every method of the service through a
 // registered NodeHandler and fails if any of them answers Unimplemented, so the
@@ -163,10 +162,15 @@ func (h *NodeHandler) PullVersionChanges(req *pb.PullVersionChangesRequest, stre
 	return h.receiver.PullVersionChanges(req, stream)
 }
 
-// ReportDataVersions accepts a storage node's periodic cursor report, which the
-// control leader aggregates into the "which node holds version V" view (§7.13.4).
-func (h *NodeHandler) ReportDataVersions(ctx context.Context, req *pb.ReportDataVersionsRequest) (*pb.ReportDataVersionsResponse, error) {
-	return h.receiver.ReportDataVersions(ctx, req)
+// Heartbeat accepts a storage node's periodic "I am alive", which the control leader
+// judges storage redundancy from.
+func (h *NodeHandler) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	return h.receiver.Heartbeat(ctx, req)
+}
+
+// GetChainTails serves a node whose last pull is at a different chain generation.
+func (h *NodeHandler) GetChainTails(ctx context.Context, req *pb.GetChainTailsRequest) (*pb.GetChainTailsResponse, error) {
+	return h.receiver.GetChainTails(ctx, req)
 }
 
 // FetchIndexData serves a peer that wants this node's copy of a version's

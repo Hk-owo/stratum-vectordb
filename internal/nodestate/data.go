@@ -30,14 +30,11 @@ func (m *Machine) Cursor(kbID string) int64 {
 	return m.cursors[kbID]
 }
 
-// Cursors returns every knowledge base's cursor as a copy — the whole view a
-// node reports to the control leader (§7.13.4).
+// Cursors returns every knowledge base's cursor as a copy.
 //
-// A copy, not the live map: the caller may encode it, retry it, or hold it
-// across a tick, and a concurrent write must not mutate what was already
-// reported. Knowledge bases with no local data are absent rather than zero, so
-// the receiver can tell "reported 0" from "never reported" — a distinction
-// §7.13.4's aggregate depends on.
+// A copy, not the live map: the caller may hold it across a tick, and a concurrent
+// write must not mutate it. Knowledge bases with no local data are absent rather than
+// zero.
 func (m *Machine) Cursors() map[string]int64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

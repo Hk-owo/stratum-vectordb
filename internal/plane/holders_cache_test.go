@@ -95,13 +95,12 @@ func TestHoldersCacheLookupReturnsACopy(t *testing.T) {
 }
 
 // "Nobody holds it" must not enter the cache as if it were a fact about where the
-// data IS: an empty holder list is the leader saying "nobody I have heard from",
+// data IS: an empty holder list is only "no peer answered",
 // and freezing that would turn one quiet interval into a lasting negative.
 func TestHoldersCacheRefusesToStoreEmptyAnswers(t *testing.T) {
 	holders := NewHoldersCache(HoldersCacheConfig{})
 	holders.Store("kb-1", 3, nil)
 	holders.Store("kb-1", 3, []string{})
-	holders.StoreHolders(map[string][]string{"kb-1": nil, "kb-2": {}}, map[string]int64{"kb-1": 3, "kb-2": 3})
 
 	if holders.Len() != 0 {
 		t.Fatalf("an empty answer must not be stored, Len = %d", holders.Len())
@@ -111,53 +110,11 @@ func TestHoldersCacheRefusesToStoreEmptyAnswers(t *testing.T) {
 	}
 }
 
-// The response's holders are keyed by knowledge base and are good THROUGH the
-// version named alongside them (on the report response, the chain tail). An entry
-// with no usable version has no defined direction, so it must not enter the cache:
-// storing it at some default would let "these nodes reached 6" answer a question
-// about 10 — the one direction that is not valid.
-func TestHoldersCacheStoreHoldersNeedsAVersion(t *testing.T) {
-	holders := NewHoldersCache(HoldersCacheConfig{})
-
-	holders.StoreHolders(
-		map[string][]string{
-			"kb-1": {"holder:7001"},
-			"kb-2": {"holder:7002"}, // no version alongside it
-			"kb-3": {"holder:7003"}, // a version that is not usable
-			"kb-4": {"holder:7004"}, // usable
-		},
-		map[string]int64{"kb-1": 6, "kb-3": 0, "kb-4": 9},
-	)
-
-	if _, ok := holders.Lookup("kb-1", 6); !ok {
-		t.Fatal("an answer with a version must be usable for that version")
-	}
-	if _, ok := holders.Lookup("kb-1", 4); !ok {
-		t.Fatal("a node holding 6 holds 4 too, so the entry must answer lower asks")
-	}
-	if _, ok := holders.Lookup("kb-1", 10); ok {
-		t.Fatal("a node that reached 6 says nothing about 10")
-	}
-	if _, ok := holders.Lookup("kb-2", 3); ok {
-		t.Fatal("an answer with no version must not be stored at all")
-	}
-	if _, ok := holders.Lookup("kb-3", 3); ok {
-		t.Fatal("an answer with a non-positive version must not be stored at all")
-	}
-	if _, ok := holders.Lookup("kb-4", 9); !ok {
-		t.Fatal("the entry that did have a version must be there")
-	}
-	if holders.Len() != 2 {
-		t.Fatalf("Len = %d, want only the entries that had a usable version", holders.Len())
-	}
-}
-
 // A nil cache is what an unwired node passes around: every method has to be
 // safe so the resolver needs no branch.
 func TestHoldersCacheNilIsInert(t *testing.T) {
 	var holders *HoldersCache
 	holders.Store("kb-1", 1, []string{"holder:7001"})
-	holders.StoreHolders(map[string][]string{"kb-1": {"holder:7001"}}, map[string]int64{"kb-1": 1})
 	if _, ok := holders.Lookup("kb-1", 1); ok {
 		t.Fatal("a nil cache must not answer")
 	}
@@ -169,7 +126,7 @@ func TestHoldersCacheNilIsInert(t *testing.T) {
 	}
 }
 
-// The cache is written from the report loop while the lookup runs on the apply
+// The cache is written from the catch-up while the lookup runs on the apply
 // path, so the two have to be able to overlap.
 func TestHoldersCacheIsConcurrencySafe(t *testing.T) {
 	holders := NewHoldersCache(HoldersCacheConfig{})
@@ -180,10 +137,7 @@ func TestHoldersCacheIsConcurrencySafe(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
 				if writer {
-					holders.StoreHolders(
-						map[string][]string{"kb-1": {"holder:7001"}},
-						map[string]int64{"kb-1": int64(j + 1)},
-					)
+					holders.Store("kb-1", int64(j+1), []string{"holder:7001"})
 				}
 				_, _ = holders.Lookup("kb-1", int64(j))
 			}

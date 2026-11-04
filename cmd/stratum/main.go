@@ -243,7 +243,7 @@ func main() {
 	storageLocal := cfg.Role != NodeRoleControl
 	// The data-plane helpers that actually touch stores. A control node builds
 	// none of them: what it keeps is the broadcast side of the contract plus the
-	// leader-side aggregate storage nodes report their cursors to (§7.13.4).
+	// leader-side record of the storage nodes' heartbeats.
 	var syncLeader *stratumsync.LeaderHandler
 	var syncFollower *stratumsync.Follower
 	var syncPusher *stratumsync.Pusher
@@ -307,13 +307,12 @@ func main() {
 	// controlPlane is the storage layer's only channel to replicated state
 	// (control-data-separation-design.md §4.2); stage ① runs it in-process.
 	//
-	// §7.13.4: the leader-side aggregate of storage-layer cursor reports, plus the
-	// gate that clears it when this node takes over leadership. Clearing on
-	// takeover is the point: a new leader must not answer "who holds version V"
-	// from reports its predecessor collected. Both are created here because the
-	// control plane is the view's first reader.
-	dataVersionRegistry := plane.NewDataVersionRegistry()
-	dataVersionGate := plane.NewLeaderGate(rn.IsLeader, dataVersionRegistry.Reset)
+	// The leader's record of the storage nodes' heartbeats, plus the gate that clears it
+	// when this node takes over leadership. Clearing on takeover is the point: a new leader
+	// must not judge redundancy from heartbeats its predecessor received. Both are created
+	// here because the control plane is the record's first reader.
+	livenessRegistry := plane.NewLivenessRegistry()
+	livenessGate := plane.NewLeaderGate(rn.IsLeader, livenessRegistry.Reset)
 	// requiredReplicaIDs is assigned once peerAddrByID exists, further down.
 	var requiredReplicaIDs func() ([]int64, error)
 	controlPlane := plane.NewLocalControlPlane(rn,
@@ -330,13 +329,12 @@ func main() {
 		// "someone is" — the rolling cleanup asks that before taking one out of
 		// service.
 		plane.WithNodeID(cfg.NodeID),
-		plane.WithDataVersionView(dataVersionRegistry, dataVersionGate),
-		// §7.5: the replica set a version must reach before the WAL changes behind
-		// it become reclaimable. It comes from the cluster topology — never from the
-		// aggregate — so a node that is merely silent cannot drop out of the
-		// requirement. Assigned further down (once peerAddrByID exists) and read
-		// through this closure, so the assembly order does not matter; until then it
-		// reports no topology, which yields no watermark, i.e. "keep the changes".
+		plane.WithLivenessView(livenessRegistry, livenessGate),
+		// The replica set a write must reach, for the redundancy verdict. It comes from
+		// the cluster topology — never from who has reported — so a node that is merely
+		// silent cannot drop out of the requirement. Assigned further down (once
+		// peerAddrByID exists) and read through this closure, so the assembly order does
+		// not matter.
 		plane.WithRequiredReplicas(func() ([]int64, error) {
 			if requiredReplicaIDs == nil {
 				return nil, errors.New("stratum: replica topology not assembled yet")
@@ -716,10 +714,10 @@ func main() {
 		})
 	}
 
-	// §7.5: which nodes must hold a version before its WAL changes become
-	// reclaimable. The static peer list (cfg.Peers) is the right source: "should
-	// hold it" is a deployment fact, not a runtime observation — deriving it from
-	// who has reported would let a silent node silently leave the requirement.
+	// Which nodes a write must reach. The static peer list (cfg.Peers) is the right
+	// source: "should hold it" is a deployment fact, not a runtime observation —
+	// deriving it from who has reported would let a silent node silently leave the
+	// requirement.
 	requiredReplicaIDs = func() ([]int64, error) {
 		// Same source rule as resolveReplicaAddrs: the declared storage group
 		// when there is one, every Raft member otherwise.
@@ -772,14 +770,12 @@ func main() {
 	// above is filled only by a writer's confirmation, which is a bounded
 	// fire-and-forget broadcast. A replica that missed it has no source at all —
 	// the leader this lookup falls back to is the control leader, which in a
-	// two-tier deployment exports no data and refuses. This cache mirrors the
-	// control leader's §7.13.4 aggregate (built from the report every storage
-	// node already sends), so such a replica can still find one.
+	// two-tier deployment exports no data and refuses. The holders cache below keeps
+	// what this node's catch-up learned from its peers, so such a replica can still
+	// find one.
 	//
 	// The lookup stays a pure map read: it runs on the Raft apply path, where
-	// dialling anyone is what made the first attempt at §8.5 unusable. The
-	// misses it queues are serviced by the data-version report below, which
-	// already runs on an interval and already resolves the leader.
+	// dialling anyone is what made the first attempt at §8.5 unusable.
 	resolveControlLeader := func(rctx context.Context) (string, bool, error) {
 		status, err := rn.GetClusterStatus(rctx)
 		if err != nil {
@@ -794,12 +790,9 @@ func main() {
 		}
 		return addr, true, nil
 	}
-	// The mirror of the control leader's §7.13.4 aggregate, read by the data-source
-	// lookup. It is filled FROM the report response (see the reporter wiring below),
-	// not by a refresh of its own: the lookup may run on the Raft apply path, so it
-	// can only read memory, and the heartbeat already talks to the leader every
-	// interval — carrying the answer back is one map in a response that is being
-	// sent anyway.
+	// Which peers can serve a knowledge base, read by the data-source lookup. A node that
+	// is behind fills it while catching up (see the LagCatchup wiring below): the lookup
+	// may run on the Raft apply path, so it can only read memory.
 	holdersCache := plane.NewHoldersCache(plane.HoldersCacheConfig{
 		Logger: logger,
 	})
@@ -894,8 +887,8 @@ func main() {
 			return verifyVersionPull(ctx, rn, vd, kbID, versionID)
 		},
 		// Resolve answers "who holds this version's data": the §8.5 table first
-		// (a writer announced itself), then the control leader's aggregate read
-		// from the local mirror, then the pre-§8.5 answer — the leader. All three
+		// (a writer announced itself), then the peers this node's catch-up asked,
+		// then the pre-§8.5 answer — the leader. All three
 		// are lookups; nothing here dials a peer, because this runs on the Raft
 		// apply path.
 		Resolve: plane.ResolverWithRegistry(dataSources, holdersCache, func(ctx context.Context, kbID string, versionID int64) (string, bool, error) {
@@ -1339,17 +1332,12 @@ func main() {
 
 	if raftNode != nil {
 		kbSvc := service.NewKnowledgeBaseService(rn, writeCoord, deleteCoord, deleteVersionCoord)
-		// §9.3(1)/§4.3(1): the station's route table reads "which nodes hold this
-		// version" from the leader's §7.13.4 aggregate instead of probing storage
-		// nodes itself. The adapter bridges plane's Holder to the service's own
-		// type so the service does not import plane.
-		kbSvc.SetVersionHolderSource(versionHolderSource{controlPlane})
-		// §4.3: the same aggregate's other answer — whether a write can still
-		// reach quorum — so a doomed write is refused before the version number,
+		// §4.3: whether a write can still reach quorum, judged from the storage nodes'
+		// heartbeats, so a doomed write is refused before the version number,
 		// the Raft entry and the retry budget are spent on it. An unreadable
 		// verdict allows the write, which is how a leadership change stays a
 		// failover rather than an outage.
-		kbSvc.SetStorageDegradationSource(versionHolderSource{controlPlane})
+		kbSvc.SetStorageDegradationSource(storageGateSource{controlPlane})
 		// Per-stage write timings, at debug level. The storage node's own
 		// stages (write: stage timings) already existed; what was missing is the
 		// half the CLIENT waits for — the control node's handling up to the
@@ -1423,11 +1411,10 @@ func main() {
 		// would pull traffic off a node whose reads are still being served. The
 		// verdict is unknown on a node that does not lead, and unknown reports
 		// nothing rather than vouching for storage it cannot see.
-		adminSvc.SetStorageDegradationSource(versionHolderSource{controlPlane})
-		// §7.5: "which required replica is holding this knowledge base's reclaim watermark
-		// still" — the one thing the watermark's own answer cannot carry, and the state
-		// that otherwise stops both pruning and WAL reclamation silently.
-		adminSvc.SetReclaimDiagnosticsSource(reclaimDiagnosticsSource{controlPlane})
+		adminSvc.SetStorageDegradationSource(storageGateSource{controlPlane})
+		// §7.5: "which replica kept this knowledge base's reclaim watermark unavailable" —
+		// the state that otherwise stops WAL reclamation silently.
+		adminSvc.SetReclaimDiagnosticsSource(reclaimDiagnosticsSource{dataPlane})
 		// docs/storage-node-state-machine-plan.md §6: surface this node's own
 		// phase and its not-at-rest versions through the existing admin entry
 		// points. Inside this branch the machine always exists — the typed-nil
@@ -1442,10 +1429,9 @@ func main() {
 		// A node without stores answers Unimplemented for every admin call that
 		// reads them — but GetClusterStatus it answers in full, because the Raft
 		// view lives only here. Without this registration a storage node cannot
-		// resolve the control leader at all: every cursor report fails with
-		// "Unimplemented: unknown service stratum.AdminService", so §7.13.4's
-		// report never leaves the node, and the chain tails (lag catch-up), the
-		// holder view and the station's read routing go with it.
+		// resolve the control leader at all: every heartbeat fails with
+		// "Unimplemented: unknown service stratum.AdminService", and the chain tails
+		// (lag catch-up) and the redundancy verdict go with it.
 		pb.RegisterAdminServiceServer(grpcServer, newControlAdminService(cfg.NodeID, rn))
 	}
 
@@ -1481,23 +1467,15 @@ func main() {
 			// range and replay them, instead of transferring each version's full
 			// record set. The WAL already holds them for crash recovery.
 			stratumsync.WithVersionChangesReader(walImpl),
-			// §7.13.4: only the control leader keeps the aggregate of the storage
-			// layer's periodic cursor reports. The gate below clear-s it on each
-			// leadership term, so a new leader never answers "who holds V" from
-			// reports it never received.
-			stratumsync.WithDataVersionAggregator(dataVersionRegistry, dataVersionGate.IsLeader),
-			// §7.5: carry the reclaim watermark back on each accepted report, so the
-			// node that WROTE the data can discard its recorded changes even when it
-			// is not the leader (§7.13.2).
-			stratumsync.WithReclaimWatermarks(controlPlane),
-			// docs/active-lag-detection-design.md: and the chain tail, for the same
-			// reason — the leader is the only one that knows where the chain ends, and
-			// the reporter is the one that must decide whether it has fallen behind.
+			// Only the control leader keeps the record of the storage nodes' heartbeats.
+			// The gate clears it on each leadership term, so a new leader never judges from
+			// heartbeats it never received.
+			stratumsync.WithHeartbeatRecorder(livenessRegistry, livenessGate.IsLeader),
+			// docs/active-lag-detection-design.md: the leader is the only one that knows
+			// where the chain ends, and the node is the one that must decide whether it has
+			// fallen behind. A heartbeat's response says when the tails moved, and
+			// GetChainTails serves them.
 			stratumsync.WithChainTails(controlPlane),
-			// docs/data-source-holders-fallback-plan.md: and the holders, which the
-			// reporter mirrors so its data-source lookup can answer without dialling —
-			// that lookup may run on the Raft apply path, where it cannot ask.
-			stratumsync.WithHolders(dataVersionRegistry),
 			// The landing path's last line: a version this node already knows was
 			// deleted is drained and refused here rather than written, so a late push
 			// cannot re-land data whose metadata is gone. nil on a node with no table.
@@ -1588,6 +1566,13 @@ func main() {
 			MaxConcurrentKBs: cfg.LagCatchupMaxConcurrentKBs,
 			Ensure:           dataPlane.EnsureIndex,
 			Cursor:           dataPlane.DataVersionsSnapshot,
+			// docs/data-source-holders-fallback-plan.md: a node that is behind finds out
+			// who can serve it, off the Raft apply path where the lookup cannot ask.
+			FindHolders: func(ctx context.Context, kbID string) {
+				if version, addrs, ok := dataPlane.PeerHolders(ctx, kbID); ok {
+					holdersCache.Store(kbID, version, addrs)
+				}
+			},
 			// docs/storage-node-state-machine-plan.md §3.3: declare the
 			// knowledge bases this node is catching up on, so the node's state
 			// answers "is it behind" without re-deriving it from the cursors at
@@ -1620,41 +1605,24 @@ func main() {
 			zap.Int("max_concurrent_kbs", cfg.LagCatchupMaxConcurrentKBs))
 	}
 
-	// §7.13.4: report this node's data cursors to the control leader every
-	// interval. The leader it resolves is looked up per interval, never cached:
-	// caching would pin the reporter to a leadership term that has ended. The
-	// report is soft state, so a failed one is only logged and the next interval
-	// sends the whole view again.
-	go stratumsync.NewDataVersionReporter(stratumsync.DataVersionReporterConfig{
+	// Tell the control leader this node is alive, every interval. The leader it reaches is
+	// looked up per interval, never cached: caching would pin the heartbeat to a leadership
+	// term that has ended. It is soft state, so a failed one is only logged.
+	go stratumsync.NewHeartbeater(stratumsync.HeartbeaterConfig{
 		NodeID: cfg.NodeID,
-		// §3.1: the leader's aggregate hands this address to consumers (the
-		// station's route table), so a holder is something they can dial rather
-		// than an id each of them would have to map on its own.
-		SelfAddr:     localAddr,
-		DataVersions: dataPlane.DataVersionsSnapshot,
 		// Re-resolved every interval rather than cached, and shared with the
 		// source lookup's holders client: both want the same address, and for the
 		// same reason — §7.13.1's re-resolve instead of a cached forwarding path.
 		ResolveLeader: resolveControlLeader,
-		// The same fingerprint, so the leader and this node can each tell whether
-		// the other computes owner sets over the same replica set.
-		// §7.5: store the watermarks the leader carries back, so this node's WAL can
-		// be reclaimed even when this node is not the leader.
-		Watermarks: controlPlane,
-		// And the chain tails, which are what tell this node it has fallen behind.
+		// The chain tails are what tell this node it has fallen behind.
 		ChainTails: chainTails,
-		// And the control leader's answer to "who holds this version", which the
-		// data-source lookup mirrors. That lookup may run on the apply path, so it
-		// cannot ask for itself; this response is what fills the mirror.
-		Holders: holdersCache,
-		Logger:  logger,
+		Logger:     logger,
 	}).Run(ctx)
 
 	// §7.5: reclaim the WAL's recorded changes once every replica holds the versions
 	// behind them. This is a background loop on purpose — compacting rewrites a file,
-	// and nothing on the apply path may block on it. Each pass asks the control plane
-	// for the watermarks (locally as leader, or as carried back on the report), so a
-	// node that writes data reclaims even when it does not lead.
+	// and nothing on the apply path may block on it. Each pass asks the replicas
+	// themselves how far they have reached.
 	go plane.NewWALReclaimer(plane.WALReclaimerConfig{
 		Reclaimer: dataPlane,
 		Logger:    logger,
@@ -3037,69 +3005,35 @@ func defaultConfig() appConfig {
 	}
 }
 
-// reclaimDiagnosticsSource adapts the control plane's watermark diagnosis
-// (plane.ReclaimBlocker) to the shape the admin service consumes
-// (service.ReclaimBlockedReplica). It is bridged here for the same reason
-// versionHolderSource bridges the holder types: service does not import plane, so the two
-// type systems meet in this one place.
-//
-// The diagnosis is what turns "the reclaim watermark is unknown" into "node 4 has not
-// reported since…", which is the difference between a stuck knowledge base an operator can
-// act on and one they can only wonder about.
+// reclaimDiagnosticsSource adapts the data plane's reclaim diagnosis
+// (plane.ReclaimBlocker) to the shape the admin service reports
+// (service.ReclaimBlockedReplica). It is bridged here because service does not import
+// plane, the same reason storageGateSource exists.
 type reclaimDiagnosticsSource struct {
-	cp *plane.LocalControlPlane
+	dp *plane.LocalDataPlane
 }
 
-// ReclaimBlockedReplicas reports which required replicas keep kbID's reclaim watermark
-// unavailable, and why.
-//
-// ok=false means this node cannot answer at all (it does not lead): the admin service
-// reports that as "judgement unavailable", never as "nothing is blocked", because those
-// two lead an operator to opposite conclusions.
+// ReclaimBlockedReplicas reports which replicas kept kbID's reclaim watermark unavailable
+// on this node's last pass. ok=false means no pass has judged anything yet: the admin
+// service reports that as "judgement unavailable", never as "nothing is blocked".
 func (s reclaimDiagnosticsSource) ReclaimBlockedReplicas(kbID string) ([]service.ReclaimBlockedReplica, bool) {
-	blockers, ok := s.cp.ReclaimBlockers(kbID)
+	blockers, ok := s.dp.ReclaimBlockers(kbID)
 	if !ok {
 		return nil, false
 	}
 	out := make([]service.ReclaimBlockedReplica, 0, len(blockers))
 	for _, b := range blockers {
-		out = append(out, service.ReclaimBlockedReplica{
-			NodeID:     b.NodeID,
-			Reason:     b.Reason,
-			Reached:    b.Reached,
-			ReportedAt: b.ReportedAt,
-		})
+		out = append(out, service.ReclaimBlockedReplica{Address: b.Address, Reason: b.Reason})
 	}
 	return out, true
 }
 
-// versionHolderSource adapts the control plane's data-version aggregate to the
-// two things the service layer asks of it: which nodes hold a version (§3.1), and
-// whether the storage layer can still meet a write's durability contract (§4.3).
-//
-// It exists to keep the dependency pointing one way: service does not import
-// plane, so the two Holder types (identical in content) are bridged here, where
-// both are already visible. The redundancy verdict is bridged in the same place
-// for the same reason, and both service callers that need it — the CreateVersion
-// gate and HealthCheck — take this one adapter, so the two type systems meet in
-// exactly one spot.
-type versionHolderSource struct {
+// storageGateSource adapts the control plane's redundancy verdict to the shape the
+// service layer asks for. It exists to keep the dependency pointing one way: service does
+// not import plane's state enum, and both service callers that need the verdict — the
+// CreateVersion gate and HealthCheck — take this one adapter.
+type storageGateSource struct {
 	cp *plane.LocalControlPlane
-}
-
-// DataVersionHolders reports which nodes hold kbID at or past versionID, and
-// whether this node is the control leader — a non-leader has folded no reports,
-// so its empty answer means "nobody I have heard from", never "nobody has it".
-func (s versionHolderSource) DataVersionHolders(kbID string, versionID int64) ([]service.VersionHolder, bool) {
-	holders, ok := s.cp.DataVersionHolders(kbID, versionID)
-	if !ok {
-		return nil, false
-	}
-	out := make([]service.VersionHolder, 0, len(holders))
-	for _, h := range holders {
-		out = append(out, service.VersionHolder{NodeID: h.NodeID, Address: h.Address})
-	}
-	return out, true
 }
 
 // StorageDegraded reports whether the storage layer is short of a quorum for
@@ -3109,7 +3043,7 @@ func (s versionHolderSource) DataVersionHolders(kbID string, versionID int64) ([
 // replica topology is not wired — and every caller treats that as "allow". See
 // service.StorageDegradationSource: the verdict is soft state, so it may only
 // ever cost a retry, never a refused write that would otherwise have succeeded.
-func (s versionHolderSource) StorageDegraded(kbID string) (bool, string, bool) {
+func (s storageGateSource) StorageDegraded(kbID string) (bool, string, bool) {
 	return s.cp.StorageDegraded(kbID)
 }
 
@@ -3117,7 +3051,7 @@ func (s versionHolderSource) StorageDegraded(kbID string) (bool, string, bool) {
 // are separate methods because service declares its own narrow interface rather
 // than importing plane's state enum, and the pair of answers is what decides which
 // sentinel a refusal carries (§4.1).
-func (s versionHolderSource) StorageUnavailable(kbID string) (bool, string, bool) {
+func (s storageGateSource) StorageUnavailable(kbID string) (bool, string, bool) {
 	return s.cp.StorageUnavailable(kbID)
 }
 

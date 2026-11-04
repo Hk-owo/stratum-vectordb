@@ -266,7 +266,7 @@ func lagCatchupTimeout() time.Duration {
 //     never reached. Fixed by registering a control-side admin service that answers
 //     GetClusterStatus.
 //
-// Measured after both repairs: the reporter logs "data-version report landed" with
+// Measured after both repairs: the heartbeat logs "chain tails pulled" with
 // chain_tails=2, and the scheduler logs "nothing behind the chain tail" with
 // tails_received=2 — i.e. the signal now arrives carrying tails.
 func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {

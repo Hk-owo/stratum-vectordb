@@ -74,6 +74,11 @@ type stateMachine struct {
 	deletedSeq      int64
 	deletedLog      []types.DeletedVersion
 	deletedLogLimit int
+
+	// chainSeq counts the applies that may have moved a knowledge base's chain tail. It
+	// is local to this replica and never persisted: only the leader's value is read, and
+	// the term it travels with is what separates one leader's count from another's.
+	chainSeq uint64
 }
 
 // deletedLogLimit bounds the deletion log. A thousand deletions an hour for ten
@@ -188,6 +193,7 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 			delete(sm.versions, versionID)
 		}
 		delete(sm.versionsByKB, cmd.KBID)
+		sm.chainSeq++
 		sm.dropRequestMappings(cmd.KBID, 0)
 		// ONE entry for the whole knowledge base, never one per version: a KB can hold
 		// hundreds of thousands of versions, and appending them would flush the bounded
@@ -737,6 +743,7 @@ func (sm *stateMachine) applyRemoveVersionMeta(cmd command) applyResult {
 	for i, id := range list {
 		if id == cmd.VersionID {
 			sm.versionsByKB[cmd.KBID] = append(list[:i], list[i+1:]...)
+			sm.chainSeq++
 			break
 		}
 	}
@@ -795,6 +802,7 @@ func (sm *stateMachine) applyDiscardVersion(cmd command) applyResult {
 	for i, id := range list {
 		if id == cmd.VersionID {
 			sm.versionsByKB[cmd.KBID] = append(list[:i], list[i+1:]...)
+			sm.chainSeq++
 			break
 		}
 	}
@@ -924,6 +932,7 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 	}
 	sm.versions[versionID] = meta
 	sm.versionsByKB[cmd.KBID] = append(sm.versionsByKB[cmd.KBID], versionID)
+	sm.chainSeq++
 	if cmd.ClientRequestID != "" {
 		sm.versionsByRequest[requestKey(cmd.KBID, cmd.ClientRequestID)] = versionID
 	}
@@ -1019,6 +1028,7 @@ func (sm *stateMachine) restore(data []byte) error {
 	sm.deletedEpoch = snap.DeletedEpoch
 	sm.deletedSeq = snap.DeletedSeq
 	sm.deletedLog = snap.DeletedLog
+	sm.chainSeq++
 	if sm.deletedEpoch == "" {
 		// A snapshot written before the log existed. Mint a fresh epoch rather than
 		// reusing "": consumers compare epochs, and an empty one must not read as "the

@@ -11,8 +11,8 @@ import (
 	"stratum/internal/nodestate"
 )
 
-// LagCatchup turns the chain tails the control leader carries back on this node's
-// periodic cursor report into an occasional background catch-up
+// LagCatchup turns the chain tails this node learns through its heartbeat into an
+// occasional background catch-up
 // (docs/active-lag-detection-design.md).
 //
 // The trade it is built around:
@@ -46,7 +46,7 @@ type LagCatchup struct {
 	mu sync.Mutex
 
 	// tails is the latest chain-tail mirror the leader carried back, per knowledge
-	// base. Catch-up itself does not need to remember it (every report repeats it),
+	// base. Catch-up itself does not need to remember it (every heartbeat repeats it),
 	// but §8.6(d)'s tombstone scan does: "the versions with nothing after them" is
 	// exactly this map, and reading it here costs no RPC that is not already made.
 	//
@@ -71,9 +71,8 @@ func (l *LagCatchup) storeTails(tails map[string]int64) {
 // base — the versions with nothing after them.
 //
 // It exists for §8.6(d)'s tombstone scan, which needs those versions and would
-// otherwise have to ask the control layer again for a fact this node is handed every
-// report interval. A copy, for the same reason storeTails copies: the caller must not
-// be able to mutate the mirror, and the next report may replace it at any moment.
+// otherwise have to ask the control layer again for a fact this node already holds. A copy, for the same reason storeTails copies: the caller must not
+// be able to mutate the mirror, and the next heartbeat may replace it at any moment.
 //
 // An empty result means "not told yet", never "no chains" — the same reading the
 // chain_tails field documents, and the reason a caller must not treat absence as a
@@ -95,7 +94,7 @@ func (l *LagCatchup) ChainTails() map[string]int64 {
 type LagCatchupConfig struct {
 	// MinLagVersions is how far behind the tail a knowledge base must be before it
 	// counts as left behind; 1 means "any gap". Raising it trades a slower reaction
-	// for fewer wake-ups on ordinary write races, where a report can overlap the
+	// for fewer wake-ups on ordinary write races, where a pull can overlap the
 	// version being committed.
 	MinLagVersions int64
 
@@ -114,6 +113,12 @@ type LagCatchupConfig struct {
 
 	// Cursor reports this node's own contiguous cursor per knowledge base. Required.
 	Cursor func() map[string]int64
+
+	// FindHolders asks the peers who can serve kbID and leaves the answer where the
+	// data-source lookup reads it. A catch-up calls it before Ensure and keeps calling it
+	// until Ensure returns, because that lookup runs on the Raft apply path and cannot
+	// ask for itself. Optional.
+	FindHolders func(ctx context.Context, kbID string)
 
 	// NodeState is the node state machine, which OWNS the catch-up set
 	// (docs/storage-node-state-machine-plan.md §3.3). Optional: a catch-up built
@@ -145,6 +150,11 @@ const DefaultMaxConcurrentLagCatchups = 2
 // costs a retry on the next signal rather than a stuck version.
 const LagCatchupTimeout = 5 * time.Minute
 
+// holdersRefreshInterval is how often a running catch-up re-asks its peers who can
+// serve it. A third of DefaultHoldersCacheTTL, so one failed round leaves the answer
+// usable.
+const holdersRefreshInterval = 5 * time.Second
+
 // NewLagCatchup returns a LagCatchup. It satisfies sync.ChainTailSink.
 func NewLagCatchup(cfg LagCatchupConfig) *LagCatchup {
 	if cfg.now == nil {
@@ -162,12 +172,12 @@ func NewLagCatchup(cfg LagCatchupConfig) *LagCatchup {
 	return &LagCatchup{cfg: cfg}
 }
 
-// SetChainTails implements sync.ChainTailSink: it is handed the tails the leader
-// carried back on this node's latest cursor report.
+// SetChainTails implements sync.ChainTailSink: it is handed the latest tails on every
+// accepted heartbeat, whether or not they changed.
 //
 // A knowledge base is picked up when its own cursor is at least MinLagVersions behind
 // the tail, it is not already catching up, and there is room under the concurrency
-// bound. Anything skipped is simply reconsidered on the next report — the signal
+// bound. Anything skipped is simply reconsidered on the next heartbeat — the signal
 // repeats every interval by construction, so nothing needs a queue of its own.
 //
 // NOTE: this used to iterate in a sorted order (furthest behind first). That was
@@ -205,7 +215,7 @@ func (l *LagCatchup) SetChainTails(tails map[string]int64) {
 	started := 0
 	for kbID, tail := range tails {
 		if l.cfg.NodeState.CatchingUpCount() >= maxKBs {
-			// Out of room: the rest wait for the next report, which is a few
+			// Out of room: the rest wait for the next heartbeat, which is a few
 			// seconds away by construction.
 			return
 		}
@@ -218,7 +228,7 @@ func (l *LagCatchup) SetChainTails(tails map[string]int64) {
 		if cursor[kbID]+l.lagThreshold() > tail {
 			continue // not behind enough to act on
 		}
-		// Declared while l.mu is held, so one report's decision to run a
+		// Declared while l.mu is held, so one heartbeat's decision to run a
 		// catch-up and the declaration of it are a single step. The state machine
 		// never calls back into this component, so this cannot deadlock.
 		l.cfg.NodeState.MarkCatchingUp(kbID, true)
@@ -255,6 +265,10 @@ func (l *LagCatchup) catchUp(kbID string, target int64) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), LagCatchupTimeout)
 	defer cancel()
+	if l.cfg.FindHolders != nil {
+		l.cfg.FindHolders(ctx, kbID)
+		go l.refreshHolders(ctx, kbID)
+	}
 	if err := l.cfg.Ensure(ctx, kbID, target); err != nil {
 		l.cfg.Logger.Warn("plane: lag catch-up failed; the version will be built on demand instead",
 			zap.String("kb_id", kbID), zap.Int64("version_id", target), zap.Error(err))
@@ -262,6 +276,21 @@ func (l *LagCatchup) catchUp(kbID string, target int64) {
 	}
 	l.cfg.Logger.Info("plane: caught up with the chain tail",
 		zap.String("kb_id", kbID), zap.Int64("version_id", target))
+}
+
+// refreshHolders keeps the holders fresh while a catch-up runs. A catch-up can outlast
+// one answer's TTL, and the lookup re-resolves on every attempt.
+func (l *LagCatchup) refreshHolders(ctx context.Context, kbID string) {
+	ticker := time.NewTicker(holdersRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.cfg.FindHolders(ctx, kbID)
+		}
+	}
 }
 
 // jitterFor returns this signal's delay. The knowledge base id goes into the hash so

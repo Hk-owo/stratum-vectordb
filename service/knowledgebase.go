@@ -36,14 +36,7 @@ type KnowledgeBaseServiceImpl struct {
 	deleteCoord        coordinator.DeleteCoordinator
 	deleteVersionCoord coordinator.DeleteVersionCoordinator
 
-	// versionHolders is the control leader's data-version aggregate, exposed to
-	// the service station's route table (storage-coordination-and-service-station
-	// -design.md §3.1). Optional: without it the RPC answers known=false and the
-	// station keeps its previous behaviour.
-	versionHolders VersionHolderSource
-
-	// storageGate answers the other half of the same question, from the same
-	// aggregate: can the storage layer still meet a WRITE's durability contract?
+	// storageGate answers, from the storage nodes' heartbeats: can the storage layer still meet a WRITE's durability contract?
 	// Optional, and an unwired gate means "unknown" — which callers read as
 	// "allow" (docs/storage-degradation-signal-plan.md §3.3).
 	storageGate StorageDegradationSource
@@ -73,30 +66,6 @@ type KnowledgeBaseServiceImpl struct {
 	versionWatcher VersionWatcher
 }
 
-// VersionHolder is one node that reported holding a version, with the address it
-// reported for itself. It mirrors plane's holder rather than importing it: this
-// is the control-layer service, and its caller is the station.
-type VersionHolder struct {
-	NodeID  int64
-	Address string
-}
-
-// VersionHolderSource answers "which nodes reported holding kbID at or past
-// versionID". ok=false means the answering node is not the control leader, so an
-// empty list is "I have heard from nobody", never "nobody has it" — the two
-// justify opposite actions, since the second would license deleting data (§10.6).
-//
-// *plane.LocalControlPlane implements it; declared narrow here so this package
-// does not depend on plane.
-type VersionHolderSource interface {
-	DataVersionHolders(kbID string, versionID int64) ([]VersionHolder, bool)
-}
-
-// SetVersionHolderSource wires the aggregate the holders RPC answers from.
-func (s *KnowledgeBaseServiceImpl) SetVersionHolderSource(src VersionHolderSource) {
-	s.versionHolders = src
-}
-
 // StorageDegradationSource answers whether the storage layer can still meet a
 // WRITE's durability contract for a knowledge base: are enough of the replicas
 // that must hold a version still alive?
@@ -115,8 +84,8 @@ func (s *KnowledgeBaseServiceImpl) SetVersionHolderSource(src VersionHolderSourc
 // refusal carries.
 //
 // ok=false means the judgement cannot be made — this node is not the control
-// leader, the replica topology is not wired, or the aggregate has folded no
-// report yet — and callers MUST read that as "allow" rather than as
+// leader, the replica topology is not wired, or no heartbeat has arrived
+// yet — and callers MUST read that as "allow" rather than as
 // "unavailable". The verdict is soft state, so letting a leadership change refuse
 // writes would turn a failover into an outage (§3.3).
 //
@@ -132,61 +101,31 @@ type StorageDegradationSource interface {
 }
 
 // SetStorageDegradationSource wires the redundancy verdict that the CreateVersion
-// gate and the holders RPC both read.
+// gate and GetStorageDegradation both read.
 func (s *KnowledgeBaseServiceImpl) SetStorageDegradationSource(src StorageDegradationSource) {
 	s.storageGate = src
 }
 
-// GetDataVersionHolders answers the station's two route-table questions about
-// kbID: which nodes reported a contiguous cursor reaching versionID, and whether
-// the storage layer can still meet a write's durability contract.
+// GetStorageDegradation answers the station's write gate: can the storage layer still
+// meet a write's durability contract?
 //
-// Deliberately not an error when this node is not the leader: it answers
-// known=false, which the station reads as "ask someone else" rather than as a
-// fact about where data lives. A station treating a follower's empty list as
-// "nobody has it" would route every query away from nodes that do hold it.
-//
-// The redundancy half rides along instead of getting an RPC of its own
-// (docs/storage-degradation-signal-plan.md §4.2): the station already polls this
-// call on every route refresh, and both answers come from the same leader-side
-// aggregate. It is filled even when the holders half cannot answer — the two
-// share an aggregate but not a precondition, and the station's write gate must
-// not go blind merely because the leader has no holder to name.
-func (s *KnowledgeBaseServiceImpl) GetDataVersionHolders(ctx context.Context, req *pb.GetDataVersionHoldersRequest) (*pb.GetDataVersionHoldersResponse, error) {
-	kbID := req.GetKnowledgeBaseId()
-	resp := &pb.GetDataVersionHoldersResponse{}
-
-	if s.storageGate != nil {
-		degraded, detail, ok := s.storageGate.StorageDegraded(kbID)
-		// Degraded is false whenever ok is false, so a reader that ignores
-		// degradation_known still lands on "allow" — see the field's comment in
-		// the proto.
-		resp.Degraded = degraded
-		resp.DegradationKnown = ok
-		if ok {
-			resp.DegradationDetail = detail
-		}
-		// The cluster tier travels on the same response, so the station names the
-		// refusal the same way the control layer does (§4.1) instead of calling
-		// "the storage layer is gone" a KB-level problem. Its detail is the more
-		// specific one, so it replaces the diagnosis above when it fires.
-		if unavailable, unavailableDetail, ok := s.storageGate.StorageUnavailable(kbID); ok && unavailable {
-			resp.StorageUnavailable = true
-			resp.DegradationDetail = unavailableDetail
-		}
-	}
-
-	if s.versionHolders == nil {
+// Not an error when this node cannot judge: known=false sends the station to the next
+// control node, and if none can judge, the write is allowed.
+func (s *KnowledgeBaseServiceImpl) GetStorageDegradation(context.Context, *pb.GetStorageDegradationRequest) (*pb.GetStorageDegradationResponse, error) {
+	resp := &pb.GetStorageDegradationResponse{}
+	if s.storageGate == nil {
 		return resp, nil
 	}
-	holders, ok := s.versionHolders.DataVersionHolders(kbID, req.GetVersionId())
+	degraded, detail, ok := s.storageGate.StorageDegraded("")
 	if !ok {
 		return resp, nil
 	}
 	resp.Known = true
-	resp.Holders = make([]*pb.DataVersionHolder, 0, len(holders))
-	for _, h := range holders {
-		resp.Holders = append(resp.Holders, &pb.DataVersionHolder{NodeId: h.NodeID, Address: h.Address})
+	resp.Degraded = degraded
+	resp.Detail = detail
+	if unavailable, unavailableDetail, ok := s.storageGate.StorageUnavailable(""); ok && unavailable {
+		resp.StorageUnavailable = true
+		resp.Detail = unavailableDetail
 	}
 	return resp, nil
 }
@@ -369,7 +308,7 @@ func (s *KnowledgeBaseServiceImpl) DeleteKnowledgeBase(ctx context.Context, req 
 //
 // The verdict is soft state, so the refusal is retryable (ErrKBStorageDegraded
 // maps to codes.Unavailable): the next attempt is the one that gets the
-// authoritative answer once the aggregate has caught up.
+// authoritative answer once the heartbeats have caught up.
 func (s *KnowledgeBaseServiceImpl) CreateVersion(ctx context.Context, req *pb.CreateVersionRequest) (*pb.CreateVersionResponse, error) {
 	// Per-stage timings of one write, at debug level.
 	//

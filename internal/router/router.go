@@ -108,13 +108,6 @@ type Router struct {
 	conns        []*grpc.ClientConn
 	kbs          []pb.KnowledgeBaseServiceClient // control layer
 
-	// storageIndexByAddr maps a storage node's reported address to this station's
-	// connection index for it. The leader's aggregate identifies holders by the
-	// address each node reported for itself; turning that into a candidate means
-	// matching it against the addresses this station dials, which are the same
-	// list (storage.nodes in the config, -storage-nodes here).
-	storageIndexByAddr map[string]int
-
 	// logger records the background refreshes' failures. A refresh failure is
 	// expected and survivable (the previous snapshot stands), so it must be
 	// visible without being alarming — hence Debug for a KB that could not be
@@ -149,14 +142,17 @@ type Router struct {
 	// deployment gets a disabled signer, which stamps nothing.
 	mark *authmeta.Signer
 
-	// syncs are the storage layer's data-plane clients: the station asks them
-	// for cursors to build the routing table (§9.3(1)), using the §7.6 query
-	// rather than a new interface.
+	// syncs are the storage layer's data-plane clients: the station asks them whether a
+	// circuit-broken node is back (probeOpenBreakers).
 	syncs []pb.DataSyncServiceClient
 
-	// routes is the station's local cache of "which node can serve which KB at
-	// which version". nil when disabled.
+	// routes is the station's local cache of each knowledge base's expected version
+	// and the storage layer's redundancy verdict. nil when disabled.
 	routes *RouteTable
+
+	// lag is what this station learned from refusals: which nodes were behind on which
+	// knowledge base. nil means nothing is remembered, and every node stays in line.
+	lag *lagRecords
 
 	// ownerInactiveK is Config.OwnerInactiveK: the BASE owner count for a version
 	// that is not active — the floor the priority ladder raises from.
@@ -180,25 +176,18 @@ func NewRouter(cfg Config) (*Router, error) {
 		storage = cfg.Addrs
 	}
 	r := &Router{
-		controlAddrs:       append([]string(nil), cfg.Addrs...),
-		storageAddrs:       append([]string(nil), storage...),
-		storageIndexByAddr: make(map[string]int, len(storage)),
-		auth:               cfg.Auth,
-		mark:               cfg.Mark,
-		logger:             cfg.Logger,
-		ownerInactiveK:     cfg.OwnerInactiveK,
-		priority:           newIndexPriority(cfg.OwnerPriorityHalfLife, nil),
-		controlInflight:    newInflight(len(cfg.Addrs)),
-		storageInflight:    newInflight(len(storage)),
+		controlAddrs:    append([]string(nil), cfg.Addrs...),
+		storageAddrs:    append([]string(nil), storage...),
+		auth:            cfg.Auth,
+		mark:            cfg.Mark,
+		logger:          cfg.Logger,
+		ownerInactiveK:  cfg.OwnerInactiveK,
+		priority:        newIndexPriority(cfg.OwnerPriorityHalfLife, nil),
+		controlInflight: newInflight(len(cfg.Addrs)),
+		storageInflight: newInflight(len(storage)),
 	}
 	if r.logger == nil {
 		r.logger = zap.NewNop()
-	}
-	// Indexed by position in storage, which is the order the storage clients are
-	// built in below — so an address the leader names resolves to the same node
-	// this station would dial for it.
-	for idx, addr := range storage {
-		r.storageIndexByAddr[addr] = idx
 	}
 	dial := func(addrs []string) error {
 		for _, a := range addrs {
@@ -266,6 +255,7 @@ func NewRouter(cfg Config) (*Router, error) {
 
 	if cfg.RouteRefreshInterval >= 0 {
 		r.routes = NewRouteTable(r.refreshRouteSnapshot, cfg.RouteRefreshInterval, nil)
+		r.lag = newLagRecords(defaultLagRecordTTL)
 	}
 	return r, nil
 }
@@ -278,16 +268,61 @@ func (r *Router) Start(ctx context.Context) {
 	if r.routes != nil {
 		r.routes.Start(ctx)
 	}
+	if len(r.syncs) > 0 && len(r.syncs) == len(r.storageBreakers) {
+		for _, b := range r.storageBreakers {
+			b.useExternalProbe()
+		}
+		go r.probeOpenBreakers(ctx, breakerProbeInterval)
+	}
 }
 
-// refreshRouteSnapshot observes the cluster once, by asking the control layer
-// both halves of the question: which knowledge bases exist and what version each
-// should be served at, and which storage nodes the leader's §7.13.4 aggregate
-// says hold that version (§3.1, §4.3(1)).
+const (
+	// breakerProbeInterval is how often the prober looks for an open breaker that has
+	// waited out its cooldown. A healthy cluster costs nothing: no breaker is open, so
+	// nothing is sent.
+	breakerProbeInterval = time.Second
+	// breakerProbeTimeout bounds one probe, so a hung node cannot stall the others.
+	breakerProbeTimeout = 2 * time.Second
+)
+
+// probeOpenBreakers finds out when a circuit-broken storage node is back, so no client
+// request has to fail over to learn the same thing.
 //
-// The leader that can answer either question is whichever one is leading — any
-// control node holds the log, but only the leader folds the cursor reports, so
-// the holders query is retried across the control set like any other read.
+// It asks LocalVersion rather than HealthCheck. A storage node answers HealthCheck by
+// reading the cluster status from the control tier, so during a control outage a healthy
+// storage node would keep failing its probe, and reads it could serve would stay blocked.
+// LocalVersion is answered from the node's own memory, which is the question here.
+func (r *Router) probeOpenBreakers(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.probeOnce(ctx)
+		}
+	}
+}
+
+// probeOnce probes every storage node whose breaker has waited out its cooldown.
+func (r *Router) probeOnce(ctx context.Context) {
+	for idx, b := range r.storageBreakers {
+		if idx >= len(r.syncs) || !b.needsProbe(time.Now()) {
+			continue
+		}
+		probeCtx, cancel := context.WithTimeout(r.mark.Stamp(ctx), breakerProbeTimeout)
+		_, err := r.syncs[idx].LocalVersion(probeCtx, &pb.LocalVersionRequest{})
+		cancel()
+		// Only a node-level failure keeps it open: an answer of any kind means the node
+		// is up and handling requests.
+		b.probeResult(time.Now(), err == nil || !nodeLevelFailure(err))
+	}
+}
+
+// refreshRouteSnapshot observes the cluster once: which knowledge bases exist and what
+// version each should be served at, and the storage layer's redundancy verdict. One RPC
+// for each, however many knowledge bases there are.
 func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error) {
 	// Everything the refresh sends to the control layer carries the internal mark.
 	//
@@ -299,11 +334,7 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 	// trying to avoid, and it was live until this mark was added.
 	ctx = r.mark.Stamp(ctx)
 
-	snap := routeSnapshot{
-		servable:    map[string]map[int]bool{},
-		expected:    map[string]int64{},
-		degradation: map[string]degradationVerdict{},
-	}
+	snap := routeSnapshot{expected: map[string]int64{}}
 
 	// The control layer is the authority on what exists and what version should
 	// be visible; any control node can answer, they share the log.
@@ -333,162 +364,78 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 		snap.expected[kb.GetKnowledgeBaseId()] = kb.GetActiveVersionId()
 	}
 
-	// Per knowledge base, ask which nodes reported holding its expected version,
-	// and whether a write for it can still reach quorum.
+	// The redundancy verdict is one question per refresh, not one per knowledge base:
+	// with a single cluster-wide replica topology every knowledge base shares it.
 	//
-	// A KB whose query fails, or whose answer comes from a non-leader, is simply
-	// left out: Servable then does not narrow for it, which is the same answer it
-	// gives before the first refresh, and the write gate reads a missing verdict
-	// as unknown — which allows. The freshness credential still rides the
-	// forwarded query, so nothing about correctness depends on this succeeding.
-	for kbID, version := range snap.expected {
-		answer, err := r.versionHolders(ctx, kbID, version)
-		if err != nil {
-			r.loggerOrNop().Debug("route table: holders query failed; leaving the KB unnarrowed",
-				zap.String("kb_id", kbID), zap.Int64("version", version), zap.Error(err))
-			continue
-		}
-		set := make(map[int]bool, len(answer.addrs))
-		for _, addr := range answer.addrs {
-			if idx, ok := r.storageIndexByAddr[addr]; ok {
-				set[idx] = true
-			}
-		}
-		snap.servable[kbID] = set
-		// Only a KNOWN verdict is recorded. An absent entry is what makes the
-		// write gate allow, so storing a zero-valued "healthy" for an unknown
-		// answer would launder missing information into a clean bill of health.
-		if answer.degradationKnown {
-			snap.degradation[kbID] = degradationVerdict{
-				degraded:    answer.degraded,
-				unavailable: answer.unavailable,
-				detail:      answer.detail,
-			}
-		}
-	}
+	// A failed query, or an answer from a node that cannot judge, leaves the verdict
+	// unknown, and the write gate reads unknown as allow. The freshness credential still
+	// rides the forwarded query, so nothing about correctness depends on this succeeding.
+	snap.degradation, snap.degradationKnown = r.storageDegradation(ctx)
 	return snap, nil
 }
 
-// holdersAnswer is one control node's answer to the holders question: the storage
-// addresses that reported holding the version, plus the leader's redundancy
-// verdict for the knowledge base.
-//
-// Both ride one response because both come from one aggregate
-// (docs/storage-degradation-signal-plan.md §4.2), and because the station needs
-// them on one schedule: the write gate reads the verdict, the route table reads
-// the addresses, and a single refresh keeps the two consistent with each other.
-type holdersAnswer struct {
-	// addrs are the storage addresses the leader named for this version.
-	addrs []string
-
-	// degraded / unavailable / detail carry the redundancy verdict: the two
-	// failure tiers and the diagnosis, straight off the wire. They become a
-	// degradationVerdict in the snapshot, which is what the write gate reads.
-	degraded    bool
-	unavailable bool
-	detail      string
-
-	// degradationKnown is false when the leader reported no verdict: an older
-	// peer that predates the field, or a leader whose replica topology is not
-	// wired. That is emphatically not "not degraded" — see
-	// RouteTable.Degradation.
-	degradationKnown bool
-}
-
-// versionHolders asks the control layer which nodes hold kbID at version, and
-// returns them together with the leader's redundancy verdict for the knowledge
-// base.
-//
-// ok=false from the leader is not an error: it means the node we reached is not
-// the leader and has folded no reports, so the empty answer carries no
-// information. Returning it as a failure is what makes the caller leave the KB
-// unnarrowed instead of recording "no holders", which Servable would otherwise
-// have to interpret.
-//
-// A non-leader's verdict is skipped along with its holder list, for the same
-// reason it is skipped for the list: an empty aggregate has no verdict to give,
-// and the caller moves on to the node that has one.
-func (r *Router) versionHolders(ctx context.Context, kbID string, version int64) (holdersAnswer, error) {
+// storageDegradation asks the control layer for the storage layer's redundancy verdict.
+// Only the leader can judge, so the question goes round the control set until a node can.
+func (r *Router) storageDegradation(ctx context.Context) (degradationVerdict, bool) {
 	var lastErr error
 	for i := range r.kbs {
-		resp, err := r.kbs[i].GetDataVersionHolders(ctx, &pb.GetDataVersionHoldersRequest{
-			KnowledgeBaseId: kbID,
-			VersionId:       version,
-		})
+		resp, err := r.kbs[i].GetStorageDegradation(ctx, &pb.GetStorageDegradationRequest{})
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		if !resp.GetKnown() {
-			lastErr = errors.New("router: holders answer came from a non-leader")
 			continue
 		}
-		answer := holdersAnswer{
-			addrs:            make([]string, 0, len(resp.GetHolders())),
-			degraded:         resp.GetDegraded(),
-			unavailable:      resp.GetStorageUnavailable(),
-			detail:           resp.GetDegradationDetail(),
-			degradationKnown: resp.GetDegradationKnown(),
-		}
-		for _, h := range resp.GetHolders() {
-			if h.GetAddress() != "" {
-				answer.addrs = append(answer.addrs, h.GetAddress())
-			}
-		}
-		return answer, nil
+		return degradationVerdict{
+			degraded:    resp.GetDegraded(),
+			unavailable: resp.GetStorageUnavailable(),
+			detail:      resp.GetDetail(),
+		}, true
 	}
-	if lastErr == nil {
-		lastErr = errors.New("router: no control node answered the holders query")
-	}
-	return holdersAnswer{}, lastErr
+	r.loggerOrNop().Debug("route table: no control node could judge storage redundancy", zap.Error(lastErr))
+	return degradationVerdict{}, false
 }
 
-// candidates narrows a storage-layer call to the nodes that should serve it:
-// the version's INDEX OWNERS that also HOLD its data.
+// routeTiers orders a storage-layer call's nodes into the tiers it tries them in:
 //
-// versionID does double duty, and that is not a coincidence — it is the same
-// value in both roles. It is the freshness credential §9.3(1) needs (a node whose
-// cursor has not reached it cannot answer without returning a stale-but-complete
-// result), and it is the key the owner set is computed from.
+//  1. the version's index OWNERS, which is what keeps every node's LRU from filling
+//     with the same working set (R3 of docs/code-review-2026-10-14.md);
+//  2. everyone else, because an owner can be behind or down while another replica
+//     holds the data, and that replica's answer is just as correct;
+//  3. nodes a recent refusal says are behind on this version, last rather than never.
+//     A record is only a hint: the node may have caught up since, and when nobody else
+//     could answer, asking it again is better than refusing on the strength of a hint.
 //
-// The two sets are combined by INTERSECTION, and neither alone would do:
-//
-//   - holders alone is what this used to be, and it is why every node converged
-//     on the same working set (R3 of docs/code-review-2026-10-14.md): a query
-//     landed on whichever holder the round-robin reached, so every node's LRU
-//     filled with the same versions and the cluster held N copies of one working
-//     set.
-//   - owners alone would send reads to replicas that may not hold the data yet.
-//
-// An empty intersection falls back to the holders, deliberately: an owner set
-// that no holder belongs to means the owner view is stale or the topology has
-// just changed, and "the node that has the data" is the answer that still works.
-func (r *Router) candidates(kbID string, versionID int64, n int) []int {
+// Nobody is ruled out. The freshness credential on the forwarded query is what makes a
+// node that does not hold the version refuse, so the order only decides how many round
+// trips finding the right node costs.
+func (r *Router) routeTiers(kbID string, versionID int64, n int, now time.Time) [][]int {
 	if r.routes == nil {
-		return allIndexes(n)
+		return [][]int{allIndexes(n)}
 	}
-	holders := r.routes.Servable(kbID, versionID, n)
-	if r.ownerInactiveK <= 0 || len(r.storageAddrs) == 0 {
-		return holders // sharding off: every holder qualifies
+	var owners map[string]bool
+	if r.ownerInactiveK > 0 && len(r.storageAddrs) > 0 {
+		owners = r.ownersOf(kbID, versionID)
 	}
-
-	owners := r.ownersOf(kbID, versionID)
-	if len(owners) == 0 {
-		return holders
-	}
-	narrowed := make([]int, 0, len(holders))
-	for _, idx := range holders {
-		if idx >= 0 && idx < len(r.storageAddrs) && owners[r.storageAddrs[idx]] {
-			narrowed = append(narrowed, idx)
+	var primary, others, behind []int
+	for _, idx := range allIndexes(n) {
+		switch {
+		case versionID > 0 && r.lag.behind(kbID, idx, versionID, now):
+			behind = append(behind, idx)
+		case owners == nil || (idx < len(r.storageAddrs) && owners[r.storageAddrs[idx]]):
+			primary = append(primary, idx)
+		default:
+			others = append(others, idx)
 		}
 	}
-	if len(narrowed) == 0 {
-		// Nobody in the owner set holds the version yet. Serving from a holder is
-		// still correct (the freshness credential is what guarantees the answer),
-		// and refusing would turn a topology change into an outage.
-		return holders
+	tiers := make([][]int, 0, 3)
+	for _, tier := range [][]int{primary, others, behind} {
+		if len(tier) > 0 {
+			tiers = append(tiers, tier)
+		}
 	}
-	return narrowed
+	return tiers
 }
 
 // ownerKFor decides how many replicas should hold this version's index.
@@ -600,17 +547,13 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 		if n == 0 {
 			n = len(r.controlAddrs)
 		}
-		// §9.3(1): the routing table narrows the candidates to the nodes whose
-		// cursor has reached the version this query should be answering from. A
-		// knowledge base the table has not seen yields no expected version, and
-		// then every node qualifies — routing degrades to round-robin rather
-		// than to refusal.
+		// The version this call must be answered from decides who is asked first. A
+		// knowledge base the table has not seen yields no expected version, and then
+		// every node qualifies — routing degrades to round-robin rather than to refusal.
 		//
-		// R1 of docs/code-review-2026-10-14.md: when the caller PINNED a
-		// version, that version is the credential — not the active one. Narrowing
-		// a pinned read by "fresh for the active version" selects exactly the
-		// nodes least likely to still hold the old one, since the whole point of
-		// the active pointer is that older versions stop being the working set.
+		// R1 of docs/code-review-2026-10-14.md: when the caller PINNED a version, that
+		// version is the credential — not the active one. Routing a pinned read by the
+		// active version would pick the owners of the wrong version.
 		expected, _ := r.ExpectedVersion(kbID)
 		if fo.pinnedVersion != 0 {
 			expected = fo.pinnedVersion
@@ -622,12 +565,21 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 		if r.priority != nil && expected != 0 {
 			r.priority.Observe(kbID, expected)
 		}
-		// P2C over the candidates the owner intersection produced: send the call to
-		// the less busy of two randomly chosen nodes. It reorders only — a node
-		// that is merely slow is still tried, just not first.
-		cands := leastLoadedFirst(r.candidates(kbID, expected, n), r.storageInflight)
-		return forwardRead(r, ctx, readTrace{kbID: kbID, layer: "storage", admission: time.Since(stationStart)},
-			cands, r.storageBreakers, r.storageInflight, fn)
+		// P2C within each tier: send the call to the less busy of two randomly chosen
+		// nodes. It reorders only — a node that is merely slow is still tried, just not
+		// first.
+		tiers := r.routeTiers(kbID, expected, n, time.Now())
+		for i, tier := range tiers {
+			tiers[i] = leastLoadedFirst(tier, r.storageInflight)
+		}
+		return forwardTiers(r, ctx, readTrace{kbID: kbID, layer: "storage", admission: time.Since(stationStart)},
+			tiers, r.storageBreakers, r.storageInflight, func(idx int, ctx context.Context) (T, error) {
+				resp, err := fn(idx, ctx)
+				if cursor, ok := stratumerrors.ReplicaCursorOf(err); ok {
+					r.lag.note(kbID, idx, cursor, time.Now())
+				}
+				return resp, err
+			})
 	}
 	if isWriteMethod(fullMethod) {
 		// §4.3(1): refuse a write this station already knows cannot reach quorum,
@@ -674,8 +626,7 @@ func WithPinnedVersion(versionID int64) ForwardOption {
 // The control layer checks again regardless, because a request can reach it
 // without passing a station at all.
 //
-// Unknown ALWAYS allows: no verdict for the KB, an unwired table, or a KB the
-// snapshot never saw. The snapshot is periodic and what it carries is soft state,
+// Unknown ALWAYS allows: no verdict in the snapshot, or an unwired table. The snapshot is periodic and what it carries is soft state,
 // so it can be wrong in either direction — which is why the refusal is retryable
 // (both sentinels are codes.Unavailable) and why this signal never decides
 // correctness, only fails earlier and with a reason the caller can read.
@@ -687,7 +638,7 @@ func (r *Router) writeGate(kbID string) error {
 	if r.routes == nil || kbID == "" {
 		return nil
 	}
-	verdict, known := r.routes.Degradation(kbID)
+	verdict, known := r.routes.Degradation()
 	if !known || !verdict.unhealthy() {
 		return nil
 	}
@@ -695,7 +646,7 @@ func (r *Router) writeGate(kbID string) error {
 	if verdict.unavailable {
 		sentinel = stratumerrors.ErrStorageUnavailable
 	}
-	return stratumerrors.ToGRPCStatus(fmt.Errorf("%w: %s", sentinel, verdict.detail))
+	return stratumerrors.ToGRPCStatus(fmt.Errorf("%w: %s: %s", sentinel, kbID, verdict.detail))
 }
 
 // budgetSlice bounds one attempt's share of the client's remaining deadline
@@ -914,6 +865,12 @@ type readTrace struct {
 // the same helper serves both layers and their client slices are indexed by
 // their own node lists.
 func forwardRead[T any](r *Router, ctx context.Context, trace readTrace, candidates []int, breakers []*breaker, load []*inflight, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
+	return forwardTiers(r, ctx, trace, [][]int{candidates}, breakers, load, fn)
+}
+
+// forwardTiers is forwardRead over tiers of candidates: a later tier is only asked once
+// every node of the earlier ones has failed in a retryable way.
+func forwardTiers[T any](r *Router, ctx context.Context, trace readTrace, tiers [][]int, breakers []*breaker, load []*inflight, fn func(idx int, ctx context.Context) (T, error)) (T, error) {
 	var zero T
 
 	// Per-stage timings of one forwarded read, at debug level — the read-side
@@ -940,52 +897,65 @@ func forwardRead[T any](r *Router, ctx context.Context, trace readTrace, candida
 			zap.Int64("total_us", time.Since(start).Microseconds()))
 	}()
 
-	if len(candidates) == 0 {
+	total := 0
+	for _, tier := range tiers {
+		total += len(tier)
+	}
+	if total == 0 {
 		return zero, unavailableFor(trace.layer, "no node can serve this request")
 	}
-	n := len(candidates)
-	rrStart := int(r.rr.Add(1)-1) % n
+	rr := int(r.rr.Add(1) - 1)
 	now := time.Now()
 	admitted := 0
-	for i := 0; i < n; i++ {
-		idx := candidates[(rrStart+i)%n]
-		if idx < len(breakers) && !breakers[idx].allow(now) {
-			continue // sick node: skip it instead of paying its timeout
-		}
-		admitted++
-		attemptCtx, cancel := budgetSlice(ctx, n-i)
-		attemptStart := time.Now()
-		// P2C's other half: the counter is held for exactly as long as the call is
-		// outstanding, and only for a call that was actually made. A node skipped
-		// by the breaker above has nothing in flight, and counting it would make
-		// the healthy nodes look busier than the sick one.
-		//
-		// The defer lives inside the closure so the decrement happens on every
-		// exit — including a panic on the way out. Incrementing in the loop and
-		// decrementing in the function's own defer is the version of this that
-		// leaks a count per interval, forever.
-		call := func() (T, error) {
-			if idx < len(load) && load[idx] != nil {
-				load[idx].n.Add(1)
-				defer load[idx].n.Add(-1)
+	for t, tier := range tiers {
+		n := len(tier)
+		for i := 0; i < n; i++ {
+			idx := tier[(rr%n+i)%n]
+			if idx < len(breakers) && !breakers[idx].allow(now) {
+				continue // sick node: skip it instead of paying its timeout
 			}
-			return fn(idx, attemptCtx)
-		}
-		resp, err := call()
-		tAttempt += time.Since(attemptStart)
-		cancel()
-		attempts++
-		nodeIdx = idx
-		if idx < len(breakers) {
-			breakers[idx].observe(err)
-		}
-		if err == nil {
-			return resp, nil
-		}
-		// Reads keep version_pending retryable: another replica may already be
-		// serving the version this one is still writing (see isRetryableErr).
-		if !isRetryableErr(err, false) {
-			return zero, err
+			admitted++
+			// A share of the budget for each node left in this tier, plus one for all
+			// the later tiers together: the fallbacks must not leave the nodes that
+			// should answer too little time to do so, nor be left with nothing.
+			shares := n - i
+			if t < len(tiers)-1 {
+				shares++
+			}
+			attemptCtx, cancel := budgetSlice(ctx, shares)
+			attemptStart := time.Now()
+			// P2C's other half: the counter is held for exactly as long as the call is
+			// outstanding, and only for a call that was actually made. A node skipped
+			// by the breaker above has nothing in flight, and counting it would make
+			// the healthy nodes look busier than the sick one.
+			//
+			// The defer lives inside the closure so the decrement happens on every
+			// exit — including a panic on the way out. Incrementing in the loop and
+			// decrementing in the function's own defer is the version of this that
+			// leaks a count per interval, forever.
+			call := func() (T, error) {
+				if idx < len(load) && load[idx] != nil {
+					load[idx].n.Add(1)
+					defer load[idx].n.Add(-1)
+				}
+				return fn(idx, attemptCtx)
+			}
+			resp, err := call()
+			tAttempt += time.Since(attemptStart)
+			cancel()
+			attempts++
+			nodeIdx = idx
+			if idx < len(breakers) {
+				breakers[idx].observe(err)
+			}
+			if err == nil {
+				return resp, nil
+			}
+			// Reads keep version_pending retryable: another replica may already be
+			// serving the version this one is still writing (see isRetryableErr).
+			if !isRetryableErr(err, false) {
+				return zero, err
+			}
 		}
 	}
 	if admitted == 0 {

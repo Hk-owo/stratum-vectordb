@@ -10,9 +10,9 @@ import (
 // A quorum of live replicas is the bar. Below it a write cannot reach its
 // durability target, and naming that state is what this signal exists for
 // (docs/storage-degradation-signal-plan.md §3.1).
-func TestDataVersionRegistry_DegradeBelowQuorum(t *testing.T) {
-	reg := NewDataVersionRegistry()
-	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+func TestLivenessRegistry_DegradeBelowQuorum(t *testing.T) {
+	reg := NewLivenessRegistry()
+	reg.Record(1)
 	// Nodes 2 and 3 have never reported.
 
 	d := reg.Degrade([]int64{1, 2, 3}, time.Now(), DefaultStorageSilenceWindow)
@@ -35,8 +35,8 @@ func TestDataVersionRegistry_DegradeBelowQuorum(t *testing.T) {
 	for _, want := range []string{
 		"1 of 3 required replicas live",
 		"below the quorum of 2",
-		"2 (never reported)",
-		"3 (never reported)",
+		"2 (no heartbeat yet)",
+		"3 (no heartbeat yet)",
 	} {
 		if !strings.Contains(d.Detail, want) {
 			t.Errorf("Detail = %q, want it to contain %q", d.Detail, want)
@@ -46,10 +46,10 @@ func TestDataVersionRegistry_DegradeBelowQuorum(t *testing.T) {
 
 // Exactly a quorum is HEALTHY; one short is not. The boundary is the whole
 // question, so both sides of it get a case.
-func TestDataVersionRegistry_DegradeAtQuorumIsHealthy(t *testing.T) {
-	reg := NewDataVersionRegistry()
-	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
-	reg.Record(2, "10.0.0.2:7000", map[string]int64{"kb-1": 9})
+func TestLivenessRegistry_DegradeAtQuorumIsHealthy(t *testing.T) {
+	reg := NewLivenessRegistry()
+	reg.Record(1)
+	reg.Record(2)
 	// Node 3 is silent, and that is allowed: 2 of 3 is a quorum.
 
 	d := reg.Degrade([]int64{1, 2, 3}, time.Now(), DefaultStorageSilenceWindow)
@@ -65,9 +65,9 @@ func TestDataVersionRegistry_DegradeAtQuorumIsHealthy(t *testing.T) {
 // The window IS the hysteresis §3.2 asks for: a report that arrived inside it keeps
 // its replica live, and one that fell outside it does not. Time is a parameter, so
 // the test moves the clock rather than sleeping.
-func TestDataVersionRegistry_DegradeWindowIsTheHysteresis(t *testing.T) {
-	reg := NewDataVersionRegistry()
-	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+func TestLivenessRegistry_DegradeWindowIsTheHysteresis(t *testing.T) {
+	reg := NewLivenessRegistry()
+	reg.Record(1)
 
 	required := []int64{1, 2, 3}
 	window := 30 * time.Second
@@ -82,20 +82,20 @@ func TestDataVersionRegistry_DegradeWindowIsTheHysteresis(t *testing.T) {
 	if d.State != StorageUnavailable {
 		t.Errorf("a report older than the window must not count: State = %s, want UNAVAILABLE", d.State)
 	}
-	if !strings.Contains(d.Detail, "1 (last report") {
-		t.Errorf("Detail = %q, want the age of the last report", d.Detail)
+	if !strings.Contains(d.Detail, "1 (last heartbeat") {
+		t.Errorf("Detail = %q, want the age of the last heartbeat", d.Detail)
 	}
 }
 
 // The two failure tiers are separate states, and the boundary between them is
 // exactly "is anyone at all still answering" (docs/storage-degradation-signal-plan.md
 // §4.1): one live replica out of three is degraded, zero is unavailable.
-func TestDataVersionRegistry_DegradeTiers(t *testing.T) {
-	reg := NewDataVersionRegistry()
+func TestLivenessRegistry_DegradeTiers(t *testing.T) {
+	reg := NewLivenessRegistry()
 	required := []int64{1, 2, 3}
 
 	t.Run("one replica answering is DEGRADED", func(t *testing.T) {
-		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+		reg.Record(1)
 		d := reg.Degrade(required, time.Now(), DefaultStorageSilenceWindow)
 		if d.State != StorageDegraded {
 			t.Errorf("State = %s, want DEGRADED: 1 of 3 is short of the quorum of 2 but someone answers", d.State)
@@ -106,8 +106,8 @@ func TestDataVersionRegistry_DegradeTiers(t *testing.T) {
 	})
 
 	t.Run("nobody answering is UNAVAILABLE", func(t *testing.T) {
-		empty := NewDataVersionRegistry() // not one report for this replica set
-		empty.Record(99, "10.0.0.99:7000", map[string]int64{"kb-1": 9})
+		empty := NewLivenessRegistry() // not one report for this replica set
+		empty.Record(99)
 		d := empty.Degrade(required, time.Now(), DefaultStorageSilenceWindow)
 		if d.State != StorageUnavailable {
 			t.Errorf("State = %s, want UNAVAILABLE: none of the required replicas is live", d.State)
@@ -146,12 +146,12 @@ func TestLocalControlPlane_StorageTierReducers(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			reg := NewDataVersionRegistry()
+			reg := NewLivenessRegistry()
 			for _, nodeID := range tc.reportedNodes {
-				reg.Record(nodeID, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+				reg.Record(nodeID)
 			}
 			c := NewLocalControlPlane(nil,
-				WithDataVersionView(reg, gate),
+				WithLivenessView(reg, gate),
 				WithRequiredReplicas(func() ([]int64, error) { return []int64{1, 2, 3}, nil }))
 
 			degraded, _, degradedOK := c.StorageDegraded("kb-1")
@@ -168,7 +168,7 @@ func TestLocalControlPlane_StorageTierReducers(t *testing.T) {
 
 	t.Run("unknown leaves both false", func(t *testing.T) {
 		c := NewLocalControlPlane(nil,
-			WithDataVersionView(NewDataVersionRegistry(), gate),
+			WithLivenessView(NewLivenessRegistry(), gate),
 			WithRequiredReplicas(func() ([]int64, error) { return []int64{1, 2, 3}, nil }))
 		degraded, _, _ := c.StorageDegraded("kb-1")
 		unavailable, _, _ := c.StorageUnavailable("kb-1")
@@ -181,17 +181,17 @@ func TestLocalControlPlane_StorageTierReducers(t *testing.T) {
 // Every way of not knowing is UNKNOWN, never "unavailable" — a fresh leader, an
 // unwired replica set and an empty aggregate all have to let the write through, or
 // the signal itself becomes the outage it was meant to warn about (§3.3).
-func TestDataVersionRegistry_DegradeUnknownIsNotUnavailable(t *testing.T) {
+func TestLivenessRegistry_DegradeUnknownIsNotUnavailable(t *testing.T) {
 	t.Run("empty aggregate", func(t *testing.T) {
-		reg := NewDataVersionRegistry()
+		reg := NewLivenessRegistry()
 		if d := reg.Degrade([]int64{1, 2, 3}, time.Now(), DefaultStorageSilenceWindow); d.Known {
 			t.Error("a leader that has folded no report cannot judge redundancy")
 		}
 	})
 
 	t.Run("after a leadership change", func(t *testing.T) {
-		reg := NewDataVersionRegistry()
-		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+		reg := NewLivenessRegistry()
+		reg.Record(1)
 		reg.Reset() // what LeaderGate does on the false→true edge
 		if d := reg.Degrade([]int64{1}, time.Now(), DefaultStorageSilenceWindow); d.Known {
 			t.Error("a new term must not answer redundancy from a predecessor's reports")
@@ -199,16 +199,16 @@ func TestDataVersionRegistry_DegradeUnknownIsNotUnavailable(t *testing.T) {
 	})
 
 	t.Run("no replica set", func(t *testing.T) {
-		reg := NewDataVersionRegistry()
-		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+		reg := NewLivenessRegistry()
+		reg.Record(1)
 		if d := reg.Degrade(nil, time.Now(), DefaultStorageSilenceWindow); d.Known {
 			t.Error("without a topology there is nothing to hold the reports against")
 		}
 	})
 
 	t.Run("a zero window takes the default", func(t *testing.T) {
-		reg := NewDataVersionRegistry()
-		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+		reg := NewLivenessRegistry()
+		reg.Record(1)
 		d := reg.Degrade([]int64{1}, time.Now(), 0)
 		if !d.Known || d.State != StorageHealthy {
 			t.Errorf("Degrade(window=0) = (%s, known=%v), want the default window and HEALTHY", d.State, d.Known)
@@ -216,13 +216,27 @@ func TestDataVersionRegistry_DegradeUnknownIsNotUnavailable(t *testing.T) {
 	})
 }
 
+// degradationFixture wires a leader-side control plane with an aggregate and a replica
+// set. The gate is primed first: the first IsLeader() of a new term clears the aggregate,
+// so the tests record their reports afterwards, which is also what happens in production.
+func degradationFixture(t *testing.T, required ...int64) (*LocalControlPlane, *LivenessRegistry) {
+	t.Helper()
+	reg := NewLivenessRegistry()
+	gate := NewLeaderGate(func() bool { return true }, reg.Reset)
+	c := NewLocalControlPlane(nil,
+		WithLivenessView(reg, gate),
+		WithRequiredReplicas(func() ([]int64, error) { return required, nil }))
+	gate.IsLeader()
+	return c, reg
+}
+
 // StorageDegradation is the verdict behind the leader gate and the topology hook,
 // so the ways of NOT being able to judge it are checked through that entry point
 // too — that is the one the write gates actually call.
 func TestLocalControlPlane_StorageDegradation(t *testing.T) {
 	t.Run("below quorum, and the diagnosis names the knowledge base", func(t *testing.T) {
-		c, reg := reclaimFixture(t, 1, 2, 3)
-		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+		c, reg := degradationFixture(t, 1, 2, 3)
+		reg.Record(1)
 
 		state, detail, ok := c.StorageDegradation("kb-1")
 		if !ok || state != StorageDegraded {
@@ -234,10 +248,10 @@ func TestLocalControlPlane_StorageDegradation(t *testing.T) {
 	})
 
 	t.Run("not the leader", func(t *testing.T) {
-		reg := NewDataVersionRegistry()
-		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+		reg := NewLivenessRegistry()
+		reg.Record(1)
 		c := NewLocalControlPlane(nil,
-			WithDataVersionView(reg, NewLeaderGate(func() bool { return false }, nil)),
+			WithLivenessView(reg, NewLeaderGate(func() bool { return false }, nil)),
 			WithRequiredReplicas(func() ([]int64, error) { return []int64{1}, nil }))
 		if _, _, ok := c.StorageDegradation("kb-1"); ok {
 			t.Error("a follower holds no authoritative aggregate")
@@ -245,20 +259,20 @@ func TestLocalControlPlane_StorageDegradation(t *testing.T) {
 	})
 
 	t.Run("no replica set wired", func(t *testing.T) {
-		reg := NewDataVersionRegistry()
-		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+		reg := NewLivenessRegistry()
+		reg.Record(1)
 		c := NewLocalControlPlane(nil,
-			WithDataVersionView(reg, NewLeaderGate(func() bool { return true }, nil)))
+			WithLivenessView(reg, NewLeaderGate(func() bool { return true }, nil)))
 		if _, _, ok := c.StorageDegradation("kb-1"); ok {
 			t.Error("without a replica set there is no requirement to judge against")
 		}
 	})
 
 	t.Run("topology read fails", func(t *testing.T) {
-		reg := NewDataVersionRegistry()
-		reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+		reg := NewLivenessRegistry()
+		reg.Record(1)
 		c := NewLocalControlPlane(nil,
-			WithDataVersionView(reg, NewLeaderGate(func() bool { return true }, nil)),
+			WithLivenessView(reg, NewLeaderGate(func() bool { return true }, nil)),
 			WithRequiredReplicas(func() ([]int64, error) {
 				return nil, errors.New("cluster status unavailable")
 			}))
@@ -278,9 +292,9 @@ func TestLocalControlPlane_StorageDegradation(t *testing.T) {
 	// The one-bit reducer must never claim "degraded" when it is in fact
 	// UNKNOWN: a caller that checks only the flag still has to fail open.
 	t.Run("the boolean reducer fails open", func(t *testing.T) {
-		reg := NewDataVersionRegistry() // empty: nothing folded yet
+		reg := NewLivenessRegistry() // empty: nothing folded yet
 		c := NewLocalControlPlane(nil,
-			WithDataVersionView(reg, NewLeaderGate(func() bool { return true }, nil)),
+			WithLivenessView(reg, NewLeaderGate(func() bool { return true }, nil)),
 			WithRequiredReplicas(func() ([]int64, error) { return []int64{1}, nil }))
 		degraded, _, ok := c.StorageDegraded("kb-1")
 		if ok || degraded {
@@ -294,8 +308,8 @@ func TestLocalControlPlane_StorageDegradation(t *testing.T) {
 // here keeps the simplification deliberate rather than a surprise on the day per-KB
 // placement lands (§10.2).
 func TestLocalControlPlane_StorageDegradationIgnoresTheKnowledgeBase(t *testing.T) {
-	c, reg := reclaimFixture(t, 1, 2)
-	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+	c, reg := degradationFixture(t, 1, 2)
+	reg.Record(1)
 
 	busyState, _, busyOK := c.StorageDegradation("kb-1")
 	quietState, _, quietOK := c.StorageDegradation("kb-never-mentioned")
@@ -313,13 +327,13 @@ func TestLocalControlPlane_StorageDegradationIgnoresTheKnowledgeBase(t *testing.
 // than disabling the verdict: "no window" would mean every replica is permanently
 // stale, which reads as a permanent outage.
 func TestLocalControlPlane_StorageSilenceWindowOption(t *testing.T) {
-	reg := NewDataVersionRegistry()
-	reg.Record(1, "10.0.0.1:7000", map[string]int64{"kb-1": 9})
+	reg := NewLivenessRegistry()
+	reg.Record(1)
 	gate := NewLeaderGate(func() bool { return true }, nil)
 
 	t.Run("a wider window keeps a stale report live", func(t *testing.T) {
 		c := NewLocalControlPlane(nil,
-			WithDataVersionView(reg, gate),
+			WithLivenessView(reg, gate),
 			WithRequiredReplicas(func() ([]int64, error) { return []int64{1}, nil }),
 			WithStorageSilenceWindow(time.Hour))
 		if _, _, ok := c.StorageDegradation("kb-1"); !ok {
@@ -329,7 +343,7 @@ func TestLocalControlPlane_StorageSilenceWindowOption(t *testing.T) {
 
 	t.Run("a non-positive window keeps the default", func(t *testing.T) {
 		c := NewLocalControlPlane(nil,
-			WithDataVersionView(reg, gate),
+			WithLivenessView(reg, gate),
 			WithRequiredReplicas(func() ([]int64, error) { return []int64{1}, nil }),
 			WithStorageSilenceWindow(0))
 		if c.silenceWindow != 0 {

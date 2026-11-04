@@ -232,3 +232,35 @@ func TestLagCatchup_ChainTailsKeepsTheMirrorWithoutCatchUpWiring(t *testing.T) {
 		t.Errorf("an unwired mirror = %v, want nil", empty)
 	}
 }
+
+// A catch-up must find out who can serve it BEFORE it needs the answer, because the
+// lookup Ensure ends up in cannot ask for itself.
+func TestLagCatchup_FindsHoldersBeforeEnsure(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	note := func(what string) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, what)
+	}
+	done := make(chan struct{})
+
+	l := NewLagCatchup(LagCatchupConfig{
+		Cursor:      func() map[string]int64 { return map[string]int64{"kb-1": 1} },
+		FindHolders: func(context.Context, string) { note("find") },
+		Ensure: func(context.Context, string, int64) error {
+			note("ensure")
+			close(done)
+			return nil
+		},
+		sleep: func(time.Duration) {},
+	})
+	l.SetChainTails(map[string]int64{"kb-1": 5})
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != "find" || order[1] != "ensure" {
+		t.Fatalf("order = %v, want find before ensure", order)
+	}
+}

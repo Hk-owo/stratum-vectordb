@@ -7,25 +7,21 @@ import (
 	"go.uber.org/zap"
 )
 
-// The holders cache mirrors the control leader's §7.13.4 aggregate, so the
-// data-source lookup can answer "who can serve this version" when §8.5's
-// announced-holder table misses — instead of falling through to the leader, which
-// in a two-tier deployment exports no data at all
-// (docs/data-source-holders-fallback-plan.md).
+// The holders cache keeps this node's latest answer to "which peers can serve this
+// knowledge base", so the data-source lookup can answer when §8.5's announced-holder
+// table misses — instead of falling through to the leader, which in a two-tier deployment
+// exports no data at all (docs/data-source-holders-fallback-plan.md).
 //
-// The one hard constraint it is built around: that lookup runs on the Raft apply
-// path (replaying history re-runs every CreateVersion through it), so reading the
-// answer must be a pure map read and nothing here may dial. The cache is filled
-// from the report RESPONSE instead — the heartbeat this node already sends to the
-// leader every interval (internal/sync's DataVersionReporter), which is off the
-// apply path. There is no refresh call to make: the answer comes back with the
-// report.
+// The one hard constraint it is built around: that lookup runs on the Raft apply path
+// (replaying history re-runs every CreateVersion through it), so reading the answer must
+// be a pure map read and nothing here may dial. The cache is filled off that path instead:
+// a node that finds itself behind asks its peers for their cursors while it catches up
+// (LagCatchupConfig.FindHolders). A node that is not behind has nothing to fetch and no
+// use for the answer, so a healthy cluster pays nothing for this.
 const (
-	// DefaultHoldersCacheTTL is how long one answer stays usable. Three report
-	// intervals (DefaultDataVersionReportInterval = 5s): long enough to ride out
-	// a heartbeat's jitter, short enough that a stale view cannot outlive the
-	// aggregate it mirrors — that aggregate is soft state, scoped to the
-	// leader's term, and rebuilt from scratch after an election.
+	// DefaultHoldersCacheTTL is how long one answer stays usable. Three of the
+	// catch-up's refreshes (holdersRefreshInterval): long enough to ride out a slow
+	// peer, short enough that a stale answer cannot outlive the catch-up it served.
 	DefaultHoldersCacheTTL = 15 * time.Second
 
 	// DefaultHoldersCacheLimit bounds the cache by knowledge base. Entries are
@@ -68,13 +64,11 @@ type holdersEntry struct {
 	fetchedAt      time.Time
 }
 
-// HoldersCache is a mirror of the control leader's §7.13.4 aggregate, plus the
-// queue of questions it could not answer yet.
+// HoldersCache keeps the peers' latest answers per knowledge base.
 //
-// The entries are a MIRROR of soft state. They expire on their own (the
-// aggregate keeps changing as nodes report and restart), and an unknown answer
-// is never stored, because "I could not find out" must not be frozen into
-// "nobody has it" — the two lead to opposite actions.
+// The entries are soft state. They expire on their own (peers keep moving and
+// restarting), and an unknown answer is never stored, because "I could not find out"
+// must not be frozen into "nobody has it" — the two lead to opposite actions.
 type HoldersCache struct {
 	ttl    time.Duration
 	limit  int
@@ -92,10 +86,8 @@ type HoldersCache struct {
 
 // HoldersCacheStats are the counters that make the layer visible.
 //
-// A knowledge base the leader said nothing about is simply absent from the cache
-// and counted as a Miss: there is no separate "asked and got nothing" counter any
-// more, because nothing here asks. Whether the leader is answering at all is
-// visible in the response (internal/sync's report log has the counts).
+// A knowledge base nobody has asked about is simply absent from the cache and counted
+// as a Miss: nothing in here asks.
 type HoldersCacheStats struct {
 	// Hit / Miss count lookups.
 	Hit  uint64
@@ -108,7 +100,7 @@ type HoldersCacheStats struct {
 	Evicted uint64
 }
 
-// NewHoldersCache returns an empty cache that refreshes through cfg.Client.
+// NewHoldersCache returns an empty cache.
 func NewHoldersCache(cfg HoldersCacheConfig) *HoldersCache {
 	ttl := cfg.TTL
 	if ttl <= 0 {
@@ -173,9 +165,9 @@ func (c *HoldersCache) Lookup(kbID string, versionID int64) ([]string, bool) {
 // Store records a successful, truthy answer together with the version it was
 // fetched with.
 //
-// An empty list must NOT be stored: "no node I have heard from" is not a fact
-// about where data lives, and caching it would let one quiet interval outlive
-// the report that corrects it. A new answer replaces the previous one for that
+// An empty list must NOT be stored: "no peer answered" is not a fact about where data
+// lives, and caching it would let one bad moment outlive the answer that corrects it.
+// A new answer replaces the previous one for that
 // knowledge base — it is the answer to the most recent question, and keeping an
 // older, higher-versioned entry would silently shrink the candidate set for
 // later, lower questions.
@@ -191,38 +183,6 @@ func (c *HoldersCache) Store(kbID string, versionID int64, addrs []string) {
 		fetchedAt:      c.now(),
 	}
 	c.stats.Stored++
-	for len(c.entries) > c.limit {
-		c.evictOldestLocked()
-	}
-}
-
-// StoreHolders records a whole response's worth of answers under one lock.
-//
-// through is the version each answer holds through — on the report response it is the
-// chain tail. An entry with no usable version is skipped rather than stored at some
-// default, because the direction matters: "these nodes reached 6" may answer a
-// question about 4 (they hold that too) and must never answer one about 10.
-func (c *HoldersCache) StoreHolders(holders map[string][]string, through map[string]int64) {
-	if c == nil || len(holders) == 0 {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for kbID, addrs := range holders {
-		if len(addrs) == 0 {
-			continue
-		}
-		versionID, ok := through[kbID]
-		if !ok || versionID <= 0 {
-			continue
-		}
-		c.entries[kbID] = holdersEntry{
-			queriedVersion: versionID,
-			addrs:          append([]string(nil), addrs...),
-			fetchedAt:      c.now(),
-		}
-		c.stats.Stored++
-	}
 	for len(c.entries) > c.limit {
 		c.evictOldestLocked()
 	}

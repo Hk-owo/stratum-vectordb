@@ -171,9 +171,9 @@ func (c *DeleteCoordinatorImpl) Execute(ctx context.Context, kbID string) error 
 
 	// Step 9: drop the knowledge base's records from the WAL — the one layer steps
 	// 1-6 never touched. It cannot be reclaimed later by the ordinary path:
-	// reclamation is driven by the watermark, the watermark comes from replicas
-	// reporting a cursor, and a deleted knowledge base has no replicas reporting one
-	// — so `ReclaimableChangesThrough` answers "unknown" forever and the BEGIN
+	// reclamation is driven by the watermark, the watermark comes from replicas'
+	// cursors, and a deleted knowledge base has no replica holding one — so
+	// `ReclaimChanges` finds it blocked forever and the BEGIN
 	// records (each carrying the full text of the documents it changed) stay on disk
 	// for good.
 	//

@@ -82,8 +82,8 @@ func (im *IndexManagerImpl) SetActiveVersionsProvider(fn func(ctx context.Contex
 // the append path can never reclaim (there is no append to trigger a rebuild).
 //
 // Optional: unwired means "active versions only". A storage node can wire it from the
-// chain-tail mirror its cursor report already brings back (the same signal §7.5's
-// catch-up reads), so this needs no new RPC.
+// chain tails its heartbeat already keeps current (the same signal §7.5's catch-up
+// reads), so this needs no new RPC.
 //
 // An absent knowledge base means "the control layer said nothing about it", never
 // "it has no tail" — the caller decides whether absence is worth a fallback.

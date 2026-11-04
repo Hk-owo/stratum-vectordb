@@ -157,62 +157,33 @@ type PushHandler struct {
 	// serve delta backfill at all, and peers fall back to pulling full records.
 	versionChanges VersionChangesReader
 
-	// dataVersions, when set, receives the storage layer's periodic §7.13.4
-	// report. Only the control leader aggregates: isLeader tells this node
-	// whether it is the one that should accept, so a follower answers
-	// accepted=false instead of silently holding a view nobody reads.
-	dataVersions DataVersionRecorder
-	isLeader     func() bool
-
-	// watermarks, when set, supplies the §7.5 reclaim watermarks this node carries
-	// back on the report's response. The reporter is the node that may need to act on
-	// them, and under §7.13.2 it need not be the leader — so the leader sends them
-	// rather than waiting to be asked.
-	watermarks ReclaimWatermarkSource
+	// heartbeats, when set, receives the storage nodes' heartbeats; isLeader gates it
+	// (only the control leader keeps the record).
+	heartbeats HeartbeatRecorder
+	isLeader   func() bool
 
 	// chainTails, when set, supplies the version at the TAIL of each knowledge
 	// base's replicated chain — the newest version the control layer has accepted.
-	// A reporter whose own cursor is behind it has fallen behind and may start
-	// catching up; whether and when it does is the reporter's own decision
-	// (docs/active-lag-detection-design.md §5). Same reason as watermarks for
-	// riding this response: the tail is the leader's global view.
+	// A node whose own cursor is behind it has fallen behind and may start catching up;
+	// whether and when it does is the node's own decision
+	// (docs/active-lag-detection-design.md §5).
 	chainTails ChainTailSource
-
-	// holders, when set, supplies the nodes that reported holding a version and the
-	// address each reported for itself (§7.13.4) — the same aggregate the service
-	// station's route table reads, now with a second consumer. The reportee mirrors
-	// it because its data-source lookup may run on the Raft apply path, where it
-	// cannot ask (docs/data-source-holders-fallback-plan.md).
-	holders HolderSource
 }
 
-// ReclaimWatermarkSource answers "how far can this knowledge base's recorded changes
-// be discarded?" (v13 §7.5). *plane.LocalControlPlane implements it. Declared here,
-// rather than importing plane, because plane imports this package.
-type ReclaimWatermarkSource interface {
-	ReclaimableChangesThrough(kbID string) (int64, bool)
-}
-
-// ChainTailSource answers "what is the newest version the control layer has accepted
-// for this knowledge base?" — the tail a node compares its own cursor against.
-// *plane.LocalControlPlane implements it. Declared here for the same reason
-// ReclaimWatermarkSource is: plane imports this package.
+// ChainTailSource answers "what is the newest version the control layer has accepted"
+// for every knowledge base, and names the state of that answer so a node can tell when it
+// has to ask again. *plane.LocalControlPlane implements it. Declared here because plane
+// imports this package.
 type ChainTailSource interface {
-	ChainTail(kbID string) (int64, bool)
+	ChainGeneration() (term, seq uint64, ok bool)
+	ChainTails(ctx context.Context) (map[string]int64, error)
 }
 
-// DataVersionRecorder is the control leader's §7.13.4 aggregate, reduced to the
-// one call the receive side makes: store a node's complete report. *plane.
-// DataVersionRegistry implements it. Declared here, rather than importing plane,
-// because plane imports this package.
-type DataVersionRecorder interface {
-	Record(nodeID int64, address string, dataVersions map[string]int64)
-	// KnowledgeBases reports every knowledge base any node has reported a cursor
-	// for. The leader needs it to answer about chains the REPORTER never named: a
-	// node that missed a whole chain names it in no map at all, and the leader
-	// naming its chains is the only way that node learns there is something to be
-	// behind on (docs/active-lag-detection-design.md).
-	KnowledgeBases() []string
+// HeartbeatRecorder is the control leader's record of who is alive, reduced to the one
+// call the receive side makes. *plane.LivenessRegistry implements it. Declared here,
+// rather than importing plane, because plane imports this package.
+type HeartbeatRecorder interface {
+	Record(nodeID int64)
 }
 
 // VersionWriteExecutor runs the storage layer's write transaction for a version
@@ -243,52 +214,24 @@ func WithVersionChangesReader(r VersionChangesReader) PushHandlerOption {
 	return func(h *PushHandler) { h.versionChanges = r }
 }
 
-// WithDataVersionAggregator wires the §7.13.4 report sink and the leader check
-// that decides whether this node should aggregate at all. Both are passed
-// together because they are two halves of one decision: a node that aggregates
-// without knowing whether it is the leader would store reports nobody reads,
-// and one that knows without aggregating would answer accepted=true and drop the
-// data. isLeader may be nil (treated as "never the leader": the single-node
-// default for tests and for nodes with no control leadership).
-func WithDataVersionAggregator(rec DataVersionRecorder, isLeader func() bool) PushHandlerOption {
+// WithHeartbeatRecorder wires the heartbeat sink and the leader check that decides
+// whether this node should keep the record at all. Both are passed together because they
+// are two halves of one decision: a node that records without knowing whether it is the
+// leader would store heartbeats nobody reads, and one that knows without recording would
+// answer accepted=true and drop them. isLeader may be nil (treated as "never the leader":
+// the single-node default for tests and for nodes with no control leadership).
+func WithHeartbeatRecorder(rec HeartbeatRecorder, isLeader func() bool) PushHandlerOption {
 	return func(h *PushHandler) {
-		h.dataVersions = rec
+		h.heartbeats = rec
 		h.isLeader = isLeader
 	}
 }
 
-// WithReclaimWatermarks wires the source of the §7.5 watermarks carried back on a
-// report's response. It is separate from WithDataVersionAggregator because the two
-// answer different questions: the aggregator decides whether to KEEP reports, this
-// decides what to tell reporters they may DISCARD. A leader normally passes itself
-// for both.
-func WithReclaimWatermarks(src ReclaimWatermarkSource) PushHandlerOption {
-	return func(h *PushHandler) { h.watermarks = src }
-}
-
-// WithChainTails wires the source of the chain tails carried back on a report's
-// response (docs/active-lag-detection-design.md). Separate from WithReclaimWatermarks
-// because they answer different questions — "what may you discard" versus "how far
-// behind are you" — even though a leader normally passes itself for both.
+// WithChainTails wires the source of the chain generation carried back on a heartbeat's
+// response and of the tails GetChainTails answers with
+// (docs/active-lag-detection-design.md).
 func WithChainTails(src ChainTailSource) PushHandlerOption {
 	return func(h *PushHandler) { h.chainTails = src }
-}
-
-// HolderSource answers "which nodes reported holding this version, and at which
-// address each can be reached" (§7.13.4). *plane.DataVersionRegistry implements it.
-// Declared here for the same reason the recorder is: plane imports this package.
-type HolderSource interface {
-	HolderAddresses(kbID string, versionID int64) []string
-}
-
-// WithHolders wires the source of the holder lists carried back on a report's
-// response. Separate from WithChainTails even though a leader normally passes
-// itself for both: the tail says "you are behind", the holders say "here is who can
-// give it to you" — and it is the second that the reportee's data-source lookup
-// mirrors, because that lookup may run where it cannot ask
-// (docs/data-source-holders-fallback-plan.md, §8.5's history).
-func WithHolders(src HolderSource) PushHandlerOption {
-	return func(h *PushHandler) { h.holders = src }
 }
 
 // DataSourceRegistry is the slice of plane.DataSourceRegistry that the receive
@@ -636,82 +579,50 @@ func (h *PushHandler) PullVersionChanges(req *pb.PullVersionChangesRequest, stre
 	return nil
 }
 
-// ReportDataVersions receives one node's periodic cursor report (§7.13.4) and, if
-// this node is the control leader, folds it into the in-memory aggregate.
+// Heartbeat receives one node's periodic "I am alive" and, if this node is the control
+// leader, records it.
 //
-// A non-leader answers accepted=false rather than an error: the reporter's next
-// interval re-resolves the leader (§7.13.1's pattern), and an error would have it
-// retry the same wrong address. accepted=false is deliberately a success on the
-// wire — "you reached the wrong node" is not a transport failure.
-func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportDataVersionsRequest) (*pb.ReportDataVersionsResponse, error) {
-	if h.dataVersions == nil || h.isLeader == nil || !h.isLeader() {
-		return &pb.ReportDataVersionsResponse{Accepted: false, NodeId: h.nodeID}, nil
+// A non-leader answers accepted=false rather than an error: the reporter's next interval
+// re-resolves the leader (§7.13.1's pattern), and an error would have it retry the same
+// wrong address. accepted=false is deliberately a success on the wire — "you reached the
+// wrong node" is not a transport failure.
+func (h *PushHandler) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	if h.heartbeats == nil || h.isLeader == nil || !h.isLeader() {
+		return &pb.HeartbeatResponse{Accepted: false, NodeId: h.nodeID}, nil
 	}
-	// A report is accepted on the reporter's own node_id, not on anything in the
-	// payload: a node vouching for someone else's cursors would let a stale or
-	// malicious reporter speak for a healthy node.
-	if err := ctx.Err(); err != nil {
-		return nil, status.Errorf(codes.Canceled, "sync: ReportDataVersions: %v", err)
-	}
-	h.dataVersions.Record(req.GetNodeId(), req.GetAddress(), req.GetDataVersions())
+	h.heartbeats.Record(req.GetNodeId())
 
-	// §2: an owner set is a pure function of (kbID, versionID) and the member set,
-	resp := &pb.ReportDataVersionsResponse{Accepted: true, NodeId: h.nodeID}
-	// Carry back the watermarks for the knowledge bases this reporter just told us
-	// about: those are the ones it holds data for, and hence whose changes could be
-	// sitting in its WAL. Nothing is sent for a knowledge base whose watermark cannot
-	// be established — absent means "keep everything".
-	if h.watermarks != nil {
-		reclaimable := make(map[string]int64)
-		for kbID := range req.GetDataVersions() {
-			if watermark, ok := h.watermarks.ReclaimableChangesThrough(kbID); ok {
-				reclaimable[kbID] = watermark
-			}
-		}
-		if len(reclaimable) > 0 {
-			resp.Reclaimable = reclaimable
-		}
-	}
-	// And the chain tails and holder lists, for every knowledge base this leader
-	// knows about — NOT merely the ones this reporter named.
-	//
-	// That difference is the point. A node that missed a whole chain names it in no
-	// map at all, so answering the named set tells it nothing: it would hear back
-	// exactly the emptiness it already has, and never learn there is something to be
-	// behind on. (Measured on a replica that had been offline for 55 versions: its
-	// report carried reported_kbs=0, and every response came back with no tails
-	// because of that.) The union across nodes is what turns "I hold nothing" into
-	// "here is the chain, here is its tail, and here is who can serve it".
-	//
-	// An entry ABSENT from either map still means "unknown" — no signal, never
-	// "nothing to catch up" and never "nobody holds it"
-	// (docs/active-lag-detection-design.md, docs/data-source-holders-fallback-plan.md).
+	resp := &pb.HeartbeatResponse{Accepted: true, NodeId: h.nodeID}
+	// Carry back the chain generation, not the tails: this answer goes out on every
+	// heartbeat of every node, so it must stay the same size however many knowledge bases
+	// there are. A node pulls the tails only when this changes (GetChainTails).
 	if h.chainTails != nil {
-		tails := make(map[string]int64)
-		holders := make(map[string]*pb.HolderList)
-		for _, kbID := range h.dataVersions.KnowledgeBases() {
-			tail, ok := h.chainTails.ChainTail(kbID)
-			if !ok || tail <= 0 {
-				continue
-			}
-			tails[kbID] = tail
-			// The holder list is fetched AT the tail, which is the version this
-			// answer is good through: whoever holds the tail holds everything
-			// below it, so the reportee may reuse these addresses for any lower
-			// version it is missing — and only for lower ones.
-			if h.holders != nil {
-				if addrs := h.holders.HolderAddresses(kbID, tail); len(addrs) > 0 {
-					holders[kbID] = &pb.HolderList{Addresses: addrs}
-				}
-			}
-		}
-		if len(tails) > 0 {
-			resp.ChainTails = tails
-		}
-		if len(holders) > 0 {
-			resp.Holders = holders
+		if term, seq, ok := h.chainTails.ChainGeneration(); ok {
+			resp.ChainGeneration = &pb.ChainGeneration{Term: term, Seq: seq}
 		}
 	}
+	return resp, nil
+}
+
+// GetChainTails answers a node whose last pull is at a different chain generation.
+//
+// A non-leader answers accepted=false, like Heartbeat, because a follower's
+// metadata can lag and a lagging tail would tell a node it is fine when it is not.
+func (h *PushHandler) GetChainTails(ctx context.Context, _ *pb.GetChainTailsRequest) (*pb.GetChainTailsResponse, error) {
+	if h.chainTails == nil || h.isLeader == nil || !h.isLeader() {
+		return &pb.GetChainTailsResponse{Accepted: false}, nil
+	}
+	// The generation first: the tails read after it are at least as new as it says, so a
+	// change landing between the two reads costs one extra pull rather than a missed one.
+	resp := &pb.GetChainTailsResponse{Accepted: true}
+	if term, seq, ok := h.chainTails.ChainGeneration(); ok {
+		resp.Generation = &pb.ChainGeneration{Term: term, Seq: seq}
+	}
+	tails, err := h.chainTails.ChainTails(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "sync: GetChainTails: %v", err)
+	}
+	resp.ChainTails = tails
 	return resp, nil
 }
 

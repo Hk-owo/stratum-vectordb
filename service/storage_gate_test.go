@@ -32,16 +32,6 @@ func (g *stubStorageGate) StorageUnavailable(string) (bool, string, bool) {
 	return g.unavailable, g.detail, g.known
 }
 
-// stubHolderSource is a VersionHolderSource under the test's control.
-type stubHolderSource struct {
-	holders []VersionHolder
-	ok      bool
-}
-
-func (s stubHolderSource) DataVersionHolders(string, int64) ([]VersionHolder, bool) {
-	return s.holders, s.ok
-}
-
 func createVersionRequest(kbID string) *pb.CreateVersionRequest {
 	return &pb.CreateVersionRequest{
 		KnowledgeBaseId: kbID,
@@ -148,121 +138,6 @@ func TestKnowledgeBaseService_CreateVersionUnchangedWithoutAGate(t *testing.T) {
 	}
 }
 
-// The redundancy verdict rides the holders RPC because the station already polls it
-// on every route refresh (§4.2) — the station's write gate reads it from there.
-func TestKnowledgeBaseService_GetDataVersionHoldersCarriesTheVerdict(t *testing.T) {
-	t.Run("a known verdict rides the response", func(t *testing.T) {
-		h := newKBSvcTestHarness()
-		h.svc.SetVersionHolderSource(stubHolderSource{
-			ok:      true,
-			holders: []VersionHolder{{NodeID: 1, Address: "10.0.0.1:7000"}},
-		})
-		h.svc.SetStorageDegradationSource(&stubStorageGate{
-			degraded: true,
-			detail:   "1 of 3 required replicas live, below the quorum of 2",
-			known:    true,
-		})
-
-		resp, err := h.svc.GetDataVersionHolders(context.Background(),
-			&pb.GetDataVersionHoldersRequest{KnowledgeBaseId: "kb-1", VersionId: 1})
-		if err != nil {
-			t.Fatalf("GetDataVersionHolders failed: %v", err)
-		}
-		if !resp.GetDegradationKnown() || !resp.GetDegraded() {
-			t.Errorf("degradation = (degraded=%v, known=%v), want (true, true)",
-				resp.GetDegraded(), resp.GetDegradationKnown())
-		}
-		if resp.GetDegradationDetail() != "1 of 3 required replicas live, below the quorum of 2" {
-			t.Errorf("detail = %q, want the leader's diagnosis", resp.GetDegradationDetail())
-		}
-		// The holders half is unaffected: one response, two independent answers.
-		if !resp.GetKnown() || len(resp.GetHolders()) != 1 {
-			t.Errorf("holders = (%v, %v), want the single reported holder", resp.GetKnown(), resp.GetHolders())
-		}
-	})
-
-	t.Run("an unknown verdict is not laundered into healthy", func(t *testing.T) {
-		h := newKBSvcTestHarness()
-		h.svc.SetStorageDegradationSource(&stubStorageGate{known: false})
-
-		resp, err := h.svc.GetDataVersionHolders(context.Background(),
-			&pb.GetDataVersionHoldersRequest{KnowledgeBaseId: "kb-1", VersionId: 1})
-		if err != nil {
-			t.Fatalf("GetDataVersionHolders failed: %v", err)
-		}
-		if resp.GetDegradationKnown() {
-			t.Error("degradation_known must be false when the leader has no verdict")
-		}
-		if resp.GetDegraded() {
-			t.Error("degraded must be false when the verdict is unknown, so a reader of the flag alone fails open")
-		}
-	})
-
-	t.Run("no gate wired answers no verdict at all", func(t *testing.T) {
-		h := newKBSvcTestHarness()
-
-		resp, err := h.svc.GetDataVersionHolders(context.Background(),
-			&pb.GetDataVersionHoldersRequest{KnowledgeBaseId: "kb-1", VersionId: 1})
-		if err != nil {
-			t.Fatalf("GetDataVersionHolders failed: %v", err)
-		}
-		if resp.GetDegradationKnown() || resp.GetDegraded() || resp.GetStorageUnavailable() {
-			t.Error("an unwired gate has no information, which is exactly what degradation_known=false says")
-		}
-	})
-
-	// The extreme tier travels on the same response so the station can name the
-	// refusal the way the control layer does (§4.1) — and its detail has to be the
-	// more specific one, or the station would report "1 of 3" for a cluster where
-	// nobody answers.
-	t.Run("the cluster tier rides along and wins the diagnosis", func(t *testing.T) {
-		h := newKBSvcTestHarness()
-		h.svc.SetStorageDegradationSource(&stubStorageGate{
-			unavailable: true,
-			detail:      "no required replica is live (the quorum is 2); silent: 1 (never reported), 2 (never reported)",
-			known:       true,
-		})
-
-		resp, err := h.svc.GetDataVersionHolders(context.Background(),
-			&pb.GetDataVersionHoldersRequest{KnowledgeBaseId: "kb-1", VersionId: 1})
-		if err != nil {
-			t.Fatalf("GetDataVersionHolders failed: %v", err)
-		}
-		if !resp.GetDegradationKnown() || !resp.GetStorageUnavailable() {
-			t.Errorf("degradation = (known=%v, unavailable=%v), want (true, true)",
-				resp.GetDegradationKnown(), resp.GetStorageUnavailable())
-		}
-		if resp.GetDegraded() {
-			t.Error("degraded must stay false: the two tiers are exclusive on the wire")
-		}
-		if !strings.Contains(resp.GetDegradationDetail(), "no required replica is live") {
-			t.Errorf("detail = %q, want the cluster-tier diagnosis", resp.GetDegradationDetail())
-		}
-	})
-
-	t.Run("the verdict is reported even when the holders half cannot answer", func(t *testing.T) {
-		h := newKBSvcTestHarness()
-		h.svc.SetVersionHolderSource(stubHolderSource{ok: false}) // not the leader
-		h.svc.SetStorageDegradationSource(&stubStorageGate{
-			degraded: true,
-			detail:   "2 of 3 required replicas live, below the quorum of 2",
-			known:    true,
-		})
-
-		resp, err := h.svc.GetDataVersionHolders(context.Background(),
-			&pb.GetDataVersionHoldersRequest{KnowledgeBaseId: "kb-1", VersionId: 1})
-		if err != nil {
-			t.Fatalf("GetDataVersionHolders failed: %v", err)
-		}
-		if resp.GetKnown() {
-			t.Error("a non-leader names no holders")
-		}
-		if !resp.GetDegradationKnown() || !resp.GetDegraded() {
-			t.Error("the two halves are independent: a missing holder list must not hide the verdict")
-		}
-	})
-}
-
 // GetSystemStatus inherits the verdict through health, which is where §4.5 puts it.
 func TestAdminService_GetSystemStatusSurfacesStorageDegradation(t *testing.T) {
 	h := newAdminHarness()
@@ -317,4 +192,45 @@ func TestAdminService_HealthCheckSaysNothingWhenTheVerdictIsUnknown(t *testing.T
 	if strings.Contains(resp.GetDetails(), "storage:") {
 		t.Errorf("details = %q; an unknown verdict must report nothing", resp.GetDetails())
 	}
+}
+
+// The station's write gate reads this RPC, so its three answers have to stay apart:
+// healthy, each failure tier, and "this node cannot judge".
+func TestKnowledgeBaseService_GetStorageDegradation(t *testing.T) {
+	ask := func(t *testing.T, gate StorageDegradationSource) *pb.GetStorageDegradationResponse {
+		t.Helper()
+		h := newKBSvcTestHarness()
+		if gate != nil {
+			h.svc.SetStorageDegradationSource(gate)
+		}
+		resp, err := h.svc.GetStorageDegradation(context.Background(), &pb.GetStorageDegradationRequest{})
+		if err != nil {
+			t.Fatalf("GetStorageDegradation failed: %v", err)
+		}
+		return resp
+	}
+
+	t.Run("no gate wired is unknown", func(t *testing.T) {
+		if ask(t, nil).GetKnown() {
+			t.Error("a node with no gate cannot judge")
+		}
+	})
+	t.Run("a node that cannot judge says so", func(t *testing.T) {
+		resp := ask(t, &stubStorageGate{known: false, detail: "not the control leader"})
+		if resp.GetKnown() || resp.GetDetail() != "" {
+			t.Errorf("resp = %+v, want unknown with no detail", resp)
+		}
+	})
+	t.Run("short of a quorum", func(t *testing.T) {
+		resp := ask(t, &stubStorageGate{known: true, degraded: true, detail: "1 of 3"})
+		if !resp.GetKnown() || !resp.GetDegraded() || resp.GetStorageUnavailable() || resp.GetDetail() != "1 of 3" {
+			t.Errorf("resp = %+v, want the degraded tier", resp)
+		}
+	})
+	t.Run("nobody answering", func(t *testing.T) {
+		resp := ask(t, &stubStorageGate{known: true, unavailable: true, detail: "none live"})
+		if !resp.GetKnown() || resp.GetDegraded() || !resp.GetStorageUnavailable() || resp.GetDetail() != "none live" {
+			t.Errorf("resp = %+v, want the unavailable tier", resp)
+		}
+	})
 }

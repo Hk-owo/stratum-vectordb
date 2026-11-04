@@ -26,10 +26,6 @@ type stubControl struct {
 	durableErr error
 }
 
-// ReclaimableChangesThrough defaults to "unknown": a stub must keep the data,
-// because that is the only safe answer when the judgement cannot be made.
-func (c *stubControl) ReclaimableChangesThrough(string) (int64, bool) { return 0, false }
-
 type failureReport struct {
 	kbID      string
 	versionID int64
