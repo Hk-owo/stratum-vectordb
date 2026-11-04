@@ -793,12 +793,9 @@ func main() {
 		}
 		return addr, true, nil
 	}
-	// The mirror of the control leader's §7.13.4 aggregate, read by the data-source
-	// lookup. It is filled FROM the report response (see the reporter wiring below),
-	// not by a refresh of its own: the lookup may run on the Raft apply path, so it
-	// can only read memory, and the heartbeat already talks to the leader every
-	// interval — carrying the answer back is one map in a response that is being
-	// sent anyway.
+	// Which peers can serve a knowledge base, read by the data-source lookup. A node that
+	// is behind fills it while catching up (see the LagCatchup wiring below): the lookup
+	// may run on the Raft apply path, so it can only read memory.
 	holdersCache := plane.NewHoldersCache(plane.HoldersCacheConfig{
 		Logger: logger,
 	})
@@ -893,8 +890,8 @@ func main() {
 			return verifyVersionPull(ctx, rn, vd, kbID, versionID)
 		},
 		// Resolve answers "who holds this version's data": the §8.5 table first
-		// (a writer announced itself), then the control leader's aggregate read
-		// from the local mirror, then the pre-§8.5 answer — the leader. All three
+		// (a writer announced itself), then the peers this node's catch-up asked,
+		// then the pre-§8.5 answer — the leader. All three
 		// are lookups; nothing here dials a peer, because this runs on the Raft
 		// apply path.
 		Resolve: plane.ResolverWithRegistry(dataSources, holdersCache, func(ctx context.Context, kbID string, versionID int64) (string, bool, error) {
@@ -1489,10 +1486,6 @@ func main() {
 			// ends, and the reporter is the one that must decide whether it has fallen
 			// behind.
 			stratumsync.WithChainTails(controlPlane),
-			// docs/data-source-holders-fallback-plan.md: and the holders, which the
-			// reporter mirrors so its data-source lookup can answer without dialling —
-			// that lookup may run on the Raft apply path, where it cannot ask.
-			stratumsync.WithHolders(dataVersionRegistry),
 			// The landing path's last line: a version this node already knows was
 			// deleted is drained and refused here rather than written, so a late push
 			// cannot re-land data whose metadata is gone. nil on a node with no table.
@@ -1583,6 +1576,13 @@ func main() {
 			MaxConcurrentKBs: cfg.LagCatchupMaxConcurrentKBs,
 			Ensure:           dataPlane.EnsureIndex,
 			Cursor:           dataPlane.DataVersionsSnapshot,
+			// docs/data-source-holders-fallback-plan.md: a node that is behind finds out
+			// who can serve it, off the Raft apply path where the lookup cannot ask.
+			FindHolders: func(ctx context.Context, kbID string) {
+				if version, addrs, ok := dataPlane.PeerHolders(ctx, kbID); ok {
+					holdersCache.Store(kbID, version, addrs)
+				}
+			},
 			// docs/storage-node-state-machine-plan.md §3.3: declare the
 			// knowledge bases this node is catching up on, so the node's state
 			// answers "is it behind" without re-deriving it from the cursors at
@@ -1635,11 +1635,7 @@ func main() {
 		// the other computes owner sets over the same replica set.
 		// And the chain tails, which are what tell this node it has fallen behind.
 		ChainTails: chainTails,
-		// And the control leader's answer to "who holds this version", which the
-		// data-source lookup mirrors. That lookup may run on the apply path, so it
-		// cannot ask for itself; this response is what fills the mirror.
-		Holders: holdersCache,
-		Logger:  logger,
+		Logger:     logger,
 	}).Run(ctx)
 
 	// §7.5: reclaim the WAL's recorded changes once every replica holds the versions

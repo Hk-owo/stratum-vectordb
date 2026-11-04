@@ -171,13 +171,6 @@ type PushHandler struct {
 	// (docs/active-lag-detection-design.md §5). Same reason as watermarks for
 	// riding this response: the tail is the leader's global view.
 	chainTails ChainTailSource
-
-	// holders, when set, supplies the nodes that reported holding a version and the
-	// address each reported for itself (§7.13.4) — the same aggregate the service
-	// station's route table reads, now with a second consumer. The reportee mirrors
-	// it because its data-source lookup may run on the Raft apply path, where it
-	// cannot ask (docs/data-source-holders-fallback-plan.md).
-	holders HolderSource
 }
 
 // ChainTailSource answers "what is the newest version the control layer has accepted
@@ -250,23 +243,6 @@ func WithDataVersionAggregator(rec DataVersionRecorder, isLeader func() bool) Pu
 // behind are you" — even though a leader normally passes itself for both.
 func WithChainTails(src ChainTailSource) PushHandlerOption {
 	return func(h *PushHandler) { h.chainTails = src }
-}
-
-// HolderSource answers "which nodes reported holding this version, and at which
-// address each can be reached" (§7.13.4). *plane.DataVersionRegistry implements it.
-// Declared here for the same reason the recorder is: plane imports this package.
-type HolderSource interface {
-	HolderAddresses(kbID string, versionID int64) []string
-}
-
-// WithHolders wires the source of the holder lists carried back on a report's
-// response. Separate from WithChainTails even though a leader normally passes
-// itself for both: the tail says "you are behind", the holders say "here is who can
-// give it to you" — and it is the second that the reportee's data-source lookup
-// mirrors, because that lookup may run where it cannot ask
-// (docs/data-source-holders-fallback-plan.md, §8.5's history).
-func WithHolders(src HolderSource) PushHandlerOption {
-	return func(h *PushHandler) { h.holders = src }
 }
 
 // DataSourceRegistry is the slice of plane.DataSourceRegistry that the receive
@@ -635,7 +611,7 @@ func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 
 	// §2: an owner set is a pure function of (kbID, versionID) and the member set,
 	resp := &pb.ReportDataVersionsResponse{Accepted: true, NodeId: h.nodeID}
-	// Carry back the chain tails and holder lists, for every knowledge base this leader
+	// Carry back the chain tails, for every knowledge base this leader
 	// knows about — NOT merely the ones this reporter named.
 	//
 	// That difference is the point. A node that missed a whole chain names it in no
@@ -644,35 +620,21 @@ func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 	// behind on. (Measured on a replica that had been offline for 55 versions: its
 	// report carried reported_kbs=0, and every response came back with no tails
 	// because of that.) The union across nodes is what turns "I hold nothing" into
-	// "here is the chain, here is its tail, and here is who can serve it".
+	// "here is the chain, and here is its tail".
 	//
-	// An entry ABSENT from either map still means "unknown" — no signal, never
-	// "nothing to catch up" and never "nobody holds it"
-	// (docs/active-lag-detection-design.md, docs/data-source-holders-fallback-plan.md).
+	// An entry ABSENT from the map still means "unknown" — no signal, never "nothing to
+	// catch up" (docs/active-lag-detection-design.md).
 	if h.chainTails != nil {
 		tails := make(map[string]int64)
-		holders := make(map[string]*pb.HolderList)
 		for _, kbID := range h.dataVersions.KnowledgeBases() {
 			tail, ok := h.chainTails.ChainTail(kbID)
 			if !ok || tail <= 0 {
 				continue
 			}
 			tails[kbID] = tail
-			// The holder list is fetched AT the tail, which is the version this
-			// answer is good through: whoever holds the tail holds everything
-			// below it, so the reportee may reuse these addresses for any lower
-			// version it is missing — and only for lower ones.
-			if h.holders != nil {
-				if addrs := h.holders.HolderAddresses(kbID, tail); len(addrs) > 0 {
-					holders[kbID] = &pb.HolderList{Addresses: addrs}
-				}
-			}
 		}
 		if len(tails) > 0 {
 			resp.ChainTails = tails
-		}
-		if len(holders) > 0 {
-			resp.Holders = holders
 		}
 	}
 	return resp, nil

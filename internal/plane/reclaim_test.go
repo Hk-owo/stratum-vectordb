@@ -240,3 +240,24 @@ func TestLocalDataPlane_ReclaimChangesReportsCompactionFailure(t *testing.T) {
 		t.Fatal("a failed compaction must be reported")
 	}
 }
+
+// The furthest cursor wins, and everyone who reached it is named: they hold every version
+// below it too. A silent peer is skipped rather than held against the answer.
+func TestLocalDataPlane_PeerHolders(t *testing.T) {
+	peers := &peerCursors{cursors: map[string]map[string]int64{
+		"p3": {"kb-1": 9},
+		"p1": {"kb-1": 9},
+		"p2": {"kb-1": 4},
+		"p4": {},
+	}}
+	dp := reclaimPlane(t, &stubWAL{t: &tracer{}}, peers, []string{"p3", "p1", "p2", "p4", "dead"})
+
+	version, addrs, ok := dp.PeerHolders(context.Background(), "kb-1")
+	if !ok || version != 9 || !reflect.DeepEqual(addrs, []string{"p1", "p3"}) {
+		t.Fatalf("PeerHolders = %d, %v, %v; want 9, [p1 p3], true", version, addrs, ok)
+	}
+
+	if _, _, ok := dp.PeerHolders(context.Background(), "kb-unknown"); ok {
+		t.Error("nobody holds it, so there is no answer to cache")
+	}
+}

@@ -115,6 +115,12 @@ type LagCatchupConfig struct {
 	// Cursor reports this node's own contiguous cursor per knowledge base. Required.
 	Cursor func() map[string]int64
 
+	// FindHolders asks the peers who can serve kbID and leaves the answer where the
+	// data-source lookup reads it. A catch-up calls it before Ensure and keeps calling it
+	// until Ensure returns, because that lookup runs on the Raft apply path and cannot
+	// ask for itself. Optional.
+	FindHolders func(ctx context.Context, kbID string)
+
 	// NodeState is the node state machine, which OWNS the catch-up set
 	// (docs/storage-node-state-machine-plan.md §3.3). Optional: a catch-up built
 	// without one makes its own, the same way the data plane does. The set
@@ -144,6 +150,11 @@ const DefaultMaxConcurrentLagCatchups = 2
 // placeholder: a large knowledge base may legitimately take longer, and being wrong
 // costs a retry on the next signal rather than a stuck version.
 const LagCatchupTimeout = 5 * time.Minute
+
+// holdersRefreshInterval is how often a running catch-up re-asks its peers who can
+// serve it. A third of DefaultHoldersCacheTTL, so one failed round leaves the answer
+// usable.
+const holdersRefreshInterval = 5 * time.Second
 
 // NewLagCatchup returns a LagCatchup. It satisfies sync.ChainTailSink.
 func NewLagCatchup(cfg LagCatchupConfig) *LagCatchup {
@@ -255,6 +266,10 @@ func (l *LagCatchup) catchUp(kbID string, target int64) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), LagCatchupTimeout)
 	defer cancel()
+	if l.cfg.FindHolders != nil {
+		l.cfg.FindHolders(ctx, kbID)
+		go l.refreshHolders(ctx, kbID)
+	}
 	if err := l.cfg.Ensure(ctx, kbID, target); err != nil {
 		l.cfg.Logger.Warn("plane: lag catch-up failed; the version will be built on demand instead",
 			zap.String("kb_id", kbID), zap.Int64("version_id", target), zap.Error(err))
@@ -262,6 +277,21 @@ func (l *LagCatchup) catchUp(kbID string, target int64) {
 	}
 	l.cfg.Logger.Info("plane: caught up with the chain tail",
 		zap.String("kb_id", kbID), zap.Int64("version_id", target))
+}
+
+// refreshHolders keeps the holders fresh while a catch-up runs. A catch-up can outlast
+// one answer's TTL, and the lookup re-resolves on every attempt.
+func (l *LagCatchup) refreshHolders(ctx context.Context, kbID string) {
+	ticker := time.NewTicker(holdersRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.cfg.FindHolders(ctx, kbID)
+		}
+	}
 }
 
 // jitterFor returns this signal's delay. The knowledge base id goes into the hash so

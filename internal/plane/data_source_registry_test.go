@@ -179,13 +179,10 @@ func TestResolverWithRegistryAnswersFromHoldersBeforeFallingBack(t *testing.T) {
 // A miss on the holders mirror falls through to the leader, and NOTHING on this
 // path dials anyone: the function runs on the Raft apply path, where the first
 // attempt at §8.5 drove `integration` from 26s to 462s by probing peers. The
-// mirror is filled by the report RESPONSE, never by work done here.
+// mirror is filled by the node's catch-up, never by work done here.
 func TestResolverWithRegistryUsesTheMirrorAndNeverDials(t *testing.T) {
 	holders := NewHoldersCache(HoldersCacheConfig{})
-	holders.StoreHolders(
-		map[string][]string{"kb-1": {"holder:7001"}},
-		map[string]int64{"kb-1": 5},
-	)
+	holders.Store("kb-1", 5, []string{"holder:7001"})
 
 	calls := 0
 	resolve := ResolverWithRegistry(NewDataSourceRegistry(), holders, func(context.Context, string, int64) (string, bool, error) {

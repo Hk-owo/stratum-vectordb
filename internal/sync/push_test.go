@@ -245,15 +245,6 @@ func TestFollower_PullVersion_AdvancesTheCursor(t *testing.T) {
 	}
 }
 
-// fixedHolders is a HolderSource with a fixed table.
-type fixedHolders struct {
-	holders map[string][]string
-}
-
-func (h *fixedHolders) HolderAddresses(kbID string, _ int64) []string {
-	return h.holders[kbID]
-}
-
 // The leader answers about EVERY knowledge base it knows, not only the ones the
 // reporter named.
 //
@@ -270,7 +261,6 @@ func TestPushHandler_ReportDataVersions_AnswersAboutChainsTheReporterNeverNamed(
 	h := NewPushHandler(nil, 7,
 		WithDataVersionAggregator(rec, func() bool { return true }),
 		WithChainTails(&fixedChainTails{tails: map[string]int64{"kb-1": 55}}),
-		WithHolders(&fixedHolders{holders: map[string][]string{"kb-1": {"other:7001"}}}),
 	)
 
 	resp, err := h.ReportDataVersions(context.Background(), &pb.ReportDataVersionsRequest{
@@ -288,9 +278,5 @@ func TestPushHandler_ReportDataVersions_AnswersAboutChainsTheReporterNeverNamed(
 	if got := resp.GetChainTails()["kb-1"]; got != 55 {
 		t.Errorf("chain_tails = %v, want kb-1:55 even though the reporter named nothing",
 			resp.GetChainTails())
-	}
-	addrs := resp.GetHolders()["kb-1"].GetAddresses()
-	if len(addrs) != 1 || addrs[0] != "other:7001" {
-		t.Errorf("holders = %v, want kb-1:[other:7001]", resp.GetHolders())
 	}
 }

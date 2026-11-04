@@ -1566,6 +1566,39 @@ func (d *LocalDataPlane) pickTransferSource(ctx context.Context, kbID string, ne
 	return "", false
 }
 
+// PeerHolders asks the replicas how far they have reached for kbID, and returns the
+// furthest version anyone reached with the peers that reached it. Those peers hold every
+// version below it too, since a cursor is a contiguous prefix.
+//
+// ok=false means no peer holds anything it could say so about: a silent peer is not
+// evidence of anything, so it is skipped rather than held against the answer.
+func (d *LocalDataPlane) PeerHolders(ctx context.Context, kbID string) (version int64, addrs []string, ok bool) {
+	if d.cursorQuerier == nil || d.resolveReplicas == nil {
+		return 0, nil, false
+	}
+	peers, err := d.resolveReplicas(ctx)
+	if err != nil {
+		return 0, nil, false
+	}
+	for _, peer := range peers {
+		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
+		cancel()
+		if err != nil || cursor <= 0 || cursor < version {
+			continue
+		}
+		if cursor > version {
+			version, addrs = cursor, addrs[:0]
+		}
+		addrs = append(addrs, peer)
+	}
+	if len(addrs) == 0 {
+		return 0, nil, false
+	}
+	sort.Strings(addrs)
+	return version, addrs, true
+}
+
 // Search runs a vector query against versionID's index.
 func (d *LocalDataPlane) Search(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) {
 	return d.indexMgr.Search(ctx, kbID, versionID, vector, topK)

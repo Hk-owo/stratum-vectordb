@@ -97,11 +97,11 @@ func (r *DataSourceRegistry) Len() int {
 // ResolverWithRegistry answers with, in order:
 //
 //  1. the announced holder of (kbID, versionID) — a writer said so (§8.5);
-//  2. the control leader's §7.13.4 aggregate, read from a LOCAL mirror: never an
-//     RPC, because this runs on the Raft apply path (see the history above). The
-//     mirror is filled by the report heartbeat even when this node's own
-//     confirmation never arrived, which is what makes a replica that missed one
-//     still able to find a source (docs/data-source-holders-fallback-plan.md);
+//  2. the peers that answered this node's catch-up, read from a LOCAL cache: never an
+//     RPC, because this runs on the Raft apply path (see the history above). A node that
+//     finds itself behind fills it by asking its peers, even when this node's own
+//     confirmation never arrived, which is what makes a replica that missed one still
+//     able to find a source (docs/data-source-holders-fallback-plan.md);
 //  3. the pre-§8.5 answer — the leader.
 //
 // What every layer's answer must pass is dataCapable: "this address can hold
@@ -124,9 +124,8 @@ func (r *DataSourceRegistry) Len() int {
 // really holds the version.
 //
 // All three layers are pure map reads, and nothing on this path dials a peer —
-// that is the whole point (see §8.5's history above). Layer 2 is filled by the
-// report heartbeat's response, never by a call from here: the answer arrives
-// carrying the interval this node already sends.
+// that is the whole point (see §8.5's history above). Layer 2 is filled by the catch-up,
+// never by a call from here.
 //
 // dataCapable may be nil, which disables the check (the single-tier shape, and
 // every unit test that does not care about topology).
@@ -138,7 +137,7 @@ func ResolverWithRegistry(reg *DataSourceRegistry, holders *HoldersCache, fallba
 		}
 		if holders != nil {
 			if addrs, ok := holders.Lookup(kbID, versionID); ok {
-				// Ascending node id ⇒ reproducible; the rest are retry
+				// Ascending address ⇒ reproducible; the rest are retry
 				// candidates for callers that keep the list. The first one that
 				// can actually hold data wins, rather than mechanically addrs[0]:
 				// a mirror entry that cannot serve would otherwise shadow the
