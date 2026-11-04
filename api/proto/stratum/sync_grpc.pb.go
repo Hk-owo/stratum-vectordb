@@ -40,6 +40,7 @@ const (
 	DataSyncService_PullVersionData_FullMethodName     = "/stratum.DataSyncService/PullVersionData"
 	DataSyncService_PullVersionChanges_FullMethodName  = "/stratum.DataSyncService/PullVersionChanges"
 	DataSyncService_ReportDataVersions_FullMethodName  = "/stratum.DataSyncService/ReportDataVersions"
+	DataSyncService_GetChainTails_FullMethodName       = "/stratum.DataSyncService/GetChainTails"
 	DataSyncService_PushVersionData_FullMethodName     = "/stratum.DataSyncService/PushVersionData"
 	DataSyncService_VersionPresence_FullMethodName     = "/stratum.DataSyncService/VersionPresence"
 	DataSyncService_LocalVersion_FullMethodName        = "/stratum.DataSyncService/LocalVersion"
@@ -87,6 +88,10 @@ type DataSyncServiceClient interface {
 	// leader and tries again next interval (§7.13.1's pattern), rather than the
 	// system growing a second forwarding path.
 	ReportDataVersions(ctx context.Context, in *ReportDataVersionsRequest, opts ...grpc.CallOption) (*ReportDataVersionsResponse, error)
+	// GetChainTails returns the tail of every knowledge base's version chain. A node calls
+	// it when a heartbeat's chain_generation differs from the one it last pulled at, so the
+	// heartbeat itself stays the same size however many knowledge bases there are.
+	GetChainTails(ctx context.Context, in *GetChainTailsRequest, opts ...grpc.CallOption) (*GetChainTailsResponse, error)
 	// PushVersionData hands one version's records to this node: the caller
 	// (the write's coordinator) streams the same SyncEntry records
 	// PullVersionData would have produced, and receives a single
@@ -184,6 +189,16 @@ func (c *dataSyncServiceClient) ReportDataVersions(ctx context.Context, in *Repo
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReportDataVersionsResponse)
 	err := c.cc.Invoke(ctx, DataSyncService_ReportDataVersions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dataSyncServiceClient) GetChainTails(ctx context.Context, in *GetChainTailsRequest, opts ...grpc.CallOption) (*GetChainTailsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetChainTailsResponse)
+	err := c.cc.Invoke(ctx, DataSyncService_GetChainTails_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -301,6 +316,10 @@ type DataSyncServiceServer interface {
 	// leader and tries again next interval (§7.13.1's pattern), rather than the
 	// system growing a second forwarding path.
 	ReportDataVersions(context.Context, *ReportDataVersionsRequest) (*ReportDataVersionsResponse, error)
+	// GetChainTails returns the tail of every knowledge base's version chain. A node calls
+	// it when a heartbeat's chain_generation differs from the one it last pulled at, so the
+	// heartbeat itself stays the same size however many knowledge bases there are.
+	GetChainTails(context.Context, *GetChainTailsRequest) (*GetChainTailsResponse, error)
 	// PushVersionData hands one version's records to this node: the caller
 	// (the write's coordinator) streams the same SyncEntry records
 	// PullVersionData would have produced, and receives a single
@@ -357,6 +376,9 @@ func (UnimplementedDataSyncServiceServer) PullVersionChanges(*PullVersionChanges
 }
 func (UnimplementedDataSyncServiceServer) ReportDataVersions(context.Context, *ReportDataVersionsRequest) (*ReportDataVersionsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReportDataVersions not implemented")
+}
+func (UnimplementedDataSyncServiceServer) GetChainTails(context.Context, *GetChainTailsRequest) (*GetChainTailsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetChainTails not implemented")
 }
 func (UnimplementedDataSyncServiceServer) PushVersionData(grpc.ClientStreamingServer[SyncEntry, PushVersionDataResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method PushVersionData not implemented")
@@ -451,6 +473,24 @@ func _DataSyncService_ReportDataVersions_Handler(srv interface{}, ctx context.Co
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DataSyncServiceServer).ReportDataVersions(ctx, req.(*ReportDataVersionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DataSyncService_GetChainTails_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetChainTailsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataSyncServiceServer).GetChainTails(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataSyncService_GetChainTails_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataSyncServiceServer).GetChainTails(ctx, req.(*GetChainTailsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -559,6 +599,10 @@ var DataSyncService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportDataVersions",
 			Handler:    _DataSyncService_ReportDataVersions_Handler,
+		},
+		{
+			MethodName: "GetChainTails",
+			Handler:    _DataSyncService_GetChainTails_Handler,
 		},
 		{
 			MethodName: "VersionPresence",

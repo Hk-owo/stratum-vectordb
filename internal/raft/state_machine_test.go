@@ -1118,3 +1118,43 @@ func TestMockAndStateMachine_VersionDeleteModesAgree(t *testing.T) {
 		})
 	}
 }
+
+// chainSeq has to move whenever a knowledge base's tail can have, or a node would keep
+// comparing itself against a tail that no longer exists. It must also move only then: an
+// index status changing says nothing about the tail, and pulling on it would put back the
+// per-heartbeat cost this exists to remove.
+func TestStateMachine_ChainSeqFollowsTheTail(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := proposeCtx(t)
+	apply := func(cmd command) applyResult {
+		t.Helper()
+		res := sm.apply(ctx, cmd, w, zap.NewNop())
+		if res.Err != nil {
+			t.Fatalf("apply %s: %v", cmd.Type, res.Err)
+		}
+		return res
+	}
+	mustMove := func(what string, before uint64) uint64 {
+		t.Helper()
+		if sm.chainSeq == before {
+			t.Errorf("%s did not move chainSeq", what)
+		}
+		return sm.chainSeq
+	}
+
+	apply(command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))})
+	seq := sm.chainSeq
+	res := apply(command{Type: cmdCreateVersion, KBID: "kb-1"})
+	seq = mustMove("creating a version", seq)
+
+	apply(command{Type: cmdMarkDataDurable, VersionID: res.VersionID})
+	if sm.chainSeq != seq {
+		t.Error("marking data durable moved chainSeq, but the tail did not change")
+	}
+
+	apply(command{Type: cmdRemoveVersionMeta, KBID: "kb-1", VersionID: res.VersionID})
+	seq = mustMove("removing a version", seq)
+
+	apply(command{Type: cmdRemoveKBMeta, KBID: "kb-1"})
+	mustMove("removing the knowledge base", seq)
+}

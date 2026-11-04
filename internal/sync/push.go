@@ -173,12 +173,13 @@ type PushHandler struct {
 	chainTails ChainTailSource
 }
 
-// ChainTailSource answers "what is the newest version the control layer has accepted
-// for this knowledge base?" — the tail a node compares its own cursor against.
-// *plane.LocalControlPlane implements it. Declared here for the same reason
-// ReclaimWatermarkSource is: plane imports this package.
+// ChainTailSource answers "what is the newest version the control layer has accepted"
+// for every knowledge base, and names the state of that answer so a node can tell when it
+// has to ask again. *plane.LocalControlPlane implements it. Declared here because plane
+// imports this package.
 type ChainTailSource interface {
-	ChainTail(kbID string) (int64, bool)
+	ChainGeneration() (term, seq uint64, ok bool)
+	ChainTails(ctx context.Context) (map[string]int64, error)
 }
 
 // DataVersionRecorder is the control leader's §7.13.4 aggregate, reduced to the
@@ -237,8 +238,8 @@ func WithDataVersionAggregator(rec DataVersionRecorder, isLeader func() bool) Pu
 	}
 }
 
-// WithChainTails wires the source of the chain tails carried back on a report's
-// response (docs/active-lag-detection-design.md). Separate from WithReclaimWatermarks
+// WithChainTails wires the source of the chain generation carried back on a report's
+// response and of the tails GetChainTails answers with (docs/active-lag-detection-design.md). Separate from WithReclaimWatermarks
 // because they answer different questions — "what may you discard" versus "how far
 // behind are you" — even though a leader normally passes itself for both.
 func WithChainTails(src ChainTailSource) PushHandlerOption {
@@ -611,32 +612,36 @@ func (h *PushHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 
 	// §2: an owner set is a pure function of (kbID, versionID) and the member set,
 	resp := &pb.ReportDataVersionsResponse{Accepted: true, NodeId: h.nodeID}
-	// Carry back the chain tails, for every knowledge base this leader
-	// knows about — NOT merely the ones this reporter named.
-	//
-	// That difference is the point. A node that missed a whole chain names it in no
-	// map at all, so answering the named set tells it nothing: it would hear back
-	// exactly the emptiness it already has, and never learn there is something to be
-	// behind on. (Measured on a replica that had been offline for 55 versions: its
-	// report carried reported_kbs=0, and every response came back with no tails
-	// because of that.) The union across nodes is what turns "I hold nothing" into
-	// "here is the chain, and here is its tail".
-	//
-	// An entry ABSENT from the map still means "unknown" — no signal, never "nothing to
-	// catch up" (docs/active-lag-detection-design.md).
+	// Carry back the chain generation, not the tails: this answer goes out on every
+	// heartbeat of every node, so it must stay the same size however many knowledge bases
+	// there are. A node pulls the tails only when this changes (GetChainTails).
 	if h.chainTails != nil {
-		tails := make(map[string]int64)
-		for _, kbID := range h.dataVersions.KnowledgeBases() {
-			tail, ok := h.chainTails.ChainTail(kbID)
-			if !ok || tail <= 0 {
-				continue
-			}
-			tails[kbID] = tail
-		}
-		if len(tails) > 0 {
-			resp.ChainTails = tails
+		if term, seq, ok := h.chainTails.ChainGeneration(); ok {
+			resp.ChainGeneration = &pb.ChainGeneration{Term: term, Seq: seq}
 		}
 	}
+	return resp, nil
+}
+
+// GetChainTails answers a node whose last pull is at a different chain generation.
+//
+// A non-leader answers accepted=false, like ReportDataVersions, because a follower's
+// metadata can lag and a lagging tail would tell a node it is fine when it is not.
+func (h *PushHandler) GetChainTails(ctx context.Context, _ *pb.GetChainTailsRequest) (*pb.GetChainTailsResponse, error) {
+	if h.chainTails == nil || h.isLeader == nil || !h.isLeader() {
+		return &pb.GetChainTailsResponse{Accepted: false}, nil
+	}
+	// The generation first: the tails read after it are at least as new as it says, so a
+	// change landing between the two reads costs one extra pull rather than a missed one.
+	resp := &pb.GetChainTailsResponse{Accepted: true}
+	if term, seq, ok := h.chainTails.ChainGeneration(); ok {
+		resp.Generation = &pb.ChainGeneration{Term: term, Seq: seq}
+	}
+	tails, err := h.chainTails.ChainTails(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "sync: GetChainTails: %v", err)
+	}
+	resp.ChainTails = tails
 	return resp, nil
 }
 

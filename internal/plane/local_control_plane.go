@@ -2,6 +2,7 @@ package plane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -519,30 +520,60 @@ func (c *LocalControlPlane) StorageUnavailable(kbID string) (unavailable bool, d
 	return ok && state == StorageUnavailable, detail, ok
 }
 
-// ChainTail answers "what is the newest version the control layer has accepted for
-// this knowledge base?" — the tail a node compares its own cursor against to decide
+// chainGenerationSource is the part of a Raft node that can name the state of the chain
+// tails. Only the shape that holds the log has it, which is the only shape that leads.
+type chainGenerationSource interface {
+	ChainGeneration() (term, seq uint64)
+}
+
+// ChainGeneration names the current state of the chain tails, so a node can tell whether
+// it has to pull them again. ok=false means this node offers no signal.
+//
+// It is read BEFORE the tails it describes wherever the two travel together, so tails
+// are always at least as new as the generation they came with: at worst a node pulls
+// once more than it had to, and it can never miss a change.
+func (c *LocalControlPlane) ChainGeneration() (term, seq uint64, ok bool) {
+	src, isSource := c.rn.(chainGenerationSource)
+	if !isSource {
+		return 0, 0, false
+	}
+	term, seq = src.ChainGeneration()
+	return term, seq, true
+}
+
+// ChainTails answers "what is the newest version the control layer has accepted?" for
+// every knowledge base — the tails a node compares its own cursors against to decide
 // whether it has fallen behind (docs/active-lag-detection-design.md).
 //
-// It reads the replicated metadata directly, so this is the leader's answer and
-// nobody else's: a follower's metadata view can lag, and a lagging tail would tell a
-// node it is fine when it is not. Callers must treat false as "no signal", never as
-// "nothing to catch up".
-func (c *LocalControlPlane) ChainTail(kbID string) (int64, bool) {
+// It reads the replicated metadata directly, so this is the leader's answer and nobody
+// else's: a follower's metadata view can lag, and a lagging tail would tell a node it is
+// fine when it is not. The list comes from the metadata rather than from any node's
+// report because a node that missed a whole chain has nothing to report about it, and this
+// is how it learns there is something to be behind on.
+//
+// A knowledge base whose tail cannot be read, or which has no versions, is left out:
+// absence is "no signal", never "nothing to catch up".
+func (c *LocalControlPlane) ChainTails(ctx context.Context) (map[string]int64, error) {
 	if c.rn == nil {
-		c.logger.Debug("plane: chain tail: no metadata source wired", zap.String("kb_id", kbID))
-		return 0, false
+		return nil, errors.New("plane: chain tails: no metadata source wired")
 	}
-	// The EXTREME VALUE, not the chain: this runs once per knowledge base on EVERY
-	// cursor report, so a whole-chain read here was paid per report for one number.
-	// The control node answers in O(1) (see RaftNode.LastVersionID).
-	tail, err := c.rn.LastVersionID(context.Background(), kbID)
-	if err != nil || tail <= 0 {
-		c.logger.Debug("plane: chain tail unavailable",
-			zap.String("kb_id", kbID), zap.Int64("tail", tail), zap.Error(err))
-		return 0, false
+	kbs, err := c.rn.ListKnowledgeBases(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("plane: chain tails: list knowledge bases: %w", err)
 	}
-	c.logger.Debug("plane: chain tail", zap.String("kb_id", kbID), zap.Int64("tail", tail))
-	return tail, true
+	tails := make(map[string]int64, len(kbs))
+	for _, kb := range kbs {
+		// The extreme value, not the chain: the control node answers in O(1) (see
+		// RaftNode.LastVersionID).
+		tail, err := c.rn.LastVersionID(ctx, kb.KBID)
+		if err != nil || tail <= 0 {
+			c.logger.Debug("plane: chain tail unavailable",
+				zap.String("kb_id", kb.KBID), zap.Int64("tail", tail), zap.Error(err))
+			continue
+		}
+		tails[kb.KBID] = tail
+	}
+	return tails, nil
 }
 
 // effectiveSilenceWindow resolves the configured silence window, defaulting it exactly

@@ -169,6 +169,11 @@ func (h *NodeHandler) ReportDataVersions(ctx context.Context, req *pb.ReportData
 	return h.receiver.ReportDataVersions(ctx, req)
 }
 
+// GetChainTails serves a node whose last pull is at a different chain generation.
+func (h *NodeHandler) GetChainTails(ctx context.Context, req *pb.GetChainTailsRequest) (*pb.GetChainTailsResponse, error) {
+	return h.receiver.GetChainTails(ctx, req)
+}
+
 // FetchIndexData serves a peer that wants this node's copy of a version's
 // artifact (§8.4's distribution, other direction).
 //

@@ -95,6 +95,9 @@ type DataVersionReporter struct {
 	// (docs/active-lag-detection-design.md). A sink decides for itself what to do
 	// with them — including nothing.
 	chainTails ChainTailSink
+	// tails and tailsGeneration are the last pull. Only Run's goroutine touches them.
+	tails           map[string]int64
+	tailsGeneration *pb.ChainGeneration
 }
 
 // NewDataVersionReporter returns a reporter that dials leaders directly.
@@ -160,7 +163,8 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	resp, err := pb.NewDataSyncServiceClient(conn).ReportDataVersions(ctx, &pb.ReportDataVersionsRequest{
+	client := pb.NewDataSyncServiceClient(conn)
+	resp, err := client.ReportDataVersions(ctx, &pb.ReportDataVersionsRequest{
 		NodeId:       r.nodeID,
 		Address:      r.selfAddr,
 		DataVersions: r.dataVersions(),
@@ -175,27 +179,45 @@ func (r *DataVersionReporter) ReportOnce(ctx context.Context) error {
 			addr, resp.GetNodeId())
 	}
 
-	// An accepted response carries the chain tails back. Only an accepted answer may
-	// act on this node: a stale or refused response says
-	// nothing about where the chain is. What the sink does with them is its decision
-	// — an unwired or disabled sink simply does nothing
-	// (docs/active-lag-detection-design.md).
+	// Only an accepted answer may act on this node: a stale or refused response says
+	// nothing about where the chain is.
 	if r.chainTails != nil {
-		// What actually crossed the wire. "The report did not land" and "it landed
-		// carrying nothing" look identical from outside and mean opposite things: the
-		// first says the leader never heard us, the second says it did and had no tail
-		// to give. Both counts are needed to tell them apart, because a report naming
-		// zero knowledge bases cannot carry a tail at all — the leader only fills
-		// tails for the knowledge bases the reporter names.
-		//
-		// dataVersions is read again here rather than kept from the request: this is
-		// diagnostic, and a second read of the same node-local map is close enough.
-		if r.logger != nil {
-			r.logger.Debug("sync: data-version report landed",
-				zap.Int("reported_kbs", len(r.dataVersions())),
-				zap.Int("chain_tails", len(resp.GetChainTails())))
-		}
-		r.chainTails.SetChainTails(resp.GetChainTails())
+		r.syncChainTails(ctx, client, resp.GetChainGeneration())
 	}
 	return nil
+}
+
+// syncChainTails pulls the tails when the leader's generation differs from the one this
+// node last pulled at, and hands the sink the latest tails either way.
+//
+// Handing them over on every accepted heartbeat is deliberate. The sink skips what it has
+// no room for, and retries what failed, on the next signal, so the signal has to keep
+// coming whether or not anything changed. It costs a local comparison, not a network trip.
+//
+// A failed pull keeps the old generation, so the next heartbeat tries again.
+func (r *DataVersionReporter) syncChainTails(ctx context.Context, client pb.DataSyncServiceClient, generation *pb.ChainGeneration) {
+	if generation != nil && !sameGeneration(generation, r.tailsGeneration) {
+		resp, err := client.GetChainTails(ctx, &pb.GetChainTailsRequest{})
+		switch {
+		case err != nil:
+			if r.logger != nil {
+				r.logger.Debug("sync: chain tails not pulled; retrying next interval", zap.Error(err))
+			}
+		case resp.GetAccepted() && resp.GetGeneration() != nil:
+			r.tails = resp.GetChainTails()
+			r.tailsGeneration = resp.GetGeneration()
+			if r.logger != nil {
+				r.logger.Debug("sync: chain tails pulled", zap.Int("chain_tails", len(r.tails)))
+			}
+		}
+	}
+	// Nothing pulled yet means "not told", which is not "no chains": the sink hears
+	// nothing rather than an empty answer.
+	if r.tailsGeneration != nil {
+		r.chainTails.SetChainTails(r.tails)
+	}
+}
+
+func sameGeneration(a, b *pb.ChainGeneration) bool {
+	return b != nil && a.GetTerm() == b.GetTerm() && a.GetSeq() == b.GetSeq()
 }

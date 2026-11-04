@@ -60,6 +60,11 @@ service DataSyncService {
   // system growing a second forwarding path.
   rpc ReportDataVersions(ReportDataVersionsRequest) returns (ReportDataVersionsResponse);
 
+  // GetChainTails returns the tail of every knowledge base's version chain. A node calls
+  // it when a heartbeat's chain_generation differs from the one it last pulled at, so the
+  // heartbeat itself stays the same size however many knowledge bases there are.
+  rpc GetChainTails(GetChainTailsRequest) returns (GetChainTailsResponse);
+
   // PushVersionData hands one version's records to this node: the caller
   // (the write's coordinator) streams the same SyncEntry records
   // PullVersionData would have produced, and receives a single
@@ -324,6 +329,32 @@ message ReportDataVersionsResponse {
   // interval.
   map<string, HolderList> holders = 5;
 
+  // chain_generation changes whenever any knowledge base's chain tail may have. A node
+  // that last pulled at a different generation calls GetChainTails. Absent means this
+  // leader offers no signal.
+  ChainGeneration chain_generation = 6;
+}
+
+// ChainGeneration names one state of the chain tails. Compare for equality only:
+// seq counts tail changes on the node that answers and restarts with it, so the term
+// is what keeps two leaders' numbers from being mistaken for one another.
+message ChainGeneration {
+  uint64 term = 1;
+  uint64 seq = 2;
+}
+
+message GetChainTailsRequest {}
+
+message GetChainTailsResponse {
+  // accepted is false when the receiving node is not the control leader.
+  bool accepted = 1;
+  // chain_tails is, per knowledge base, the newest version the control layer has
+  // accepted. Deliberately the chain tail, NOT the active version: a node is not "behind"
+  // merely because it has not switched to the newest version. A knowledge base absent
+  // from this map means "unknown", not "nothing to catch up".
+  map<string, int64> chain_tails = 2;
+  // generation is the generation these tails are at least as new as.
+  ChainGeneration generation = 3;
 }
 
 // HolderList is one knowledge base's holders, in ascending node-id order so a

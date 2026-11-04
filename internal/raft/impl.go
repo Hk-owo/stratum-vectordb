@@ -1093,6 +1093,20 @@ func (impl *RaftNodeImpl) LastVersionID(_ context.Context, kbID string) (int64, 
 	return ids[len(ids)-1], nil
 }
 
+// ChainGeneration names the current state of the chain tails: it changes whenever one
+// may have, and a new leader's term keeps its count apart from its predecessor's.
+//
+// Not on the RaftNode interface: only a leader's answer means anything, and every other
+// shape would have to invent one.
+func (impl *RaftNodeImpl) ChainGeneration() (term, seq uint64) {
+	// Read apart: the apply path takes the state-machine lock while Raft is working, so
+	// holding it across a call into Raft is an ordering nobody needs to reason about.
+	term = impl.raft.Term()
+	impl.sm.mu.RLock()
+	defer impl.sm.mu.RUnlock()
+	return term, impl.sm.chainSeq
+}
+
 // VersionLiveness answers "which of these versions are still alive, and how far has
 // allocation got" for one knowledge base.
 //

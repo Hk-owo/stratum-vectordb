@@ -100,6 +100,10 @@ func TestNodeHandler_ForwardsEveryDataSyncMethod(t *testing.T) {
 			_, err := client.ConfirmVersionWrite(ctx, &pb.ConfirmVersionWriteRequest{})
 			return err
 		}},
+		{"GetChainTails", func() error {
+			_, err := client.GetChainTails(ctx, &pb.GetChainTailsRequest{})
+			return err
+		}},
 		{"ReportDataVersions", func() error {
 			_, err := client.ReportDataVersions(ctx, &pb.ReportDataVersionsRequest{})
 			return err
