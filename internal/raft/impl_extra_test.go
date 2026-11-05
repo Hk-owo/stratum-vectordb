@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -345,5 +346,67 @@ func TestRaftNodeImpl_SetOnVersionFailedPermanent_SkipsTheIndexSide(t *testing.T
 	case got := <-called:
 		t.Fatalf("index-side verdict fired the data-reclaim hook for v%d", got)
 	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// TestRaftNodeImpl_WriteChainSurvivesTheFailureThatRacedTheAnnouncement is the whole
+// scenario: the child waits on a PENDING parent, an announcement settles it, the child
+// lands, and the writer's late verdict changes nothing for either of them.
+func TestRaftNodeImpl_WriteChainSurvivesTheFailureThatRacedTheAnnouncement(t *testing.T) {
+	impl, _ := newTestRaftNodeImpl(t)
+	ctx := proposeCtx(t)
+	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	parent, err := impl.ProposeCreateVersion(ctx, "kb-1", 0)
+	if err != nil {
+		t.Fatalf("ProposeCreateVersion(parent): %v", err)
+	}
+
+	if _, err := impl.ProposeCreateVersion(ctx, "kb-1", parent); !errors.Is(err, stratumerrors.ErrParentNotDurable) {
+		t.Fatalf("child on a PENDING parent: err = %v, want ErrParentNotDurable", err)
+	}
+
+	if err := impl.ProposeUpdateVersionSummary(ctx, parent, "digest"); err != nil {
+		t.Fatalf("ProposeUpdateVersionSummary: %v", err)
+	}
+	child, err := impl.ProposeCreateVersion(ctx, "kb-1", parent)
+	if err != nil {
+		t.Fatalf("child on a DURABLE parent: %v", err)
+	}
+
+	err = impl.ProposeMarkVersionFailedPermanent(ctx, "kb-1", parent, types.FailureSideData, "late", 5)
+	if !errors.Is(err, stratumerrors.ErrVersionDataSettled) {
+		t.Fatalf("late verdict: err = %v, want ErrVersionDataSettled", err)
+	}
+	for _, id := range []int64{parent, child} {
+		if _, err := impl.GetVersion(ctx, "kb-1", id); err != nil {
+			t.Errorf("v%d after the refused verdict: %v", id, err)
+		}
+	}
+}
+
+// TestRaftNodeImpl_TerminalParentIsNotARetryableAnswer: "not yet" and "never" must stay
+// apart. A caller retrying on a parent that will never be durable waits forever.
+func TestRaftNodeImpl_TerminalParentIsNotARetryableAnswer(t *testing.T) {
+	impl, _ := newTestRaftNodeImpl(t)
+	ctx := proposeCtx(t)
+	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
+		t.Fatalf("ProposeCreateKB: %v", err)
+	}
+	parent, err := impl.ProposeCreateVersion(ctx, "kb-1", 0)
+	if err != nil {
+		t.Fatalf("ProposeCreateVersion: %v", err)
+	}
+	if err := impl.ProposeMarkVersionFailedPermanent(ctx, "kb-1", parent, types.FailureSideData, "gone", 5); err != nil {
+		t.Fatalf("ProposeMarkVersionFailedPermanent: %v", err)
+	}
+
+	_, err = impl.ProposeCreateVersion(ctx, "kb-1", parent)
+	if !errors.Is(err, stratumerrors.ErrInvalidParentVersion) {
+		t.Errorf("err = %v, want ErrInvalidParentVersion", err)
+	}
+	if errors.Is(err, stratumerrors.ErrParentNotDurable) {
+		t.Error("a terminal parent must not read as \"not yet\"")
 	}
 }
