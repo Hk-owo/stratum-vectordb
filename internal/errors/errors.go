@@ -38,7 +38,21 @@ var (
 	// caller polls until its deadline without learning anything. The move is a NEW
 	// write under a NEW key; AwaitVersion reports the same state as
 	// DATA_FAILED_PERMANENT.
-	ErrVersionDataFailed     = errors.New("version data will never arrive")
+	ErrVersionDataFailed = errors.New("version data will never arrive")
+	// ErrVersionDataSettled is the control layer refusing to declare a version's
+	// DATA side permanently failed after that side already reached DURABLE.
+	//
+	// The two claims contradict each other, and the durable one wins: the data is
+	// on a quorum, so a later failure report describes a transient the system has
+	// since resolved — typically a push that timed out while a lagging replica was
+	// already catching up. Letting it through marks a perfectly good version
+	// terminal, and every replica's apply then reclaims data a child version
+	// already depends on (docs/known-gaps.md §K).
+	//
+	// NOT a retryable answer for the reporter: retrying the same report reaches the
+	// same state machine and the same verdict. Callers treat it as "already
+	// settled" and stop.
+	ErrVersionDataSettled    = errors.New("version data is already durable")
 	ErrVersionDeleting       = errors.New("version is being deleted")
 	ErrVersionIsActive       = errors.New("version is the active version")
 	ErrKnowledgeBaseNotFound = errors.New("knowledge base not found")
@@ -61,6 +75,22 @@ var (
 	ErrEmptyChanges         = errors.New("empty changes")
 	ErrIndexLoadTimeout     = errors.New("index load timeout")
 	ErrInvalidParentVersion = errors.New("invalid parent version")
+	// ErrParentNotDurable is a CreateVersion naming a parent whose DATA side is
+	// still PENDING. Unlike ErrInvalidParentVersion it is not a statement about the
+	// request: the parent exists, belongs to this knowledge base, and has no child
+	// yet — the data simply has not been announced durable at this instant.
+	//
+	// That instant is real and getting wider: a replica that caught up builds the
+	// parent's INDEX before the writer's digest round trip finishes, and callers
+	// wait on index readiness. So the answer is "not yet, retry" (codes.Unavailable),
+	// never "your request is invalid" — the latter made a transient state a
+	// permanent client error and stalled write chains at 11–19 batches on the 3+3
+	// cluster (docs/known-gaps.md §K).
+	//
+	// It deliberately does NOT spend the failure budget: the write was never
+	// attempted (the propose never landed), so there is nothing to retry on the
+	// storage side.
+	ErrParentNotDurable = errors.New("parent version's data is not durable yet")
 	// ErrVersionNotPending rejects a DiscardVersion for a version that is not
 	// (or no longer) PENDING. Discarding is for a write that never landed; a
 	// version whose data side has already settled is DeleteVersion's business
@@ -122,6 +152,7 @@ var sentinelNames = []struct {
 	{"version_pending", ErrVersionPending},
 	{"version_failed", ErrVersionFailed},
 	{"version_data_failed", ErrVersionDataFailed},
+	{"version_data_settled", ErrVersionDataSettled},
 	{"version_deleting", ErrVersionDeleting},
 	{"version_is_active", ErrVersionIsActive},
 	{"version_not_pending", ErrVersionNotPending},
@@ -134,6 +165,7 @@ var sentinelNames = []struct {
 	{"empty_changes", ErrEmptyChanges},
 	{"index_load_timeout", ErrIndexLoadTimeout},
 	{"invalid_parent_version", ErrInvalidParentVersion},
+	{"parent_not_durable", ErrParentNotDurable},
 	{"kb_storage_degraded", ErrKBStorageDegraded},
 	{"no_leader_yet", ErrNoLeaderYet},
 	{"storage_unavailable", ErrStorageUnavailable},
@@ -184,6 +216,18 @@ var grpcCodeMap = map[error]codes.Code{
 	ErrEmptyChanges:              codes.InvalidArgument,
 	ErrIndexLoadTimeout:          codes.DeadlineExceeded,
 	ErrInvalidParentVersion:      codes.InvalidArgument,
+	// FailedPrecondition, not InvalidArgument: the parent is fine, its data side
+	// just has not been announced durable yet. And deliberately NOT Unavailable —
+	// that code means "this node failed", so the station's breaker would count a
+	// business refusal as a node outage and blacklist every healthy control node
+	// (measured: "every node for this layer is circuit-broken" after a burst of
+	// these). The client waits and retries; see the sentinel's comment.
+	ErrParentNotDurable: codes.FailedPrecondition,
+	// FailedPrecondition, not InvalidArgument: the request itself was fine — the
+	// version simply is not in the state the reporter assumed. And not Unavailable:
+	// repeating the same report reaches the same verdict, so "try again" would be
+	// a lie (see the sentinel's comment).
+	ErrVersionDataSettled: codes.FailedPrecondition,
 	// Unavailable, not FailedPrecondition: below quorum the storage layer is
 	// temporarily unable to accept this write — the storage layer is coming back
 	// or a failover is in flight, and the caller should retry rather than treat

@@ -179,6 +179,19 @@ func (c *LocalControlPlane) ReportVersionFailure(ctx context.Context, kbID strin
 		return false, nil // still inside the budget: the next attempt may succeed
 	}
 	if err := c.rn.ProposeMarkVersionFailedPermanent(ctx, kbID, versionID, side, detail, count); err != nil {
+		// The version settled while this report was travelling: the data side reached
+		// DURABLE — usually because a replica that caught up announced it — so the
+		// failure this report describes has been resolved by events. Answered as
+		// "already settled" instead of as a report failure, and with terminal=false
+		// rather than true: the caller must stop retrying, but must NOT reclaim data
+		// a child version may already depend on (docs/known-gaps.md §K).
+		if errors.Is(err, stratumerrors.ErrVersionDataSettled) {
+			c.clearFailures(kbID, versionID, side)
+			c.logger.Debug("plane: the version is already durable; the failure report is discarded",
+				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+				zap.String("side", side.String()))
+			return false, nil
+		}
 		return false, fmt.Errorf("plane: ReportVersionFailure: mark version %d permanently failed: %w", versionID, err)
 	}
 	return true, nil
@@ -547,6 +560,37 @@ func (c *LocalControlPlane) ChainTails(ctx context.Context) (map[string]int64, e
 		tails[kb.KBID] = tail
 	}
 	return tails, nil
+}
+
+// DataStatusOf answers "is this version's DATA side still PENDING?" from the
+// local metadata replica, without leaving the node (plane.VersionDataStatusQuerier).
+//
+// Why the DATA side and not the version as a whole: the §7.3 takeover announces
+// data durability, so IndexStatus is irrelevant here. An index reaches READY on
+// a node that holds no data, which is exactly the confusion the two-sided state
+// exists to prevent (v13 §10.1b).
+//
+// ok=false means "cannot answer" — no metadata replica wired, or the version is
+// not in it. The caller then announces anyway: "not found" is not "settled", and
+// an announcement nobody needed is cheaper than a version stranded in PENDING.
+func (c *LocalControlPlane) DataStatusOf(ctx context.Context, kbID string, versionID int64) (types.DataStatus, bool) {
+	if c.rn == nil || versionID <= 0 {
+		return types.DataStatusPending, false
+	}
+	// ListVersionsInRange is (fromExclusive, toInclusive]: the narrowest read
+	// that answers "just this version", so the takeover costs one bounded
+	// metadata read instead of a whole-chain scan.
+	from, to := versionID-1, versionID
+	metas, err := c.rn.ListVersionsInRange(ctx, kbID, &from, &to)
+	if err != nil {
+		return types.DataStatusPending, false
+	}
+	for _, m := range metas {
+		if m.VersionID == versionID {
+			return m.DataStatus, true
+		}
+	}
+	return types.DataStatusPending, false
 }
 
 // effectiveSilenceWindow resolves the configured silence window, defaulting it exactly

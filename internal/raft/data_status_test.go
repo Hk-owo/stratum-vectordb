@@ -158,3 +158,53 @@ func TestStateMachine_DigestAfterDataFailedPermanentIsDropped(t *testing.T) {
 		t.Errorf("digest = %q, want it dropped: the data side is already retired", got.DocIDSetHash)
 	}
 }
+
+// The reverse order must be refused too, and that is the direction that loses
+// data if it is not: a version already DURABLE refuses a later data-terminal
+// verdict, because every replica's apply would otherwise reclaim data a CHILD
+// version already depends on (docs/known-gaps.md §K).
+//
+// The ordering is real, not hypothetical: the writer's fan-out falls short and
+// reports a transient failure, a replica that caught up announces the version
+// (so it becomes DURABLE), and the writer's next report — over budget by then —
+// arrives afterwards.
+func TestStateMachine_RefusesDataTerminalAfterDurable(t *testing.T) {
+	sm, w := newTestSM(t)
+	ctx := proposeCtx(t)
+	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-1"))}, w, zap.NewNop())
+	v := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
+
+	// The quorum announcement lands first.
+	if res := sm.apply(ctx, command{Type: cmdUpdateVersionSummary, VersionID: v.VersionID, DocIDSetHash: "digest"}, w, zap.NewNop()); res.Err != nil {
+		t.Fatalf("UpdateVersionSummary: %v", res.Err)
+	}
+
+	res := sm.apply(ctx, command{
+		Type: cmdMarkVersionFailedPermanent, KBID: "kb-1", VersionID: v.VersionID,
+		FailureSide: types.FailureSideData, FailureReason: "replication failed", FailureCount: 5,
+	}, w, zap.NewNop())
+	if !errors.Is(res.Err, stratumerrors.ErrVersionDataSettled) {
+		t.Fatalf("err = %v, want ErrVersionDataSettled: a durable version must not be retired", res.Err)
+	}
+
+	got := sm.versions[v.VersionID]
+	if got.DataStatus != types.DataStatusDurable {
+		t.Errorf("data status = %v, want DATA_DURABLE (unchanged)", got.DataStatus)
+	}
+	if got.FailureReason != "" || got.FailureCount != 0 {
+		t.Errorf("failure bookkeeping = (%q, %d), want none: the refused verdict must not be recorded",
+			got.FailureReason, got.FailureCount)
+	}
+	// The index side is a different claim and may still fail: this refusal is
+	// about the data, not about retiring the version wholesale.
+	idx := sm.apply(ctx, command{
+		Type: cmdMarkVersionFailedPermanent, KBID: "kb-1", VersionID: v.VersionID,
+		FailureSide: types.FailureSideIndex, FailureReason: "build keeps failing", FailureCount: 5,
+	}, w, zap.NewNop())
+	if idx.Err != nil {
+		t.Fatalf("index-side verdict: %v", idx.Err)
+	}
+	if got := sm.versions[v.VersionID]; got.IndexStatus != types.IndexStatusFailedPermanent {
+		t.Errorf("index status = %v, want INDEX_FAILED_PERMANENT", got.IndexStatus)
+	}
+}

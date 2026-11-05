@@ -216,7 +216,13 @@ func waitableWriteRefusal(err error) bool {
 	}
 	// The wire name is the contract; the code is the fallback for a peer built before
 	// no_leader_yet existed (the station used to answer codes.Unknown for it).
-	return stratumerrors.ReasonOf(err) == "no_leader_yet" || status.Code(err) == codes.Unavailable
+	// parent_not_durable is the third family: the parent exists and the request is
+	// well-formed, its DATA side just has not been announced durable yet. A replica
+	// that caught up builds the parent's index before the writer's digest lands, so
+	// this window is normal under load — waiting it out is the whole fix.
+	return stratumerrors.ReasonOf(err) == "no_leader_yet" ||
+		stratumerrors.ReasonOf(err) == "parent_not_durable" ||
+		status.Code(err) == codes.Unavailable
 }
 
 // rollbackTo points the knowledge base's active version at versionID.

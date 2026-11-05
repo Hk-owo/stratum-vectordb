@@ -435,6 +435,15 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 			continue
 		}
 		if err := h.follower.applyEntry(ctx, entry); err != nil {
+			// Logged HERE, before the error becomes a gRPC status: the sender only
+			// ever sees "stream ended early" (a Send that returns io.EOF once this
+			// handler returns), which is unactionable on its own. Measured on the
+			// 3+3 cluster: a fan-out push failed with `stream ChunkDocMapper
+			// forward: EOF` while the receiver logged nothing at all, because this
+			// return value never reaches a log on either side.
+			h.logger.Warn("sync: a pushed entry could not be applied; the sender will see the stream end early",
+				zap.String("kb_id", entry.GetKbId()), zap.Int64("version_id", entry.GetVersionId()),
+				zap.String("entry_type", entry.GetEntryType().String()), zap.Error(err))
 			return fmt.Errorf("sync: push apply (%s v%d): %w", entry.GetKbId(), entry.GetVersionId(), err)
 		}
 	}

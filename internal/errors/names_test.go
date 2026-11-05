@@ -15,6 +15,7 @@ func TestNameByNameRoundTripEverySentinel(t *testing.T) {
 		ErrVersionPending,
 		ErrVersionFailed,
 		ErrVersionDataFailed,
+		ErrVersionDataSettled,
 		ErrVersionDeleting,
 		ErrVersionIsActive,
 		ErrKnowledgeBaseNotFound,
@@ -24,6 +25,7 @@ func TestNameByNameRoundTripEverySentinel(t *testing.T) {
 		ErrEmptyChanges,
 		ErrIndexLoadTimeout,
 		ErrInvalidParentVersion,
+		ErrParentNotDurable,
 		ErrNoLeaderYet,
 	} {
 		name := Name(err)

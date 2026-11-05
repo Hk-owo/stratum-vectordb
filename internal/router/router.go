@@ -1126,4 +1126,9 @@ var retryableReasons = map[string]bool{
 	// No control node would take the write because the cluster has no leader yet — an
 	// election in flight. Retrying is the whole answer.
 	"no_leader_yet": true,
+	// parent_not_durable is deliberately NOT here. It is retryable for the CALLER
+	// (wait a moment, then send the same request), but another control node would
+	// give the same answer — the parent's state is replicated. Listing it would
+	// spend the candidate budget re-asking nodes that are all correct.
+
 }

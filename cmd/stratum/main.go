@@ -844,9 +844,15 @@ func main() {
 		CleanupBroadcaster: stratumsync.NewVersionDataCleaner(stratumsync.PresenceCheckerConfig{}),
 		// §7.3: a replica that received a version stands ready to announce it
 		// if the coordinator's confirmation never arrives.
-		Presence:  stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{}),
-		Digest:    syncFollower,
-		Confirmer: stratumsync.NewConfirmBroadcaster(stratumsync.PresenceCheckerConfig{}),
+		Presence: stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{}),
+		Digest:   syncFollower,
+		// The announcement is only worth proposing while the data side is still
+		// PENDING: this reads the local metadata replica so a takeover on an
+		// already-durable version costs nothing. It also covers the catch-up
+		// path, which arms the same check after replaying a version nobody
+		// confirmed (docs/known-gaps.md §K).
+		DataStatus: controlPlane,
+		Confirmer:  stratumsync.NewConfirmBroadcaster(stratumsync.PresenceCheckerConfig{}),
 		// §8.4: "建一次、分发 N 份" — the builder reads its own index files and
 		// ships them; replicas install them instead of building their own.
 		IndexReader:  indexMgr,

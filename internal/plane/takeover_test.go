@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/types"
 )
 
@@ -19,6 +20,9 @@ import (
 type takeoverControl struct {
 	mu      sync.Mutex
 	durable []durableReport
+	// durableErr makes every report fail, so the takeover's handling of a refusal
+	// (a version the caller discarded meanwhile) can be asserted.
+	durableErr error
 }
 
 type durableReport struct {
@@ -31,7 +35,7 @@ func (c *takeoverControl) ReportDataDurable(_ context.Context, kbID string, vers
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.durable = append(c.durable, durableReport{kbID: kbID, versionID: versionID, digest: digest})
-	return nil
+	return c.durableErr
 }
 
 // count is how many announcements have landed so far — the polling condition
@@ -278,5 +282,198 @@ func TestLocalDataPlane_WatchIsIdempotentPerVersion(t *testing.T) {
 
 	if reports := control.reports(); len(reports) != 1 {
 		t.Fatalf("durable reports = %+v, want exactly one announcement", reports)
+	}
+}
+
+// --- the catch-up path arms the same check (docs/known-gaps.md §K) ----------
+
+// stubDataStatus answers the local metadata read that lets a takeover skip a
+// version whose data side is already settled.
+type stubDataStatus struct {
+	status map[int64]types.DataStatus
+	known  bool
+}
+
+func (s *stubDataStatus) DataStatusOf(_ context.Context, _ string, versionID int64) (types.DataStatus, bool) {
+	if !s.known {
+		return types.DataStatusPending, false
+	}
+	st, ok := s.status[versionID]
+	return st, ok
+}
+
+var _ VersionDataStatusQuerier = (*stubDataStatus)(nil)
+
+// newTakeoverPlaneWithStatus is newTakeoverPlane plus the optional local
+// metadata read.
+func newTakeoverPlaneWithStatus(control ControlPlane, presence VersionPresenceQuerier, digest VersionDigest,
+	status VersionDataStatusQuerier, peers []string,
+) *LocalDataPlane {
+	dp := newTakeoverPlane(control, presence, digest, peers)
+	dp.dataStatus = status
+	return dp
+}
+
+// A version whose data side is already settled must not be announced again. The
+// report would be harmless — the state machine accepts a repeated digest for a
+// DURABLE version — but pointless: a Raft proposal plus one presence RPC per
+// peer to re-state a settled fact, on a path that runs for every version this
+// node ever pulls.
+func TestLocalDataPlane_TakeoverLeavesASettledVersionAlone(t *testing.T) {
+	shortenTakeover(t, 10*time.Millisecond)
+	control := &takeoverControl{}
+	dp := newTakeoverPlaneWithStatus(control,
+		&stubPresence{holds: map[string]bool{"peer-a": true, "peer-b": true}},
+		&stubDigest{digest: "d"},
+		&stubDataStatus{known: true, status: map[int64]types.DataStatus{7: types.DataStatusDurable}},
+		[]string{"peer-a", "peer-b"},
+	)
+
+	dp.WatchVersionWrite("kb-1", 7)
+	time.Sleep(200 * time.Millisecond)
+
+	if reports := control.reports(); len(reports) != 0 {
+		t.Fatalf("durable reports = %+v, want none: the data side is already durable", reports)
+	}
+}
+
+// "Cannot read the status" is not "settled": the announcement still happens.
+// Forgetting one strands the version in PENDING, while an unnecessary one costs
+// a single idempotent proposal.
+func TestLocalDataPlane_TakeoverAnnouncesWhenTheStatusCannotBeRead(t *testing.T) {
+	shortenTakeover(t, 10*time.Millisecond)
+	control := &takeoverControl{}
+	dp := newTakeoverPlaneWithStatus(control,
+		&stubPresence{holds: map[string]bool{"peer-a": true}},
+		&stubDigest{digest: "d"},
+		&stubDataStatus{known: false},
+		[]string{"peer-a"},
+	)
+
+	dp.WatchVersionWrite("kb-1", 7)
+	reports := waitForAnnouncements(t, control, 1)
+
+	if len(reports) != 1 {
+		t.Fatalf("durable reports = %+v, want one: an unreadable status must not silence the announcement", reports)
+	}
+}
+
+// flipPresence answers "not held" for its first `left` calls, then `holds`.
+//
+// It stands in for the case the single-shot check got wrong: the replica that
+// has to answer is still running its own pull, so the same question has
+// different answers a moment apart.
+type flipPresence struct {
+	mu    sync.Mutex
+	left  int
+	holds bool
+}
+
+func (p *flipPresence) HasVersion(context.Context, string, string, int64) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.left > 0 {
+		p.left--
+		return false, nil
+	}
+	return p.holds, nil
+}
+
+var _ VersionPresenceQuerier = (*flipPresence)(nil)
+
+// No quorum on the first look, a quorum on the next: the check must not give up
+// after one attempt (the third replica lands the data one catch-up tick later),
+// and it must still announce exactly once.
+func TestLocalDataPlane_TakeoverRetriesUntilAQuorumAppears(t *testing.T) {
+	shortenTakeover(t, 10*time.Millisecond)
+	control := &takeoverControl{}
+	dp := newTakeoverPlane(control,
+		&flipPresence{left: 1, holds: true},
+		&stubDigest{digest: "d"},
+		[]string{"peer-a"},
+	)
+
+	dp.WatchVersionWrite("kb-1", 7)
+	reports := waitForAnnouncements(t, control, 1)
+	if len(reports) != 1 {
+		t.Fatalf("durable reports = %+v, want exactly one", reports)
+	}
+	// Past the remaining attempts: a version that was announced must not keep
+	// announcing.
+	time.Sleep(200 * time.Millisecond)
+	if n := control.count(); n != 1 {
+		t.Fatalf("durable reports = %d, want 1: a successful announcement ends the watch", n)
+	}
+}
+
+// The catch-up replay is the path that strands a version when nobody announces
+// it (docs/known-gaps.md §K): the coordinator's push failed, the data arrived
+// through the backfill instead, and no confirmation will ever follow. It must
+// arm the quorum check rather than report the digest itself.
+func TestLocalDataPlane_BackfillArmsTheDurabilityCheck(t *testing.T) {
+	shortenTakeover(t, 10*time.Millisecond)
+	tr := &tracer{}
+	control := &takeoverControl{}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		WAL:      &stubWAL{t: tr},
+		Executor: &stubExecutor{t: tr},
+		Control:  control,
+		Presence: &stubPresence{holds: map[string]bool{"peer-a": true}},
+		Digest:   &stubDigest{digest: "digest-from-backfill"},
+		ResolveReplicas: func(context.Context) ([]string, error) {
+			return []string{"peer-a"}, nil
+		},
+	})
+
+	if err := dp.ApplyBackfillChanges(context.Background(), "kb-1", 7, 6,
+		[]types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc-1"}}); err != nil {
+		t.Fatalf("ApplyBackfillChanges: %v", err)
+	}
+
+	reports := waitForAnnouncements(t, control, 1)
+	if len(reports) != 1 {
+		t.Fatalf("durable reports = %+v, want one: the catch-up path must arm the quorum check", reports)
+	}
+	if got := reports[0]; got.kbID != "kb-1" || got.versionID != 7 {
+		t.Errorf("announced %s v%d, want kb-1 v7", got.kbID, got.versionID)
+	}
+	if got := reports[0]; got.digest != "digest-from-backfill" {
+		t.Errorf("digest = %q, want the locally computed one", got.digest)
+	}
+}
+
+// The caller may discard the version while the check is running. Whichever lands
+// first, the two paths agree; this covers the one the takeover sees: the discard
+// wins, the report comes back VersionNotFound, and that must read as "nothing to
+// announce" —
+//
+//   - not as a failure to retry (the version is not coming back),
+//   - not as a reason to keep the watch alive (it would poll a discarded id),
+//   - and not as a warning, which is what buries this signal in a busy cluster
+//     (docs/known-gaps.md §K).
+//
+// The other order — the announcement lands first — is the service layer's: the
+// discard is then refused because the version already has durable data. Both
+// outcomes leave the same state: no version, or a durable one.
+func TestLocalDataPlane_TakeoverAcceptsADiscardedVersion(t *testing.T) {
+	shortenTakeover(t, 10*time.Millisecond)
+	control := &takeoverControl{durableErr: stratumerrors.ErrVersionNotFound}
+	dp := newTakeoverPlane(control,
+		&stubPresence{holds: map[string]bool{"peer-a": true}},
+		&stubDigest{digest: "d"},
+		[]string{"peer-a"},
+	)
+
+	dp.WatchVersionWrite("kb-1", 7)
+	time.Sleep(150 * time.Millisecond)
+
+	if n := control.count(); n == 0 {
+		t.Fatal("the check never reported, so the refusal path was not exercised")
+	}
+	dp.takeoverMu.Lock()
+	pending := len(dp.pendingTakeovers)
+	dp.takeoverMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending takeovers = %d, want 0: a discarded version must not be polled", pending)
 	}
 }

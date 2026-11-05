@@ -360,6 +360,23 @@ func (sm *stateMachine) applyMarkVersionFailedPermanent(cmd command) applyResult
 	case types.FailureSideIndex:
 		v.IndexStatus = types.IndexStatusFailedPermanent
 	default:
+		// A version whose DATA side already reached DURABLE cannot be declared
+		// data-terminal. The two claims contradict, and the durable one wins: the
+		// data is on a quorum, so this report describes a transient the system has
+		// since resolved (a push that timed out while a lagging replica was already
+		// catching up). Overwriting would mark a healthy version terminal, and every
+		// replica's apply would then reclaim data a CHILD version already depends on
+		// — data loss no later write can repair (docs/known-gaps.md §K).
+		//
+		// Returning an error (rather than silently ignoring) is what keeps the
+		// reporter honest: ReportVersionFailure maps it to "already settled" and the
+		// writer stops. It also keeps the apply-level success hooks from firing, so
+		// no replica starts reclaiming.
+		if v.DataStatus == types.DataStatusDurable {
+			return applyResult{Err: fmt.Errorf(
+				"version %d is already durable on the data side; refusing the terminal verdict: %w",
+				cmd.VersionID, stratumerrors.ErrVersionDataSettled)}
+		}
 		v.DataStatus = types.DataStatusFailedPermanent
 	}
 	v.FailureReason = cmd.FailureReason
@@ -881,6 +898,15 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 			// 建、也不该知道——以前这里看 IndexStatus，等于要求"父版本的索引已建好"
 			// 才能写下一版；而索引没人查就不建，于是数据早已落盘的库照样被拒在
 			// invalid_parent_version 上，链就卡在那里。
+			//
+			// 两个非 durable 的原因必须分开：PENDING 是"还没到"（可重试），终态是
+			// "永远不到"（重试无用）。混成一个是这条链在 20,000 档反复断掉的原因
+			// （docs/known-gaps.md §K）——追赶副本建好父版本的索引在先、写方 digest
+			// 绕 Raft 回来在后，调用方等的是索引 READY，于是必然撞上这个窗口。
+			if parent.DataStatus == types.DataStatusPending {
+				return applyResult{Err: fmt.Errorf("parent version %d has no durable data (data_status=%s): %w",
+					cmd.ParentVersionID, parent.DataStatus.String(), stratumerrors.ErrParentNotDurable)}
+			}
 			return applyResult{Err: fmt.Errorf("parent version %d has no durable data (data_status=%s): %w",
 				cmd.ParentVersionID, parent.DataStatus.String(), stratumerrors.ErrInvalidParentVersion)}
 		}

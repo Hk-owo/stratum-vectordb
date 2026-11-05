@@ -3,8 +3,10 @@ package plane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/types"
 )
 
@@ -184,5 +186,35 @@ func TestLocalControlPlane_SuccessResetsOnlyItsOwnSide(t *testing.T) {
 	// The data side kept its one failure, so a second one spends its budget.
 	if terminal, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "data"); err != nil || !terminal {
 		t.Fatalf("data side = (%v, %v), want the terminal verdict", terminal, err)
+	}
+}
+
+// The version may settle between the failure and its report: a replica that
+// caught up announces the data side DURABLE, and the state machine then refuses
+// the terminal verdict. That refusal must read as "already settled" — not as a
+// report error (the writer would keep retrying a decision that cannot change)
+// and not as terminal=true (the caller would reclaim data a child version may
+// already depend on). See docs/known-gaps.md §K.
+func TestLocalControlPlane_FailureReportOnASettledVersionIsDiscarded(t *testing.T) {
+	meta := &stubMeta{permanentErr: fmt.Errorf("version 7 is already durable: %w", stratumerrors.ErrVersionDataSettled)}
+	cp := NewLocalControlPlane(meta, WithFailureBudget(1))
+	ctx := context.Background()
+
+	terminal, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "replication failed")
+	if err != nil {
+		t.Fatalf("err = %v, want the refusal absorbed as \"already settled\"", err)
+	}
+	if terminal {
+		t.Fatal("terminal = true, want false: reclaiming here would delete data a child may depend on")
+	}
+	if len(meta.permanentCalls) != 0 {
+		t.Fatalf("permanent calls = %+v, want none", meta.permanentCalls)
+	}
+
+	// The counter was cleared, so a genuine later failure starts from a fresh
+	// budget instead of inheriting an attempt the system has already resolved.
+	meta.permanentErr = nil
+	if terminal, err := cp.ReportVersionFailure(ctx, "kb-1", 7, types.FailureSideData, types.FailureTransient, "genuine"); err != nil || !terminal {
+		t.Fatalf("next report = (%v, %v), want it to spend a fresh budget", terminal, err)
 	}
 }

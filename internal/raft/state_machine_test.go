@@ -159,11 +159,12 @@ func TestStateMachine_Apply_CreateVersion_Constraints(t *testing.T) {
 		t.Errorf("expected ErrInvalidParentVersion for cross-KB parent, got %v", res.Err)
 	}
 
-	// Parent must not be PENDING.
+	// Parent must not be PENDING — and that answer is "not yet", not "invalid":
+	// the very same call succeeds once the parent's digest lands.
 	pending := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1"}, w, zap.NewNop())
 	res = sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-1", ParentVersionID: pending.VersionID}, w, zap.NewNop())
-	if !errors.Is(res.Err, stratumerrors.ErrInvalidParentVersion) {
-		t.Errorf("expected ErrInvalidParentVersion for PENDING parent, got %v", res.Err)
+	if !errors.Is(res.Err, stratumerrors.ErrParentNotDurable) {
+		t.Errorf("expected ErrParentNotDurable for PENDING parent, got %v", res.Err)
 	}
 
 	// The version chain is strictly linear: a parent that already has a

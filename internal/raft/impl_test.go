@@ -158,8 +158,8 @@ func TestRaftNodeImpl_ParentMustNotBePending(t *testing.T) {
 	// v1 stays PENDING.
 
 	_, err = impl.ProposeCreateVersion(ctx, "kb1", v1)
-	if !errors.Is(err, stratumerrors.ErrInvalidParentVersion) {
-		t.Fatalf("err = %v, want ErrInvalidParentVersion (PENDING parent)", err)
+	if !errors.Is(err, stratumerrors.ErrParentNotDurable) {
+		t.Fatalf("err = %v, want ErrParentNotDurable (a PENDING parent is a \"not yet\", not an invalid request)", err)
 	}
 }
 

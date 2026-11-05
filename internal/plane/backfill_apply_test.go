@@ -16,8 +16,9 @@ import (
 // harmfully so:
 //   - fan-out would push the version at the very peers this node is copying it
 //     from — a node catching up does not notify the nodes it is learning from;
-//   - the durable report would re-confirm a version whose durability was settled
-//     long ago (that is exactly why the peer's WAL range was still readable);
+//   - the durable report would claim durability on this node's single copy,
+//     which is not a quorum (docs/known-gaps.md §K); the path arms the §7.3
+//     quorum check instead, and that check announces only if a quorum holds it;
 //   - the index build would spend work on a historical version that, per §8.6b,
 //     may never be queried;
 //   - and the failure report is the *coordinator's* channel: letting a node that

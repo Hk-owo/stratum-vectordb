@@ -69,6 +69,9 @@ func TestClassifyLocalWriteFailure(t *testing.T) {
 		{"knowledge base deleted", stratumerrors.ErrKnowledgeBaseDeleted, types.FailureFatalGlobal},
 		{"rejected input", stratumerrors.ErrInvalidArgument, types.FailureFatalGlobal},
 		{"invalid parent", stratumerrors.ErrInvalidParentVersion, types.FailureFatalGlobal},
+		// Not fatal: nothing about the write is wrong — the parent's data side is
+		// simply still PENDING, and the very same call succeeds a moment later.
+		{"parent not durable yet", stratumerrors.ErrParentNotDurable, types.FailureTransient},
 		{"version vanished", stratumerrors.ErrVersionNotFound, types.FailureFatalGlobal},
 		{"wrapped fatal", errors.Join(errors.New("ctx"), stratumerrors.ErrKnowledgeBaseDeleted), types.FailureFatalGlobal},
 		{"disk full", errors.New("disk full"), types.FailureTransient},
