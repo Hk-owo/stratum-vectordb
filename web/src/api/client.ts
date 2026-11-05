@@ -22,13 +22,15 @@
 export interface GatewayErrorBody {
   error: string
   grpc_code: string
+  /** 稳定错误名（internal/errors）。同一个 grpc_code 下可能有等一等就好和换操作才行两种情况。 */
+  reason?: string
 }
 
 /** §4.4 的映射里前端会分支处理的那几个（其余按 string 收）。 */
 export type GrpcCode =
   | 'InvalidArgument' // 400：empty_changes、invalid_parent_version
   | 'NotFound' // 404：version_not_found、knowledge_base_not_found
-  | 'FailedPrecondition' // 412：version_pending、index_not_ready、version_is_active
+  | 'FailedPrecondition' // 412：version_pending、index_not_ready、version_is_active、parent_not_durable
   | 'Unavailable' // 503：kb_storage_degraded、storage_unavailable
   | 'Unimplemented' // 501
   | 'Internal' // 500
@@ -38,12 +40,15 @@ export type GrpcCode =
 export class ApiError extends Error {
   readonly status: number
   readonly grpcCode: GrpcCode
+  /** 服务端的稳定错误名；网关没给时为空串。 */
+  readonly reason: string
 
-  constructor(status: number, grpcCode: GrpcCode, message: string) {
+  constructor(status: number, grpcCode: GrpcCode, message: string, reason = '') {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.grpcCode = grpcCode
+    this.reason = reason
   }
 
   /**
@@ -145,6 +150,7 @@ async function request<T>(
       res.status,
       toGrpcCode(errBody?.grpc_code),
       errBody?.error ?? `HTTP ${res.status}`,
+      errBody?.reason ?? '',
     )
   }
 

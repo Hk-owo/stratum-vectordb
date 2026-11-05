@@ -47,6 +47,7 @@ import (
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/authmeta"
 	"stratum/internal/embed"
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/types"
 )
 
@@ -441,9 +442,13 @@ func writeError(w http.ResponseWriter, err error) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpCode)
+	// reason is the stable wire name (internal/errors). grpc_code alone cannot tell a
+	// caller what to do: parent_not_durable and version_is_active are both
+	// FailedPrecondition, and only the first is worth waiting out.
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"error":     st.Message(),
 		"grpc_code": st.Code().String(),
+		"reason":    stratumerrors.ReasonOf(err),
 	})
 }
 

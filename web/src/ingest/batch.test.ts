@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { MAX_BATCH_BYTES, planBatches } from './batch'
+import { ApiError } from '../api/client'
+import { MAX_BATCH_BYTES, MAX_PARENT_WAIT_ATTEMPTS, planBatches, postWaitingForParent } from './batch'
 import type { QueueItem } from './queue'
 
 function item(docId: string, content: string): QueueItem {
@@ -57,5 +58,63 @@ describe('planBatches', () => {
 
   it('默认上限是 1 MiB', () => {
     expect(MAX_BATCH_BYTES).toBe(1 << 20)
+  })
+})
+
+describe('postWaitingForParent', () => {
+  const notDurable = () => new ApiError(412, 'FailedPrecondition', 'parent 7', 'parent_not_durable')
+  const noSleep = () => Promise.resolve()
+
+  it('父版本还没 durable → 等一等，再发一次就成', async () => {
+    const send = vi.fn<() => Promise<string>>()
+    send.mockRejectedValueOnce(notDurable()).mockResolvedValueOnce('ok')
+
+    await expect(postWaitingForParent(send, undefined, noSleep)).resolves.toBe('ok')
+    expect(send).toHaveBeenCalledTimes(2)
+  })
+
+  it('等待时间翻倍且有上限', async () => {
+    const sleeps: number[] = []
+    const send = vi.fn(() => Promise.reject(notDurable()))
+
+    await expect(
+      postWaitingForParent(send, undefined, (ms) => {
+        sleeps.push(ms)
+        return Promise.resolve()
+      }),
+    ).rejects.toThrow()
+
+    expect(sleeps).toEqual([500, 1000, 2000, 4000, 8000, 8000, 8000])
+  })
+
+  it('次数用完就抛出最后的错误，不能无限等', async () => {
+    const send = vi.fn(() => Promise.reject(notDurable()))
+
+    await expect(postWaitingForParent(send, undefined, noSleep)).rejects.toMatchObject({
+      reason: 'parent_not_durable',
+    })
+    expect(send).toHaveBeenCalledTimes(MAX_PARENT_WAIT_ATTEMPTS)
+  })
+
+  it('同一个错误码下的其他错误不等待：等多久都不会变', async () => {
+    const send = vi.fn(() =>
+      Promise.reject(new ApiError(412, 'FailedPrecondition', 'active', 'version_is_active')),
+    )
+
+    await expect(postWaitingForParent(send, undefined, noSleep)).rejects.toMatchObject({
+      reason: 'version_is_active',
+    })
+    expect(send).toHaveBeenCalledTimes(1)
+  })
+
+  it('取消后立刻停，不再发', async () => {
+    const controller = new AbortController()
+    const send = vi.fn(() => Promise.reject(notDurable()))
+    const waiting = postWaitingForParent(send, controller.signal)
+
+    controller.abort(new Error('cancelled'))
+
+    await expect(waiting).rejects.toThrow('cancelled')
+    expect(send).toHaveBeenCalledTimes(1)
   })
 })

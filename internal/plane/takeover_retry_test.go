@@ -20,6 +20,14 @@ func (p *countingPresence) HasVersion(context.Context, string, string, int64) (b
 	return false, nil
 }
 
+// mustAnnounce fails unless want announcements land in time.
+func mustAnnounce(t *testing.T, c *takeoverControl, want int) {
+	t.Helper()
+	if got := len(waitForAnnouncements(t, c, want)); got < want {
+		t.Fatalf("announcements = %d, want at least %d", got, want)
+	}
+}
+
 func (d *LocalDataPlane) takeoverWatchFor(kbID string, versionID int64) (takeoverWatch, bool) {
 	d.takeoverMu.Lock()
 	defer d.takeoverMu.Unlock()
@@ -176,7 +184,7 @@ func TestLocalDataPlane_RearmingKeepsOneWatchPerVersion(t *testing.T) {
 		t.Errorf("watches = %d, want 1", watches)
 	}
 
-	waitForAnnouncements(t, control, 1)
+	mustAnnounce(t, control, 1)
 	time.Sleep(60 * time.Millisecond)
 	if got := control.count(); got != 1 {
 		t.Errorf("announced %d times, want once", got)
@@ -293,4 +301,127 @@ func TestLocalDataPlane_EnsureIndexArmsWhenTheCursorArrivesMidLoop(t *testing.T)
 			}
 		})
 	}
+}
+
+// A pulled version gets no coordinator confirmation, and this is the ordinary end of a
+// catch-up: the pull succeeds and verification accepts it (a PENDING version has no digest
+// yet). A PENDING version is always the chain's tail, so it is the catch-up target rather
+// than a gap version, and ApplyBackfillChanges never sees it.
+func TestLocalDataPlane_PulledVersionArmsTheDurabilityCheck(t *testing.T) {
+	shortenTakeover(t, 5*time.Millisecond)
+	control := &takeoverControl{}
+	dp := newTakeoverPlane(control, &stubPresence{holds: map[string]bool{"peer-a": true}}, &stubDigest{digest: "d"}, []string{"peer-a"})
+	dp.puller = &recordingPuller{}
+	dp.verify = func(context.Context, string, int64) bool { return true }
+	dp.resolve = func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil }
+
+	if err := dp.EnsureIndex(context.Background(), "kb-1", 7); err != nil {
+		t.Fatalf("EnsureIndex: %v", err)
+	}
+
+	mustAnnounce(t, control, 1)
+}
+
+// The other pull: the apply path's FetchVersionData, which replicas run for every new version.
+func TestLocalDataPlane_FetchedVersionArmsTheDurabilityCheck(t *testing.T) {
+	shortenTakeover(t, 5*time.Millisecond)
+	control := &takeoverControl{}
+	dp := newTakeoverPlane(control, &stubPresence{holds: map[string]bool{"peer-a": true}}, &stubDigest{digest: "d"}, []string{"peer-a"})
+	dp.puller = &recordingPuller{}
+	dp.resolve = func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil }
+
+	if err := dp.FetchVersionData(context.Background(), "kb-1", 7); err != nil {
+		t.Fatalf("FetchVersionData: %v", err)
+	}
+
+	mustAnnounce(t, control, 1)
+}
+
+// Replayed gap versions all have a successor, and CreateVersion refuses a parent that is
+// not durable, so they are settled. Arming here would be one metadata RPC per version in a
+// burst, on a gap that can be thousands long.
+func TestLocalDataPlane_BackfillReplayArmsNothing(t *testing.T) {
+	tr := &tracer{}
+	dp := NewLocalDataPlane(LocalDataPlaneConfig{
+		WAL:             &stubWAL{t: tr},
+		Executor:        &stubExecutor{t: tr},
+		Control:         &takeoverControl{},
+		Presence:        &stubPresence{holds: map[string]bool{"peer-a": true}},
+		Digest:          &stubDigest{digest: "d"},
+		ResolveReplicas: func(context.Context) ([]string, error) { return []string{"peer-a"}, nil },
+	})
+
+	for v := int64(1); v <= 100; v++ {
+		if err := dp.ApplyBackfillChanges(context.Background(), "kb-1", v, v-1, []types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc-1"}}); err != nil {
+			t.Fatalf("ApplyBackfillChanges(v%d): %v", v, err)
+		}
+	}
+
+	dp.takeoverMu.Lock()
+	defer dp.takeoverMu.Unlock()
+	if got := len(dp.pendingTakeovers); got != 0 {
+		t.Errorf("watches = %d, want 0", got)
+	}
+}
+
+// failingDigest fails until it has been asked enough times.
+type failingDigest struct {
+	left atomic.Int64
+}
+
+func (d *failingDigest) DigestOf(context.Context, string, int64) (string, error) {
+	if d.left.Add(-1) >= 0 {
+		return "", errors.New("store busy")
+	}
+	return "d", nil
+}
+
+// Everything between "quorum proven" and "announced" gets retried. A report that fails, say
+// during a leader election, must not drop the watch: this node is no longer behind, so
+// nothing else would ever arm the check again.
+func TestLocalDataPlane_TakeoverRetriesWhatCouldNotFinish(t *testing.T) {
+	holds := &stubPresence{holds: map[string]bool{"peer-a": true}}
+
+	t.Run("a failed report", func(t *testing.T) {
+		shortenTakeover(t, time.Millisecond)
+		control := &takeoverControl{durableErr: errors.New("no leader yet")}
+		dp := newTakeoverPlane(control, holds, &stubDigest{digest: "d"}, []string{"peer-a"})
+		dp.WatchVersionWrite("kb-1", 7)
+		mustAnnounce(t, control, 2)
+	})
+	t.Run("a failed digest", func(t *testing.T) {
+		shortenTakeover(t, time.Millisecond)
+		control := &takeoverControl{}
+		digest := &failingDigest{}
+		digest.left.Store(2)
+		dp := newTakeoverPlane(control, holds, digest, []string{"peer-a"})
+		dp.WatchVersionWrite("kb-1", 7)
+		mustAnnounce(t, control, 1)
+	})
+	t.Run("an unreadable topology", func(t *testing.T) {
+		shortenTakeover(t, time.Millisecond)
+		control := &takeoverControl{}
+		dp := newTakeoverPlane(control, holds, &stubDigest{digest: "d"}, []string{"peer-a"})
+		var calls atomic.Int64
+		dp.resolveReplicas = func(context.Context) ([]string, error) {
+			if calls.Add(1) <= 2 {
+				return nil, errors.New("no control node answers")
+			}
+			return []string{"peer-a"}, nil
+		}
+		dp.WatchVersionWrite("kb-1", 7)
+		mustAnnounce(t, control, 1)
+	})
+	t.Run("and the retries stay bounded", func(t *testing.T) {
+		shortenTakeover(t, time.Millisecond)
+		control := &takeoverControl{durableErr: errors.New("no leader yet")}
+		dp := newTakeoverPlane(control, holds, &stubDigest{digest: "d"}, []string{"peer-a"})
+		dp.WatchVersionWrite("kb-1", 7)
+		mustAnnounce(t, control, maxTakeoverAttempts)
+		waitForNoTakeover(t, dp, "kb-1", 7)
+		time.Sleep(20 * time.Millisecond)
+		if got := control.count(); got != maxTakeoverAttempts {
+			t.Errorf("attempted %d times, want %d", got, maxTakeoverAttempts)
+		}
+	})
 }

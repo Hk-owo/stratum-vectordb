@@ -553,7 +553,9 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	// anyone else knowing. Who needs to pull is a data-plane question, not a
 	// Raft one: the plane already skips the pull when its own cursor covers the
 	// version, so announcing every apply is both correct and cheap.
-	if err == nil && cmd.Type == cmdCreateVersion {
+	// result.Err as well as err: err only says the command decoded, and a command the
+	// state machine REFUSED changed nothing, so nobody may act as if it had.
+	if err == nil && result.Err == nil && cmd.Type == cmdCreateVersion {
 		// Run asynchronously: pulling storage-layer data can block
 		// (dial + stream + retries), and a blocked apply loop would
 		// stall every subsequent committed entry — most visible when
@@ -567,8 +569,11 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 		}
 	}
 
-	if err == nil && cmd.Type == cmdMarkVersionFailedPermanent &&
+	if err == nil && result.Err == nil && cmd.Type == cmdMarkVersionFailedPermanent &&
 		cmd.FailureSide == types.FailureSideData {
+		// A refused verdict must not get here: the state machine refuses one for a version
+		// already DURABLE, and this hook deletes the version's data on every replica.
+		//
 		// Only the DATA side reaches this hook. Its consumers reclaim the version's
 		// PHYSICAL data, and an index-side verdict says a BUILD failed, not that the
 		// data is gone — a version with durable data and a dead index is exactly the
@@ -598,7 +603,7 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	// where two nodes both believe they lead is accepted: writes are
 	// content-addressed and idempotent (§1.4), and the dispatcher's take-once
 	// registration (§7.13.2) makes a repeated dispatch a no-op.
-	if err == nil && cmd.Type == cmdCreateVersion && impl.IsLeader() {
+	if err == nil && result.Err == nil && cmd.Type == cmdCreateVersion && impl.IsLeader() {
 		if fn := impl.onVersionCommittedAsLeader.Load(); fn != nil {
 			impl.callbackWG.Add(1)
 			go func() {

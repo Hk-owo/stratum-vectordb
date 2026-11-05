@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -8,6 +10,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"stratum/internal/authmeta"
+	stratumerrors "stratum/internal/errors"
 )
 
 // H3 of docs/code-review-2026-09-24.md: the gateway performs no authentication of
@@ -174,5 +177,23 @@ func TestWithCredentialAppliesOnlyToTheAPIPrefix(t *testing.T) {
 		if carried := len(got) == 1 && got[0] == "console-token"; carried != tc.want {
 			t.Errorf("%s: credential carried = %v (%v), want %v", tc.path, carried, got, tc.want)
 		}
+	}
+}
+
+// A caller cannot tell "wait a moment" from "do something else" by the code alone, so the
+// stable wire name has to survive the trip to HTTP.
+func TestWriteErrorCarriesTheStableReason(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeError(rec, stratumerrors.ToGRPCStatus(fmt.Errorf("parent 7: %w", stratumerrors.ErrParentNotDurable)))
+
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Errorf("status = %d, want 412", rec.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body: %v", err)
+	}
+	if body["reason"] != "parent_not_durable" || body["grpc_code"] != "FailedPrecondition" {
+		t.Errorf("body = %v, want the reason and the code", body)
 	}
 }

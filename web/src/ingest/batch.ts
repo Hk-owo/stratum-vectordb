@@ -13,7 +13,7 @@
  */
 import { ChangeOp } from '../api/gen/knowledgebase'
 import type { CreateVersionResponse } from '../api/gen/knowledgebase'
-import { api, kbPath } from '../api/client'
+import { api, ApiError, kbPath } from '../api/client'
 import type { AwaitVersionResponse } from '../api/gen/knowledgebase'
 import { awaitUntilTerminal } from '../pending/awaitUntilTerminal'
 import type { AwaitTargetKind, Decision } from '../pending/decide'
@@ -35,6 +35,51 @@ export const MAX_BATCH_BYTES = 1 << 20
 
 /** RESEND 的上限：服务端说"按同一 key 重发"时我们最多再试几次。 */
 export const MAX_RESEND_ATTEMPTS = 3
+
+/** 等父版本 durable 的总时长约 40 秒，够覆盖一次 takeover 的整个重试窗口（约 20 秒）。 */
+export const MAX_PARENT_WAIT_ATTEMPTS = 8
+const PARENT_WAIT_BASE_MS = 500
+const PARENT_WAIT_MAX_MS = 8000
+
+const abortableSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason)
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(signal?.reason)
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+
+/**
+ * 发一次写入，父版本的数据侧还没 durable（`parent_not_durable`）时等一等再发。
+ *
+ * 这是"还没到"，不是"请求不对"：父版本就在那里，只是 durable 的宣布还在路上。
+ * 服务站不会替我们重试，因为换个控制节点答案也一样，所以等待归调用方。用同一个
+ * `client_request_id` 重发是安全的；次数用完就把最后的错误抛给上层，不能无限等。
+ */
+export async function postWaitingForParent<T>(
+  send: () => Promise<T>,
+  signal?: AbortSignal,
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void> = abortableSleep,
+): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await send()
+    } catch (err) {
+      const waitable = err instanceof ApiError && err.reason === 'parent_not_durable'
+      if (!waitable || attempt >= MAX_PARENT_WAIT_ATTEMPTS) throw err
+      await sleep(Math.min(PARENT_WAIT_BASE_MS * 2 ** (attempt - 1), PARENT_WAIT_MAX_MS), signal)
+    }
+  }
+}
 
 export interface Batch {
   items: QueueItem[]
@@ -136,12 +181,16 @@ async function submitBatchWithRecovery(
     await upsertPending(record)
 
     // 2. 提交。parent_version_id 是 int64 → protojson 要字符串；0 表示新链的根。
-    const resp = await api.post<CreateVersionResponse>(kbPath(kbId, '/versions'), {
-      knowledge_base_id: kbId,
-      parent_version_id: parentVersionId ?? '0',
-      changes,
-      client_request_id: clientRequestId,
-    })
+    const resp = await postWaitingForParent(
+      () =>
+        api.post<CreateVersionResponse>(kbPath(kbId, '/versions'), {
+          knowledge_base_id: kbId,
+          parent_version_id: parentVersionId ?? '0',
+          changes,
+          client_request_id: clientRequestId,
+        }),
+      opts.signal,
+    )
 
     // 3. 把服务端回传的版本号与幂等键写回记录。
     //    版本号是"继续等"的入口（WAIT 之后要靠它再问一次），幂等键则是重发的凭证：
