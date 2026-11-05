@@ -749,6 +749,34 @@ func TestAwaitVersion_AnswersBeforeTheCallersDeadline(t *testing.T) {
 	}
 }
 
+// The answer-by point (caller deadline - awaitAnswerMargin) rarely lines up with a poll
+// tick. With a 350 ms budget it lands at 250 ms, between the ticks at 200 ms and 400 ms; a
+// loop that only checks the deadline after a full poll sleeps through it and loses to the
+// caller's deadline at 350 ms.
+func TestAwaitVersion_AnswersBetweenPolls(t *testing.T) {
+	for _, budget := range []time.Duration{250, 350, 450, 550} {
+		budget := budget * time.Millisecond
+		t.Run(budget.String(), func(t *testing.T) {
+			svc, _, kbID, v := newAwaitHarness(t)
+			ctx, cancel := context.WithTimeout(context.Background(), budget)
+			defer cancel()
+
+			resp, err := svc.AwaitVersion(ctx, &pb.AwaitVersionRequest{
+				KnowledgeBaseId: kbID,
+				VersionId:       v,
+				Target:          pb.AwaitTarget_AWAIT_TARGET_DATA_DURABLE,
+				WaitTimeoutMs:   5000,
+			})
+			if err != nil {
+				t.Fatalf("AwaitVersion = %v, want \"not yet\" before the caller's deadline", err)
+			}
+			if resp.GetStage() != StageDataPending {
+				t.Errorf("stage = %s, want %s", resp.GetStage(), StageDataPending)
+			}
+		})
+	}
+}
+
 // NotFound takes the whole window the caller asked for to mean anything. On a slice of it
 // a lagging follower would report a healthy version as missing, and NotFound is not retried
 // on another node, so this one still ends at the deadline.
