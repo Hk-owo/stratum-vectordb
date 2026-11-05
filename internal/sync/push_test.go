@@ -2,10 +2,12 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -276,4 +278,54 @@ func TestPushHandler_PushVersionData_LogsAnEntryItCannotApply(t *testing.T) {
 	if _, ok := fields["error"]; !ok {
 		t.Errorf("fields = %v, want the cause", fields)
 	}
+}
+
+// exportUntilStopped sends entries until the stream refuses one, like a real export does.
+type exportUntilStopped struct {
+	entry *pb.SyncEntry
+	pause time.Duration
+}
+
+func (e exportUntilStopped) ExportVersion(_ context.Context, _ string, _ int64, send func(*pb.SyncEntry) error) error {
+	for {
+		if err := send(e.entry); err != nil {
+			return fmt.Errorf("sync: stream ChunkDocMapper forward: %w", err)
+		}
+		time.Sleep(e.pause)
+	}
+}
+
+// Send only ever says EOF once a stream has ended. The failure has to say why it ended,
+// because a broken replica and a push that ran out of time call for different fixes.
+func TestPusher_ReportsWhatEndedTheStream(t *testing.T) {
+	_, _, addr := startPushServer(t, 7)
+
+	t.Run("the receiver refused", func(t *testing.T) {
+		pusher := NewPusher(PusherConfig{Exporter: exportUntilStopped{
+			entry: &pb.SyncEntry{EntryType: pb.SyncEntryType(9999), KbId: "kb-1", VersionId: 7},
+			pause: time.Millisecond,
+		}, NodeID: 1})
+
+		_, err := pusher.PushVersion(context.Background(), addr, "kb-1", 7)
+		if err == nil || !strings.Contains(err.Error(), "unknown SyncEntryType") {
+			t.Fatalf("err = %v, want the receiver's reason", err)
+		}
+		if !strings.Contains(err.Error(), "ChunkDocMapper forward") {
+			t.Errorf("err = %v, want where the export stopped too", err)
+		}
+	})
+
+	t.Run("the push ran out of time", func(t *testing.T) {
+		pusher := NewPusher(PusherConfig{Exporter: exportUntilStopped{
+			entry: &pb.SyncEntry{EntryType: pb.SyncEntryType_SYNC_ENTRY_TYPE_VERSION_DOC_LIST, KbId: "kb-1", VersionId: 7, DocId: "doc-1"},
+			pause: time.Millisecond,
+		}, NodeID: 1})
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		_, err := pusher.PushVersion(ctx, addr, "kb-1", 7)
+		if err == nil || !strings.Contains(err.Error(), "DeadlineExceeded") {
+			t.Fatalf("err = %v, want the deadline named", err)
+		}
+	})
 }
