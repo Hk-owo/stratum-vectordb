@@ -562,8 +562,10 @@ func (c *LocalControlPlane) ChainTails(ctx context.Context) (map[string]int64, e
 	return tails, nil
 }
 
-// DataStatusOf answers "is this version's DATA side still PENDING?" from the
-// local metadata replica, without leaving the node (plane.VersionDataStatusQuerier).
+// DataStatusOf answers "is this version's DATA side still PENDING?"
+// (plane.VersionDataStatusQuerier). Not free: a storage node's metadata lives in the
+// control tier, so this is one RPC there, and a control node reads the whole chain to
+// narrow it. Callers ask once per data arrival, not once per query.
 //
 // Why the DATA side and not the version as a whole: the §7.3 takeover announces
 // data durability, so IndexStatus is irrelevant here. An index reaches READY on
@@ -577,9 +579,8 @@ func (c *LocalControlPlane) DataStatusOf(ctx context.Context, kbID string, versi
 	if c.rn == nil || versionID <= 0 {
 		return types.DataStatusPending, false
 	}
-	// ListVersionsInRange is (fromExclusive, toInclusive]: the narrowest read
-	// that answers "just this version", so the takeover costs one bounded
-	// metadata read instead of a whole-chain scan.
+	// ListVersionsInRange is (fromExclusive, toInclusive]: the narrowest read this
+	// interface offers, and the one that keeps the answer small on the wire.
 	from, to := versionID-1, versionID
 	metas, err := c.rn.ListVersionsInRange(ctx, kbID, &from, &to)
 	if err != nil {

@@ -82,10 +82,10 @@ var (
 	//
 	// That instant is real and getting wider: a replica that caught up builds the
 	// parent's INDEX before the writer's digest round trip finishes, and callers
-	// wait on index readiness. So the answer is "not yet, retry" (codes.Unavailable),
-	// never "your request is invalid" — the latter made a transient state a
-	// permanent client error and stalled write chains at 11–19 batches on the 3+3
-	// cluster (docs/known-gaps.md §K).
+	// wait on index readiness. So the answer is "not yet, retry", never "your request
+	// is invalid" — the latter made a transient state a permanent client error and
+	// stalled write chains at 11–19 batches on the 3+3 cluster (docs/known-gaps.md §K).
+	// The code is FailedPrecondition; grpcCodeMap says why it is not Unavailable.
 	//
 	// It deliberately does NOT spend the failure budget: the write was never
 	// attempted (the propose never landed), so there is nothing to retry on the

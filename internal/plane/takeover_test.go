@@ -406,42 +406,6 @@ func TestLocalDataPlane_TakeoverRetriesUntilAQuorumAppears(t *testing.T) {
 	}
 }
 
-// The catch-up replay is the path that strands a version when nobody announces
-// it (docs/known-gaps.md §K): the coordinator's push failed, the data arrived
-// through the backfill instead, and no confirmation will ever follow. It must
-// arm the quorum check rather than report the digest itself.
-func TestLocalDataPlane_BackfillArmsTheDurabilityCheck(t *testing.T) {
-	shortenTakeover(t, 10*time.Millisecond)
-	tr := &tracer{}
-	control := &takeoverControl{}
-	dp := NewLocalDataPlane(LocalDataPlaneConfig{
-		WAL:      &stubWAL{t: tr},
-		Executor: &stubExecutor{t: tr},
-		Control:  control,
-		Presence: &stubPresence{holds: map[string]bool{"peer-a": true}},
-		Digest:   &stubDigest{digest: "digest-from-backfill"},
-		ResolveReplicas: func(context.Context) ([]string, error) {
-			return []string{"peer-a"}, nil
-		},
-	})
-
-	if err := dp.ApplyBackfillChanges(context.Background(), "kb-1", 7, 6,
-		[]types.DocChange{{Op: types.ChangeOpAdd, DocID: "doc-1"}}); err != nil {
-		t.Fatalf("ApplyBackfillChanges: %v", err)
-	}
-
-	reports := waitForAnnouncements(t, control, 1)
-	if len(reports) != 1 {
-		t.Fatalf("durable reports = %+v, want one: the catch-up path must arm the quorum check", reports)
-	}
-	if got := reports[0]; got.kbID != "kb-1" || got.versionID != 7 {
-		t.Errorf("announced %s v%d, want kb-1 v7", got.kbID, got.versionID)
-	}
-	if got := reports[0]; got.digest != "digest-from-backfill" {
-		t.Errorf("digest = %q, want the locally computed one", got.digest)
-	}
-}
-
 // The caller may discard the version while the check is running. Whichever lands
 // first, the two paths agree; this covers the one the takeover sees: the discard
 // wins, the report comes back VersionNotFound, and that must read as "nothing to

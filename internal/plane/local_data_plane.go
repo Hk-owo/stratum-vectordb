@@ -115,8 +115,7 @@ type VersionDigest interface {
 	DigestOf(ctx context.Context, kbID string, versionID int64) (string, error)
 }
 
-// VersionDataStatusQuerier answers, from this node's LOCAL metadata replica,
-// whether a version's DATA side is still PENDING.
+// VersionDataStatusQuerier answers whether a version's DATA side is still PENDING.
 //
 // It exists so the §7.3 takeover can tell "nobody has announced this version"
 // from "it was announced long ago". The difference matters: announcing again is
@@ -730,11 +729,11 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 		// the cursor as it finishes, and this sees it — instead of pulling its
 		// own data back from a peer until the deadline expires.
 		if d.localVersionOf(kbID) >= versionID {
-			// The data is here and this path produced it (a pull), so no
-			// coordinator confirmation will follow: arm the §7.3 quorum check,
-			// or the version's data side stays PENDING while every replica holds
-			// it (docs/known-gaps.md §K). watchForDurability skips the arming
-			// when the version is already settled.
+			// The data arrived some other way while this loop ran — this node's own
+			// write, or another path's pull. Arm the §7.3 quorum check anyway: nothing
+			// says a confirmation will follow, and a version every replica holds must
+			// not stay PENDING (docs/known-gaps.md §K). watchForDurability skips the
+			// arming when the version is already settled.
 			d.watchForDurability(ctx, kbID, versionID)
 			return nil
 		}
@@ -798,6 +797,10 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 			lastErr = nil
 			if d.verify(ctx, kbID, versionID) {
 				d.dataLanded(kbID, versionID)
+				// A pulled version gets no coordinator confirmation. This is the path a
+				// lagging replica's catch-up target takes, and a PENDING version is
+				// always the chain's tail, so this is where the check matters most.
+				d.watchForDurability(ctx, kbID, versionID)
 				// The data is here; the index is a separate question, and this node
 				// was ASKED for the version — so it takes a peer's artifact or builds
 				// one. Returning straight after the data left a requested version
@@ -818,6 +821,7 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 				// never reaches here, so a broken transfer can never be mistaken for
 				// an empty version.
 				d.dataLanded(kbID, versionID)
+				d.watchForDurability(ctx, kbID, versionID)
 				// The data is here; the index is a separate question, and a node
 				// that was ASKED for this version answers it by building.
 				return d.ensureOwnIndex(ctx, kbID, versionID)
@@ -979,6 +983,8 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 		return err
 	}
 	d.dataLanded(kbID, versionID)
+	// Nobody confirms a pull, so arm the §7.3 quorum check (see EnsureIndex).
+	d.watchForDurability(ctx, kbID, versionID)
 	return nil
 }
 
@@ -1976,13 +1982,12 @@ func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string,
 //   - no fan-out: the replicas it would push to are the very peers this node is
 //     learning from, and they already hold the version. A node catching up does
 //     not notify the nodes it is copying from.
-//   - no durable report (digest): a single replica holding the data is not a
-//     quorum, and reporting from here would claim exactly that. That claim is
-//     what the control layer's parent gate trusts, so a write chain built on it
-//     stalls behind a version no quorum ever confirmed (docs/known-gaps.md §K).
-//     Durability is announced only by the §7.3 quorum check, which this path
-//     arms at the end — see watchForDurability for why the check, not the
-//     report, belongs here.
+//   - no durable report (digest), and no §7.3 quorum check either: everything
+//     replayed here has a successor, and CreateVersion refuses a parent that is
+//     not durable, so these versions are settled already. Only the catch-up target
+//     can still be PENDING, and that one is pulled (see EnsureIndex), which is where
+//     the check is armed. Arming here would also send one metadata RPC per version
+//     in a burst, on a gap that can be thousands of versions long.
 //   - no index scheduling: historical versions build lazily or never (§8.6b), so
 //     an unconditional build attempt spends work on something no query asks for.
 //     If the version happens to be the active one, the very apply that triggered
@@ -2004,17 +2009,6 @@ func (d *LocalDataPlane) ApplyBackfillChanges(ctx context.Context, kbID string, 
 	if _, err := d.writeLocalTransaction(ctx, kbID, versionID, parentVersionID, changes, nil); err != nil {
 		return fmt.Errorf("plane: backfill apply %s v%d: %w", kbID, versionID, err)
 	}
-	// Arm the §7.3 quorum check. A catch-up replay never receives the
-	// coordinator's confirmation — the writer's push is long gone — so without
-	// this the version's data side can stay PENDING forever even though every
-	// replica ends up holding the data (docs/known-gaps.md §K): the next
-	// CreateVersion is then refused on "parent has no durable data", and the
-	// write chain stops.
-	//
-	// Pure memory work (a map insert plus a timer), so it is safe on the apply
-	// path. Whether anything gets announced is decided later, by the quorum
-	// check itself.
-	d.WatchVersionWrite(kbID, versionID)
 	return nil
 }
 
@@ -2730,7 +2724,7 @@ const maxTakeoverAttempts = 8
 const maxTakeoverRetryDelay = 5 * time.Second
 
 // WatchVersionWrite starts the §7.3 takeover timer for a version this node has
-// just received via fan-out, a pull, or a catch-up replay.
+// just received via fan-out or a pull.
 //
 // This is the replica's half of coordinator-crash recovery: the data is already
 // here, so the only thing that can go missing is the announcement that a quorum
@@ -2748,8 +2742,7 @@ func (d *LocalDataPlane) WatchVersionWrite(kbID string, versionID int64) {
 }
 
 // watchForDurability arms the §7.3 check after data landed here through a path
-// that will never receive a coordinator confirmation — a pull, or a catch-up
-// replay.
+// that will never receive a coordinator confirmation: a pull.
 //
 // This is deliberately NOT "report the digest here". One replica holding the
 // data is not a quorum, and reporting from this point would claim durability on
@@ -2769,7 +2762,12 @@ func (d *LocalDataPlane) watchForDurability(ctx context.Context, kbID string, ve
 	// which falls through to the announcement (harmless, and the safe
 	// direction).
 	if d.dataStatus != nil {
-		if st, ok := d.dataStatus.DataStatusOf(ctx, kbID, versionID); ok && st != types.DataStatusPending {
+		// Bounded on its own: on a storage node this is an RPC to the control tier, and a
+		// slow answer must not hold up a pull that has already finished.
+		statusCtx, cancel := context.WithTimeout(ctx, takeoverCheckTimeout)
+		st, ok := d.dataStatus.DataStatusOf(statusCtx, kbID, versionID)
+		cancel()
+		if ok && st != types.DataStatusPending {
 			return
 		}
 	}
@@ -2824,10 +2822,10 @@ func (d *LocalDataPlane) ConfirmVersionWrite(kbID string, versionID int64) {
 // are retired (§10.6) — which is exactly why no replica has to be elected to do
 // it.
 //
-// A check that finds no quorum is retried a bounded number of times
-// (maxTakeoverAttempts): the missing replica is usually still copying, and
-// "still copying" is a fact that changes. Beyond that the version is left to
-// its retry budget, which is the honest outcome for a version no quorum holds.
+// A check that finds no quorum, or cannot finish, is retried a bounded number of
+// times (maxTakeoverAttempts): the missing replica is usually still copying, the
+// failed report usually a leader election, and both are facts that change. Beyond
+// that the version is left to its retry budget.
 func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64, gen uint64, attempts int) {
 	key := failureKey(kbID, versionID)
 	d.takeoverMu.Lock()
@@ -2870,6 +2868,7 @@ func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64, gen uint6
 	if err != nil {
 		d.logger.Warn("plane: takeover: resolve replicas",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		d.retryTakeover(kbID, versionID, attempts, delay)
 		return
 	}
 
@@ -2889,21 +2888,8 @@ func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64, gen uint6
 	}
 	quorum := QuorumSize(len(peers) + 1)
 	if acks < quorum {
-		if attempts+1 < maxTakeoverAttempts {
-			// The missing replica is usually the one still copying. Re-check
-			// rather than declaring the version stuck, with a doubling interval so
-			// a long outage costs few RPCs while a catch-up tick is still noticed
-			// promptly.
-			next := delay * 2
-			if next <= 0 || next > maxTakeoverRetryDelay {
-				next = maxTakeoverRetryDelay
-			}
-			d.logger.Debug("plane: takeover: no quorum yet, re-checking",
-				zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
-				zap.Int("acks", acks), zap.Int("quorum", quorum),
-				zap.Int("attempt", attempts+1), zap.Int("max_attempts", maxTakeoverAttempts),
-				zap.Duration("next_check_in", next))
-			d.armTakeover(kbID, versionID, attempts+1, next)
+		// The missing replica is usually the one still copying.
+		if d.retryTakeover(kbID, versionID, attempts, delay) {
 			return
 		}
 		// Out of attempts: better to let the version run out its retry budget
@@ -2919,6 +2905,7 @@ func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64, gen uint6
 	if err != nil {
 		d.logger.Warn("plane: takeover: compute digest",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		d.retryTakeover(kbID, versionID, attempts, delay)
 		return
 	}
 	if err := d.control.ReportDataDurable(ctx, kbID, versionID, digest); err != nil {
@@ -2931,12 +2918,34 @@ func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64, gen uint6
 				zap.String("kb_id", kbID), zap.Int64("version_id", versionID))
 			return
 		}
+		// Usually a leader election. The quorum is proven and this node is no longer
+		// behind, so nothing else would ever arm this check again.
 		d.logger.Warn("plane: takeover: report durable",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+		d.retryTakeover(kbID, versionID, attempts, delay)
 		return
 	}
 	d.logger.Info("plane: takeover: announced a version the coordinator never announced",
 		zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Int("acks", acks))
+}
+
+// retryTakeover schedules the next quorum check with a doubling interval, so a long
+// outage costs few RPCs while a catch-up tick is still noticed promptly. false means this
+// watch has spent its attempts.
+func (d *LocalDataPlane) retryTakeover(kbID string, versionID int64, attempts int, delay time.Duration) bool {
+	if attempts+1 >= maxTakeoverAttempts {
+		return false
+	}
+	next := delay * 2
+	if next <= 0 || next > maxTakeoverRetryDelay {
+		next = maxTakeoverRetryDelay
+	}
+	d.logger.Debug("plane: takeover: re-checking",
+		zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
+		zap.Int("attempt", attempts+1), zap.Int("max_attempts", maxTakeoverAttempts),
+		zap.Duration("next_check_in", next))
+	d.armTakeover(kbID, versionID, attempts+1, next)
+	return true
 }
 
 // SafeDurableVersion reports the highest version this node may claim durable
