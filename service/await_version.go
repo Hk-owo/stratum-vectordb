@@ -144,12 +144,23 @@ func (s *KnowledgeBaseServiceImpl) AwaitVersion(ctx context.Context, req *pb.Awa
 			return nil, stratumerrors.ToGRPCStatus(err)
 		}
 
+		// The poll never sleeps past the deadline. The deadline is only checked at the top
+		// of the loop, so a full 200 ms poll can carry the wait past an answer-by point
+		// that sits 100 ms before the caller's deadline, and the caller's ctx.Done() then
+		// wins: DeadlineExceeded instead of the answer the margin was there to deliver.
+		// Measured on the 3+3 cluster: 171 of 202 sliced awaits ended that way.
+		wake := awaitPollInterval
+		if left := time.Until(deadline); left < wake {
+			wake = max(left, 0)
+		}
+
 		select {
 		case <-changed:
 			// The state moved; go read it. A nil channel here (no watcher) simply
 			// never fires, which is what leaves the poll as the only wake-up.
-		case <-time.After(awaitPollInterval):
-			// Fallback: covers a watcher that is absent or missed an event.
+		case <-time.After(wake):
+			// Fallback for a watcher that is absent or missed an event, and the wake-up
+			// that brings the loop back at the deadline to answer.
 		case <-ctx.Done():
 			stopIfWatching()
 			// The caller hung up, or its budget ended a wait that could not answer yet
