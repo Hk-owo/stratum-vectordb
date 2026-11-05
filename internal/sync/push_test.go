@@ -2,6 +2,8 @@ package sync
 
 import (
 	"context"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"net"
 	"strconv"
 	"sync"
@@ -242,5 +244,36 @@ func TestFollower_PullVersion_AdvancesTheCursor(t *testing.T) {
 	got := adv.got()
 	if len(got) != 1 || got[0] != kbID+"/"+strconv.FormatInt(versionID, 10) {
 		t.Fatalf("cursor after pull = %v, want exactly [%s/%d]", got, kbID, versionID)
+	}
+}
+
+// A pushed entry that cannot be applied has to be logged where it happens: the sender
+// only sees its stream end early (`stream ChunkDocMapper forward: EOF`), and before this
+// line neither side recorded why.
+func TestPushHandler_PushVersionData_LogsAnEntryItCannotApply(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	_, _, addr := startPushServer(t, 7, WithLogger(zap.New(core)))
+
+	stream, err := dialSyncServer(t, addr).PushVersionData(context.Background())
+	if err != nil {
+		t.Fatalf("PushVersionData: %v", err)
+	}
+	if err := stream.Send(&pb.SyncEntry{EntryType: pb.SyncEntryType(9999), KbId: "kb-1", VersionId: 7}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err == nil {
+		t.Fatal("the entry could not be applied, so the push must fail")
+	}
+
+	entries := logs.FilterMessageSnippet("could not be applied").All()
+	if len(entries) != 1 {
+		t.Fatalf("warnings = %+v, want one naming the failed entry", logs.All())
+	}
+	fields := entries[0].ContextMap()
+	if fields["kb_id"] != "kb-1" || fields["version_id"] != int64(7) {
+		t.Errorf("fields = %v, want kb-1 v7", fields)
+	}
+	if _, ok := fields["error"]; !ok {
+		t.Errorf("fields = %v, want the cause", fields)
 	}
 }
