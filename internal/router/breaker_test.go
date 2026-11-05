@@ -265,3 +265,80 @@ func TestBreaker_ProbeResultIgnoredWhenNotOpen(t *testing.T) {
 		t.Fatal("a closed breaker must stay closed through a failed probe")
 	}
 }
+
+// halfOpenBreaker returns a breaker past its cooldown with one probe admitted.
+func halfOpenBreaker(t *testing.T) *breaker {
+	t.Helper()
+	cfg := defaultBreakerConfig
+	cfg.cooldown = 0
+	cfg.halfOpenProbes = 1
+	b := tripped(cfg, time.Now())
+	if !b.allow(time.Now()) {
+		t.Fatal("past the cooldown a probe must be admitted")
+	}
+	return b
+}
+
+// An answer proves the node serves. Dropping it would spend the probe with no outcome, and
+// a half-open breaker with no probes left admits nothing, forever.
+func TestBreaker_BusinessAnswerClosesAHalfOpenBreaker(t *testing.T) {
+	b := halfOpenBreaker(t)
+
+	b.observe(status.Error(codes.FailedPrecondition, "parent is not durable yet"))
+
+	if got := b.stateNow(time.Now()); got != breakerClosed {
+		t.Fatalf("state = %v, want closed", got)
+	}
+}
+
+// A closed breaker keeps ignoring answers: they say nothing about the node's health.
+func TestBreaker_BusinessAnswerStaysOutOfAClosedWindow(t *testing.T) {
+	b := newBreaker(defaultBreakerConfig)
+
+	b.observe(status.Error(codes.FailedPrecondition, "x"))
+
+	if len(b.window) != 0 {
+		t.Fatalf("window = %+v, want empty", b.window)
+	}
+}
+
+// A call that failed after the caller gave up says nothing about the node.
+func TestBreaker_CallerLeavingIsNotAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	timeout := status.Error(codes.DeadlineExceeded, "deadline exceeded")
+
+	b := newBreaker(defaultBreakerConfig)
+	for i := 0; i < defaultBreakerConfig.minSamples*3; i++ {
+		b.observeFor(ctx, timeout)
+	}
+	if got := b.stateNow(time.Now()); got != breakerClosed {
+		t.Fatalf("state = %v, want closed", got)
+	}
+
+	// With the caller still waiting, the attempt's own budget expiring is evidence.
+	for i := 0; i < defaultBreakerConfig.minSamples; i++ {
+		b.observeFor(context.Background(), timeout)
+	}
+	if got := b.stateNow(time.Now()); got != breakerOpen {
+		t.Fatalf("state = %v, want open", got)
+	}
+}
+
+// A probe that produced no verdict goes back, or the breaker runs out of them and stays
+// half-open for good.
+func TestBreaker_CallerLeavingReturnsTheProbe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b := halfOpenBreaker(t)
+
+	b.observeFor(ctx, status.Error(codes.DeadlineExceeded, "x"))
+
+	if !b.allow(time.Now()) {
+		t.Fatal("the probe must be available again")
+	}
+	b.observeFor(context.Background(), nil)
+	if got := b.stateNow(time.Now()); got != breakerClosed {
+		t.Fatalf("state = %v, want closed", got)
+	}
+}

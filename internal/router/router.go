@@ -759,6 +759,7 @@ func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission 
 		return resp
 	}
 
+	leaderBroken := false
 	for attempt := 0; attempt <= len(r.controlAddrs); attempt++ {
 		lookupStart := time.Now()
 		idx, ok := r.discoverer.LeaderNow(ctx)
@@ -777,6 +778,7 @@ func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission 
 			// The discovered leader is circuit-broken: trying it again is what
 			// the breaker exists to stop. Another attempt re-discovers, which is
 			// also how a write finds the new leader after a failover.
+			leaderBroken = true
 			continue
 		}
 		attemptCtx, cancel := budgetSlice(ctx, len(r.controlAddrs)-attempt)
@@ -785,7 +787,7 @@ func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission 
 		cancel()
 		tAttempt += time.Since(attemptStart)
 		attempts++
-		r.observeControl(idx, err)
+		r.observeControl(ctx, idx, err)
 		if err == nil {
 			return noteResponse(resp), nil
 		}
@@ -800,6 +802,11 @@ func forwardWrite[T any](r *Router, ctx context.Context, kbID string, admission 
 		// available" alone is wrong anyway — the leader was found and the write
 		// reached it.
 		return zero, noLeaderAfter(fmt.Sprintf("router: no leader available after %d attempt(s)", attempts), lastErr)
+	}
+	if leaderBroken {
+		// A leader was found and never asked: the write was not sent at all.
+		return zero, fmt.Errorf("%w: the leader (node %d) is circuit-broken and the write was not sent",
+			stratumerrors.ErrControlCircuitOpen, leaderIdx)
 	}
 	// Named, not a bare errors.New: "the cluster is electing" is transient, and without a
 	// sentinel the caller sees `code = Unknown` and cannot know to retry — measured as a
@@ -841,11 +848,11 @@ func (r *Router) allowControl(idx int) bool {
 	return r.controlBreakers[idx].allow(time.Now())
 }
 
-func (r *Router) observeControl(idx int, err error) {
+func (r *Router) observeControl(ctx context.Context, idx int, err error) {
 	if idx < 0 || idx >= len(r.controlBreakers) {
 		return
 	}
-	r.controlBreakers[idx].observe(err)
+	r.controlBreakers[idx].observeFor(ctx, err)
 }
 
 // readTrace carries what forwardRead reports about the station's own share of a
@@ -946,7 +953,7 @@ func forwardTiers[T any](r *Router, ctx context.Context, trace readTrace, tiers 
 			attempts++
 			nodeIdx = idx
 			if idx < len(breakers) {
-				breakers[idx].observe(err)
+				breakers[idx].observeFor(ctx, err)
 			}
 			if err == nil {
 				return resp, nil
@@ -1002,7 +1009,7 @@ func tryAll[T any](r *Router, ctx context.Context, fn func(idx int, ctx context.
 		attemptCtx, cancel := budgetSlice(ctx, len(r.controlAddrs)-idx)
 		resp, err := fn(idx, attemptCtx)
 		cancel()
-		r.observeControl(idx, err)
+		r.observeControl(ctx, idx, err)
 		if err == nil {
 			return resp, nil
 		}

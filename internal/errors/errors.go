@@ -91,6 +91,12 @@ var (
 	// attempted (the propose never landed), so there is nothing to retry on the
 	// storage side.
 	ErrParentNotDurable = errors.New("parent version's data is not durable yet")
+	// ErrControlCircuitOpen is the station not sending a call because every control node
+	// it could ask is circuit-broken. Nothing is wrong with the leadership: naming this
+	// no_leader_yet sent operators looking for an election that never happened
+	// (measured: attempts=0 with one leader throughout). Worth retrying, because a
+	// breaker reopens on its own after its cooldown.
+	ErrControlCircuitOpen = errors.New("the control layer is circuit-broken at this station")
 	// ErrVersionNotPending rejects a DiscardVersion for a version that is not
 	// (or no longer) PENDING. Discarding is for a write that never landed; a
 	// version whose data side has already settled is DeleteVersion's business
@@ -168,6 +174,7 @@ var sentinelNames = []struct {
 	{"parent_not_durable", ErrParentNotDurable},
 	{"kb_storage_degraded", ErrKBStorageDegraded},
 	{"no_leader_yet", ErrNoLeaderYet},
+	{"control_circuit_open", ErrControlCircuitOpen},
 	{"storage_unavailable", ErrStorageUnavailable},
 }
 
@@ -222,7 +229,8 @@ var grpcCodeMap = map[error]codes.Code{
 	// business refusal as a node outage and blacklist every healthy control node
 	// (measured: "every node for this layer is circuit-broken" after a burst of
 	// these). The client waits and retries; see the sentinel's comment.
-	ErrParentNotDurable: codes.FailedPrecondition,
+	ErrParentNotDurable:   codes.FailedPrecondition,
+	ErrControlCircuitOpen: codes.Unavailable,
 	// FailedPrecondition, not InvalidArgument: the request itself was fine — the
 	// version simply is not in the state the reporter assumed. And not Unavailable:
 	// repeating the same report reaches the same verdict, so "try again" would be

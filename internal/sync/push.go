@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -76,7 +77,24 @@ func (p *Pusher) PushVersion(ctx context.Context, targetAddr, kbID string, versi
 		return nil, fmt.Errorf("sync: open PushVersionData to %s: %w", targetAddr, err)
 	}
 
-	if err := p.exporter.ExportVersion(ctx, kbID, versionID, stream.Send); err != nil {
+	// A client stream's Send only ever says io.EOF once the stream has ended, whatever ended
+	// it: the receiver refusing, or this push's own budget running out. The status that
+	// says which comes from CloseAndRecv. Without it a timed-out push and a broken replica
+	// read the same, as `stream ChunkDocMapper forward: EOF`.
+	streamEnded := false
+	send := func(entry *pb.SyncEntry) error {
+		err := stream.Send(entry)
+		if errors.Is(err, io.EOF) {
+			streamEnded = true
+		}
+		return err
+	}
+	if err := p.exporter.ExportVersion(ctx, kbID, versionID, send); err != nil {
+		if streamEnded {
+			if _, recvErr := stream.CloseAndRecv(); recvErr != nil {
+				return nil, fmt.Errorf("sync: export version %d to %s stopped at %q: %w", versionID, targetAddr, err.Error(), recvErr)
+			}
+		}
 		return nil, fmt.Errorf("sync: export version %d to %s: %w", versionID, targetAddr, err)
 	}
 

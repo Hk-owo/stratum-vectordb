@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"sync"
@@ -144,9 +145,39 @@ func (b *breaker) allow(now time.Time) bool {
 // for a health mechanism to cause the outage it exists to prevent.
 func (b *breaker) observe(err error) {
 	if err != nil && !nodeLevelFailure(err) {
+		// An answer proves the node serves, which is what a half-open probe asks. Dropping
+		// it would spend the probe with no outcome, and a half-open breaker whose probes
+		// are all spent never admits anything again.
+		b.mu.Lock()
+		halfOpen := b.state == breakerHalfOpen
+		b.mu.Unlock()
+		if halfOpen {
+			b.record(time.Now(), true)
+		}
 		return
 	}
 	b.record(time.Now(), err == nil)
+}
+
+// observeFor is observe for a call made under the caller's ctx. A call that failed after
+// the caller gave up says nothing about the node: the budget ran out, whoever spent it.
+// The attempt's own smaller budget expiring is still evidence, since the caller was still
+// waiting then.
+func (b *breaker) observeFor(ctx context.Context, err error) {
+	if err != nil && ctx.Err() != nil {
+		b.release()
+		return
+	}
+	b.observe(err)
+}
+
+// release returns a half-open probe that produced no verdict, so the next call can use it.
+func (b *breaker) release() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == breakerHalfOpen && b.probes > 0 {
+		b.probes--
+	}
 }
 
 // nodeLevelFailure reports whether err says something about the NODE rather than

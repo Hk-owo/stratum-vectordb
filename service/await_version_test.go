@@ -258,8 +258,11 @@ func TestAwaitVersion_DeletingStopsTheWait(t *testing.T) {
 func TestAwaitVersion_CancellationIsHonoured(t *testing.T) {
 	svc, _, kbID, v := newAwaitHarness(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	// An explicit cancel, not a deadline: a deadline is closed with an answer before it
+	// expires (TestAwaitVersion_AnswersBeforeTheCallersDeadline).
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	time.AfterFunc(60*time.Millisecond, cancel)
 
 	start := time.Now()
 	_, err := svc.AwaitVersion(ctx, &pb.AwaitVersionRequest{
@@ -268,11 +271,8 @@ func TestAwaitVersion_CancellationIsHonoured(t *testing.T) {
 		Target:          pb.AwaitTarget_AWAIT_TARGET_QUERYABLE,
 		WaitTimeoutMs:   5000, // the server would happily wait 5 s
 	})
-	if err == nil {
-		t.Fatal("AwaitVersion with an expiring context = nil error, want the caller's cancellation")
-	}
-	if code := status.Code(err); code != codes.DeadlineExceeded && code != codes.Canceled {
-		t.Errorf("cancellation code = %v, want DeadlineExceeded or Canceled", code)
+	if code := status.Code(err); code != codes.Canceled {
+		t.Errorf("code = %v (err %v), want Canceled", code, err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("returned after %v; a cancelled caller must not be made to finish the wait", elapsed)
@@ -721,5 +721,48 @@ func TestAwaitVersion_StillWorksWithoutAWatcher(t *testing.T) {
 	}
 	if resp.GetStage() != StageIndexReady {
 		t.Errorf("stage = %s, want %s", resp.GetStage(), StageIndexReady)
+	}
+}
+
+// A caller whose budget is shorter than the window still gets an answer. The station splits
+// an 8 s call across three control nodes, so 2 s against a 5 s window is the normal case,
+// and a DeadlineExceeded here is what opened the breaker of every healthy control node.
+func TestAwaitVersion_AnswersBeforeTheCallersDeadline(t *testing.T) {
+	svc, _, kbID, v := newAwaitHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	resp, err := svc.AwaitVersion(ctx, &pb.AwaitVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v,
+		Target:          pb.AwaitTarget_AWAIT_TARGET_DATA_DURABLE,
+		WaitTimeoutMs:   5000,
+	})
+	if err != nil {
+		t.Fatalf("AwaitVersion = %v, want \"not yet\" inside the caller's budget", err)
+	}
+	if resp.GetStage() != StageDataPending {
+		t.Errorf("stage = %s, want %s", resp.GetStage(), StageDataPending)
+	}
+	if ctx.Err() != nil {
+		t.Error("the answer came after the caller's deadline")
+	}
+}
+
+// NotFound takes the whole window the caller asked for to mean anything. On a slice of it
+// a lagging follower would report a healthy version as missing, and NotFound is not retried
+// on another node, so this one still ends at the deadline.
+func TestAwaitVersion_ASliceOfTheWindowCannotReportNotFound(t *testing.T) {
+	svc, _, kbID, v := newAwaitHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	_, err := svc.AwaitVersion(ctx, &pb.AwaitVersionRequest{
+		KnowledgeBaseId: kbID,
+		VersionId:       v + 1000,
+		WaitTimeoutMs:   5000,
+	})
+	if got := status.Code(err); got != codes.DeadlineExceeded {
+		t.Errorf("code = %v (err %v), want DeadlineExceeded", got, err)
 	}
 }

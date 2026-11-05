@@ -48,6 +48,9 @@ const (
 	// goroutine on the control node, so the server — not the caller's wish —
 	// decides when a call must come back (§5 contract 5).
 	awaitMaxWait = 5 * time.Second
+	// awaitAnswerMargin is how far ahead of the caller's deadline the wait closes, so the
+	// answer has time to travel back.
+	awaitAnswerMargin = 100 * time.Millisecond
 	// awaitPollInterval is how often the loop re-reads the version. It is the
 	// same order of magnitude as takeoverTimeout (200 ms) for the same reason:
 	// that is the granularity at which this cluster notices anything.
@@ -76,6 +79,20 @@ func (s *KnowledgeBaseServiceImpl) AwaitVersion(ctx context.Context, req *pb.Awa
 		wait = awaitMaxWait
 	}
 	deadline := time.Now().Add(wait)
+	// The window closes before the caller's budget does. "Not there yet" is an answer
+	// (§5 contract 1), and the caller's budget is often shorter than the window: the
+	// station splits it across candidates, so an 8 s call reaches this node with 2 s.
+	// Waiting past that turns the answer into a DeadlineExceeded, which the station's
+	// breaker reads as this node failing. Measured on the 3+3 cluster: polling a version
+	// in PENDING opened the breaker of every healthy control node, and writes then
+	// failed without being sent.
+	closedForCaller := false
+	if callerDeadline, ok := ctx.Deadline(); ok {
+		if answerBy := callerDeadline.Add(-awaitAnswerMargin); answerBy.Before(deadline) {
+			deadline = answerBy
+			closedForCaller = true
+		}
+	}
 
 	// A NotFound from the LOCAL read is ambiguous, and the difference matters:
 	// it can mean "no such version" or "this node has not applied the entry
@@ -115,8 +132,11 @@ func (s *KnowledgeBaseServiceImpl) AwaitVersion(ctx context.Context, req *pb.Awa
 				stopIfWatching()
 				return s.awaitResponse(ctx, v, stage), nil
 			}
-		case notVisibleYet(err) && !everVisible && time.Now().Before(deadline):
-			// Keep waiting: this node may simply be behind.
+		case notVisibleYet(err) && !everVisible && (closedForCaller || time.Now().Before(deadline)):
+			// Keep waiting: this node may simply be behind. NotFound takes the whole
+			// window the caller asked for to mean anything, so a slice of it cannot
+			// report one. The caller's deadline ends this wait instead, and the
+			// station asks the next node.
 		default:
 			// No such knowledge base or version (§5 contract 2), or an error
 			// that is not about visibility at all.
@@ -132,8 +152,9 @@ func (s *KnowledgeBaseServiceImpl) AwaitVersion(ctx context.Context, req *pb.Awa
 			// Fallback: covers a watcher that is absent or missed an event.
 		case <-ctx.Done():
 			stopIfWatching()
-			// The caller hung up or ran out of budget: report its cancellation
-			// instead of finishing the wait on its behalf (§5 contract 3).
+			// The caller hung up, or its budget ended a wait that could not answer yet
+			// (a version not visible here): report that instead of finishing the wait on
+			// its behalf (§5 contract 3).
 			return nil, status.FromContextError(ctx.Err()).Err()
 		}
 		stopIfWatching()

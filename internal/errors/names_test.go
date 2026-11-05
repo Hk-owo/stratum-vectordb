@@ -27,6 +27,7 @@ func TestNameByNameRoundTripEverySentinel(t *testing.T) {
 		ErrInvalidParentVersion,
 		ErrParentNotDurable,
 		ErrNoLeaderYet,
+		ErrControlCircuitOpen,
 	} {
 		name := Name(err)
 		if name == "" {

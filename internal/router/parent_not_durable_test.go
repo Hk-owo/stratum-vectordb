@@ -2,9 +2,12 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
 	stratumerrors "stratum/internal/errors"
@@ -57,5 +60,53 @@ func TestForward_ParentNotDurableReachesTheCallerWithoutTrippingABreaker(t *test
 		if !b.allow(time.Now()) {
 			t.Errorf("breaker %d opened on a business refusal", i)
 		}
+	}
+}
+
+// A write that found a leader and never asked it must not say there is no leader: that
+// sent the diagnosis looking for an election that never happened.
+func TestForward_BrokenLeaderIsNamedAndTheWriteIsNotSent(t *testing.T) {
+	cfg := defaultBreakerConfig
+	cfg.cooldown = time.Hour
+	r := &Router{
+		controlAddrs:    []string{"a", "b", "c"},
+		discoverer:      &fakeResolver{order: []int{0, 0, 0, 0}, ok: true},
+		controlBreakers: []*breaker{tripped(cfg, time.Now()), newBreaker(cfg), newBreaker(cfg)},
+	}
+
+	calls := 0
+	_, err := Forward(r, context.Background(), pb.KnowledgeBaseService_CreateVersion_FullMethodName, "kb-1",
+		func(int, context.Context) (string, error) {
+			calls++
+			return "ok", nil
+		})
+
+	if !errors.Is(err, stratumerrors.ErrControlCircuitOpen) {
+		t.Fatalf("err = %v, want ErrControlCircuitOpen", err)
+	}
+	if calls != 0 {
+		t.Errorf("calls = %d, want 0", calls)
+	}
+	if errors.Is(err, stratumerrors.ErrNoLeaderYet) {
+		t.Error("a leader was found, so this must not read as no_leader_yet")
+	}
+}
+
+// The breaker does not count a read the caller walked away from, however many there are.
+func TestForward_ExpiredCallerDoesNotOpenAReadBreaker(t *testing.T) {
+	breakers := []*breaker{newBreaker(defaultBreakerConfig)}
+	r := &Router{controlAddrs: []string{"a"}, controlBreakers: breakers}
+
+	for i := 0; i < defaultBreakerConfig.minSamples*2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		_, _ = Forward(r, ctx, pb.KnowledgeBaseService_AwaitVersion_FullMethodName, "kb-1",
+			func(_ int, attempt context.Context) (string, error) {
+				<-ctx.Done()
+				return "", status.FromContextError(attempt.Err()).Err()
+			})
+		cancel()
+	}
+	if got := breakers[0].stateNow(time.Now()); got != breakerClosed {
+		t.Fatalf("state = %v, want closed", got)
 	}
 }
