@@ -28,14 +28,28 @@ type bloomEntry struct {
 	fp     uint64
 }
 
-// documentSetFingerprint fingerprints a version's document set, order-insensitively:
+// DocumentSetFingerprint fingerprints a version's document set, order-insensitively:
 // the set arrives from a prefix scan whose order is not part of any contract, and the
 // write path forms it from its own changes, so two callers describing the same set
 // must agree.
-func documentSetFingerprint(docIDs []string) uint64 {
-	ids := make([]string, len(docIDs))
-	copy(ids, docIDs)
-	sort.Strings(ids)
+//
+// Exported for the read path, which already holds a set it verified against the
+// control layer's committed digest (service/docSetCache) and must not pay for
+// re-deriving this on every query: the fingerprint travels WITH that set, so a warm
+// query's filter lookup costs no walk over the documents at all. Recomputing it per
+// query was the last O(documents) pass left on a warm query — 8,000 documents meant a
+// second full copy of the ID slice plus a sort, on every request.
+//
+// An already-sorted input is hashed in place: the caller owns docIDs and no caller
+// mutates a set it has handed over (the query path shares one read-only set across
+// requests), so the copy exists only to make unsorted input hashable.
+func DocumentSetFingerprint(docIDs []string) uint64 {
+	ids := docIDs
+	if !sort.StringsAreSorted(ids) {
+		ids = make([]string, len(docIDs))
+		copy(ids, docIDs)
+		sort.Strings(ids)
+	}
 
 	h := fnv.New64a()
 	for _, id := range ids {
@@ -44,6 +58,12 @@ func documentSetFingerprint(docIDs []string) uint64 {
 	}
 	return h.Sum64()
 }
+
+// setFingerprint is DocumentSetFingerprint, indirected so a test can count how often a
+// caller leaves this store to derive the fingerprint itself. That derivation is exactly
+// what GetForDocumentsWithFingerprint exists to skip, and it is invisible from the
+// outside: a hit and a re-derivation both return the right filter.
+var setFingerprint = DocumentSetFingerprint
 
 // versionKey identifies a single version's document bloom filter within a
 // knowledge base.
@@ -120,30 +140,42 @@ func (s *VersionBloomStore) Get(ctx context.Context, kbID string, versionID int6
 // confirms a bloom hit), so handing the same list over keeps the filter and the
 // membership test derived from one snapshot — and saves a second prefix scan.
 func (s *VersionBloomStore) GetForDocuments(kbID string, versionID int64, docIDs []string) BloomFilter {
+	return s.GetForDocumentsWithFingerprint(kbID, versionID, setFingerprint(docIDs), docIDs)
+}
+
+// GetForDocumentsWithFingerprint is GetForDocuments for a caller that ALSO holds the
+// set's fingerprint already — the query path, whose document-set cache keeps the
+// fingerprint next to the verified set (service/docSetCache). That makes a warm
+// query's lookup O(1) in the document count: without it, every request re-derived the
+// fingerprint from the full set (a copy plus a sort of 8,000 IDs at 8,000 documents)
+// purely to discover that the cached filter was still current.
+//
+// fingerprint must be DocumentSetFingerprint of the same docIDs; docIDs is still
+// required because the filter is built from it on a miss.
+func (s *VersionBloomStore) GetForDocumentsWithFingerprint(kbID string, versionID int64, fingerprint uint64, docIDs []string) BloomFilter {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	key := versionKey{kbID: kbID, versionID: versionID}
-	fp := documentSetFingerprint(docIDs)
-	if e, ok := s.cache[key]; ok && e.fp == fp {
+	if e, ok := s.cache[key]; ok && e.fp == fingerprint {
 		return e.filter
 	}
 
 	// A disk copy is used only when it carries the SAME fingerprint. Anything else
 	// is a filter for a document set this version no longer has, and using it would
 	// drop hits that are really there.
-	if f, diskFP, err := s.loadFromDisk(kbID, versionID); err == nil && diskFP == fp {
-		s.cache[key] = bloomEntry{filter: f, fp: fp}
+	if f, diskFP, err := s.loadFromDisk(kbID, versionID); err == nil && diskFP == fingerprint {
+		s.cache[key] = bloomEntry{filter: f, fp: fingerprint}
 		return f
 	}
 
 	f := s.build(docIDs)
-	if err := s.persist(kbID, versionID, fp, f); err != nil {
+	if err := s.persist(kbID, versionID, fingerprint, f); err != nil {
 		// A persistence failure is non-fatal: the filter is still usable in memory,
 		// and the next call retries the disk write.
 		_ = err
 	}
-	s.cache[key] = bloomEntry{filter: f, fp: fp}
+	s.cache[key] = bloomEntry{filter: f, fp: fingerprint}
 	return f
 }
 
@@ -156,7 +188,7 @@ func (s *VersionBloomStore) BuildAndPersist(kbID string, versionID int64, docIDs
 	defer s.mu.Unlock()
 
 	f := s.build(docIDs)
-	fp := documentSetFingerprint(docIDs)
+	fp := DocumentSetFingerprint(docIDs)
 	if err := s.persist(kbID, versionID, fp, f); err != nil {
 		return nil, err
 	}

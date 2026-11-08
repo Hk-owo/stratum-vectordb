@@ -671,7 +671,11 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// (targetVersion.DocIDSetHash, already in hand from meta_us). A cache hit is
 	// then equivalent to re-reading the store and verifying it, and a replica
 	// whose data has not arrived is never cached. See docSetCache.
-	ids, vDocs, idsErr := s.docSets.lookup(ctx, s.versionDocList, kbID, versionID, targetVersion.DocIDSetHash)
+	//
+	// The set comes back with its fingerprint, so the bloom store below does not have
+	// to re-derive it from the IDs on every query — on a hit that is the difference
+	// between O(1) and a copy-plus-sort of the whole set per request.
+	vSet, idsErr := s.docSets.lookup(ctx, s.versionDocList, kbID, versionID, targetVersion.DocIDSetHash)
 	stageDocList = time.Since(bloomStart)
 	var (
 		vBloom    bloom.BloomFilter
@@ -713,7 +717,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// the chunk, the filter dropped it because the set it was filtering against
 	// was empty — and the caller got `results=0, err=nil` for ~14 s (t+6…+18 s)
 	// until the replica caught up.
-	if idsErr == nil && len(ids) == 0 && targetVersion.DocIDSetHash != types.EmptyDocIDSetHash {
+	if idsErr == nil && len(vSet.ids) == 0 && targetVersion.DocIDSetHash != types.EmptyDocIDSetHash {
 		return nil, stratumerrors.ToGRPCStatus(fmt.Errorf(
 			"%w: %s: version %d's document set is not on this replica yet (its committed digest is not the empty set's)",
 			stratumerrors.ErrIndexNotReady, kbID, versionID))
@@ -730,18 +734,19 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	// ntotal=18 took_us=16). A single fetch plus a set makes membership O(1) and
 	// the whole query O(documents) once.
 	//
-	// A failed fetch leaves vDocs nil, and every membership test then fails —
+	// A failed fetch leaves the set's map nil, and every membership test then fails —
 	// the same conservative "cannot confirm, so skip" the per-candidate fetch
 	// had when its own call errored.
 	if idsErr == nil {
-		// bloom_build_us is inside bloom_us: the store's GetForDocuments, which
-		// rebuilds and caches the version filter when the set has changed.
-		// Separated from doclist_us because one is a read of our own storage and
-		// the other is CPU plus its own bookkeeping. The membership map is no
-		// longer built here — docSets.lookup returns it, from the cache when the
-		// set has already been verified.
+		// bloom_build_us is inside bloom_us: the store's filter lookup, which rebuilds
+		// and caches the version filter when the set has changed. Separated from
+		// doclist_us because one is a read of our own storage and the other is CPU
+		// plus its own bookkeeping. Neither the membership map nor the set's
+		// fingerprint is derived here any more: docSets.lookup returns both, from the
+		// cache when the set has already been verified, so a warm query hands the
+		// store a fingerprint it can compare instead of one it has to recompute.
 		bloomBuildStart := time.Now()
-		vBloom = s.vBloomStore.GetForDocuments(kbID, versionID, ids)
+		vBloom = s.vBloomStore.GetForDocumentsWithFingerprint(kbID, versionID, vSet.fingerprint, vSet.ids)
 		stageBloomBuild = time.Since(bloomBuildStart)
 	}
 	stageBloom = time.Since(bloomStart)
@@ -780,7 +785,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 				if !vBloom.Test(docID) {
 					continue
 				}
-				if _, ok := vDocs[docID]; !ok {
+				if _, ok := vSet.docs[docID]; !ok {
 					continue
 				}
 			}

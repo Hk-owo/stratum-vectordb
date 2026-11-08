@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"stratum/internal/bloom"
 	stratumerrors "stratum/internal/errors"
 	stratinternalsync "stratum/internal/sync"
 	"stratum/internal/versiondoc"
@@ -16,8 +17,8 @@ import (
 // a time, so a small bound holds the hot set in a few megabytes.
 const docSetCacheCap = 4
 
-// docSetCache memoizes a version's document-ID set — and the membership map
-// derived from it — for this replica.
+// docSetCache memoizes a version's document-ID set — the IDs, the membership map
+// derived from it, and the set's bloom fingerprint — for this replica.
 //
 // Why caching is possible at all: a version's document set is immutable once the
 // write that produced it has landed. A new version gets a new id, and version ids
@@ -51,29 +52,48 @@ type docSetKey struct {
 }
 
 type docSetEntry struct {
-	ids    []string
-	docs   map[string]struct{}
+	set    docSet
 	digest string // the committed digest this set was verified against
 }
 
-// lookup returns (kbID, versionID)'s document-ID set and its membership map: from
-// the cache when a verified entry for the same digest is present, else by reading
-// store. digest is the control layer's committed DocIDSetHash for the version —
-// "" means none is committed yet, which makes the read unverifiable and therefore
-// uncacheable (and unhittable).
+// docSet is one version's document-ID set — the ID slice, the membership map derived
+// from it, and the fingerprint that identifies the set to the version-bloom store.
 //
-// The returned map is shared with other callers and must not be mutated. A store
-// error is returned as-is and never cached.
-func (c *docSetCache) lookup(ctx context.Context, store versiondoc.VersionDocList, kbID string, versionID int64, digest string) ([]string, map[string]struct{}, error) {
+// The three travel together because they are three answers about the same immutable
+// snapshot: the slice is the filter's input, the map is the authoritative membership
+// test that confirms a bloom hit, and the fingerprint is what the bloom store keys its
+// cached filter on. Deriving the fingerprint ONCE, here, is what keeps a warm query
+// free of the O(documents) copy-plus-sort it used to pay for on every request just to
+// re-establish that the cached filter matched the cached set.
+type docSet struct {
+	ids         []string
+	docs        map[string]struct{}
+	fingerprint uint64
+}
+
+// documentSetFingerprint is bloom.DocumentSetFingerprint, indirected so a test can
+// count how often a lookup re-derives it. Only a miss may call it: re-deriving the
+// fingerprint per query is exactly the cost this cache exists to remove.
+var documentSetFingerprint = bloom.DocumentSetFingerprint
+
+// lookup returns (kbID, versionID)'s document set — IDs, membership map and
+// fingerprint: from the cache when a verified entry for the same digest is present,
+// else by reading store. digest is the control layer's committed DocIDSetHash for the
+// version — "" means none is committed yet, which makes the read unverifiable and
+// therefore uncacheable (and unhittable).
+//
+// The returned set's slice and map are shared with other callers and must not be
+// mutated. A store error is returned as-is and never cached.
+func (c *docSetCache) lookup(ctx context.Context, store versiondoc.VersionDocList, kbID string, versionID int64, digest string) (docSet, error) {
 	if digest != "" {
 		if e, ok := c.get(kbID, versionID, digest); ok {
-			return e.ids, e.docs, nil
+			return e.set, nil
 		}
 	}
 
 	ids, err := store.ListDocIDs(ctx, kbID, versionID)
 	if err != nil {
-		return nil, nil, err
+		return docSet{}, err
 	}
 	docs := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
@@ -92,15 +112,21 @@ func (c *docSetCache) lookup(ctx context.Context, store versiondoc.VersionDocLis
 	// that are perfectly fine.
 	if digest != "" {
 		if got := stratinternalsync.ComputeDocIDSetHash(ids); got != digest {
-			return nil, nil, fmt.Errorf(
+			return docSet{}, fmt.Errorf(
 				"%w: %s: version %d's document set does not match the committed digest on this replica",
 				stratumerrors.ErrIndexNotReady, kbID, versionID)
 		}
+	}
+
+	// Fingerprinted only after the set is known to be this version's: a refused read
+	// has no reusable set to describe.
+	set := docSet{ids: ids, docs: docs, fingerprint: documentSetFingerprint(ids)}
+	if digest != "" {
 		// Verified against the control layer's digest, the set is the authoritative one
 		// for this version and can be reused.
-		c.put(kbID, versionID, docSetEntry{ids: ids, docs: docs, digest: digest})
+		c.put(kbID, versionID, docSetEntry{set: set, digest: digest})
 	}
-	return ids, docs, nil
+	return set, nil
 }
 
 func (c *docSetCache) get(kbID string, versionID int64, digest string) (docSetEntry, bool) {

@@ -6,6 +6,8 @@ import (
 	"sort"
 	"testing"
 
+	pb "stratum/api/proto/stratum"
+	"stratum/internal/bloom"
 	stratumerrors "stratum/internal/errors"
 	stratinternalsync "stratum/internal/sync"
 	"stratum/internal/versiondoc"
@@ -72,28 +74,135 @@ func TestDocSetCache_ReusesAVerifiedSet(t *testing.T) {
 	src := &countingVDL{VersionDocList: vdl}
 	var c docSetCache
 
-	gotIDs, gotDocs, err := c.lookup(ctx, src, "kb-1", 7, digest)
+	first, err := c.lookup(ctx, src, "kb-1", 7, digest)
 	if err != nil {
 		t.Fatalf("first lookup: %v", err)
 	}
 	if src.calls != 1 {
 		t.Fatalf("first lookup read the store %d times, want 1", src.calls)
 	}
-	assertSameSet(t, gotIDs, ids)
-	if _, ok := gotDocs["d2"]; !ok {
-		t.Fatalf("membership map is missing d2: %v", gotDocs)
+	assertSameSet(t, first.ids, ids)
+	if _, ok := first.docs["d2"]; !ok {
+		t.Fatalf("membership map is missing d2: %v", first.docs)
 	}
 
-	gotIDs2, gotDocs2, err := c.lookup(ctx, src, "kb-1", 7, digest)
+	second, err := c.lookup(ctx, src, "kb-1", 7, digest)
 	if err != nil {
 		t.Fatalf("second lookup: %v", err)
 	}
 	if src.calls != 1 {
 		t.Fatalf("a verified set must be served from the cache; the store was read %d times", src.calls)
 	}
-	assertSameSet(t, gotIDs2, ids)
-	if len(gotDocs2) != len(gotDocs) {
-		t.Fatalf("cached membership map = %v, want %v", gotDocs2, gotDocs)
+	assertSameSet(t, second.ids, ids)
+	if len(second.docs) != len(first.docs) {
+		t.Fatalf("cached membership map = %v, want %v", second.docs, first.docs)
+	}
+	// The fingerprint travels with the set: a hit must hand the bloom store the very
+	// value a rebuild would produce, or the store would rebuild a correct filter.
+	if second.fingerprint != first.fingerprint {
+		t.Fatalf("cached fingerprint = %d, want %d", second.fingerprint, first.fingerprint)
+	}
+	if want := bloom.DocumentSetFingerprint(ids); second.fingerprint != want {
+		t.Fatalf("fingerprint = %d, want DocumentSetFingerprint(ids) = %d", second.fingerprint, want)
+	}
+}
+
+// TestDocSetCache_HitDoesNotRefingerprint is the other half of the cache's job: a hit
+// must not re-derive the set's fingerprint. That derivation is O(documents) (a copy
+// plus a sort of the whole set) and used to run on EVERY query, because the bloom
+// store needed a fingerprint to check its cached filter against and was handed nothing
+// but the IDs. Now it is derived once, on the miss, and cached next to the set.
+//
+// 撤掉即变红: deriving the fingerprint on the hit path would make calls 2.
+func TestDocSetCache_HitDoesNotRefingerprint(t *testing.T) {
+	ctx := context.Background()
+	ids := []string{"d1", "d2", "d3"}
+	vdl := seedVDL(t, "kb-1", 7, ids)
+	digest := stratinternalsync.ComputeDocIDSetHash(ids)
+
+	calls := 0
+	restore := documentSetFingerprint
+	documentSetFingerprint = func(got []string) uint64 {
+		calls++
+		return restore(got)
+	}
+	t.Cleanup(func() { documentSetFingerprint = restore })
+
+	src := &countingVDL{VersionDocList: vdl}
+	var c docSetCache
+
+	first, err := c.lookup(ctx, src, "kb-1", 7, digest)
+	if err != nil {
+		t.Fatalf("first lookup: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("a miss derived the fingerprint %d times, want 1", calls)
+	}
+
+	for i := 0; i < 3; i++ {
+		hit, err := c.lookup(ctx, src, "kb-1", 7, digest)
+		if err != nil {
+			t.Fatalf("lookup %d: %v", i, err)
+		}
+		if hit.fingerprint != first.fingerprint {
+			t.Fatalf("hit %d returned fingerprint %d, want %d", i, hit.fingerprint, first.fingerprint)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("cache hits re-derived the fingerprint; %d derivations for 1 miss and 3 hits, want 1", calls)
+	}
+	if src.calls != 1 {
+		t.Fatalf("the store was read %d times, want 1", src.calls)
+	}
+}
+
+// TestQueryService_WarmQueryDoesNotRefingerprintTheDocumentSet: the document-set cache
+// must be REUSED across requests, not rebuilt per request — the same version asked three
+// times derives the set's fingerprint once, on the first cold read. That cached set is
+// what the second and third queries hand the bloom store, fingerprint included, which is
+// what lets the store skip deriving it (pinned on the store's side by
+// TestVersionBloomStore_FingerprintIsDerivedOnlyWhenTheCallerHasNone).
+//
+// 撤掉即变红: a per-request cache (a docSetCache built inside Query) would make calls 3.
+func TestQueryService_WarmQueryDoesNotRefingerprintTheDocumentSet(t *testing.T) {
+	ctx := context.Background()
+	h := newQuerySvcHarness(t)
+	kbID, vID := h.setupQueryableKB(t, map[string][]string{
+		"doc-a": {"chunk-1"},
+		"doc-b": {"chunk-2"},
+	})
+
+	// Commit the document-set digest. Without one the read is unverifiable, and an
+	// unverifiable set is deliberately never cached (see docSetCache) — such a replica
+	// keeps paying the read, exactly as it did before the cache existed.
+	ids, err := h.versionDocs.ListDocIDs(ctx, kbID, vID)
+	if err != nil {
+		t.Fatalf("ListDocIDs: %v", err)
+	}
+	if err := h.raftNode.ProposeUpdateVersionSummary(ctx, vID, stratinternalsync.ComputeDocIDSetHash(ids)); err != nil {
+		t.Fatalf("ProposeUpdateVersionSummary: %v", err)
+	}
+
+	calls := 0
+	restore := documentSetFingerprint
+	documentSetFingerprint = func(got []string) uint64 {
+		calls++
+		return restore(got)
+	}
+	t.Cleanup(func() { documentSetFingerprint = restore })
+
+	for i := 0; i < 3; i++ {
+		if _, err := h.svc.Query(ctx, &pb.QueryRequest{
+			KnowledgeBaseId: kbID,
+			VersionId:       &vID,
+			Vector:          []float32{0.1, 0.2, 0.3, 0.4},
+			TopK:            2,
+		}); err != nil {
+			t.Fatalf("query %d: %v", i, err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("3 queries derived the document-set fingerprint %d times, want 1 (the cold read)", calls)
 	}
 }
 
@@ -112,7 +221,7 @@ func TestDocSetCache_DoesNotCacheAnUnverifiedRead(t *testing.T) {
 	var c docSetCache
 
 	for i := 0; i < 3; i++ {
-		if _, _, err := c.lookup(ctx, src, "kb-1", 7, "digest-that-does-not-match"); !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+		if _, err := c.lookup(ctx, src, "kb-1", 7, "digest-that-does-not-match"); !errors.Is(err, stratumerrors.ErrIndexNotReady) {
 			t.Fatalf("lookup %d = %v, want ErrIndexNotReady", i, err)
 		}
 	}
@@ -132,7 +241,7 @@ func TestDocSetCache_NoCommittedDigestIsNotCached(t *testing.T) {
 	var c docSetCache
 
 	for i := 0; i < 2; i++ {
-		if _, _, err := c.lookup(ctx, src, "kb-1", 7, ""); err != nil {
+		if _, err := c.lookup(ctx, src, "kb-1", 7, ""); err != nil {
 			t.Fatalf("lookup %d: %v", i, err)
 		}
 	}
@@ -161,22 +270,22 @@ func TestDocSetCache_AnEarlyEmptyReadNeverSticks(t *testing.T) {
 	// The early read is refused, not returned: an empty set that does not hash to the
 	// committed digest is "this replica is incomplete", and a caller must not filter
 	// against it.
-	if _, _, err := c.lookup(ctx, src, "kb-1", 7, digest); !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+	if _, err := c.lookup(ctx, src, "kb-1", 7, digest); !errors.Is(err, stratumerrors.ErrIndexNotReady) {
 		t.Fatalf("lookup 1 = %v, want ErrIndexNotReady", err)
 	}
 
-	ids, docs, err := c.lookup(ctx, src, "kb-1", 7, digest)
+	set, err := c.lookup(ctx, src, "kb-1", 7, digest)
 	if err != nil {
 		t.Fatalf("lookup 2: %v", err)
 	}
-	assertSameSet(t, ids, full)
-	if len(docs) != len(full) {
-		t.Fatalf("membership map = %v, want %d documents", docs, len(full))
+	assertSameSet(t, set.ids, full)
+	if len(set.docs) != len(full) {
+		t.Fatalf("membership map = %v, want %d documents", set.docs, len(full))
 	}
 
 	// And now that it IS verified, it is cached: the store is not read again.
 	before := src.calls
-	if _, _, err := c.lookup(ctx, src, "kb-1", 7, digest); err != nil {
+	if _, err := c.lookup(ctx, src, "kb-1", 7, digest); err != nil {
 		t.Fatalf("lookup 3: %v", err)
 	}
 	if src.calls != before {
@@ -194,12 +303,12 @@ func TestDocSetCache_ADifferentDigestMisses(t *testing.T) {
 	src := &countingVDL{VersionDocList: vdl}
 	var c docSetCache
 
-	if _, _, err := c.lookup(ctx, src, "kb-1", 7, stratinternalsync.ComputeDocIDSetHash(ids)); err != nil {
+	if _, err := c.lookup(ctx, src, "kb-1", 7, stratinternalsync.ComputeDocIDSetHash(ids)); err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
 	// A digest the local set does not hash to is a refusal (this replica cannot serve
 	// the version), and it must not be cached either.
-	if _, _, err := c.lookup(ctx, src, "kb-1", 7, "some-other-digest"); !errors.Is(err, stratumerrors.ErrIndexNotReady) {
+	if _, err := c.lookup(ctx, src, "kb-1", 7, "some-other-digest"); !errors.Is(err, stratumerrors.ErrIndexNotReady) {
 		t.Fatalf("lookup with a different digest = %v, want ErrIndexNotReady", err)
 	}
 	if src.calls != 2 {
@@ -215,7 +324,7 @@ func TestDocSetCache_EvictsOldVersions(t *testing.T) {
 	for i := 0; i < docSetCacheCap+1; i++ {
 		ids := []string{"d1"}
 		vdl := seedVDL(t, "kb-1", 100+int64(i), ids)
-		if _, _, err := c.lookup(ctx, &countingVDL{VersionDocList: vdl}, "kb-1", 100+int64(i),
+		if _, err := c.lookup(ctx, &countingVDL{VersionDocList: vdl}, "kb-1", 100+int64(i),
 			stratinternalsync.ComputeDocIDSetHash(ids)); err != nil {
 			t.Fatalf("lookup %d: %v", i, err)
 		}

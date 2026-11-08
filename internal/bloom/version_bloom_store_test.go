@@ -2,6 +2,8 @@ package bloom
 
 import (
 	"context"
+	"fmt"
+	"math/rand"
 	"testing"
 )
 
@@ -174,6 +176,131 @@ func TestVersionBloomStore_FilterFollowsTheDocumentSetForwardsAndBackwards(t *te
 	}
 	if f3.Test("doc-a") {
 		t.Error("a document removed from the version must be gone from the rebuilt filter")
+	}
+}
+
+// TestVersionBloomStore_WithFingerprintReusesTheCachedFilter pins the read path's
+// shortcut: a caller that already holds the set's fingerprint (the query path, whose
+// docSetCache keeps it beside the verified set) gets the cached filter back WITHOUT
+// the store deriving the fingerprint from the IDs again. That derivation is
+// O(documents) — a copy plus a sort of the whole set — and re-running it per query was
+// what made a warm query's filter lookup expensive in the first place.
+//
+// 撤掉即变红: the nil docIDs below would make a miss build an empty filter, which the
+// assertions catch; the identity check catches a rebuild that happens to hold the same
+// documents.
+func TestVersionBloomStore_WithFingerprintReusesTheCachedFilter(t *testing.T) {
+	ids := []string{"p", "q"}
+	src := &mockVdl{docs: map[int64][]string{9: ids}}
+	s := NewVersionBloomStore("", 1000, 0.01, src)
+	fp := DocumentSetFingerprint(ids)
+
+	first := s.GetForDocumentsWithFingerprint("kb-1", 9, fp, ids)
+	if !first.Test("p") || first.Test("absent") {
+		t.Fatal("the filter must describe exactly the document set handed over")
+	}
+
+	// Same fingerprint, no set handed over at all: the cached filter answers, which is
+	// only possible if nothing was rebuilt from docIDs.
+	again := s.GetForDocumentsWithFingerprint("kb-1", 9, fp, nil)
+	if again != first {
+		t.Fatal("a matching fingerprint must be served from the cache, not rebuilt")
+	}
+
+	// A fingerprint that does not describe the cached filter must rebuild from the set
+	// handed over — the filter is derived data, never a source of truth.
+	other := []string{"r"}
+	rebuilt := s.GetForDocumentsWithFingerprint("kb-1", 9, DocumentSetFingerprint(other), other)
+	if rebuilt == first {
+		t.Fatal("a changed document set must be rebuilt, not served from the cache")
+	}
+	if !rebuilt.Test("r") || rebuilt.Test("p") {
+		t.Fatal("the rebuilt filter must describe the new document set")
+	}
+}
+
+// TestVersionBloomStore_FingerprintIsDerivedOnlyWhenTheCallerHasNone pins the cost
+// split: a caller that hands over the set's fingerprint never makes the store derive
+// one, warm or cold, while GetForDocuments — which has nothing else to compare the
+// cached filter against — always does. The query path is the first kind, and it is the
+// one whose every request used to pay for the derivation.
+//
+// 撤掉即变红: routing GetForDocumentsWithFingerprint through setFingerprint would make
+// calls 2 instead of 0.
+func TestVersionBloomStore_FingerprintIsDerivedOnlyWhenTheCallerHasNone(t *testing.T) {
+	ids := []string{"p", "q"}
+	src := &mockVdl{docs: map[int64][]string{9: ids}}
+	s := NewVersionBloomStore("", 1000, 0.01, src)
+	fp := DocumentSetFingerprint(ids)
+
+	calls := 0
+	restore := setFingerprint
+	setFingerprint = func(docIDs []string) uint64 {
+		calls++
+		return restore(docIDs)
+	}
+	t.Cleanup(func() { setFingerprint = restore })
+
+	for i := 0; i < 2; i++ {
+		s.GetForDocumentsWithFingerprint("kb-1", 9, fp, ids)
+	}
+	if calls != 0 {
+		t.Fatalf("a caller that supplied the fingerprint caused %d derivations, want 0", calls)
+	}
+
+	s.GetForDocuments("kb-1", 9, ids)
+	if calls != 1 {
+		t.Fatalf("GetForDocuments derived the fingerprint %d times, want 1 (it has no other way to match the cached filter)", calls)
+	}
+}
+
+// TestDocumentSetFingerprint_IsOrderInsensitive is the contract both callers rely on:
+// the write path forms a set from its own changes, the read path from a prefix scan, and
+// they must agree on one fingerprint for one set.
+func TestDocumentSetFingerprint_IsOrderInsensitive(t *testing.T) {
+	sorted := []string{"a", "ab", "b"}
+
+	if got, want := DocumentSetFingerprint([]string{"b", "a", "ab"}), DocumentSetFingerprint(sorted); got != want {
+		t.Fatalf("fingerprint depends on order: %d != %d", got, want)
+	}
+	// The separator is load-bearing: {"ab","c"} must not hash like {"a","bc"}.
+	if DocumentSetFingerprint([]string{"ab", "c"}) == DocumentSetFingerprint([]string{"a", "bc"}) {
+		t.Fatal("document IDs are not delimited; two different sets collide")
+	}
+	// Feeding an already-sorted slice must not reorder the caller's own data.
+	in := []string{"b", "a"}
+	_ = DocumentSetFingerprint(in)
+	if in[0] != "b" || in[1] != "a" {
+		t.Fatalf("DocumentSetFingerprint reordered its input: %v", in)
+	}
+}
+
+// BenchmarkDocumentSetFingerprint measures the pass a warm query no longer runs: the
+// unsorted case is the old per-query cost (copy + sort + hash), the sorted case is the
+// miss path's cost.
+func BenchmarkDocumentSetFingerprint(b *testing.B) {
+	ids := make([]string, 8000)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("doc-%05d", i)
+	}
+	shuffled := make([]string, len(ids))
+	for i, j := range rand.Perm(len(ids)) {
+		shuffled[i] = ids[j]
+	}
+
+	for _, tc := range []struct {
+		name string
+		ids  []string
+	}{
+		{"sorted", ids},
+		{"unsorted", shuffled},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				_ = DocumentSetFingerprint(tc.ids)
+			}
+		})
 	}
 }
 
