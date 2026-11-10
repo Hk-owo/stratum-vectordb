@@ -251,6 +251,23 @@ func (t *Transport) applyAppendResponse(rf *Raft, id int64, req *kvraftpb.Append
 		return
 	}
 
+	// A stale response must not touch the leader's bookkeeping. The RPC ran with
+	// rf.mu released, so by now this node may have been deposed (and possibly
+	// truncated its log following someone else), or lost and regained leadership
+	// in a later term. Either way the response answers a request built from a log
+	// and a nextIndex that no longer exist: adopting its ConflictIndex can point
+	// past the end of the current log, and counting its success toward matchIndex
+	// could advance commitIndex on an acknowledgement given to another term.
+	// The higher-term check above stays first: stepping down is valid whatever
+	// request the response belongs to.
+	if rf.state != Leader || req.Term != rf.term {
+		t.logger.Debug("dropping a stale AppendEntries response",
+			zap.Int64("node_id", rf.me), zap.Int64("peer_id", id),
+			zap.Uint64("req_term", req.Term), zap.Uint64("current_term", rf.term),
+			zap.Bool("is_leader", rf.state == Leader))
+		return
+	}
+
 	if resp.Success {
 		newMatch := req.PrevLogIndex + uint64(len(req.Entries))
 		if newMatch > rf.matchIndex[id] {
