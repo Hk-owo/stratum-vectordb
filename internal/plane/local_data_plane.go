@@ -226,10 +226,12 @@ type LocalDataPlane struct {
 	// lastChainReconcile is when the last FULL live-chain pass ran, and
 	// chainReconcileMaxAge bounds how long the incremental path may keep it away.
 	// In-memory: a restart forces a full pass, which is the safe direction.
-	lastChainReconcile   time.Time
-	chainReconcileMaxAge time.Duration
-	presence             VersionPresenceQuerier
-	digest               VersionDigest
+	lastChainReconcile    time.Time
+	chainReconcileMaxAge  time.Duration
+	chainReconcileMinAge  time.Duration
+	deletionPagesPerSweep int
+	presence              VersionPresenceQuerier
+	digest                VersionDigest
 	// dataStatus reads this node's local metadata to tell a still-PENDING
 	// version from one already announced (§7.3 takeover). Optional.
 	dataStatus     VersionDataStatusQuerier
@@ -243,6 +245,27 @@ type LocalDataPlane struct {
 	// exercise the loop's bounds without waiting out 30 s.
 	pullIdleTimeout time.Duration
 	pullMaxDuration time.Duration
+
+	// The peer-facing timing knobs. Every one follows the same convention: a
+	// positive configured value wins, zero falls back to the package-level
+	// default — a var where a test shortens it, a const otherwise. The defaults
+	// are read ONCE, in NewLocalDataPlane, so a test must shrink its var before
+	// building the plane (every existing test does).
+	cursorWriteTimeout    time.Duration
+	cursorRetryDelay      time.Duration
+	confirmAttemptTimeout time.Duration
+	confirmRetryBackoff   time.Duration
+	confirmBudget         time.Duration
+	replicaPushTimeout    time.Duration
+	pushTimeoutPerDoc     time.Duration
+	peerCursorTimeout     time.Duration
+	takeoverTimeout       time.Duration
+	takeoverCheckTimeout  time.Duration
+	takeoverMaxAttempts   int
+	takeoverMaxRetryDelay time.Duration
+	terminalReclaimEvery  time.Duration
+	terminalReclaimTries  int
+
 	// selfDataSyncAddr is what this node announces as the holder of the
 	// versions it writes (§8.5). See LocalDataPlaneConfig.SelfDataSyncAddr.
 	selfDataSyncAddr string
@@ -401,6 +424,13 @@ type LocalDataPlaneConfig struct {
 	// ChainReconcileMaxAge bounds how long the incremental path may keep the full
 	// live-chain pass away (0 = 24h).
 	ChainReconcileMaxAge time.Duration
+	// ChainReconcileMinAge is the floor between two FULL passes triggered by local
+	// activity, so a busy node does not turn "something landed here" into a range
+	// scan every tick (0 = 5min).
+	ChainReconcileMinAge time.Duration
+	// DeletionPagesPerSweep caps one pass's pagination; a bulk deletion larger than
+	// this is finished by the following ticks (0 = 8 pages).
+	DeletionPagesPerSweep int
 	// DisableChainReconcile switches off the ACTIVITY-DRIVEN full pass: the
 	// reconciliation that finds leftovers nobody told this node about, on a local landing
 	// or once ChainReconcileMaxAge has gone by. The start-up sweep and this node's own
@@ -472,6 +502,41 @@ type LocalDataPlaneConfig struct {
 	// declaration and are not wired yet.
 	MaxInFlightWrites int
 
+	// The peer-facing timing knobs below are all optional: zero takes the
+	// package default (the same number as before they were configurable), so
+	// an unconfigured node behaves exactly as it always did.
+
+	// CursorWriteTimeout bounds ONE cursor record's write to the WAL.
+	CursorWriteTimeout time.Duration
+	// CursorRetryDelay is the pause before a failed cursor batch is retried.
+	CursorRetryDelay time.Duration
+	// ConfirmAttemptTimeout / ConfirmRetryBackoff / ConfirmBudget pace the §7.3
+	// confirmation broadcast: one attempt, the pause between attempts, and the
+	// whole broadcast.
+	ConfirmAttemptTimeout time.Duration
+	ConfirmRetryBackoff   time.Duration
+	ConfirmBudget         time.Duration
+	// ReplicaPushTimeout / PushTimeoutPerDoc bound one replica's push during
+	// fan-out: a floor plus a per-document increment, because the peer's work
+	// scales with the batch (v13 §7.2).
+	ReplicaPushTimeout time.Duration
+	PushTimeoutPerDoc  time.Duration
+	// PeerCursorTimeout bounds one peer's cursor query on the startup /
+	// reclaim paths.
+	PeerCursorTimeout time.Duration
+	// TakeoverTimeout is the §7.3 "did the coordinator announce this?" wait;
+	// TakeoverCheckTimeout bounds one quorum check, TakeoverMaxAttempts caps
+	// how many checks one watch spends and TakeoverMaxRetryDelay caps the
+	// backoff between them.
+	TakeoverTimeout       time.Duration
+	TakeoverCheckTimeout  time.Duration
+	TakeoverMaxAttempts   int
+	TakeoverMaxRetryDelay time.Duration
+	// TerminalReclaimInterval / TerminalReclaimAttempts pace the local reclaim
+	// queue for versions the control layer retired.
+	TerminalReclaimInterval time.Duration
+	TerminalReclaimAttempts int
+
 	// State is the node state machine this plane maintains
 	// (docs/storage-node-state-machine-plan.md §7). Optional: a plane built
 	// without one makes its own, which is what every test gets — and what a
@@ -513,6 +578,8 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		deletionLogPage:       cfg.DeletionLogPage,
 		chainReconcileEnabled: !cfg.DisableChainReconcile,
 		chainReconcileMaxAge:  cfg.ChainReconcileMaxAge,
+		chainReconcileMinAge:  durationOr(cfg.ChainReconcileMinAge, defaultChainReconcileMinAge),
+		deletionPagesPerSweep: intOr(cfg.DeletionPagesPerSweep, maxDeletionPagesPerSweep),
 		verify:                cfg.Verify,
 		resolve:               cfg.Resolve,
 		wal:                   cfg.WAL,
@@ -535,6 +602,20 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		selfDataSyncAddr:      cfg.SelfDataSyncAddr,
 		pullIdleTimeout:       cfg.PullIdleTimeout,
 		pullMaxDuration:       cfg.PullMaxDuration,
+		cursorWriteTimeout:    durationOr(cfg.CursorWriteTimeout, cursorWriteTimeout),
+		cursorRetryDelay:      durationOr(cfg.CursorRetryDelay, cursorRetryDelay),
+		confirmAttemptTimeout: durationOr(cfg.ConfirmAttemptTimeout, confirmAttemptTimeout),
+		confirmRetryBackoff:   durationOr(cfg.ConfirmRetryBackoff, confirmRetryBackoff),
+		confirmBudget:         durationOr(cfg.ConfirmBudget, confirmBroadcastBudget),
+		replicaPushTimeout:    durationOr(cfg.ReplicaPushTimeout, replicaPushTimeout),
+		pushTimeoutPerDoc:     durationOr(cfg.PushTimeoutPerDoc, pushTimeoutPerDoc),
+		peerCursorTimeout:     durationOr(cfg.PeerCursorTimeout, peerCursorTimeout),
+		takeoverTimeout:       durationOr(cfg.TakeoverTimeout, takeoverTimeout),
+		takeoverCheckTimeout:  durationOr(cfg.TakeoverCheckTimeout, takeoverCheckTimeout),
+		takeoverMaxAttempts:   intOr(cfg.TakeoverMaxAttempts, maxTakeoverAttempts),
+		takeoverMaxRetryDelay: durationOr(cfg.TakeoverMaxRetryDelay, maxTakeoverRetryDelay),
+		terminalReclaimEvery:  durationOr(cfg.TerminalReclaimInterval, terminalReclaimInterval),
+		terminalReclaimTries:  intOr(cfg.TerminalReclaimAttempts, terminalReclaimAttempts),
 		limiter:               newWriteLimiter(cfg.MaxInFlightWrites),
 		state:                 state,
 		logger:                logger,
@@ -544,6 +625,24 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 }
 
 var _ DataPlane = (*LocalDataPlane)(nil)
+
+// durationOr and intOr apply the "configured value wins, else the package
+// default" rule the timing knobs share. Written once so a knob added later
+// cannot invent a third convention (and so "unset" can never be read as "zero",
+// which for a duration is a bound that fires immediately).
+func durationOr(v, fallback time.Duration) time.Duration {
+	if v > 0 {
+		return v
+	}
+	return fallback
+}
+
+func intOr(v, fallback int) int {
+	if v > 0 {
+		return v
+	}
+	return fallback
+}
 
 // DefaultPullIdleTimeout is how long a pull loop may go without a completed
 // transfer before it gives up (LocalDataPlaneConfig.PullIdleTimeout).
@@ -1125,6 +1224,8 @@ func (d *LocalDataPlane) localVersionOf(kbID string) int64 {
 // cursorWriteTimeout bounds ONE cursor record's write. The write is a local
 // append plus fsync, so this is generous; it exists so a stuck disk can never
 // pin the flusher goroutine forever — the value stays queued either way.
+//
+// The default for LocalDataPlaneConfig.CursorWriteTimeout.
 const cursorWriteTimeout = 5 * time.Second
 
 // cursorRetryDelay is how long flushCursors waits before retrying a batch it
@@ -1132,6 +1233,8 @@ const cursorWriteTimeout = 5 * time.Second
 // reaches it — and it exists for the same reason the failed value is re-queued at
 // all: without a delay, re-queueing spins the flusher at disk-error speed, one
 // repeated warning per fsync attempt, for as long as the disk misbehaves.
+//
+// The default for LocalDataPlaneConfig.CursorRetryDelay.
 const cursorRetryDelay = time.Second
 
 // persistCursor queues a cursor value for persistence. It never blocks and never
@@ -1189,7 +1292,7 @@ func (d *LocalDataPlane) flushCursors() {
 
 		var failed bool
 		for kbID, versionID := range pending {
-			ctx, cancel := context.WithTimeout(context.Background(), cursorWriteTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), d.cursorWriteTimeout)
 			err := d.cursorWAL.WriteCursor(ctx, kbID, versionID)
 			cancel()
 			if err == nil {
@@ -1213,7 +1316,7 @@ func (d *LocalDataPlane) flushCursors() {
 			// An advance arriving during the sleep is not lost: it lands in
 			// cursorPending (cursorFlushing still reports a flusher running) and
 			// the next pass of this loop picks it up.
-			time.Sleep(cursorRetryDelay)
+			time.Sleep(d.cursorRetryDelay)
 		}
 	}
 }
@@ -1538,7 +1641,7 @@ func (d *LocalDataPlane) pickBackfillSource(ctx context.Context, kbID string, ne
 		// Bounded for the same reason as SafeDurableVersion's peer queries: this can
 		// run while a peer is not serving yet, and an unbounded wait would turn a
 		// backfill choice into a hang.
-		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		peerCtx, cancel := context.WithTimeout(ctx, d.peerCursorTimeout)
 		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
 		cancel()
 		if err != nil {
@@ -1591,7 +1694,7 @@ func (d *LocalDataPlane) pickTransferSource(ctx context.Context, kbID string, ne
 		// Bounded for the same reason as pickBackfillSource's query: this can run
 		// while a peer is not serving yet, and an unbounded wait would turn a source
 		// choice into a hang.
-		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		peerCtx, cancel := context.WithTimeout(ctx, d.peerCursorTimeout)
 		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
 		cancel()
 		if err != nil {
@@ -1622,7 +1725,7 @@ func (d *LocalDataPlane) PeerHolders(ctx context.Context, kbID string) (version 
 		return 0, nil, false
 	}
 	for _, peer := range peers {
-		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		peerCtx, cancel := context.WithTimeout(ctx, d.peerCursorTimeout)
 		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
 		cancel()
 		if err != nil || cursor <= 0 || cursor < version {
@@ -1727,6 +1830,9 @@ const (
 // (the takeoverTimeout precedent): the case worth pinning down is a peer that
 // hangs for its whole attempt deadline, and no test should spend seconds per
 // attempt to produce it. Unexported, and written nowhere outside tests.
+//
+// They are also the defaults behind LocalDataPlaneConfig.Confirm*: a configured
+// value wins, these apply when none was given.
 var (
 	// confirmAttemptTimeout bounds ONE attempt. Same order as peerCursorTimeout:
 	// this is a small RPC between peers, and one unreachable peer must not hold
@@ -1773,7 +1879,7 @@ func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64) {
 		// A fresh context: the request that ran the write is over by now. This
 		// bounds the whole broadcast — including resolving the peers — so a slow
 		// peer cannot starve the ones behind it.
-		ctx, cancel := context.WithTimeout(context.Background(), confirmBroadcastBudget)
+		ctx, cancel := context.WithTimeout(context.Background(), d.confirmBudget)
 		defer cancel()
 		peers, err := d.resolveReplicas(ctx)
 		if err != nil {
@@ -1798,7 +1904,7 @@ func (d *LocalDataPlane) confirmPeer(ctx context.Context, peer, kbID string, ver
 			lastErr = err
 			break
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, confirmAttemptTimeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, d.confirmAttemptTimeout)
 		// The confirmation doubles as the §8.5 announcement: it carries this
 		// node's own address so the peer records where the version's data is
 		// (see DataSourceRegistry). An empty address means "announce nothing".
@@ -1818,7 +1924,7 @@ func (d *LocalDataPlane) confirmPeer(ctx context.Context, peer, kbID string, ver
 		if attempt < confirmAttempts {
 			select {
 			case <-ctx.Done():
-			case <-time.After(confirmRetryBackoff):
+			case <-time.After(d.confirmRetryBackoff):
 			}
 		}
 	}
@@ -2028,6 +2134,8 @@ func (d *LocalDataPlane) ApplyBackfillChanges(ctx context.Context, kbID string, 
 // batch measured pushBudget == the timeout exactly on all three replicas —
 // every push timed out while the peers were busy committing the very version
 // being pushed — which is what pushTimeoutPerDoc pays for.
+//
+// The default for LocalDataPlaneConfig.ReplicaPushTimeout.
 const replicaPushTimeout = 3 * time.Second
 
 // pushTimeoutPerDoc is what one document's worth of remote work adds to a push's
@@ -2035,6 +2143,8 @@ const replicaPushTimeout = 3 * time.Second
 // (measured at ~14.6 ms/document for a 1000-document batch, split/embed/write).
 // Without it the budget is a constant while the work is not, and a large batch
 // times out on a replica that is doing exactly what it was asked to.
+//
+// The default for LocalDataPlaneConfig.PushTimeoutPerDoc.
 const pushTimeoutPerDoc = 20 * time.Millisecond
 
 func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int64, docs int, st *fanoutStages) error {
@@ -2099,7 +2209,7 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 	// a peer doing exactly what it was asked to — measured on a 1000-document
 	// batch, where pushBudget was the timeout to the microsecond on all three
 	// replicas while each was busy committing the version being pushed.
-	pushBudget := replicaPushTimeout + time.Duration(docs)*pushTimeoutPerDoc
+	pushBudget := d.replicaPushTimeout + time.Duration(docs)*d.pushTimeoutPerDoc
 	if deadline, ok := ctx.Deadline(); ok {
 		if left := time.Until(deadline); left < pushBudget {
 			pushBudget = left
@@ -2170,6 +2280,8 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 // whether the answers that DID arrive suffice. Like the other budget numbers this is
 // a placeholder: raise it if startup on slow disks shows peers being skipped that
 // would have answered.
+//
+// The default for LocalDataPlaneConfig.PeerCursorTimeout.
 const peerCursorTimeout = 2 * time.Second
 
 // QuorumSize is the durable threshold for n replicas (Stratum_设计文档v13.md
@@ -2427,6 +2539,7 @@ type cleanupTask struct {
 // version whose data will never arrive. A failed local prefix delete is disk hygiene
 // that a later pass fixes, so the interval can be generous (a minute) and the patience
 // long (ten attempts): nothing is waiting on it, and nothing else will do it.
+// Their defaults are LocalDataPlaneConfig.TerminalReclaimInterval / Attempts.
 var terminalReclaimInterval = time.Minute
 
 const terminalReclaimAttempts = 10
@@ -2477,7 +2590,7 @@ func (d *LocalDataPlane) clearTerminalReclaim(kbID string, versionID int64) {
 // StartTerminalReclaims runs the reclaim retry loop until ctx ends.
 func (d *LocalDataPlane) StartTerminalReclaims(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(terminalReclaimInterval)
+		ticker := time.NewTicker(d.terminalReclaimEvery)
 		defer ticker.Stop()
 		for {
 			select {
@@ -2504,7 +2617,7 @@ func (d *LocalDataPlane) retryTerminalReclaims(ctx context.Context) {
 		if d.dropper != nil {
 			if err := d.dropper.DropVersionStorage(ctx, task.kbID, task.versionID); err != nil {
 				task.attempts++
-				if task.attempts >= terminalReclaimAttempts {
+				if task.attempts >= d.terminalReclaimTries {
 					d.clearTerminalReclaim(task.kbID, task.versionID)
 					d.logger.Error("plane: giving up on a local terminal-version reclaim; leftover bytes need an operator",
 						zap.String("kb_id", task.kbID), zap.Int64("version_id", task.versionID),
@@ -2677,7 +2790,8 @@ func (d *LocalDataPlane) EnforceRetention(ctx context.Context, meta MetadataList
 // cost of waiting too long is a version stranded in PENDING. Like the other
 // §10.4 numbers it is a placeholder.
 //
-// A var so tests can shorten it.
+// A var so tests can shorten it; the default for
+// LocalDataPlaneConfig.TakeoverTimeout.
 var takeoverTimeout = 200 * time.Millisecond
 
 // takeoverCheckTimeout bounds the whole quorum check attemptTakeover runs once
@@ -2689,6 +2803,8 @@ var takeoverTimeout = 200 * time.Millisecond
 // still-running check on the same variable (measured with -race). It is also the
 // honest number: the check is a handful of small RPCs, not something whose budget
 // should shrink to tens of milliseconds because a test wanted a prompt timer.
+//
+// The default for LocalDataPlaneConfig.TakeoverCheckTimeout.
 const takeoverCheckTimeout = 2 * time.Second
 
 // takeoverWatch is one pending §7.3 timer.
@@ -2717,10 +2833,14 @@ type takeoverWatch struct {
 // resolve plus one presence RPC per peer, and a version that no quorum holds
 // deserves §10.1's verdict rather than an endless poll. With the backoff below
 // the whole watch lives ~20 s, which covers a catch-up tick on either side.
+//
+// The default for LocalDataPlaneConfig.TakeoverMaxAttempts.
 const maxTakeoverAttempts = 8
 
 // maxTakeoverRetryDelay caps the exponential backoff between checks, so a long
 // outage is still noticed promptly once the peers come back.
+//
+// The default for LocalDataPlaneConfig.TakeoverMaxRetryDelay.
 const maxTakeoverRetryDelay = 5 * time.Second
 
 // WatchVersionWrite starts the §7.3 takeover timer for a version this node has
@@ -2738,7 +2858,7 @@ func (d *LocalDataPlane) WatchVersionWrite(kbID string, versionID int64) {
 	if d.control == nil || d.resolveReplicas == nil || d.presence == nil || d.digest == nil {
 		return // takeover not wired; the client-retry path still covers this
 	}
-	d.armTakeover(kbID, versionID, 0, takeoverTimeout)
+	d.armTakeover(kbID, versionID, 0, d.takeoverTimeout)
 }
 
 // watchForDurability arms the §7.3 check after data landed here through a path
@@ -2764,7 +2884,7 @@ func (d *LocalDataPlane) watchForDurability(ctx context.Context, kbID string, ve
 	if d.dataStatus != nil {
 		// Bounded on its own: on a storage node this is an RPC to the control tier, and a
 		// slow answer must not hold up a pull that has already finished.
-		statusCtx, cancel := context.WithTimeout(ctx, takeoverCheckTimeout)
+		statusCtx, cancel := context.WithTimeout(ctx, d.takeoverCheckTimeout)
 		st, ok := d.dataStatus.DataStatusOf(statusCtx, kbID, versionID)
 		cancel()
 		if ok && st != types.DataStatusPending {
@@ -2845,7 +2965,7 @@ func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64, gen uint6
 
 	// A fresh context: the request that delivered the data is long gone by
 	// now, and the announcement is this node's own business.
-	ctx, cancel := context.WithTimeout(context.Background(), takeoverCheckTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), d.takeoverCheckTimeout)
 	defer cancel()
 
 	// Already announced? Then there is nothing to say. This is the check that
@@ -2933,16 +3053,16 @@ func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64, gen uint6
 // outage costs few RPCs while a catch-up tick is still noticed promptly. false means this
 // watch has spent its attempts.
 func (d *LocalDataPlane) retryTakeover(kbID string, versionID int64, attempts int, delay time.Duration) bool {
-	if attempts+1 >= maxTakeoverAttempts {
+	if attempts+1 >= d.takeoverMaxAttempts {
 		return false
 	}
 	next := delay * 2
-	if next <= 0 || next > maxTakeoverRetryDelay {
-		next = maxTakeoverRetryDelay
+	if next <= 0 || next > d.takeoverMaxRetryDelay {
+		next = d.takeoverMaxRetryDelay
 	}
 	d.logger.Debug("plane: takeover: re-checking",
 		zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
-		zap.Int("attempt", attempts+1), zap.Int("max_attempts", maxTakeoverAttempts),
+		zap.Int("attempt", attempts+1), zap.Int("max_attempts", d.takeoverMaxAttempts),
 		zap.Duration("next_check_in", next))
 	d.armTakeover(kbID, versionID, attempts+1, next)
 	return true
@@ -2989,7 +3109,7 @@ func (d *LocalDataPlane) SafeDurableVersion(ctx context.Context, kbID string) (i
 		// An unreachable peer is not evidence of anything and is skipped either way, so
 		// the deadline only decides how long establishing "unreachable" takes — which
 		// during startup is the difference between a node that boots and one that hangs.
-		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		peerCtx, cancel := context.WithTimeout(ctx, d.peerCursorTimeout)
 		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
 		cancel()
 		if err != nil {

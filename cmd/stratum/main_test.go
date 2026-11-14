@@ -22,6 +22,11 @@ import (
 
 // TestLoadConfig_OverlaysDefaults verifies that a YAML config file overrides
 // the single-node defaults while unset fields keep their defaults.
+// testReplayRetry is the crash-replay budget the tests drive: the same values
+// defaultConfig() supplies, kept in one place so a test that wants a different
+// budget does not have to restate the whole struct.
+var testReplayRetry = replayRetry{MaxAttempts: crashReplayMaxAttempts, BaseMS: crashReplayRetryBaseMillis}
+
 func TestLoadConfig_OverlaysDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
@@ -230,7 +235,7 @@ func TestRunCrashRecovery(t *testing.T) {
 		{Type: types.PendingRecordTypeVersionWrite, KBID: "kb-x", VersionID: 11},
 	}
 
-	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w, testReplayRetry)
 
 	if got := dc.Calls(); len(got) != 1 || got[0] != "kb-del" {
 		t.Errorf("DeleteCoordinator calls = %v, want [kb-del]", got)
@@ -289,7 +294,7 @@ func TestRunCrashRecovery_ReplayFailuresSkipped(t *testing.T) {
 
 	// Must not abort: runCrashRecovery has no error return — all four
 	// records are skipped and surfaced via the replay counter.
-	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w, testReplayRetry)
 
 	// Each record was attempted (with retries) or skipped exactly once.
 	if got := dc.Calls(); len(got) != crashReplayMaxAttempts {
@@ -345,7 +350,7 @@ func TestRunCrashRecovery_VersionWriteKBNotFoundSkipped(t *testing.T) {
 		{Type: types.PendingRecordTypeVersionWrite, KBID: "kb-gone", VersionID: 2, ParentVersionID: 1, Changes: changes},
 	}
 
-	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w, testReplayRetry)
 
 	got := w.GetReplayCounters()
 	if len(got) != 1 || got[0].Record.VersionID != 2 || got[0].Record.KBID != "kb-gone" {
@@ -379,7 +384,7 @@ func TestRunCrashRecovery_VersionWriteRetrySucceeds(t *testing.T) {
 		{Type: types.PendingRecordTypeVersionWrite, KBID: "kb-ok", VersionID: 9, ParentVersionID: 3, Changes: changes},
 	}
 
-	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w, testReplayRetry)
 
 	if got := wc.ReplayCalls(); len(got) != crashReplayMaxAttempts {
 		t.Errorf("ReplayVersionStorageWrites calls = %d, want %d (retried until success)", len(got), crashReplayMaxAttempts)
@@ -683,7 +688,7 @@ func TestRunCrashRecovery_SiblingSweepFailureKeepsTheRecordPaid(t *testing.T) {
 		{Type: types.PendingRecordTypeVersionDelete, KBID: "kb-vdel", VersionID: 7},
 	}
 
-	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w)
+	runCrashRecovery(ctx, logger, records, wc, dc, dvc, w, testReplayRetry)
 
 	if got := dvc.ResumeCalls(); len(got) != 1 || got[0].VersionID != 7 {
 		t.Fatalf("resume calls = %+v, want one for {kb-vdel, 7}", got)

@@ -359,7 +359,7 @@ func (d *LocalDataPlane) reconcileDeletions(ctx context.Context, meta MetadataLi
 	//   - there is no watermark, so this node cannot be served incrementally at all and
 	//     must not be told "you are up to date";
 	//   - the last full pass is older than the bound.
-	if d.peekDeletedReconcileDirty() && d.chainAvailableTo(allowChain, defaultChainReconcileMinAge) {
+	if d.peekDeletedReconcileDirty() && d.chainAvailableTo(allowChain, d.chainReconcileMinAge) {
 		return d.reconcileFromChain(ctx, meta, res, "local-holdings-changed")
 	}
 	if d.deletions == nil {
@@ -390,7 +390,7 @@ func (d *LocalDataPlane) reconcileDeletions(ctx context.Context, meta MetadataLi
 	// minutes to become visible; draining a bounded number per tick keeps each pass
 	// short while making the backlog converge in one.
 	page := d.deletionPage()
-	for pages := 0; pages < maxDeletionPagesPerSweep; pages++ {
+	for pages := 0; pages < d.deletionPagesPerSweep; pages++ {
 		entries, latest, oldest, epoch, err := d.deletions.DeletionsSince(ctx, state.Seq, page)
 		if err != nil {
 			// A control tier that cannot be read now says nothing about the next pass;

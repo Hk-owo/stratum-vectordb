@@ -110,7 +110,7 @@ func (d *LocalDataPlane) reclaimWatermark(ctx context.Context, kbID string, peer
 			blockers = append(blockers, ReclaimBlocker{Address: peer, Reason: ReclaimBlockerUnreachable})
 			continue
 		}
-		peerCtx, cancel := context.WithTimeout(ctx, peerCursorTimeout)
+		peerCtx, cancel := context.WithTimeout(ctx, d.peerCursorTimeout)
 		cursor, err := d.cursorQuerier.LocalVersionOf(peerCtx, peer, kbID)
 		cancel()
 		switch {

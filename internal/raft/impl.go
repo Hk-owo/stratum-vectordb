@@ -116,6 +116,12 @@ type Config struct {
 	// on a proposal whose leader has lost quorum; it does not make this node stop
 	// waiting for leadership changes, which is polled separately.
 	ProposeApplyTimeout time.Duration
+
+	// RPCTimeout bounds one peer-to-peer Raft RPC (RequestVote, AppendEntries,
+	// the InstallSnapshot trigger). Zero means kvraft's own 1 s default. These
+	// are timer-driven background calls, so the bound is what keeps one hung
+	// peer from holding a replication round open.
+	RPCTimeout time.Duration
 }
 
 // pendingProposal tracks a single in-flight Propose* call waiting for its
@@ -233,7 +239,7 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 		logger = zap.NewNop()
 	}
 
-	transport := kvraft.NewTransport(logger)
+	transport := kvraft.NewTransportWithRPCTimeout(logger, cfg.RPCTimeout)
 	for _, p := range cfg.Peers {
 		if p.ID == cfg.NodeID {
 			continue // skip self — the transport only needs OTHER peers

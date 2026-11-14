@@ -85,6 +85,12 @@ var errVersionTombstoned = errors.New("sync: version was deleted on this node")
 // DefaultPullDialTimeout bounds the connection handshake of a pull.
 const DefaultPullDialTimeout = 15 * time.Second
 
+// SetPullDialTimeout overrides that bound (sync.pull_dial_timeout_ms). A
+// non-positive value keeps the default.
+func (f *Follower) SetPullDialTimeout(d time.Duration) {
+	f.pullDialTimeout = d
+}
+
 // dialTimeout returns the handshake bound, defaulting for a zero-valued Follower.
 func (f *Follower) dialTimeout() time.Duration {
 	if f.pullDialTimeout > 0 {

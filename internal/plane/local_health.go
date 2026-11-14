@@ -54,8 +54,9 @@ type peerHealth struct {
 }
 
 // HealthViewConfig tunes a LocalHealthView. The zero value takes the defaults,
-// which is what the node assembly passes: these numbers are heuristic and
-// deliberately not exposed as knobs until a deployment has a reason.
+// which is what a node without a `health:` section passes: these numbers are
+// heuristic, so the config file may override them (health.demote_after /
+// demote_for_ms) but nothing requires it.
 type HealthViewConfig struct {
 	// DemoteAfter is the consecutive-failure threshold. <= 0 takes the default.
 	DemoteAfter int

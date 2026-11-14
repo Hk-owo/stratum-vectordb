@@ -15,6 +15,10 @@ node:
   grpc_addr: "0.0.0.0:7000"         # KnowledgeBaseService / QueryService / AdminService
   raft_addr: "0.0.0.0:8000"         # Raft internal communication
   metrics_addr: "0.0.0.0:9000"      # Prometheus /metrics
+  # 服务站信任戳的时效（毫秒）。它约束的是重放：戳一旦在链路上被看到，超过这时长就
+  # 不再被接受。窗口要覆盖同密钥进程之间的时钟偏差，所以是几十秒而不是 1 秒。
+  # 0 = 用 authmeta.DefaultMarkTTL（30 秒）。
+  station_mark_ttl_ms: 0
 
 control_plane:
   # 判 FAILED_PERMANENT 之前容忍的失败次数（Stratum_设计文档v13.md §10.1）。
@@ -28,6 +32,14 @@ raft:
   # 控制层**有界删除日志**的条数上限；<= 0 用默认的 10000。存储节点靠它做增量对账：
   # 调大 ⇒ 节点可以落后更久才必须回退全量活链读；代价是每条都随 raft 快照往返。
   deleted_log_limit: 0
+  # 单次 peer 间 Raft RPC（RequestVote / AppendEntries / 快照触发）的超时。
+  # 这些是定时器驱动的后台调用，所以这个上限只决定"一个挂住的 peer 能把一轮复制拖
+  # 多久"。0 = 用 kvraft 默认值（1 秒）。
+  rpc_timeout_ms: 0
+  # 一次 Propose* 等待自己的日志被 apply 的上限；超时后报告"结果未知"（可安全重试）。
+  # 0 = 用 raft 默认值（60 秒）。调小让失去 quorum 的 leader 更早放手，但不会让本节点
+  # 停止等待领导权变更。
+  propose_apply_timeout_ms: 0
 
 storage:
   data_dir: "/var/lib/stratum/node1"
@@ -36,14 +48,42 @@ vecstore:
   # 节点只连 vecstore 的 gRPC 端口;vecstore 进程自己的 --rocksdb_path / --health_addr
   # 由启动它的脚本给出,不在节点配置里。
   grpc_addr: "127.0.0.1:7100"
+  # 节点到 vecstore 的 gRPC 连接保活参数（chunk 存储与索引管理共用一条配置）。
+  # **只探测活动流**：vecstore 的 C++ 服务端会把无流 ping 当成 too_many_pings 用
+  # GoAway 踢掉连接（压测时表现为 build RPC 挂起、版本永久 PENDING）。
+  # 0 = 默认值（间隔 60 秒、应答窗口 3 秒）。
+  keepalive_interval_ms: 0
+  keepalive_timeout_ms: 0
+
+embed:
+  # embed 服务的地址；省略 = http://localhost:8080（与本文件的单节点假设一致）。
+  # service_addr: "http://localhost:8080"
+  # embed 服务的 HTTP 客户端超时；0 = 30 秒；负数 = 不做客户端级超时（交给 ctx）。
+  timeout_ms: 0
 
 write_coordinator:
   max_retries: 3
   retry_base_interval_ms: 100
+  # 一次后台派发的**外层**预算：从版本提交到写入交给某个协调者。它必须**大于**
+  # dispatcher 的单候选预算（下面那三件套），否则内层先过期、外层无从报告，调用方
+  # 只看到"派发出去了但没发生"。0 = 5 分钟。
+  dispatch_timeout_ms: 0
+  # 一次后台派发的"认领"记录能解释多久之后的 miss（把"派发与 apply 抢跑"和"版本
+  # 无人认领"区分开）。0 = 2 分钟。
+  dispatch_claim_window_ms: 0
+  # 记录"放弃"那次 Raft 往返的上限。0 = 30 秒。
+  abandon_report_timeout_ms: 0
+  # 一个版本里同时处理的文档数上限。0 = 8。
+  max_concurrent_document_writes: 0
 
 delete_coordinator:
   max_retries: 5
   retry_base_interval_ms: 500
+  # 两个"收尾"扫描的周期：版本被标记 Deleting（那是已应答调用方的 Raft 命令）之后
+  # 进程死掉，清理就没人做了——这两个扫描把它接着做完。一轮只读状态机里的 id，
+  # 无 IO 无 RPC，所以周期可以短。0 = 各自默认 1 分钟。
+  deleting_version_sweep_interval_ms: 0
+  deleting_kb_sweep_interval_ms: 0
 
 # 对账（reconcile）—— 把"元数据里已经删除、但本节点还留着字节"的残留版本清掉
 # （docs/known-gaps.md §B/§C 那个窗口）。判据是控制层的当前状态：本节点持有的版本号
@@ -81,6 +121,20 @@ reconcile:
   deleted_versions_incremental_interval_s: 0
   # 单次增量读的页大小；<= 0 用默认的 512。控制层日志上限 10 000 条 ⇒ 最多 20 页。
   deleted_versions_log_page: 0
+  # 一次扫描最多翻几页。更大的批量删除由后续 tick 翻完；这个上限保证一轮不会无限长。
+  # 0 = 8 页。
+  deletion_pages_per_sweep: 0
+  # 两次**完整活链对账**之间的最小间隔（本节点有落地活动时才会触发）。没有它，
+  # "这里有东西落地"会变成每个增量 tick 都做一次区间扫描——正是这套机制要省的开销。
+  # 0 = 5 分钟。
+  chain_reconcile_min_age_ms: 0
+  # 本节点"被告知删除、本地清理失败"的重试周期。它不走网络（读本地墓碑表 + 本地
+  # 前缀删除），所以比上面的对账快得多：这是那条"没人会再告诉我一次"的快路径。
+  # 0 = 30 秒。
+  deleted_version_retry_interval_ms: 0
+  # 已完成的墓碑条目保留多久：覆盖最后一个窗口——回收完成不等于没有在途副本
+  # （一个还在重试的 push、一次删除前就开始的 backfill）。0 = 1 小时。
+  tombstone_grace_ms: 0
 
 index_manager:
   lru_capacity: 16
@@ -181,6 +235,98 @@ index_manager:
   # 后台扫描按文件 mtime 超过该窗口即删除两者（已封印的一对永不触碰——那是磁盘
   # 保留策略的职责）。0 = 默认 30 分钟；负数 = 关闭该扫描。
   build_abandon_timeout_ms: 0
+  # 上面那个扫描的周期；0 = 5 分钟。
+  build_abandon_sweep_interval_ms: 0
+  # 未建索引的版本小于该文档数时，查询直接暴力扫描而不建索引（§8.6b）。
+  # 0 = DefaultBruteForceMaxChunks（50 000）。
+  brute_force_max_chunks: 0
+  # 构建内的重试循环：数据同步还在落地时，构建要么等它、要么失败后由控制层换候选
+  # 重试。调大超时能让构建赢过一次慢拉取。0 = 5 分钟 / 2 秒。
+  build_retry_timeout_ms: 0
+  build_retry_interval_ms: 0
+  # 版本的访问时间写进 <versionID>.index.used 旁车的节流间隔——那是保留保护
+  # 唯一的证据来源。0 = 1 分钟。
+  access_persist_interval_ms: 0
+
+# 存储平面（data_plane）—— 面向 peer 的各种预算。每一项都是 0 = 组件自己的默认值，
+# 也就是这些键出现之前每个部署都在用的那个数。
+#
+# 这些数共同决定"一个节点落后多久才算异常"与"一次拉取/推送/确认能占多久"的平衡，
+# 属于部署判断（磁盘、网络、批量大小），所以从常量提到了配置里。
+data_plane:
+  # EnsureIndex 拉取循环：多久**没有进展**就放弃（进度 = 完成一次传输，不是时钟）。
+  # 0 = 30 秒。
+  pull_idle_timeout_ms: 0
+  # 拉取循环的绝对上限，防止"一直有一点点进展"的循环永不结束。0 = 10 分钟。
+  pull_max_duration_ms: 0
+  # 每个知识库同时在途的写入数上限（§7.7）：一个卡住的版本不能让后面排成无界队列。
+  # 0 = 8。
+  max_in_flight_writes: 0
+  # 游标记录的一次写入上限（本地 append + fsync）。0 = 5 秒。
+  cursor_write_timeout_ms: 0
+  # 一批游标写失败后多久重试；只作用于失败路径。0 = 1 秒。
+  cursor_retry_delay_ms: 0
+  # §7.3 确认广播：单次尝试、尝试间隔、整场广播的预算。0 = 2 秒 / 500 毫秒 / 60 秒。
+  confirm_attempt_timeout_ms: 0
+  confirm_retry_backoff_ms: 0
+  confirm_budget_ms: 0
+  # 扇出时单个副本的推送预算：一个下限 + 每文档增量——因为 peer 要做的事随批量增长
+  # （实测 ~14.6 ms/文档）。0 = 3 秒 + 20 毫秒/文档。
+  replica_push_timeout_ms: 0
+  push_timeout_per_doc_ms: 0
+  # 单个 peer 的游标查询上限（启动期与回收水位判定用）。0 = 2 秒。
+  peer_cursor_timeout_ms: 0
+  # §7.3 接管：等协调者公告的时长、一次 quorum 检查的上限、一次监视最多几次检查、
+  # 以及检查之间的退避上限。0 = 200 毫秒 / 2 秒 / 8 次 / 5 秒。
+  takeover_timeout_ms: 0
+  takeover_check_timeout_ms: 0
+  takeover_max_attempts: 0
+  takeover_max_retry_delay_ms: 0
+  # 控制层判定终态版本的本地回收队列：周期与耐心（次数）。
+  # 0 = 1 分钟 / 10 次。
+  terminal_reclaim_interval_ms: 0
+  terminal_reclaim_attempts: 0
+
+# 节点之间的控制流量（sync）。
+sync:
+  # 向控制 leader 报活的心跳周期（响应里带回链尾，是本节点发现自己落后的信号）。
+  # 心跳是软状态，丢一次没关系。0 = 5 秒。
+  heartbeat_interval_ms: 0
+  # 一次拉取的**连接握手**上限，只限握手——传输本身大不等于失败。0 = 15 秒。
+  pull_dial_timeout_ms: 0
+  # holders 缓存（"哪个 peer 能供这个 KB"）的 TTL 与按 KB 的条目上限。追赶中的节点
+  # 每隔几秒刷新一次，缓存骑得住一个慢 peer。0 = 15 秒 / 512。
+  holders_cache_ttl_ms: 0
+  holders_cache_limit: 0
+
+# 写派发的单候选预算（§7.13.2）：下限 + 每文档增量 + 二者之和的上限。
+# 这里必须小于 write_coordinator.dispatch_timeout_ms，否则内层先过期、外层无从报告。
+# 0 = 15 秒 / 50 毫秒 / 10 分钟。
+dispatcher:
+  candidate_timeout_ms: 0
+  candidate_timeout_per_doc_ms: 0
+  max_candidate_timeout_ms: 0
+
+# §7.13.5 的 peer 降级启发式：连续失败几次开始降级、降级持续多久（期间排到最后，
+# 但不会被剔除）。0 = 3 次 / 30 秒。
+health:
+  demote_after: 0
+  demote_for_ms: 0
+
+# 进程自己的启动/收尾节奏。
+recovery:
+  # WAL 崩溃回放：每条记录在进程内重试几次、指数退避的基数（毫秒）。
+  # 重试窗口之外仍然失败的记录被跳过并计数，留在 WAL 里等下次重启——启动绝不因此中止。
+  # 0 = 3 次 / 100 毫秒。
+  crash_replay_max_attempts: 0
+  crash_replay_retry_base_ms: 0
+  # 启动后发布 epoch 载荷的重试：间隔与总窗口。"本节点已 serving"不代表"peer 也
+  # serving"，所以那些还没有 quorum 的 KB 要重试；窗口之外仍不齐就是另一个问题了。
+  # 0 = 3 秒 / 60 秒。
+  epoch_report_retry_interval_ms: 0
+  epoch_report_retry_window_ms: 0
+  # 收尾时等待 metrics 端点停止的上限。0 = 2 秒。
+  shutdown_timeout_ms: 0
 
 bloom_filter:
   expected_items: 1000000
@@ -196,6 +342,9 @@ gc:
   # 在向量写与映射写之间崩溃留下的孤儿映射）。所以默认给到 1 小时——每轮它是
   # 每 KB 一次整链读 + 一次全量 chunk 映射扫描。
   sweep_interval_s: 3600
+  # WAL 压缩周期：丢掉每个副本都已持有的变更记录（§7.5）。压缩要重写文件，而丢掉
+  # 的记录只是省空间，没人等它，所以可以慢。0 = 5 分钟。
+  wal_reclaim_interval_s: 0
 
 # 主动落后追赶（docs/active-lag-detection-design.md）。节点每 5 秒向控制 leader 发心跳，
 # 响应里的 chain_generation 变化时拉取每 KB 的「链尾」（已提交的最新版本）；本节点若发现
@@ -210,6 +359,12 @@ lag_catchup:
   jitter_ms: 0
   # 同时最多几个 KB 在追赶。0 = 用默认值（2）。
   max_concurrent_kbs: 0
+  # 一次追赶的上限。大 KB 合法地可能更久；估错了的代价只是"下一次信号再试一次"，而不是
+  # 版本卡住。0 = 5 分钟。
+  timeout_ms: 0
+  # 追赶进行中，多久重新问一次 peer"谁能供这个 KB"（答案的 TTL 是它的三倍）。
+  # 0 = 5 秒。
+  holders_refresh_interval_ms: 0
 
 logging:
   level: "info"

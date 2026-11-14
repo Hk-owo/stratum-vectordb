@@ -38,6 +38,10 @@ type CoordinatorDispatcher struct {
 
 	// candidateTimeout bounds one candidate's turn at the write.
 	candidateTimeout time.Duration
+	// candidateTimeoutPerDoc / maxCandidateTimeout scale and cap that budget by
+	// the batch the candidate was handed (see the const comments below).
+	candidateTimeoutPerDoc time.Duration
+	maxCandidateTimeout    time.Duration
 
 	// health is this node's own view of which peers it recently reached
 	// (§7.13.5). It only reorders candidates — it never removes one — and it is
@@ -58,6 +62,8 @@ type CoordinatorDispatcher struct {
 // without a per-candidate deadline the first unreachable replica absorbs the
 // whole dispatch — and every replica that IS up goes unasked, leaving the
 // version PENDING indefinitely rather than merely delayed.
+//
+// The default for CoordinatorDispatcherConfig.CandidateTimeout.
 const defaultCandidateTimeout = 15 * time.Second
 
 // candidateTimeoutPerDoc adds to a candidate's budget in proportion to the work
@@ -75,11 +81,15 @@ const defaultCandidateTimeout = 15 * time.Second
 // The budget therefore scales with the batch. The number is deliberately loose:
 // overshooting only delays the next candidate, while undershooting throws away a
 // write that was about to land.
+//
+// The default for CoordinatorDispatcherConfig.CandidateTimeoutPerDoc.
 const candidateTimeoutPerDoc = 50 * time.Millisecond
 
 // maxCandidateTimeout caps a scaled budget so a very large batch cannot hold one
 // candidate indefinitely. Batches are bounded by the 4 MiB gRPC message limit
 // (~1400 docs each), so this cap sits far above what a real batch needs.
+//
+// The default for CoordinatorDispatcherConfig.MaxCandidateTimeout.
 const maxCandidateTimeout = 10 * time.Minute
 
 // CoordinatorDispatcherConfig wires a CoordinatorDispatcher.
@@ -95,6 +105,13 @@ type CoordinatorDispatcherConfig struct {
 	// LocalWrite runs the write on this node without an RPC. Required for
 	// SelfAddr to be a usable candidate; without it this node is skipped.
 	LocalWrite func(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error
+
+	// CandidateTimeout, CandidateTimeoutPerDoc and MaxCandidateTimeout bound one
+	// candidate's turn: a floor, an allowance per document in the batch, and a
+	// cap on the sum. Zero on any of them takes the package default.
+	CandidateTimeout       time.Duration
+	CandidateTimeoutPerDoc time.Duration
+	MaxCandidateTimeout    time.Duration
 
 	// Dial overrides the gRPC dialer, so tests can point at an in-process
 	// listener. Optional.
@@ -145,14 +162,16 @@ func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispa
 		health = NewLocalHealthView(HealthViewConfig{})
 	}
 	return &CoordinatorDispatcher{
-		replicas:         cfg.Replicas,
-		selfAddr:         cfg.SelfAddr,
-		localhost:        cfg.LocalWrite,
-		dial:             dial,
-		logger:           logger,
-		candidateTimeout: defaultCandidateTimeout,
-		health:           health,
-		redundancy:       cfg.Redundancy,
+		replicas:               cfg.Replicas,
+		selfAddr:               cfg.SelfAddr,
+		localhost:              cfg.LocalWrite,
+		dial:                   dial,
+		logger:                 logger,
+		candidateTimeout:       durationOr(cfg.CandidateTimeout, defaultCandidateTimeout),
+		candidateTimeoutPerDoc: durationOr(cfg.CandidateTimeoutPerDoc, candidateTimeoutPerDoc),
+		maxCandidateTimeout:    durationOr(cfg.MaxCandidateTimeout, maxCandidateTimeout),
+		health:                 health,
+		redundancy:             cfg.Redundancy,
 	}
 }
 
@@ -164,9 +183,9 @@ func (d *CoordinatorDispatcher) candidateBudget(docs int) time.Duration {
 	if docs < 0 {
 		docs = 0
 	}
-	budget := d.candidateTimeout + time.Duration(docs)*candidateTimeoutPerDoc
-	if budget > maxCandidateTimeout {
-		budget = maxCandidateTimeout
+	budget := d.candidateTimeout + time.Duration(docs)*d.candidateTimeoutPerDoc
+	if budget > d.maxCandidateTimeout {
+		budget = d.maxCandidateTimeout
 	}
 	if budget <= 0 {
 		budget = defaultCandidateTimeout

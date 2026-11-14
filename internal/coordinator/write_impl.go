@@ -113,6 +113,19 @@ type WriteCoordinatorConfig struct {
 	// the outer bound, so it must be LARGER than the per-candidate budget.
 	DispatchTimeout time.Duration
 
+	// DispatchClaimWindow is how long a background dispatch's registration claim
+	// keeps explaining a later miss by the apply hook (zero takes
+	// dispatchClaimWindow).
+	DispatchClaimWindow time.Duration
+
+	// AbandonReportTimeout bounds the Raft round trip that records a give-up
+	// (zero takes abandonReportTimeout).
+	AbandonReportTimeout time.Duration
+
+	// MaxConcurrentDocumentWrites bounds how many documents one version's write
+	// processes at once (zero takes maxConcurrentDocumentWrites).
+	MaxConcurrentDocumentWrites int
+
 	// Locks hands out the per-knowledge-base write lock, held for a whole
 	// CreateVersion transaction (BEGIN through COMMIT). It is shared with the
 	// orphan-chunk garbage collector so the GC's reclaim phase (current-version
@@ -182,6 +195,7 @@ type WriteCoordinatorImpl struct {
 // being too large is only that a genuine "nobody holds these changes" gets
 // reported as noise — while the cost of being too small is a false warning on
 // every write, which is the state this replaced.
+// The default for WriteCoordinatorConfig.DispatchClaimWindow.
 const dispatchClaimWindow = 2 * time.Minute
 
 // dispatchKey identifies one in-flight write's pending dispatch.
@@ -241,7 +255,7 @@ func (c *WriteCoordinatorImpl) claimDispatch(kbID, clientRequestID string) {
 	// Sweep as we go: claims only matter for dispatchClaimWindow, and this keeps
 	// the map bounded without a background goroutine.
 	for k, at := range c.claimedDispatch {
-		if now.Sub(at) > dispatchClaimWindow {
+		if now.Sub(at) > c.cfg.DispatchClaimWindow {
 			delete(c.claimedDispatch, k)
 		}
 	}
@@ -257,7 +271,7 @@ func (c *WriteCoordinatorImpl) DispatchClaimed(kbID, clientRequestID string) boo
 	c.dispatchMu.Lock()
 	defer c.dispatchMu.Unlock()
 	at, ok := c.claimedDispatch[dispatchKey{kbID: kbID, clientRequestID: clientRequestID}]
-	return ok && time.Since(at) <= dispatchClaimWindow
+	return ok && time.Since(at) <= c.cfg.DispatchClaimWindow
 }
 
 // ForgetPendingDispatch drops a registration whose proposal never landed, so it
@@ -275,6 +289,15 @@ func NewWriteCoordinatorImpl(cfg WriteCoordinatorConfig) *WriteCoordinatorImpl {
 	}
 	if cfg.RetryBaseIntervalMS <= 0 {
 		cfg.RetryBaseIntervalMS = 100
+	}
+	if cfg.DispatchClaimWindow <= 0 {
+		cfg.DispatchClaimWindow = dispatchClaimWindow
+	}
+	if cfg.AbandonReportTimeout <= 0 {
+		cfg.AbandonReportTimeout = abandonReportTimeout
+	}
+	if cfg.MaxConcurrentDocumentWrites <= 0 {
+		cfg.MaxConcurrentDocumentWrites = maxConcurrentDocumentWrites
 	}
 	locks := cfg.Locks
 	if locks == nil {
@@ -490,6 +513,7 @@ func (c *WriteCoordinatorImpl) dispatchTimeout() time.Duration {
 //
 // Short, and independent of anything the caller holds: it exists so the give-up path
 // can always record its verdict, not to bound work the caller asked for.
+// The default for WriteCoordinatorConfig.AbandonReportTimeout.
 const abandonReportTimeout = 30 * time.Second
 
 // dispatchFailureClass maps a dispatch failure onto the class §10.1 should see.
@@ -550,7 +574,7 @@ func (c *WriteCoordinatorImpl) AbandonDispatch(ctx context.Context, kbID string,
 	// retry budget already spent (H10 of docs/code-review-2026-10-18.md).
 	// WithoutCancel keeps the context's values (trace ids, deadlines that were not the
 	// problem) and drops the cancellation, so a fresh bound decides instead.
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abandonReportTimeout)
+	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.AbandonReportTimeout)
 	defer cancel()
 	terminal, err := c.cfg.ControlPlane.ReportVersionFailure(reportCtx, kbID, versionID, types.FailureSideData, class, detail)
 	if err != nil {
@@ -893,7 +917,7 @@ func (c *WriteCoordinatorImpl) writeDocumentsConcurrently(ctx context.Context, k
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sem := make(chan struct{}, maxConcurrentDocumentWrites)
+	sem := make(chan struct{}, c.cfg.MaxConcurrentDocumentWrites)
 	var (
 		wg       sync.WaitGroup
 		mu       sync.Mutex

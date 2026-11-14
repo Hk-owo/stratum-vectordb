@@ -132,6 +132,15 @@ type LagCatchupConfig struct {
 	// so there would be no version entry to aggregate from.
 	NodeState *nodestate.Machine
 
+	// Timeout bounds ONE catch-up (<= 0 takes LagCatchupTimeout). A large
+	// knowledge base may legitimately take longer; being wrong costs a retry on
+	// the next signal rather than a stuck version.
+	Timeout time.Duration
+
+	// HoldersRefreshInterval is how often a running catch-up re-asks its peers
+	// who can serve it (<= 0 takes holdersRefreshInterval).
+	HoldersRefreshInterval time.Duration
+
 	// Logger is optional.
 	Logger *zap.Logger
 
@@ -148,11 +157,13 @@ const DefaultMaxConcurrentLagCatchups = 2
 // LagCatchupTimeout bounds one catch-up. Like the other §10.4 numbers it is a
 // placeholder: a large knowledge base may legitimately take longer, and being wrong
 // costs a retry on the next signal rather than a stuck version.
+//
+// The default for LagCatchupConfig.Timeout.
 const LagCatchupTimeout = 5 * time.Minute
 
 // holdersRefreshInterval is how often a running catch-up re-asks its peers who can
 // serve it. A third of DefaultHoldersCacheTTL, so one failed round leaves the answer
-// usable.
+// usable. The default for LagCatchupConfig.HoldersRefreshInterval.
 const holdersRefreshInterval = 5 * time.Second
 
 // NewLagCatchup returns a LagCatchup. It satisfies sync.ChainTailSink.
@@ -168,6 +179,12 @@ func NewLagCatchup(cfg LagCatchupConfig) *LagCatchup {
 	}
 	if cfg.NodeState == nil {
 		cfg.NodeState = nodestate.New(nodestate.Options{Logger: cfg.Logger})
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = LagCatchupTimeout
+	}
+	if cfg.HoldersRefreshInterval <= 0 {
+		cfg.HoldersRefreshInterval = holdersRefreshInterval
 	}
 	return &LagCatchup{cfg: cfg}
 }
@@ -263,7 +280,7 @@ func (l *LagCatchup) catchUp(kbID string, target int64) {
 	if delay := l.jitterFor(kbID); delay > 0 {
 		l.cfg.sleep(delay)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), LagCatchupTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), l.cfg.Timeout)
 	defer cancel()
 	if l.cfg.FindHolders != nil {
 		l.cfg.FindHolders(ctx, kbID)
@@ -281,7 +298,7 @@ func (l *LagCatchup) catchUp(kbID string, target int64) {
 // refreshHolders keeps the holders fresh while a catch-up runs. A catch-up can outlast
 // one answer's TTL, and the lookup re-resolves on every attempt.
 func (l *LagCatchup) refreshHolders(ctx context.Context, kbID string) {
-	ticker := time.NewTicker(holdersRefreshInterval)
+	ticker := time.NewTicker(l.cfg.HoldersRefreshInterval)
 	defer ticker.Stop()
 	for {
 		select {

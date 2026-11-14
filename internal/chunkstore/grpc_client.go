@@ -24,6 +24,24 @@ type VecstoreChunkStore struct {
 	client vecstorepb.ChunkStorageServiceClient
 }
 
+// ClientOptions tunes the gRPC channel this client owns. The zero value takes
+// the defaults below, which is what every caller used before they were
+// configurable (vecstore.keepalive_interval_ms / keepalive_timeout_ms).
+type ClientOptions struct {
+	// KeepaliveInterval / KeepaliveTimeout are the keepalive probe's period and
+	// answer window. Only ACTIVE streams are probed: pinging without one gets
+	// this client GoAway'd by the vecstore's C++ server.
+	KeepaliveInterval time.Duration
+	KeepaliveTimeout  time.Duration
+}
+
+// DefaultKeepaliveInterval / DefaultKeepaliveTimeout are the values a client
+// built without ClientOptions uses.
+const (
+	DefaultKeepaliveInterval = 60 * time.Second
+	DefaultKeepaliveTimeout  = 3 * time.Second
+)
+
 // NewVecstoreChunkStore dials addr (the vecstore.grpc_addr config value)
 // and returns a ready-to-use ChunkStore. Dialing is non-blocking by
 // default (grpc-go lazily connects on first RPC and transparently
@@ -34,14 +52,26 @@ type VecstoreChunkStore struct {
 // (configured via write_coordinator.max_retries), not to this thin client
 // wrapper.
 func NewVecstoreChunkStore(addr string) (*VecstoreChunkStore, error) {
+	return NewVecstoreChunkStoreWithOptions(addr, ClientOptions{})
+}
+
+// NewVecstoreChunkStoreWithOptions is NewVecstoreChunkStore with the channel's
+// keepalive parameters exposed.
+func NewVecstoreChunkStoreWithOptions(addr string, opts ClientOptions) (*VecstoreChunkStore, error) {
+	if opts.KeepaliveInterval <= 0 {
+		opts.KeepaliveInterval = DefaultKeepaliveInterval
+	}
+	if opts.KeepaliveTimeout <= 0 {
+		opts.KeepaliveTimeout = DefaultKeepaliveTimeout
+	}
 	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			// 10s 无流 ping + PermitWithoutStream 会被 vecstore 的 C++
 			// 服务端以 too_many_pings GoAway 踢掉连接；改为仅在活动流
 			// 上以 60s 间隔探测。
-			Time:                60 * time.Second,
-			Timeout:             3 * time.Second,
+			Time:                opts.KeepaliveInterval,
+			Timeout:             opts.KeepaliveTimeout,
 			PermitWithoutStream: false,
 		}),
 	)

@@ -199,7 +199,7 @@ func main() {
 	// gate (H4 of docs/code-review-2026-09-24.md). An empty secret disables both
 	// halves — it stamps nothing and verifies nothing — which is what a cluster
 	// that does not require the mark needs.
-	mark := authmeta.NewSigner([]byte(cfg.StationSecret), 0)
+	mark := authmeta.NewSigner([]byte(cfg.StationSecret), cfg.StationMarkTTL)
 	if cfg.RequireAuthenticated && !mark.Enabled() {
 		logger.Warn("require_authenticated is on but no station_secret is configured: " +
 			"every client-facing call will be refused (set node.station_secret to the station's secret)")
@@ -221,6 +221,10 @@ func main() {
 			HeartbeatInterval:  cfg.HeartbeatInterval,
 			ElectionTimeoutMin: cfg.ElectionTimeoutMin,
 			ElectionTimeoutMax: cfg.ElectionTimeoutMax,
+			// raft.*: the log's own bounds. Zero leaves kvraft's / raft's defaults,
+			// which is what every deployment ran with before these were config keys.
+			RPCTimeout:          cfg.RaftRPCTimeout,
+			ProposeApplyTimeout: cfg.RaftProposeApplyTimeout,
 		})
 		if err != nil {
 			logger.Fatal("failed to start RaftNode", zap.Error(err))
@@ -463,18 +467,25 @@ func main() {
 	writeCoord := coordinator.NewWriteCoordinatorImpl(coordinator.WriteCoordinatorConfig{
 		MaxRetries:          cfg.WriteMaxRetries,
 		RetryBaseIntervalMS: cfg.WriteRetryBaseMS,
-		Locks:               kbLocks,
-		WAL:                 walImpl,
-		RaftNode:            rn,
-		Splitter:            chunkSplitter,
-		EmbedClient:         embedClient,
-		ChunkBloom:          chunkBloom,
-		VersionBloom:        vBloomStore,
-		ChunkStore:          chunkStoreIface,
-		ChunkDocMapper:      chunkDocIface,
-		DocStore:            docStoreIface,
-		VersionDocList:      versionDocIface,
-		IndexManager:        indexMgrIface,
+		// write_coordinator.*: the background dispatch's outer budget, its claim
+		// window, the give-up report's round trip, and the per-document fan-out
+		// bound. Zero takes each one's package default.
+		DispatchTimeout:             cfg.WriteDispatchTimeout,
+		DispatchClaimWindow:         cfg.WriteDispatchClaimWindow,
+		AbandonReportTimeout:        cfg.WriteAbandonReportTimeout,
+		MaxConcurrentDocumentWrites: cfg.WriteMaxConcurrentDocs,
+		Locks:                       kbLocks,
+		WAL:                         walImpl,
+		RaftNode:                    rn,
+		Splitter:                    chunkSplitter,
+		EmbedClient:                 embedClient,
+		ChunkBloom:                  chunkBloom,
+		VersionBloom:                vBloomStore,
+		ChunkStore:                  chunkStoreIface,
+		ChunkDocMapper:              chunkDocIface,
+		DocStore:                    docStoreIface,
+		VersionDocList:              versionDocIface,
+		IndexManager:                indexMgrIface,
 		// The event-driven half of the chunk GC: a deleted version's chunks go when
 		// its document set still names them (see DropVersionStorage).
 		ChunkReclaimer: gcImpl,
@@ -751,6 +762,9 @@ func main() {
 		// LocalDataPlane.SetVersionTombstones for the reconciliation it does NOT
 		// replace).
 		syncFollower.SetVersionTombstones(versionTombstones)
+		// sync.pull_dial_timeout_ms: the handshake bound of a pull, and only the
+		// handshake — a transfer that is merely large is not a failure.
+		syncFollower.SetPullDialTimeout(cfg.PullDialTimeout)
 	}
 
 	// DataPlane owns "does this node need the version's data, and where from"
@@ -794,6 +808,8 @@ func main() {
 	// is behind fills it while catching up (see the LagCatchup wiring below): the lookup
 	// may run on the Raft apply path, so it can only read memory.
 	holdersCache := plane.NewHoldersCache(plane.HoldersCacheConfig{
+		TTL:    cfg.HoldersCacheTTL,
+		Limit:  cfg.HoldersCacheLimit,
 		Logger: logger,
 	})
 
@@ -887,6 +903,8 @@ func main() {
 		// judgement about the trade between "how far may a node fall behind" and "how
 		// much does a sweep cost", so they belong in the config file.
 		DeletionLogPage:       cfg.ReconcileDeletionsLogPage,
+		DeletionPagesPerSweep: cfg.ReconcileDeletionPages,
+		ChainReconcileMinAge:  cfg.ReconcileChainMinAge,
 		ChainReconcileMaxAge:  time.Duration(cfg.ReconcileDeletedVersionsIntervalS) * time.Second,
 		DisableChainReconcile: !cfg.ReconcileDeletedVersionsPeriodic,
 		Verify: func(ctx context.Context, kbID string, versionID int64) bool {
@@ -945,6 +963,25 @@ func main() {
 		// replicas learn where the data is. It is its own DataSyncService
 		// address — the same gRPC endpoint serves every service.
 		SelfDataSyncAddr: localAddr,
+		// data_plane.*: the peer-facing budgets. Zero takes the plane's own
+		// defaults, so an unconfigured node behaves exactly as before.
+		PullIdleTimeout:         cfg.PullIdleTimeout,
+		PullMaxDuration:         cfg.PullMaxDuration,
+		MaxInFlightWrites:       cfg.MaxInFlightWrites,
+		CursorWriteTimeout:      cfg.CursorWriteTimeout,
+		CursorRetryDelay:        cfg.CursorRetryDelay,
+		ConfirmAttemptTimeout:   cfg.ConfirmAttemptTimeout,
+		ConfirmRetryBackoff:     cfg.ConfirmRetryBackoff,
+		ConfirmBudget:           cfg.ConfirmBudget,
+		ReplicaPushTimeout:      cfg.ReplicaPushTimeout,
+		PushTimeoutPerDoc:       cfg.PushTimeoutPerDoc,
+		PeerCursorTimeout:       cfg.PeerCursorTimeout,
+		TakeoverTimeout:         cfg.TakeoverTimeout,
+		TakeoverCheckTimeout:    cfg.TakeoverCheckTimeout,
+		TakeoverMaxAttempts:     cfg.TakeoverMaxAttempts,
+		TakeoverMaxRetryDelay:   cfg.TakeoverMaxRetryDelay,
+		TerminalReclaimInterval: cfg.TerminalReclaimInterval,
+		TerminalReclaimAttempts: cfg.TerminalReclaimAttempts,
 		// docs/storage-node-state-machine-plan.md §7: the machine this plane
 		// maintains — the version layer's entries, the data cursor, and the two
 		// accounts the cursor advances over. nil on a control node, where the
@@ -964,7 +1001,7 @@ func main() {
 	// a node with no store, which is the behaviour before this table existed.
 	if versionTombstones != nil {
 		dataPlane.SetVersionTombstones(versionTombstones)
-		dataPlane.StartDeletedVersionRetry(ctx, 0, 0)
+		dataPlane.StartDeletedVersionRetry(ctx, cfg.DeletedVersionRetryInterval, cfg.TombstoneGrace)
 	}
 
 	// The pull path is the third: it is what knows a version's records have
@@ -1001,6 +1038,18 @@ func main() {
 		Replicas: resolveReplicaAddrs,
 		SelfAddr: localAddr,
 		Logger:   logger,
+		// dispatcher.*: one candidate's budget — a floor, a per-document
+		// allowance and the cap on their sum. Zero takes the plane's defaults.
+		CandidateTimeout:       cfg.CandidateTimeout,
+		CandidateTimeoutPerDoc: cfg.CandidateTimeoutPerDoc,
+		MaxCandidateTimeout:    cfg.MaxCandidateTimeout,
+		// health.*: the §7.13.5 peer-demotion heuristic. Built here so the numbers
+		// come from the config file; without it the dispatcher makes its own view
+		// with the same defaults, which is what it did before the knob existed.
+		Health: plane.NewLocalHealthView(plane.HealthViewConfig{
+			DemoteAfter: cfg.HealthDemoteAfter,
+			DemoteFor:   cfg.HealthDemoteFor,
+		}),
 	}
 	// docs/storage-node-state-machine-plan.md §3.2: this node's own redundancy
 	// verdict — what IT observed while reaching its peers, not the control
@@ -1065,7 +1114,8 @@ func main() {
 	// (Raft's own records live there); what must not happen is treating those as storage
 	// transactions to resume.
 	if storageLocal {
-		runCrashRecovery(ctx, logger, records, writeCoord, deleteCoord, deleteVersionCoord, walImpl)
+		runCrashRecovery(ctx, logger, records, writeCoord, deleteCoord, deleteVersionCoord, walImpl,
+			replayRetry{MaxAttempts: cfg.CrashReplayMaxAttempts, BaseMS: cfg.CrashReplayRetryBaseMS})
 	}
 
 	// Startup maintenance across the contract: the storage layer trims index
@@ -1277,7 +1327,7 @@ func main() {
 		// fresh process has received no marks and could still be carrying stuck ones
 		// from a previous life.
 		raftNode.MarkAllDeletingDirty()
-		go coordinator.NewDeletingVersionSweeper(raftNode, raftNode, deleteVersionCoord, 0, logger).Run(ctx)
+		go coordinator.NewDeletingVersionSweeper(raftNode, raftNode, deleteVersionCoord, cfg.DeletingVersionSweepInterval, logger).Run(ctx)
 
 		// The knowledge-base half of the same repair (M3 of
 		// docs/code-review-2026-10-18.md). DeleteKnowledgeBase proposes the
@@ -1287,7 +1337,7 @@ func main() {
 		// to resume from (it was never written), and no other pass looks for a KB
 		// that is still in the metadata. This sweep re-runs the same idempotent
 		// cleanup, so an interrupted deletion is resumed instead of forgotten.
-		go coordinator.NewDeletingKBSweeper(raftNode, deleteCoord, 0, logger).Run(ctx)
+		go coordinator.NewDeletingKBSweeper(raftNode, deleteCoord, cfg.DeletingKBSweepInterval, logger).Run(ctx)
 	}
 
 	// --- gRPC services ---
@@ -1544,7 +1594,7 @@ func main() {
 			}
 		}
 		if metricsSrv != nil {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 			defer cancel()
 			_ = metricsSrv.Shutdown(shutdownCtx)
 		}
@@ -1570,8 +1620,12 @@ func main() {
 			MinLagVersions:   int64(cfg.LagCatchupMinLagVersions),
 			Jitter:           time.Duration(cfg.LagCatchupJitterMS) * time.Millisecond,
 			MaxConcurrentKBs: cfg.LagCatchupMaxConcurrentKBs,
-			Ensure:           dataPlane.EnsureIndex,
-			Cursor:           dataPlane.DataVersionsSnapshot,
+			// One catch-up's budget and how often it re-asks its peers who can
+			// serve it (lag_catchup.timeout_ms / holders_refresh_interval_ms).
+			Timeout:                cfg.LagCatchupTimeout,
+			HoldersRefreshInterval: cfg.LagCatchupHoldersRefresh,
+			Ensure:                 dataPlane.EnsureIndex,
+			Cursor:                 dataPlane.DataVersionsSnapshot,
 			// docs/data-source-holders-fallback-plan.md: a node that is behind finds out
 			// who can serve it, off the Raft apply path where the lookup cannot ask.
 			FindHolders: func(ctx context.Context, kbID string) {
@@ -1616,6 +1670,8 @@ func main() {
 	// term that has ended. It is soft state, so a failed one is only logged.
 	go stratumsync.NewHeartbeater(stratumsync.HeartbeaterConfig{
 		NodeID: cfg.NodeID,
+		// sync.heartbeat_interval_ms; zero takes the package default (5 s).
+		Interval: cfg.SyncHeartbeatInterval,
 		// Re-resolved every interval rather than cached, and shared with the
 		// source lookup's holders client: both want the same address, and for the
 		// same reason — §7.13.1's re-resolve instead of a cached forwarding path.
@@ -1631,7 +1687,9 @@ func main() {
 	// themselves how far they have reached.
 	go plane.NewWALReclaimer(plane.WALReclaimerConfig{
 		Reclaimer: dataPlane,
-		Logger:    logger,
+		// gc.wal_reclaim_interval_s; zero takes the plane's default (5 min).
+		Interval: cfg.GCWALReclaimInterval,
+		Logger:   logger,
 	}).Run(ctx)
 
 	logger.Info("Stratum gRPC server listening", zap.String("addr", cfg.GRPCAddr))
@@ -1657,7 +1715,8 @@ func main() {
 	// point — none of them serves until that returns, so each one sees only itself
 	// and the claim fails for every knowledge base at once. The helper retries,
 	// since "this node is serving" does not imply "its peers are".
-	go reportEpochWhenPeersAreUp(ctx, logger, dataPlane, controlPlane, epochDurable)
+	go reportEpochWhenPeersAreUp(ctx, logger, dataPlane, controlPlane, epochDurable,
+		cfg.EpochReportRetryInterval, cfg.EpochReportRetryWindow)
 
 	if err := grpcServer.Serve(lis); err != nil {
 		logger.Fatal("gRPC server failed", zap.Error(err))
@@ -1676,6 +1735,14 @@ func main() {
 // outage at boot), then is skipped and surfaced via the replay counter
 // (GetSystemStatus). The record stays in the WAL and is retried on the
 // next restart.
+// replayRetry is the crash-replay budget (recovery.crash_replay_*): how many
+// in-process attempts per record, and the base of the exponential backoff
+// between them.
+type replayRetry struct {
+	MaxAttempts int
+	BaseMS      int
+}
+
 const (
 	// crashReplayMaxAttempts bounds in-process replay retries per record.
 	crashReplayMaxAttempts = 3
@@ -1786,15 +1853,15 @@ func reportIndexStatus(ctx context.Context, cp plane.ControlPlane, kbID string, 
 	}
 }
 
-func replayCoordinatorCall(ctx context.Context, fn func() error) error {
+func replayCoordinatorCall(ctx context.Context, r replayRetry, fn func() error) error {
 	var err error
-	for attempt := 1; attempt <= crashReplayMaxAttempts; attempt++ {
+	for attempt := 1; attempt <= r.MaxAttempts; attempt++ {
 		if err = fn(); err == nil {
 			return nil
 		}
-		if attempt < crashReplayMaxAttempts {
+		if attempt < r.MaxAttempts {
 			select {
-			case <-time.After(time.Duration(crashReplayRetryBaseMillis<<(attempt-1)) * time.Millisecond):
+			case <-time.After(time.Duration(r.BaseMS<<(attempt-1)) * time.Millisecond):
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -1819,13 +1886,14 @@ func runCrashRecovery(
 	dc coordinator.DeleteCoordinator,
 	dvc coordinator.DeleteVersionCoordinator,
 	w wal.WAL,
+	retry replayRetry,
 ) {
 	for _, rec := range records {
 		switch rec.Type {
 		case types.PendingRecordTypeDeleteMark:
 			logger.Info("crash recovery: resuming interrupted knowledge-base deletion",
 				zap.String("kb_id", rec.KBID))
-			if err := replayCoordinatorCall(ctx, func() error { return dc.Execute(ctx, rec.KBID) }); err != nil {
+			if err := replayCoordinatorCall(ctx, retry, func() error { return dc.Execute(ctx, rec.KBID) }); err != nil {
 				logger.Warn("crash recovery: skipping KB-deletion resume after retries exhausted",
 					zap.String("kb_id", rec.KBID), zap.Error(err))
 				w.IncrementReplayCounter(rec)
@@ -1846,7 +1914,7 @@ func runCrashRecovery(
 			//     record was never written (the crash landed between the mark and
 			//     deleteOne's WriteVersionDeleteMark). Those are not this record's debt,
 			//     so a failure there is reported without counting this record as unpaid.
-			if err := replayCoordinatorCall(ctx, func() error {
+			if err := replayCoordinatorCall(ctx, retry, func() error {
 				return dvc.ResumeVersionDelete(ctx, rec.KBID, rec.VersionID)
 			}); err != nil {
 				logger.Warn("crash recovery: skipping version-deletion resume after retries exhausted",
@@ -1854,7 +1922,7 @@ func runCrashRecovery(
 				w.IncrementReplayCounter(rec)
 				continue
 			}
-			if err := replayCoordinatorCall(ctx, func() error { return dvc.Execute(ctx, rec.KBID) }); err != nil {
+			if err := replayCoordinatorCall(ctx, retry, func() error { return dvc.Execute(ctx, rec.KBID) }); err != nil {
 				logger.Warn("crash recovery: the sibling sweep after a version-deletion resume did not finish",
 					zap.String("kb_id", rec.KBID), zap.Error(err))
 			}
@@ -1874,7 +1942,7 @@ func runCrashRecovery(
 			}
 			logger.Info("crash recovery: replaying interrupted version write",
 				zap.String("kb_id", rec.KBID), zap.Int64("version_id", rec.VersionID))
-			err := replayCoordinatorCall(ctx, func() error {
+			err := replayCoordinatorCall(ctx, retry, func() error {
 				return wc.ReplayVersionStorageWrites(ctx, rec.KBID, rec.ParentVersionID, rec.VersionID, rec.Changes)
 			})
 			if err != nil {
@@ -2061,10 +2129,11 @@ func reportEpoch(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPla
 }
 
 const (
-	// epochReportRetryInterval is how long to wait between attempts to publish a
-	// payload that quorum was not ready for yet.
+	// epochReportRetryInterval is the DEFAULT wait between attempts to publish a
+	// payload that quorum was not ready for yet (recovery.epoch_report_retry_interval_ms).
 	epochReportRetryInterval = 3 * time.Second
-	// epochReportRetryWindow bounds the retrying. Peers come up within seconds of
+	// epochReportRetryWindow is the DEFAULT bound on the retrying
+	// (recovery.epoch_report_retry_window_ms). Peers come up within seconds of
 	// each other; a peer that is still not serving after this long is a different
 	// problem, and the log line below is the evidence for it.
 	epochReportRetryWindow = 60 * time.Second
@@ -2078,8 +2147,8 @@ const (
 // peer inside its own reconcile. Giving up quietly would leave the data side
 // unpublished for the whole life of the process, which is exactly the failure this
 // replaces.
-func reportEpochWhenPeersAreUp(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPlane, cp plane.ControlPlane, durable []plane.VersionRef) {
-	deadline := time.Now().Add(epochReportRetryWindow)
+func reportEpochWhenPeersAreUp(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPlane, cp plane.ControlPlane, durable []plane.VersionRef, retryInterval, retryWindow time.Duration) {
+	deadline := time.Now().Add(retryWindow)
 	for {
 		skipped := reportEpoch(ctx, logger, dp, cp, durable)
 		if skipped == 0 {
@@ -2096,7 +2165,7 @@ func reportEpochWhenPeersAreUp(ctx context.Context, logger *zap.Logger, dp *plan
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(epochReportRetryInterval):
+		case <-time.After(retryInterval):
 		}
 	}
 }
@@ -2480,6 +2549,110 @@ type appConfig struct {
 
 	// Orphan-chunk garbage collector sweep interval.
 	GCSweepIntervalSec int
+
+	// --- Tuning knobs, grouped by the component they belong to. ---
+	//
+	// Every duration/limit below reads 0 (or, where noted, a negative value) as
+	// "leave the component's own default in place". That keeps the defaults in
+	// one place — the components that own them — instead of restating them here,
+	// and it is what makes an unconfigured node behave exactly as it did before
+	// these keys existed.
+
+	// StationMarkTTL is how long the station's trust mark stays acceptable
+	// (node.station_mark_ttl_ms); 0 takes authmeta.DefaultMarkTTL.
+	StationMarkTTL time.Duration
+
+	// RaftRPCTimeout / RaftProposeApplyTimeout are the Raft log's own bounds
+	// (raft.rpc_timeout_ms / propose_apply_timeout_ms); 0 takes kvraft's /
+	// raft's defaults.
+	RaftRPCTimeout          time.Duration
+	RaftProposeApplyTimeout time.Duration
+
+	// VecstoreKeepaliveInterval / VecstoreKeepaliveTimeout configure the gRPC
+	// channel to the vecstore process, shared by the chunk store and the index
+	// manager (vecstore.keepalive_*_ms); 0 takes 60 s / 3 s.
+	VecstoreKeepaliveInterval time.Duration
+	VecstoreKeepaliveTimeout  time.Duration
+
+	// EmbedTimeout is the HTTP client timeout for the embed service
+	// (embed.timeout_ms). 0 takes 30 s; negative means no client-level timeout.
+	EmbedTimeout time.Duration
+
+	// Data plane (data_plane.*): the pull/push/confirm/takeover budgets and the
+	// per-KB write cap.
+	PullIdleTimeout         time.Duration
+	PullMaxDuration         time.Duration
+	MaxInFlightWrites       int
+	CursorWriteTimeout      time.Duration
+	CursorRetryDelay        time.Duration
+	ConfirmAttemptTimeout   time.Duration
+	ConfirmRetryBackoff     time.Duration
+	ConfirmBudget           time.Duration
+	ReplicaPushTimeout      time.Duration
+	PushTimeoutPerDoc       time.Duration
+	PeerCursorTimeout       time.Duration
+	TakeoverTimeout         time.Duration
+	TakeoverCheckTimeout    time.Duration
+	TakeoverMaxAttempts     int
+	TakeoverMaxRetryDelay   time.Duration
+	TerminalReclaimInterval time.Duration
+	TerminalReclaimAttempts int
+
+	// sync.*: heartbeat cadence, pull handshake bound, holders cache.
+	SyncHeartbeatInterval time.Duration
+	PullDialTimeout       time.Duration
+	HoldersCacheTTL       time.Duration
+	HoldersCacheLimit     int
+
+	// dispatcher.*: one write candidate's budget.
+	CandidateTimeout       time.Duration
+	CandidateTimeoutPerDoc time.Duration
+	MaxCandidateTimeout    time.Duration
+
+	// health.*: when a peer is demoted and for how long.
+	HealthDemoteAfter int
+	HealthDemoteFor   time.Duration
+
+	// reconcile.*: the pacing of the deleted-version reconciliation and its
+	// local tombstone retry.
+	ReconcileChainMinAge        time.Duration
+	ReconcileDeletionPages      int
+	DeletedVersionRetryInterval time.Duration
+	TombstoneGrace              time.Duration
+
+	// index_manager.*: build-side timing and the brute-force fallback size.
+	IndexBruteForceMaxChunks       int
+	IndexBuildAbandonSweepInterval time.Duration
+	IndexBuildRetryTimeout         time.Duration
+	IndexBuildRetryInterval        time.Duration
+	IndexAccessPersistInterval     time.Duration
+
+	// write_coordinator.*: the background dispatch and document-write bounds.
+	WriteDispatchTimeout      time.Duration
+	WriteDispatchClaimWindow  time.Duration
+	WriteAbandonReportTimeout time.Duration
+	WriteMaxConcurrentDocs    int
+
+	// delete_coordinator.*: the two sweeps that finish interrupted deletions.
+	DeletingVersionSweepInterval time.Duration
+	DeletingKBSweepInterval      time.Duration
+
+	// lag_catchup.*: one catch-up's budget and its holders refresh.
+	LagCatchupTimeout        time.Duration
+	LagCatchupHoldersRefresh time.Duration
+
+	// GCWALReclaimInterval is how often the WAL reclaimer compacts
+	// (gc.wal_reclaim_interval_s); 0 takes plane.DefaultReclaimInterval.
+	GCWALReclaimInterval time.Duration
+
+	// recovery.*: the node's own start-up/shutdown pacing. These are the only
+	// knobs here whose defaults live in this file rather than in a component,
+	// because nothing else uses them.
+	CrashReplayMaxAttempts   int
+	CrashReplayRetryBaseMS   int
+	EpochReportRetryInterval time.Duration
+	EpochReportRetryWindow   time.Duration
+	ShutdownTimeout          time.Duration
 }
 
 // fileConfig mirrors the on-disk YAML schema (configs/config1.yaml and
@@ -2512,6 +2685,10 @@ type fileConfig struct {
 		// signed with (internal/authmeta). Same value as the station's
 		// -station-secret.
 		StationSecret string `yaml:"station_secret"`
+
+		// StationMarkTTLMS is how long a forwarded call's trust mark stays
+		// acceptable; <= 0 takes authmeta.DefaultMarkTTL (30 s).
+		StationMarkTTLMS int `yaml:"station_mark_ttl_ms"`
 	} `yaml:"node"`
 
 	Raft struct {
@@ -2538,6 +2715,12 @@ type fileConfig struct {
 		// behind before it must re-read a whole version range; it also grows each
 		// snapshot.
 		DeletedLogLimit int `yaml:"deleted_log_limit"`
+
+		// RPCTimeoutMS bounds one peer-to-peer Raft RPC; <= 0 takes kvraft's 1 s.
+		RPCTimeoutMS int `yaml:"rpc_timeout_ms"`
+		// ProposeApplyTimeoutMS bounds one proposal's wait for its entry to be
+		// applied; <= 0 takes raft's 60 s.
+		ProposeApplyTimeoutMS int `yaml:"propose_apply_timeout_ms"`
 	} `yaml:"raft"`
 
 	// ControlPlane carries the control layer's own knobs. Today that is the
@@ -2564,10 +2747,18 @@ type fileConfig struct {
 
 	Vecstore struct {
 		GRPCAddr string `yaml:"grpc_addr"`
+		// KeepaliveIntervalMS / KeepaliveTimeoutMS tune the gRPC channel both the
+		// chunk store and the index manager open to the vecstore. <= 0 takes
+		// 60 s / 3 s. Only ACTIVE streams are probed: a stream-less ping gets this
+		// client GoAway'd by the vecstore's C++ server.
+		KeepaliveIntervalMS int `yaml:"keepalive_interval_ms"`
+		KeepaliveTimeoutMS  int `yaml:"keepalive_timeout_ms"`
 	} `yaml:"vecstore"`
 
 	Embed struct {
 		ServiceAddr string `yaml:"service_addr"`
+		// TimeoutMS is the HTTP client timeout; <= 0 takes 30 s.
+		TimeoutMS int `yaml:"timeout_ms"`
 	} `yaml:"embed"`
 
 	// Reconcile is the reconciliation's opt-ins — the start-up sweep and the runtime
@@ -2595,6 +2786,20 @@ type fileConfig struct {
 		DeletedVersionsIncrementalIntervalS int `yaml:"deleted_versions_incremental_interval_s"`
 		// DeletedVersionsLogPage caps one incremental read (<= 0 means 512).
 		DeletedVersionsLogPage int `yaml:"deleted_versions_log_page"`
+		// ChainReconcileMinAgeMS is the floor between two FULL passes triggered by
+		// local activity (<= 0 means 5 minutes), so a busy node does not turn
+		// "something landed here" into a range scan every tick.
+		ChainReconcileMinAgeMS int `yaml:"chain_reconcile_min_age_ms"`
+		// DeletionPagesPerSweep caps one pass's pagination (<= 0 means 8); the
+		// following ticks finish a larger bulk deletion.
+		DeletionPagesPerSweep int `yaml:"deletion_pages_per_sweep"`
+		// DeletedVersionRetryIntervalMS paces the LOCAL retry of deletions this node
+		// was told about (<= 0 means 30 s). Much shorter than the reconciliation's
+		// cadence on purpose: it has no network in it.
+		DeletedVersionRetryIntervalMS int `yaml:"deleted_version_retry_interval_ms"`
+		// TombstoneGraceMS is how long a finished deletion's entry is kept so a late
+		// arrival is still refused (<= 0 means 1 hour).
+		TombstoneGraceMS int `yaml:"tombstone_grace_ms"`
 	} `yaml:"reconcile"`
 
 	IndexManager struct {
@@ -2667,16 +2872,51 @@ type fileConfig struct {
 		// consequence of a version switch. Since distribution became pull-only
 		// this is the only gate on it.
 		FetchConcurrency int `yaml:"fetch_concurrency"`
+		// BruteForceMaxChunks is the version size up to which a query for an
+		// unbuilt version is answered by scanning instead of building (§8.6b).
+		// <= 0 takes the IndexManager's default (50 000).
+		BruteForceMaxChunks int `yaml:"brute_force_max_chunks"`
+		// BuildAbandonSweepIntervalMS is how often the abandoned-artifact sweeper
+		// looks (<= 0 takes 5 minutes).
+		BuildAbandonSweepIntervalMS int `yaml:"build_abandon_sweep_interval_ms"`
+		// BuildRetryTimeoutMS / BuildRetryIntervalMS bound the in-build retry loop
+		// that waits for a racing data sync to land (<= 0 means 5 minutes / 2 s).
+		// Raising the timeout lets a build win against a slow pull instead of
+		// failing and being retried from the control layer.
+		BuildRetryTimeoutMS  int `yaml:"build_retry_timeout_ms"`
+		BuildRetryIntervalMS int `yaml:"build_retry_interval_ms"`
+		// AccessPersistIntervalMS throttles how often a version's access time is
+		// written to its sidecar — the evidence the retention shield reads
+		// (<= 0 means 1 minute).
+		AccessPersistIntervalMS int `yaml:"access_persist_interval_ms"`
 	} `yaml:"index_manager"`
 
 	WriteCoordinator struct {
 		MaxRetries          int `yaml:"max_retries"`
 		RetryBaseIntervalMS int `yaml:"retry_base_interval_ms"`
+		// DispatchTimeoutMS bounds ONE background dispatch, from the commit to the
+		// hand-off (<= 0 means 5 minutes). It must stay ABOVE the dispatcher's
+		// per-candidate budget — it is the outer bound.
+		DispatchTimeoutMS int `yaml:"dispatch_timeout_ms"`
+		// DispatchClaimWindowMS is how long a dispatch's registration claim keeps
+		// explaining a later miss (<= 0 means 2 minutes).
+		DispatchClaimWindowMS int `yaml:"dispatch_claim_window_ms"`
+		// AbandonReportTimeoutMS bounds the Raft round trip that records a give-up
+		// (<= 0 means 30 s).
+		AbandonReportTimeoutMS int `yaml:"abandon_report_timeout_ms"`
+		// MaxConcurrentDocumentWrites bounds how many documents one version's write
+		// processes at once (<= 0 means 8).
+		MaxConcurrentDocumentWrites int `yaml:"max_concurrent_document_writes"`
 	} `yaml:"write_coordinator"`
 
 	DeleteCoordinator struct {
 		MaxRetries          int `yaml:"max_retries"`
 		RetryBaseIntervalMS int `yaml:"retry_base_interval_ms"`
+		// DeletingVersionSweepIntervalMS / DeletingKBSweepIntervalMS pace the passes
+		// that finish a deletion whose cleanup never completed (<= 0 means 1 minute
+		// each).
+		DeletingVersionSweepIntervalMS int `yaml:"deleting_version_sweep_interval_ms"`
+		DeletingKBSweepIntervalMS      int `yaml:"deleting_kb_sweep_interval_ms"`
 	} `yaml:"delete_coordinator"`
 
 	BloomFilter struct {
@@ -2687,6 +2927,8 @@ type fileConfig struct {
 	GC struct {
 		VersionRetentionCount int `yaml:"version_retention_count"`
 		SweepIntervalSec      int `yaml:"sweep_interval_s"`
+		// WALReclaimIntervalSec paces WAL compaction (<= 0 means 5 minutes).
+		WALReclaimIntervalSec int `yaml:"wal_reclaim_interval_s"`
 	} `yaml:"gc"`
 
 	// LagCatchup is the background catch-up described in
@@ -2696,7 +2938,68 @@ type fileConfig struct {
 		MinLagVersions   int `yaml:"min_lag_versions"`
 		JitterMS         int `yaml:"jitter_ms"`
 		MaxConcurrentKBs int `yaml:"max_concurrent_kbs"`
+		// TimeoutMS bounds one catch-up; HoldersRefreshIntervalMS paces how often a
+		// running catch-up re-asks its peers who can serve it.
+		TimeoutMS                int `yaml:"timeout_ms"`
+		HoldersRefreshIntervalMS int `yaml:"holders_refresh_interval_ms"`
 	} `yaml:"lag_catchup"`
+
+	// DataPlane carries the storage plane's peer-facing budgets: pulls, pushes,
+	// confirmations, takeovers and the per-KB write cap. Every field reads 0 as
+	// "the component's default", so a config file that predates this section
+	// behaves exactly as before.
+	DataPlane struct {
+		PullIdleTimeoutMS         int `yaml:"pull_idle_timeout_ms"`
+		PullMaxDurationMS         int `yaml:"pull_max_duration_ms"`
+		MaxInFlightWrites         int `yaml:"max_in_flight_writes"`
+		CursorWriteTimeoutMS      int `yaml:"cursor_write_timeout_ms"`
+		CursorRetryDelayMS        int `yaml:"cursor_retry_delay_ms"`
+		ConfirmAttemptTimeoutMS   int `yaml:"confirm_attempt_timeout_ms"`
+		ConfirmRetryBackoffMS     int `yaml:"confirm_retry_backoff_ms"`
+		ConfirmBudgetMS           int `yaml:"confirm_budget_ms"`
+		ReplicaPushTimeoutMS      int `yaml:"replica_push_timeout_ms"`
+		PushTimeoutPerDocMS       int `yaml:"push_timeout_per_doc_ms"`
+		PeerCursorTimeoutMS       int `yaml:"peer_cursor_timeout_ms"`
+		TakeoverTimeoutMS         int `yaml:"takeover_timeout_ms"`
+		TakeoverCheckTimeoutMS    int `yaml:"takeover_check_timeout_ms"`
+		TakeoverMaxAttempts       int `yaml:"takeover_max_attempts"`
+		TakeoverMaxRetryDelayMS   int `yaml:"takeover_max_retry_delay_ms"`
+		TerminalReclaimIntervalMS int `yaml:"terminal_reclaim_interval_ms"`
+		TerminalReclaimAttempts   int `yaml:"terminal_reclaim_attempts"`
+	} `yaml:"data_plane"`
+
+	// Sync is the node-to-peer control traffic: the liveness heartbeat, the pull
+	// handshake, and the holders cache a catch-up fills.
+	Sync struct {
+		HeartbeatIntervalMS int `yaml:"heartbeat_interval_ms"`
+		PullDialTimeoutMS   int `yaml:"pull_dial_timeout_ms"`
+		HoldersCacheTTLMS   int `yaml:"holders_cache_ttl_ms"`
+		HoldersCacheLimit   int `yaml:"holders_cache_limit"`
+	} `yaml:"sync"`
+
+	// Dispatcher is one write candidate's budget (§7.13.2): a floor, a per-document
+	// allowance, and the cap on their sum.
+	Dispatcher struct {
+		CandidateTimeoutMS       int `yaml:"candidate_timeout_ms"`
+		CandidateTimeoutPerDocMS int `yaml:"candidate_timeout_per_doc_ms"`
+		MaxCandidateTimeoutMS    int `yaml:"max_candidate_timeout_ms"`
+	} `yaml:"dispatcher"`
+
+	// Health is the §7.13.5 peer-demotion heuristic.
+	Health struct {
+		DemoteAfter int `yaml:"demote_after"`
+		DemoteForMS int `yaml:"demote_for_ms"`
+	} `yaml:"health"`
+
+	// Recovery is the node's own start-up/shutdown pacing: WAL crash replay, the
+	// epoch payload's retry, and how long a graceful stop waits.
+	Recovery struct {
+		CrashReplayMaxAttempts     int `yaml:"crash_replay_max_attempts"`
+		CrashReplayRetryBaseMS     int `yaml:"crash_replay_retry_base_ms"`
+		EpochReportRetryIntervalMS int `yaml:"epoch_report_retry_interval_ms"`
+		EpochReportRetryWindowMS   int `yaml:"epoch_report_retry_window_ms"`
+		ShutdownTimeoutMS          int `yaml:"shutdown_timeout_ms"`
+	} `yaml:"recovery"`
 }
 
 // loadConfig reads a YAML config file and overlays it on the defaults.
@@ -2918,8 +3221,102 @@ func loadConfig(path string) (appConfig, error) {
 	if fc.LagCatchup.MaxConcurrentKBs != 0 {
 		cfg.LagCatchupMaxConcurrentKBs = fc.LagCatchup.MaxConcurrentKBs
 	}
+	applyMS(&cfg.LagCatchupTimeout, fc.LagCatchup.TimeoutMS)
+	applyMS(&cfg.LagCatchupHoldersRefresh, fc.LagCatchup.HoldersRefreshIntervalMS)
+
+	// --- Tuning knobs (see appConfig's comment on the group). ---
+	//
+	// One helper per unit, each applying only a NON-ZERO value: an absent key must
+	// keep the component's own default, and 0 in these units is not a sensible
+	// bound. Negative values pass through, so the knobs whose "off" is negative
+	// (e.g. index_manager.build_abandon_timeout_ms) keep working.
+	applyMS(&cfg.StationMarkTTL, fc.Node.StationMarkTTLMS)
+	applyMS(&cfg.RaftRPCTimeout, fc.Raft.RPCTimeoutMS)
+	applyMS(&cfg.RaftProposeApplyTimeout, fc.Raft.ProposeApplyTimeoutMS)
+	applyMS(&cfg.VecstoreKeepaliveInterval, fc.Vecstore.KeepaliveIntervalMS)
+	applyMS(&cfg.VecstoreKeepaliveTimeout, fc.Vecstore.KeepaliveTimeoutMS)
+	applyMS(&cfg.EmbedTimeout, fc.Embed.TimeoutMS)
+
+	applyMS(&cfg.PullIdleTimeout, fc.DataPlane.PullIdleTimeoutMS)
+	applyMS(&cfg.PullMaxDuration, fc.DataPlane.PullMaxDurationMS)
+	applyInt(&cfg.MaxInFlightWrites, fc.DataPlane.MaxInFlightWrites)
+	applyMS(&cfg.CursorWriteTimeout, fc.DataPlane.CursorWriteTimeoutMS)
+	applyMS(&cfg.CursorRetryDelay, fc.DataPlane.CursorRetryDelayMS)
+	applyMS(&cfg.ConfirmAttemptTimeout, fc.DataPlane.ConfirmAttemptTimeoutMS)
+	applyMS(&cfg.ConfirmRetryBackoff, fc.DataPlane.ConfirmRetryBackoffMS)
+	applyMS(&cfg.ConfirmBudget, fc.DataPlane.ConfirmBudgetMS)
+	applyMS(&cfg.ReplicaPushTimeout, fc.DataPlane.ReplicaPushTimeoutMS)
+	applyMS(&cfg.PushTimeoutPerDoc, fc.DataPlane.PushTimeoutPerDocMS)
+	applyMS(&cfg.PeerCursorTimeout, fc.DataPlane.PeerCursorTimeoutMS)
+	applyMS(&cfg.TakeoverTimeout, fc.DataPlane.TakeoverTimeoutMS)
+	applyMS(&cfg.TakeoverCheckTimeout, fc.DataPlane.TakeoverCheckTimeoutMS)
+	applyInt(&cfg.TakeoverMaxAttempts, fc.DataPlane.TakeoverMaxAttempts)
+	applyMS(&cfg.TakeoverMaxRetryDelay, fc.DataPlane.TakeoverMaxRetryDelayMS)
+	applyMS(&cfg.TerminalReclaimInterval, fc.DataPlane.TerminalReclaimIntervalMS)
+	applyInt(&cfg.TerminalReclaimAttempts, fc.DataPlane.TerminalReclaimAttempts)
+
+	applyMS(&cfg.SyncHeartbeatInterval, fc.Sync.HeartbeatIntervalMS)
+	applyMS(&cfg.PullDialTimeout, fc.Sync.PullDialTimeoutMS)
+	applyMS(&cfg.HoldersCacheTTL, fc.Sync.HoldersCacheTTLMS)
+	applyInt(&cfg.HoldersCacheLimit, fc.Sync.HoldersCacheLimit)
+
+	applyMS(&cfg.CandidateTimeout, fc.Dispatcher.CandidateTimeoutMS)
+	applyMS(&cfg.CandidateTimeoutPerDoc, fc.Dispatcher.CandidateTimeoutPerDocMS)
+	applyMS(&cfg.MaxCandidateTimeout, fc.Dispatcher.MaxCandidateTimeoutMS)
+
+	applyInt(&cfg.HealthDemoteAfter, fc.Health.DemoteAfter)
+	applyMS(&cfg.HealthDemoteFor, fc.Health.DemoteForMS)
+
+	applyMS(&cfg.ReconcileChainMinAge, fc.Reconcile.ChainReconcileMinAgeMS)
+	applyInt(&cfg.ReconcileDeletionPages, fc.Reconcile.DeletionPagesPerSweep)
+	applyMS(&cfg.DeletedVersionRetryInterval, fc.Reconcile.DeletedVersionRetryIntervalMS)
+	applyMS(&cfg.TombstoneGrace, fc.Reconcile.TombstoneGraceMS)
+
+	applyInt(&cfg.IndexBruteForceMaxChunks, fc.IndexManager.BruteForceMaxChunks)
+	applyMS(&cfg.IndexBuildAbandonSweepInterval, fc.IndexManager.BuildAbandonSweepIntervalMS)
+	applyMS(&cfg.IndexBuildRetryTimeout, fc.IndexManager.BuildRetryTimeoutMS)
+	applyMS(&cfg.IndexBuildRetryInterval, fc.IndexManager.BuildRetryIntervalMS)
+	applyMS(&cfg.IndexAccessPersistInterval, fc.IndexManager.AccessPersistIntervalMS)
+
+	applyMS(&cfg.WriteDispatchTimeout, fc.WriteCoordinator.DispatchTimeoutMS)
+	applyMS(&cfg.WriteDispatchClaimWindow, fc.WriteCoordinator.DispatchClaimWindowMS)
+	applyMS(&cfg.WriteAbandonReportTimeout, fc.WriteCoordinator.AbandonReportTimeoutMS)
+	applyInt(&cfg.WriteMaxConcurrentDocs, fc.WriteCoordinator.MaxConcurrentDocumentWrites)
+
+	applyMS(&cfg.DeletingVersionSweepInterval, fc.DeleteCoordinator.DeletingVersionSweepIntervalMS)
+	applyMS(&cfg.DeletingKBSweepInterval, fc.DeleteCoordinator.DeletingKBSweepIntervalMS)
+
+	applySec(&cfg.GCWALReclaimInterval, fc.GC.WALReclaimIntervalSec)
+
+	applyInt(&cfg.CrashReplayMaxAttempts, fc.Recovery.CrashReplayMaxAttempts)
+	applyInt(&cfg.CrashReplayRetryBaseMS, fc.Recovery.CrashReplayRetryBaseMS)
+	applyMS(&cfg.EpochReportRetryInterval, fc.Recovery.EpochReportRetryIntervalMS)
+	applyMS(&cfg.EpochReportRetryWindow, fc.Recovery.EpochReportRetryWindowMS)
+	applyMS(&cfg.ShutdownTimeout, fc.Recovery.ShutdownTimeoutMS)
 
 	return cfg, nil
+}
+
+// applyMS / applySec / applyInt overlay a config-file value onto a default,
+// skipping only the "unset" zero. They exist so the tuning-knob block above stays
+// one line per knob — and so no knob can quietly grow its own idea of what an
+// unset key means.
+func applyMS(dst *time.Duration, ms int) {
+	if ms != 0 {
+		*dst = time.Duration(ms) * time.Millisecond
+	}
+}
+
+func applySec(dst *time.Duration, sec int) {
+	if sec != 0 {
+		*dst = time.Duration(sec) * time.Second
+	}
+}
+
+func applyInt(dst *int, v int) {
+	if v != 0 {
+		*dst = v
+	}
 }
 
 // defaultConfig returns hardcoded defaults matching configs/config1.yaml.
@@ -3008,6 +3405,17 @@ func defaultConfig() appConfig {
 		BloomFalsePositiveRate: 0.01,
 
 		GCSweepIntervalSec: 3600,
+
+		// The tuning knobs added with the config cleanup keep 0 here unless the
+		// value is used by THIS file rather than by a component that owns its own
+		// default. Those few follow; everything else stays 0 = "the component's
+		// default", so the numbers live in exactly one place.
+		EmbedTimeout:             30 * time.Second,
+		CrashReplayMaxAttempts:   crashReplayMaxAttempts,
+		CrashReplayRetryBaseMS:   crashReplayRetryBaseMillis,
+		EpochReportRetryInterval: epochReportRetryInterval,
+		EpochReportRetryWindow:   epochReportRetryWindow,
+		ShutdownTimeout:          2 * time.Second,
 	}
 }
 

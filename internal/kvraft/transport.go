@@ -20,6 +20,7 @@ import (
 // context (heartbeats and replication are Raft's own internal clock, not
 // something a Stratum-level caller is blocked on) — see the package doc
 // comment on why these do not thread an external context through.
+// The default for NewTransportWithRPCTimeout (raft.rpc_timeout_ms).
 const defaultRPCTimeout = 1 * time.Second
 
 // peerConn is a single peer's Raft gRPC client connection.
@@ -54,12 +55,22 @@ type Transport struct {
 // no-op logger is used (convenient for tests that don't care about Raft's
 // internal logging).
 func NewTransport(logger *zap.Logger) *Transport {
+	return NewTransportWithRPCTimeout(logger, 0)
+}
+
+// NewTransportWithRPCTimeout is NewTransport with the per-RPC bound exposed
+// (raft.rpc_timeout_ms). A non-positive value takes defaultRPCTimeout, so an
+// unconfigured node waits exactly as long as it always did.
+func NewTransportWithRPCTimeout(logger *zap.Logger, rpcTimeout time.Duration) *Transport {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	if rpcTimeout <= 0 {
+		rpcTimeout = defaultRPCTimeout
+	}
 	return &Transport{
 		logger:     logger,
-		rpcTimeout: defaultRPCTimeout,
+		rpcTimeout: rpcTimeout,
 		peers:      make(map[int64]*peerConn),
 	}
 }

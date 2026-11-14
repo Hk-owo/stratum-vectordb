@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"go.uber.org/zap"
 
@@ -85,7 +84,11 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		return nil, fmt.Errorf("open Tombstones: %w", err)
 	}
 
-	chunkStore, err := chunkstore.NewVecstoreChunkStore(cfg.VecstoreGRPCAddr)
+	chunkStore, err := chunkstore.NewVecstoreChunkStoreWithOptions(cfg.VecstoreGRPCAddr,
+		chunkstore.ClientOptions{
+			KeepaliveInterval: cfg.VecstoreKeepaliveInterval,
+			KeepaliveTimeout:  cfg.VecstoreKeepaliveTimeout,
+		})
 	if err != nil {
 		return nil, fmt.Errorf("connect to vecstore at %s: %w", cfg.VecstoreGRPCAddr, err)
 	}
@@ -96,7 +99,7 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		VersionDocList: vd,
 		ChunkStore:     chunkStore,
 		Tombstones:     tombstones,
-		EmbedClient:    embed.NewHTTPEmbedClient(cfg.EmbedServiceAddr, 30*time.Second),
+		EmbedClient:    embed.NewHTTPEmbedClient(cfg.EmbedServiceAddr, cfg.EmbedTimeout),
 	}
 
 	// Bloom filters: the chunk-existence filter on the write path and the
@@ -172,6 +175,15 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		GCGraphRebuildRatio:    cfg.IndexGCGraphRebuildRatio,
 		GCSweepInterval:        cfg.IndexGCSweepInterval,
 		BuildConcurrency:       cfg.IndexBuildConcurrency,
+		// index_manager.*: the build-side timing knobs, all of which read 0 as
+		// "the IndexManager's own default".
+		BruteForceMaxChunks:       cfg.IndexBruteForceMaxChunks,
+		BuildAbandonSweepInterval: cfg.IndexBuildAbandonSweepInterval,
+		BuildRetryTimeout:         cfg.IndexBuildRetryTimeout,
+		BuildRetryInterval:        cfg.IndexBuildRetryInterval,
+		AccessPersistInterval:     cfg.IndexAccessPersistInterval,
+		KeepaliveInterval:         cfg.VecstoreKeepaliveInterval,
+		KeepaliveTimeout:          cfg.VecstoreKeepaliveTimeout,
 		// docs/storage-node-state-machine-plan.md §7 item 4: the manager owns the
 		// version layer's build transitions, including the install path and the
 		// build that never starts.

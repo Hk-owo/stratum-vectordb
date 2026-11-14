@@ -139,6 +139,27 @@ type IndexManagerConfig struct {
 	// <= 0 means DefaultBuildAbandonTimeout; negative disables the sweeper.
 	BuildAbandonTimeout time.Duration
 
+	// BuildAbandonSweepInterval is how often that sweeper looks (<= 0 means
+	// DefaultBuildAbandonSweepInterval).
+	BuildAbandonSweepInterval time.Duration
+
+	// BuildRetryTimeout and BuildRetryInterval bound the in-build retry loop that
+	// waits for a racing data sync to land (<= 0 means buildRetryTimeout /
+	// buildRetryInterval). Raising the timeout is what lets a build win against a
+	// slow pull instead of failing and being retried from the control layer.
+	BuildRetryTimeout  time.Duration
+	BuildRetryInterval time.Duration
+
+	// AccessPersistInterval throttles how often a version's access time is
+	// written to its sidecar (<= 0 means accessPersistInterval).
+	AccessPersistInterval time.Duration
+
+	// KeepaliveInterval / KeepaliveTimeout are the gRPC keepalive parameters for
+	// the vecstore connection (<= 0 means 60s / 3s). They are deliberately only
+	// for ACTIVE streams: pinging without one gets this client GoAway'd.
+	KeepaliveInterval time.Duration
+	KeepaliveTimeout  time.Duration
+
 	// AppendMaxDeadRatio bounds how much dead weight a §8.6(c) pure-append
 	// reuse may carry: the share of the base artifact's vectors that this
 	// version no longer needs (documents deleted here, or by an ancestor and
@@ -515,11 +536,40 @@ type loadedIndex struct {
 
 var _ IndexManager = (*IndexManagerImpl)(nil)
 
+// defaultKeepaliveInterval / defaultKeepaliveTimeout are the vecstore channel's
+// keepalive defaults when the config leaves them unset (vecstore.keepalive_*).
+// The same numbers chunkstore uses; kept here rather than imported so this
+// package does not take a dependency for two literals.
+const (
+	defaultKeepaliveInterval = 60 * time.Second
+	defaultKeepaliveTimeout  = 3 * time.Second
+)
+
 // NewIndexManager constructs an IndexManagerImpl. The caller must either
 // set cfg.VecstoreAddr (and the constructor will dial it), or inject
 // vectorIndexClient and the build data-source callbacks directly before
 // use (used by tests).
 func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
+	// Fill the timing defaults once, so every reader below can use the config
+	// value directly (the same shape the other components use).
+	if cfg.BuildAbandonSweepInterval <= 0 {
+		cfg.BuildAbandonSweepInterval = DefaultBuildAbandonSweepInterval
+	}
+	if cfg.BuildRetryTimeout <= 0 {
+		cfg.BuildRetryTimeout = buildRetryTimeout
+	}
+	if cfg.BuildRetryInterval <= 0 {
+		cfg.BuildRetryInterval = buildRetryInterval
+	}
+	if cfg.AccessPersistInterval <= 0 {
+		cfg.AccessPersistInterval = accessPersistInterval
+	}
+	if cfg.KeepaliveInterval <= 0 {
+		cfg.KeepaliveInterval = defaultKeepaliveInterval
+	}
+	if cfg.KeepaliveTimeout <= 0 {
+		cfg.KeepaliveTimeout = defaultKeepaliveTimeout
+	}
 	im := &IndexManagerImpl{
 		cfg:             cfg,
 		loaded:          make(map[indexKey]*loadedIndex),
@@ -548,8 +598,8 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 				// 导致 build RPC 挂起、版本永久 PENDING）。改为仅在
 				// 活动流上以 60s 间隔探测：既保留死连接检测，又不再
 				// 触发服务端 keepalive 强制策略。
-				Time:                60 * time.Second,
-				Timeout:             3 * time.Second,
+				Time:                cfg.KeepaliveInterval,
+				Timeout:             cfg.KeepaliveTimeout,
 				PermitWithoutStream: false,
 			}),
 		)
@@ -1177,7 +1227,7 @@ func (im *IndexManagerImpl) StartAbandonSweeper() {
 	im.abandonWG.Add(1)
 	go func() {
 		defer im.abandonWG.Done()
-		ticker := time.NewTicker(DefaultBuildAbandonSweepInterval)
+		ticker := time.NewTicker(im.cfg.BuildAbandonSweepInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -1642,6 +1692,7 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 // retrying is safe. The whole retry loop is bounded by buildRetryTimeout
 // so a permanently-failing build still surfaces as FAILED instead of
 // wedging the version forever.
+// The defaults for IndexManagerConfig.BuildRetryTimeout / BuildRetryInterval.
 const buildRetryTimeout = 5 * time.Minute
 const buildRetryInterval = 2 * time.Second
 
@@ -1685,7 +1736,7 @@ func chunkVectorReadErr(chunkID string, err error) error {
 }
 
 func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64, graphFree bool) (int64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), buildRetryTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), im.cfg.BuildRetryTimeout)
 	defer cancel()
 
 	var lastErr error
@@ -1703,7 +1754,7 @@ func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64, graphFr
 		select {
 		case <-ctx.Done():
 			return 0, lastErr
-		case <-time.After(buildRetryInterval):
+		case <-time.After(im.cfg.BuildRetryInterval):
 		}
 	}
 }
@@ -2619,7 +2670,7 @@ func (im *IndexManagerImpl) recordAccess(key indexKey) {
 	// costs nothing.
 	persist := false
 	if im.retentionProtectWindow() > 0 && im.cfg.IndexDataDir != "" {
-		if last, ok := im.lastPersist[key]; !ok || now.Sub(last) >= accessPersistInterval {
+		if last, ok := im.lastPersist[key]; !ok || now.Sub(last) >= im.cfg.AccessPersistInterval {
 			im.lastPersist[key] = now
 			persist = true
 		}
