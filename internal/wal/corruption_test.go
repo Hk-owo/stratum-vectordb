@@ -263,8 +263,8 @@ func appendRecordOfType(t *testing.T, path string, kind byte, payload []byte) {
 	header := make([]byte, recordHeaderLen)
 	header[0] = kind
 	binary.BigEndian.PutUint32(header[1:5], uint32(len(payload)))
-	crc := crc32.ChecksumIEEE(header)
-	crc = crc32.Update(crc, crc32.IEEETable, payload)
+	crc := crc32.Update(0, walCRC, header)
+	crc = crc32.Update(crc, walCRC, payload)
 	crcBytes := make([]byte, recordCRCLen)
 	binary.BigEndian.PutUint32(crcBytes, crc)
 

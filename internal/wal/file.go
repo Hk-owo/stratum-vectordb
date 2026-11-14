@@ -34,10 +34,10 @@ const (
 )
 
 // On-disk record framing: [1 byte type][4 byte big-endian payload
-// length][payload][4 byte big-endian CRC32 of (type byte + length bytes +
+// length][payload][4 byte big-endian CRC32C of (type byte + length bytes +
 // payload)].
 //
-// The CRC32 lets Recover distinguish a genuinely complete record from one
+// The CRC32C lets Recover distinguish a genuinely complete record from one
 // that was cut short by a crash mid-write (the trailing bytes either fail
 // the length check via io.ErrUnexpectedEOF, or — in the rare case where
 // exactly enough garbage bytes happen to be present — fail the checksum).
@@ -63,6 +63,17 @@ const (
 	recordHeaderLen = 1 + 4 // type + length
 	recordCRCLen    = 4
 )
+
+// walCRC is the checksum the record framing uses: CRC-32C (Castagnoli,
+// reflected polynomial 0x82F63B78), not the IEEE 802.3 variant. Go's
+// hash/crc32 serves the Castagnoli table through the CPU's CRC32
+// instructions (SSE4.2 on amd64, the CRC32* family on arm64), so the
+// checksum costs a fraction of the table-driven IEEE path — and every
+// record written and every record recovered pays it.
+//
+// The table is built once: MakeTable allocates a 256-entry table, and
+// both the write and the read path would otherwise rebuild it per call.
+var walCRC = crc32.MakeTable(crc32.Castagnoli)
 
 // maxSanePayload bounds the payload length readRecord will accept before
 // treating a record as corrupt garbage. The largest legitimate payload is
@@ -568,8 +579,8 @@ func readRecord(r *bufio.Reader) (parsedRecord, int64, error) {
 	}
 	wantCRC := binary.BigEndian.Uint32(crcBytes)
 
-	gotCRC := crc32.ChecksumIEEE(header)
-	gotCRC = crc32.Update(gotCRC, crc32.IEEETable, payload)
+	gotCRC := crc32.Update(0, walCRC, header)
+	gotCRC = crc32.Update(gotCRC, walCRC, payload)
 	if gotCRC != wantCRC {
 		return parsedRecord{}, 0, fmt.Errorf("%w: checksum mismatch", ErrLogCorrupt)
 	}
@@ -700,8 +711,8 @@ func findRecordIn(data []byte) (int, bool) {
 			continue
 		}
 		wantCRC := binary.BigEndian.Uint32(data[end-recordCRCLen : end])
-		gotCRC := crc32.ChecksumIEEE(data[off:body])
-		gotCRC = crc32.Update(gotCRC, crc32.IEEETable, data[body:body+payloadLen])
+		gotCRC := crc32.Update(0, walCRC, data[off:body])
+		gotCRC = crc32.Update(gotCRC, walCRC, data[body:body+payloadLen])
 		if gotCRC != wantCRC {
 			continue
 		}
@@ -765,8 +776,8 @@ func (w *FileWAL) writeRecordLocked(kind recordType, payload []byte) (uint64, in
 	header[0] = byte(kind)
 	binary.BigEndian.PutUint32(header[1:5], uint32(len(payload)))
 
-	crc := crc32.ChecksumIEEE(header)
-	crc = crc32.Update(crc, crc32.IEEETable, payload)
+	crc := crc32.Update(0, walCRC, header)
+	crc = crc32.Update(crc, walCRC, payload)
 	crcBytes := make([]byte, recordCRCLen)
 	binary.BigEndian.PutUint32(crcBytes, crc)
 

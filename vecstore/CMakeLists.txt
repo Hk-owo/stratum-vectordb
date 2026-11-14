@@ -175,6 +175,7 @@ target_include_directories(vecstore_core
 
 target_link_libraries(vecstore_core
   PUBLIC
+    absl::crc32c
     absl::status
     absl::statusor
     gRPC::grpc++

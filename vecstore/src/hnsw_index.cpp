@@ -1,7 +1,6 @@
 #include "vecstore/src/hnsw_index.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,8 +18,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "absl/crc/crc32c.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "faiss/Index.h"
 #include "faiss/IndexFlatCodes.h"
 #include "faiss/IndexHNSW.h"
@@ -112,54 +113,36 @@ constexpr char kShapePrefix[] = "graph_free ";
 //      because anything unmatched in this loop is taken for a chunk id.
 constexpr char kTrainedPrefix[] = "trained ";
 
-// Crc32Table returns the standard CRC-32 (IEEE 802.3, reflected, polynomial
-// 0xEDB88320) lookup table, built once on first use.
-const std::array<uint32_t, 256>& Crc32Table() {
-  static const std::array<uint32_t, 256> table = [] {
-    std::array<uint32_t, 256> t{};
-    for (uint32_t i = 0; i < 256; ++i) {
-      uint32_t c = i;
-      for (int bit = 0; bit < 8; ++bit) {
-        c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-      }
-      t[i] = c;
-    }
-    return t;
-  }();
-  return table;
-}
-
-// Crc32 folds len bytes into a running CRC-32 (seed with 0 for a fresh run).
-uint32_t Crc32(const unsigned char* data, size_t len, uint32_t crc = 0) {
-  const auto& table = Crc32Table();
-  uint32_t c = ~crc;
-  for (size_t i = 0; i < len; ++i) {
-    c = table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
-  }
-  return ~c;
-}
-
-// Crc32OfFile streams a file through Crc32 in fixed-size chunks, so indexes
-// far larger than memory can still be checksummed.
+// Crc32OfFile streams the file through CRC-32C (Castagnoli, reflected
+// polynomial 0x82F63B78) in fixed-size chunks, so indexes far larger than
+// memory can still be checksummed. The value travels in the sidecar and is
+// re-checked on Load, which is what turns a torn file, a half-applied update
+// (new index + stale sidecar) or a corrupted copy between nodes into a loud
+// error instead of silently wrong search results.
+//
+// CRC-32C rather than the IEEE 802.3 variant deliberately: absl serves this
+// polynomial through the CPU's CRC32 instructions (SSE4.2 on x86-64, the
+// CRC32* family on arm64), and this walk covers whole index files — up to
+// hundreds of MB — on every Save and Load.
 absl::StatusOr<uint32_t> Crc32OfFile(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     return absl::NotFoundError("hnsw_index: cannot open " + path + " for checksum");
   }
   std::vector<char> buf(1 << 20);
-  uint32_t crc = 0;
+  absl::crc32c_t crc{0};
   while (in) {
     in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
     const std::streamsize n = in.gcount();
     if (n > 0) {
-      crc = Crc32(reinterpret_cast<const unsigned char*>(buf.data()),
-                  static_cast<size_t>(n), crc);
+      crc = absl::ExtendCrc32c(
+          crc, absl::string_view(buf.data(), static_cast<size_t>(n)));
     }
   }
   if (in.bad()) {
     return absl::InternalError("hnsw_index: read error while checksumming " + path);
   }
-  return crc;
+  return static_cast<uint32_t>(crc);
 }
 
 // FsyncPath flushes a file's (or directory's) contents and metadata to stable

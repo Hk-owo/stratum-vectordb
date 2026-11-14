@@ -544,8 +544,8 @@ func readRawRecord(r *bufio.Reader) (parsedRecord, *rawRecord, error) {
 		return parsedRecord{}, nil, err
 	}
 	wantCRC := binary.BigEndian.Uint32(crcBytes)
-	gotCRC := crc32.ChecksumIEEE(header)
-	gotCRC = crc32.Update(gotCRC, crc32.IEEETable, payload)
+	gotCRC := crc32.Update(0, walCRC, header)
+	gotCRC = crc32.Update(gotCRC, walCRC, payload)
 	if gotCRC != wantCRC {
 		return parsedRecord{}, nil, fmt.Errorf("%w: checksum mismatch", ErrLogCorrupt)
 	}
