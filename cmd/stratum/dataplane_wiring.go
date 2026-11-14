@@ -125,7 +125,6 @@ func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 		Confirmer:  stratumsync.NewConfirmBroadcaster(stratumsync.PresenceCheckerConfig{}),
 		// §8.4: "建一次、分发 N 份" — the builder reads its own index files and
 		// ships them; replicas install them instead of building their own.
-		IndexReader:  indexMgr,
 		IndexFetcher: stratumsync.NewIndexFetcher(),
 		// docs/index-owner-sharding-plan.md §7: where an artifact FETCHED from a
 		// peer lands. The same call the push direction ends in, so a fetched

@@ -431,7 +431,6 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 	dataSources := plane.NewDataSourceRegistry()
 	indexDistributor := plane.NewLocalDataPlane(plane.LocalDataPlaneConfig{
 		IndexManager:   im,
-		IndexReader:    im,
 		IndexFetcher:   sync.NewIndexFetcher(),
 		IndexInstaller: im,
 		// §7.8/docs/cursor-persistence-plan.md §3: the cursor is persisted in the
