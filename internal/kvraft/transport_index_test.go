@@ -41,7 +41,7 @@ func TestTransport_ClampsAFollowersConflictIndex(t *testing.T) {
 	rf.log = []*kvraftpb.Entry{{Index: 10, Term: 1}, {Index: 11, Term: 1}, {Index: 12, Term: 1}}
 	rf.nextIndex[2] = 5
 	tr.applyAppendResponse(rf, 2,
-		&kvraftpb.AppendEntriesRequest{PrevLogIndex: 4},
+		&kvraftpb.AppendEntriesRequest{Term: 7, PrevLogIndex: 4},
 		&kvraftpb.AppendEntriesResponse{Term: 7, Success: false, ConflictIndex: 99})
 	got := rf.nextIndex[2]
 	rf.mu.Unlock()
@@ -65,7 +65,7 @@ func TestTransport_ConflictTermResolvesToAGlobalIndexNotASliceOffset(t *testing.
 	rf.nextIndex[2] = 11
 	rf.matchIndex[2] = 10
 	tr.applyAppendResponse(rf, 2,
-		&kvraftpb.AppendEntriesRequest{PrevLogIndex: 12},
+		&kvraftpb.AppendEntriesRequest{Term: 7, PrevLogIndex: 12},
 		&kvraftpb.AppendEntriesResponse{Term: 7, Success: false, ConflictIndex: 12, ConflictTerm: 1})
 	got := rf.nextIndex[2]
 	rf.mu.Unlock()
@@ -86,7 +86,7 @@ func TestTransport_ApplyAppendResponseAdvancesMatchOnSuccess(t *testing.T) {
 	rf.log = []*kvraftpb.Entry{{Index: 10, Term: 1}, {Index: 11, Term: 1}, {Index: 12, Term: 1}}
 	rf.nextIndex[2] = 10
 	tr.applyAppendResponse(rf, 2,
-		&kvraftpb.AppendEntriesRequest{PrevLogIndex: 11, Entries: []*kvraftpb.Entry{{Index: 12, Term: 7}}},
+		&kvraftpb.AppendEntriesRequest{Term: 7, PrevLogIndex: 11, Entries: []*kvraftpb.Entry{{Index: 12, Term: 7}}},
 		&kvraftpb.AppendEntriesResponse{Term: 7, Success: true})
 	next, match := rf.nextIndex[2], rf.matchIndex[2]
 	rf.mu.Unlock()
@@ -111,5 +111,47 @@ func TestTransport_ApplyAppendResponseStepsDownOnAHigherTerm(t *testing.T) {
 
 	if state != Follower || term != 9 {
 		t.Errorf("state/term = %v/%d, want Follower/9", state, term)
+	}
+}
+
+// 过期响应（请求属于更早的任期，或本节点已不是 leader）不能改 leader 的复制状态：
+// 它是按一份已经不存在的日志 / nextIndex 发出的。b356e10 之后这条路径只靠 clamp
+// 兜底；现在直接丢弃。
+func TestTransport_ApplyAppendResponseDropsAStaleResponse(t *testing.T) {
+	cases := []struct {
+		name    string
+		state   int
+		reqTerm uint64
+		resp    *kvraftpb.AppendEntriesResponse
+	}{
+		// 旧任期发出的请求，回复迟到：本节点在 term 7 重新当选，回复属于 term 5。
+		{"success from an earlier term", Leader, 5, &kvraftpb.AppendEntriesResponse{Term: 5, Success: true}},
+		{"conflict from an earlier term", Leader, 5, &kvraftpb.AppendEntriesResponse{Term: 5, ConflictIndex: 2}},
+		// 已被罢免（同任期内跟随了别人），迟到的回复。
+		{"success after stepping down", Follower, 7, &kvraftpb.AppendEntriesResponse{Term: 7, Success: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rf, tr, _ := newTestRaft(t, 1, WithLogger(zap.NewNop()))
+
+			rf.mu.Lock()
+			rf.state = tc.state
+			rf.term = 7
+			rf.log = []*kvraftpb.Entry{{Index: 10, Term: 1}, {Index: 11, Term: 1}, {Index: 12, Term: 7}}
+			rf.nextIndex[2] = 12
+			rf.matchIndex[2] = 11
+			commit := rf.lastCommitIndex
+			tr.applyAppendResponse(rf, 2,
+				&kvraftpb.AppendEntriesRequest{Term: tc.reqTerm, PrevLogIndex: 11,
+					Entries: []*kvraftpb.Entry{{Index: 12, Term: 7}}},
+				tc.resp)
+			next, match, gotCommit := rf.nextIndex[2], rf.matchIndex[2], rf.lastCommitIndex
+			rf.mu.Unlock()
+
+			if next != 12 || match != 11 || gotCommit != commit {
+				t.Errorf("next/match/commit = %d/%d/%d, want 12/11/%d unchanged: a stale response "+
+					"must not move replication state", next, match, gotCommit, commit)
+			}
+		})
 	}
 }
