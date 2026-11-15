@@ -54,7 +54,7 @@ func createVersionOnce(ctx context.Context, addr, kbID, docID string) (*pb.Creat
 // reason, or the deadline passes.
 //
 // The reason is a parameter because the two failure tiers carry two names
-// (docs/storage-degradation-signal-plan.md §4.1), and asserting the wrong one
+// (docs/已实施/storage-degradation-signal-plan.md §4.1), and asserting the wrong one
 // would pass for the wrong fault.
 //
 // Nothing here is instantaneous by design: the verdict is built from periodic
@@ -164,7 +164,7 @@ func awaitStorageReconcileSettled(t *testing.T, quiet, timeout time.Duration) {
 	}
 }
 
-// docs/storage-degradation-signal-plan.md §8, the integration case: with the storage
+// docs/已实施/storage-degradation-signal-plan.md §8, the integration case: with the storage
 // tier below quorum a WRITE is refused by name and retryably — instead of burning a
 // version number, a Raft entry and a retry budget per attempt — a READ of an
 // already-durable version keeps working, and the gate lifts once the replicas are
@@ -185,8 +185,33 @@ func TestT4_StorageDegradationRefusesWritesButStillServesReads(t *testing.T) {
 		"健康时写入的版本：存储层降级之后，它必须仍然可读。")
 	t.Logf("committed %s v%d while healthy", kbID, versionID)
 
-	// Below quorum: 3 replicas, QuorumSize(3) = 2, so two victims leave one live.
-	victims := storageServices[1:]
+	// Below quorum, with the victim COUNT derived from the KB's own replica set
+	// rather than from the storage group's size.
+	//
+	// `storageServices[1:]` was a three-replica assumption: it happened to leave
+	// exactly one live replica on a 3+3 cluster. On a 3+5 cluster every KB is
+	// placed on five nodes (quorum 3), so the same slice kills four and leaves one
+	// — still "below quorum" for the refusal half, but the recovery half below then
+	// brings back a single replica and waits for a write that can never succeed
+	// (2 of 5 live, quorum 3). Deriving the set from the placement keeps both halves
+	// honest at any storage-group size.
+	p := placementOf(storageDirectory(t, ctx), kbID)
+	if p == nil {
+		t.Fatalf("KB %s has no placement", kbID)
+	}
+	required := int(p.GetRequiredReplicas())
+	quorum := required/2 + 1
+	if required < 2 {
+		t.Skipf("KB %s has %d replica(s); degradation needs at least 2", kbID, required)
+	}
+	ids := append([]int64(nil), p.GetReplicaIds()...)
+	victims := make([]string, 0, required)
+	for _, id := range ids[:required-quorum+1] {
+		victims = append(victims, storageServiceOf(t, id))
+	}
+	survivors := ids[required-quorum+1:]
+	t.Logf("KB %s has %d replicas (quorum %d); taking %v down, survivors %v",
+		kbID, required, quorum, victims, survivors)
 	for _, victim := range victims {
 		killNode(t, victim)
 	}
@@ -195,6 +220,28 @@ func TestT4_StorageDegradationRefusesWritesButStillServesReads(t *testing.T) {
 			startNode(t, victim)
 		}
 	}()
+
+	// READS ARE NOT REFUSED (§2 non-goals) — and this check has to happen BEFORE the
+	// refusal loop below.
+	//
+	// That loop deliberately keeps submitting writes until the verdict lands, and the
+	// window before it lands accepts them: their data can never reach quorum, so the
+	// chain tail advances past every surviving replica's cursor (measured on the 3+5
+	// cluster: tail v28 against cursors at v26). A read of the OLD, perfectly durable
+	// version is then refused on the freshness credential — "this replica is behind",
+	// retryable — which surfaces as "all nodes unavailable" and looks like the read
+	// half being broken, when the version is fine and the tail is the problem. Waiting
+	// for the verdict first keeps the assertion about what it claims to be about.
+	if resp := awaitServable(t, ctx, storageAddrs[0], kbID, versionID, 90*time.Second); resp == nil {
+		t.Errorf("the station stopped serving %s v%d below quorum: reads must keep working", kbID, versionID)
+	}
+	// The same claim without the router in the middle: a surviving replica answers for
+	// the version it holds, which is the direct evidence that the data is still there.
+	for _, id := range survivors {
+		if resp := awaitDirectServable(t, ctx, storageAddrOf(t, id), kbID, versionID, 90*time.Second); resp == nil {
+			t.Errorf("surviving replica %d stopped serving %s v%d below quorum", id, kbID, versionID)
+		}
+	}
 
 	refusal := awaitWriteRefusal(t, ctx, kbID, reasonKBStorageDegraded, 120*time.Second)
 	if got := status.Code(refusal); got != codes.Unavailable {
@@ -208,13 +255,6 @@ func TestT4_StorageDegradationRefusesWritesButStillServesReads(t *testing.T) {
 		t.Logf("write refused as expected: %s", msg)
 	}
 
-	// READS ARE NOT REFUSED (§2 non-goals). A replica that still holds the data still
-	// serves it, and that trade-off is the reason this signal is not a health check.
-	if resp := awaitServable(t, ctx, storageAddrs[0], kbID, versionID, 90*time.Second); resp == nil {
-		t.Errorf("the surviving replica stopped serving %s v%d: below quorum, reads must keep working",
-			kbID, versionID)
-	}
-
 	// One replica back is 2 of 3 — a quorum again — so the gate has to lift. The
 	// verdict is derived, so this is observed by the write succeeding, not by a flag
 	// being cleared.
@@ -226,7 +266,7 @@ func TestT4_StorageDegradationRefusesWritesButStillServesReads(t *testing.T) {
 // "cannot write" answer as being one short, but the error says which happened —
 // storage_unavailable rather than kb_storage_degraded — so whoever reads it can
 // tell "the storage layer is gone" from "it needs a replica back"
-// (docs/storage-degradation-signal-plan.md §4.1).
+// (docs/已实施/storage-degradation-signal-plan.md §4.1).
 func TestT4_StorageUnavailabilityIsNamedDistinctly(t *testing.T) {
 	if len(storageServices) < 3 {
 		t.Skipf("needs at least 3 storage nodes, have %d", len(storageServices))

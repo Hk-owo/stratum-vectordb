@@ -49,14 +49,23 @@ func TestT4_LagCatchupRetentionWindow(t *testing.T) {
 	t.Logf("leader: node %d (%s); KB %s", leaderIdx, leaderAddr, kbID)
 
 	// A storage node that is not the leader plays the replica we watch.
+	//
+	// The address list has to be the PER-NODE one (storageReplicaAddrs), not
+	// storageAddrs: the latter is the tier's READ entry point — the station in the
+	// deployed shape — so it has one entry per station, not per container. Pairing
+	// it with storageServices panicked ("index out of range [3] with length 3") the
+	// first time this suite ran against five storage containers.
 	behind := 0
 	for i := range storageServices {
-		if storageAddrs[i] != leaderAddr {
+		if i >= len(storageReplicaAddrs) {
+			break
+		}
+		if storageReplicaAddrs[i] != leaderAddr {
 			behind = i
 			break
 		}
 	}
-	t.Logf("replica under observation: %s (%s)", storageServices[behind], storageAddrs[behind])
+	t.Logf("replica under observation: %s (%s)", storageServices[behind], storageReplicaAddrs[behind])
 
 	// One real version first, so the KB exists for everyone before we start.
 	seed := genUniqueDocs(1, 600)
@@ -75,20 +84,26 @@ func TestT4_LagCatchupRetentionWindow(t *testing.T) {
 	}
 
 	versions := lagCatchupVersions()
-	t.Logf("advancing %d versions", versions)
+	t.Logf("advancing %d versions (each waits for its index to reach READY)", versions)
 	pool := genUniqueDocs(versions, 600)
+	batchStart := time.Now()
 	for i := 0; i < versions; i++ {
 		parent = writeChanges(t, ctx, leaderAddr, kbID, parent, lagAddChange(pool[i]))
 		waitVersionStatus(t, ctx, leaderAddr, kbID, parent, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
-		if (i+1)%10 == 0 {
-			t.Logf("  %d/%d advanced (latest v%d)", i+1, versions, parent)
+		// Progress every five versions, with the per-version cost. The whole loop is
+		// minutes of waiting by design (each version must reach READY before the next
+		// is chained onto it), and without this a run looks stuck: the only other
+		// output is at the end.
+		if (i+1)%5 == 0 || i+1 == versions {
+			t.Logf("  %d/%d advanced (latest v%d, %v/version)", i+1, versions, parent,
+				(time.Since(batchStart) / time.Duration(i+1)).Round(time.Millisecond))
 		}
 	}
-	t.Logf("batch complete: latest version v%d", parent)
+	t.Logf("batch complete: latest version v%d after %v", parent, time.Since(batchStart).Round(time.Second))
 
 	if offlineSvc != "" {
 		startNode(t, offlineSvc)
-		waitForNodeToSeeKB(t, ctx, storageAddrs[behind], kbID, 60*time.Second)
+		waitForNodeToSeeKB(t, ctx, storageReplicaAddrs[behind], kbID, 60*time.Second)
 		t.Logf("%s is back; giving it %v to settle", offlineSvc, lagCatchupSettle())
 		time.Sleep(lagCatchupSettle())
 	}
@@ -239,7 +254,7 @@ func lagCatchupTimeout() time.Duration {
 }
 
 // TestT4_ActiveLagCatchupCatchesUpWithoutAQuery is the case
-// docs/active-lag-detection-design.md exists for: a node that fell behind catches up
+// docs/已实施/active-lag-detection-design.md exists for: a node that fell behind catches up
 // on its own, with nothing asking it for data.
 //
 // It kills one storage node, advances versions while it is away, brings it back, and
@@ -280,7 +295,10 @@ func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
 
 	behind := 0
 	for i := range storageServices {
-		if storageAddrs[i] != leaderAddr {
+		if i >= len(storageReplicaAddrs) {
+			break
+		}
+		if storageReplicaAddrs[i] != leaderAddr {
 			behind = i
 			break
 		}
@@ -299,9 +317,14 @@ func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
 
 	versions := lagCatchupVersions()
 	pool := genUniqueDocs(versions, 600)
+	batchStart := time.Now()
 	for i := 0; i < versions; i++ {
 		parent = writeChanges(t, ctx, leaderAddr, kbID, parent, lagAddChange(pool[i]))
 		waitVersionStatus(t, ctx, leaderAddr, kbID, parent, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
+		if (i+1)%5 == 0 || i+1 == versions {
+			t.Logf("  %d/%d advanced while %s is away (latest v%d, %v/version)", i+1, versions, behindSvc, parent,
+				(time.Since(batchStart) / time.Duration(i+1)).Round(time.Millisecond))
+		}
 	}
 	t.Logf("%s was away for %d versions (chain tail v%d); artifacts before: %d",
 		behindSvc, versions, parent, before)
@@ -355,7 +378,7 @@ func TestT4_ActiveLagCatchupCatchesUpWithoutAQuery(t *testing.T) {
 	// What a catch-up moves is this node's CONTIGUOUS HISTORY, not its artifacts.
 	// Artifacts are §8.6(b) lazy by design — a node that holds the data but not the
 	// artifact rebuilds it on demand — and the lag-catch-up design says so outright
-	// (docs/active-lag-detection-design.md:104, "追赶仍是后台预热，缺失产物照旧可按需
+	// (docs/已实施/active-lag-detection-design.md:104, "追赶仍是后台预热，缺失产物照旧可按需
 	// 重建"). Counting artifacts therefore asserted something the design never
 	// promises; the cursor is the thing the catch-up actually maintains.
 	//

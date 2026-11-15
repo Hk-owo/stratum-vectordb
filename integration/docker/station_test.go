@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -44,18 +45,6 @@ func TestMain(m *testing.M) {
 	}
 	defer cleanup()
 
-	// Every client-side address now points at the station. The two lists stay
-	// distinct in the tests' vocabulary because they mean different things —
-	// where metadata lives versus where data lives — but telling them apart is
-	// exactly what the station is for.
-	// Three entries, all naming the station. These lists are indexed by node
-	// ordinal all over the suite — the leader index, the follower after it — and
-	// every one of those calls now goes through the station. A single entry
-	// would break that indexing; three distinct addresses would be the
-	// direct-dial shape this suite just left behind.
-	nodeAddrs = []string{station, station, station}
-	storageAddrs = []string{station, station, station}
-
 	// nodeServices / storageServices keep the CONTAINER names. They are not
 	// client entry points: they are what the fault-injection helpers kill and
 	// start, and a kill has to name a container however the client reaches the
@@ -70,14 +59,54 @@ func TestMain(m *testing.M) {
 	storageServices = splitEnv("STRATUM_T4_STORAGE_SERVICES",
 		"stratum-node-storage1,stratum-node-storage2,stratum-node-storage3")
 
+	// Every client-side address now points at the station. The lists stay
+	// distinct in the tests' vocabulary because they mean different things —
+	// where metadata lives versus where data lives — but telling them apart is
+	// exactly what the station is for.
+	//
+	// The LENGTHS are not symmetric, and getting that wrong is a panic rather
+	// than a wrong answer: nodeAddrs is indexed by control-node ordinal (the
+	// leader index, the follower after it), while storageAddrs is indexed by
+	// STORAGE-node ordinal everywhere it is used — `storageAddrs[i]` paired with
+	// `storageServices[i]`, the rotation in the lag-catchup cases, the cold-read
+	// pick in the latency case. Hard-coding three of each worked only while the
+	// suite ran against three storage nodes; on a five-storage topology it
+	// panicked with "index out of range [3] with length 3". So the storage list is
+	// sized from the storage tier, and every entry is the station: the station is
+	// the tier's read entry point, and which node answers is its decision.
+	nodeAddrs = make([]string, len(nodeServices))
+	storageAddrs = make([]string, len(storageReplicaAddrs))
+	for i := range nodeAddrs {
+		nodeAddrs[i] = station
+	}
+	for i := range storageAddrs {
+		storageAddrs[i] = station
+	}
+	if len(storageServices) > len(storageAddrs) {
+		fmt.Fprintf(os.Stderr,
+			"docker_test: %d storage containers but %d storage addresses; "+
+				"set STRATUM_T4_STORAGE_NODE_ADDRS to match STRATUM_T4_STORAGE_SERVICES\n",
+			len(storageServices), len(storageAddrs))
+		os.Exit(1)
+	}
+
 	os.Exit(m.Run())
 }
 
 // startStation returns the station's address, or an existing one when
 // STRATUM_T4_STATION_ADDR names it.
+//
+// STRATUM_T4_STATION_NETWORK runs the station INSIDE that docker network
+// instead of on the host (see startStationInNetwork). It is required for any
+// suite that exercises per-KB placement, because the station now routes by the
+// addresses the DIRECTORY holds — and a two-tier deployment registers its
+// storage nodes by container name, which a host process cannot resolve.
 func startStation() (addr string, cleanup func(), err error) {
 	if existing := os.Getenv("STRATUM_T4_STATION_ADDR"); existing != "" {
 		return existing, func() {}, nil
+	}
+	if network := os.Getenv("STRATUM_T4_STATION_NETWORK"); network != "" {
+		return startStationInNetwork(network)
 	}
 
 	// controlAddrs is the package-level list await_direct_test.go declares — the
@@ -147,6 +176,108 @@ func startStation() (addr string, cleanup func(), err error) {
 		cleanup()
 		return "", nil, err
 	}
+	return addr, cleanup, nil
+}
+
+// startStationInNetwork runs the station as a container ON the cluster's docker
+// network and returns the host port that reaches it.
+//
+// Why a container: the per-KB placement work made the directory the routing
+// authority, and the directory holds the addresses the deployment registered —
+// "stratum-node-storage1:7000" in a two-tier cluster. Those names resolve only
+// inside the network, so a host-side station answered every query with "storage
+// unavailable: all nodes unavailable" (measured on the five-storage-node
+// cluster). Running the station beside the nodes is also the shape the plan
+// describes (docs/实施中/storage-topology-plan.md §3): the station is part of the
+// cluster, not a client outside it.
+//
+// The binary is built statically (CGO_ENABLED=0) and mounted from a directory
+// under run/ rather than /tmp: this environment's docker cannot mount /tmp, and
+// run/ is already ignored by git.
+func startStationInNetwork(network string) (string, func(), error) {
+	root, err := repoRoot()
+	if err != nil {
+		return "", nil, err
+	}
+	runDir := filepath.Join(root, "run")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return "", nil, fmt.Errorf("create run dir: %w", err)
+	}
+	dir, err := os.MkdirTemp(runDir, "station-net-")
+	if err != nil {
+		return "", nil, fmt.Errorf("temp dir for the station binary: %w", err)
+	}
+	bin := filepath.Join(dir, "stratum-router")
+
+	build := exec.Command("go", "build", "-o", bin, "./cmd/stratum-router/")
+	build.Dir = root
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	build.Stderr = os.Stderr
+	if err := build.Run(); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("build the station: %w", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("pick a station port: %w", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	image := os.Getenv("STRATUM_T4_STATION_IMAGE")
+	if image == "" {
+		image = "alpine:latest"
+	}
+	name := fmt.Sprintf("stratum-test-station-%d", os.Getpid())
+
+	// The nodes are named, not addressed: inside the network their container
+	// names are the addresses the directory holds, and every node listens on
+	// 7000 there (scripts/cluster.sh publishes host ports, not container ones).
+	inNetwork := func(names []string) string {
+		out := make([]string, 0, len(names))
+		for _, n := range names {
+			out = append(out, n+":7000")
+		}
+		return strings.Join(out, ",")
+	}
+	controls := splitEnv("STRATUM_T4_NODE_SERVICES",
+		"stratum-node-control1,stratum-node-control2,stratum-node-control3")
+	storages := splitEnv("STRATUM_T4_STORAGE_SERVICES",
+		"stratum-node-storage1,stratum-node-storage2,stratum-node-storage3")
+
+	args := []string{
+		"run", "-d", "--rm", "--name", name,
+		"--network", network,
+		"-p", fmt.Sprintf("127.0.0.1:%d:7000", port),
+		"-v", dir + ":/app:ro",
+		"-w", "/app",
+		image, "/app/stratum-router",
+		"-listen", "0.0.0.0:7000",
+		"-nodes", inNetwork(controls),
+		"-storage-nodes", inNetwork(storages),
+	}
+	if secret := stationSecret(); len(secret) > 0 {
+		args = append(args, "-station-secret", string(secret))
+	}
+	out, err := exec.Command("docker", args...).CombinedOutput()
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return "", nil, fmt.Errorf("start the station container: %w\n%s", err, out)
+	}
+
+	cleanup := func() {
+		_ = exec.Command("docker", "rm", "-f", name).Run()
+		_ = os.RemoveAll(dir)
+	}
+	if err := waitForListen(addr, 30*time.Second); err != nil {
+		logs, _ := exec.Command("docker", "logs", name).CombinedOutput()
+		cleanup()
+		return "", nil, fmt.Errorf("%w\nstation logs:\n%s", err, logs)
+	}
+	fmt.Fprintf(os.Stderr, "docker_test: station container %s on %s (network %s)\n", name, addr, network)
 	return addr, cleanup, nil
 }
 

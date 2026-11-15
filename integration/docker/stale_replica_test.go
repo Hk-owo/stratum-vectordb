@@ -56,8 +56,14 @@ func TestT4_UnconvergedReplicaDoesNotAnswerEmpty(t *testing.T) {
 	}
 	const down = 1 // storage2
 	// 直连存储副本（不经服务站）的调用必须自己带服务站的信任标记，且它现在是 HMAC
-	// 签名的（H4 of docs/code-review-2026-09-24.md）——手写一个 "1" 会被节点直接拒绝。
-	trusted := asStation(ctx)
+	// 签名的（H4 of docs/参考/code-review-2026-09-24.md）——手写一个 "1" 会被节点直接拒绝。
+	//
+	// 这里**故意不**预先算一份 mark 复用：mark 的 TTL 是 30 秒
+	// （internal/authmeta.DefaultMarkTTL，用于限制重放），而下面的循环最长 90 秒。
+	// 复用一份 mark 的写法在 3+3 集群上侥幸有效——副本通常 30 秒内就追上了——但在
+	// 5 副本拓扑上追赶更慢，30 秒后每个调用都被节点判成"没有可信标记"
+	// （Unauthenticated），用例于是以"拒绝不可重试"失败，而真正的问题是测试自己
+	// 拿了一份过期凭证。每轮重新签一个即可。
 
 	// --- Make one replica miss a write ---
 	killNode(t, storageServices[down])
@@ -74,7 +80,7 @@ func TestT4_UnconvergedReplicaDoesNotAnswerEmpty(t *testing.T) {
 	deadline := time.Now().Add(90 * time.Second)
 	var refusals, empties, served int
 	for time.Now().Before(deadline) {
-		resp, err := queryReplicaDirectly(ctx, trusted, storageReplicaAddrs[down], kbID, versionID)
+		resp, err := queryReplicaDirectly(ctx, asStation(ctx), storageReplicaAddrs[down], kbID, versionID)
 		switch {
 		case err != nil:
 			// Retryable is the requirement: a caller (the station always is one)

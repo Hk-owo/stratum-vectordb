@@ -200,6 +200,14 @@ jobs:
       - name: 运行 T4 集群容错测试
         env:
           STRATUM_T4_NODE_SERVICES: stratum-node-control1,stratum-node-control2,stratum-node-control3
+          # 服务站必须和节点在同一个 docker 网络里（2026-11 的 per-KB 放置改造之后）。
+          # 原因：服务站现在按存储目录里的地址路由，而两层部署登记的是容器名
+          # （stratum-node-storageN:7000）——宿主进程解析不到这些名字，于是每个查询都
+          # 返回 "storage unavailable: all nodes unavailable"。integration/docker 的
+          # TestMain 看到这个变量就把服务站作为容器跑在 stratum-net 上，节点用容器名
+          # + 7000 注册，与 scripts/cluster.sh 起的两层拓扑一致。
+          # 本地等价入口：scripts/t4-integration.sh -s 3（该脚本默认导出这个变量）。
+          STRATUM_T4_STATION_NETWORK: stratum-net
         # 失败时把每个失败用例最后 80 行输出写成 error 注解：注解可以通过 checks API
         # 读到，而原始日志下载在某些环境里拿不到。
         run: |
