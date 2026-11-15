@@ -19,18 +19,23 @@ import (
 	"stratum/internal/authmeta"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/owner"
+	"stratum/internal/storage"
+	"stratum/internal/wire"
 )
 
 // Config configures a Router.
 //
 // The two address lists exist because the two layers no longer answer the same
-// services (Stratum_设计文档v13.md §11 阶段 ④). QueryService and AdminService take
+// services (docs/参考/历史/Stratum_设计文档v13.md §11 阶段 ④). QueryService and AdminService take
 // the index manager and the local stores in their constructors, so only a node
 // that holds data can serve them; KnowledgeBaseService is metadata and belongs
 // to the control layer. A router that treated every node as interchangeable
 // would send a query to a node that has no indices to search — which is not a
 // hypothetical, it is what it did.
 type Config struct {
+	// Required for per-KB placement. The executable enables it unconditionally;
+	// false retains compatibility for legacy embedded/test router stacks.
+	RequireDirectory bool
 	// Addrs is the control-layer nodes: metadata reads and writes. On the
 	// all-in-one topology these are also the storage nodes.
 	Addrs []string
@@ -44,7 +49,7 @@ type Config struct {
 	StorageAddrs []string
 
 	// OwnerInactiveK is how many replicas should hold a NON-active version's
-	// index (docs/index-owner-sharding-plan.md §3). <= 0 disables sharding: every
+	// index (docs/已实施/index-owner-sharding-plan.md §3). <= 0 disables sharding: every
 	// node qualifies for every version, which is the pre-sharding behaviour.
 	//
 	// The active version always keeps its whole replica set, because any node may
@@ -103,6 +108,24 @@ type Config struct {
 // indexes the control clients (kbs), a storage-routed one indexes the storage
 // clients (querys, admins).
 type Router struct {
+	requireDirectory bool
+	storagePool      *storagePool
+	directories      []pb.InternalServiceClient
+	// dirPreferred is the index in directories of the control node that answered
+	// the last directory read.
+	//
+	// Why it exists: only the control LEADER answers GetStorageDirectory (§13.3), and
+	// the refresh used to walk the list from index 0 every time. With three control
+	// nodes and a leader that is not the first, that is one guaranteed wasted round
+	// trip per refresh — measured on the 5-storage-node cluster during a performance
+	// run: 1,414 `Unavailable/GetStorageDirectory` calls on control1 (the non-leader
+	// at the head of the list) against 1,380 successful ones, i.e. half of the
+	// control plane's directory traffic answered nothing.
+	//
+	// Starting from the last node that worked turns "one wasted hop per refresh" into
+	// "one wasted hop per leadership change". A leadership change costs exactly one
+	// failed probe, because the next success overwrites this.
+	dirPreferred atomic.Int32
 	controlAddrs []string
 	storageAddrs []string
 	conns        []*grpc.ClientConn
@@ -176,15 +199,19 @@ func NewRouter(cfg Config) (*Router, error) {
 		storage = cfg.Addrs
 	}
 	r := &Router{
-		controlAddrs:    append([]string(nil), cfg.Addrs...),
-		storageAddrs:    append([]string(nil), storage...),
-		auth:            cfg.Auth,
-		mark:            cfg.Mark,
-		logger:          cfg.Logger,
-		ownerInactiveK:  cfg.OwnerInactiveK,
-		priority:        newIndexPriority(cfg.OwnerPriorityHalfLife, nil),
-		controlInflight: newInflight(len(cfg.Addrs)),
-		storageInflight: newInflight(len(storage)),
+		requireDirectory: cfg.RequireDirectory,
+		controlAddrs:     append([]string(nil), cfg.Addrs...),
+		storageAddrs:     append([]string(nil), storage...),
+		auth:             cfg.Auth,
+		mark:             cfg.Mark,
+		logger:           cfg.Logger,
+		ownerInactiveK:   cfg.OwnerInactiveK,
+		priority:         newIndexPriority(cfg.OwnerPriorityHalfLife, nil),
+		controlInflight:  newInflight(len(cfg.Addrs)),
+		storageInflight:  newInflight(len(storage)),
+	}
+	if cfg.RequireDirectory {
+		r.storagePool = newStoragePool()
 	}
 	if r.logger == nil {
 		r.logger = zap.NewNop()
@@ -203,9 +230,11 @@ func NewRouter(cfg Config) (*Router, error) {
 		r.Close()
 		return nil, err
 	}
-	if err := dial(storage); err != nil {
-		r.Close()
-		return nil, err
+	if !cfg.RequireDirectory {
+		if err := dial(storage); err != nil {
+			r.Close()
+			return nil, err
+		}
 	}
 	// Connections are appended in the same order the client slices are built
 	// below, so the two stay aligned.
@@ -214,6 +243,7 @@ func NewRouter(cfg Config) (*Router, error) {
 	// layer's AdminService — not the same list as r.admins below it.
 	discoveryAdmins := make([]statusClient, 0, len(cfg.Addrs))
 	for i := 0; i < len(cfg.Addrs); i++ {
+		r.directories = append(r.directories, pb.NewInternalServiceClient(r.conns[i]))
 		r.kbs = append(r.kbs, pb.NewKnowledgeBaseServiceClient(r.conns[i]))
 		discoveryAdmins = append(discoveryAdmins, pb.NewAdminServiceClient(r.conns[i]))
 	}
@@ -230,7 +260,7 @@ func NewRouter(cfg Config) (*Router, error) {
 	// in the list it was handed. Both IDs are therefore read in the ID space of
 	// whoever answers, and the two layers do not share one: a control node
 	// reports 1..N, a storage node in the split topology reports 11..1N
-	// (Stratum_设计文档v13.md §11). Pointing this at the storage layer — which the
+	// (docs/参考/历史/Stratum_设计文档v13.md §11). Pointing this at the storage layer — which the
 	// station did, under a comment claiming a control node builds no
 	// AdminService, untrue since cmd/stratum/control_admin.go taught it to answer
 	// the Raft view — keyed nodeByID on storage IDs while the votes named control
@@ -268,7 +298,10 @@ func (r *Router) Start(ctx context.Context) {
 	if r.routes != nil {
 		r.routes.Start(ctx)
 	}
-	if len(r.syncs) > 0 && len(r.syncs) == len(r.storageBreakers) {
+	if r.storagePool != nil {
+		r.storagePool.enableProbes()
+		go r.probeOpenBreakers(ctx, breakerProbeInterval)
+	} else if len(r.syncs) > 0 && len(r.syncs) == len(r.storageBreakers) {
 		for _, b := range r.storageBreakers {
 			b.useExternalProbe()
 		}
@@ -307,6 +340,9 @@ func (r *Router) probeOpenBreakers(ctx context.Context, interval time.Duration) 
 
 // probeOnce probes every storage node whose breaker has waited out its cooldown.
 func (r *Router) probeOnce(ctx context.Context) {
+	if r.storagePool != nil {
+		r.storagePool.probe(r.mark.Stamp(ctx))
+	}
 	for idx, b := range r.storageBreakers {
 		if idx >= len(r.syncs) || !b.needsProbe(time.Now()) {
 			continue
@@ -323,6 +359,27 @@ func (r *Router) probeOnce(ctx context.Context) {
 // refreshRouteSnapshot observes the cluster once: which knowledge bases exist and what
 // version each should be served at, and the storage layer's redundancy verdict. One RPC
 // for each, however many knowledge bases there are.
+// dirOrder is the order in which control nodes are asked for the directory:
+// preferred first, then the rest in their original order.
+//
+// Pure and separate from the caller so the wrap-around and the out-of-range cases
+// are testable without a gRPC server — preferred comes from a badged atomic that a
+// previous refresh wrote, and a stale index (fewer control nodes than before) must
+// not become an out-of-range panic on the first call after a configuration change.
+func dirOrder(preferred, n int) []int {
+	if n <= 0 {
+		return nil
+	}
+	if preferred < 0 || preferred >= n {
+		preferred = 0
+	}
+	order := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		order = append(order, (preferred+i)%n)
+	}
+	return order
+}
+
 func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error) {
 	// Everything the refresh sends to the control layer carries the internal mark.
 	//
@@ -335,6 +392,33 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 	ctx = r.mark.Stamp(ctx)
 
 	snap := routeSnapshot{expected: map[string]int64{}}
+	if r.requireDirectory {
+		var lastErr error
+		for _, idx := range dirOrder(int(r.dirPreferred.Load()), len(r.directories)) {
+			client := r.directories[idx]
+			resp, err := client.GetStorageDirectory(ctx, &pb.GetStorageDirectoryRequest{})
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			r.dirPreferred.Store(int32(idx))
+			dir := wire.StorageDirectoryFromProto(resp)
+			if r.storagePool != nil {
+				r.storagePool.reconcile(dir)
+			}
+			snap.directory = &dir
+			snap.expected = dir.ActiveVersions
+			snap.health = make(map[string]storage.Health, len(resp.GetHealth()))
+			for kb, h := range resp.GetHealth() {
+				snap.health[kb] = storage.Health{Known: h.GetKnown(), Degraded: h.GetDegraded(), Unavailable: h.GetUnavailable(), Detail: h.GetDetail()}
+			}
+			return snap, nil
+		}
+		if lastErr == nil {
+			lastErr = stratumerrors.ErrPlacementUnknown
+		}
+		return routeSnapshot{}, lastErr
+	}
 
 	// The control layer is the authority on what exists and what version should
 	// be visible; any control node can answer, they share the log.
@@ -358,7 +442,7 @@ func (r *Router) refreshRouteSnapshot(ctx context.Context) (routeSnapshot, error
 			// left out of the table rather than recorded as version 0: "who holds
 			// version 0" has no answer, so asking would narrow the KB to nothing by
 			// accident, and the freshness credential below would carry a version
-			// that exists nowhere (docs/cursor-persistence-plan.md §5.3).
+			// that exists nowhere (docs/已实施/cursor-persistence-plan.md §5.3).
 			continue
 		}
 		snap.expected[kb.GetKnowledgeBaseId()] = kb.GetActiveVersionId()
@@ -488,6 +572,9 @@ func (r *Router) ExpectedVersion(kbID string) (int64, bool) {
 
 // Close closes every node connection.
 func (r *Router) Close() {
+	if r.storagePool != nil {
+		r.storagePool.close()
+	}
 	for _, c := range r.conns {
 		_ = c.Close()
 	}
@@ -533,12 +620,18 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 	// mark would reject the station's own forwarding the moment an operator ran
 	// without a token table.
 	//
-	// What changed with H4 (docs/code-review-2026-09-24.md): the stamp is an HMAC
+	// What changed with H4 (docs/参考/code-review-2026-09-24.md): the stamp is an HMAC
 	// over a timestamp under a key shared with the nodes, not the constant "1".
 	// A node can now actually tell whether the station sent the call, which is
 	// what the gate above always claimed.
 	ctx = r.mark.Stamp(ctx)
 	if isStorageMethod(fullMethod) {
+		if r.requireDirectory && kbID == "" && r.storagePool != nil {
+			return forwardDirectoryNodes(r, ctx, fn, stationStart)
+		}
+		if r.requireDirectory && kbID != "" {
+			return forwardDirectory(r, ctx, fullMethod, kbID, fn, fo, stationStart)
+		}
 		// No separate storage layer means the all-in-one shape, where the control
 		// nodes are the storage nodes too — the same fallback NewRouter applies
 		// when it dials them. Keeping the two consistent matters because a Router
@@ -561,7 +654,7 @@ func Forward[T any](r *Router, ctx context.Context, fullMethod, kbID string, fn 
 		// Sampling happens HERE, on the read being served, rather than on a ticker:
 		// the versions worth counting are exactly the ones somebody asks for, and a
 		// table a timer walked would keep decaying entries nobody is looking at
-		// (docs/index-owner-sharding-plan.md §4).
+		// (docs/已实施/index-owner-sharding-plan.md §4).
 		if r.priority != nil && expected != 0 {
 			r.priority.Observe(kbID, expected)
 		}
@@ -618,7 +711,7 @@ func WithPinnedVersion(versionID int64) ForwardOption {
 }
 
 // writeGate refuses a write the routing cache already knows cannot reach quorum
-// (docs/storage-degradation-signal-plan.md §4.3, first line).
+// (docs/已实施/storage-degradation-signal-plan.md §4.3, first line).
 //
 // This is the station's half of the gate and deliberately the cheap half: it
 // answers from the snapshot the background refresh already took, so the common
@@ -639,6 +732,9 @@ func (r *Router) writeGate(kbID string) error {
 		return nil
 	}
 	verdict, known := r.routes.Degradation()
+	if r.requireDirectory {
+		verdict, known = r.routes.KBDegradation(kbID)
+	}
 	if !known || !verdict.unhealthy() {
 		return nil
 	}
@@ -650,7 +746,7 @@ func (r *Router) writeGate(kbID string) error {
 }
 
 // budgetSlice bounds one attempt's share of the client's remaining deadline
-// (Stratum_设计文档v13.md §9.5).
+// (docs/参考/历史/Stratum_设计文档v13.md §9.5).
 //
 // The client's deadline is passed through unchanged — the station adds no
 // timeout of its own — but an attempt that is allowed to run until that
@@ -1113,6 +1209,11 @@ var writeTerminalReasons = map[string]bool{
 // here — e.g. version_deleting or knowledge_base_deleted, which share
 // FailedPrecondition but are terminal — is never retried by accident.
 var retryableReasons = map[string]bool{
+	"migration_in_progress":  true,
+	"migration_busy":         true,
+	"kb_write_paused":        true,
+	"storage_service_paused": true,
+	"placement_unknown":      true,
 	// This replica has not built the version's index (yet); another one may have.
 	"index_not_ready": true,
 	// This replica IS building the version's index, and the caller waited out
@@ -1120,7 +1221,7 @@ var retryableReasons = map[string]bool{
 	// transient, and another candidate may already be serving the version — with
 	// an even stronger case: a build that has been running longer than the wait
 	// is positive evidence that this replica is busy. Leaving it out made ONE busy
-	// candidate a terminal error for the caller (docs/stress-test-report.md §E.4).
+	// candidate a terminal error for the caller (docs/参考/stress-test-report.md §E.4).
 	"index_load_timeout": true,
 	// This replica took the version's index out of service on purpose, for the
 	// §8.6(d) rolling cleanup; another one is serving it.

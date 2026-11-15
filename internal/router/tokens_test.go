@@ -114,3 +114,19 @@ tokens:
 		t.Error("expected \"*\" mixed with named kb_ids to fail the load")
 	}
 }
+
+func TestTokenTableStorageAdminIsExplicit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tokens.yaml")
+	if err := os.WriteFile(path, []byte("tokens:\n  - token: ordinary\n    kb_ids: ['*']\n  - token: operator\n    kb_ids: ['*']\n    storage_admin: true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	table, err := LoadTokenTable(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary, _ := table.Lookup("ordinary")
+	operator, _ := table.Lookup("operator")
+	if ordinary.StorageAdmin || !operator.StorageAdmin || !ordinary.AllKBs || !operator.AllKBs {
+		t.Fatal("storage admin privilege was inferred from wildcard KB access")
+	}
+}

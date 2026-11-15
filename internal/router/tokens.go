@@ -9,7 +9,7 @@ import (
 )
 
 // TokenTable is the service station's credential table, loaded from a static
-// YAML file at startup (Stratum_设计文档v13.md §9.3(5)).
+// YAML file at startup (docs/参考/历史/Stratum_设计文档v13.md §9.3(5)).
 //
 // Static, loaded once, and deliberately not watched. Adding or removing a demo
 // credential is rarer than restarting the station; file watching and hot reload
@@ -17,7 +17,7 @@ import (
 // paying that complexity here would be paying it for nothing.
 type TokenTable struct {
 	// Keyed by the SHA-256 of the token, not by the token itself (L1 of
-	// docs/code-review-2026-10-18.md). Looking a plaintext secret up in a map compares
+	// docs/参考/code-review-2026-10-18.md). Looking a plaintext secret up in a map compares
 	// it byte by byte and stops at the first difference, so lookup time leaks how much
 	// of a candidate is right — the classic argument for constant-time comparison. With
 	// the digest as the key, the comparison an attacker can observe is over a value
@@ -39,8 +39,9 @@ func tokenKey(token string) [sha256.Size]byte {
 //	    kb_ids: ["kb-interview-prep"]
 type tokenFile struct {
 	Tokens []struct {
-		Token string   `yaml:"token"`
-		KBIDs []string `yaml:"kb_ids"`
+		StorageAdmin bool     `yaml:"storage_admin"`
+		Token        string   `yaml:"token"`
+		KBIDs        []string `yaml:"kb_ids"`
 	} `yaml:"tokens"`
 }
 
@@ -89,7 +90,7 @@ func LoadTokenTable(path string) (*TokenTable, error) {
 		// and an entry whose meaning depends on which list the reader is looking at
 		// is how a table stops being auditable.
 		if len(e.KBIDs) == 1 && e.KBIDs[0] == "*" {
-			principals[tokenKey(e.Token)] = Principal{AllKBs: true}
+			principals[tokenKey(e.Token)] = Principal{AllKBs: true, StorageAdmin: e.StorageAdmin}
 			continue
 		}
 		grants := make(map[string]Grant, len(e.KBIDs))
@@ -105,7 +106,7 @@ func LoadTokenTable(path string) (*TokenTable, error) {
 		}
 		// No tenant id: the table's unit is the credential, and inventorying
 		// "who" is not something the routing layer needs in order to decide.
-		principals[tokenKey(e.Token)] = Principal{Grants: grants}
+		principals[tokenKey(e.Token)] = Principal{Grants: grants, StorageAdmin: e.StorageAdmin}
 	}
 	return &TokenTable{principals: principals}, nil
 }

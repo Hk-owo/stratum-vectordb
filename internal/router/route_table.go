@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"stratum/internal/storage"
 )
 
 // RouteTable is the service station's cache of what the control layer knows and a
@@ -13,14 +14,15 @@ import (
 // station stamps on a query as the freshness credential (§9.3(2)), and the storage
 // layer's redundancy verdict for the write gate.
 //
-// WHERE a query goes is not in here. The owner set is a pure function of the version and
-// the member list, and a node that cannot serve the version refuses by its own cursor,
-// so the station computes the first and learns the second from refusals (Router.routeTiers).
+// Directory-aware routing takes version, placement and addresses from one cached
+// view. Owner ranking and recent refusals reorder only that KB's valid replicas.
 //
 // Refreshing is periodic and asynchronous by design: §9.3(1) says the table is
 // refreshed in the background rather than consulted per query, so a query costs
 // a map read and the control layer is not on the read path.
 type RouteTable struct {
+	refreshMu sync.Mutex
+	serial    uint64
 	// refresh pulls one snapshot of the world. Supplied by the Router, which
 	// owns the connections.
 	refresh func(context.Context) (routeSnapshot, error)
@@ -39,15 +41,17 @@ type RouteTable struct {
 
 // routeSnapshot is one observation of the cluster.
 type routeSnapshot struct {
+	directory *storage.Directory
+	health    map[string]storage.Health
 	// expected[kbID] is the version that knowledge base should currently be
 	// served at — the control layer's answer, which becomes the freshness
 	// credential on a forwarded query.
 	expected map[string]int64
 
 	// degradation is the control leader's redundancy verdict
-	// (docs/storage-degradation-signal-plan.md §4.3): whether a write can still reach a
+	// (docs/已实施/storage-degradation-signal-plan.md §4.3): whether a write can still reach a
 	// quorum of the replicas that must hold it. There is one replica topology for the
-	// whole cluster, so there is one verdict rather than one per knowledge base.
+	// whole legacy cluster. Directory-aware routing uses the per-KB health map.
 	//
 	// degradationKnown=false is "no information": never "healthy", never "unavailable".
 	// The write gate lets the write through then — see Degradation.
@@ -95,6 +99,19 @@ func (t *RouteTable) Degradation() (verdict degradationVerdict, known bool) {
 		return degradationVerdict{}, false
 	}
 	return t.snapshot.degradation, true
+}
+
+func (t *RouteTable) KBDegradation(kbID string) (degradationVerdict, bool) {
+	if t == nil {
+		return degradationVerdict{}, false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if !t.ready {
+		return degradationVerdict{}, false
+	}
+	h, ok := t.snapshot.health[kbID]
+	return degradationVerdict{degraded: h.Degraded, unavailable: h.Unavailable, detail: h.Detail}, ok && h.Known
 }
 
 // DegradationSummary answers the station's cluster-level questions: the
@@ -165,9 +182,19 @@ func (t *RouteTable) Start(ctx context.Context) {
 // kept: stale routing information is worth more than none, and the freshness
 // credential is what protects the caller from a stale answer in the meantime.
 func (t *RouteTable) Refresh(ctx context.Context) {
+	if t == nil {
+		return
+	}
+	t.refreshMu.Lock()
+	defer t.refreshMu.Unlock()
+	t.refreshLocked(ctx)
+}
+
+func (t *RouteTable) refreshLocked(ctx context.Context) {
 	if t == nil || t.refresh == nil {
 		return
 	}
+	defer func() { t.mu.Lock(); t.serial++; t.mu.Unlock() }()
 	// Bounded, because one control node that never answers must not hold the
 	// snapshot open indefinitely.
 	rctx, cancel := context.WithTimeout(ctx, refreshTimeout)

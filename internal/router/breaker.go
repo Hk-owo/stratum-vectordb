@@ -4,13 +4,14 @@ import (
 	"context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	stratumerrors "stratum/internal/errors"
 	"sync"
 	"time"
 )
 
 // breaker is the §9.5 three-state circuit breaker for one upstream node.
 //
-// Why it exists (Stratum_设计文档v13.md §9.3): the routing layer's only defence
+// Why it exists (docs/参考/历史/Stratum_设计文档v13.md §9.3): the routing layer's only defence
 // against a sick node was "forward, fail, try the next one" — so every client
 // paid the failing node's timeout, every time, until an operator noticed. A
 // breaker moves that cost to where it belongs: the node that is failing.
@@ -191,6 +192,10 @@ func (b *breaker) release() {
 // "not leader" travels as Internal: that is a routing mistake the station
 // corrects by asking someone else, not a mark against the node that said it.
 func nodeLevelFailure(err error) bool {
+	switch stratumerrors.ReasonOf(err) {
+	case "migration_in_progress", "migration_busy", "kb_write_paused":
+		return false
+	}
 	switch status.Code(err) {
 	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted:
 		return true

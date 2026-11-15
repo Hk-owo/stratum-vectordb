@@ -40,6 +40,8 @@ type Grant struct {
 
 // Principal is an authenticated caller.
 type Principal struct {
+	// StorageAdmin is an explicit cluster-management grant, separate from tenant KB access.
+	StorageAdmin bool
 	// TenantID comes from the credential lookup and never from a request field.
 	// A client able to assert its own tenant would make the credential check
 	// decorative: the token may well be valid, but whose it is cannot be the

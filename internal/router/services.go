@@ -2,6 +2,8 @@ package router
 
 import (
 	"context"
+	"google.golang.org/protobuf/proto"
+	"stratum/internal/storage"
 	"strings"
 
 	pb "stratum/api/proto/stratum"
@@ -89,7 +91,7 @@ func (s *KBServer) ListKnowledgeBases(ctx context.Context, req *pb.ListKnowledge
 // — and every entry it returned carries the KB's name, id and embed config. A token
 // granted one KB therefore got an inventory of the whole cluster, which is the half
 // of tenant isolation that does not depend on guessing an id (M16 of
-// docs/code-review-2026-10-18.md). Filtering has to happen here: the service layer
+// docs/参考/code-review-2026-10-18.md). Filtering has to happen here: the service layer
 // has no principal, by design (see authgate's ClientFacing comment), so the station
 // is the only layer that knows who is asking.
 func (s *KBServer) keepVisibleKnowledgeBases(ctx context.Context, resp *pb.ListKnowledgeBasesResponse) *pb.ListKnowledgeBasesResponse {
@@ -146,8 +148,8 @@ func (s *QueryServer) Query(ctx context.Context, req *pb.QueryRequest) (*pb.Quer
 	// A knowledge base with no active version carries no credential: there is no
 	// version to be fresh at, and attaching min_version 0 would have every query
 	// refused by its own credential — version 0 exists nowhere
-	// (docs/cursor-persistence-plan.md §5.3).
-	if req.MinVersion == nil {
+	// (docs/已实施/cursor-persistence-plan.md §5.3).
+	if req.MinVersion == nil && !s.r.requireDirectory {
 		if v, ok := s.r.ExpectedVersion(req.GetKnowledgeBaseId()); ok && v > 0 {
 			req.MinVersion = &v
 		}
@@ -162,7 +164,13 @@ func (s *QueryServer) Query(ctx context.Context, req *pb.QueryRequest) (*pb.Quer
 		queryOpts = append(queryOpts, WithPinnedVersion(v))
 	}
 	resp, err := Forward(s.r, ctx, pb.QueryService_Query_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.QueryResponse, error) {
-		return s.r.querys[idx].Query(ctx, req)
+		if snap, ok := storage.Bound(ctx, req.GetKnowledgeBaseId()); ok && req.MinVersion == nil && snap.ActiveVersion > 0 {
+			boundReq := proto.Clone(req).(*pb.QueryRequest)
+			v := snap.ActiveVersion
+			boundReq.MinVersion = &v
+			return s.r.queryClient(ctx, idx).Query(ctx, boundReq)
+		}
+		return s.r.queryClient(ctx, idx).Query(ctx, req)
 	}, queryOpts...)
 	if err != nil {
 		return nil, err
@@ -179,7 +187,11 @@ func (s *QueryServer) Query(ctx context.Context, req *pb.QueryRequest) (*pb.Quer
 	// flag stays false when the snapshot has no verdict, which is the same value
 	// as "healthy" — see the field's comment in the proto for why that collapse is
 	// deliberate.
-	if degraded, _, known := s.r.routes.DegradationSummary(); known {
+	if s.r.requireDirectory {
+		if health, known := s.r.routes.KBDegradation(req.GetKnowledgeBaseId()); known {
+			resp.StorageDegraded = health.unhealthy()
+		}
+	} else if degraded, _, known := s.r.routes.DegradationSummary(); known {
 		resp.StorageDegraded = degraded
 	}
 	return resp, nil
@@ -200,7 +212,7 @@ func NewAdminServer(r *Router) *AdminServer {
 // HealthCheck proxies the storage node's LOCAL health and appends the one thing
 // that node cannot know: whether the storage layer as a whole is below quorum.
 //
-// The append is the point (docs/storage-degradation-signal-plan.md §10.1). The
+// The append is the point (docs/已实施/storage-degradation-signal-plan.md §10.1). The
 // verdict lives in the control leader's aggregate, and the node answering
 // HealthCheck is a storage node — its "am I the control leader" answer is
 // constant false (RemoteRaftNode.IsLeader), so the line can never come from
@@ -216,7 +228,7 @@ func NewAdminServer(r *Router) *AdminServer {
 // rather than reported twice.
 func (s *AdminServer) HealthCheck(ctx context.Context, req *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
 	resp, err := Forward(s.r, ctx, pb.AdminService_HealthCheck_FullMethodName, "", func(idx int, ctx context.Context) (*pb.HealthCheckResponse, error) {
-		return s.r.admins[idx].HealthCheck(ctx, req)
+		return s.r.adminClient(ctx, idx).HealthCheck(ctx, req)
 	})
 	if err != nil {
 		return nil, err
@@ -238,25 +250,25 @@ func (s *AdminServer) HealthCheck(ctx context.Context, req *pb.HealthCheckReques
 
 func (s *AdminServer) GetSystemStatus(ctx context.Context, req *pb.GetSystemStatusRequest) (*pb.GetSystemStatusResponse, error) {
 	return forwarded(Forward(s.r, ctx, pb.AdminService_GetSystemStatus_FullMethodName, "", func(idx int, ctx context.Context) (*pb.GetSystemStatusResponse, error) {
-		return s.r.admins[idx].GetSystemStatus(ctx, req)
+		return s.r.adminClient(ctx, idx).GetSystemStatus(ctx, req)
 	}))
 }
 
 func (s *AdminServer) GetClusterStatus(ctx context.Context, req *pb.GetClusterStatusRequest) (*pb.GetClusterStatusResponse, error) {
 	return forwarded(Forward(s.r, ctx, pb.AdminService_GetClusterStatus_FullMethodName, "", func(idx int, ctx context.Context) (*pb.GetClusterStatusResponse, error) {
-		return s.r.admins[idx].GetClusterStatus(ctx, req)
+		return s.r.adminClient(ctx, idx).GetClusterStatus(ctx, req)
 	}))
 }
 
 func (s *AdminServer) RebuildIndex(ctx context.Context, req *pb.RebuildIndexRequest) (*pb.RebuildIndexResponse, error) {
 	return forwarded(Forward(s.r, ctx, pb.AdminService_RebuildIndex_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.RebuildIndexResponse, error) {
-		return s.r.admins[idx].RebuildIndex(ctx, req)
+		return s.r.adminClient(ctx, idx).RebuildIndex(ctx, req)
 	}))
 }
 
 func (s *AdminServer) WarmupVersion(ctx context.Context, req *pb.WarmupVersionRequest) (*pb.WarmupVersionResponse, error) {
 	return forwarded(Forward(s.r, ctx, pb.AdminService_WarmupVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.WarmupVersionResponse, error) {
-		return s.r.admins[idx].WarmupVersion(ctx, req)
+		return s.r.adminClient(ctx, idx).WarmupVersion(ctx, req)
 	}))
 }
 
@@ -266,14 +278,14 @@ func (s *AdminServer) WarmupVersion(ctx context.Context, req *pb.WarmupVersionRe
 // does for GetSystemStatus.
 func (s *AdminServer) ListFailedVersions(ctx context.Context, req *pb.ListFailedVersionsRequest) (*pb.ListFailedVersionsResponse, error) {
 	resp, err := Forward(s.r, ctx, pb.AdminService_ListFailedVersions_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ListFailedVersionsResponse, error) {
-		return s.r.admins[idx].ListFailedVersions(ctx, req)
+		return s.r.adminClient(ctx, idx).ListFailedVersions(ctx, req)
 	})
 	if err != nil {
 		return nil, err
 	}
 	// The knowledge base is optional here, so a cluster-wide query is served — and
 	// every entry names a version of somebody's KB. Narrow it the same way
-	// ListKnowledgeBases is narrowed (M16 of docs/code-review-2026-10-18.md).
+	// ListKnowledgeBases is narrowed (M16 of docs/参考/code-review-2026-10-18.md).
 	if s.r.auth == nil || req.GetKnowledgeBaseId() != "" {
 		return resp, nil
 	}
@@ -296,14 +308,14 @@ func (s *AdminServer) ListFailedVersions(ctx context.Context, req *pb.ListFailed
 // operator RPCs and inherits their retry semantics.
 func (s *AdminServer) ForceRetryVersion(ctx context.Context, req *pb.ForceRetryVersionRequest) (*pb.ForceRetryVersionResponse, error) {
 	return forwarded(Forward(s.r, ctx, pb.AdminService_ForceRetryVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ForceRetryVersionResponse, error) {
-		return s.r.admins[idx].ForceRetryVersion(ctx, req)
+		return s.r.adminClient(ctx, idx).ForceRetryVersion(ctx, req)
 	}))
 }
 
 // ForceAbandonVersion proxies an operator's abandonment of a terminated version.
 func (s *AdminServer) ForceAbandonVersion(ctx context.Context, req *pb.ForceAbandonVersionRequest) (*pb.ForceAbandonVersionResponse, error) {
 	return forwarded(Forward(s.r, ctx, pb.AdminService_ForceAbandonVersion_FullMethodName, req.GetKnowledgeBaseId(), func(idx int, ctx context.Context) (*pb.ForceAbandonVersionResponse, error) {
-		return s.r.admins[idx].ForceAbandonVersion(ctx, req)
+		return s.r.adminClient(ctx, idx).ForceAbandonVersion(ctx, req)
 	}))
 }
 

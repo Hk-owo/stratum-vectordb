@@ -30,6 +30,12 @@ import (
 // Keep this list in sync with the RPC sets in the service layer: if a
 // method starts calling RaftNode.Propose*, it becomes a write.
 var writeMethods = map[string]bool{
+	pb.StorageAdminService_GetDirectory_FullMethodName:         true,
+	pb.StorageAdminService_RegisterNodes_FullMethodName:        true,
+	pb.StorageAdminService_ManageNode_FullMethodName:           true,
+	pb.StorageAdminService_MigrateKB_FullMethodName:            true,
+	pb.StorageAdminService_CancelMigration_FullMethodName:      true,
+	pb.StorageAdminService_DrainNode_FullMethodName:            true,
 	pb.KnowledgeBaseService_CreateKnowledgeBase_FullMethodName: true,
 	pb.KnowledgeBaseService_DeleteKnowledgeBase_FullMethodName: true,
 	pb.KnowledgeBaseService_CreateVersion_FullMethodName:       true,
@@ -42,7 +48,7 @@ var writeMethods = map[string]bool{
 	// which is this map's own stated criterion, and both change a version's verdict.
 	// They were missing, so a caller holding only read grants could revoke or abandon
 	// a version AND skip the leader-bound routing every other write takes (M17 of
-	// docs/code-review-2026-10-18.md).
+	// docs/参考/code-review-2026-10-18.md).
 	pb.AdminService_ForceRetryVersion_FullMethodName:   true,
 	pb.AdminService_ForceAbandonVersion_FullMethodName: true,
 }
