@@ -13,7 +13,7 @@ import (
 )
 
 // These tests cover the two changes the CDC plan adds to the write path
-// (docs/content-defined-chunking-plan.md §4 and §3.8). They run the production
+// (docs/已实施/content-defined-chunking-plan.md §4 and §3.8). They run the production
 // splitter — both modes — over the in-memory doubles, so what they exercise is
 // the real decision path, not a stub of it.
 
@@ -189,7 +189,7 @@ func TestWriteCoordinator_SplitsPerKnowledgeBaseMode(t *testing.T) {
 			KBID: "kb-window", Name: "window",
 			// Only code asks for the window; the zero value would be
 			// content-defined chunking, like every knowledge base the API can
-			// create (docs/content-defined-chunking-plan.md §3.6).
+			// create (docs/已实施/content-defined-chunking-plan.md §3.6).
 			ChunkMode:       types.ChunkModeWindow,
 			ChunkWindowSize: 512, ChunkOverlapSize: 64,
 			EmbedConfig: types.EmbedConfig{ServiceAddr: "emb:8080", ModelID: "m1"},

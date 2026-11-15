@@ -520,7 +520,7 @@ func TestLeaderHandler_MetadataEmptyVectors(t *testing.T) {
 }
 
 // TestLeaderHandler_MiddleVersionExportIncludesLaterUpdatedDocs pins C4 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // Exporting a version whose documents have since been updated has to ship the
 // entries visible AT THAT VERSION. The iterator bound used to be the document

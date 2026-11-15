@@ -142,7 +142,7 @@ func (d *LocalDataPlane) MarkVersionContiguous(kbID string, versionID int64) {
 
 // LocalVersionOf reports the highest version this node holds contiguously for
 // kbID (0 = nothing known yet). It is the storage layer's answer to peers
-// looking for a backfill source (Stratum_设计文档v13.md §7.6).
+// looking for a backfill source (docs/参考/历史/Stratum_设计文档v13.md §7.6).
 func (d *LocalDataPlane) LocalVersionOf(kbID string) int64 {
 	return d.localVersionOf(kbID)
 }
@@ -322,7 +322,7 @@ func (d *LocalDataPlane) RecoverLocalCursors(ctx context.Context, meta MetadataL
 	if meta == nil {
 		return nil
 	}
-	// The persisted record comes FIRST (docs/cursor-persistence-plan.md §3.5).
+	// The persisted record comes FIRST (docs/已实施/cursor-persistence-plan.md §3.5).
 	// It is a direct statement of the local fact, so a knowledge base that has
 	// one needs no inference — and the inference below is exactly what the record
 	// exists to replace: it reads an index artifact off this node's disk, and an

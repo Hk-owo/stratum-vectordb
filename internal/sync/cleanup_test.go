@@ -72,7 +72,7 @@ func TestPushHandler_DeleteVersionDataReclaimsLocally(t *testing.T) {
 // there is exactly how leftover bytes lose the last metadata row that could have
 // named them: the broadcaster would read success, the control layer would go on to
 // remove the version, and this node would keep the data with nothing left to
-// notice it (docs/known-gaps.md §B/§C). §10.6 states the principle for the local
+// notice it (docs/未实施/known-gaps.md §B/§C). §10.6 states the principle for the local
 // path — 一个悄悄什么都不做的清理，正是孤儿数据活下来的方式 — and this is its
 // receiving end.
 //
@@ -158,7 +158,7 @@ func startFakeCleanupServer(t *testing.T, srv pb.DataSyncServiceServer) string {
 // that holds nothing reports true (the delete is an idempotent prefix delete), so
 // dropped=false is a peer that could not do the work — and the delete flow has to
 // hear that BEFORE it removes the version's metadata, because afterwards nothing
-// can name this node's leftovers (docs/known-gaps.md §B/§C). Older receiving builds
+// can name this node's leftovers (docs/未实施/known-gaps.md §B/§C). Older receiving builds
 // answered exactly this way when they had no dropper wired.
 func TestVersionDataCleaner_TreatsDroppedFalseAsAFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

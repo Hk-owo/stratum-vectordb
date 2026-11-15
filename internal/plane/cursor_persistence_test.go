@@ -19,7 +19,7 @@ import (
 // countingIndexStore counts IndexExists calls. The whole point of persisting the
 // cursor is that startup stops asking the disk what this node holds: an artifact
 // is a cache the retention policy may delete, so the answer it gives is not a
-// statement of fact (docs/cursor-persistence-plan.md §4).
+// statement of fact (docs/已实施/cursor-persistence-plan.md §4).
 type countingIndexStore struct {
 	stubIndexStore
 	existsCalls int
@@ -110,7 +110,7 @@ func waitForPersistedCursor(t *testing.T, store CursorStore, kbID string, want i
 }
 
 // TestLocalDataPlane_RecoverLocalCursors_PrefersTheRecord is the acceptance case
-// of docs/cursor-persistence-plan.md §4.3: a node that holds v1..v10 but whose
+// of docs/已实施/cursor-persistence-plan.md §4.3: a node that holds v1..v10 but whose
 // artifacts were ALL deleted by the retention policy must come back with a cursor
 // of 10.
 //
@@ -174,7 +174,7 @@ func TestLocalDataPlane_RecoverLocalCursors_FallbackInfersAndPersists(t *testing
 }
 
 // TestLocalDataPlane_CrashBetweenDataAndCursorLeavesTheCursorLow pins the
-// direction of the failure (docs/cursor-persistence-plan.md §3.3): the record may
+// direction of the failure (docs/已实施/cursor-persistence-plan.md §3.3): the record may
 // lag the data, never lead it.
 //
 // The crash is simulated by a store that accepts nothing. In memory the cursor
@@ -222,7 +222,7 @@ func TestLocalDataPlane_CrashBetweenDataAndCursorLeavesTheCursorLow(t *testing.T
 
 // TestLocalDataPlane_EveryAdvancePointPersistsTheCursor drives each path that
 // accounts for a version and asserts that the record followed it. The paths are
-// what docs/cursor-persistence-plan.md §3.2 lists; they all go through
+// what docs/已实施/cursor-persistence-plan.md §3.2 lists; they all go through
 // advanceLocalVersion, and this is what keeps that from being a promise in a
 // comment.
 func TestLocalDataPlane_EveryAdvancePointPersistsTheCursor(t *testing.T) {
@@ -280,7 +280,7 @@ func TestLocalDataPlane_EveryAdvancePointPersistsTheCursor(t *testing.T) {
 }
 
 // TestLocalDataPlane_RecoverLocalCursors_MixesTheRecordAndTheFallback covers the
-// startup step's real shape (docs/cursor-persistence-plan.md §3.5): some knowledge
+// startup step's real shape (docs/已实施/cursor-persistence-plan.md §3.5): some knowledge
 // bases have a persisted cursor and some do not, and the two are decided by
 // DIFFERENT evidence in the SAME pass — the record where there is one, the disk
 // where there is not.
@@ -343,7 +343,7 @@ func TestLocalDataPlane_RecoverLocalCursors_MixesTheRecordAndTheFallback(t *test
 }
 
 // TestLocalDataPlane_RecoverLocalCursors_LogsWhichEvidenceWasUsed pins the
-// observable half of docs/cursor-persistence-plan.md §9: "read the cursor back"
+// observable half of docs/已实施/cursor-persistence-plan.md §9: "read the cursor back"
 // and "inferred it from the disk" have to be distinguishable in the log, because
 // an operator looking at a low cursor needs to know which of the two happened —
 // one is a fact the node recorded, the other is a judgement about files that may

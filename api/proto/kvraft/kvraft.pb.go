@@ -4,7 +4,7 @@
 //
 // Adapted from the KVServer project's raft.proto (an MIT 6.5840-style
 // teaching implementation) as the foundation for Stratum's RaftNode, per
-// Stratum_实现顺序.md 阶段 3: "依赖现有 kvserver Raft，扩展状态机支持知识库和
+// docs/已实施/Stratum_实现顺序.md 阶段 3: "依赖现有 kvserver Raft，扩展状态机支持知识库和
 // 版本元数据". Field-for-field identical to the source proto; only the
 // package/go_package and comment language changed to match this repo's
 // conventions.

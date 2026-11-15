@@ -14,7 +14,7 @@
 // Both usages share the same interface; the distinction is purely in how
 // callers instantiate and scope individual filter instances.
 //
-// See Stratum_接口设计v9.md "BloomFilter" and Stratum_设计文档v10.md
+// See docs/参考/历史/Stratum_接口设计v9.md "BloomFilter" and docs/参考/历史/Stratum_设计文档v10.md
 // "布隆过滤器" for the authoritative design. This file contains only the
 // interface definition; the bits-and-blooms-backed implementation is built
 // in Phase 1 (1-A-4).

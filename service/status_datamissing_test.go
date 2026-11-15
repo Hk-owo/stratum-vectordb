@@ -10,7 +10,7 @@ import (
 
 // TestGetSystemStatus_ReportsDataMissingVersions pins the wiring: a PENDING
 // version that no candidate replica holds shows up in the status response
-// (Stratum_设计文档v13.md §7.12 step ② — surface it instead of letting it look
+// (docs/参考/历史/Stratum_设计文档v13.md §7.12 step ② — surface it instead of letting it look
 // like a slow index build).
 func TestGetSystemStatus_ReportsDataMissingVersions(t *testing.T) {
 	ctx := context.Background()

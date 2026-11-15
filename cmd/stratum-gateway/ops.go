@@ -39,7 +39,7 @@ type opsManager struct {
 // the request guard that stands between a browser and a process manager.
 //
 // Two things make the guard necessary rather than nice to have (H2 of
-// docs/code-review-2026-09-24.md): the console can start, stop and reconfigure
+// docs/参考/code-review-2026-09-24.md): the console can start, stop and reconfigure
 // processes, and the default listener is reachable from a browser. A page on any
 // other origin can POST here without the console's consent — no preflight is
 // involved for a form or a no-cors fetch — and `POST /ops/stop` with an empty
@@ -277,14 +277,14 @@ func (m *opsManager) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	next := *m.cfg
 	// Cluster is the only reference field in OpsConfig, so the copy above would share
 	// its array with the object being replaced. Copy it too, and then publish a NEW
-	// pointer instead of overwriting this one (M15 of docs/code-review-2026-10-18.md):
+	// pointer instead of overwriting this one (M15 of docs/参考/code-review-2026-10-18.md):
 	// the supervisor and every handler that takes `cfg := m.cfg` under m.mu and then
 	// works outside it read a snapshot, so a snapshot must stop changing the moment it
 	// is handed out. Writing through the old pointer raced those readers under a lock
 	// nobody shared.
 	next.Cluster = append([]ClusterNode(nil), m.cfg.Cluster...)
 	// Edits that decide WHAT GETS EXECUTED are refused over HTTP, rather than
-	// silently ignored (H2 of docs/code-review-2026-09-24.md): bin_dir, the
+	// silently ignored (H2 of docs/参考/code-review-2026-09-24.md): bin_dir, the
 	// cluster table forwardNode sends requests to, and the orchestration script
 	// are the difference between "tune a parameter" and "run this program". They
 	// belong to the deployment scripts, which write them next to the config.
@@ -339,7 +339,7 @@ func (m *opsManager) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 // program an operator's request will run, cluster picks the hosts a forwarded
 // /ops request is sent to (SSRF), and station_secret is the key the node trusts.
 // A console that can rewrite them over HTTP is a remote execution endpoint
-// (H2 of docs/code-review-2026-09-24.md), which is why the fix is to refuse the
+// (H2 of docs/参考/code-review-2026-09-24.md), which is why the fix is to refuse the
 // edit rather than to validate it: there is no safe new value for
 // "run this other binary".
 func refuseExecSemanticEdits(cur *OpsConfig, patch OpsConfig) error {
@@ -758,7 +758,7 @@ type dockerClusterPatch struct {
 // handleDockerPutConfig 更新集群级统一参数并持久化（整个集群一起生效）。
 //
 // This is the SECOND way to write the config over HTTP, so it has to obey the same
-// rules as handlePutConfig (C2 of docs/code-review-2026-10-18.md). It used to obey
+// rules as handlePutConfig (C2 of docs/参考/code-review-2026-10-18.md). It used to obey
 // none: `docker.script` was written straight through and `dockerCluster.run` execs
 // that path, which meant one PUT plus POST /ops/docker/up was arbitrary command
 // execution as the gateway — exactly what refusing the same field on /ops/config

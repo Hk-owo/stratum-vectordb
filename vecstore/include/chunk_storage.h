@@ -10,7 +10,7 @@
 //   ChunkStore.Exists         -> ChunkStorage::Exists
 //   ChunkStore.DeleteByKB     -> ChunkStorage::DeleteByPrefix
 //
-// See Stratum_接口设计v9.md "ChunkStorage" for the authoritative design.
+// See docs/参考/历史/Stratum_接口设计v9.md "ChunkStorage" for the authoritative design.
 // This header defines only the interface; the RocksDB-backed
 // implementation is built in Phase 1 (1-B-1).
 #ifndef STRATUM_VECSTORE_CHUNK_STORAGE_H_

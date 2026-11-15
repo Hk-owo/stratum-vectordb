@@ -2,7 +2,7 @@
 // mechanism for both the write path (CreateVersion) and the delete path
 // (DeleteKnowledgeBase).
 //
-// See Stratum_接口设计v9.md "WAL" and Stratum_设计文档v10.md "事务保证（WAL）"
+// See docs/参考/历史/Stratum_接口设计v9.md "WAL" and docs/参考/历史/Stratum_设计文档v10.md "事务保证（WAL）"
 // and "删除知识库" for the authoritative design. This file contains only
 // the interface definition; the on-disk implementation (WALImpl) is built
 // in Phase 2 (2-A).
@@ -85,7 +85,7 @@ type WAL interface {
 	//
 	// kbID is part of the signature because the record now carries it, and that is
 	// what keeps the BEGIN/VERSION_ID pairing exact once writes to different
-	// knowledge bases run concurrently (M7 of docs/code-review-2026-09-24.md). The
+	// knowledge bases run concurrently (M7 of docs/参考/code-review-2026-09-24.md). The
 	// version id alone cannot identify the transaction.
 	WriteVersionID(ctx context.Context, kbID string, versionID int64) error
 
@@ -117,7 +117,7 @@ type WAL interface {
 	WriteVersionDeleteComplete(ctx context.Context, kbID string, versionID int64) error
 
 	// WriteCursor records that this node's CONTIGUOUS data cursor for kbID has
-	// reached versionID (Stratum_设计文档v13.md §7.8). It is a local fact — never
+	// reached versionID (docs/参考/历史/Stratum_设计文档v13.md §7.8). It is a local fact — never
 	// a consensus value — and the record exists so a restart can read the cursor
 	// back instead of inferring it: the cursor lives in memory, and the disk
 	// facts it used to be inferred from (an index artifact) are a cache the

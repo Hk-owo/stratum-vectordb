@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # kb-create.sh — 创建知识库。
 #
-# 注意：创建知识库**不再产生初始版本**（docs/cursor-persistence-plan.md §5，
+# 注意：创建知识库**不再产生初始版本**（docs/已实施/cursor-persistence-plan.md §5，
 # CreateKnowledgeBaseResponse.initial_version_id 恒为 0）。第一个版本由第一次
 # 写入产生，见 kb-version-create.sh；在那之前知识库是空的，也仍然可查询。
 #

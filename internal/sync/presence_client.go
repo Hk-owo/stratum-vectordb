@@ -14,7 +14,7 @@ import (
 // control layer's side of DataSyncService.VersionPresence. A version that no
 // candidate replica holds is one whose data never landed anywhere, as opposed
 // to one that is merely waiting for its index build
-// (Stratum_设计文档v13.md §7.12 step ①).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.12 step ①).
 type PresenceChecker struct {
 	dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 }
@@ -42,7 +42,7 @@ func NewPresenceChecker(cfg PresenceCheckerConfig) *PresenceChecker {
 
 // LocalVersionQuerier asks a peer how far its contiguous history reaches —
 // the query a lagging node uses to pick a backfill source instead of always
-// asking the leader (Stratum_设计文档v13.md §7.6). It shares
+// asking the leader (docs/参考/历史/Stratum_设计文档v13.md §7.6). It shares
 // PresenceCheckerConfig: both are just "how to dial a peer".
 type LocalVersionQuerier struct {
 	dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
@@ -96,7 +96,7 @@ func NewVersionDataCleaner(cfg PresenceCheckerConfig) *VersionDataCleaner {
 // that holds nothing answers true — the reclaim is an idempotent prefix delete —
 // so false means the reclaim did not run, and the caller has to hear it BEFORE
 // the version's metadata is removed: once that row is gone, nothing can name this
-// node's leftover bytes again (docs/known-gaps.md §B/§C). A peer answering it
+// node's leftover bytes again (docs/未实施/known-gaps.md §B/§C). A peer answering it
 // without an error is an older build of the receiving side, which reported
 // "no dropper wired" that way.
 func (c *VersionDataCleaner) DeleteVersionData(ctx context.Context, peerAddr, kbID string, versionID int64, reason string) error {

@@ -8,7 +8,7 @@ import (
 	"stratum/internal/types"
 )
 
-// TestFileWAL follows the T1-6 case table in Stratum_测试顺序.md exactly,
+// TestFileWAL follows the T1-6 case table in docs/已实施/Stratum_测试顺序.md exactly,
 // run against the real file-backed implementation. Written before
 // FileWAL exists (TDD): this file does not compile until file.go is
 // added.

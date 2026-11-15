@@ -9,7 +9,7 @@ import (
 )
 
 // TestLocalDataPlane_ReportsVersionEventsToTheStateMachine pins the wiring in
-// docs/storage-node-state-machine-plan.md §7: the version-layer events only this
+// docs/已实施/storage-node-state-machine-plan.md §7: the version-layer events only this
 // layer can observe reach the machine — and, just as importantly, the two "the
 // cursor moved" paths report OPPOSITE facts. A landing and a version that will
 // never arrive both advance the cursor, and telling them apart is the whole
@@ -25,7 +25,7 @@ func TestLocalDataPlane_ReportsVersionEventsToTheStateMachine(t *testing.T) {
 	}
 
 	// Scheduling a build from HERE must leave the version layer alone: the index
-	// manager owns that transition (docs/…plan.md §7 item 4), because it is the
+	// manager owns that transition (docs/已实施/storage-node-state-machine-plan.md §7 item 4), because it is the
 	// single entry point every build passes through — a second reporter would be
 	// exactly the two-sources-for-one-fact problem the machine exists to end.
 	//

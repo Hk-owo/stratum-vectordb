@@ -7,7 +7,7 @@ import (
 	"stratum/internal/types"
 )
 
-// TestMockWAL follows the T1-6 case table in Stratum_测试顺序.md, adapted
+// TestMockWAL follows the T1-6 case table in docs/已实施/Stratum_测试顺序.md, adapted
 // to the in-memory record log MockWAL exposes (Truncate / PendingVersionIDs)
 // in place of real file truncation.
 func TestMockWAL(t *testing.T) {
@@ -186,7 +186,7 @@ func mustWriteBegin(t *testing.T, w *MockWAL) {
 func mustWriteVersionID(t *testing.T, w *MockWAL, versionID int64) {
 	t.Helper()
 	// The helper's BEGIN carries no kbID, and pairing is per knowledge base now
-	// (M7 of docs/code-review-2026-09-24.md), so the VERSION_ID says the same.
+	// (M7 of docs/参考/code-review-2026-09-24.md), so the VERSION_ID says the same.
 	if err := w.WriteVersionID(context.Background(), "", versionID); err != nil {
 		t.Fatalf("WriteVersionID(%d): %v", versionID, err)
 	}

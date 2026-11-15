@@ -5,7 +5,7 @@ import "sync"
 // KBLockSet hands out one write lock per knowledge base.
 //
 // Why per knowledge base and not one global lock (M7 of
-// docs/code-review-2026-09-24.md): the lock is held across the whole CreateVersion
+// docs/参考/code-review-2026-09-24.md): the lock is held across the whole CreateVersion
 // transaction, which includes a Raft round trip (ProposeCreateVersion) and, on the
 // non-dispatch path, the storage layer's fan-out. With a single lock that is a
 // cluster-wide serialization: every write to every knowledge base waits behind the

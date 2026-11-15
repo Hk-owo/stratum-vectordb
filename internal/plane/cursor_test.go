@@ -56,7 +56,7 @@ func TestLocalDataPlane_LocalVersionCursorOnlyMovesForward(t *testing.T) {
 }
 
 // A node that knows it is behind fills the gap in order before applying the
-// newer version (Stratum_设计文档v13.md §7.5).
+// newer version (docs/参考/历史/Stratum_设计文档v13.md §7.5).
 func TestLocalDataPlane_BackfillClosesKnownGap(t *testing.T) {
 	puller := &recordingPuller{}
 	dp := newCursorPlane(puller)

@@ -43,7 +43,7 @@ type LocalVersionLister interface {
 
 // DeletedVersionLeftovers reports, per knowledge base, the version ids this node still
 // holds documents for while the control layer no longer has them — the "local leftovers"
-// of docs/known-gaps.md §B/§C.
+// of docs/未实施/known-gaps.md §B/§C.
 //
 // "No longer has them" is judged from CURRENT state (alive-in-range plus the allocation
 // bound), never from a removal record: a removal record is history that pruning can drop,

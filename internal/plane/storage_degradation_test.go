@@ -9,7 +9,7 @@ import (
 
 // A quorum of live replicas is the bar. Below it a write cannot reach its
 // durability target, and naming that state is what this signal exists for
-// (docs/storage-degradation-signal-plan.md §3.1).
+// (docs/已实施/storage-degradation-signal-plan.md §3.1).
 func TestLivenessRegistry_DegradeBelowQuorum(t *testing.T) {
 	reg := NewLivenessRegistry()
 	reg.Record(1)
@@ -88,7 +88,7 @@ func TestLivenessRegistry_DegradeWindowIsTheHysteresis(t *testing.T) {
 }
 
 // The two failure tiers are separate states, and the boundary between them is
-// exactly "is anyone at all still answering" (docs/storage-degradation-signal-plan.md
+// exactly "is anyone at all still answering" (docs/已实施/storage-degradation-signal-plan.md
 // §4.1): one live replica out of three is degraded, zero is unavailable.
 func TestLivenessRegistry_DegradeTiers(t *testing.T) {
 	reg := NewLivenessRegistry()

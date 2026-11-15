@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
 
   // index_dirs is the allow-list for the on-disk index RPCs (Save / Load /
   // LoadForAppend / ExistsIndex), which otherwise take any path a caller names
-  // (M4 of docs/code-review-2026-09-24.md). Comma-separated, because a node may
+  // (M4 of docs/参考/code-review-2026-09-24.md). Comma-separated, because a node may
   // legitimately keep indexes under more than one root.
   //
   // Unset means `<rocksdb_path>/../index` — the parent directory's `index`
@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
   // whatever path it is handed through a temp file and a rename, so one call naming
   // `<rocksdb>/CURRENT` (or `MANIFEST-*`, or an `.sst`) replaces RocksDB's own engine
   // file — and the store does not open again (C3 of
-  // docs/code-review-2026-10-18.md).
+  // docs/参考/code-review-2026-10-18.md).
   std::vector<std::string> index_dirs;
   for (size_t start = 0; start <= index_dir_flag.size();) {
     const size_t comma = index_dir_flag.find(',', start);
@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
   // The chunk store's own directory is excluded at the RPC (see
   // IndexPathAllowed): the allow-list confines Save/Load, and a root that happens to
   // contain the store would otherwise let one Save() replace RocksDB's engine files
-  // (C3 of docs/code-review-2026-10-18.md).
+  // (C3 of docs/参考/code-review-2026-10-18.md).
   g_server = std::make_unique<stratum::vecstore::VecstoreGrpcServer>(
       std::move(storage_or.value()), index_dirs, keepalive,
       std::vector<std::string>{rocksdb_path});

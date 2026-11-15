@@ -16,7 +16,7 @@ import (
 )
 
 // searchRequest builds the vector-store search request, applying the node's
-// coarse-pass budget when one is configured (Stratum_设计文档v12.md §2.2).
+// coarse-pass budget when one is configured (docs/参考/历史/Stratum_设计文档v12.md §2.2).
 //
 // CandidateN stays unset at zero on purpose: the vector store already reads 0
 // as "use my own default" (clamp(top_k × 8, 16, 4096)), and leaving the field
@@ -112,7 +112,7 @@ func (im *IndexManagerImpl) Search(ctx context.Context, kbID string, versionID i
 	// index for it. Falling through to acquire() in this state is what turned "a
 	// build is in progress" into a load_wait_timeout stall followed by
 	// ErrIndexLoadTimeout, for versions of a dozen chunks whose scan takes
-	// microseconds (docs/stress-test-report.md §E.4).
+	// microseconds (docs/参考/stress-test-report.md §E.4).
 	//
 	// Deliberately no loadFromDisk on this path: loading==true means the artifact
 	// for this key is being written right now, and reading a half-written one is
@@ -242,7 +242,7 @@ func (im *IndexManagerImpl) searchLoaded(ctx context.Context, key indexKey, vect
 // for.
 //
 // It does NOT schedule a build. The two-step rule that decides "ask a peer, then build"
-// (docs/index-owner-sharding-plan.md §4.2) belongs to the caller, which can run it off the
+// (docs/已实施/index-owner-sharding-plan.md §4.2) belongs to the caller, which can run it off the
 // request: doing it here as well would build twice, and a build for an artifact that is
 // already finished is a full rebuild.
 //

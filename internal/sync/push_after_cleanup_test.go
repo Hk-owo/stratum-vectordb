@@ -27,7 +27,7 @@ func (d reclaimDropper) DropVersionStorage(ctx context.Context, kbID string, ver
 }
 
 // TestPushHandler_PushAfterACleanupWritesTheVersionBack pins the source of the
-// leftover window docs/known-gaps.md §B/§C describes, and it is the one that needs
+// leftover window docs/未实施/known-gaps.md §B/§C describes, and it is the one that needs
 // NO failure at all:
 //
 //   - fanOut returns the instant QUORUM is satisfied and lets the remaining pushes

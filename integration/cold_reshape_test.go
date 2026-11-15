@@ -74,13 +74,13 @@ func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) 
 }
 
 // TestRealStack_ColdRebuildReplacesOnlyTheLocalArtifact is the cluster-level proof
-// of the last piece of Stratum_设计文档v13.md §8.6(a): a version that has gone
+// of the last piece of docs/参考/历史/Stratum_设计文档v13.md §8.6(a): a version that has gone
 // cold is rebuilt in the graph-free shape, and §8.4's callback chain is what
 // puts that rebuild through — no new channel.
 //
 // What the rebuild does NOT do, now that §8.4(a)'s presence probe has landed, is
 // replace a replica's artifact. The probe answers "do you already have it", not
-// "is yours the same shape" (docs/index-push-probe-plan.md §3, with the
+// "is yours the same shape" (docs/参考/历史/index-push-probe-plan.md §3, with the
 // content-level tightening that would change that deliberately left to §10.1),
 // so a replica already holding the version keeps its own copy. That is the trade
 // the plan records as acceptable: the two shapes are retrieval-equivalent

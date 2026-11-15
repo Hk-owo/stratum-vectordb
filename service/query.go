@@ -60,14 +60,14 @@ type QueryServiceImpl struct {
 
 	// indexFetcher asks the other replicas for a version's built index. It is what
 	// keeps a replica that does not build for itself (not the version's owner
-	// head, docs/index-owner-sharding-plan.md §5.2) from staying cold forever
+	// head, docs/已实施/index-owner-sharding-plan.md §5.2) from staying cold forever
 	// when §8.4's fire-and-forget push never reached it. Optional: without it the
 	// PENDING path builds locally, which is the behaviour before on-demand fetch.
 	indexFetcher IndexFetcher
 
 	// pulls records the catch-up goroutines in flight, keyed by (kbID, versionID),
 	// so a burst of queries on a lagging replica starts ONE pull rather than one
-	// each (M1 of docs/code-review-2026-09-24.md). Guarded by pullMu and created
+	// each (M1 of docs/参考/code-review-2026-09-24.md). Guarded by pullMu and created
 	// lazily by beginPull: a node that never answers a lagging query never needs
 	// the map at all.
 	pullMu sync.Mutex
@@ -77,7 +77,7 @@ type QueryServiceImpl struct {
 // pullKey identifies one in-flight catch-up: this node's history for one
 // knowledge base up to one version.
 // pullKey is the de-duplication key for a background catch-up, and it holds the
-// knowledge base ONLY (M2 of docs/code-review-2026-10-18.md).
+// knowledge base ONLY (M2 of docs/参考/code-review-2026-10-18.md).
 //
 // It used to be (kbID, versionID), which made the de-duplication trivially
 // bypassable: nothing bounds min_version, so a caller that alternated two values had
@@ -215,7 +215,7 @@ const indexWarmupBudget = 5 * time.Minute
 // someone else (retryably) while the pull runs to completion behind it, and the
 // next query is served from here.
 //
-// What is new here (M1 of docs/code-review-2026-09-24.md) is the de-duplication.
+// What is new here (M1 of docs/参考/code-review-2026-09-24.md) is the de-duplication.
 // The pull is idempotent — EnsureIndex re-checks the cursor on every pass and
 // returns as soon as it is satisfied — so overlapping pulls bought nothing while
 // costing a full transfer each: N concurrent queries on a lagging replica meant N
@@ -427,7 +427,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 				// Re-triggering is harmless: EnsureIndex re-checks the cursor on every
 				// pass and returns immediately once it is satisfied (see its pull loop).
 				//
-				// M1 of docs/code-review-2026-09-24.md: "harmless" was true of the
+				// M1 of docs/参考/code-review-2026-09-24.md: "harmless" was true of the
 				// WORK but not of the cost. Every query that missed on the same
 				// (kbID, version) started its own goroutine and its own four-attempt
 				// full pull, so N concurrent queries meant N pulls of the same
@@ -468,7 +468,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		if versionID == 0 {
 			// A knowledge base with nothing written yet has NO active version, and
 			// that is an empty result rather than a missing one
-			// (docs/cursor-persistence-plan.md §5.1): a version now comes into
+			// (docs/已实施/cursor-persistence-plan.md §5.1): a version now comes into
 			// existence only when something is written, so refusing here would make
 			// "create a knowledge base, then query it" fail against a knowledge
 			// base that has done nothing wrong — it is simply unpopulated.

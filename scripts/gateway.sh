@@ -85,7 +85,7 @@ ensure_station_credentials() {
     (umask 077; printf 'console-%s' "$(random_hex 16)" >"$CONSOLE_TOKEN_FILE")
   fi
   cat >"$STATION_TOKENS_FILE" <<EOF
-# 服务站凭据表 — 由 scripts/gateway.sh 生成（H3 of docs/code-review-2026-09-24.md）。
+# 服务站凭据表 — 由 scripts/gateway.sh 生成（H3 of docs/参考/code-review-2026-09-24.md）。
 #
 # kb_ids: ["*"] 表示"所有知识库，包括以后创建的"：kbID 由服务端随机生成
 # （service.generateKBID），静态表列不出将来的 id。

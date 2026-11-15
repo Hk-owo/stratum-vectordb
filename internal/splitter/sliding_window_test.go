@@ -8,7 +8,7 @@ import (
 )
 
 // TestSlidingWindowSplitter follows the T1-5 case table in
-// Stratum_测试顺序.md.
+// docs/已实施/Stratum_测试顺序.md.
 func TestSlidingWindowSplitter(t *testing.T) {
 	s := NewSlidingWindowSplitter()
 

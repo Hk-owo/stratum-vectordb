@@ -13,7 +13,7 @@ import "stratum/internal/types"
 // The boundaries depend on nothing but the offset from the start of the
 // document, which is exactly why a mid-document insertion or deletion shifts
 // every chunk after it and invalidates their IDs
-// (docs/content-defined-chunking-plan.md §1.2). CDCSplitter is the
+// (docs/已实施/content-defined-chunking-plan.md §1.2). CDCSplitter is the
 // content-defined alternative; this one stays as the default mode and as the
 // baseline the CDC tests compare against.
 type SlidingWindowSplitter struct{}

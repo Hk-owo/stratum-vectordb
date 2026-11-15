@@ -47,7 +47,7 @@ func (b *blockingBackfiller) calls() int {
 	return b.n
 }
 
-// M1 of docs/code-review-2026-09-24.md: every query that missed on the same
+// M1 of docs/参考/code-review-2026-09-24.md: every query that missed on the same
 // (kbID, version) used to start its own goroutine and its own four-attempt full
 // pull, so N concurrent queries on a lagging replica were N full transfers of one
 // version — amplification anyone able to send queries could ask for, and the

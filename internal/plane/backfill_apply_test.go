@@ -17,7 +17,7 @@ import (
 //   - fan-out would push the version at the very peers this node is copying it
 //     from — a node catching up does not notify the nodes it is learning from;
 //   - the durable report would claim durability on this node's single copy,
-//     which is not a quorum (docs/known-gaps.md §K); the path arms the §7.3
+//     which is not a quorum (docs/未实施/known-gaps.md §K); the path arms the §7.3
 //     quorum check instead, and that check announces only if a quorum holds it;
 //   - the index build would spend work on a historical version that, per §8.6b,
 //     may never be queried;

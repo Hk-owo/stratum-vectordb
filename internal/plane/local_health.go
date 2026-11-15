@@ -6,7 +6,7 @@ import (
 )
 
 // LocalHealthView is one node's own record of which peers it has recently been
-// able to reach (Stratum_设计文档v13.md §7.13.5).
+// able to reach (docs/参考/历史/Stratum_设计文档v13.md §7.13.5).
 //
 // It is deliberately small, and every property below comes straight from that
 // section:

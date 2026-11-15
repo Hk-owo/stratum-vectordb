@@ -1,6 +1,6 @@
 package main
 
-// auth_config_test.go — H4 of docs/code-review-2026-09-24.md, the configuration half.
+// auth_config_test.go — H4 of docs/参考/code-review-2026-09-24.md, the configuration half.
 //
 // The node now verifies the service station's trust mark with an HMAC under a shared
 // secret, and a node that HOLDS that secret is, by that fact, part of a deployment

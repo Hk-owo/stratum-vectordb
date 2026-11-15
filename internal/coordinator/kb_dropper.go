@@ -24,7 +24,7 @@ import (
 // mappings, version→doc lists — are storage-layer business; on a node that
 // keeps no storage of its own there is nothing local to delete, and reclaiming
 // becomes a broadcast to the nodes that do hold the data
-// (Stratum_设计文档v13.md §7.0 的契约边界、§11 阶段 ④).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.0 的契约边界、§11 阶段 ④).
 type KBStorageDropper interface {
 	DropKnowledgeBase(ctx context.Context, kbID string) error
 }
@@ -170,7 +170,7 @@ func (ds KBStorageDroppers) DropKnowledgeBase(ctx context.Context, kbID string) 
 // It is the per-version counterpart of KBStorageDropper, and it exists for the
 // same reason: the delete-version flow decides *that* a version is gone, while
 // where its bytes are and which of them a survivor still reads is the storage
-// layer's business (Stratum_设计文档v13.md §7.0).
+// layer's business (docs/参考/历史/Stratum_设计文档v13.md §7.0).
 type VersionStorageDropper interface {
 	DropVersion(ctx context.Context, kbID string, versionID int64) error
 }

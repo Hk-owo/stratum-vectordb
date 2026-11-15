@@ -48,7 +48,7 @@ func (c *recordingDeleteCoordinator) calls() []string {
 }
 
 // TestDeletingKBSweeper_ResumesEveryKBMarkedDeleting pins M3 of
-// docs/code-review-2026-10-18.md: a knowledge base marked DELETING whose cleanup
+// docs/参考/code-review-2026-10-18.md: a knowledge base marked DELETING whose cleanup
 // never ran (the process died between the Raft proposal and the goroutine that
 // writes the WAL delete mark) has no other repair — the WAL has no record and no
 // pass looks for a KB still present in the metadata. The sweep is that repair.

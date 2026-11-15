@@ -1,9 +1,9 @@
 // Package client is a minimal Stratum client: the caller's side of
-// docs/client-integration-guide.md, written down as code.
+// docs/参考/client-integration-guide.md, written down as code.
 //
 // It is deliberately NOT an SDK — no retry policy, no connection pool, no
 // framework. What it provides is the part every caller has to get right on its
-// own (docs/await-version-plan.md §12 item 4): a durable local record of each
+// own (docs/已实施/await-version-plan.md §12 item 4): a durable local record of each
 // in-flight batch. The cluster holds no changes for anyone (the only persistent
 // copy outside this process appears once the coordinator writes its WAL BEGIN),
 // so that record is what turns "re-send or give up" from a slogan into a
@@ -205,7 +205,7 @@ const (
 // replica holds this data" (data_missing), but whether the changes still exist
 // anywhere is a fact only the caller has. That is why the server reports the
 // fact and the caller decides, and why a caller that has thrown its changes away
-// can only discard (docs/client-integration-guide.md §7).
+// can only discard (docs/参考/client-integration-guide.md §7).
 func Decide(resp *pb.AwaitVersionResponse, haveChanges bool) Decision {
 	switch resp.GetStage() {
 	case stageIndexReady:

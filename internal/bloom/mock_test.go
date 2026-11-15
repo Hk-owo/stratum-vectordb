@@ -4,7 +4,7 @@ import "testing"
 
 // TestMockBloomFilter sanity-checks the in-memory mock's behavior, mirroring
 // the functional (non-false-positive-rate) case shapes from T1-4 in
-// Stratum_测试顺序.md. False-positive-rate testing is out of scope for this
+// docs/已实施/Stratum_测试顺序.md. False-positive-rate testing is out of scope for this
 // mock by design — see the MockBloomFilter doc comment — and belongs to the
 // real bits-and-blooms-backed implementation's own T1-4 suite in Phase 1.
 func TestMockBloomFilter(t *testing.T) {

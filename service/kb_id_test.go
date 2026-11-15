@@ -9,7 +9,7 @@ import (
 	pb "stratum/api/proto/stratum"
 )
 
-// H1 of docs/code-review-2026-09-24.md: kbID names the knowledge base's on-disk
+// H1 of docs/参考/code-review-2026-09-24.md: kbID names the knowledge base's on-disk
 // directory, so nothing the caller sent may appear in it. The name is folded in
 // by nothing here on purpose — it is a label, and it is stored as one.
 func TestCreateKnowledgeBase_IDCarriesNothingTheCallerSent(t *testing.T) {

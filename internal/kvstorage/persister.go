@@ -5,7 +5,7 @@
 //
 // Adapted from the KVServer project's internal/storage/persistent.go (an
 // MIT 6.5840-style teaching implementation), which Stratum's RaftNode
-// builds on per Stratum_实现顺序.md 阶段 3. The original used gob encoding
+// builds on per docs/已实施/Stratum_实现顺序.md 阶段 3. The original used gob encoding
 // and an atomic-rename write pattern; both are preserved here as sound,
 // simple choices — only documentation, naming, and a couple of minor
 // safety details (directory creation error handling) were adjusted to
@@ -153,7 +153,7 @@ func (p *Persister) LoadSnapshot() (data []byte, lastIndex uint64, err error) {
 // sync, the rename itself may not have reached disk. Either way the result is a
 // state file that fails to decode on the next start — and for Raft's hard state
 // that means term 0 / no vote / empty log, which lets the node vote twice in one
-// term (H4 of docs/code-review-2026-10-18.md).
+// term (H4 of docs/参考/code-review-2026-10-18.md).
 func atomicWriteGob(path string, val any) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

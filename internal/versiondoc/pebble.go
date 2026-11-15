@@ -12,7 +12,7 @@ import (
 
 // PebbleVersionDocList is the real, disk-persistent VersionDocList
 // implementation, backed by PebbleDB. Key layout (see
-// Stratum_设计文档v10.md "版本文档列表"):
+// docs/参考/历史/Stratum_设计文档v10.md "版本文档列表"):
 //
 //	EncodeString(kbID) + EncodeVersionID(versionID) + EncodeString(docID)
 //

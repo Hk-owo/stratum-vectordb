@@ -1,4 +1,4 @@
-// Two-tier topology tests (Stratum_设计文档v13.md §11 阶段 ④「存储集群独立进程」).
+// Two-tier topology tests (docs/参考/历史/Stratum_设计文档v13.md §11 阶段 ④「存储集群独立进程」).
 //
 // These exercise what the split is for, and what the all-in-one T4 suite in
 // docker_test.go cannot see: the control tier commits a write and the storage

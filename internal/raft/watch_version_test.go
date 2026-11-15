@@ -8,7 +8,7 @@ import (
 )
 
 // The watcher is what takes await's latency from "up to one poll" to "as soon as
-// the apply lands" (docs/await-version-plan.md §12 item 1). What it has to get
+// the apply lands" (docs/已实施/await-version-plan.md §12 item 1). What it has to get
 // right is its edges: it fires on state changes, it stops when told, and it never
 // blocks the apply loop.
 

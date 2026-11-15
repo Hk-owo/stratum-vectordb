@@ -5,7 +5,7 @@
 // RocksDB (ChunkStorage); ChunkStore is purely a client wrapper. No vector
 // data is duplicated in PebbleDB.
 //
-// See Stratum_接口设计v9.md "ChunkStore" and Stratum_设计文档v10.md
+// See docs/参考/历史/Stratum_接口设计v9.md "ChunkStore" and docs/参考/历史/Stratum_设计文档v10.md
 // "chunk store" for the authoritative design. This file contains only the
 // interface definition; the gRPC-backed implementation (VecstoreChunkStore)
 // is built in Phase 2 (2-B), against the real vecstore gRPC server from

@@ -2,7 +2,7 @@ package index
 
 // quantizer_build_test.go — verifies that async builds forward the
 // KB-level quantizer configuration (read via SetKBMetaGetter) in the
-// vecstore Build RPC (Stratum_设计文档v12.md 2.4 "透传路径").
+// vecstore Build RPC (docs/参考/历史/Stratum_设计文档v12.md 2.4 "透传路径").
 
 import (
 	"context"

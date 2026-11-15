@@ -10,7 +10,7 @@ import (
 // The holders cache keeps this node's latest answer to "which peers can serve this
 // knowledge base", so the data-source lookup can answer when §8.5's announced-holder
 // table misses — instead of falling through to the leader, which in a two-tier deployment
-// exports no data at all (docs/data-source-holders-fallback-plan.md).
+// exports no data at all (docs/已实施/data-source-holders-fallback-plan.md).
 //
 // The one hard constraint it is built around: that lookup runs on the Raft apply path
 // (replaying history re-runs every CreateVersion through it), so reading the answer must

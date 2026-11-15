@@ -7,7 +7,7 @@ import (
 )
 
 // TestPebbleVersionDocList follows the T1-3 case table in
-// Stratum_测试顺序.md exactly, run against the real PebbleDB-backed
+// docs/已实施/Stratum_测试顺序.md exactly, run against the real PebbleDB-backed
 // implementation. Written before PebbleVersionDocList exists (TDD): this
 // file does not compile until pebble.go is added.
 func TestPebbleVersionDocList(t *testing.T) {

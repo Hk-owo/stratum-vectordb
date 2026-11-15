@@ -11,7 +11,7 @@ import (
 
 // TestFileWAL_CursorRoundTrip pins the record's whole reason for existing: a
 // cursor written before a restart is read back after one, with no inference in
-// between (docs/cursor-persistence-plan.md §3).
+// between (docs/已实施/cursor-persistence-plan.md §3).
 func TestFileWAL_CursorRoundTrip(t *testing.T) {
 	path := tempWALPath(t)
 	w := mustOpenFileWAL(t, path)
@@ -73,7 +73,7 @@ func TestFileWAL_CursorIsMonotone(t *testing.T) {
 }
 
 // TestFileWAL_CompactKeepsTheNewestCursorAndIgnoresTheReclaimWatermark covers
-// both halves of docs/cursor-persistence-plan.md §3.4 in one log: the newest
+// both halves of docs/已实施/cursor-persistence-plan.md §3.4 in one log: the newest
 // cursor of a knowledge base survives compaction even when EVERY change of that
 // knowledge base is reclaimed, and the older cursor records do not.
 func TestFileWAL_CompactKeepsTheNewestCursorAndIgnoresTheReclaimWatermark(t *testing.T) {
@@ -129,7 +129,7 @@ func TestFileWAL_CompactKeepsTheNewestCursorAndIgnoresTheReclaimWatermark(t *tes
 // An older log has no CURSOR records at all. Recovery must answer "nothing
 // recorded" rather than fail — and must not invent a 0 for the knowledge bases it
 // finds in the other records, because "no record" and "cursor 0" mean different
-// things to the caller (docs/cursor-persistence-plan.md §3.5).
+// things to the caller (docs/已实施/cursor-persistence-plan.md §3.5).
 func TestFileWAL_RecoverCursorsOnAnOlderLogIsEmpty(t *testing.T) {
 	path := tempWALPath(t)
 	w := mustOpenFileWAL(t, path)

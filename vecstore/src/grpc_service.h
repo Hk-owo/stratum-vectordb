@@ -4,7 +4,7 @@
 // instances, and hosts a real grpc::Server.
 //
 // This is the Go <-> C++ internal communication entry point referenced
-// throughout Stratum_接口设计v9.md as "[内部 gRPC]" — Go-side ChunkStore and
+// throughout docs/参考/历史/Stratum_接口设计v9.md as "[内部 gRPC]" — Go-side ChunkStore and
 // IndexManager are gRPC clients of this server.
 #ifndef STRATUM_VECSTORE_SRC_GRPC_SERVICE_H_
 #define STRATUM_VECSTORE_SRC_GRPC_SERVICE_H_
@@ -62,7 +62,7 @@ class ChunkStorageServiceImpl final : public ::vecstore::ChunkStorageService::Se
 // not-yet-seen key) and looked up by key for Search/Save/Reset.
 //
 // Concrete VectorIndex instances are always HNSWVectorIndex today (the
-// only real implementation; see Stratum_设计文档v10.md "当前实现：仅
+// only real implementation; see docs/参考/历史/Stratum_设计文档v10.md "当前实现：仅
 // HNSW").
 //
 // Cancellation is handled in two places on purpose: every RPC checks
@@ -77,7 +77,7 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // filesystem path straight from the wire: without this, any caller that can
   // reach the vecstore port reads and writes arbitrary files as the vecstore
   // process — with the port unauthenticated, that is "whoever can connect"
-  // (M4 of docs/code-review-2026-09-24.md).
+  // (M4 of docs/参考/code-review-2026-09-24.md).
   //
   // Passed in normalized (see NormalizeIndexDirs in grpc_service.cpp). Empty means
   // every path is refused: a vecstore that was not told where its indexes live has
@@ -87,7 +87,7 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // allow-list is the only thing confining Save/Load, and a root that CONTAINS the
   // store confines them to include it — one Save() naming <rocksdb>/CURRENT replaces
   // RocksDB's engine file and the store never opens again (C3 of
-  // docs/code-review-2026-10-18.md). Excluded at the RPC rather than by refusing to
+  // docs/参考/code-review-2026-10-18.md). Excluded at the RPC rather than by refusing to
   // start, so a wide root stays usable for what it is for (tests, ad-hoc runs) while
   // the store's own files stay unreachable.
   VectorIndexServiceImpl(ChunkStorage* storage, std::vector<std::string> index_dirs,
@@ -144,7 +144,7 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // What makes the unlocked use safe:
   //   - the object outlives the caller's reference. Instances are shared_ptr, so
   //     a concurrent Drop or reshape may drop the map's reference without
-  //     freeing one that is still in use (H6 of docs/code-review-2026-09-24.md);
+  //     freeing one that is still in use (H6 of docs/参考/code-review-2026-09-24.md);
   //   - two RPCs on the SAME key stay serialized, by the instance's own
   //     state_mu_: the exclusive lock covers Build / AddChunks / Save / Load /
   //     LoadForAppend / RemoveChunks / Reset, the shared lock covers the Search
@@ -197,7 +197,7 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   static bool FileExists(const std::string& path);
 
   // IndexPathAllowed reports whether path may be touched, and why not when it may
-  // not. Every on-disk RPC goes through it (M4 of docs/code-review-2026-09-24.md).
+  // not. Every on-disk RPC goes through it (M4 of docs/参考/code-review-2026-09-24.md).
   bool IndexPathAllowed(const std::string& path, std::string* reason) const;
 
   // index_dirs_ are the normalized allowed roots (see the constructor).
@@ -228,7 +228,7 @@ class VectorIndexServiceImpl final : public ::vecstore::VectorIndexService::Serv
   // a Save or a Load is still working through its own copy. Keeping the object
   // alive until the last copy goes away is what makes the unlocked use safe;
   // with unique_ptr it was a use-after-free (H6 of
-  // docs/code-review-2026-09-24.md).
+  // docs/参考/code-review-2026-09-24.md).
   std::map<IndexKey, std::shared_ptr<VectorIndex>> indexes_;
   ChunkStorage* storage_;  // not owned; supplied by VecstoreGrpcServer
 };

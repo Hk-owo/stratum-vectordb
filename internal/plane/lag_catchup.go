@@ -13,7 +13,7 @@ import (
 
 // LagCatchup turns the chain tails this node learns through its heartbeat into an
 // occasional background catch-up
-// (docs/active-lag-detection-design.md).
+// (docs/已实施/active-lag-detection-design.md).
 //
 // The trade it is built around:
 //
@@ -121,7 +121,7 @@ type LagCatchupConfig struct {
 	FindHolders func(ctx context.Context, kbID string)
 
 	// NodeState is the node state machine, which OWNS the catch-up set
-	// (docs/storage-node-state-machine-plan.md §3.3). Optional: a catch-up built
+	// (docs/已实施/storage-node-state-machine-plan.md §3.3). Optional: a catch-up built
 	// without one makes its own, the same way the data plane does. The set
 	// cannot stay private to this component without becoming a second source for
 	// a fact the node reports.

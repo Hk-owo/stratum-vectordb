@@ -216,7 +216,7 @@ func (m *mockVectorIndexClient) Drop(_ context.Context, in *vecstorepb.DropIndex
 	// in-memory index object; the artifact that Save wrote stays on disk and Load
 	// rebuilds from it. This mock has no disk, so keeping the entry is what makes
 	// "evict, then search again" behave like production — which is exactly the path
-	// L6 of docs/code-review-2026-10-18.md made reachable (Evict now drops).
+	// L6 of docs/参考/code-review-2026-10-18.md made reachable (Evict now drops).
 	_ = key
 	if m.dropErr != nil {
 		return nil, m.dropErr
@@ -2841,7 +2841,7 @@ func TestIndexManager_RetentionClearsOrphanedSidecars(t *testing.T) {
 	}
 }
 
-// --- §3 码本刷新（docs/codebook-refresh-plan.md）---
+// --- §3 码本刷新（docs/已实施/codebook-refresh-plan.md）---
 //
 // 码本只在全量重建时训练，而"只 append、不删除"的库几乎不会全量重建 ⇒ 新向量一直
 // 用旧码本编码，粗筛的候选覆盖随分布漂移变差（排序仍由 rerank 决定，所以查询不报错、
@@ -3155,7 +3155,7 @@ func TestIndexManager_SearchScansWhileABuildIsInFlight(t *testing.T) {
 }
 
 // TestIndexManager_DocumentsWithoutChunksIsNeverReportedReady pins H7 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // "Has documents but produced no chunks" is a half-successful write: the version
 // was committed, its data never landed. The build used to report it as SUCCEEDED —
@@ -3202,7 +3202,7 @@ func TestIndexManager_DocumentsWithoutChunksIsNeverReportedReady(t *testing.T) {
 }
 
 // TestIndexManager_RebuildKeepsPinsAndAccounting pins H8 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // Rebuilding a version that is ALREADY resident used to replace its `loaded` entry
 // wholesale. That dropped the refCount pins held by searches in flight — release()

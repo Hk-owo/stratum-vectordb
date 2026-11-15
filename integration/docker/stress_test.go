@@ -345,7 +345,7 @@ func versionIndexBytes(t *testing.T, kbID string, versionID int64) int64 {
 // It used to require every replica, which was the "§8.4 分发 N 份" model: one
 // builder shipped the artifact to all the rest. Indices are not distributed that
 // way any more — the owner set decides which replicas hold a version's index
-// (docs/index-owner-sharding-plan.md §3), and for an inactive version that is a
+// (docs/已实施/index-owner-sharding-plan.md §3), and for an inactive version that is a
 // deliberate subset. Requiring all of them would wait out a distribution the
 // design no longer performs.
 //

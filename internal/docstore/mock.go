@@ -12,7 +12,7 @@ import (
 // MockDocStore is an in-memory DocStore implementation for use in unit
 // tests of modules that depend on DocStore (WriteCoordinator, QueryService,
 // etc.). It is not a substitute for the real PebbleDB-backed
-// implementation's own tests (see T1-1 in Stratum_测试顺序.md) — those
+// implementation's own tests (see T1-1 in docs/已实施/Stratum_测试顺序.md) — those
 // exercise PebbleDocStore directly.
 type MockDocStore struct {
 	mu sync.Mutex

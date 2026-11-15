@@ -20,7 +20,7 @@ const (
 	// cdcRollingWindow is the chunker's rolling window, in bytes. It is a hard
 	// floor on MinSize rather than a tuning knob: the chunker computes
 	// `pre = MinSize - cdcRollingWindow` in uint, so anything smaller
-	// underflows silently (docs/content-defined-chunking-plan.md §3.2).
+	// underflows silently (docs/已实施/content-defined-chunking-plan.md §3.2).
 	cdcRollingWindow = 64
 
 	// cdcSentenceSlack bounds how far past a content-defined boundary we look
@@ -37,7 +37,7 @@ const (
 // boundary after the edit is recomputed from the same bytes as before and lands
 // in the same place, which is what keeps the chunk IDs — and with them the
 // stored vectors and their embeddings — reusable
-// (docs/content-defined-chunking-plan.md §1.2b).
+// (docs/已实施/content-defined-chunking-plan.md §1.2b).
 //
 // Three adjustments turn the raw fingerprint boundaries into chunks a retrieval
 // index wants:

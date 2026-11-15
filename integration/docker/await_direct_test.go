@@ -20,7 +20,7 @@ import (
 var controlAddrs = splitEnv("STRATUM_T4_CONTROL_ADDRS", "localhost:17000,localhost:17001,localhost:17002")
 
 // TestT4_AwaitVersion_EveryControlNodeAnswersOnItsOwn pins the property the whole
-// design rests on (docs/await-version-plan.md §0 decision 2): the wait's anchor is
+// design rests on (docs/已实施/await-version-plan.md §0 decision 2): the wait's anchor is
 // the version's STATUS, which lives in replicated state, so every control node can
 // answer for itself. That is what makes "reconnect somewhere else and keep
 // waiting" work.
@@ -44,7 +44,7 @@ func TestT4_AwaitVersion_EveryControlNodeAnswersOnItsOwn(t *testing.T) {
 	}
 
 	// 直连控制节点（不经服务站）的调用必须自己带服务站的信任标记。它是 HMAC 签名的
-	// （H4 of docs/code-review-2026-09-24.md），所以不能像以前那样手写一个 "1"：
+	// （H4 of docs/参考/code-review-2026-09-24.md），所以不能像以前那样手写一个 "1"：
 	// 那是旧格式，现在节点会直接拒绝。
 	trusted := asStation(context.Background())
 	for _, addr := range controlAddrs {

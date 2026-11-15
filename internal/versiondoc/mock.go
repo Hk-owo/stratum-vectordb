@@ -15,7 +15,7 @@ type versionKey struct {
 // MockVersionDocList is an in-memory VersionDocList for use in unit tests
 // of modules that depend on VersionDocList (WriteCoordinator, IndexManager,
 // QueryService, etc.). It is not a substitute for the real PebbleDB-backed
-// implementation's own tests (see T1-3 in Stratum_测试顺序.md).
+// implementation's own tests (see T1-3 in docs/已实施/Stratum_测试顺序.md).
 type MockVersionDocList struct {
 	mu sync.Mutex
 	// docs[versionKey] = set of docIDs

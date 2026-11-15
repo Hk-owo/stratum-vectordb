@@ -5,9 +5,9 @@
 //   - SQ/PQ: faiss::IndexHNSWSQ / IndexHNSWPQ (quantized codes inside the
 //            HNSW structure) — approximate coarse retrievers whose
 //            results must be re-ranked against full-precision vectors via
-//            SearchWithRerank (Stratum_设计文档v12.md "两段式检索设计").
+//            SearchWithRerank (docs/参考/历史/Stratum_设计文档v12.md "两段式检索设计").
 //
-// Concurrency model (Stratum_设计文档v12.md 2.6): every instance carries an
+// Concurrency model (docs/参考/历史/Stratum_设计文档v12.md 2.6): every instance carries an
 // explicit LifecycleState and a per-instance std::shared_mutex. Read
 // operations (Search / SearchCandidates / SearchWithRerank /
 // EstimatedMemoryBytes) hold the shared lock for their whole body —
@@ -18,7 +18,7 @@
 // exclusive per object and makes illegal calls (search while building,
 // add after ready) fail with a clear error instead of racing.
 //
-// See Stratum_接口设计v9.md "VectorIndex" for the interface contract this
+// See docs/参考/历史/Stratum_接口设计v9.md "VectorIndex" for the interface contract this
 // satisfies.
 #ifndef STRATUM_VECSTORE_SRC_HNSW_INDEX_H_
 #define STRATUM_VECSTORE_SRC_HNSW_INDEX_H_
@@ -105,7 +105,7 @@ class HNSWVectorIndex : public VectorIndex {
 
   // EstimatedMemoryBytes reports the index's in-memory footprint estimate
   // (bytes) to the Go IndexManager's LRU byte accounting via the
-  // Build/AddChunks RPC responses (Stratum_设计文档v12.md 3.3, coarse-
+  // Build/AddChunks RPC responses (docs/参考/历史/Stratum_设计文档v12.md 3.3, coarse-
   // retriever basis: graph edges + quantized codes for SQ/PQ, float32
   // payload otherwise). Approximate is fine; monotone in ntotal required.
   int64_t EstimatedMemoryBytes() const override;
@@ -188,7 +188,7 @@ class HNSWVectorIndex : public VectorIndex {
   // it. Full-precision (Flat) indexes always have quantized_ == false.
   bool quantized_ = false;
 
-  // 码本基线（docs/codebook-refresh-plan.md §3）。它回答"当前码本是在多大的
+  // 码本基线（docs/已实施/codebook-refresh-plan.md §3）。它回答"当前码本是在多大的
   // 语料上训出来的、之后被追加复用了多少次"，是 Go 侧判断"要不要放弃追加复用、
   // 全量重建以重训码本"的依据。两者都随 sidecar 跨版本继承：追加复用改不了码本，
   // 所以值是继承来的；全量重建（新建索引）才是新基线。故意放在 sidecar 而不是

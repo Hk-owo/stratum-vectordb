@@ -3,9 +3,9 @@
 // SlidingWindowSplitter (fixed offsets, the default) and CDCSplitter
 // (content-defined boundaries).
 //
-// See Stratum_接口设计v9.md "ChunkSplitter" and Stratum_设计文档v10.md
+// See docs/参考/历史/Stratum_接口设计v9.md "ChunkSplitter" and docs/参考/历史/Stratum_设计文档v10.md
 // "文档切割与向量生成" for the authoritative design, and
-// docs/content-defined-chunking-plan.md for why the second implementation
+// docs/已实施/content-defined-chunking-plan.md for why the second implementation
 // exists and what it is worth.
 package splitter
 
@@ -19,7 +19,7 @@ import (
 // ChunkSplitter splits document content into chunks. The implementation is
 // chosen per call from params.Mode, not per instance: the mode is an attribute
 // of each knowledge base, while the node wires a single splitter for all of
-// them (docs/content-defined-chunking-plan.md §3.8). NewDefault builds the
+// them (docs/已实施/content-defined-chunking-plan.md §3.8). NewDefault builds the
 // complete set.
 //
 // Split also computes each chunk's ChunkID = SHA-256(chunk text +
@@ -64,7 +64,7 @@ func (d *DefaultSplitter) Split(content string, params types.ChunkParams, embedC
 // ID depends only on its text and the embed configuration — never on which
 // algorithm produced it, or on where it sat in the document. That is the
 // property the whole reuse story rests on
-// (docs/content-defined-chunking-plan.md §3.7).
+// (docs/已实施/content-defined-chunking-plan.md §3.7).
 func newChunk(text string, embedConfigID string) types.Chunk {
 	h := sha256.Sum256([]byte(text + embedConfigID))
 	return types.Chunk{

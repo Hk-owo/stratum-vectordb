@@ -1,7 +1,7 @@
 // Package versiondoc defines the VersionDocList interface: the full set of
 // document IDs belonging to a given version of a knowledge base.
 //
-// See Stratum_接口设计v9.md "VersionDocList" and Stratum_设计文档v10.md
+// See docs/参考/历史/Stratum_接口设计v9.md "VersionDocList" and docs/参考/历史/Stratum_设计文档v10.md
 // "版本文档列表" for the authoritative design. This file contains only the
 // interface definition; the PebbleDB-backed implementation is built in
 // Phase 1.
@@ -46,7 +46,7 @@ type VersionDocList interface {
 	// ListVersions returns, in ascending order and without duplicates, the
 	// version ids this store currently holds documents for within kbID.
 	//
-	// It exists for reconciliation (docs/known-gaps.md §B): a node comparing what
+	// It exists for reconciliation (docs/未实施/known-gaps.md §B): a node comparing what
 	// it locally holds against the control layer needs to enumerate its own
 	// versions, and this store is what knows them. A version disappears from this
 	// list the moment its last document does, which is exactly the "local

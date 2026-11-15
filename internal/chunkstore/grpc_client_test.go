@@ -15,7 +15,7 @@ import (
 // TestVecstoreChunkStore exercises the real gRPC-backed ChunkStore
 // implementation against a real vecstore_server subprocess (built from
 // vecstore/cmd/vecstore_server.cpp), per the 2-B test node in
-// Stratum_实现顺序.md: "连接真实 vecstore gRPC server", "Write + Exists +
+// docs/已实施/Stratum_实现顺序.md: "连接真实 vecstore gRPC server", "Write + Exists +
 // Delete 正确性", "DeleteByKB 前缀删除正确性".
 //
 // Written before VecstoreChunkStore exists (TDD): this file does not
@@ -141,7 +141,7 @@ func TestVecstoreChunkStore(t *testing.T) {
 			t.Fatalf("Write: %v", err)
 		}
 		// ChunkStore interface does not expose Read directly (per
-		// Stratum_接口设计v9.md, chunk vector reads for index building go
+		// docs/参考/历史/Stratum_接口设计v9.md, chunk vector reads for index building go
 		// through IndexManager -> ChunkStorage.Read via internal gRPC
 		// directly, not through Go-side ChunkStore) — Exists is the only
 		// way to assert through this interface that the write landed.

@@ -42,7 +42,7 @@ func (c *recordingControlPlane) snapshot() (reported, live bool, class types.Fai
 }
 
 // TestAbandonDispatch_RecordsDespiteExpiredCallerContext pins H10 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // A dispatch that ran out of budget is the ordinary reason to abandon a write, and
 // the context passed in is the very one that just expired. Reporting the failure

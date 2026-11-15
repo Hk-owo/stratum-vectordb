@@ -12,7 +12,7 @@ import (
 )
 
 // applyMarkDataDurable is the control layer's own data-side promotion
-// (Stratum_设计文档v13.md §10.1b), driven by the startup reconcile's cursor
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1b), driven by the startup reconcile's cursor
 // report (§7.9). These tests drive the state machine directly: what matters is
 // the transition rule, not who calls it.
 
@@ -162,7 +162,7 @@ func TestStateMachine_DigestAfterDataFailedPermanentIsDropped(t *testing.T) {
 // The reverse order must be refused too, and that is the direction that loses
 // data if it is not: a version already DURABLE refuses a later data-terminal
 // verdict, because every replica's apply would otherwise reclaim data a CHILD
-// version already depends on (docs/known-gaps.md §K).
+// version already depends on (docs/未实施/known-gaps.md §K).
 //
 // The ordering is real, not hypothetical: the writer's fan-out falls short and
 // reports a transient failure, a replica that caught up announces the version

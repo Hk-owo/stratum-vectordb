@@ -58,7 +58,7 @@ func newCleanupPlane(dropper VersionDataDropper, cleaner VersionDataCleaner, pee
 
 // Cleanup must cover every candidate replica, not just the ones that
 // acknowledged the write: the control layer does not know where the data
-// actually landed (Stratum_设计文档v13.md §10.6).
+// actually landed (docs/参考/历史/Stratum_设计文档v13.md §10.6).
 func TestLocalDataPlane_DropVersionDataCoversEveryCandidate(t *testing.T) {
 	dropper := &stubDropper{}
 	cleaner := &stubCleaner{}

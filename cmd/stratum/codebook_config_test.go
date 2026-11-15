@@ -7,7 +7,7 @@ import (
 )
 
 // TestLoadConfig_CodebookRefreshKnobs pins §3's config surface on the yaml path
-// (docs/codebook-refresh-plan.md).
+// (docs/已实施/codebook-refresh-plan.md).
 //
 // Same reason the §8.6(d) knobs get their own test: these fields have no loud
 // failure mode when they stop arriving — a mistyped key would simply mean "the

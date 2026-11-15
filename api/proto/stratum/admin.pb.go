@@ -6,7 +6,7 @@
 // whole cluster state. External applications should prefer
 // GetSystemStatus for diagnostics.
 //
-// See Stratum_接口设计v9.md "AdminService" for the authoritative
+// See docs/参考/历史/Stratum_接口设计v9.md "AdminService" for the authoritative
 // specification.
 //
 // Reserved (not implemented): GetMetrics, GetAuditLog. Per
@@ -158,7 +158,7 @@ func (x *StuckVersion) GetUpdatedAt() int64 {
 }
 
 // FailedVersion is a version the control layer declared FAILED_PERMANENT
-// (Stratum_设计文档v13.md §10.1): its Saga spent the retry budget, nothing retries
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1): its Saga spent the retry budget, nothing retries
 // it automatically, and only an operator can retry or abandon it. The cause
 // chain is carried along so acting on it needs no further digging.
 type FailedVersion struct {
@@ -506,11 +506,11 @@ type GetSystemStatusResponse struct {
 	// data_missing_versions lists PENDING versions whose data no candidate
 	// replica holds: they cannot become READY on their own and are only
 	// recoverable by the writer re-sending its changes under the same
-	// client_request_id (Stratum_设计文档v13.md §7.12).
+	// client_request_id (docs/参考/历史/Stratum_设计文档v13.md §7.12).
 	DataMissingVersions []*StuckVersion `protobuf:"bytes,7,rep,name=data_missing_versions,json=dataMissingVersions,proto3" json:"data_missing_versions,omitempty"`
 	// failed_permanent_versions lists versions that will never become READY on
 	// their own: the control layer has declared them dead and only an operator
-	// can retry or abandon them (Stratum_设计文档v13.md §10.1).
+	// can retry or abandon them (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 	//
 	// The remedy is ForceRetryVersion (index side, revocable) or
 	// ForceAbandonVersion (removes the version from the chain). Abandoning is also
@@ -541,7 +541,7 @@ type GetSystemStatusResponse struct {
 	Reclaim *ReclaimDiagnostics `protobuf:"bytes,10,opt,name=reclaim,proto3" json:"reclaim,omitempty"`
 	// node_state is THIS node's own lifecycle phase, its own view of storage
 	// redundancy, and what it is currently working on
-	// (docs/storage-node-state-machine-plan.md §3).
+	// (docs/已实施/storage-node-state-machine-plan.md §3).
 	//
 	// It is the one place to ask "what state is this node in". Before it, that
 	// answer was computed on demand in six unrelated places and differed by
@@ -675,7 +675,7 @@ func (x *GetSystemStatusResponse) GetVersionStates() []*VersionStateEntry {
 }
 
 // NodeState is the storage node's own lifecycle phase and local view
-// (docs/storage-node-state-machine-plan.md §3).
+// (docs/已实施/storage-node-state-machine-plan.md §3).
 type NodeState struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -769,7 +769,7 @@ func (x *NodeState) GetActions() []string {
 }
 
 // VersionStateEntry is one version's local state on the node that answered
-// (docs/storage-node-state-machine-plan.md §4).
+// (docs/已实施/storage-node-state-machine-plan.md §4).
 type VersionStateEntry struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache

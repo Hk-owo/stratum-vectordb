@@ -6,7 +6,7 @@
 // package is what stops a field from being added on one side and silently
 // dropped on the other.
 //
-// See Stratum_设计文档v13.md §11 阶段 ④ (存储集群独立进程).
+// See docs/参考/历史/Stratum_设计文档v13.md §11 阶段 ④ (存储集群独立进程).
 package wire
 
 import (
@@ -94,7 +94,7 @@ func VersionFromInfo(kbID string, info *pb.VersionInfo) types.VersionMeta {
 }
 
 // dataStatusFromProto mirrors indexStatusFromProto for the DATA side, which is a
-// separate state on the same version (Stratum_设计文档v13.md §10.1b). PENDING is the
+// separate state on the same version (docs/参考/历史/Stratum_设计文档v13.md §10.1b). PENDING is the
 // default because it is the conservative one: "not known to be durable" must never
 // be read as "durable".
 func dataStatusFromProto(s pb.DataStatus) types.DataStatus {

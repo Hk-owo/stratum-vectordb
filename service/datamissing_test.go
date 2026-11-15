@@ -33,7 +33,7 @@ func pendingVersion(versionID, createdAt int64) types.VersionMeta {
 
 // TestDataMissingVersions pins the distinction between "still being written /
 // being built" and "the data never landed anywhere"
-// (Stratum_设计文档v13.md §7.12 step ①).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.12 step ①).
 func TestDataMissingVersions(t *testing.T) {
 	ctx := context.Background()
 	const (

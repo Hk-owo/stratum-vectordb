@@ -1,6 +1,6 @@
 // grpc_service_test.cpp — verifies "gRPC 接口正常通信" per the 1-B-3 测试节点
-// in Stratum_实现顺序.md (this specific check is not part of the formal
-// T1-8 table in Stratum_测试顺序.md, which only covers ChunkStorage and
+// in docs/已实施/Stratum_实现顺序.md (this specific check is not part of the formal
+// T1-8 table in docs/已实施/Stratum_测试顺序.md, which only covers ChunkStorage and
 // VectorIndex directly; this file covers the gRPC plumbing on top of
 // those two, exercised end-to-end with a real client and a real server
 // over a loopback socket).
@@ -48,7 +48,7 @@ class GrpcServiceTest : public ::testing::Test {
     ASSERT_TRUE(storage_or.ok()) << storage_or.status();
 
     // The on-disk index RPCs are confined to this fixture's directory (M4 of
-    // docs/code-review-2026-09-24.md): with no allowed root every Save/Load is
+    // docs/参考/code-review-2026-09-24.md): with no allowed root every Save/Load is
     // refused — the point of the check, and it would make this fixture test nothing.
     server_ = std::make_unique<VecstoreGrpcServer>(
         std::move(storage_or.value()),
@@ -337,7 +337,7 @@ TEST_F(GrpcServiceTest, VectorIndexSaveLoadResetRoundTrip) {
   EXPECT_EQ(search_resp.results(0).chunk_id(), "chunk-0");
 }
 
-// H5 of docs/code-review-2026-09-24.md: Drop releases the resident index object.
+// H5 of docs/参考/code-review-2026-09-24.md: Drop releases the resident index object.
 // Search afterwards is NOT_FOUND — the object is gone, not merely emptied (which
 // is what Reset does) — and the persisted artifact is untouched, so Load brings
 // the version back.
@@ -511,7 +511,7 @@ TEST_F(GrpcServiceTest, SearchWhileBuildingIsRejected) {
   EXPECT_EQ(status.error_code(), grpc::StatusCode::FAILED_PRECONDITION);
 }
 
-// M3 of docs/code-review-2026-09-24.md: top_k and candidate_n arrive from the wire
+// M3 of docs/参考/code-review-2026-09-24.md: top_k and candidate_n arrive from the wire
 // and size allocations on the vecstore side (the rerank's distance/label buffers,
 // the result set). They used to be taken at face value, so one request with
 // candidate_n = 2^31-1 asked for tens of GB inside a handler whose bad_alloc would
@@ -553,7 +553,7 @@ TEST_F(GrpcServiceTest, VectorIndexClampsHugeSearchBudgets) {
   }
 }
 
-// M4 of docs/code-review-2026-09-24.md: these RPCs take a filesystem path from the
+// M4 of docs/参考/code-review-2026-09-24.md: these RPCs take a filesystem path from the
 // caller, and the vecstore listener is unauthenticated — so without a bound they are
 // arbitrary file write and read as the vecstore process.
 TEST_F(GrpcServiceTest, IndexRpcsRefusePathsOutsideTheIndexDir) {
@@ -602,7 +602,7 @@ TEST_F(GrpcServiceTest, IndexRpcsRefusePathsOutsideTheIndexDir) {
       << "normalization must happen before the prefix check";
 }
 
-// M5 of docs/code-review-2026-09-24.md: SearchTopN validates the query vector
+// M5 of docs/参考/code-review-2026-09-24.md: SearchTopN validates the query vector
 // against the SIDECAR's dimension but hands it to Faiss as raw->d floats, so a
 // sidecar whose dim is smaller than the file's turns every search into an
 // out-of-bounds read. Load must refuse the pair.
@@ -634,7 +634,7 @@ TEST_F(GrpcServiceTest, LoadRefusesASidecarWhoseDimensionDisagrees) {
       << "a mismatched sidecar is a broken artifact, not a valid index";
 }
 
-// M6 of docs/code-review-2026-09-24.md: gRPC-C++ has no interceptor chain, so a
+// M6 of docs/参考/code-review-2026-09-24.md: gRPC-C++ has no interceptor chain, so a
 // handler that lets a C++ exception escape takes the process down. faiss::read_index
 // on a file that is not an index is exactly that case.
 TEST_F(GrpcServiceTest, LoadOfAMalformedIndexFileAnswersInternalInsteadOfDying) {
@@ -671,7 +671,7 @@ TEST_F(GrpcServiceTest, LoadOfAMalformedIndexFileAnswersInternalInsteadOfDying) 
   EXPECT_TRUE(chunk_stub_->DiskUsage(&after_ctx, after_req, &after_resp).ok());
 }
 
-// H6 of docs/code-review-2026-09-24.md: Search resolves its index under mu_ and then
+// H6 of docs/参考/code-review-2026-09-24.md: Search resolves its index under mu_ and then
 // uses it with the lock RELEASED (the rerank reads the chunk store, which must not
 // happen while holding a lock every other index RPC needs). A concurrent Build can
 // replace that entry inside the window — a §8.6a cold reshape, or a KB quantizer
@@ -681,7 +681,7 @@ TEST_F(GrpcServiceTest, LoadOfAMalformedIndexFileAnswersInternalInsteadOfDying) 
 //
 // The assertion here is "still serving, nothing corrupted". A use-after-free does not
 // reliably crash without a sanitizer, which is why the same test is also run under
-// ASan (see the vecstore notes in docs/code-review-2026-09-24.md): the load-bearing
+// ASan (see the vecstore notes in docs/参考/code-review-2026-09-24.md): the load-bearing
 // part of this fixture is that it drives the exact interleaving.
 TEST_F(GrpcServiceTest, ConcurrentReshapeDoesNotFreeTheIndexBeingSearched) {
   constexpr int kDim = 8;
@@ -985,7 +985,7 @@ TEST(VecstoreKeepaliveTest, ServerAsksForAKeepaliveItsPeersCanLiveWith) {
   EXPECT_EQ(*FindArg(args, GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS), 0);
 }
 
-// C3 of docs/code-review-2026-10-18.md.
+// C3 of docs/参考/code-review-2026-10-18.md.
 //
 // The allow-list is the only thing confining the on-disk index RPCs, so a root that
 // CONTAINS the chunk store confines them to include the store: Save() writes through a

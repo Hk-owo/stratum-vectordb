@@ -29,7 +29,7 @@ type DeletingKBReader interface {
 // completed.
 //
 // The hole it closes is the KB-level twin of the one DeletingVersionSweeper
-// closes (M3 of docs/code-review-2026-10-18.md): DeleteKnowledgeBase proposes the
+// closes (M3 of docs/参考/code-review-2026-10-18.md): DeleteKnowledgeBase proposes the
 // Deleting status in the state machine — a Raft command, so it is durable,
 // replicated, and already answered to the caller — and only THEN starts the
 // goroutine that runs the cleanup, which is what writes the WAL's delete mark. A

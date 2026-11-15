@@ -8,8 +8,8 @@
 // logical objects only — never a replica count, an erasure-coding scheme, a
 // file path or a node identity — which is what lets the two layers be split
 // into separate processes (or clusters) without the control layer learning
-// anything about placement. See control-data-separation-design.md (v1) §4 and
-// Stratum_设计文档v13.md §7.0.
+// anything about placement. See docs/已实施/control-data-separation-design.md (v1) §4 and
+// docs/参考/历史/Stratum_设计文档v13.md §7.0.
 //
 // Stage ① of that roadmap ("抽出 DataPlane/ControlPlane 契约，同进程实现")
 // draws the boundary first, at zero distributed cost: the in-process
@@ -37,7 +37,7 @@ type VersionRef struct {
 type DataPlane interface {
 	// WriteVersionData durably stores one version's document changes. The
 	// storage layer owns replication and placement, and it owns the write
-	// transaction itself (BEGIN through COMMIT) — see Stratum_设计文档v13.md
+	// transaction itself (BEGIN through COMMIT) — see docs/参考/历史/Stratum_设计文档v13.md
 	// §7.12. Completion is reported back through
 	// ControlPlane.ReportDataDurable, not through this call.
 	//
@@ -49,7 +49,7 @@ type DataPlane interface {
 	// EnsureIndex makes versionID's vector index built and serviceable.
 	// Idempotent: repeating the call for an already-built version is a
 	// no-op. Only "ActiveVersionID or explicitly accessed" versions need to
-	// be built eagerly (Stratum_设计文档v13.md §8.6b), which is why this is
+	// be built eagerly (docs/参考/历史/Stratum_设计文档v13.md §8.6b), which is why this is
 	// a declaration rather than part of WriteVersionData.
 	EnsureIndex(ctx context.Context, kbID string, versionID int64) error
 
@@ -86,7 +86,7 @@ type DataPlane interface {
 // (v1 §4.2). It is the only channel through which storage-layer progress
 // reaches the replicated metadata, and it has no counterpart for reads — the
 // read path never touches the control layer (v1 §5.2, revised in
-// Stratum_设计文档v13.md §9 to route through the service station instead).
+// docs/参考/历史/Stratum_设计文档v13.md §9 to route through the service station instead).
 type ControlPlane interface {
 	// ReportDataDurable reports that versionID's data has reached the
 	// durability policy. digest is the version's document-set digest, the
@@ -111,7 +111,7 @@ type ControlPlane interface {
 	//
 	// Returning terminal=true means the control layer has just recorded the
 	// terminal verdict for that side: when it is the DATA side, the caller
-	// should reclaim the version's physical data (Stratum_设计文档v13.md §10.6).
+	// should reclaim the version's physical data (docs/参考/历史/Stratum_设计文档v13.md §10.6).
 	ReportVersionFailure(ctx context.Context, kbID string, versionID int64, side types.FailureSide, class types.FailureClass, detail string) (terminal bool, err error)
 
 	// SetFailureBudget declares how many failed attempts kbID tolerates before

@@ -51,7 +51,7 @@ func (m *Machine) Cursors() map[string]int64 {
 // InstallCursor sets kbID's cursor from a persisted record, WITHOUT the accounts
 // a normal advance maintains.
 //
-// It is the recovery path (docs/cursor-persistence-plan.md): a restarted node
+// It is the recovery path (docs/已实施/cursor-persistence-plan.md): a restarted node
 // reads the value it wrote before the crash rather than replaying the events
 // that produced it. Monotone for the same reason the cursor itself is — memory
 // may already have moved past the record (a write that landed before this ran),

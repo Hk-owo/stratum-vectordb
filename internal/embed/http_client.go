@@ -14,7 +14,7 @@ import (
 
 // HTTPEmbedClient is the real EmbedClient implementation: an HTTP client
 // that calls an external embed service to generate vectors for chunks, per
-// Stratum_接口设计v9.md "EmbedClient".
+// docs/参考/历史/Stratum_接口设计v9.md "EmbedClient".
 //
 // The external service is expected to accept POST requests with a JSON body
 // of the form:

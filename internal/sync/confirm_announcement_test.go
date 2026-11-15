@@ -191,7 +191,7 @@ func TestDeleteVersionData_WithdrawsTheAnnouncement(t *testing.T) {
 // statement about QUORUM, not about this node's own records. Moving the cursor
 // here would claim a version whose data this node may never have received — the
 // version arrives through the fan-out (or a later pull), and that is what marks
-// it contiguous (docs/cursor-persistence-plan.md §5.2).
+// it contiguous (docs/已实施/cursor-persistence-plan.md §5.2).
 func TestPushHandler_ConfirmVersionWriteDoesNotMoveTheCursor(t *testing.T) {
 	adv := &recordingAdvancer{}
 	h := NewPushHandler(nil, 7, WithLocalVersionAdvancer(adv))

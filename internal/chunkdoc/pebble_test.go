@@ -7,7 +7,7 @@ import (
 )
 
 // TestPebbleChunkDocMapper follows the T1-2 case table in
-// Stratum_测试顺序.md exactly, run against the real PebbleDB-backed
+// docs/已实施/Stratum_测试顺序.md exactly, run against the real PebbleDB-backed
 // implementation. Written before PebbleChunkDocMapper exists (TDD): this
 // file does not compile until pebble.go is added.
 func TestPebbleChunkDocMapper(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 )
 
 // TestBitsAndBloomsFilter follows the T1-4 case table in
-// Stratum_测试顺序.md exactly, run against the real
+// docs/已实施/Stratum_测试顺序.md exactly, run against the real
 // bits-and-blooms/bloom-backed implementation. Written before
 // BitsAndBloomsFilter exists (TDD): this file does not compile until
 // bloom_impl.go is added.

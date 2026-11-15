@@ -13,7 +13,7 @@ import (
 // TestFileWAL_PairsBeginAndVersionIDInEitherOrder pins that a WAL whose
 // VERSION_ID record precedes its BEGIN record — the order the split write path
 // produces once the storage layer owns the write transaction
-// (Stratum_设计文档v13.md §7.12: the control layer allocates the version ID
+// (docs/参考/历史/Stratum_设计文档v13.md §7.12: the control layer allocates the version ID
 // first, then the storage layer writes BEGIN → data → COMMIT) — still pairs
 // the two records on reopen, so an uncommitted version can be replayed exactly
 // as with the historical BEGIN-first order.
@@ -65,7 +65,7 @@ func TestFileWAL_PairsBeginAndVersionIDInEitherOrder(t *testing.T) {
 }
 
 // TestFileWAL_RuntimePairsVersionIDFirstWithoutRestart pins the RUNTIME half of
-// C5 of docs/code-review-2026-10-18.md.
+// C5 of docs/参考/code-review-2026-10-18.md.
 //
 // TestFileWAL_PairsBeginAndVersionIDInEitherOrder above covers the reopen path
 // (rebuildIndex), which always paired both orders correctly. The in-memory path
@@ -118,7 +118,7 @@ func TestFileWAL_RuntimePairsVersionIDFirstWithoutRestart(t *testing.T) {
 }
 
 // TestFileWAL_FailsClosedWhenAPartialRecordCannotBeRolledBack pins the fail-stop
-// half of H6 of docs/code-review-2026-10-18.md: a write that fails part-way is
+// half of H6 of docs/参考/code-review-2026-10-18.md: a write that fails part-way is
 // rewound, and when the rewind itself fails the log refuses all further writes.
 // Appending after a partial record of unknown length would only surface on the
 // next restart — as silently discarded history.

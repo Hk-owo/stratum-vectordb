@@ -11,7 +11,7 @@ import (
 )
 
 // TestIntegration_FailureBudgetDeclaresVersionFailedPermanent is the end-to-end
-// path of Stratum_设计文档v13.md §10.1: storage-layer failure reports → the
+// path of docs/参考/历史/Stratum_设计文档v13.md §10.1: storage-layer failure reports → the
 // control layer's own count → the terminal verdict in replicated state → the
 // operator seeing it with its cause chain through GetSystemStatus.
 //
@@ -38,7 +38,7 @@ func TestIntegration_FailureBudgetDeclaresVersionFailedPermanent(t *testing.T) {
 	}
 	kbID := createResp.KnowledgeBaseId
 	// A knowledge base no longer comes with a version
-	// (docs/cursor-persistence-plan.md §5): the root this version forks from is
+	// (docs/已实施/cursor-persistence-plan.md §5): the root this version forks from is
 	// created here.
 	root := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
@@ -98,7 +98,7 @@ func TestIntegration_FailureBudgetDeclaresVersionFailedPermanent(t *testing.T) {
 	// itself must carry the DATA side's terminal state, which is what makes
 	// every node agree on it. It lands there — and not in IndexStatus — because
 	// the report was a FailureSideData one: the two sides have separate states
-	// (Stratum_设计文档v13.md §10.1b), so a data-side verdict must not re-label an
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1b), so a data-side verdict must not re-label an
 	// index that in fact built.
 	versions, err := cluster.RaftNode.ListVersions(ctx, kbID)
 	if err != nil {

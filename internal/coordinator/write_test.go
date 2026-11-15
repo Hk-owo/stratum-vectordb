@@ -63,7 +63,7 @@ func (s *testDocStore) ReadAt(_ context.Context, kbID, docID string, maxVersionI
 		// The real docstore reports a missing document as ErrVersionNotFound;
 		// returning a bare error here would let the GC's "is this reference dead?"
 		// check treat a store failure as a deletion (H2 of
-		// docs/code-review-2026-10-18.md). Fakes have to honour the same contract.
+		// docs/参考/code-review-2026-10-18.md). Fakes have to honour the same contract.
 		return nil, fmt.Errorf("docstore: %s/%s not found at version %d: %w",
 			kbID, docID, maxVersionID, stratumerrors.ErrVersionNotFound)
 	}
@@ -1010,7 +1010,7 @@ func TestWriteCoordinator_UpdateDocument(t *testing.T) {
 // mockSplitter implements splitter.ChunkSplitter for tests.
 //
 // It only knows the window semantics. Since the zero ChunkMode now means
-// content-defined chunking (docs/content-defined-chunking-plan.md §3.6), a
+// content-defined chunking (docs/已实施/content-defined-chunking-plan.md §3.6), a
 // knowledge base whose metadata leaves the mode unset hands it CDC parameters —
 // where WindowSize is 0. Letting that reach the loop below would make step 0 and
 // `i += step` would never terminate, so the mock falls back to the sizes it was

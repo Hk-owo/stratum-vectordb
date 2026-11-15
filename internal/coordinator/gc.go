@@ -35,7 +35,7 @@ type ChunkGarbageCollectorConfig struct {
 	// the vector. Mutual exclusion with a write to the same KB closes the
 	// stale-snapshot race (a sweep erasing data a newer version committed between the
 	// snapshot and the delete), and taking it per KB keeps a sweep from stopping
-	// writes to every other knowledge base (M7 of docs/code-review-2026-09-24.md).
+	// writes to every other knowledge base (M7 of docs/参考/code-review-2026-09-24.md).
 	// When nil a private set is allocated — sufficient only for tests without
 	// concurrent writes; production wiring MUST inject the same set as
 	// WriteCoordinatorConfig.Locks.
@@ -44,7 +44,7 @@ type ChunkGarbageCollectorConfig struct {
 
 // ChunkGarbageCollector reclaims orphan chunks — chunk vectors whose every
 // referencing document has been deleted from the knowledge base (see
-// Stratum_设计文档v10.md "chunk-doc 映射" 异步 GC). It has two halves:
+// docs/参考/历史/Stratum_设计文档v10.md "chunk-doc 映射" 异步 GC). It has two halves:
 //
 //   - ReclaimVersionChunks (VersionChunkReclaimer) is the PRIMARY trigger. It
 //     runs from the delete-version flow and reclaims the chunks of the version

@@ -20,7 +20,7 @@ func (s stubCursor) LocalVersionOf(string) int64 { return s.version }
 var _ LocalVersionReporter = stubCursor{}
 
 // TestPushHandler_LocalVersionReportsCursor pins the query a lagging node uses
-// to pick a backfill source (Stratum_设计文档v13.md §7.6).
+// to pick a backfill source (docs/参考/历史/Stratum_设计文档v13.md §7.6).
 func TestPushHandler_LocalVersionReportsCursor(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

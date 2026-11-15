@@ -2,7 +2,7 @@
 // manager responsible for loading, evicting, and querying per-version HNSW
 // indexes, and for orchestrating asynchronous index builds.
 //
-// See Stratum_接口设计v9.md "IndexManager" and Stratum_设计文档v10.md "索引
+// See docs/参考/历史/Stratum_接口设计v9.md "IndexManager" and docs/参考/历史/Stratum_设计文档v10.md "索引
 // 管理器" for the authoritative design. This file contains only the
 // interface definition; the real implementation (IndexManagerImpl, with
 // LRU eviction, reference counting, and a real vecstore gRPC client) is
@@ -25,7 +25,7 @@ import (
 type BuildCompleteCallback func(kbID string, versionID int64, status types.IndexStatus) error
 
 // BuildStateRecorder is the slice of the node state machine the index manager
-// reports to (docs/storage-node-state-machine-plan.md §7, item 4).
+// reports to (docs/已实施/storage-node-state-machine-plan.md §7, item 4).
 //
 // The manager owns these transitions because it is the ONLY entry point a build
 // has: TriggerBuild, TriggerBuildBackfill and the install path all funnel
@@ -144,7 +144,7 @@ type IndexManager interface {
 	// triggerBuild de-duplicates in-flight builds, not finished ones.
 	//
 	// Do NOT delete it because "holding a version must not be judged from an
-	// artifact" (docs/cursor-persistence-plan.md §4). That rule is about the
+	// artifact" (docs/已实施/cursor-persistence-plan.md §4). That rule is about the
 	// CURSOR, and it is right there: an artifact is a cache the retention policy
 	// may delete, so it cannot answer "does this node hold the version". The
 	// question asked here is the narrower "is this file on your disk", and for
@@ -183,7 +183,7 @@ type IndexManager interface {
 	// (<IndexDataDir>/index/<kbID>/), ignoring a missing directory
 	// (ErrNotExist) so re-running the delete flow after a crash is safe.
 	// In-memory entries are NOT touched — callers pair this with
-	// EvictByKB. Used by knowledge base deletion (Stratum_设计文档v10.md
+	// EvictByKB. Used by knowledge base deletion (docs/参考/历史/Stratum_设计文档v10.md
 	// "删除知识库" 第 4 步). No-op when disk persistence is unconfigured.
 	DeleteFilesByKB(ctx context.Context, kbID string) error
 

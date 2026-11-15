@@ -43,7 +43,7 @@ type DockerClusterConfig struct {
 
 	// Topology 选择控制台驱动的编排方式：""/"single" 为所有节点同构的单层集群，
 	// "two-tier" 为控制层只持元数据、存储层只持数据的两层集群
-	// （Stratum_设计文档v13.md §11 阶段 ④）。两者由同一个编排脚本
+	// （docs/参考/历史/Stratum_设计文档v13.md §11 阶段 ④）。两者由同一个编排脚本
 	// （scripts/cluster.sh）执行，靠 --topology 区分。
 	//
 	// 两者不可互换，控制台也不该假装可以：两层拓扑里一个节点要么是控制节点、
@@ -92,7 +92,7 @@ type VecstoreConfig struct {
 	// (vecstore_server --index_dir). Empty means "use the stratum service's
 	// data_dir", which is where the IndexManager writes its indexes; a deployment
 	// that keeps them elsewhere sets this explicitly. Without a root the vecstore
-	// would take whatever path a caller names (M4 of docs/code-review-2026-09-24.md).
+	// would take whatever path a caller names (M4 of docs/参考/code-review-2026-09-24.md).
 	IndexDir string `yaml:"index_dir,omitempty" json:"index_dir,omitempty"`
 }
 
@@ -135,7 +135,7 @@ type StratumConfig struct {
 	// (node.station_secret). scripts/gateway.sh fills it from run/station-secret,
 	// the same file the station signs with; without it a node cannot verify the
 	// station's forwards at all, and with require_authenticated on it refuses
-	// every client-facing call (H4 of docs/code-review-2026-09-24.md).
+	// every client-facing call (H4 of docs/参考/code-review-2026-09-24.md).
 	//
 	// It travels into the generated node config, so it is a SECRET sitting in
 	// run/console.yaml — which is why /ops refuses to overwrite it over HTTP

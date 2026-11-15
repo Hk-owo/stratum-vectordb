@@ -11,7 +11,7 @@ import (
 )
 
 // TestStateMachine_Apply_MarkVersionFailedPermanent pins the terminal verdict of
-// Stratum_设计文档v13.md §10.1: the control layer records that ONE SIDE of a
+// docs/参考/历史/Stratum_设计文档v13.md §10.1: the control layer records that ONE SIDE of a
 // version will not be retried automatically, together with the cause chain an
 // operator needs.
 //

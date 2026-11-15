@@ -40,7 +40,7 @@ type DeleteCoordinatorConfig struct {
 	// When set, it is what the flow calls instead of reaching into the stores
 	// above: the reclaim then happens wherever the data actually is, which is
 	// what lets a control node with no storage of its own run this flow at all
-	// (Stratum_设计文档v13.md §7.0、§11 阶段 ④).
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.0、§11 阶段 ④).
 	//
 	// nil falls back to a LocalKBDropper built from the fields above — the same
 	// layer-by-layer deletes, so the fallback is not a second code path but the
@@ -68,8 +68,8 @@ type KBAnnouncementForgetter interface {
 // DeleteCoordinatorImpl is the real DeleteCoordinator implementation,
 // orchestrating the asynchronous cleanup flow for DeleteKnowledgeBase.
 //
-// The flow is documented in Stratum_接口设计v9.md "DeleteKnowledgeBase"
-// and Stratum_设计文档v10.md "删除知识库":
+// The flow is documented in docs/参考/历史/Stratum_接口设计v9.md "DeleteKnowledgeBase"
+// and docs/参考/历史/Stratum_设计文档v10.md "删除知识库":
 //
 //  0. WAL.WriteDeleteMark (idempotent; the durable "deletion started"
 //     marker that crash recovery resumes from)
@@ -103,7 +103,7 @@ func NewDeleteCoordinatorImpl(cfg DeleteCoordinatorConfig) *DeleteCoordinatorImp
 
 // Execute implements DeleteCoordinator.
 func (c *DeleteCoordinatorImpl) Execute(ctx context.Context, kbID string) error {
-	// Step 0: WAL delete mark (Stratum_设计文档v10.md "删除知识库" 第 1 步).
+	// Step 0: WAL delete mark (docs/参考/历史/Stratum_设计文档v10.md "删除知识库" 第 1 步).
 	// Written before any cleanup so a crash at any later point leaves a
 	// durable marker that startup recovery (PendingRecordTypeDeleteMark)
 	// resumes this flow from. FileWAL.WriteDeleteMark is idempotent per

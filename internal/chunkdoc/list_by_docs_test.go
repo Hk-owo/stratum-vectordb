@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// M9 of docs/code-review-2026-09-24.md turned ListChunkIDsByDocs from "one Pebble
+// M9 of docs/参考/code-review-2026-09-24.md turned ListChunkIDsByDocs from "one Pebble
 // iterator (and one seek) per document" into "one iterator, SeekGE per document,
 // stop at the prefix". These are the cases that shape exercises and the old shape
 // did not: the scan must move FORWARD on the shared iterator without carrying

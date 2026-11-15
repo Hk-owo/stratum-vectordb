@@ -13,7 +13,7 @@ import (
 // MockEmbedClient is a deterministic, in-process stand-in for EmbedClient,
 // for use in unit tests of modules that depend on EmbedClient
 // (WriteCoordinator, etc.) and in integration tests that need a fast,
-// network-free embed service (see Stratum_测试顺序.md's "mock embed HTTP
+// network-free embed service (see docs/已实施/Stratum_测试顺序.md's "mock embed HTTP
 // server" for the over-the-wire equivalent used in later test batches).
 //
 // Vectors are derived deterministically from each chunk's ChunkID via a

@@ -16,7 +16,7 @@ import (
 //     consensus. Two stations may disagree about a version's tier, and that is
 //     fine: an owner set computed at k=2 is a SUBSET of one computed at k=3, so a
 //     disagreement costs one replica's worth of coverage rather than a
-//     correctness problem (docs/index-owner-sharding-plan.md §1).
+//     correctness problem (docs/已实施/index-owner-sharding-plan.md §1).
 //   - It samples on the read path rather than scanning on a timer. A ticker
 //     would touch every entry forever to keep a decay curve nobody is looking at;
 //     sampling touches exactly the entries something asked about, and an entry

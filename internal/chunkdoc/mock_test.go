@@ -8,7 +8,7 @@ import (
 
 // TestMockChunkDocMapper sanity-checks the in-memory mock's bidirectional
 // mapping behavior, mirroring the T1-2 case shapes in
-// Stratum_测试顺序.md. This is not a substitute for the real PebbleDB-backed
+// docs/已实施/Stratum_测试顺序.md. This is not a substitute for the real PebbleDB-backed
 // implementation's own T1-2 suite.
 func TestMockChunkDocMapper(t *testing.T) {
 	ctx := context.Background()

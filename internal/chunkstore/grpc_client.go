@@ -14,7 +14,7 @@ import (
 
 // VecstoreChunkStore is the real ChunkStore implementation: a gRPC client
 // wrapper around the C++ vecstore process's ChunkStorageService, per
-// Stratum_接口设计v9.md "ChunkStore". The key passed to vecstore is
+// docs/参考/历史/Stratum_接口设计v9.md "ChunkStore". The key passed to vecstore is
 // kbID encoded with a length prefix followed by chunkID — see encodeKey —
 // so that DeleteByKB's prefix delete cannot accidentally match a
 // different knowledge base whose ID happens to be a string prefix of

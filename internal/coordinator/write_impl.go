@@ -76,8 +76,8 @@ type WriteCoordinatorConfig struct {
 
 	// DataPlane runs the storage layer's write transaction (BEGIN → storage
 	// writes → COMMIT) and reports its outcome back up
-	// (control-data-separation-design.md §5.1; the split write path of
-	// Stratum_设计文档v13.md §7.12). When nil, the constructor assembles the
+	// (docs/已实施/control-data-separation-design.md §5.1; the split write path of
+	// docs/参考/历史/Stratum_设计文档v13.md §7.12). When nil, the constructor assembles the
 	// in-process LocalDataPlane over the pieces above — which is what the
 	// tests and the single-node deployment use.
 	DataPlane plane.DataPlane
@@ -132,7 +132,7 @@ type WriteCoordinatorConfig struct {
 	// re-check + mapping/vector deletion) is mutually exclusive with a write to the
 	// SAME knowledge base — closing the stale-snapshot race where a sweep erases data
 	// committed by a newer version — while leaving unrelated knowledge bases free to
-	// write in parallel (M7 of docs/code-review-2026-09-24.md). When nil, the
+	// write in parallel (M7 of docs/参考/code-review-2026-09-24.md). When nil, the
 	// coordinator allocates a private set; callers that also run a
 	// ChunkGarbageCollector MUST inject the same instance into both.
 	Locks *KBLockSet
@@ -140,7 +140,7 @@ type WriteCoordinatorConfig struct {
 
 // WriteCoordinatorImpl is the real WriteCoordinator implementation,
 // orchestrating the full CreateVersion write path (steps 1-7) as documented
-// in Stratum_接口设计v9.md "CreateVersion" and Stratum_设计文档v10.md "写路径".
+// in docs/参考/历史/Stratum_接口设计v9.md "CreateVersion" and docs/参考/历史/Stratum_设计文档v10.md "写路径".
 type WriteCoordinatorImpl struct {
 	cfg WriteCoordinatorConfig
 
@@ -153,7 +153,7 @@ type WriteCoordinatorImpl struct {
 	//
 	// Per KB rather than global: the lock spans a Raft round trip plus, on the
 	// inline path, the storage fan-out, so a single lock made every KB wait behind
-	// every other KB's network hop (M7 of docs/code-review-2026-09-24.md).
+	// every other KB's network hop (M7 of docs/参考/code-review-2026-09-24.md).
 	locks *KBLockSet
 
 	// pendingDispatch holds the changes of writes this node has proposed but not
@@ -327,7 +327,7 @@ func (c *WriteCoordinatorImpl) SetDataPlane(dp plane.DataPlane) {
 //
 // Exported because the service layer needs the same generator: it stamps the key
 // onto CreateVersionResponse, so the format a caller is handed is the format the
-// coordinator's own log lines show (docs/await-version-plan.md §7 Step 4).
+// coordinator's own log lines show (docs/已实施/await-version-plan.md §7 Step 4).
 // Execute runs under the knowledge base's write lock, so the timestamp alone is
 // unambiguous.
 func NewDispatchID() string {
@@ -388,7 +388,7 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	}
 
 	// An empty changes list is refused, not accepted as "a version with no
-	// documents" (docs/cursor-persistence-plan.md §5): a new version's document set
+	// documents" (docs/已实施/cursor-persistence-plan.md §5): a new version's document set
 	// is its PARENT's set plus these changes, so an empty list means "unchanged" —
 	// and the empty set is merely one thing that can be unchanged, at the root of a
 	// chain. Treating the two as the same code path made a 0-change version
@@ -438,8 +438,8 @@ func (c *WriteCoordinatorImpl) Execute(ctx context.Context, kbID string, parentV
 	if c.cfg.Dispatch == nil {
 		// Steps 3-7: the storage layer runs its own transaction (BEGIN → storage
 		// writes → COMMIT), reports the document-set digest up and schedules the
-		// index build (control-data-separation-design.md §5.1; the split write
-		// path of Stratum_设计文档v13.md §7.12).
+		// index build (docs/已实施/control-data-separation-design.md §5.1; the split write
+		// path of docs/参考/历史/Stratum_设计文档v13.md §7.12).
 		stepStart = time.Now()
 		err := c.cfg.DataPlane.WriteVersionData(ctx, kbID, versionID, parentVersionID, changes)
 		tInline = time.Since(stepStart)
@@ -571,7 +571,7 @@ func (c *WriteCoordinatorImpl) AbandonDispatch(ctx context.Context, kbID string,
 	// out its budget is the most common reason to be here at all. Reporting runs a Raft
 	// round trip, so inheriting that context guaranteed the report failed too — the one
 	// give-up path unable to record the giving-up, leaving the version PENDING with its
-	// retry budget already spent (H10 of docs/code-review-2026-10-18.md).
+	// retry budget already spent (H10 of docs/参考/code-review-2026-10-18.md).
 	// WithoutCancel keeps the context's values (trace ids, deadlines that were not the
 	// problem) and drops the cancellation, so a fresh bound decides instead.
 	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.AbandonReportTimeout)
@@ -625,7 +625,7 @@ func (c *WriteCoordinatorImpl) ReplayVersionStorageWrites(ctx context.Context, k
 
 // DropVersionStorage removes one version's physical storage writes: its MVCC
 // records in the document store and its document-ID list. It is the cleanup of
-// Stratum_设计文档v13.md §10.6 — a version the control layer declared
+// docs/参考/历史/Stratum_设计文档v13.md §10.6 — a version the control layer declared
 // FAILED_PERMANENT may still have landed on a replica whose acknowledgement was
 // lost, and nobody else would reclaim it.
 //
@@ -706,7 +706,7 @@ func (c *WriteCoordinatorImpl) DropVersionStorage(ctx context.Context, kbID stri
 // split/embed/writes plus the version document set and bloom filter. It does
 // NOT frame the WAL transaction (BEGIN/COMMIT) — the caller owns that framing,
 // which is what lets the storage layer's DataPlane run the transaction as its
-// own (Stratum_设计文档v13.md §7.12).
+// own (docs/参考/历史/Stratum_设计文档v13.md §7.12).
 // docStages accumulates the per-phase cost of the per-document step across its
 // concurrent workers.
 //
@@ -763,7 +763,7 @@ type writeStorageStages struct {
 // It does
 // NOT frame the WAL transaction (BEGIN/COMMIT) — the caller owns that framing,
 // which is what lets the storage layer's DataPlane run the transaction as its
-// own (Stratum_设计文档v13.md §7.12).
+// own (docs/参考/历史/Stratum_设计文档v13.md §7.12).
 func (c *WriteCoordinatorImpl) WriteVersionStorage(ctx context.Context, kbID string, parentVersionID, versionID int64, changes []types.DocChange) ([]string, error) {
 	// Per-phase timings of one version's storage writes, at debug level.
 	//
@@ -970,7 +970,7 @@ func (c *WriteCoordinatorImpl) writeOneChange(ctx context.Context, kbID string, 
 func (c *WriteCoordinatorImpl) writeDocument(ctx context.Context, kbID string, versionID int64, change types.DocChange, kbMeta types.KnowledgeBaseMeta, st *docStages, presence *chunkPresenceCache) error {
 	// Split, with the algorithm this knowledge base was created with: the
 	// splitter is shared by every KB on the node, so the mode travels with the
-	// call (docs/content-defined-chunking-plan.md §3.8).
+	// call (docs/已实施/content-defined-chunking-plan.md §3.8).
 	params := kbMeta.Chunking()
 	splitStart := time.Now()
 	chunks := c.cfg.Splitter.Split(change.Content, params, kbMeta.EmbedConfig.ModelID)
@@ -997,7 +997,7 @@ func (c *WriteCoordinatorImpl) writeDocument(ctx context.Context, kbID string, v
 	// neither a fresh embedding nor a fresh vector — only its chunk-document
 	// mapping. Asking the embed service for it anyway is what used to make a
 	// higher reuse rate worth nothing in compute; filtering here is what turns
-	// the reuse into skipped embed calls (docs/content-defined-chunking-plan.md
+	// the reuse into skipped embed calls (docs/已实施/content-defined-chunking-plan.md
 	// §4). The filter asks exactly the question writeChunk asks (chunkPresent),
 	// so the two cannot disagree.
 	//
@@ -1091,7 +1091,7 @@ func (c *WriteCoordinatorImpl) writeDocument(ctx context.Context, kbID string, v
 		st.storeUs.Add(time.Since(storeStart).Microseconds())
 	}
 
-	// Reuse observation (docs/content-defined-chunking-plan.md §5). The two
+	// Reuse observation (docs/已实施/content-defined-chunking-plan.md §5). The two
 	// counts differ exactly when a concurrent writer stored a chunk after the
 	// pre-embed filter: those were reused, but their embedding was paid for
 	// already.
@@ -1204,7 +1204,7 @@ func (c *WriteCoordinatorImpl) writeVersionDocList(ctx context.Context, kbID str
 		// "This node holds no data for the parent" and "the parent has no
 		// documents" both come back from ListDocIDs as an empty slice, and the
 		// difference decides whether the child version is correct (H1 of
-		// docs/code-review-2026-10-18.md). It matters under the dispatch topology:
+		// docs/参考/code-review-2026-10-18.md). It matters under the dispatch topology:
 		// the candidate set is "every replica of the KB", with no check that the
 		// candidate actually holds the parent version, so a replica whose fan-out
 		// failed — or that restarted, or just joined — would derive the child's

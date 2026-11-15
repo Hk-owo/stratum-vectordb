@@ -9,8 +9,8 @@ import "context"
 // VersionDocList / RaftNode / WAL.
 //
 // The full cleanup flow this interface's real implementation executes is
-// documented in Stratum_接口设计v9.md's "DeleteKnowledgeBase" logical flow
-// and Stratum_设计文档v10.md's "删除知识库" section:
+// documented in docs/参考/历史/Stratum_接口设计v9.md's "DeleteKnowledgeBase" logical flow
+// and docs/参考/历史/Stratum_设计文档v10.md's "删除知识库" section:
 //
 //  0. WAL.WriteDeleteMark (durable "deletion started" marker; idempotent)
 //  1. IndexManager.EvictByKB

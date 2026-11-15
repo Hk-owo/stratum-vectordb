@@ -438,7 +438,7 @@ func TestAdmin_RebuildAndWarmupRegisterRetentionInterest(t *testing.T) {
 }
 
 // TestAdmin_RebuildIndex_RefusesVersionFromAnotherKB pins C6 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // Version ids are global; a caller's authorization is per knowledge base. The
 // status change is keyed by version id alone in the state machine, so naming your

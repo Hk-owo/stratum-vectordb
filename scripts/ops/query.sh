@@ -121,7 +121,7 @@ vid=$(echo "$resp" | jq -r '.version_id')
 degraded=$(echo "$resp" | jq -r '.storage_degraded // false')
 echo "查询知识库 $KB_ID（命中版本 $vid，top-k=${TOP_K}${THRESHOLD:+，threshold=$THRESHOLD}，aggregation=$(proto_enum_short "$AGG")）"
 # storage_degraded：存储层副本不足的**报告**，不是错误——结果是完整的，但
-# 该知道（docs/storage-degradation-signal-plan.md §10.1）。
+# 该知道（docs/已实施/storage-degradation-signal-plan.md §10.1）。
 if [[ "$degraded" == "true" ]]; then
   echo "  ⚠ storage_degraded：该知识库的存储副本低于法定数，结果仍完整但持久性有风险"
 fi

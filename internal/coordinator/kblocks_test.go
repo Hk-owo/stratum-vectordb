@@ -12,7 +12,7 @@ import (
 	"stratum/internal/wal"
 )
 
-// M7 of docs/code-review-2026-09-24.md: one global write lock serialized every
+// M7 of docs/参考/code-review-2026-09-24.md: one global write lock serialized every
 // knowledge base behind every other one's network round trip. What has to stay
 // serialized is per knowledge base — that is the granularity the WAL's
 // BEGIN/VERSION_ID pairing needs — and these tests pin both halves of that.

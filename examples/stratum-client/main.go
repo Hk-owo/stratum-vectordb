@@ -1,5 +1,5 @@
 // Command stratum-client is a runnable example of the caller's side of
-// docs/client-integration-guide.md, built on the client/ package.
+// docs/参考/client-integration-guide.md, built on the client/ package.
 //
 // It is the whole loop a caller needs: submit a batch, keep its changes locally,
 // wait for it to land, and — when it never will — either re-send under the same
@@ -8,7 +8,7 @@
 // What it does NOT do is decide for you. `await` prints the decision it reached
 // and stops; only `-follow` acts on it. A tool that silently re-sent or discarded
 // would be making the caller's decision for it, which is the one thing the whole
-// design keeps on the caller's side (docs/await-version-plan.md §2.1).
+// design keeps on the caller's side (docs/已实施/await-version-plan.md §2.1).
 package main
 
 import (

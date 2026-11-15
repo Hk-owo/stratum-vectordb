@@ -8,7 +8,7 @@ import (
 	stratumerrors "stratum/internal/errors"
 )
 
-// TestPebbleDocStore follows the T1-1 case table in Stratum_测试顺序.md
+// TestPebbleDocStore follows the T1-1 case table in docs/已实施/Stratum_测试顺序.md
 // exactly, run against the real PebbleDB-backed implementation (as opposed
 // to mock_test.go's sanity checks against MockDocStore).
 func TestPebbleDocStore(t *testing.T) {

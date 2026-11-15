@@ -8,7 +8,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-// M8 of docs/code-review-2026-09-24.md: when every resident index is pinned
+// M8 of docs/参考/code-review-2026-09-24.md: when every resident index is pinned
 // (refCount != 0) nothing can be evicted, so the manager stays over LRUCapacity /
 // memory_threshold — and it did so silently, which is what made the bound look
 // enforced. The remedy chosen here is a rate-limited warning rather than a refusal:

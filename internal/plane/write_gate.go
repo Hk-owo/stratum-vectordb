@@ -7,7 +7,7 @@ import (
 )
 
 // DefaultMaxInFlightWrites caps how many writes may be in flight for one
-// knowledge base at once (Stratum_设计文档v13.md §7.7). It is a §10.4 placeholder:
+// knowledge base at once (docs/参考/历史/Stratum_设计文档v13.md §7.7). It is a §10.4 placeholder:
 // low enough that a stalled version cannot pile up an unbounded backlog on the
 // storage nodes, high enough to leave ordinary write concurrency intact.
 const DefaultMaxInFlightWrites = 8
@@ -25,7 +25,7 @@ type perKBGate struct {
 // writeLimiter bounds in-flight writes per knowledge base: the control layer
 // may dispatch versions concurrently, but the storage layer is where a stuck
 // version would otherwise let the rest pile up behind it
-// (Stratum_设计文档v13.md §7.7).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.7).
 //
 // Reaching the limit queues the newcomer rather than failing it. The write is
 // legitimate; it just has to wait for a slot. A version that is genuinely stuck

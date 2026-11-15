@@ -17,7 +17,7 @@ import (
 )
 
 // d2DeletedStub answers the liveness read from a fixed "these ids are gone" list — the
-// metadata's CURRENT state (docs/known-gaps.md §B). "Gone" is what makes a gap unfillable,
+// metadata's CURRENT state (docs/未实施/known-gaps.md §B). "Gone" is what makes a gap unfillable,
 // and unlike the removal record this replaced, nothing can prune it away.
 type d2DeletedStub struct {
 	deleted []int64

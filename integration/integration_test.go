@@ -1,6 +1,6 @@
 // Package integration_test exercises the full Stratum stack in-process:
 // gRPC server with real PebbleDB-backed stores and mock embed/vecstore,
-// verifying complete end-to-end flows per Stratum_测试顺序.md 第三批 (T3).
+// verifying complete end-to-end flows per docs/已实施/Stratum_测试顺序.md 第三批 (T3).
 //
 // These tests do not require Docker, external processes, or a running
 // vecstore gRPC server — everything is in-process with test doubles.
@@ -193,7 +193,7 @@ func TestIntegration_CreateKB_CreateVersion_Query(t *testing.T) {
 
 	// Step 2: create the root version and mark it READY so it can be used as
 	// parent. A knowledge base no longer comes with a version
-	// (docs/cursor-persistence-plan.md §5): a change-less version is refused, so
+	// (docs/已实施/cursor-persistence-plan.md §5): a change-less version is refused, so
 	// the empty READY root these suites fork from is asked for explicitly.
 	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
@@ -272,7 +272,7 @@ func TestIntegration_ListVersions(t *testing.T) {
 
 	kbID := createResp.KnowledgeBaseId
 
-	// A knowledge base starts with NO version (docs/cursor-persistence-plan.md §5),
+	// A knowledge base starts with NO version (docs/已实施/cursor-persistence-plan.md §5),
 	// and that is the first fact worth pinning: there is nothing to list until
 	// something is written.
 	resp, err := cluster.KBClient.ListVersions(ctx, &pb.ListVersionsRequest{KnowledgeBaseId: kbID})
@@ -316,7 +316,7 @@ func TestIntegration_RollbackVersion(t *testing.T) {
 	kbID := createResp.KnowledgeBaseId
 
 	// The root to roll back to: created here and left READY, because a knowledge
-	// base no longer comes with one (docs/cursor-persistence-plan.md §5).
+	// base no longer comes with one (docs/已实施/cursor-persistence-plan.md §5).
 	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	// Create a new version to rollback from.
@@ -402,12 +402,12 @@ func TestIntegration_DeleteVersion(t *testing.T) {
 	}
 	kbID := createResp.KnowledgeBaseId
 	// A knowledge base no longer comes with a version
-	// (docs/cursor-persistence-plan.md §5): the chain starts with an explicit,
+	// (docs/已实施/cursor-persistence-plan.md §5): the chain starts with an explicit,
 	// READY root.
 	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 	// Made ACTIVE on purpose: what this test pins is that deleting the active
 	// version is refused. A knowledge base no longer comes with an active version
-	// (docs/cursor-persistence-plan.md §5) — it has none until one is chosen — so
+	// (docs/已实施/cursor-persistence-plan.md §5) — it has none until one is chosen — so
 	// the test that needs the state asks for it.
 	if err := cluster.RaftNode.ProposeRollback(ctx, kbID, v1); err != nil {
 		t.Fatalf("activate v%d: %v", v1, err)
@@ -572,7 +572,7 @@ func TestIntegration_WarmupVersion(t *testing.T) {
 	}
 
 	// A version has to exist for Warmup to mean anything: a knowledge base no
-	// longer comes with one (docs/cursor-persistence-plan.md §5).
+	// longer comes with one (docs/已实施/cursor-persistence-plan.md §5).
 	v1 := seedRootVersion(t, cluster.RaftNode, ctx, createResp.KnowledgeBaseId)
 
 	resp, err := cluster.AdminClient.WarmupVersion(ctx, &pb.WarmupVersionRequest{
@@ -588,7 +588,7 @@ func TestIntegration_WarmupVersion(t *testing.T) {
 }
 
 // The version chain is strictly linear: a parent may have at most one child
-// (Stratum_设计文档v13.md §6).
+// (docs/参考/历史/Stratum_设计文档v13.md §6).
 func TestIntegration_ForkRejected(t *testing.T) {
 	cluster := newTestCluster(t)
 	defer cluster.Close()
@@ -609,7 +609,7 @@ func TestIntegration_ForkRejected(t *testing.T) {
 	kbID := createResp.KnowledgeBaseId
 	// The parent both attempts below name. It must be READY before anything forks
 	// off it, and a knowledge base no longer comes with one
-	// (docs/cursor-persistence-plan.md §5).
+	// (docs/已实施/cursor-persistence-plan.md §5).
 	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	// The first child of v1 is accepted.
@@ -668,7 +668,7 @@ func TestIntegration_ConcurrentCreateVersion(t *testing.T) {
 
 	// The parent every concurrent write names: it has to exist and be READY first,
 	// because a knowledge base no longer comes with a version
-	// (docs/cursor-persistence-plan.md §5).
+	// (docs/已实施/cursor-persistence-plan.md §5).
 	v1 := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	// Launch concurrent CreateVersion calls with the same parent. The chain
@@ -830,7 +830,7 @@ func TestIntegration_RebuildIndex(t *testing.T) {
 	}
 
 	// A version has to exist for RebuildIndex to act on: a knowledge base no longer
-	// comes with one (docs/cursor-persistence-plan.md §5).
+	// comes with one (docs/已实施/cursor-persistence-plan.md §5).
 	v1 := seedRootVersion(t, cluster.RaftNode, ctx, createResp.KnowledgeBaseId)
 
 	// Mark it FAILED.
@@ -885,7 +885,7 @@ type rootVersionProposer interface {
 // seedRootVersion creates kbID's ROOT version and leaves it READY, returning the
 // version id.
 //
-// A knowledge base no longer comes with a version (docs/cursor-persistence-plan.md
+// A knowledge base no longer comes with a version (docs/已实施/cursor-persistence-plan.md
 // §5): creating one with no document changes is refused, because a version's
 // document set is inherited from its parent — so "no changes" means "unchanged",
 // and only at the root of a chain does that coincide with "empty". These suites

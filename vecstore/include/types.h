@@ -2,7 +2,7 @@
 // data carriers with no behavior, mirroring the Go-side types defined in
 // internal/types/types.go where applicable.
 //
-// See Stratum_接口设计v9.md "数据类型定义 / C++ 侧" for the authoritative
+// See docs/参考/历史/Stratum_接口设计v9.md "数据类型定义 / C++ 侧" for the authoritative
 // definitions.
 #ifndef STRATUM_VECSTORE_TYPES_H_
 #define STRATUM_VECSTORE_TYPES_H_
@@ -40,7 +40,7 @@ struct SearchResult {
 // types store quantized codes (ScalarQuantizer / ProductQuantizer) inside
 // the HNSW structure and act as approximate coarse retrievers whose
 // results are re-ranked against full-precision vectors read from the
-// chunk store (see VectorIndex::SearchWithRerank and Stratum_设计文档v12.md).
+// chunk store (see VectorIndex::SearchWithRerank and docs/参考/历史/Stratum_设计文档v12.md).
 enum class QuantizerType {
   kOff,       // full-precision flat storage (现状)
   kSQ8,       // 8-bit scalar quantization (1 byte/component)
@@ -48,7 +48,7 @@ enum class QuantizerType {
   kSQFP16,    // fp16 scalar quantization (2 bytes/component)
   kPQ,        // product quantization (pq_m * pq_nbits / 8 bytes/vector)
 
-  // Graph-free variants (Stratum_设计文档v13.md §8.6a): the same quantizers
+  // Graph-free variants (docs/参考/历史/Stratum_设计文档v13.md §8.6a): the same quantizers
   // without the HNSW graph. The graph dominates both the memory footprint and
   // the build time, so a version that is unlikely to be queried — a cold,
   // non-active one — is better served by scanning quantized codes, which costs

@@ -2,7 +2,7 @@
 // the three PebbleDB-backed storage modules (docstore, chunkdoc,
 // versiondoc). These are pure byte-encoding helpers with no PebbleDB
 // dependency of their own; each module composes them into its own key
-// schema as documented in Stratum_设计文档v10.md "存储层设计".
+// schema as documented in docs/参考/历史/Stratum_设计文档v10.md "存储层设计".
 //
 // Encoding rules:
 //   - Variable-length string components (knowledge base ID, document ID,

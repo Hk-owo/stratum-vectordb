@@ -6,7 +6,7 @@
 // PRESCRIBES where an index should live; it does not describe where one is. That
 // distinction is what keeps the whole scheme stateless: because nobody has to
 // know who is currently holding what, there is no index-location table to
-// maintain, replicate, or invalidate (docs/index-owner-sharding-plan.md §1).
+// maintain, replicate, or invalidate (docs/已实施/index-owner-sharding-plan.md §1).
 //
 // Rendezvous (highest-random-weight) hashing is chosen for one property above
 // the others: the top-k sets are NESTED. Adding a member to the set, or raising

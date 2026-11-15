@@ -92,7 +92,7 @@ station up|down|status|logs  服务站（宿主进程）
   用 `STRATUM_REQUIRE_AUTH=false`。
 - **信任标记现在是签名的**：`init`/`up` 会在 `run/station-secret` 生成（或复用）一个共享密钥，
   写进每个节点配置的 `node.station_secret`，服务站以 `-station-secret` 用同一份签名。
-  节点校验的是 HMAC，所以「带一个 `1`」不再能冒充服务站（`docs/code-review-2026-09-24.md` H4）。
+  节点校验的是 HMAC，所以「带一个 `1`」不再能冒充服务站（`docs/参考/code-review-2026-09-24.md` H4）。
   直连节点端口的工具/测试要拿到同一份密钥（`STRATUM_STATION_SECRET`，或读那个文件）。
   **两半必须一起配**：只有节点有密钥、服务站没有时，节点会拒掉全部转发——这是安全失败，
   但集群会不可用，日志里是 `unauthenticated`。
@@ -113,11 +113,11 @@ station up|down|status|logs  服务站（宿主进程）
   默认 `/var/lib/stratum`）启动，容器的存储半边同理（`STRATUM_VECSTORE_INDEX_DIR`，默认
   由该容器的 `storage.data_dir` + `/index` 推出）。vecstore 的 `Save`/`Load` 等 RPC 直接用
   调用方给的路径，没有这道闸门就是"能连端口就能读写任意文件"
-  （`docs/code-review-2026-09-24.md` M4）。
+  （`docs/参考/code-review-2026-09-24.md` M4）。
 - 根必须收到 **`<data_dir>/index`** 这一层，不能是它的父目录：`<data_dir>` 下面还躺着
   RocksDB（`vecstore_rocksdb/` 或节点目录本身）与文档/元数据存储，而 `Save` 是带 rename
   的整文件替换 —— 一次 `Save(<data>/vecstore_rocksdb/CURRENT)` 就把引擎文件换成索引字节，
-  库再也打不开（`docs/code-review-2026-10-18.md` C3）。vecstore 另有第二道锁：启动时传入
+  库再也打不开（`docs/参考/code-review-2026-10-18.md` C3）。vecstore 另有第二道锁：启动时传入
   的 `rocksdb_path` 被列为**排除根**，落在它下面的路径即使匹配允许根也会被拒。
 
 ## 三、`gateway.sh` —— 本地入口（服务站 + 控制台）
@@ -161,7 +161,7 @@ scripts/gateway.sh router <up|stop|status|logs>     # 只操作服务站
   直接重建——否则要么启动就报 `flag provided but not defined`，要么操作者把两层参数去掉，
   服务站退回「全部节点同址」的单层假设，读请求悄悄走错节点。
 - **控制台默认只绑回环**（`STRATUM_HTTP_ADDR`，默认 `127.0.0.1:8081`）：`/ops` 能改启动参数、
-  启停服务，把它挂到 `0.0.0.0` 就等于把运维接口对全网开放（`docs/code-review-2026-09-24.md` H2）。
+  启停服务，把它挂到 `0.0.0.0` 就等于把运维接口对全网开放（`docs/参考/code-review-2026-09-24.md` H2）。
   要远程访问就显式设置该变量，并用网络边界或反向代理的另一层鉴权护住它。容器形态（`--in-docker`）
   在容器里绑 `0.0.0.0:8081`，由 `-p` 映射决定宿主侧的暴露面。
 - **凭据与信任标记由脚本生成**（`run/station-secret`、`run/tokens.yaml`、`run/console-token`）：

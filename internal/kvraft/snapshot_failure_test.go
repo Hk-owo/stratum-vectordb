@@ -10,7 +10,7 @@ import (
 )
 
 // TestSnapshot_KeepsLogWhenSnapshotWriteFails pins H5 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // A snapshot whose write fails must not trim the log. Trimming is irreversible:
 // the discarded entries are in neither the snapshot nor the log, so a restart

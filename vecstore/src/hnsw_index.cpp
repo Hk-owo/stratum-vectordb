@@ -61,7 +61,7 @@ absl::Status FaissRejected(const char* op, const std::exception& e) {
 // efConstruction / efSearch control the HNSW build/search quality-speed
 // tradeoff. These generous defaults favor recall over latency/build time,
 // appropriate for Stratum's per-version full-rebuild model (see
-// Stratum_设计文档v10.md "向量索引": "每次 CreateVersion 触发一次全量 HNSW
+// docs/参考/历史/Stratum_设计文档v10.md "向量索引": "每次 CreateVersion 触发一次全量 HNSW
 // 重建" — builds are infrequent relative to queries, so spending more time
 // per build for better recall is a reasonable tradeoff). Revisit if
 // production index sizes show this needs to be configurable per knowledge
@@ -74,7 +74,7 @@ constexpr int kM = 32;  // HNSW graph connectivity parameter
 // layer clamps what it passes down (see ClampTopK in grpc_service.cpp); this is the
 // second line of defence for SearchTopN's other callers, because the two buffers
 // below are sized directly from top_n — no exception guard between them and a
-// caller-supplied number (M3 of docs/code-review-2026-09-24.md).
+// caller-supplied number (M3 of docs/参考/code-review-2026-09-24.md).
 constexpr int kMaxSearchTopN = 4096;
 
 // kCancelCheckStride is how often SearchWithRerank's re-scoring loop asks the
@@ -98,7 +98,7 @@ constexpr char kSidecarMagic[] = "stratum-index-1";
 // it and are read as "shape unknown".
 constexpr char kShapePrefix[] = "graph_free ";
 
-// Sidecar codebook-baseline line (docs/codebook-refresh-plan.md §3): how many
+// Sidecar codebook-baseline line (docs/已实施/codebook-refresh-plan.md §3): how many
 // vectors the quantizer was trained on, and how many append-reuses have
 // happened since ("trained <ntotal> <appends>"). It rides along with the file,
 // so the baseline survives a restart and a §8.4 artifact handoff without any
@@ -474,7 +474,7 @@ absl::StatusOr<std::vector<SearchResult>> HNSWVectorIndex::SearchWithRerank(
     const CancelCheck& cancelled) {
   // The shared lock is held for the WHOLE two-stage body, including the
   // rerank disk reads: a concurrent Reset/Load/Build (writers) cannot tear
-  // the index away mid-search (Stratum_设计文档v12.md 2.6).
+  // the index away mid-search (docs/参考/历史/Stratum_设计文档v12.md 2.6).
   std::shared_lock<std::shared_mutex> read_lock(state_mu_);
   if (state_ == LifecycleState::kEmpty) {
     return std::vector<SearchResult>{};  // nothing built/loaded: empty result
@@ -553,7 +553,7 @@ absl::StatusOr<std::vector<SearchResult>> HNSWVectorIndex::SearchWithRerank(
   }
 
   // Stage 3: exact re-score of the candidates whose vectors were found;
-  // missing keys are skipped (defensive; see Stratum_设计文档v12.md 2.3.3).
+  // missing keys are skipped (defensive; see docs/参考/历史/Stratum_设计文档v12.md 2.3.3).
   //
   // Re-checked every kCancelCheckStride candidates rather than every one: this
   // loop is arithmetic over vectors already in memory (microseconds for a
@@ -736,7 +736,7 @@ absl::Status HNSWVectorIndex::Save(const std::string& path) {
     return st;
   }
 
-  // Save seals the build: BUILDING -> READY (Stratum_设计文档v12.md 2.6).
+  // Save seals the build: BUILDING -> READY (docs/参考/历史/Stratum_设计文档v12.md 2.6).
   state_ = LifecycleState::kReady;
   return absl::OkStatus();
 }
@@ -886,7 +886,7 @@ absl::Status HNSWVectorIndex::LoadLocked(const std::string& path, const char* op
 
   // The sidecar and the index must agree on the dimension as well, and this one is
   // a memory-safety check rather than a bookkeeping one (M5 of
-  // docs/code-review-2026-09-24.md): SearchTopN checks the QUERY vector against
+  // docs/参考/code-review-2026-09-24.md): SearchTopN checks the QUERY vector against
   // dim_, then hands it to Faiss as an array of raw->d floats. A sidecar whose dim
   // is SMALLER than the index's — torn, hand-edited, or simply not this file's
   // (the artifact CRC covers the index file, never the sidecar) — passes that check

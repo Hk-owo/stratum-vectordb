@@ -1,7 +1,7 @@
 // Package docstore defines the DocStore interface: MVCC storage for raw
 // document text, keyed by knowledge base ID + document ID + version ID.
 //
-// See Stratum_接口设计v9.md "DocStore" and Stratum_设计文档v10.md "doc store"
+// See docs/参考/历史/Stratum_接口设计v9.md "DocStore" and docs/参考/历史/Stratum_设计文档v10.md "doc store"
 // for the authoritative design. This file contains only the interface
 // definition; the PebbleDB-backed implementation is built in Phase 1.
 package docstore

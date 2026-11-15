@@ -17,7 +17,7 @@ func safeVersionPlane(local int64, peers []string, cursors map[string]int64, dow
 }
 
 // After a restart the local cursor is 0, so the claim must come from the peers
-// — and only as far as a quorum still reaches (Stratum_设计文档v13.md §7.8).
+// — and only as far as a quorum still reaches (docs/参考/历史/Stratum_设计文档v13.md §7.8).
 func TestLocalDataPlane_SafeDurableVersionTakesAQuorumMinimum(t *testing.T) {
 	// Three peers + self = 4 nodes, quorum 3. Reports: 0(self), 9, 7, 2.
 	// The largest version three of the four still reach is 2.

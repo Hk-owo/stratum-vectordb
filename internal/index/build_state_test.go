@@ -47,7 +47,7 @@ func (s *buildStateSpy) snapshot() []string {
 // TestIndexManager_ReportsBuildTransitionsToTheStateMachine: the manager is the
 // single entry point a build has, so it — not its callers, and not the
 // completion callback — is where the version layer's BUILDING -> READY
-// transition is recorded (docs/storage-node-state-machine-plan.md §7, item 4).
+// transition is recorded (docs/已实施/storage-node-state-machine-plan.md §7, item 4).
 func TestIndexManager_ReportsBuildTransitionsToTheStateMachine(t *testing.T) {
 	vc := newMockVectorIndexClient()
 	ds := newDocSource()

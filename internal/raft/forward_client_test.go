@@ -89,7 +89,7 @@ func TestGRPCProposeForwarder_SendsTheCommandAndReturnsTheOutcome(t *testing.T) 
 }
 
 // An apply error travels as its sentinel name and is rebuilt on this side, so
-// the caller's errors.Is still matches (Stratum_设计文档v13.md §7.3).
+// the caller's errors.Is still matches (docs/参考/历史/Stratum_设计文档v13.md §7.3).
 func TestGRPCProposeForwarder_RebuildsSentinelErrors(t *testing.T) {
 	ctx := proposeCtx(t)
 	svc := &fakeInternalService{resp: &pb.ProposeResponse{

@@ -67,7 +67,7 @@ func newReportingPlane(control ControlPlane) (*LocalDataPlane, *stubWAL, *stubEx
 
 // A failed local write must be reported: the control layer cannot count
 // attempts it never hears about, and without a count it can never reach the
-// terminal verdict (Stratum_设计文档v13.md §10.1).
+// terminal verdict (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 func TestLocalDataPlane_LocalWriteFailureIsReported(t *testing.T) {
 	control := &stubControl{}
 	dp, w, _ := newReportingPlane(control)

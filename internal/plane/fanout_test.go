@@ -63,7 +63,7 @@ func TestQuorumSize(t *testing.T) {
 }
 
 // With two targets the quorum is 2 of 3, so a single unreachable replica must
-// not fail the write (Stratum_设计文档v13.md §7.1).
+// not fail the write (docs/参考/历史/Stratum_设计文档v13.md §7.1).
 func TestLocalDataPlane_FanOutToleratesOneUnreachableReplica(t *testing.T) {
 	pusher := &stubPusher{fail: map[string]bool{"peer-b": true}}
 	dp := newFanOutPlane([]string{"peer-a", "peer-b"}, pusher)

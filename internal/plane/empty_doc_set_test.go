@@ -30,7 +30,7 @@ func (f versionDigestFunc) DigestOf(ctx context.Context, kbID string, versionID 
 //
 // The empty set is a property of a version's DOCUMENT SET, which is why it
 // outlives the empty CHANGES list that used to be conflated with it
-// (docs/cursor-persistence-plan.md §5.4): the coordinator now refuses a change-less
+// (docs/已实施/cursor-persistence-plan.md §5.4): the coordinator now refuses a change-less
 // version, but a version that removes every document is still perfectly legal and
 // still carries no digest.
 func TestLocalDataPlane_EnsureIndex_AdvancesCursorForAnEmptyVersion(t *testing.T) {

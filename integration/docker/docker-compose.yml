@@ -1,6 +1,6 @@
 # docker-compose.yml — Stratum 3-node cluster for T4 integration tests.
 #
-# See Stratum_测试顺序.md 第四批 for the test cases this environment supports.
+# See docs/已实施/Stratum_测试顺序.md 第四批 for the test cases this environment supports.
 #
 # Usage:
 #   docker compose up -d

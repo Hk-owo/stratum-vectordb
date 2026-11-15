@@ -39,7 +39,7 @@ type record struct {
 // records that would exist at that point.
 //
 // It is not a substitute for the real on-disk implementation's own tests
-// (see T1-6 in Stratum_测试顺序.md, which specifically test truncation —
+// (see T1-6 in docs/已实施/Stratum_测试顺序.md, which specifically test truncation —
 // i.e. an incomplete on-disk log — which only makes sense against a real
 // file-backed WAL).
 type MockWAL struct {
@@ -62,7 +62,7 @@ type MockWAL struct {
 	// The two pending slots mirror FileWAL's: a BEGIN and a VERSION_ID can arrive
 	// in either order (inline write path vs. dispatch topology), so each side
 	// waits for the other instead of assuming one order (C5 of
-	// docs/code-review-2026-10-18.md).
+	// docs/参考/code-review-2026-10-18.md).
 	pendingBeginByKB     map[string]beginData
 	pendingVersionIDByKB map[string]int64
 
@@ -114,7 +114,7 @@ func (w *MockWAL) WriteVersionID(_ context.Context, kbID string, versionID int64
 	w.records = append(w.records, record{kind: recordVersionID, kbID: kbID, versionID: versionID})
 	// Bind the unpaired BEGIN of THIS knowledge base, or — when the VERSION_ID
 	// arrived first, which is what the dispatch topology does — wait for it to
-	// turn up (C5 of docs/code-review-2026-10-18.md).
+	// turn up (C5 of docs/参考/code-review-2026-10-18.md).
 	if bd, ok := w.pendingBeginByKB[kbID]; ok {
 		w.beginDataByVersion[versionID] = bd
 		delete(w.pendingBeginByKB, kbID)

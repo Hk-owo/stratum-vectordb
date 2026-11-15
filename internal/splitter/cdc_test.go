@@ -10,7 +10,7 @@ import (
 )
 
 // The measurements below implement the acceptance criteria of
-// docs/content-defined-chunking-plan.md §8. Two numbers matter, and the second
+// docs/已实施/content-defined-chunking-plan.md §8. Two numbers matter, and the second
 // is the one that reflects cost:
 //
 //   - tail retention: of the chunks the original document had AFTER the

@@ -24,7 +24,7 @@ import (
 //
 // It is constructed in one place so the assembly can decide whether to
 // construct it at all. A control node keeps no data storage of its own — the
-// control layer owns replicated metadata only (Stratum_设计文档v13.md §7.0) — and
+// control layer owns replicated metadata only (docs/参考/历史/Stratum_设计文档v13.md §7.0) — and
 // that decision has to be expressible as "build this, or do not", rather than as
 // a condition repeated at each store below, where forgetting one would leave a
 // control node quietly writing to a local disk it is not supposed to have.
@@ -60,7 +60,7 @@ type storageStack struct {
 // own Raft node without this caring which it is.
 //
 // buildState is the node state machine's build-status half
-// (docs/storage-node-state-machine-plan.md §7, item 4). The index manager is
+// (docs/已实施/storage-node-state-machine-plan.md §7, item 4). The index manager is
 // where it belongs: every build — and every install of a distributed artifact —
 // passes through that one component.
 func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *zap.Logger, buildState index.BuildStateRecorder) (*storageStack, error) {
@@ -135,7 +135,7 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 
 	// One splitter serves every knowledge base on this node; which algorithm
 	// it applies comes from each KB's metadata, per write
-	// (docs/content-defined-chunking-plan.md §3.8).
+	// (docs/已实施/content-defined-chunking-plan.md §3.8).
 	stack.ChunkSplitter = splitter.NewDefault()
 
 	indexMgr := index.NewIndexManager(index.IndexManagerConfig{
@@ -157,7 +157,7 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		ColdThreshold:      cfg.IndexColdThreshold,
 		AppendMaxDeadRatio: cfg.IndexAppendMaxDeadRatio,
 		GCRatioThreshold:   cfg.IndexGCRatioThreshold,
-		// §3 codebook refresh (docs/codebook-refresh-plan.md §3). Firing either
+		// §3 codebook refresh (docs/已实施/codebook-refresh-plan.md §3). Firing either
 		// trigger rebuilds the version from scratch, which is the only way to
 		// retrain the quantizer. Gated by the KB's quantizer inside the
 		// IndexManager: only SQ8 / PQ learn a codebook, so OFF / SQ_FP16 /
@@ -184,7 +184,7 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		AccessPersistInterval:     cfg.IndexAccessPersistInterval,
 		KeepaliveInterval:         cfg.VecstoreKeepaliveInterval,
 		KeepaliveTimeout:          cfg.VecstoreKeepaliveTimeout,
-		// docs/storage-node-state-machine-plan.md §7 item 4: the manager owns the
+		// docs/已实施/storage-node-state-machine-plan.md §7 item 4: the manager owns the
 		// version layer's build transitions, including the install path and the
 		// build that never starts.
 		BuildState: buildState,
@@ -239,7 +239,7 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 	)
 	// KB metadata source: async builds read the KB-level quantizer
 	// configuration from the replicated metadata and forward it to the vecstore
-	// with each Build RPC (Stratum_设计文档v12.md 2.4).
+	// with each Build RPC (docs/参考/历史/Stratum_设计文档v12.md 2.4).
 	indexMgr.SetKBMetaGetter(rn.GetKB)
 	// §8.6(c): a pure-append version may start its index from its parent
 	// version's artifact instead of rebuilding. The parent link lives in the

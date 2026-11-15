@@ -97,7 +97,7 @@ func main() {
 	grpcAddr := flag.String("grpc-addr", "127.0.0.1:7009", "routing layer (stratum-router) gRPC address")
 	// 默认只绑回环：/ops 能改启动参数、重启服务、按配置里的路径执行程序，配上
 	// 一个默认可达的监听地址就是一个远程执行入口（H2 of
-	// docs/code-review-2026-09-24.md）。要对外提供控制台就显式 -http-addr
+	// docs/参考/code-review-2026-09-24.md）。要对外提供控制台就显式 -http-addr
 	// 0.0.0.0:8081，并且想清楚谁能访问。
 	httpAddr := flag.String("http-addr", "127.0.0.1:8081", "gateway HTTP listen address (default: loopback only)")
 	// web/dist is the Vite build output: web/ is now a Vite project whose
@@ -293,7 +293,7 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 
 	// DiscardVersion abandons a version whose write never landed: a write to the
 	// leader, admissible only while the version is still PENDING
-	// (docs/await-version-plan.md §7 Step 6). A version that already has data is
+	// (docs/已实施/await-version-plan.md §7 Step 6). A version that already has data is
 	// delete-version's business, and is refused with version_not_pending.
 	mux.HandleFunc("POST /api/knowledge-bases/{id}/discard-version", handleWithID(
 		func() *pb.DiscardVersionRequest { return &pb.DiscardVersionRequest{} },
@@ -469,7 +469,7 @@ func logRequests(next http.Handler) http.Handler {
 // decide anything if the credential reaches it. Without this the station sees
 // every console request as anonymous — so a deployment that turned authentication
 // on either refuses the whole console, or, worse, is configured to accept
-// anonymous calls, which is the state H3 of docs/code-review-2026-09-24.md
+// anonymous calls, which is the state H3 of docs/参考/code-review-2026-09-24.md
 // describes: a gate that never sees the credential cannot be a gate.
 //
 // fallback is the console's own credential (-station-token). A page cannot carry
@@ -480,7 +480,7 @@ func logRequests(next http.Handler) http.Handler {
 // credential: the fallback must never upgrade a caller.
 //
 // That last sentence is a rule to ENFORCE, not to assert (C1 of
-// docs/code-review-2026-10-18.md). scripts/gateway.sh mints the fallback token with
+// docs/参考/code-review-2026-10-18.md). scripts/gateway.sh mints the fallback token with
 // `kb_ids: ["*"]` — it has to, because kb ids are generated server-side and no static
 // table can name the ones that do not exist yet — so handing it to every request that
 // lacks an Authorization header turns "anonymous" into "read and write every

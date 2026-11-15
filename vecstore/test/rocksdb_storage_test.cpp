@@ -1,5 +1,5 @@
 // rocksdb_storage_test.cpp — T1-8 ChunkStorage test suite, per
-// Stratum_测试顺序.md. Written before src/rocksdb_storage.cpp exists
+// docs/已实施/Stratum_测试顺序.md. Written before src/rocksdb_storage.cpp exists
 // (TDD): this file does not compile until RocksDBChunkStorage is added.
 //
 // Each test opens a fresh RocksDB instance in a unique temporary

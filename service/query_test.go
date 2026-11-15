@@ -152,7 +152,7 @@ func TestQueryService_MetaStageReadsOnlyTheVersionItNames(t *testing.T) {
 }
 
 // TestQueryService_EmptyKnowledgeBaseAnswersWithNoResults pins §5.1 of
-// docs/cursor-persistence-plan.md: a knowledge base that has never been written to
+// docs/已实施/cursor-persistence-plan.md: a knowledge base that has never been written to
 // has NO active version, and querying it answers with an empty result rather than
 // version_not_found.
 //

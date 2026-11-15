@@ -6,7 +6,7 @@
 // whole cluster state. External applications should prefer
 // GetSystemStatus for diagnostics.
 //
-// See Stratum_接口设计v9.md "AdminService" for the authoritative
+// See docs/参考/历史/Stratum_接口设计v9.md "AdminService" for the authoritative
 // specification.
 //
 // Reserved (not implemented): GetMetrics, GetAuditLog. Per
@@ -55,7 +55,7 @@ type AdminServiceClient interface {
 	RebuildIndex(ctx context.Context, in *RebuildIndexRequest, opts ...grpc.CallOption) (*RebuildIndexResponse, error)
 	WarmupVersion(ctx context.Context, in *WarmupVersionRequest, opts ...grpc.CallOption) (*WarmupVersionResponse, error)
 	// The operator's three verbs for a version the control layer declared
-	// FAILED_PERMANENT (Stratum_设计文档v13.md §10.1): see it, retry it, abandon it.
+	// FAILED_PERMANENT (docs/参考/历史/Stratum_设计文档v13.md §10.1): see it, retry it, abandon it.
 	//
 	// They live here rather than on KnowledgeBaseService because the caller is an
 	// operator acting on a verdict, not an application working with a version — and
@@ -164,7 +164,7 @@ type AdminServiceServer interface {
 	RebuildIndex(context.Context, *RebuildIndexRequest) (*RebuildIndexResponse, error)
 	WarmupVersion(context.Context, *WarmupVersionRequest) (*WarmupVersionResponse, error)
 	// The operator's three verbs for a version the control layer declared
-	// FAILED_PERMANENT (Stratum_设计文档v13.md §10.1): see it, retry it, abandon it.
+	// FAILED_PERMANENT (docs/参考/历史/Stratum_设计文档v13.md §10.1): see it, retry it, abandon it.
 	//
 	// They live here rather than on KnowledgeBaseService because the caller is an
 	// operator acting on a verdict, not an application working with a version — and

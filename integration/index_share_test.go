@@ -47,7 +47,7 @@ func waitForIndex(t *testing.T, baseDir, kbID string, versionID int64, within ti
 }
 
 // TestRealStack_IndexDistributionInstallsTheBuildersArtifact is the end-to-end
-// proof of Stratum_设计文档v13.md §8.4: one node builds the index and the replica
+// proof of docs/参考/历史/Stratum_设计文档v13.md §8.4: one node builds the index and the replica
 // receives that same artifact instead of building its own.
 //
 // The assertion is byte-for-byte equality of the two index files. That is what

@@ -9,7 +9,7 @@ import (
 )
 
 // TestNewRaft_RefusesToStartOnUnreadableHardState pins H4 of
-// docs/code-review-2026-10-18.md at the entry point: a hard-state file that
+// docs/参考/code-review-2026-10-18.md at the entry point: a hard-state file that
 // cannot be decoded must stop the node, not silently restart it in term 0 with an
 // empty log (free to vote twice in one term, and forgetful of committed entries).
 func TestNewRaft_RefusesToStartOnUnreadableHardState(t *testing.T) {

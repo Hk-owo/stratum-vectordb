@@ -2,8 +2,8 @@
 // interfaces — the orchestration layer between the gRPC Service layer and
 // the internal storage/index/Raft/WAL modules.
 //
-// See Stratum_接口设计v9.md "WriteCoordinator" / "DeleteCoordinator" and
-// Stratum_设计文档v10.md "写路径" / "删除知识库" for the authoritative
+// See docs/参考/历史/Stratum_接口设计v9.md "WriteCoordinator" / "DeleteCoordinator" and
+// docs/参考/历史/Stratum_设计文档v10.md "写路径" / "删除知识库" for the authoritative
 // design. This file contains only the WriteCoordinator interface
 // definition; the real orchestration implementation (WriteCoordinatorImpl,
 // wiring together WAL/RaftNode/ChunkSplitter/EmbedClient/BloomFilter/
@@ -24,8 +24,8 @@ import (
 //
 // The full CreateVersion flow this interface's real implementation
 // executes (synchronously through WAL COMMIT, then asynchronously for
-// index build) is documented in Stratum_接口设计v9.md's "CreateVersion"
-// logical flow and Stratum_设计文档v10.md's "写路径" section:
+// index build) is documented in docs/参考/历史/Stratum_接口设计v9.md's "CreateVersion"
+// logical flow and docs/参考/历史/Stratum_设计文档v10.md's "写路径" section:
 //
 //  1. WAL.WriteBegin (persisting the transaction's replay input)
 //  2. RaftNode.ProposeCreateVersion (apply phase writes WAL.WriteVersionID
@@ -33,7 +33,7 @@ import (
 //  3. For each changed document: ChunkSplitter.Split (with the mode from the
 //     knowledge base metadata) -> per chunk: BloomFilter.Test ->
 //     ChunkStore.Exists, and only the chunks the KB does not already hold go
-//     to EmbedClient.Embed (docs/content-defined-chunking-plan.md §4) ->
+//     to EmbedClient.Embed (docs/已实施/content-defined-chunking-plan.md §4) ->
 //     ChunkStore.Write + BloomFilter.Add -> ChunkDocMapper.Write (every
 //     chunk, the reused ones included) -> DocStore.Write
 //  4. VersionDocList.Write (parent version's full doc set + this version's
@@ -65,7 +65,7 @@ type WriteCoordinator interface {
 	// idempotency key: a retry carrying the same key (for the same KB) reuses
 	// the version the first attempt allocated instead of allocating another
 	// one, which is what lets a client re-send the changes for a version whose
-	// data never landed (Stratum_设计文档v13.md §7.12). Returns the version ID
+	// data never landed (docs/参考/历史/Stratum_设计文档v13.md §7.12). Returns the version ID
 	// once the synchronous steps have completed; index build continues
 	// asynchronously.
 	Execute(ctx context.Context, kbID string, parentVersionID int64, changes []types.DocChange, clientRequestID string) (int64, error)

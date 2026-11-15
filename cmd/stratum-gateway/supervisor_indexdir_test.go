@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// M4 of docs/code-review-2026-09-24.md: the vecstore confines Save/Load/… to the
+// M4 of docs/参考/code-review-2026-09-24.md: the vecstore confines Save/Load/… to the
 // directories it was started with (--index_dir). The supervisor is what starts it in
 // the single-machine shape, so the flag has to be there — the node writes its indexes
 // under the stratum service's data_dir, and a vecstore without the flag would allow
@@ -48,7 +48,7 @@ func argValue(args []string, prefix string) (string, bool) {
 }
 
 // The root handed to the vecstore must be <data_dir>/index, not <data_dir> itself
-// (C3 of docs/code-review-2026-10-18.md): the on-disk index RPCs write whatever
+// (C3 of docs/参考/code-review-2026-10-18.md): the on-disk index RPCs write whatever
 // path they are given, so the root IS their writable set — and <data_dir> also
 // contains RocksDB's files, the document store and the metadata stores.
 func TestSupervisorPassesTheNodesIndexDirAsTheIndexDir(t *testing.T) {

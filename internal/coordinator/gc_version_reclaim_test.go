@@ -221,7 +221,7 @@ func TestReclaimVersionChunks_NothingToDoIsANoOp(t *testing.T) {
 
 // TestReclaimVersionChunks_StoreFailureKeepsChunk: the event-driven path owes the
 // same rule as the sweep — a store that cannot answer is not a deletion (H2 of
-// docs/code-review-2026-10-18.md), and the error must surface so the delete
+// docs/参考/code-review-2026-10-18.md), and the error must surface so the delete
 // flow's retry runs it again (the version document list is still there because
 // the reclaim runs before it is dropped).
 func TestReclaimVersionChunks_StoreFailureKeepsChunk(t *testing.T) {

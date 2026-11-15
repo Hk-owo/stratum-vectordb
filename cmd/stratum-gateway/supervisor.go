@@ -29,7 +29,7 @@ type ServiceStatus struct {
 // Keeping them here is what makes running() a fact rather than a guess: the old
 // check was "signal 0 succeeds", which a ZOMBIE also satisfies, so a service that
 // crashed kept reporting running:true — and Start, believing it was already up,
-// became a no-op forever (H11 of docs/code-review-2026-10-18.md).
+// became a no-op forever (H11 of docs/参考/code-review-2026-10-18.md).
 type managedProc struct {
 	cmd       *exec.Cmd
 	startedAt time.Time
@@ -242,11 +242,11 @@ func (s *Supervisor) buildCmd(svc ServiceID) (*exec.Cmd, error) {
 		}
 		// The on-disk index RPCs (Save / Load / LoadForAppend / ExistsIndex) take a
 		// path from the wire, so the vecstore confines them to --index_dir (M4 of
-		// docs/code-review-2026-09-24.md). An explicit index_dir wins when a
+		// docs/参考/code-review-2026-09-24.md). An explicit index_dir wins when a
 		// deployment keeps indexes elsewhere.
 		//
 		// The default is <data_dir>/index, NOT <data_dir> (C3 of
-		// docs/code-review-2026-10-18.md). The IndexManager keeps every index under
+		// docs/参考/code-review-2026-10-18.md). The IndexManager keeps every index under
 		// <data_dir>/index/<kbID>/, which is the set these RPCs are supposed to reach;
 		// handing over the whole data directory puts RocksDB's own files, the document
 		// store and the metadata stores inside the writable set, and Save() writes

@@ -227,7 +227,7 @@ func serveFakeAdmin(t *testing.T, nodeID, leaderID int64) string {
 // GetClusterStatus reports {node_id: the answering node's own ID, leader_id: the
 // ID it believes leads}, and LeaderNow resolves leader_id to a position in the
 // list of clients it was handed. A control node reports 1..N; a storage node in
-// the split topology reports 11..1N (Stratum_设计文档v13.md §11). Handing LeaderNow
+// the split topology reports 11..1N (docs/参考/历史/Stratum_设计文档v13.md §11). Handing LeaderNow
 // the storage layer's clients — which the station did, under a comment claiming a
 // control node builds no AdminService, untrue since cmd/stratum/control_admin.go
 // taught it to answer the Raft view — put the votes in a space no node_id in its

@@ -32,7 +32,7 @@ import (
 //
 // The reader used to collapse both into "the log ends here" and truncate the
 // file there, which permanently deleted every record after a damaged one. That
-// is the read-side twin of H6 (docs/code-review-2026-10-18.md), which the write
+// is the read-side twin of H6 (docs/参考/code-review-2026-10-18.md), which the write
 // path already answers with rewind + fail-stop; these tests pin the same rule
 // for the read path: damage in the MIDDLE refuses to open (and does not touch
 // the file), while a damaged or short TAIL is still recoverable, because a crash

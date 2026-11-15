@@ -1,5 +1,5 @@
 // Package docker_test contains Stratum's T4 multi-node integration tests
-// (Stratum_测试顺序.md 第四批). They are protected by the "docker" build tag.
+// (docs/已实施/Stratum_测试顺序.md 第四批). They are protected by the "docker" build tag.
 //
 // Two topologies are supported, and the tests below were written to work under
 // both — which is why the node addresses and container names come from the
@@ -7,7 +7,7 @@
 //
 //   - all-in-one: every node runs both halves (scripts/cluster.sh --topology single).
 //     nodeAddrs are 3 such nodes and every one of them serves reads.
-//   - split (Stratum_设计文档v13.md §11 阶段 ④): a control group that holds no
+//   - split (docs/参考/历史/Stratum_设计文档v13.md §11 阶段 ④): a control group that holds no
 //     storage and a storage group that holds no metadata
 //     (scripts/cluster.sh --topology two-tier). nodeAddrs are the control nodes;
 //     storageAddrs (see two_tier_test.go) are where reads are served.
@@ -46,7 +46,7 @@ import (
 )
 
 // stationSecret is the key the cluster's station stamps its trust mark with,
-// written by scripts/cluster.sh (H3/H4 of docs/code-review-2026-09-24.md).
+// written by scripts/cluster.sh (H3/H4 of docs/参考/code-review-2026-09-24.md).
 //
 // The mark used to be the constant "1", so a test could produce one by writing
 // that string. It is now an HMAC over a timestamp under a key shared with the
@@ -185,7 +185,7 @@ func controlLeaderIndex(t *testing.T, ctx context.Context) int {
 		t.Fatalf("no control node reported a leader (asked %v; last error: %v)", controlAddrs, lastErr)
 	}
 	// Control nodes are 1..N in the order they are configured, which is the order
-	// of controlAddrs (Stratum_设计文档v13.md §11).
+	// of controlAddrs (docs/参考/历史/Stratum_设计文档v13.md §11).
 	idx := int(best) - 1
 	if idx < 0 || idx >= len(controlAddrs) {
 		t.Fatalf("leader id %d is outside the %d control nodes (%v)",
@@ -306,7 +306,7 @@ func measurementKB(t *testing.T, ctx context.Context, addr, label, probeKB strin
 // and answers success, so a KB proves the cluster HAS a leader — not that the
 // node asked is it. A version write is what separates the two, because the
 // coordinator refuses with ErrNotLeader unless this node leads and nothing
-// forwards it (Stratum_设计文档v13.md §7.13.2). Asking a follower for a version
+// forwards it (docs/参考/历史/Stratum_设计文档v13.md §7.13.2). Asking a follower for a version
 // is how every test that "mysteriously" came back with "not leader" failed.
 //
 // The KB from a node that turns out not to lead is left behind. It is harmless

@@ -54,7 +54,7 @@ func newSourcePlane(puller VersionPuller, replicas []string, querier CursorQueri
 }
 
 // A backfill must pull from a peer that actually holds the gap — the whole
-// point of exchanging cursors (Stratum_设计文档v13.md §7.6).
+// point of exchanging cursors (docs/参考/历史/Stratum_设计文档v13.md §7.6).
 func TestLocalDataPlane_BackfillPicksAPeerHoldingTheGap(t *testing.T) {
 	puller := &sourceRecordingPuller{}
 	dp := newSourcePlane(puller,

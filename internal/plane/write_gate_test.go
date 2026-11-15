@@ -25,7 +25,7 @@ func TestWriteLimiter_AdmitsUpToTheLimit(t *testing.T) {
 }
 
 // The write past the limit queues rather than failing: it is a legitimate
-// write that merely has to wait for a slot (Stratum_设计文档v13.md §7.7).
+// write that merely has to wait for a slot (docs/参考/历史/Stratum_设计文档v13.md §7.7).
 func TestWriteLimiter_QueuesPastTheLimit(t *testing.T) {
 	l := newWriteLimiter(1)
 	ctx := context.Background()

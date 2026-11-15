@@ -1,7 +1,7 @@
 // query.proto — external QueryService contract: vector queries against a
 // knowledge base version.
 //
-// See Stratum_接口设计v9.md "QueryService" for the authoritative
+// See docs/参考/历史/Stratum_接口设计v9.md "QueryService" for the authoritative
 // specification.
 //
 // Reserved (not implemented): BatchQuery, HybridQuery. Per

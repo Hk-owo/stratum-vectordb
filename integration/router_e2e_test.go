@@ -106,7 +106,7 @@ func TestRouter_ThreeNodeCluster(t *testing.T) {
 	}
 	kbID := kbResp.KnowledgeBaseId
 	// A knowledge base no longer comes with a version
-	// (docs/cursor-persistence-plan.md §5): the root this test forks from is
+	// (docs/已实施/cursor-persistence-plan.md §5): the root this test forks from is
 	// created on the leader.
 	v1 := seedRootVersion(t, leader.raftNode, ctx, kbID)
 

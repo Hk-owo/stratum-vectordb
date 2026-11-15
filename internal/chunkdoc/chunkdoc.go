@@ -1,7 +1,7 @@
 // Package chunkdoc defines the ChunkDocMapper interface: a bidirectional
 // mapping between chunk IDs and document IDs, scoped per knowledge base.
 //
-// See Stratum_接口设计v9.md "ChunkDocMapper" and Stratum_设计文档v10.md
+// See docs/参考/历史/Stratum_接口设计v9.md "ChunkDocMapper" and docs/参考/历史/Stratum_设计文档v10.md
 // "chunk-doc 映射" for the authoritative design. This file contains only
 // the interface definition; the PebbleDB-backed implementation is built in
 // Phase 1.
@@ -69,7 +69,7 @@ type ChunkDocMapper interface {
 	// DeleteByDoc drops the document's mapping to EVERY chunk it has, which makes
 	// the document's other chunks invisible to the orphan sweep (the sweep finds
 	// candidates by scanning the forward keyspace) while their vectors stay in the
-	// store forever — H3 of docs/code-review-2026-10-18.md. Reclaiming a chunk
+	// store forever — H3 of docs/参考/code-review-2026-10-18.md. Reclaiming a chunk
 	// must only unpin that chunk.
 	DeleteMapping(ctx context.Context, kbID, chunkID, docID string) error
 }

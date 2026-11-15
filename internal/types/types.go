@@ -2,7 +2,7 @@
 // modules. These types have no behavior of their own; they are pure data
 // carriers exchanged between coordinator, storage, index, and service layers.
 //
-// See Stratum_接口设计v9.md "数据类型定义" for the authoritative definitions.
+// See docs/参考/历史/Stratum_接口设计v9.md "数据类型定义" for the authoritative definitions.
 package types
 
 // IndexStatus represents the build status of a version's vector index.
@@ -25,7 +25,7 @@ const (
 	// version has spent its retry budget (or hit an unrecoverable error) and
 	// will not be retried automatically again. Unlike FAILED, nothing
 	// re-triggers it: an operator must retry or abandon it
-	// (Stratum_设计文档v13.md §10.1).
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 	IndexStatusFailedPermanent
 )
 
@@ -56,7 +56,7 @@ func (s IndexStatus) IsFailed() bool {
 
 // FailureClass is the storage layer's classification of a failed attempt to
 // make a version durable. It decides how the control layer treats the failure
-// (Stratum_设计文档v13.md §10.1): the storage layer names the kind, the control
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1): the storage layer names the kind, the control
 // layer owns the verdict.
 type FailureClass int
 
@@ -92,7 +92,7 @@ func (c FailureClass) String() string {
 // The retry budget, the failure counter, and the terminal verdict all apply to
 // one side at a time: a version whose index build keeps failing must not spend
 // the budget its data write needs, and vice versa
-// (Stratum_设计文档v13.md §10.1, §10.1b).
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1, §10.1b).
 type FailureSide int
 
 const (
@@ -120,7 +120,7 @@ func (s FailureSide) String() string {
 }
 
 // DataStatus is the storage-layer state of a version's DATA, kept independent
-// of its index state (Stratum_设计文档v13.md §10.1b).
+// of its index state (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 //
 // The two are tracked apart because they fail apart: a version whose data is
 // durable may still have no working index, and a failed index build says
@@ -140,7 +140,7 @@ const (
 	// DataStatusFailedPermanent is the data side's terminal verdict: the retry
 	// budget is spent, or the failure was globally fatal, so the data will
 	// never be written. Like the index side's, nothing re-triggers it — only an
-	// operator can retry or abandon the version (Stratum_设计文档v13.md §10.1).
+	// operator can retry or abandon the version (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 	DataStatusFailedPermanent
 )
 
@@ -198,7 +198,7 @@ type Chunk struct {
 }
 
 // ChunkMode names the splitting algorithm a knowledge base uses to turn a
-// document into chunks (docs/content-defined-chunking-plan.md §3).
+// document into chunks (docs/已实施/content-defined-chunking-plan.md §3).
 type ChunkMode string
 
 const (
@@ -209,7 +209,7 @@ const (
 	// documents, that moves the share of chunks past the edit point that keep
 	// their ChunkID from 0% to about 95%, and the text that has to be embedded
 	// again from 64% to 10% of the document
-	// (docs/content-defined-chunking-plan.md §1.2b).
+	// (docs/已实施/content-defined-chunking-plan.md §1.2b).
 	//
 	// The zero value means this mode deliberately. Knowledge base metadata is
 	// stored as JSON/gob in the Raft state machine and read back through the
@@ -219,14 +219,14 @@ const (
 	// for the mode at all (""). Making the default here means all three resolve
 	// to the same algorithm — which is what removes the need for a proto field,
 	// and with it the failure mode of one node cutting a knowledge base
-	// differently from another (docs/content-defined-chunking-plan.md §3.6).
+	// differently from another (docs/已实施/content-defined-chunking-plan.md §3.6).
 	ChunkModeCDC ChunkMode = "cdc"
 
 	// ChunkModeWindow is the fixed-offset sliding window
 	// (splitter.SlidingWindowSplitter). Nothing in the API selects it: every
 	// knowledge base is chunked content-defined, and the window survives as the
 	// implementation the CDC tests are measured against
-	// (docs/content-defined-chunking-plan.md §8). Only code sets this.
+	// (docs/已实施/content-defined-chunking-plan.md §8). Only code sets this.
 	ChunkModeWindow ChunkMode = "window"
 )
 
@@ -246,7 +246,7 @@ func (m ChunkMode) String() string {
 // WindowSize/OverlapSize are RUNES (as they always were, so that multi-byte
 // text counts correctly), while MinSize/MaxSize are BYTES — the content-defined
 // chunker rolls a byte-wise fingerprint and reports byte offsets
-// (docs/content-defined-chunking-plan.md §3.2, §3.3). Each mode reads only its
+// (docs/已实施/content-defined-chunking-plan.md §3.2, §3.3). Each mode reads only its
 // own fields.
 type ChunkParams struct {
 	Mode        ChunkMode
@@ -268,7 +268,7 @@ func CDCChunkParams(minSize, maxSize, avgBits int) ChunkParams {
 }
 
 // Defaults for the chunk sizes each mode falls back to when metadata leaves
-// them unset (docs/content-defined-chunking-plan.md §3.2). The window pair
+// them unset (docs/已实施/content-defined-chunking-plan.md §3.2). The window pair
 // matches knowledge_base_defaults in configs; the CDC triple is the measured
 // pick — it averages 738 bytes per chunk against the window's 766, so the
 // retrieval granularity is unchanged while the reuse rate is not.
@@ -304,7 +304,7 @@ type KnowledgeBaseMeta struct {
 	// ChunkMode selects how documents are split into chunks. The zero value is
 	// ChunkModeCDC, so a knowledge base is chunked content-defined unless code
 	// says otherwise; nothing in the API sets this field, by design
-	// (docs/content-defined-chunking-plan.md §3.6). Each mode reads only its own
+	// (docs/已实施/content-defined-chunking-plan.md §3.6). Each mode reads only its own
 	// sizes — the two window fields above, or the three CDC fields below.
 	// Immutable after creation: every version of a knowledge base has to be
 	// split the same way, or the same text yields different chunk IDs and
@@ -318,7 +318,7 @@ type KnowledgeBaseMeta struct {
 	Similarity string // COSINE / EUCLIDEAN / INNER_PRODUCT; immutable after
 	// creation; defaults to COSINE.
 	// QuantizerType selects the in-memory index payload storage:
-	// OFF / SQ8 / SQ_BF16 / SQ_FP16 / PQ (Stratum_设计文档v12.md). Immutable
+	// OFF / SQ8 / SQ_BF16 / SQ_FP16 / PQ (docs/参考/历史/Stratum_设计文档v12.md). Immutable
 	// after creation; defaults to OFF (full precision, current behavior).
 	QuantizerType    string
 	QuantizerPQM     int // PQ sub-vectors; used only when QuantizerType == "PQ".
@@ -394,7 +394,7 @@ type VersionMeta struct {
 	IndexStatus IndexStatus
 
 	// DataStatus is this version's DATA-side state, kept independent of
-	// IndexStatus (Stratum_设计文档v13.md §10.1b). The two are tracked apart
+	// IndexStatus (docs/参考/历史/Stratum_设计文档v13.md §10.1b). The two are tracked apart
 	// because they fail apart: a version whose data is durable may still have
 	// no working index, and a failed index build says nothing about whether the
 	// data landed. Before this field existed, the data side's terminal verdict
@@ -437,7 +437,7 @@ type VersionMeta struct {
 	FailureCount int32
 
 	// FailureSide is WHICH half of the version that verdict settled
-	// (Stratum_设计文档v13.md §10.1b). The two sides carry independent states and
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1b). The two sides carry independent states and
 	// therefore independent verdicts, so "the version failed" is not a complete
 	// statement without it — and the reason chain above belongs to whichever side
 	// this names.
@@ -536,9 +536,9 @@ const (
 	// writes from scratch using VersionID, which is safe because every
 	// storage write is idempotent.
 	//
-	// This type was added to close a gap between Stratum_接口设计v9.md
+	// This type was added to close a gap between docs/参考/历史/Stratum_接口设计v9.md
 	// (whose original PendingRecordType enum only covered DeleteMark) and
-	// Stratum_测试顺序.md's T1-6 case table, which expects WAL.Recover to
+	// docs/已实施/Stratum_测试顺序.md's T1-6 case table, which expects WAL.Recover to
 	// directly surface a pending versionID for this scenario rather than
 	// requiring callers to discover it through a separate accessor.
 	PendingRecordTypeVersionWrite

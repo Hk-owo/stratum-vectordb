@@ -160,7 +160,7 @@ constexpr int kMaxCandidates = 4096;
 
 // CandidateCountFor scales top_k into a candidate budget.
 //
-// The multiply is done in 64-bit on purpose (M3 of docs/code-review-2026-09-24.md):
+// The multiply is done in 64-bit on purpose (M3 of docs/参考/code-review-2026-09-24.md):
 // top_k is an int32 straight off the wire, so `top_k * 8` overflows for anything
 // past INT_MAX/8 — signed overflow, i.e. undefined behaviour, and whatever the
 // clamp below then compares is a wrapped value (a large top_k could land on a
@@ -204,7 +204,7 @@ int ClampCandidateN(int32_t candidate_n) {
 // remove_ids on a shape it cannot compact — unwinds through the generated code and
 // reaches std::terminate, taking the whole vecstore process down with it. One
 // malformed .index file was enough to do it, which is M6 of
-// docs/code-review-2026-09-24.md. Build/AddChunks already had this treatment; every
+// docs/参考/code-review-2026-09-24.md. Build/AddChunks already had this treatment; every
 // other handler did not.
 //
 // The exception's message is passed to the caller rather than scrubbed: this is an
@@ -526,7 +526,7 @@ grpc::Status VectorIndexServiceImpl::Search(grpc::ServerContext* context,
   //
   // Both numbers size allocations downstream (candidate_n the rerank's
   // distance/label buffers, top_k the result set) and both arrive from the wire, so
-  // both are clamped here (M3 of docs/code-review-2026-09-24.md). Before this, a
+  // both are clamped here (M3 of docs/参考/code-review-2026-09-24.md). Before this, a
   // candidate_n of 2^31-1 was taken at face value: ~8 GB of floats plus as much
   // again in labels, allocated in a handler whose bad_alloc escapes to
   // std::terminate — a remote kill from one request.
@@ -658,7 +658,7 @@ bool VectorIndexServiceImpl::FileExists(const std::string& path) {
 }
 
 // IndexPathAllowed confines every on-disk index operation to the directories this
-// process was configured with (M4 of docs/code-review-2026-09-24.md).
+// process was configured with (M4 of docs/参考/code-review-2026-09-24.md).
 //
 // Save, Load, LoadForAppend and ExistsIndex each take a filesystem path from the
 // request. Nothing else constrains it: the vecstore listener is unauthenticated,
@@ -686,7 +686,7 @@ bool VectorIndexServiceImpl::IndexPathAllowed(const std::string& path, std::stri
   // An excluded root wins over an allowed one. It exists for the chunk store's own
   // directory: an allow-list wide enough to contain the store would otherwise permit
   // Save() to rename index bytes over RocksDB's CURRENT/MANIFEST/*.sst, which ends the
-  // store (C3 of docs/code-review-2026-10-18.md).
+  // store (C3 of docs/参考/code-review-2026-10-18.md).
   for (const auto& dir : excluded_dirs_) {
     const std::string rel = target.lexically_relative(dir).string();
     if (rel.empty()) {
@@ -776,7 +776,7 @@ grpc::Status VectorIndexServiceImpl::Drop(grpc::ServerContext* context,
     // the id table, the two things that make an index big. Reset (called by the Go
     // side's Discard before this existed) empties an index but keeps the object, so
     // the map only ever grew: a process's RSS tracked how many versions had been
-    // touched, not how many it was holding (H5 of docs/code-review-2026-09-24.md).
+    // touched, not how many it was holding (H5 of docs/参考/code-review-2026-09-24.md).
     //
     // A shared_ptr keeps a concurrent Search's copy alive until that search
     // returns, so this cannot pull the object out from under a reader (see

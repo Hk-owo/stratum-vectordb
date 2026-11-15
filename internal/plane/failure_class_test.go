@@ -11,7 +11,7 @@ import (
 
 // A globally fatal failure does not spend the retry budget: retrying cannot
 // help, so waiting would only delay the verdict and keep the version PENDING
-// meanwhile (Stratum_设计文档v13.md §10.1).
+// meanwhile (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 func TestLocalControlPlane_FatalFailureShortCircuitsTheBudget(t *testing.T) {
 	meta := &stubMeta{}
 	cp := NewLocalControlPlane(meta, WithFailureBudget(5))

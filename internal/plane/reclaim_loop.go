@@ -34,7 +34,7 @@ type WALReclaimerConfig struct {
 }
 
 // WALReclaimer periodically compacts the WAL, dropping the recorded changes that
-// every replica already holds (Stratum_设计文档v13.md §7.5). It is a background
+// every replica already holds (docs/参考/历史/Stratum_设计文档v13.md §7.5). It is a background
 // loop for the same reason index builds are: reclaiming rewrites a file, and nothing
 // in the apply path may block on it.
 type WALReclaimer struct {

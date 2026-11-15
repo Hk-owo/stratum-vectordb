@@ -594,7 +594,7 @@ func TestLocalDataPlane_Search_Delegates(t *testing.T) {
 }
 
 // WriteVersionData owns the whole storage-layer transaction: BEGIN (with the
-// replay input) before the writes, COMMIT after them (Stratum_设计文档v13.md
+// replay input) before the writes, COMMIT after them (docs/参考/历史/Stratum_设计文档v13.md
 // §7.12).
 func TestLocalDataPlane_WriteVersionData_FramesTheTransaction(t *testing.T) {
 	tr := &tracer{}

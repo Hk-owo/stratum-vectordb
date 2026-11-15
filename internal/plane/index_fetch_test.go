@@ -328,7 +328,7 @@ func (s *slowIndexFetcher) callCount() int {
 }
 
 // TestFetchIndexFromPeers_SharesOneFetchAcrossConcurrentCallers pins the
-// deduplication half of H9 of docs/code-review-2026-10-18.md.
+// deduplication half of H9 of docs/参考/code-review-2026-10-18.md.
 //
 // The query path asks for the artifact on every PENDING query and the catch-up loop
 // on every round, so the same version is asked about repeatedly and concurrently.

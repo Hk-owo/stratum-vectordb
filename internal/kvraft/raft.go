@@ -2,7 +2,7 @@
 // replication, and snapshotting, exposed as a reusable library independent
 // of any particular state machine. The Stratum-specific state machine
 // (knowledge base and version metadata) is built on top of this package in
-// internal/raft (RaftNodeImpl), per Stratum_实现顺序.md 阶段 3.
+// internal/raft (RaftNodeImpl), per docs/已实施/Stratum_实现顺序.md 阶段 3.
 //
 // Originally adapted from the KVServer project's internal/raft package
 // (an MIT 6.5840-style teaching implementation that pairs this consensus
@@ -166,7 +166,7 @@ func WithElectionTimeoutRange(min, max time.Duration) Option {
 // of committed entries — and an unreadable snapshot means an empty state machine
 // whose lastApplied still claims the compacted range was applied. Both are silent
 // until they are not, so refusing to start is the only honest answer (H4 of
-// docs/code-review-2026-10-18.md).
+// docs/参考/code-review-2026-10-18.md).
 func NewRaft(id int64, transport *Transport, applyCh chan ApplyMsg, persister *kvstorage.Persister, opts ...Option) (*Raft, error) {
 	rf := &Raft{
 		me:                 id,

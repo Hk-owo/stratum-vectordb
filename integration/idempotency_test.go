@@ -11,7 +11,7 @@ import (
 // client idempotency key — proto field → service → write coordinator → Raft
 // state machine. A retry carrying the same key must return the version the
 // first attempt allocated, which is what lets a client re-send the changes for
-// a version whose data never landed (Stratum_设计文档v13.md §7.12).
+// a version whose data never landed (docs/参考/历史/Stratum_设计文档v13.md §7.12).
 func TestIntegration_CreateVersionIdempotentRetry(t *testing.T) {
 	cluster := newTestCluster(t)
 	defer cluster.Close()
@@ -31,7 +31,7 @@ func TestIntegration_CreateVersionIdempotentRetry(t *testing.T) {
 	}
 	kbID := createResp.KnowledgeBaseId
 	// The parent the retried request names: a knowledge base no longer comes with a
-	// version, so the root is created here (docs/cursor-persistence-plan.md §5).
+	// version, so the root is created here (docs/已实施/cursor-persistence-plan.md §5).
 	root := seedRootVersion(t, cluster.RaftNode, ctx, kbID)
 
 	req := &pb.CreateVersionRequest{

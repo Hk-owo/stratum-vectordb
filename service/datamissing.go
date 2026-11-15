@@ -21,7 +21,7 @@ type PresenceChecker interface {
 // version holds it, its data never landed at all — the writer died between
 // allocating the version and writing it, or every push failed. Such a version
 // is only recoverable by the client re-sending its changes under the same
-// client_request_id (Stratum_设计文档v13.md §7.12), so it has to be visible
+// client_request_id (docs/参考/历史/Stratum_设计文档v13.md §7.12), so it has to be visible
 // rather than silently PENDING forever.
 //
 // Only versions older than minAgeSec are probed: one allocated a moment ago may

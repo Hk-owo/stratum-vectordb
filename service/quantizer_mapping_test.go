@@ -2,7 +2,7 @@ package service
 
 // quantizer_mapping_test.go — round-trips the KB quantizer mapping
 // between the console-facing proto enum (QUANTIZER_*) and the short
-// internal name stored in KnowledgeBaseMeta (Stratum_设计文档v12.md 2.4).
+// internal name stored in KnowledgeBaseMeta (docs/参考/历史/Stratum_设计文档v12.md 2.4).
 
 import (
 	"testing"

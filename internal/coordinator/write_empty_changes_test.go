@@ -12,7 +12,7 @@ import (
 	"stratum/internal/wal"
 )
 
-// TestWriteCoordinator_RejectsEmptyChanges pins docs/cursor-persistence-plan.md §5:
+// TestWriteCoordinator_RejectsEmptyChanges pins docs/已实施/cursor-persistence-plan.md §5:
 // an empty changes list is REFUSED rather than turned into a version.
 //
 // A version's document set is inherited from its parent, so "no changes" means

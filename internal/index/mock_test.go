@@ -17,7 +17,7 @@ import (
 // for VersionDocList / ChunkDocMapper / ChunkStore without pulling in
 // those packages (keeping this package's tests dependency-light; cross-
 // module wiring is exercised later in coordinator/index integration
-// tests per Stratum_测试顺序.md T2-2).
+// tests per docs/已实施/Stratum_测试顺序.md T2-2).
 type testDeps struct {
 	mu       sync.Mutex
 	docIDs   map[string][]string             // versionKey -> docIDs

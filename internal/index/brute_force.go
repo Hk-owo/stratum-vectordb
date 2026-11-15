@@ -13,7 +13,7 @@ import (
 )
 
 // DefaultBruteForceMaxChunks is the version size up to which a missing index is
-// answered by scanning rather than by building (Stratum_设计文档v13.md §8.6b).
+// answered by scanning rather than by building (docs/参考/历史/Stratum_设计文档v13.md §8.6b).
 // Above it, scanning costs about as much as building, so making the caller wait
 // is the better trade. Placeholder value, see §10.4.
 const DefaultBruteForceMaxChunks = 50_000

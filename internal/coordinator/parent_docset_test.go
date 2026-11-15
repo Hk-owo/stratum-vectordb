@@ -58,7 +58,7 @@ func parentDocSetFixture(t *testing.T) (*WriteCoordinatorImpl, *testVersionDocLi
 }
 
 // TestWriteCoordinator_RefusesChildWhenParentDataIsMissing pins H1 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // A child version's document set is the parent's set plus this version's changes,
 // and the parent's set is read from THIS node's store. Under the dispatch topology

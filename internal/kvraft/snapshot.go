@@ -45,7 +45,7 @@ func (rf *Raft) ResetSnapshotting() {
 // logBase] entries exist neither in the snapshot nor in the log, so a restart
 // replays neither, the state machine boots from an older snapshot, and the
 // metadata those entries carried is simply gone — including whatever the version
-// counter had reached (H5 of docs/code-review-2026-10-18.md).
+// counter had reached (H5 of docs/参考/code-review-2026-10-18.md).
 func (rf *Raft) Snapshot(index uint64, data []byte) {
 	rf.mu.Lock()
 	if index <= rf.log[0].Index {

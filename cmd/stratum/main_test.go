@@ -552,7 +552,7 @@ func TestReconcileIndexStatus(t *testing.T) {
 }
 
 // TestReconcileIndexStatus_ReadsTheCursorBackBeforeAnythingElse pins the startup
-// order docs/cursor-persistence-plan.md §3.5 asks for: the persisted cursor is read
+// order docs/已实施/cursor-persistence-plan.md §3.5 asks for: the persisted cursor is read
 // first, and it is right even when every artifact this node could have been
 // inferred from is gone.
 //

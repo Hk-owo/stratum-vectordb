@@ -129,7 +129,7 @@ func (im *IndexManagerImpl) loadFromDisk(ctx context.Context, kbID string, versi
 // The shard is what serialises InstallIndex and ReadIndexFiles per version (see
 // install.go), and it is also what makes the index/sidecar PAIR a unit: a reader
 // holding it knows nothing is renaming either half of the pair underneath it. The
-// delete paths take it too (M8 of docs/code-review-2026-10-18.md) — a removal that
+// delete paths take it too (M8 of docs/参考/code-review-2026-10-18.md) — a removal that
 // skipped it could pull the .ids sidecar out from under a concurrent fetch, which
 // then stores an index whose chunk ids it can no longer look up.
 func (im *IndexManagerImpl) withInstallShard(kbID string, versionID int64, fn func() error) error {
@@ -288,7 +288,7 @@ func (im *IndexManagerImpl) usedPath(kbID string, versionID int64) string {
 //
 // Drop rather than Reset: Reset empties an index but keeps the object, and the
 // object (Faiss index + id table) is the memory a discarded version must not go
-// on holding (H5 of docs/code-review-2026-09-24.md).
+// on holding (H5 of docs/参考/code-review-2026-09-24.md).
 func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID int64) error {
 	im.mu.Lock()
 	key := indexKey{kbID, versionID}
@@ -319,7 +319,7 @@ func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID 
 	// disk retention window (see EnforceDiskRetention).
 	if im.cfg.IndexDataDir != "" {
 		// The version's shard, so a concurrent fetch cannot be reading the pair while
-		// half of it disappears (M8 of docs/code-review-2026-10-18.md).
+		// half of it disappears (M8 of docs/参考/code-review-2026-10-18.md).
 		err := im.withInstallShard(kbID, versionID, func() error {
 			for _, suffix := range []string{"", ".ids", ".mem", ".used"} {
 				path := im.indexPath(kbID, versionID) + suffix

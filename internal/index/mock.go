@@ -48,7 +48,7 @@ type builtIndex struct {
 //
 // It is not a substitute for the real implementation's own tests against
 // a real vecstore gRPC server with real HNSW (see T2-2 in
-// Stratum_测试顺序.md).
+// docs/已实施/Stratum_测试顺序.md).
 type MockIndexManager struct {
 	lruCapacity     int
 	loadWaitTimeout time.Duration

@@ -70,7 +70,7 @@ func TestFileWAL_CompactDropsReclaimedVersions(t *testing.T) {
 	}
 }
 
-// M2 of docs/code-review-2026-09-24.md: compaction must trim the per-version
+// M2 of docs/参考/code-review-2026-09-24.md: compaction must trim the per-version
 // idempotency maps along with the replay input, or a long-running node's memory
 // tracks how many versions it has ever written instead of how many it is holding.
 // Safe because a reclaimed version is by definition COMMITTED and its BEGIN and

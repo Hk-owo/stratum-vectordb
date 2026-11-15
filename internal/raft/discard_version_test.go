@@ -9,7 +9,7 @@ import (
 )
 
 // DiscardVersion is the caller's way out of a write that never landed
-// (docs/await-version-plan.md §7 Step 6). Its admission rule is the interesting
+// (docs/已实施/await-version-plan.md §7 Step 6). Its admission rule is the interesting
 // part: it is a compare-and-set on the state machine, so what these tests pin is
 // who gets refused and why.
 

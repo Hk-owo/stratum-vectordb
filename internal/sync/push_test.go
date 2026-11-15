@@ -60,7 +60,7 @@ func startPushServer(t *testing.T, nodeID int64, opts ...PushHandlerOption) (*Fo
 }
 
 // TestPusher_PushVersion_EndToEnd is the module-interaction test for the push
-// direction (Stratum_设计文档v13.md §7.2): a real LeaderHandler exports over real
+// direction (docs/参考/历史/Stratum_设计文档v13.md §7.2): a real LeaderHandler exports over real
 // gRPC into a real PushHandler whose stores are real PebbleDB instances. The
 // target must end up with the dataset the pull path would have produced, and
 // must schedule its own build.

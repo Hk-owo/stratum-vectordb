@@ -278,7 +278,7 @@ type FileWAL struct {
 	// pendingBeginByKB holds the BEGIN records still awaiting their VERSION_ID, one
 	// per knowledge base — the runtime counterpart of rebuildIndex's local
 	// pendingBegin. Per knowledge base rather than a single slot because writes to
-	// different KBs now run concurrently (M7 of docs/code-review-2026-09-24.md): a
+	// different KBs now run concurrently (M7 of docs/参考/code-review-2026-09-24.md): a
 	// single slot would let KB A's BEGIN bind to KB B's VERSION_ID, and the replay
 	// input ChangesInRange hands a lagging peer would then belong to the wrong
 	// knowledge base.
@@ -286,7 +286,7 @@ type FileWAL struct {
 
 	// pendingVersionIDByKB holds the VERSION_ID records still awaiting their
 	// BEGIN, one per knowledge base — the mirror of pendingBeginByKB, and the
-	// reason both directions need a slot (C5 of docs/code-review-2026-10-18.md).
+	// reason both directions need a slot (C5 of docs/参考/code-review-2026-10-18.md).
 	//
 	// The pairing is written from two places with the two possible orders: the
 	// inline write path writes BEGIN then proposes (apply writes VERSION_ID), while
@@ -448,10 +448,10 @@ func (w *FileWAL) rebuildIndex() error {
 	// first in the file; both orders occur. The original write path wrote
 	// BEGIN first, so that an already-allocated version always had its replay
 	// input on disk. The split write path of the control/data separation
-	// (Stratum_设计文档v13.md §7.12) allocates the version ID first and writes
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.12) allocates the version ID first and writes
 	// BEGIN as part of the storage layer's own transaction. Writes to one knowledge
 	// base are serialized, so at most one BEGIN per KB is ever unpaired; different
-	// KBs pair independently (M7 of docs/code-review-2026-09-24.md).
+	// KBs pair independently (M7 of docs/参考/code-review-2026-09-24.md).
 	//
 	// The pairing itself is by kbID, because a VERSION_ID now records which
 	// knowledge base it belongs to (see WriteVersionID). Records written before that
@@ -613,7 +613,7 @@ func decodeRecord(kind recordType, payload []byte) (parsedRecord, error) {
 	case recordTypeVersionID:
 		// 8 bytes from records written before the payload carried the knowledge
 		// base; more is the version id followed by the kbID's raw bytes (M7 of
-		// docs/code-review-2026-09-24.md).
+		// docs/参考/code-review-2026-09-24.md).
 		if len(payload) < 8 {
 			return parsedRecord{}, fmt.Errorf("%w: malformed versionID payload length %d", ErrLogCorrupt, len(payload))
 		}
@@ -766,7 +766,7 @@ func (w *FileWAL) applyRecordLocked(rec parsedRecord) {
 // stops at the first unparseable record and truncates from there, so a half
 // record left in the middle of the log silently discards every valid record after
 // it — ones whose callers were already told the write succeeded (H6 of
-// docs/code-review-2026-10-18.md).
+// docs/参考/code-review-2026-10-18.md).
 func (w *FileWAL) writeRecordLocked(kind recordType, payload []byte) (uint64, int64, error) {
 	if w.broken != nil {
 		return 0, 0, fmt.Errorf("wal: %s cannot accept writes: %w", w.path, w.broken)
@@ -1035,13 +1035,13 @@ func (w *FileWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int
 		// be durable.
 		//
 		// Per knowledge base, because writes to different KBs are concurrent now
-		// (M7 of docs/code-review-2026-09-24.md): a single slot would let this BEGIN
+		// (M7 of docs/参考/code-review-2026-09-24.md): a single slot would let this BEGIN
 		// bind to another KB's VERSION_ID.
 		//
 		// A VERSION_ID may already be waiting for this BEGIN: under the dispatch
 		// topology the proposal — and therefore the apply that writes VERSION_ID —
 		// happens BEFORE the storage write that lands here (C5 of
-		// docs/code-review-2026-10-18.md). Binding it now is what keeps the replay
+		// docs/参考/code-review-2026-10-18.md). Binding it now is what keeps the replay
 		// input attached to the right version in that order too.
 		if versionID, ok := w.pendingVersionIDByKB[kbID]; ok {
 			w.beginDataByVersion[versionID] = bd
@@ -1056,7 +1056,7 @@ func (w *FileWAL) WriteBegin(_ context.Context, kbID string, parentVersionID int
 func (w *FileWAL) WriteVersionID(_ context.Context, kbID string, versionID int64) error {
 	// The record carries the knowledge base, so the BEGIN/VERSION_ID pairing is
 	// exact regardless of how two KBs' writes interleave on disk (M7 of
-	// docs/code-review-2026-09-24.md). Records written before this change carry only
+	// docs/参考/code-review-2026-09-24.md). Records written before this change carry only
 	// the version id; rebuildIndex still reads those (len==8) and pairs them the old
 	// way.
 	payload := make([]byte, 8+len(kbID))
@@ -1080,7 +1080,7 @@ func (w *FileWAL) WriteVersionID(_ context.Context, kbID string, versionID int64
 		// When no BEGIN is waiting, the write is in the other order (propose/apply
 		// first, storage write later: the dispatch topology), so THIS version waits
 		// for its BEGIN instead of the next version silently stealing the BEGIN that
-		// arrives afterwards (C5 of docs/code-review-2026-10-18.md).
+		// arrives afterwards (C5 of docs/参考/code-review-2026-10-18.md).
 		if bd, ok := w.pendingBeginByKB[kbID]; ok {
 			w.beginDataByVersion[versionID] = bd
 			delete(w.pendingBeginByKB, kbID)

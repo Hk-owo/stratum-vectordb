@@ -13,7 +13,7 @@ import (
 // deleteBlockedByPending decides whether DeleteVersion must refuse a version, and
 // it reads the DATA side on purpose: the question is "may this version's storage
 // writes still be in flight?", which a data-side terminal verdict answers with a
-// definite no (Stratum_设计文档v13.md §10.1b).
+// definite no (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 func TestDeleteBlockedByPending_DecisionTable(t *testing.T) {
 	cases := []struct {
 		name string

@@ -2,7 +2,7 @@
 // IndexManager) and the C++ vecstore process. Address configured via
 // vecstore.grpc_addr in the node config file.
 //
-// See Stratum_接口设计v9.md "vecstore 内部 gRPC（vecstore.proto）" for the
+// See docs/参考/历史/Stratum_接口设计v9.md "vecstore 内部 gRPC（vecstore.proto）" for the
 // authoritative specification this file mirrors exactly.
 syntax = "proto3";
 package vecstore;
@@ -22,7 +22,7 @@ service ChunkStorageService {
   // write path, DELETE_COMPLETE on the knowledge-base delete path. Without this
   // barrier a power loss could leave the record durable and the chunk vectors it
   // vouches for gone — and recovery never replays a version whose COMMIT is
-  // present. See internal/plane/local_data_plane.go and Stratum_设计文档v14.md
+  // present. See internal/plane/local_data_plane.go and docs/参考/Stratum_设计文档v14.md
   // §3.3.
   rpc FlushWAL(FlushWALRequest) returns (FlushWALResponse);
 }
@@ -72,7 +72,7 @@ service VectorIndexService {
   // eviction and its Discard path both remove the version from their own view,
   // and nothing told the C++ side to do the same, so a long-running process's
   // RSS tracked the number of versions ever touched instead of the number it is
-  // holding (H5 of docs/code-review-2026-09-24.md). Reset is not the same thing:
+  // holding (H5 of docs/参考/code-review-2026-09-24.md). Reset is not the same thing:
   // it empties an index but keeps the object alive.
   //
   // Idempotent, and best-effort by design: dropping an index that is not
@@ -118,7 +118,7 @@ enum MetricTypeProto {
 }
 
 // QuantizerTypeProto selects how the in-memory index stores vector
-// payloads (Stratum_设计文档v12.md 2.4). QUANTIZER_OFF keeps the
+// payloads (docs/参考/历史/Stratum_设计文档v12.md 2.4). QUANTIZER_OFF keeps the
 // full-precision IndexHNSWFlat behavior (single-stage exact search); the
 // other types build quantized HNSW indexes (IndexHNSWSQ / IndexHNSWPQ)
 // whose search results are coarse candidates re-ranked against
@@ -130,7 +130,7 @@ enum QuantizerTypeProto {
   QUANTIZER_SQ_FP16 = 3;  // fp16 scalar quantization
   QUANTIZER_PQ = 4;       // product quantization
 
-  // Graph-free variants (Stratum_设计文档v13.md §8.6a). Same quantization, no
+  // Graph-free variants (docs/参考/历史/Stratum_设计文档v13.md §8.6a). Same quantization, no
   // HNSW graph: search degrades to a full scan of the quantized codes, which
   // for a cold version is a good trade — the graph is what dominates both the
   // memory footprint and the build time, and a cold version's index may never
@@ -158,7 +158,7 @@ message BuildIndexResponse {
   // this build, in bytes, on the "coarse retriever" accounting basis
   // (HNSW graph edges + quantized codes for quantized indexes; vector
   // payload bytes otherwise). 0 = unknown/unreported (callers fall back
-  // to their own estimate). See Stratum_设计文档v12.md 3.3.
+  // to their own estimate). See docs/参考/历史/Stratum_设计文档v12.md 3.3.
   int64 mem_bytes = 1;
 }
 

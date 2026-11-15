@@ -12,7 +12,7 @@ import (
 )
 
 // PebbleDocStore is the real, disk-persistent DocStore implementation,
-// backed by PebbleDB. Key layout (see Stratum_设计文档v10.md "doc store"):
+// backed by PebbleDB. Key layout (see docs/参考/历史/Stratum_设计文档v10.md "doc store"):
 //
 //	EncodeString(kbID) + EncodeString(docID) + EncodeVersionID(versionID)
 //

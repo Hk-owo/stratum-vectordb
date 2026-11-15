@@ -17,7 +17,7 @@ import (
 	"stratum/service"
 )
 
-// The await/discard half of docs/await-version-plan.md, on a live cluster.
+// The await/discard half of docs/已实施/await-version-plan.md, on a live cluster.
 //
 // What only a real cluster can show, and why these cases exist on top of the
 // unit tests:

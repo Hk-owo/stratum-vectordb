@@ -13,7 +13,7 @@ import (
 
 // TestPushHandler_VersionPresence pins the answer the control layer relies on
 // to tell a version that is merely waiting for its index build apart from one
-// whose data never landed anywhere (Stratum_设计文档v13.md §7.12 step ①).
+// whose data never landed anywhere (docs/参考/历史/Stratum_设计文档v13.md §7.12 step ①).
 func TestPushHandler_VersionPresence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

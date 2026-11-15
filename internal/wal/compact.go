@@ -25,7 +25,7 @@ import (
 // has, while a cursor is this node's own knowledge of how far its history
 // reaches. Only the newest cursor per knowledge base is kept — the older ones
 // say strictly less, since the value is a scalar — and that is the one record
-// per knowledge base a restart reads back (Stratum_设计文档v13.md §7.8).
+// per knowledge base a restart reads back (docs/参考/历史/Stratum_设计文档v13.md §7.8).
 //
 // A version is only dropped when it is BOTH at or below its knowledge base's
 // watermark AND committed. An uncommitted flow is exactly what Recover exists to
@@ -103,7 +103,7 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	// knowledge base. A BEGIN carries no versionID — the pairing is what identifies
 	// it — so the decision to keep or drop it can only be made once its VERSION_ID
 	// arrives; and since writes to different KBs are concurrent (M7 of
-	// docs/code-review-2026-09-24.md), their pairs sit interleaved in the log, so a
+	// docs/参考/code-review-2026-09-24.md), their pairs sit interleaved in the log, so a
 	// single slot would pair the wrong two records and drop a live transaction's
 	// replay input.
 	pending := make(map[string]*rawRecord)
@@ -254,7 +254,7 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	// must report a reclaimed version as MISSING, not as "here are the changes",
 	// and the per-version idempotency records must go with it.
 	//
-	// M2 of docs/code-review-2026-09-24.md: only beginDataByVersion used to be
+	// M2 of docs/参考/code-review-2026-09-24.md: only beginDataByVersion used to be
 	// trimmed here, so versionIDsWritten and committedVersions grew with every
 	// version the process had ever written — a long-running node's memory tracked
 	// its history rather than its work. Dropping these two is safe for the same

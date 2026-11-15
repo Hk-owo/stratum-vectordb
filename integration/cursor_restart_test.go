@@ -71,7 +71,7 @@ func waitUntilMetadataVisible(t *testing.T, n *realNode, kbID string) {
 }
 
 // TestRealStack_CursorIsRightImmediatelyAfterARestartWithEveryArtifactDeleted is
-// docs/cursor-persistence-plan.md §8's cluster case, and the "变体" of the dec22a0
+// docs/已实施/cursor-persistence-plan.md §8's cluster case, and the "变体" of the dec22a0
 // scenario the plan asks for: a replica is killed, the majority moves on without
 // it, EVERY index artifact it has is deleted, and it is brought back — its cursor
 // must be right the moment it starts, with no query, no pull and no lag-catchup

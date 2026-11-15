@@ -14,7 +14,7 @@ import (
 //
 // Nothing about a version's data status is decided at creation any more. A
 // version created with NO changes is refused outright by the coordinator
-// (docs/cursor-persistence-plan.md §5) — a version's document set is inherited
+// (docs/已实施/cursor-persistence-plan.md §5) — a version's document set is inherited
 // from its parent, so an empty changes list means "unchanged", not "empty" — so
 // the only case the state machine has to get right here is the ordinary one.
 func TestCreateVersion_WithChangesStartsPending(t *testing.T) {

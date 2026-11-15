@@ -1,5 +1,5 @@
 // lifecycle_state_test.cpp — verifies the index-object lifecycle state
-// machine (Stratum_设计文档v12.md 2.6): state transitions, per-state
+// machine (docs/参考/历史/Stratum_设计文档v12.md 2.6): state transitions, per-state
 // read/write admission (strict mode: searches are rejected while
 // BUILDING), and a concurrent Search ∥ Reset/Load smoke test that must
 // neither crash nor deadlock.

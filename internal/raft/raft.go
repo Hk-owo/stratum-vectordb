@@ -2,7 +2,7 @@
 // read/write access to knowledge base and version metadata, backed by the
 // existing kvserver Raft implementation.
 //
-// See Stratum_接口设计v9.md "RaftNode" and Stratum_设计文档v10.md "版本元数据
+// See docs/参考/历史/Stratum_接口设计v9.md "RaftNode" and docs/参考/历史/Stratum_设计文档v10.md "版本元数据
 // （Raft 状态机）" for the authoritative design. This file contains only the
 // interface definition; the real implementation (RaftNodeImpl) is built in
 // Phase 3, on top of the existing kvserver Raft.
@@ -80,7 +80,7 @@ type RaftNode interface {
 	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error
 
 	// ProposeMarkVersionFailedPermanent records the terminal verdict for one
-	// side of a version (Stratum_设计文档v13.md §10.1, §10.1b): the control
+	// side of a version (docs/参考/历史/Stratum_设计文档v13.md §10.1, §10.1b): the control
 	// layer has decided that side's retry budget is spent and nothing will
 	// retry it automatically. side says which state the verdict lands in —
 	// DataStatusFailedPermanent or IndexStatusFailedPermanent — and reason and
@@ -88,7 +88,7 @@ type RaftNode interface {
 	ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error
 
 	// ProposeRetryVersion revokes one side's terminal verdict
-	// (Stratum_设计文档v13.md §10.1). It is an OPERATOR's action, never an automatic
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1). It is an OPERATOR's action, never an automatic
 	// one: "nothing re-triggers it" keeps holding for every machine in the system.
 	//
 	// Only the index side is accepted — the state machine refuses a data-side retry,
@@ -107,7 +107,7 @@ type RaftNode interface {
 
 	// ProposeMarkVersionDataDurable records that versionID's DATA is durable,
 	// on the control layer's own authority rather than a writer's report
-	// (Stratum_设计文档v13.md §10.1b). It is how the startup reconcile turns the
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1b). It is how the startup reconcile turns the
 	// storage layer's reported cursor into replicated state (§7.9). Only a
 	// PENDING data side is promoted: an already settled one — durable, or a
 	// terminal verdict — is left exactly as it is.
@@ -137,7 +137,7 @@ type RaftNode interface {
 
 	// ProposeDiscardVersion removes a version the CALLER has declared abandoned:
 	// a write that never landed, so there is nothing to reclaim
-	// (docs/await-version-plan.md §7 Step 6).
+	// (docs/已实施/await-version-plan.md §7 Step 6).
 	//
 	// Admission is a compare-and-set applied in the state machine, not a check
 	// the caller performs: the version must still be PENDING at apply time.
@@ -166,7 +166,7 @@ type RaftNode interface {
 	// GetVersion returns ONE version's metadata within kbID, so a caller can
 	// ask about a single version without pulling the whole chain: ListVersions
 	// is O(versions) in the KB and the await path polls it repeatedly
-	// (docs/await-version-plan.md §7 Step 2).
+	// (docs/已实施/await-version-plan.md §7 Step 2).
 	//
 	// kbID is required because a version id is unique within a knowledge base,
 	// not globally. Unknown kbID → ErrKnowledgeBaseNotFound; an unknown version
@@ -208,7 +208,7 @@ type proposeOptions struct {
 // retry carrying the same key (for the same knowledge base) reuses the version
 // the first attempt allocated instead of allocating another one — what lets a
 // client re-send the changes for a version whose data never landed
-// (Stratum_设计文档v13.md §7.12). An empty key means "no idempotency".
+// (docs/参考/历史/Stratum_设计文档v13.md §7.12). An empty key means "no idempotency".
 func WithClientRequestID(id string) ProposeOption {
 	return func(o *proposeOptions) { o.clientRequestID = id }
 }

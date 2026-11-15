@@ -3,7 +3,7 @@
 // it".
 //
 // It exists because the answers were previously computed on demand, in six
-// unrelated places (docs/storage-node-state-machine-plan.md §1): the process
+// unrelated places (docs/已实施/storage-node-state-machine-plan.md §1): the process
 // phase was not represented anywhere at all, storage redundancy was re-derived
 // from a report aggregate on every call, lag was a comparison repeated at each
 // site, and "index build in progress" lived in a private map inside the index
@@ -33,13 +33,13 @@
 //     RestoreVersion, and it accepts only the two states disk facts can
 //     express (see its comment).
 //   - It is in memory, and it is rebuilt from disk facts at startup
-//     (docs/storage-node-state-machine-plan.md §5.1). Nothing is persisted:
+//     (docs/已实施/storage-node-state-machine-plan.md §5.1). Nothing is persisted:
 //     a state file would introduce "the file disagrees with the disk" as a new
 //     failure mode, and the rebuild already exists (ReconcileIndexes).
 //   - It does not leave the node. This is one node's own knowledge, fed by
 //     events that already happen here. It is not reported to the control
 //     layer, not shared with the service station, and never consensed on —
-//     the same rule as docs/coordinator-selection-and-node-liveness-design.md
+//     the same rule as docs/已实施/coordinator-selection-and-node-liveness-design.md
 //     §5.1/§5.4: a health view that needs a maintainer needs an election, and
 //     a local view disagreeing with another node's costs nothing.
 //
@@ -131,7 +131,7 @@ func (s NodeState) canTransitionTo(next NodeState) bool {
 // is not the leader answers "unknown" for all of it. This one is what THIS
 // node knows, which for a non-leader is less, and the honest encoding of "I
 // cannot see the others" is RedundancyUnknown rather than borrowing a global
-// verdict it did not compute (docs/storage-node-state-machine-plan.md §3.2).
+// verdict it did not compute (docs/已实施/storage-node-state-machine-plan.md §3.2).
 type Redundancy int
 
 const (
@@ -140,7 +140,7 @@ const (
 	//
 	// It is the zero value, and it must never be treated as a problem: the
 	// existing degradation signal fails OPEN on exactly this input
-	// (docs/storage-degradation-signal-plan.md §3.3), and a write gate that
+	// (docs/已实施/storage-degradation-signal-plan.md §3.3), and a write gate that
 	// turned "I cannot tell" into a refusal would reject writes that would
 	// have succeeded.
 	RedundancyUnknown Redundancy = iota
@@ -177,7 +177,7 @@ func (r Redundancy) String() string {
 // THIS NODE.
 //
 // It is not types.DataStatus or types.IndexStatus, and the three answer
-// different questions (docs/storage-node-state-machine-plan.md §4.2). Those
+// different questions (docs/已实施/storage-node-state-machine-plan.md §4.2). Those
 // two are the control layer's replicated metadata — what the version's Saga
 // has reached cluster-wide, identical on every node. This one is a local fact:
 // the same version is routinely READY on one replica, BUILDING on the next,
@@ -186,13 +186,13 @@ func (r Redundancy) String() string {
 // Two consequences of the split, both deliberate:
 //
 //   - The control layer's FAILED_PERMANENT does not appear here. That verdict
-//     is the retry budget's conclusion (Stratum_设计文档v13.md §10.1), decided
+//     is the retry budget's conclusion (docs/参考/历史/Stratum_设计文档v13.md §10.1), decided
 //     by the control layer; this node knows only that its own build failed.
 //   - VersionAbsent means "this node does not have it", NOT "it does not
 //     exist". Whether the version exists is the control layer's answer, and
 //     §7.5's invariant (a cursor must not step over a version the node is
 //     missing) needs that distinction — see
-//     docs/storage-node-state-machine-plan.md §7, item 3.
+//     docs/已实施/storage-node-state-machine-plan.md §7, item 3.
 type VersionState int
 
 const (

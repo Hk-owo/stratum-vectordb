@@ -10,7 +10,7 @@ import (
 	pb "stratum/api/proto/stratum"
 )
 
-// Step 4 of docs/await-version-plan.md: the idempotency key travels back to the
+// Step 4 of docs/已实施/await-version-plan.md: the idempotency key travels back to the
 // caller.
 //
 // What these tests pin is the key's JOURNEY, not just its presence. A caller told

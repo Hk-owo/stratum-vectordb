@@ -31,7 +31,7 @@ type versionKey struct {
 
 // versionEntry is one version's record. Kept to 8 bytes of payload plus the
 // key and two words of time so a node holding many versions does not pay for
-// the bookkeeping (docs/storage-node-state-machine-plan.md §4.3).
+// the bookkeeping (docs/已实施/storage-node-state-machine-plan.md §4.3).
 type versionEntry struct {
 	state  VersionState
 	since  time.Time
@@ -54,7 +54,7 @@ type Machine struct {
 	// It is a node-level fact rather than a version-level aggregate: a
 	// knowledge base may be catching up while nothing has moved yet (it is
 	// waiting on a pull), so no version entry would exist to aggregate from
-	// (docs/storage-node-state-machine-plan.md §3.3).
+	// (docs/已实施/storage-node-state-machine-plan.md §3.3).
 	catchingUp map[string]struct{}
 
 	// versions holds the entries. A version with no entry is VersionAbsent —
@@ -167,7 +167,7 @@ func (m *Machine) Redundancy() (Redundancy, string) {
 // known=false means the sample was INCOMPLETE: at least one required replica has
 // never been reached, so the honest reading is UNKNOWN rather than a verdict
 // extrapolated from the others. That is not a problem state — the write gates
-// fail OPEN on it (docs/storage-degradation-signal-plan.md §3.3).
+// fail OPEN on it (docs/已实施/storage-degradation-signal-plan.md §3.3).
 func (m *Machine) SetPeerRedundancy(known bool, live, quorum int, detail string) {
 	switch {
 	case !known:
@@ -345,7 +345,7 @@ func (m *Machine) VersionState(kbID string, versionID int64) VersionState {
 //
 // This is one of the two entries that bypass the transition table — IndexDropped
 // is the other, and it only ever corrects an existing entry — and it is not a
-// general-purpose setter. It exists for two callers (docs/…plan.md §5.1
+// general-purpose setter. It exists for two callers (docs/已实施/storage-node-state-machine-plan.md §5.1
 // and §5.2): the startup rebuild, which projects the reconciled disk state
 // before the node serves, and the runtime correction of a fact that moved
 // underneath the machine — the retention policy dropping an artifact, or a

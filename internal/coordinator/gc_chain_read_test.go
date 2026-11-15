@@ -216,7 +216,7 @@ func seedDeadChunk(t *testing.T, cdm chunkdoc.ChunkDocMapper, ds *testDocStore, 
 // TestChunkGarbageCollector_ChainReadFailureKeepsChunks: the liveness judgement
 // depends on the control layer's answer. A read that fails is not "no live
 // version" — treating it as one would reclaim the whole knowledge base's chunks
-// (H2 of docs/code-review-2026-10-18.md, one level up).
+// (H2 of docs/参考/code-review-2026-10-18.md, one level up).
 func TestChunkGarbageCollector_ChainReadFailureKeepsChunks(t *testing.T) {
 	ctx := context.Background()
 	cdm, err := chunkdoc.NewPebbleChunkDocMapper(t.TempDir())

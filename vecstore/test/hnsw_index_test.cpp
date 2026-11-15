@@ -1,5 +1,5 @@
 // hnsw_index_test.cpp — T1-8 VectorIndex test suite, per
-// Stratum_测试顺序.md. Written before src/hnsw_index.cpp exists (TDD):
+// docs/已实施/Stratum_测试顺序.md. Written before src/hnsw_index.cpp exists (TDD):
 // this file does not compile until HNSWVectorIndex is added.
 #include "vecstore/include/vector_index.h"
 
@@ -128,7 +128,7 @@ class HNSWVectorIndexTest : public ::testing::Test {
 
   void TearDown() override { fs::remove_all(test_dir_); }
 
-  // SaveReady seals a built index into READY (Stratum_设计文档v12.md 2.6
+  // SaveReady seals a built index into READY (docs/参考/历史/Stratum_设计文档v12.md 2.6
   // strict mode): tests follow the product sequence Build → Save → Search.
   void SaveReady(HNSWVectorIndex* index, const std::string& path) {
     ASSERT_TRUE(index->Save(path).ok());
@@ -228,7 +228,7 @@ TEST_F(HNSWVectorIndexTest, SaveThenLoadProducesConsistentSearchResults) {
   }
 }
 
-// --- atomic + checksummed persistence (Stratum_设计文档v13.md §8.3) --------
+// --- atomic + checksummed persistence (docs/参考/历史/Stratum_设计文档v13.md §8.3) --------
 
 // A corrupted index file must be rejected at Load rather than silently
 // searched: the sidecar records the index's CRC-32, so a torn write, bit
@@ -401,7 +401,7 @@ TEST_F(HNSWVectorIndexTest, BuildOnAlreadyBuiltIndexReplacesContents) {
 
 // ---------------------------------------------------------------------------
 // Two-stage search (quantized coarse pass + full-precision rerank) tests.
-// Stratum_设计文档v12.md "两段式检索设计": quantized indexes are coarse
+// docs/参考/历史/Stratum_设计文档v12.md "两段式检索设计": quantized indexes are coarse
 // retrievers; the final top-k comes from re-scoring the coarse candidates
 // against full-precision vectors read back from the chunk store.
 // ---------------------------------------------------------------------------
@@ -920,7 +920,7 @@ TEST_F(HNSWVectorIndexTest, LoadForAppendContinuesABuildFromAnArtifact) {
 }
 
 // ---------------------------------------------------------------------------
-// §3 码本基线（docs/codebook-refresh-plan.md）：sidecar 记录"码本是在多大的语料
+// §3 码本基线（docs/已实施/codebook-refresh-plan.md）：sidecar 记录"码本是在多大的语料
 // 上训出来的、之后被追加了多少次"，两值都随产物继承 —— 追加复用改不了码本，所以
 // 基线原样带过去、只有追加计数 +1；全量构建才是新基线。Go 侧读它来决定要不要放弃
 // 追加复用、全量重建以重训码本。

@@ -14,7 +14,7 @@ import (
 
 // dispatchCommittedVersion is the §7.13.2 hand-off, and the case these tests
 // are about is the one Step 0 changed: a version this node just committed but
-// holds no changes for (docs/await-version-plan.md §4.3, §7 Step 0).
+// holds no changes for (docs/已实施/await-version-plan.md §4.3, §7 Step 0).
 
 type stubPendingDispatch struct {
 	parentID  int64
@@ -61,7 +61,7 @@ func (s *stubDispatcher) Dispatch(_ context.Context, kbID string, versionID, par
 // is Step 0's regression: an in-memory miss on this node must NOT be turned
 // into a failure report. It proves neither "the background dispatch already
 // took the changes" nor "nobody has them", so the version stays PENDING and the
-// caller decides — re-send or discard (docs/await-version-plan.md §4.3).
+// caller decides — re-send or discard (docs/已实施/await-version-plan.md §4.3).
 func TestDispatchCommittedVersion_LeavesTheVersionPendingWhenNothingIsRegistered(t *testing.T) {
 	registry := &stubPendingDispatch{found: false}
 	dispatcher := &stubDispatcher{}

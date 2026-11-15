@@ -116,7 +116,7 @@ func TestAuthGate_OffAcceptsEverything(t *testing.T) {
 	}
 }
 
-// TestAuthGate_RefusesAForgedMark is H4 of docs/code-review-2026-09-24.md: the
+// TestAuthGate_RefusesAForgedMark is H4 of docs/参考/code-review-2026-09-24.md: the
 // mark used to be the constant "1", which anything able to reach the node's port
 // could send. It is now an HMAC only the station can produce, so a caller echoing
 // the old value — or replaying someone else's mark — gets nothing.

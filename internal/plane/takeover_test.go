@@ -285,7 +285,7 @@ func TestLocalDataPlane_WatchIsIdempotentPerVersion(t *testing.T) {
 	}
 }
 
-// --- the catch-up path arms the same check (docs/known-gaps.md §K) ----------
+// --- the catch-up path arms the same check (docs/未实施/known-gaps.md §K) ----------
 
 // stubDataStatus answers the local metadata read that lets a takeover skip a
 // version whose data side is already settled.
@@ -414,7 +414,7 @@ func TestLocalDataPlane_TakeoverRetriesUntilAQuorumAppears(t *testing.T) {
 //   - not as a failure to retry (the version is not coming back),
 //   - not as a reason to keep the watch alive (it would poll a discarded id),
 //   - and not as a warning, which is what buries this signal in a busy cluster
-//     (docs/known-gaps.md §K).
+//     (docs/未实施/known-gaps.md §K).
 //
 // The other order — the announcement lands first — is the service layer's: the
 // discard is then refused because the version already has durable data. Both

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # kb-discard-version.sh — 放弃一个写入从未落地的版本。
 #
-# 适用场景（docs/await-version-plan.md §5 contract 7、§7 Step 6）：某个版本一直
+# 适用场景（docs/已实施/await-version-plan.md §5 contract 7、§7 Step 6）：某个版本一直
 # 停在 PENDING，await 报 data_missing —— 没有任何可达副本持有它的数据。这种版本
 # 自己好不了，能做的只有两件：用自己的幂等键把变更**重发**一遍
 # （kb-version-create.sh --client-request-id），或者放弃它、腾出元数据。

@@ -9,7 +9,7 @@ import (
 )
 
 // GetVersion exists so the await path can read ONE version instead of the whole
-// chain on every poll (docs/await-version-plan.md §7 Step 2). What matters for
+// chain on every poll (docs/已实施/await-version-plan.md §7 Step 2). What matters for
 // its callers is that it answers exactly what ListVersions would say about that
 // version, and that "not in this knowledge base" is one answer rather than two.
 

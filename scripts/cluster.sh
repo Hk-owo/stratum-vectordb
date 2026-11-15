@@ -86,12 +86,12 @@ ONLY=all
 STORAGE_ID_BASE=10
 VECSTORE_BASE_PORT=7101
 VECSTORE_IMAGE=stratum-node:latest   # 单层的 all-in-one 镜像
-# 宿主 vecstore 允许读写的索引根（M4 of docs/code-review-2026-09-24.md）。单层拓扑
+# 宿主 vecstore 允许读写的索引根（M4 of docs/参考/code-review-2026-09-24.md）。单层拓扑
 # 下节点配置的 storage.data_dir 是 /var/lib/stratum/nodeN，索引写在它的 index/ 子目录，
 # 宿主 vecstore 与容器看到的是同一份 bind mount。
 #
 # 根必须收到 **nodeN/index** 这一层，不能是 /var/lib/stratum（C3 of
-# docs/code-review-2026-10-18.md）：这些 RPC 会写它们收到的任何路径，根越宽可写的
+# docs/参考/code-review-2026-10-18.md）：这些 RPC 会写它们收到的任何路径，根越宽可写的
 # 越多，而 /var/lib/stratum 下面还躺着 RocksDB 与文档/元数据存储 —— 一次
 # Save(<data>/vecstore_rocksdb/CURRENT) 就把引擎文件换成索引字节，库再也打不开。
 # 每个节点一个根，与实际索引位置一一对应。
@@ -483,10 +483,10 @@ index_manager:
   # 历史行为：每个版本都建完整 HNSW 图）。
   #
   # 做成环境变量是为了能做 A/B：同一个套件在 0 与某个阈值下各跑一遍。阈值
-  # 本身要用真实流量标定（docs/Stratum_设计文档v13.md §10.4 是占位值）。
+  # 本身要用真实流量标定（docs/参考/历史/Stratum_设计文档v13.md §10.4 是占位值）。
   cold_threshold_ms: ${COLD_THRESHOLD_MS:-0}
 
-# 主动落后检测（docs/active-lag-detection-design.md）：没有开关，落后副本自己追，
+# 主动落后检测（docs/已实施/active-lag-detection-design.md）：没有开关，落后副本自己追，
 # 下面三项只定节奏。
 lag_catchup:
   min_lag_versions: ${LAG_CATCHUP_MIN_LAG:-1}
@@ -1050,7 +1050,7 @@ ensure_station_credentials() {
     (umask 077; printf 'console-%s' "$(random_hex 16)" >"$cf")
   fi
   cat >"$tf" <<EOF
-# 服务站凭据表 — 由 scripts/cluster.sh 生成（H3 of docs/code-review-2026-09-24.md）。
+# 服务站凭据表 — 由 scripts/cluster.sh 生成（H3 of docs/参考/code-review-2026-09-24.md）。
 #
 # kb_ids: ["*"] 表示"所有知识库，包括以后创建的"：kbID 由服务端随机生成
 # （service.generateKBID），所以静态表列不出将来的 id。

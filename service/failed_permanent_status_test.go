@@ -9,7 +9,7 @@ import (
 )
 
 // TestGetSystemStatus_ReportsFailedPermanentVersions pins the operator-visible
-// half of Stratum_设计文档v13.md §10.1: a version the control layer declared dead
+// half of docs/参考/历史/Stratum_设计文档v13.md §10.1: a version the control layer declared dead
 // shows up with its cause chain, so someone can act on it.
 func TestGetSystemStatus_ReportsFailedPermanentVersions(t *testing.T) {
 	ctx := context.Background()
@@ -90,7 +90,7 @@ func TestGetSystemStatus_RetryableFailureIsNotPermanent(t *testing.T) {
 	}
 }
 
-// The side travels with the verdict (Stratum_设计文档v13.md §10.1b) because the
+// The side travels with the verdict (docs/参考/历史/Stratum_设计文档v13.md §10.1b) because the
 // remedies differ: retrying a write and rebuilding an index are different actions
 // on different layers, and a version can end up terminal on both.
 func TestGetSystemStatus_ReportsWhichSideFailed(t *testing.T) {

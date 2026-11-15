@@ -2,7 +2,7 @@
 //
 // Fills a 3-node Docker cluster with a configurable number of documents and
 // samples the data-volume cost: CreateVersion latency, index-build latency,
-// per-node storage usage, and query correctness (see Stratum_测试顺序.md
+// per-node storage usage, and query correctness (see docs/已实施/Stratum_测试顺序.md
 // T3-4 / T4-4).
 //
 // Scale via STRATUM_VOLUME_DOCS (default 1000 documents).
@@ -249,7 +249,7 @@ func waitVersionStatus(t *testing.T, ctx context.Context, addr, kbID string, ver
 			// ASK on every round, not once up front, and ask by QUERYING.
 			//
 			// A query goes through the station, which routes it to the version's
-			// index owners (internal/router, docs/index-owner-sharding-plan.md §5);
+			// index owners (internal/router, docs/已实施/index-owner-sharding-plan.md §5);
 			// that node builds the index and the replicated metadata turns READY.
 			//
 			// Repeated because ONE query is not a guarantee: the router narrows to

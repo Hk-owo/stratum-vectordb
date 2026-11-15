@@ -46,7 +46,7 @@ const (
 	// Deliberately ABOVE DefaultAppendMaxDeadRatio (0.3 vs 0.2) as of 2026-10: at
 	// 0.2 the two bars coincided, so §8.6(c) rebuilt a version exactly when §8.6(d)
 	// started caring about it and the collection path never saw a candidate
-	// (docs/stress-test-report.md §C.5, docs/known-gaps.md §G). The two answer
+	// (docs/参考/stress-test-report.md §C.5, docs/未实施/known-gaps.md §G). The two answer
 	// different questions — may a build start from this artifact, vs is a SEALED
 	// artifact worth reopening — but the collection bar has to sit higher for the
 	// second question to ever be asked.
@@ -493,7 +493,7 @@ func (im *IndexManagerImpl) artifactGraphFree(kbID string, versionID int64) (gra
 const shapeLinePrefix = "graph_free "
 
 // trainedLinePrefix is the sidecar line vecstore's Save writes to record the
-// codebook baseline (docs/codebook-refresh-plan.md §3): how many vectors the
+// codebook baseline (docs/已实施/codebook-refresh-plan.md §3): how many vectors the
 // quantizer was trained on, and how many append-reuses have happened since
 // ("trained <ntotal> <appends>"). It must match hnsw_index.cpp's kTrainedPrefix.
 //

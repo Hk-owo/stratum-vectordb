@@ -184,7 +184,7 @@ func (t *Transport) replicateToPeer(rf *Raft, id int64, peer *peerConn) {
 	}
 	nextIndex = rf.clampNextIndex(id, nextIndex)
 	prev := rf.logEntry(nextIndex - 1)
-	// Copy, do not share (M6 of docs/code-review-2026-10-18.md). This slice shares its
+	// Copy, do not share (M6 of docs/参考/code-review-2026-10-18.md). This slice shares its
 	// backing array with rf.log, and the lock is released before the request is
 	// encoded. A handler that receives an AppendEntries meanwhile rewrites that array in
 	// place — `rf.log = append(rf.log[:localIdx+1], req.Entries...)` in

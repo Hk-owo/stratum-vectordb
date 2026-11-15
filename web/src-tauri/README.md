@@ -9,7 +9,7 @@
 `client/pending.go` 的注释写明了那件事：**集群不替任何人保存 changes**。本进程
 之外的唯一副本，要等协调者写下 WAL BEGIN 才出现——在那之前，每一次提交的数据
 在世界上只有调用方手里有。所以调用方必须自己留一份记录，它是"重发还是放弃"的
-唯一依据（`docs/client-integration-guide.md` §7、§8）。
+唯一依据（`docs/参考/client-integration-guide.md` §7、§8）。
 
 浏览器版本把这份记录放在 **IndexedDB** 里，而它会被这些东西静默抹掉：
 

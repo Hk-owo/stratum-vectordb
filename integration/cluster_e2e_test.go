@@ -10,7 +10,7 @@ import (
 )
 
 // TestRealStack_ThreeNodeCluster_FaultTolerance is the in-process
-// equivalent of Stratum_测试顺序.md 第四批 (T4-1 / T4-2): three fully-real
+// equivalent of docs/已实施/Stratum_测试顺序.md 第四批 (T4-1 / T4-2): three fully-real
 // nodes (real Pebble stores + FileWAL + real vecstore subprocess +
 // real IndexManager + real Raft + real coordinators/services + digest-
 // verified DataSync pulls) forming one Raft cluster. It exercises:

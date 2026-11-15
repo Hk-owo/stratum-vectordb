@@ -17,7 +17,7 @@
          --set storage.data_dir=/data/stratum/node1 \
          --out configs/my-node1.yaml
 
-  3) 生成两层拓扑（控制组 + 存储组，Stratum_设计文档v13.md §11 阶段 ④）：
+  3) 生成两层拓扑（控制组 + 存储组，docs/参考/历史/Stratum_设计文档v13.md §11 阶段 ④）：
      # 控制节点：跑 Raft 与元数据，零数据层
      python3 scripts/ops/gen-config.py --role control --node-id 1 \
          --peers "1=c1:8000=c1:7000,2=c2:8000=c2:7000,3=c3:8000=c3:7000" \
@@ -173,7 +173,7 @@ DEFAULT_TEMPLATE = {
         "sweep_interval_s": 300,
     },
     "lag_catchup": {
-        # docs/active-lag-detection-design.md：落后副本自己追上来。
+        # docs/已实施/active-lag-detection-design.md：落后副本自己追上来。
         "min_lag_versions": 1,
         "jitter_ms": 0,
         "max_concurrent_kbs": 0,

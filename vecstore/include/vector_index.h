@@ -1,14 +1,14 @@
 // VectorIndex is the vector index interface: HNSW / IVF / FLAT each
 // implement this interface. Currently only HNSW (src/hnsw_index.cpp) has a
 // real implementation; IVF and FLAT are reserved for later iterations (see
-// Stratum_设计文档v10.md "待细化的问题").
+// docs/参考/历史/Stratum_设计文档v10.md "待细化的问题").
 //
 // Logical call chain:
 //   IndexManager.TriggerBuild -> VectorIndex::Build -> VectorIndex::Save
 //   IndexManager.Search       -> VectorIndex::Load  -> VectorIndex::Search
 //   IndexManager.EvictByKB    -> VectorIndex::Reset
 //
-// See Stratum_接口设计v9.md "VectorIndex" for the authoritative design.
+// See docs/参考/历史/Stratum_接口设计v9.md "VectorIndex" for the authoritative design.
 // This header defines only the interface; the HNSW-backed implementation
 // (Faiss-based) is built in Phase 1 (1-B-2).
 #ifndef STRATUM_VECSTORE_VECTOR_INDEX_H_
@@ -123,7 +123,7 @@ class VectorIndex {
   // EstimatedMemoryBytes returns an estimate of this index's in-memory
   // footprint (bytes), reported through the Build/AddChunks RPC responses
   // so the Go IndexManager can run its byte-budget LRU accounting on the
-  // actual resident structure (Stratum_设计文档v12.md 3.3). The default
+  // actual resident structure (docs/参考/历史/Stratum_设计文档v12.md 3.3). The default
   // reports 0 (unknown); concrete indexes override with their basis.
   virtual int64_t EstimatedMemoryBytes() const { return 0; }
 

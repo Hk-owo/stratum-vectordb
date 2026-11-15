@@ -80,7 +80,7 @@ func (im *IndexManagerImpl) appendMaxDeadRatio() float64 {
 }
 
 // codebookDriftTrigger / codebookAppendsTrigger resolve the two §3 triggers that
-// retire a stale codebook (docs/codebook-refresh-plan.md). A NEGATIVE config
+// retire a stale codebook (docs/已实施/codebook-refresh-plan.md). A NEGATIVE config
 // value disables that trigger; 0 takes the default.
 //
 // 1.0 does NOT disable the ratio trigger, unlike AppendMaxDeadRatio's 1.0: a
@@ -144,7 +144,7 @@ func quantizerNeedsTraining(q vecstorepb.QuantizerTypeProto) bool {
 
 // codebookRefreshNeeded decides whether this build should give up append reuse
 // and rebuild from scratch — the only path that retrains the quantizer
-// (docs/codebook-refresh-plan.md §3).
+// (docs/已实施/codebook-refresh-plan.md §3).
 //
 // Two triggers, either suffices:
 //   - cumulative new-vector share: (totalChunks - trainedNtotal) / trainedNtotal

@@ -12,7 +12,7 @@ import (
 	"stratum/internal/types"
 )
 
-// The two cases below cover propose *forwarding* (Stratum_设计文档v13.md §7.3): a
+// The two cases below cover propose *forwarding* (docs/参考/历史/Stratum_设计文档v13.md §7.3): a
 // node that is not the leader initiates a proposal through its own in-process
 // RaftNode, and the entry still reaches the replicated log.
 //

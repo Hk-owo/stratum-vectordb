@@ -1,7 +1,7 @@
 // Package embed defines the EmbedClient interface — the client used to
 // call an external embed service to generate vectors for chunks.
 //
-// See Stratum_接口设计v9.md "EmbedClient" and Stratum_设计文档v10.md
+// See docs/参考/历史/Stratum_接口设计v9.md "EmbedClient" and docs/参考/历史/Stratum_设计文档v10.md
 // "文档切割与向量生成" for the authoritative design. This file contains
 // only the interface definition; the HTTP-backed implementation
 // (HTTPEmbedClient) is built in Phase 4 (4-A), against a mock embed HTTP

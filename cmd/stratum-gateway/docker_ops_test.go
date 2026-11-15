@@ -346,7 +346,7 @@ func TestOpsDockerSingleTierUnchanged(t *testing.T) {
 }
 
 // TestOpsDockerConfigPut_RefusesScriptRewrite pins C2 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // /ops/config refuses to change docker.script because dockerCluster execs it, and
 // it is not a parameter — it is the choice of program to run. This endpoint is the

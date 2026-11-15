@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// M10 of docs/code-review-2026-09-24.md: the pull loop treated every failure as
+// M10 of docs/参考/code-review-2026-09-24.md: the pull loop treated every failure as
 // "try again" and never looked at the caller's context, so a cancelled pull kept
 // going — to its 30 s idle timeout or its 10 min ceiling — while the goroutine
 // that asked for it had already returned. Cancellation is an answer.

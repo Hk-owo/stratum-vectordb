@@ -10,7 +10,7 @@ import (
 // client idempotency key: a retried CreateVersion carrying the same key
 // returns the version the first attempt allocated instead of allocating
 // another one. That is what lets a client re-send the changes for a version
-// whose data never landed (Stratum_设计文档v13.md §7.12).
+// whose data never landed (docs/参考/历史/Stratum_设计文档v13.md §7.12).
 func TestStateMachine_Apply_CreateVersion_IdempotentRetry(t *testing.T) {
 	sm, w := newTestSM(t)
 	ctx := proposeCtx(t)

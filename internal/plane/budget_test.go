@@ -9,7 +9,7 @@ import (
 
 // A knowledge base's declared policy has to reach the layer that owns the
 // verdict: the number is per-KB policy, the decision is the control layer's
-// (Stratum_设计文档v13.md §10.1).
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 func TestLocalControlPlane_SetFailureBudgetOverridesPerKB(t *testing.T) {
 	meta := &stubMeta{}
 	cp := NewLocalControlPlane(meta, WithFailureBudget(5))

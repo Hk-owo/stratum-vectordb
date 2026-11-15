@@ -170,7 +170,7 @@ func TestStateMachine_Apply_CreateVersion_Constraints(t *testing.T) {
 	// The version chain is strictly linear: a parent that already has a
 	// child must reject a second one. docstore.ReadAt resolves documents
 	// by numeric version order, which only equals the ancestor chain when
-	// there are no forks (see Stratum_设计文档v13.md §6).
+	// there are no forks (see docs/参考/历史/Stratum_设计文档v13.md §6).
 	sm.apply(ctx, command{Type: cmdCreateKB, KB: kbPtr(testKB("kb-3"))}, w, zap.NewNop())
 	root := sm.apply(ctx, command{Type: cmdCreateVersion, KBID: "kb-3"}, w, zap.NewNop())
 	markIndexReady(t, sm, w, root.VersionID)

@@ -73,7 +73,7 @@ type versionKey struct {
 }
 
 // VersionBloomStore manages the per-version document bloom filters
-// (Stratum_设计文档v10.md "版本文档布隆过滤器": one filter per version,
+// (docs/参考/历史/Stratum_设计文档v10.md "版本文档布隆过滤器": one filter per version,
 // containing the full document ID set of that version).
 //
 // Lifecycle:
@@ -230,7 +230,7 @@ func (s *VersionBloomStore) DeleteByVersion(kbID string, versionID int64) error 
 // (dir/bloom-version/<kbID>/) and drops its filters from the cache. A
 // missing directory is not an error, so re-running the knowledge-base
 // delete flow after a crash is safe. Used by DeleteKnowledgeBase cleanup
-// (Stratum_设计文档v10.md "删除知识库" 第 4 步).
+// (docs/参考/历史/Stratum_设计文档v10.md "删除知识库" 第 4 步).
 func (s *VersionBloomStore) DeleteByKB(kbID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

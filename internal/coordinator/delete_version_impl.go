@@ -32,7 +32,7 @@ type DeleteVersionCoordinatorConfig struct {
 
 	// Dropper reclaims the version's physical data. When set it is what the
 	// flow calls instead of reaching into the stores above, so the reclaim
-	// happens wherever the bytes are (Stratum_设计文档v13.md §7.0).
+	// happens wherever the bytes are (docs/参考/历史/Stratum_设计文档v13.md §7.0).
 	// nil falls back to a LocalVersionDropper built from the fields above.
 	Dropper VersionStorageDropper
 
@@ -111,7 +111,7 @@ func (c *DeleteVersionCoordinatorImpl) deleteOne(ctx context.Context, kbID strin
 	// Asking rather than doing is what lets this flow run on a node that holds
 	// no records of its own: the metadata says the version is gone, and the
 	// nodes holding its bytes are the ones that reclaim them
-	// (Stratum_设计文档v13.md §7.0、§11 阶段 ④). The visibility anchor is
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.0、§11 阶段 ④). The visibility anchor is
 	// applied by that side, since it is the one holding the records.
 	dropper := c.dropperFor()
 	// A failed reclaim no longer BLOCKS the deletion, because removing the metadata is

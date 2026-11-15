@@ -8,7 +8,7 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-// H4 of docs/code-review-2026-09-24.md: the internal trust mark used to be the
+// H4 of docs/参考/code-review-2026-09-24.md: the internal trust mark used to be the
 // constant "1", which anything able to reach a node's port could send. It is now an
 // HMAC over a timestamp under a key shared with the station, and this file is what
 // pins that down — the service-layer tests only exercise the gate that consumes it.

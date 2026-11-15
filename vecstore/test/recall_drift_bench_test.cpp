@@ -1,4 +1,4 @@
-// recall_drift_bench_test.cpp — 码本漂移的召回代价（docs/codebook-refresh-plan.md §6）。
+// recall_drift_bench_test.cpp — 码本漂移的召回代价（docs/已实施/codebook-refresh-plan.md §6）。
 //
 // 问题：码本只在"全量重建"时训练一次（hnsw_index.cpp:340+ 的 !is_trained 分支），
 // 而"只 append、不删除"的库几乎不会走到全量重建 ⇒ 新向量一直用旧码本编码，量化

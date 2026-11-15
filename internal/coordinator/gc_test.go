@@ -493,7 +493,7 @@ func TestChunkGarbageCollector_ReclaimBeforeConcurrentWrite_Recovers(t *testing.
 var _ chunkstore.ChunkStore = (*gcChunkStore)(nil)
 
 // TestChunkGarbageCollector_ReclaimsEveryChunkOfADeadDocument pins H3 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // One document maps to several chunks. Reclaiming one of them used to call
 // DeleteByDoc, which drops the dead document's mapping to EVERY chunk it has —
@@ -562,7 +562,7 @@ func (s *readErrorDocStore) ReadAt(context.Context, string, string, int64) ([]by
 }
 
 // TestChunkGarbageCollector_StoreReadErrorKeepsChunk pins H2 of
-// docs/code-review-2026-10-18.md: only "the document is not there" means a
+// docs/参考/code-review-2026-10-18.md: only "the document is not there" means a
 // reference is dead. A store that cannot answer must not be read as a deletion —
 // that reclaims a live document's chunks on the strength of a read failure.
 func TestChunkGarbageCollector_StoreReadErrorKeepsChunk(t *testing.T) {

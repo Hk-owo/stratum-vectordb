@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// H5 of docs/code-review-2026-09-24.md: the vecstore holds its own object per
+// H5 of docs/参考/code-review-2026-09-24.md: the vecstore holds its own object per
 // resident index, and nothing in this node's bookkeeping pruning reached it — so
 // a process's RSS tracked how many versions had been touched rather than how many
 // it held. These tests pin the three paths that must tell it.
@@ -155,7 +155,7 @@ func TestDropEvictedDropsAVersionThatIsNoLongerLoaded(t *testing.T) {
 		t.Fatalf("Evict: %v", err)
 	}
 
-	// Evict releases the vecstore copy itself (L6 of docs/code-review-2026-10-18.md):
+	// Evict releases the vecstore copy itself (L6 of docs/参考/code-review-2026-10-18.md):
 	// dropping only the Go-side view left that copy resident for the life of the
 	// process, which is the leak every other eviction path already closed.
 	if got := vc.droppedKeys(); len(got) != 1 || got[0] != (indexKey{"kb-1", 1}) {

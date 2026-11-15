@@ -17,7 +17,7 @@ func TestIsWriteMethod(t *testing.T) {
 		pb.KnowledgeBaseService_RollbackVersion_FullMethodName,
 		pb.KnowledgeBaseService_DeleteVersion_FullMethodName,
 		// DiscardVersion removes replicated metadata, so it is leader-bound like
-		// every other proposal (docs/await-version-plan.md §7 Step 6).
+		// every other proposal (docs/已实施/await-version-plan.md §7 Step 6).
 		pb.KnowledgeBaseService_DiscardVersion_FullMethodName,
 		pb.AdminService_RebuildIndex_FullMethodName,
 		pb.AdminService_WarmupVersion_FullMethodName,

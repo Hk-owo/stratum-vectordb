@@ -4,7 +4,7 @@
 // streaming gRPC; followers apply each entry idempotently to their local
 // stores, then trigger an independent HNSW index build.
 //
-// See Stratum_设计文档v10.md "多副本构建" and api/proto/sync.proto.
+// See docs/参考/历史/Stratum_设计文档v10.md "多副本构建" and api/proto/sync.proto.
 package sync
 
 import "context"
@@ -24,7 +24,7 @@ type FollowerSync interface {
 	// idempotent-by-key. Calling PullVersionData with the same arguments
 	// more than once is safe.
 	//
-	// The index is NOT built here (Stratum_设计文档v13.md §8.6b): a version is built
+	// The index is NOT built here (docs/参考/历史/Stratum_设计文档v13.md §8.6b): a version is built
 	// when something asks for it, and pulling its data is not an ask. On failure
 	// the caller (the Raft apply loop, or the plane's catch-up) retries.
 	PullVersionData(ctx context.Context, leaderAddr string, kbID string, versionID int64) error

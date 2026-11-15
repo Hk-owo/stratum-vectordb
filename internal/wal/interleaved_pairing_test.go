@@ -8,7 +8,7 @@ import (
 	"stratum/internal/types"
 )
 
-// M7 of docs/code-review-2026-09-24.md: once writes to different knowledge bases
+// M7 of docs/参考/code-review-2026-09-24.md: once writes to different knowledge bases
 // run concurrently (they are serialized per KB, not globally), their
 // BEGIN/VERSION_ID pairs interleave in the log. Pairing by "the most recent unpaired
 // BEGIN" then binds KB A's version to KB B's replay input — so a lagging peer asking

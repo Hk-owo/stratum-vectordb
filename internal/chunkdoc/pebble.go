@@ -12,7 +12,7 @@ import (
 
 // PebbleChunkDocMapper is the real, disk-persistent ChunkDocMapper
 // implementation, backed by PebbleDB. Key layout (see
-// Stratum_设计文档v10.md "chunk-doc 映射"):
+// docs/参考/历史/Stratum_设计文档v10.md "chunk-doc 映射"):
 //
 //	forward: 'F' + EncodeString(kbID) + EncodeString(chunkID) + EncodeString(docID)
 //	reverse: 'R' + EncodeString(kbID) + EncodeString(docID) + EncodeString(chunkID)
@@ -199,7 +199,7 @@ func (m *PebbleChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) ([]s
 // ONE iterator serves the whole batch, SeekGE'd per document. It used to build an
 // iterator per docID — and the caller passes a version's entire document set, so a
 // large version paid thousands of iterator allocations for what is thousands of
-// seeks' worth of work (M9 of docs/code-review-2026-09-24.md). Nothing about the
+// seeks' worth of work (M9 of docs/参考/code-review-2026-09-24.md). Nothing about the
 // scan needs a fresh iterator: the prefixes are disjoint, and SeekGE positions the
 // same one at each in turn. The upper bound is checked by hand (HasPrefix) because
 // it differs per document, which is why this cannot use IterOptions bounds.

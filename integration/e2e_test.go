@@ -7,7 +7,7 @@
 // against a real vecstore_server subprocess, real IndexManagerImpl,
 // real coordinators, real services over real gRPC, and a real
 // HTTPEmbedClient against an in-process mock embed server. This is the
-// 全模块联合存取测试 per Stratum_测试顺序.md 第三批 (T3) with zero mocks in
+// 全模块联合存取测试 per docs/已实施/Stratum_测试顺序.md 第三批 (T3) with zero mocks in
 // the data path.
 //
 // The vecstore_server binary must be built first (see
@@ -73,7 +73,7 @@ func freeLoopbackAddr(t *testing.T) string {
 // fresh temp-dir RocksDB. Skips the test if the binary is unavailable.
 //
 // indexDirs is the allow-list for the on-disk index RPCs (M4 of
-// docs/code-review-2026-09-24.md); when the caller does not name one, the process is
+// docs/参考/code-review-2026-09-24.md); when the caller does not name one, the process is
 // allowed the temp root the fixtures build their data directories under. That is a
 // fixture convenience, not a deployment shape: scripts/cluster.sh and the console's
 // supervisor pass the node's data directory, and nothing else.
@@ -433,7 +433,7 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		IndexManager:   im,
 		IndexFetcher:   sync.NewIndexFetcher(),
 		IndexInstaller: im,
-		// §7.8/docs/cursor-persistence-plan.md §3: the cursor is persisted in the
+		// §7.8/docs/已实施/cursor-persistence-plan.md §3: the cursor is persisted in the
 		// node's own WAL — the same file this stack already keeps — so a restart
 		// reads it back instead of inferring it from the index artifacts, which
 		// retention is free to delete. Production wires the same object
@@ -607,7 +607,7 @@ func waitForLeader(t *testing.T, nodes ...*realNode) *realNode {
 // wireProposeForwarding gives a node the same propose-forwarding path the
 // production assembly wires (cmd/stratum/main.go): Raft only appends on the
 // leader, so a node that is not the leader needs the access layer to carry its
-// proposal there (Stratum_设计文档v13.md §7.3/§7.8).
+// proposal there (docs/参考/历史/Stratum_设计文档v13.md §7.3/§7.8).
 func wireProposeForwarding(t *testing.T, n *realNode, addrByID map[int64]string) {
 	t.Helper()
 	n.raftNode.SetNodeID(n.nodeID)
@@ -641,7 +641,7 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 			// The data is already here, so the cursor may say so: production
 			// advances it from exactly this point (the sync push handler and the
 			// pull path), and the advance is what writes a record into this node's
-			// WAL (docs/cursor-persistence-plan.md §3.2).
+			// WAL (docs/已实施/cursor-persistence-plan.md §3.2).
 			n.indexDistributor.MarkVersionContiguous(kbID, versionID)
 			return
 		}
@@ -1220,7 +1220,7 @@ func (n *realNode) createTestKB(ctx context.Context, name string) (string, int64
 		n.t.Fatalf("node %d: CreateKnowledgeBase: %v", n.nodeID, err)
 	}
 	// A knowledge base no longer comes with a version
-	// (docs/cursor-persistence-plan.md §5): a change-less version is refused, so
+	// (docs/已实施/cursor-persistence-plan.md §5): a change-less version is refused, so
 	// the READY root these real-stack tests build on is created here.
 	v1 := seedRootVersion(n.t, n.raftNode, ctx, resp.KnowledgeBaseId)
 	return resp.KnowledgeBaseId, v1

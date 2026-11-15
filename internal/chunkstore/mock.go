@@ -10,7 +10,7 @@ import (
 // modules that depend on ChunkStore (WriteCoordinator, IndexManager,
 // DeleteCoordinator, etc.). It is not a substitute for the real
 // gRPC-backed implementation's own tests against vecstore (see T1-8 in
-// Stratum_测试顺序.md, which targets the C++ ChunkStorage/VectorIndex
+// docs/已实施/Stratum_测试顺序.md, which targets the C++ ChunkStorage/VectorIndex
 // directly, and the T2-* batch which exercises ChunkStore against a real
 // vecstore gRPC server).
 type MockChunkStore struct {

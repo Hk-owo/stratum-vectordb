@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// H1 of docs/code-review-2026-09-24.md: kbID becomes a directory that this node
+// H1 of docs/参考/code-review-2026-09-24.md: kbID becomes a directory that this node
 // REMOVES. filepath.Join cleans ".." before handing the path to os.RemoveAll, so
 // an id that is not a single path component does not fail — it deletes somewhere
 // else entirely. The name-derived ids that made this reachable are gone (the

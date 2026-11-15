@@ -127,7 +127,7 @@ func (s *Signer) Verify(ctx context.Context) bool {
 	if skew := s.now().Sub(time.Unix(seconds, 0)); skew > s.ttl || skew < -s.ttl {
 		return false // stale, or stamped by a clock far ahead of ours
 	}
-	// Constant-time compare (L1 of docs/code-review-2026-09-24.md): the wrong MAC
+	// Constant-time compare (L1 of docs/参考/code-review-2026-09-24.md): the wrong MAC
 	// and the right one must not be distinguishable by timing.
 	return subtle.ConstantTimeCompare([]byte(parts[2]), []byte(s.mac(parts[1]))) == 1
 }

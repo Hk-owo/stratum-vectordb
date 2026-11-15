@@ -138,7 +138,7 @@ func TestResolverWithRegistryPrefersAnnouncementOverHolders(t *testing.T) {
 	}
 }
 
-// The fourth layer (docs/data-source-holders-fallback-plan.md §5 step 3): when
+// The fourth layer (docs/已实施/data-source-holders-fallback-plan.md §5 step 3): when
 // the table misses but the mirror has an answer, the mirror wins and the
 // fallback is never consulted. It answers lower versions too — a node whose
 // cursor reached 5 holds everything below it — but never a higher one.

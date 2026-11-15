@@ -144,7 +144,7 @@ func exitingServiceBin(t *testing.T, dir, name string, code int) {
 }
 
 // TestSupervisor_ReapsExitedChildAndCanRestart pins H11 of
-// docs/code-review-2026-10-18.md.
+// docs/参考/code-review-2026-10-18.md.
 //
 // Nothing called Wait on a started child, so a service that crashed became a zombie.
 // kill(pid, 0) succeeds on a zombie, so the console kept reporting it as running —

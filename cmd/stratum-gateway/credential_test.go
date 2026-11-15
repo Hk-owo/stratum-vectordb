@@ -13,13 +13,13 @@ import (
 	stratumerrors "stratum/internal/errors"
 )
 
-// H3 of docs/code-review-2026-09-24.md: the gateway performs no authentication of
+// H3 of docs/参考/code-review-2026-09-24.md: the gateway performs no authentication of
 // its own — the service station does — so the caller's credential has to survive the
 // HTTP → gRPC boundary. Without this the station sees every console request as
 // anonymous, and a deployment that turned authentication on either refuses the whole
 // console or (worse) is configured to accept anonymous calls.
 //
-// C1 of docs/code-review-2026-10-18.md: the fallback the console borrows is a
+// C1 of docs/参考/code-review-2026-10-18.md: the fallback the console borrows is a
 // PRIVILEGE decision (scripts/gateway.sh mints that token with kb_ids:["*"]), so it is
 // handed out only to the console's own pages — /api/* calls from a same-origin
 // document. Everything else that arrives without a credential is refused instead of

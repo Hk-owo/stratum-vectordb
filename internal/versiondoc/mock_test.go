@@ -7,7 +7,7 @@ import (
 )
 
 // TestMockVersionDocList sanity-checks the in-memory mock against the T1-3
-// case shapes in Stratum_测试顺序.md. This is not a substitute for the real
+// case shapes in docs/已实施/Stratum_测试顺序.md. This is not a substitute for the real
 // PebbleDB-backed implementation's own T1-3 suite.
 func TestMockVersionDocList(t *testing.T) {
 	ctx := context.Background()

@@ -42,7 +42,7 @@ func createVersionRequest(kbID string) *pb.CreateVersionRequest {
 }
 
 // The control-layer entry point is the authoritative gate
-// (docs/storage-degradation-signal-plan.md §4.3): a write that cannot reach quorum
+// (docs/已实施/storage-degradation-signal-plan.md §4.3): a write that cannot reach quorum
 // is refused here, and refused BEFORE anything is allocated — no version number, no
 // Raft entry, no retry budget spent on an attempt that could never have succeeded.
 func TestKnowledgeBaseService_CreateVersionRefusesWhenStorageIsDegraded(t *testing.T) {
@@ -96,7 +96,7 @@ func TestKnowledgeBaseService_CreateVersionAllowsWhenTheVerdictIsUnknown(t *test
 
 // The extreme tier gets the other sentinel: "the storage layer is gone" is a
 // different sentence from "it is short a quorum", and the two names are what let a
-// client tell them apart (docs/storage-degradation-signal-plan.md §4.1). The
+// client tell them apart (docs/已实施/storage-degradation-signal-plan.md §4.1). The
 // refusal itself is identical — retryable, and the write never reaches the
 // coordinator either way.
 func TestKnowledgeBaseService_CreateVersionNamesTheClusterTier(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 )
 
 // DataSourceRegistry records, per version, the peer that announced it holds
-// that version's data (Stratum_设计文档v13.md §8.5).
+// that version's data (docs/参考/历史/Stratum_设计文档v13.md §8.5).
 //
 // Why a table instead of a probe: the source lookup runs on the **Raft apply
 // path** — replaying history re-runs every CreateVersion through it — so it may
@@ -101,7 +101,7 @@ func (r *DataSourceRegistry) Len() int {
 //     RPC, because this runs on the Raft apply path (see the history above). A node that
 //     finds itself behind fills it by asking its peers, even when this node's own
 //     confirmation never arrived, which is what makes a replica that missed one still
-//     able to find a source (docs/data-source-holders-fallback-plan.md);
+//     able to find a source (docs/已实施/data-source-holders-fallback-plan.md);
 //  3. the pre-§8.5 answer — the leader.
 //
 // What every layer's answer must pass is dataCapable: "this address can hold

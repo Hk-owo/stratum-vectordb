@@ -64,7 +64,7 @@ func doOpsWithOrigin(t *testing.T, url, method string, body any, origin, secFetc
 	return resp.StatusCode
 }
 
-// H2 of docs/code-review-2026-09-24.md: /ops changes process state, and a page on
+// H2 of docs/参考/code-review-2026-09-24.md: /ops changes process state, and a page on
 // another origin can POST to it without a preflight. `POST /ops/stop` with an
 // empty body stops every service, so the cross-site case has to be refused.
 func TestOpsGuardRefusesCrossSiteWrites(t *testing.T) {

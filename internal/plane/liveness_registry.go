@@ -52,7 +52,7 @@ func (r *LivenessRegistry) Reset() {
 
 // DefaultStorageSilenceWindow is how long a required replica may go without
 // a heartbeat before this design stops counting it as live
-// (docs/storage-degradation-signal-plan.md §3.2).
+// (docs/已实施/storage-degradation-signal-plan.md §3.2).
 //
 // Three heartbeat intervals — sync.DefaultHeartbeatInterval is 5s — and the
 // third interval is the point: the window is what supplies the hysteresis §3.2
@@ -65,7 +65,7 @@ const DefaultStorageSilenceWindow = 15 * time.Second
 
 // StorageState is the storage layer's ability to meet a write's durability
 // contract for a knowledge base, as far as the leader's heartbeat record can
-// tell (docs/storage-degradation-signal-plan.md §3).
+// tell (docs/已实施/storage-degradation-signal-plan.md §3).
 type StorageState int
 
 const (

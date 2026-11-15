@@ -8,7 +8,7 @@ import "context"
 // otherwise. But a node that is not the leader may still have a fact to report:
 // a replica that just finished writing a version, or any node running its
 // startup reconcile. This interface is that missing path
-// (Stratum_设计文档v13.md §7.3/§7.8).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.3/§7.8).
 //
 // It lives here as an interface (not an implementation) so internal/raft keeps
 // no transport dependency; the node assembly wires the gRPC client.

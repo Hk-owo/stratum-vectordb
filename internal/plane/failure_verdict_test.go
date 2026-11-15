@@ -12,7 +12,7 @@ import (
 
 // The control layer decides the terminal verdict, so it must keep the count
 // itself: a version stays retryable until the budget is spent
-// (Stratum_设计文档v13.md §10.1).
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 func TestLocalControlPlane_ReportVersionFailureDeclaresTerminalAfterBudget(t *testing.T) {
 	meta := &stubMeta{}
 	cp := NewLocalControlPlane(meta, WithFailureBudget(3))
@@ -125,7 +125,7 @@ func TestLocalControlPlane_ReportVersionFailurePropagatesProposalError(t *testin
 // The two sides fail independently, so they must not share a counter: an index
 // build that keeps failing would otherwise spend the budget the data write needs
 // and declare the DATA dead — claiming the data will never arrive because an
-// index would not build (Stratum_设计文档v13.md §10.1b).
+// index would not build (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 func TestLocalControlPlane_FailureBudgetIsPerSide(t *testing.T) {
 	meta := &stubMeta{}
 	cp := NewLocalControlPlane(meta, WithFailureBudget(2))
@@ -194,7 +194,7 @@ func TestLocalControlPlane_SuccessResetsOnlyItsOwnSide(t *testing.T) {
 // the terminal verdict. That refusal must read as "already settled" — not as a
 // report error (the writer would keep retrying a decision that cannot change)
 // and not as terminal=true (the caller would reclaim data a child version may
-// already depend on). See docs/known-gaps.md §K.
+// already depend on). See docs/未实施/known-gaps.md §K.
 func TestLocalControlPlane_FailureReportOnASettledVersionIsDiscarded(t *testing.T) {
 	meta := &stubMeta{permanentErr: fmt.Errorf("version 7 is already durable: %w", stratumerrors.ErrVersionDataSettled)}
 	cp := NewLocalControlPlane(meta, WithFailureBudget(1))

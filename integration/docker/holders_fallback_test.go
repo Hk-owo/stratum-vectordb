@@ -161,7 +161,7 @@ func envDuration(key string, def time.Duration) time.Duration {
 }
 
 // TestT4_HoldersFallbackPullsTheVersionItMissed is the cluster-level proof of
-// docs/data-source-holders-fallback-plan.md: a replica that missed the §8.5
+// docs/已实施/data-source-holders-fallback-plan.md: a replica that missed the §8.5
 // announcement — so its announced-holder table has nothing for the version — still
 // finds a source and pulls the version back.
 //
@@ -181,7 +181,7 @@ func envDuration(key string, def time.Duration) time.Duration {
 // WHY THE CLUSTER NEEDS lag_catchup: a restarting replica's reconcile rebuilds
 // missing INDEXES; it does not fetch data, and it gives its head start only to
 // PENDING and ACTIVE versions. Nothing else asks a behind node for anything —
-// which is exactly the gap docs/active-lag-detection-design.md fills. So the
+// which is exactly the gap docs/已实施/active-lag-detection-design.md fills. So the
 // catch-up is the TRIGGER and the fourth layer is the SOURCE; without the trigger
 // the source is never consulted and this case would be measuring the wrong thing.
 // The case skips when the switch is off.
@@ -256,7 +256,7 @@ func TestT4_HoldersFallbackPullsTheVersionItMissed(t *testing.T) {
 		t.Logf("%s's log tail:\n%s", behindSvc, dockerCmd(t, "logs", "--tail", "30", behindSvc))
 		t.Errorf("%s never pulled v%d. With the §8.5 announcement missing and the leader fallback "+
 			"pointing at a control node that exports no data, the fourth layer is the only layer that "+
-			"could have answered (docs/data-source-holders-fallback-plan.md)", behindSvc, v2)
+			"could have answered (docs/已实施/data-source-holders-fallback-plan.md)", behindSvc, v2)
 		return
 	}
 	t.Logf("%s pulled v%d back on its own: the fourth layer answered where the table could not",
