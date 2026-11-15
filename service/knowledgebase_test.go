@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -62,7 +63,7 @@ func TestKnowledgeBaseService_CreateKnowledgeBase(t *testing.T) {
 	}
 	if resp.InitialVersionId != 0 {
 		t.Errorf("initial_version_id = %d, want 0: creating a knowledge base no longer creates a version, "+
-			"because a change-less version is refused (docs/cursor-persistence-plan.md §5)", resp.InitialVersionId)
+			"because a change-less version is refused (docs/已实施/cursor-persistence-plan.md §5)", resp.InitialVersionId)
 	}
 	// The knowledge base starts with an EMPTY version chain, and that is the state
 	// the query path treats as "no results yet" rather than as a missing version.
@@ -174,7 +175,7 @@ func TestKnowledgeBaseService_ListVersions(t *testing.T) {
 	})
 
 	// The knowledge base has no version of its own any more
-	// (docs/cursor-persistence-plan.md §5), so the first one is proposed here.
+	// (docs/已实施/cursor-persistence-plan.md §5), so the first one is proposed here.
 	// CreateVersion itself goes through the write coordinator, whose mock does not
 	// touch the Raft state machine — so the version that shows up below is this one.
 	v1, err := h.raftNode.ProposeCreateVersion(context.Background(), createResp.KnowledgeBaseId, 0)
@@ -540,7 +541,7 @@ func kbSvcTestHarnessWithChain(t *testing.T, h *kbSvcTestHarness) (string, int64
 	}
 	kbID := createResp.KnowledgeBaseId
 	// A knowledge base now starts with an empty version chain, so the chain begins
-	// with an explicit v1 (docs/cursor-persistence-plan.md §5).
+	// with an explicit v1 (docs/已实施/cursor-persistence-plan.md §5).
 	v1, err := h.raftNode.ProposeCreateVersion(ctx, kbID, 0)
 	if err != nil {
 		t.Fatalf("create v1: %v", err)
@@ -684,4 +685,104 @@ func TestKnowledgeBaseService_DeleteVersion_RejectsUnknownMode(t *testing.T) {
 	if calls := h.deleteVersionC.Calls(); len(calls) != 0 {
 		t.Errorf("DeleteVersionCoordinator.Execute calls = %v, want none", calls)
 	}
+}
+
+// TestKnowledgeBaseService_RefusesWritesWhileTheKBIsBeingDeleted is the
+// regression for an accepted-then-abandoned write.
+//
+// Measured on the five-storage-node acceptance cluster: a knowledge base left in
+// DELETE_FAILED (a reclaim had exhausted its retries) accepted a CreateVersion,
+// allocated it a version number and answered SUCCESS, and only then had the data
+// path abandoned with "dispatch failed: knowledge base is deleted". The caller was
+// told a write was accepted for a version that could never hold data —
+// docs/实施中/storage-topology-plan.md §8.2 requires the deletion intent to stop
+// new operations, and §24 records the finding.
+func TestKnowledgeBaseService_RefusesWritesWhileTheKBIsBeingDeleted(t *testing.T) {
+	for _, state := range []types.KBStatus{types.KBStatusDeleting, types.KBStatusDeleteFailed} {
+		t.Run(state.String(), func(t *testing.T) {
+			h := newKBSvcTestHarness()
+			kbID := createKBForTest(t, h)
+
+			var markErr error
+			if state == types.KBStatusDeleting {
+				markErr = h.raftNode.ProposeMarkKBDeleting(context.Background(), kbID)
+			} else {
+				if markErr = h.raftNode.ProposeMarkKBDeleting(context.Background(), kbID); markErr == nil {
+					markErr = h.raftNode.ProposeMarkKBDeleteFailed(context.Background(), kbID)
+				}
+			}
+			if markErr != nil {
+				t.Fatalf("fixture: mark the KB %s: %v", state, markErr)
+			}
+
+			_, err := h.svc.CreateVersion(context.Background(), &pb.CreateVersionRequest{
+				KnowledgeBaseId: kbID,
+				ClientRequestId: "late-" + state.String(),
+				Changes: []*pb.DocChange{{
+					Op:      pb.ChangeOp_CHANGE_OP_ADD,
+					DocId:   "doc-1",
+					Content: "写入必须被拒绝。",
+				}},
+			})
+			if err == nil {
+				t.Fatalf("CreateVersion was accepted on a %s knowledge base", state)
+			}
+			if got := status.Code(err); got != codes.FailedPrecondition {
+				t.Errorf("code = %v, want FailedPrecondition", got)
+			}
+			if calls := h.writeC.Calls(); len(calls) != 0 {
+				t.Errorf("the write coordinator was called %d time(s) for a deleted KB", len(calls))
+			}
+		})
+	}
+}
+
+// TestKnowledgeBaseService_AllowsWritesWhenTheStatusCannotBeRead: the new gate is
+// fail-open by design. "Cannot read the status" is not "the KB is gone", and
+// turning a transient read failure into a write outage would be a worse defect
+// than the one the gate fixes.
+func TestKnowledgeBaseService_AllowsWritesWhenTheStatusCannotBeRead(t *testing.T) {
+	h := newKBSvcTestHarness()
+	kbID := createKBForTest(t, h)
+	h.svc.raftNode = &statusErrorRaft{MockRaftNode: h.raftNode}
+
+	if _, err := h.svc.CreateVersion(context.Background(), &pb.CreateVersionRequest{
+		KnowledgeBaseId: kbID,
+		ClientRequestId: "unreadable-status",
+		Changes: []*pb.DocChange{{
+			Op:      pb.ChangeOp_CHANGE_OP_ADD,
+			DocId:   "doc-1",
+			Content: "状态读不到时仍然放行。",
+		}},
+	}); err != nil {
+		t.Fatalf("CreateVersion was refused although the status was unreadable: %v", err)
+	}
+	if calls := h.writeC.Calls(); len(calls) != 1 {
+		t.Errorf("write coordinator calls = %d, want 1", len(calls))
+	}
+}
+
+// statusErrorRaft makes GetKB fail, which is the shape a leadership change takes
+// from the reading node's point of view.
+type statusErrorRaft struct {
+	*raft.MockRaftNode
+}
+
+func (r *statusErrorRaft) GetKB(context.Context, string) (types.KnowledgeBaseMeta, error) {
+	return types.KnowledgeBaseMeta{}, errors.New("kb metadata is unreadable right now")
+}
+
+// createKBForTest creates a knowledge base through the service and returns its ID.
+func createKBForTest(t *testing.T, h *kbSvcTestHarness) string {
+	t.Helper()
+	resp, err := h.svc.CreateKnowledgeBase(context.Background(), &pb.CreateKnowledgeBaseRequest{
+		Name:             "gate-test",
+		ChunkWindowSize:  512,
+		ChunkOverlapSize: 64,
+		EmbedConfig:      &pb.EmbedConfig{ServiceAddr: "localhost:8080", ModelId: "test-model"},
+	})
+	if err != nil {
+		t.Fatalf("CreateKnowledgeBase: %v", err)
+	}
+	return resp.GetKnowledgeBaseId()
 }

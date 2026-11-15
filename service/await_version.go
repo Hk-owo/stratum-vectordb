@@ -14,7 +14,7 @@ import (
 	"stratum/internal/types"
 )
 
-// AwaitVersion: the caller-facing half of docs/await-version-plan.md.
+// AwaitVersion: the caller-facing half of docs/已实施/await-version-plan.md.
 //
 // CreateVersion answers as soon as the version's metadata is committed; the
 // data write and the index build happen afterwards, elsewhere. "Has my write
@@ -249,7 +249,7 @@ func awaitTargetFromProto(t pb.AwaitTarget) (pb.AwaitTarget, error) {
 }
 
 // VersionWatcher reports when a version's replicated state moves, so the await
-// path can wake on the change instead of polling for it (docs/await-version-plan.md
+// path can wake on the change instead of polling for it (docs/已实施/await-version-plan.md
 // §12 item 1). Declared here, by the consumer, like the other narrow interfaces in
 // this package.
 //
@@ -292,11 +292,20 @@ func (s *KnowledgeBaseServiceImpl) SetPresenceProbe(presence PresenceChecker, re
 // PENDING — once the data side has settled the answer is already known, and
 // asking then would be misleading rather than merely useless.
 func (s *KnowledgeBaseServiceImpl) probeDataMissing(ctx context.Context, v types.VersionMeta, stage string) bool {
-	if stage != StageDataPending || s.presence == nil || s.replicas == nil || s.probeCache == nil {
+	if stage != StageDataPending || s.presence == nil || (s.replicas == nil && s.kbReplicas == nil) || s.probeCache == nil {
 		return false
 	}
-
-	return s.probeCache.lookupOrProbe(ctx, v, s.replicas(), s.presence)
+	var peers []string
+	if s.kbReplicas != nil {
+		var err error
+		peers, err = s.kbReplicas(ctx, v.KBID)
+		if err != nil {
+			return false
+		}
+	} else {
+		peers = s.replicas()
+	}
+	return s.probeCache.lookupOrProbe(ctx, v, peers, s.presence)
 }
 
 // awaitProbe caches data_missing verdicts and bounds how many probes run at

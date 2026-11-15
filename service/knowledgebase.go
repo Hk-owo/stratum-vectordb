@@ -1,6 +1,6 @@
 // Package service implements Stratum's three external gRPC services
 // (KnowledgeBaseService, QueryService, AdminService), per
-// Stratum_接口设计v9.md and Stratum_实现顺序.md Phase 6.
+// docs/参考/历史/Stratum_接口设计v9.md and docs/已实施/Stratum_实现顺序.md Phase 6.
 //
 // Each service is a thin layer: validate inputs, convert between proto
 // messages and internal types, delegate to the coordinator/raft/index
@@ -38,7 +38,7 @@ type KnowledgeBaseServiceImpl struct {
 
 	// storageGate answers, from the storage nodes' heartbeats: can the storage layer still meet a WRITE's durability contract?
 	// Optional, and an unwired gate means "unknown" — which callers read as
-	// "allow" (docs/storage-degradation-signal-plan.md §3.3).
+	// "allow" (docs/已实施/storage-degradation-signal-plan.md §3.3).
 	storageGate StorageDegradationSource
 
 	// logger carries the per-stage timings of a write, the control-plane half of
@@ -53,15 +53,16 @@ type KnowledgeBaseServiceImpl struct {
 	// await_version.go). Optional: without them the probe is skipped and
 	// data_missing stays false — "unknown", never a claim that the data is
 	// there.
-	presence PresenceChecker
-	replicas func() []string
+	presence   PresenceChecker
+	replicas   func() []string
+	kbReplicas KBReplicaResolver
 
 	// probeCache remembers probe verdicts and bounds how many probes run at
-	// once (docs/await-version-plan.md §6.4).
+	// once (docs/已实施/await-version-plan.md §6.4).
 	probeCache *awaitProbe
 
 	// versionWatcher is the event-driven half of the await path
-	// (docs/await-version-plan.md §12 item 1). Optional: without it await polls
+	// (docs/已实施/await-version-plan.md §12 item 1). Optional: without it await polls
 	// the state machine, which is correct but pays up to one interval of latency.
 	versionWatcher VersionWatcher
 }
@@ -71,7 +72,7 @@ type KnowledgeBaseServiceImpl struct {
 // that must hold a version still alive?
 //
 // It reports the two failure tiers separately, because they produce different
-// refusals (docs/storage-degradation-signal-plan.md §4.1):
+// refusals (docs/已实施/storage-degradation-signal-plan.md §4.1):
 //
 //   - StorageDegraded: short of a quorum, with at least one replica still
 //     answering — "this knowledge base cannot be written right now";
@@ -131,7 +132,7 @@ func (s *KnowledgeBaseServiceImpl) GetStorageDegradation(context.Context, *pb.Ge
 }
 
 // checkStorageWritable refuses a write whose durability contract the storage
-// layer cannot currently meet (docs/storage-degradation-signal-plan.md §4.3).
+// layer cannot currently meet (docs/已实施/storage-degradation-signal-plan.md §4.3).
 //
 // It runs BEFORE the write coordinator, and that placement is the whole point:
 // letting the write proceed spends a version number and a Raft entry on an
@@ -240,11 +241,23 @@ func (s *KnowledgeBaseServiceImpl) CreateKnowledgeBase(ctx context.Context, req 
 		Status: types.KBStatusActive,
 	}
 
-	if err := s.raftNode.ProposeCreateKB(ctx, kb); err != nil {
+	var createErr error
+	if len(req.GetStorageReplicaIds()) > 0 {
+		creator, ok := s.raftNode.(interface {
+			ProposeCreateKBWithPlacement(context.Context, types.KnowledgeBaseMeta, []int64) error
+		})
+		if !ok {
+			return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrPlacementUnknown)
+		}
+		createErr = creator.ProposeCreateKBWithPlacement(ctx, kb, req.GetStorageReplicaIds())
+	} else {
+		createErr = s.raftNode.ProposeCreateKB(ctx, kb)
+	}
+	if err := createErr; err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
 
-	// NO version is created here (docs/cursor-persistence-plan.md §5): the knowledge
+	// NO version is created here (docs/已实施/cursor-persistence-plan.md §5): the knowledge
 	// base becomes visible with an empty version chain, and its first version comes
 	// from the client's first non-empty write. Creating a change-less version here
 	// was what conflated "the document set is empty" with "this version changed
@@ -253,7 +266,7 @@ func (s *KnowledgeBaseServiceImpl) CreateKnowledgeBase(ctx context.Context, req 
 	// case for it.
 	//
 	// An empty knowledge base remains QUERYABLE: with no active version the query
-	// path answers an empty result instead of refusing (docs/cursor-persistence-plan.md
+	// path answers an empty result instead of refusing (docs/已实施/cursor-persistence-plan.md
 	// §5.1), so a client that creates and queries one sees no behaviour change.
 	return &pb.CreateKnowledgeBaseResponse{
 		KnowledgeBaseId: kbID,
@@ -298,7 +311,7 @@ func (s *KnowledgeBaseServiceImpl) DeleteKnowledgeBase(ctx context.Context, req 
 
 // CreateVersion implements KnowledgeBaseServiceServer.
 //
-// It is the authoritative half of the storage gate (docs/storage-degradation-signal-plan.md
+// It is the authoritative half of the storage gate (docs/已实施/storage-degradation-signal-plan.md
 // §4.3): a request that reaches the control layer directly never passed the
 // service station, and one that did may have passed a station whose snapshot was
 // stale. The check therefore has to live here too, and it has to run before the
@@ -347,11 +360,31 @@ func (s *KnowledgeBaseServiceImpl) CreateVersion(ctx context.Context, req *pb.Cr
 	if err != nil {
 		return nil, stratumerrors.ToGRPCStatus(err)
 	}
+	// §8.2: a deletion stops new operations at the moment its intent is durable.
+	//
+	// Without this check a write submitted while the KB was DELETING was
+	// committed, allocated a version number and answered SUCCESS, and only then
+	// had its data path abandoned ("dispatch failed: knowledge base is deleted") —
+	// so the caller was told the write was accepted for a version that could never
+	// hold data. Measured on the five-storage-node acceptance cluster (a KB left in
+	// DELETE_FAILED by an unrelated reclaim failure accepted a new version).
+	//
+	// The status is replicated state, so the answer is local: no Raft round trip,
+	// and no new failure mode for a read that cannot be served. A read that FAILS
+	// allows the write — "cannot tell" must never become a refusal, the same rule
+	// the storage gate follows.
+	if s.raftNode != nil {
+		if kb, kbErr := s.raftNode.GetKB(ctx, req.GetKnowledgeBaseId()); kbErr == nil && kb.Status != types.KBStatusActive {
+			return nil, stratumerrors.ToGRPCStatus(fmt.Errorf(
+				"%w: knowledge base %s is %s, so it accepts no new versions",
+				stratumerrors.ErrKnowledgeBaseDeleted, req.GetKnowledgeBaseId(), kb.Status))
+		}
+	}
 
 	stepStart = time.Now()
 	changes := make([]types.DocChange, len(req.Changes))
 	for i, c := range req.Changes {
-		// No silent default (M1 of docs/code-review-2026-10-18.md). An op this build
+		// No silent default (M1 of docs/参考/code-review-2026-10-18.md). An op this build
 		// does not recognise is not "add": the caller may have meant DELETE, and
 		// executing it as ADD with an empty content field would quietly blank the
 		// document instead of removing it. Every other enum on this path is refused
@@ -383,7 +416,7 @@ func (s *KnowledgeBaseServiceImpl) CreateVersion(ctx context.Context, req *pb.Cr
 	// is told about it in the response. Leaving it to the coordinator's own
 	// "generate one if it is empty" branch produced a key nobody outside this
 	// process could see, which is what left a client that omitted one unable to
-	// re-send under it (docs/await-version-plan.md §7 Step 4).
+	// re-send under it (docs/已实施/await-version-plan.md §7 Step 4).
 	requestID := req.GetClientRequestId()
 	if requestID == "" {
 		requestID = coordinator.NewDispatchID()
@@ -473,7 +506,7 @@ func (s *KnowledgeBaseServiceImpl) DeleteVersion(ctx context.Context, req *pb.De
 // DiscardVersion implements KnowledgeBaseServiceServer.
 //
 // The caller is declaring that it is abandoning a version whose write never
-// landed (docs/await-version-plan.md §7 Step 6). Whether that is admissible is
+// landed (docs/已实施/await-version-plan.md §7 Step 6). Whether that is admissible is
 // decided by the state machine at apply time, not here: this RPC relays the
 // declaration, which is what keeps the check from racing the very write it is
 // meant to protect (§5 contract 7).
@@ -651,7 +684,7 @@ func kbStatusToProto(s types.KBStatus) pb.KBStatus {
 // client-supplied name is nothing at all — so a name like "../../../../tmp/x"
 // produced an id that escaped IndexDataDir, and DeleteKnowledgeBase's cleanup
 // then RemoveAll'd the directory it pointed at. H1 of
-// docs/code-review-2026-09-24.md.
+// docs/参考/code-review-2026-09-24.md.
 //
 // Nothing is lost by dropping the name here: the name is not an identifier, it
 // is a label, and it is already stored beside the id (types.KnowledgeBaseMeta

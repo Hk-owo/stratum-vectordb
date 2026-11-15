@@ -15,7 +15,7 @@ import (
 // or any control node when the deployment has no station. Every call it makes is
 // a plain RPC — what makes it a client rather than a wrapper is that it also
 // keeps the caller's half of the contract: the local record, and the decision
-// that only the caller can make (docs/client-integration-guide.md §1).
+// that only the caller can make (docs/参考/client-integration-guide.md §1).
 type Client struct {
 	conn  *grpc.ClientConn
 	kb    pb.KnowledgeBaseServiceClient
@@ -58,18 +58,28 @@ func (c *Client) Close() error { return c.conn.Close() }
 // Store exposes the local records so a caller can list or inspect them.
 func (c *Client) Store() *Store { return c.store }
 
-// CreateKnowledgeBase provisions a knowledge base and returns its ID.
-//
-// The chunking parameters are fixed here rather than exposed: they are immutable
-// after creation and only affect how text is split, which is not something a
-// caller of this size should be choosing at startup.
-func (c *Client) CreateKnowledgeBase(ctx context.Context, name, embedAddr, modelID string) (string, error) {
-	resp, err := c.kb.CreateKnowledgeBase(ctx, &pb.CreateKnowledgeBaseRequest{
+// KBCreateOption configures creation without changing existing KB placement.
+type KBCreateOption func(*pb.CreateKnowledgeBaseRequest)
+
+// WithStorageReplicas sets the initial physical replica IDs of a new KB.
+func WithStorageReplicas(ids ...int64) KBCreateOption {
+	copyIDs := append([]int64(nil), ids...)
+	return func(req *pb.CreateKnowledgeBaseRequest) { req.StorageReplicaIds = append([]int64(nil), copyIDs...) }
+}
+
+// CreateKnowledgeBase provisions a KB. Chunking retains the existing defaults;
+// callers may explicitly select the initial physical replica IDs.
+func (c *Client) CreateKnowledgeBase(ctx context.Context, name, embedAddr, modelID string, opts ...KBCreateOption) (string, error) {
+	req := &pb.CreateKnowledgeBaseRequest{
 		Name:             name,
 		ChunkWindowSize:  512,
 		ChunkOverlapSize: 64,
 		EmbedConfig:      &pb.EmbedConfig{ServiceAddr: embedAddr, ModelId: modelID},
-	})
+	}
+	for _, opt := range opts {
+		opt(req)
+	}
+	resp, err := c.kb.CreateKnowledgeBase(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("client: CreateKnowledgeBase: %w", err)
 	}
@@ -305,7 +315,7 @@ func (c *Client) MarkSettled(id string) error {
 }
 
 // Query asks one vector question. The vector is the caller's: Stratum never
-// embeds a query for anyone (docs/client-integration-guide.md §6).
+// embeds a query for anyone (docs/参考/client-integration-guide.md §6).
 func (c *Client) Query(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) (*pb.QueryResponse, error) {
 	req := &pb.QueryRequest{KnowledgeBaseId: kbID, Vector: vector, TopK: int32(topK)}
 	if versionID != 0 {
@@ -320,7 +330,7 @@ func (c *Client) Query(ctx context.Context, kbID string, versionID int64, vector
 
 // ListFailedVersions returns the versions the control layer declared
 // FAILED_PERMANENT, each with the cause chain that says which half died
-// (Stratum_设计文档v13.md §10.1). An empty knowledgeBaseID asks across every
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1). An empty knowledgeBaseID asks across every
 // knowledge base — "this one has a version stuck" and "is anything else stuck?"
 // are different questions, and both are worth answering.
 //
@@ -367,4 +377,10 @@ func (c *Client) ForceAbandonVersion(ctx context.Context, knowledgeBaseID string
 		return nil, fmt.Errorf("client: force abandon version %d: %w", versionID, err)
 	}
 	return resp.GetDeletedVersionIds(), nil
+}
+
+// StorageAdmin exposes cluster storage management through the same station.
+// Calls require an explicit storage_admin credential when station auth is enabled.
+func (c *Client) StorageAdmin() pb.StorageAdminServiceClient {
+	return pb.NewStorageAdminServiceClient(c.conn)
 }

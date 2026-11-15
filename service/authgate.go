@@ -22,7 +22,7 @@ import (
 //     fan-out, cursor queries, epoch reports, Raft forwarding. They have no end
 //     user behind them.
 func ClientFacing(fullMethod string) bool {
-	return hasPrefix(fullMethod, "/stratum.KnowledgeBaseService/") ||
+	return hasPrefix(fullMethod, "/stratum.StorageAdminService/") || hasPrefix(fullMethod, "/stratum.KnowledgeBaseService/") ||
 		hasPrefix(fullMethod, "/stratum.QueryService/") ||
 		hasPrefix(fullMethod, "/stratum.AdminService/")
 }

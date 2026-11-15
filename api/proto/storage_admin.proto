@@ -1,0 +1,24 @@
+syntax = "proto3";
+package stratum;
+option go_package = "stratum/api/proto/stratum";
+import "internal.proto";
+// Cluster-wide storage administration. The station requires an explicit storage_admin
+// credential, and routes this service to the control group.
+service StorageAdminService {
+ rpc GetDirectory(GetStorageDirectoryRequest) returns (GetStorageDirectoryResponse);
+ rpc RegisterNodes(RegisterStorageNodesRequest) returns (StorageAdminResult);
+ rpc ManageNode(ManageStorageNodeRequest) returns (StorageAdminResult);
+ rpc MigrateKB(MigrateStorageKBRequest) returns (StorageAdminResult);
+ rpc CancelMigration(CancelStorageMigrationRequest) returns (StorageAdminResult);
+ rpc DrainNode(DrainStorageNodeRequest) returns (StorageAdminResult);
+}
+message StorageAdminResult {}
+message RegisterStorageNodesRequest {uint64 expected_revision=1; repeated StorageNodeEntry nodes=2;}
+message ManageStorageNodeRequest {
+ int64 node_id=1; uint64 expected_revision=2;
+ // drain, address, retire, block, confirm_revoked, resume.
+ string action=3; string address=4; string operation_id=5; uint64 block_revision=6;
+}
+message MigrateStorageKBRequest {string operation_id=1; string knowledge_base_id=2; uint64 expected_epoch=3; int64 from_node_id=4; int64 to_node_id=5; bool fault=6;}
+message CancelStorageMigrationRequest {string operation_id=1;}
+message DrainStorageNodeRequest {string operation_id=1; int64 node_id=2; uint64 expected_revision=3; repeated int64 target_node_ids=4; bool fault=5;}

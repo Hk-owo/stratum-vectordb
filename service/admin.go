@@ -36,8 +36,9 @@ type AdminServiceImpl struct {
 	// data, and presence asks them whether they do. Both are optional: when
 	// either is nil the data-missing check is skipped (a single-node
 	// deployment has no other replica to ask).
-	replicas func() []string
-	presence PresenceChecker
+	replicas   func() []string
+	kbReplicas KBReplicaResolver
+	presence   PresenceChecker
 
 	// gcPressure reports versions whose §8.6(d) dead-weight collection is blocked
 	// because too few replicas would remain serving. Optional: a control node
@@ -45,7 +46,7 @@ type AdminServiceImpl struct {
 	gcPressure GCPressureReporter
 
 	// storageGate answers whether the storage layer can still meet a write's
-	// durability contract (docs/storage-degradation-signal-plan.md §4.5).
+	// durability contract (docs/已实施/storage-degradation-signal-plan.md §4.5).
 	// Optional, and nil means "unknown" — which reports nothing rather than
 	// vouching for a storage layer it cannot see.
 	storageGate StorageDegradationSource
@@ -62,7 +63,7 @@ type AdminServiceImpl struct {
 
 	// nodeState answers "what state is THIS node in" — its lifecycle phase, its
 	// own redundancy verdict, and where its versions stand
-	// (docs/storage-node-state-machine-plan.md §6). Optional: a control node
+	// (docs/已实施/storage-node-state-machine-plan.md §6). Optional: a control node
 	// runs no storage stack and has no state machine, which reports nothing
 	// rather than inventing a phase.
 	nodeState NodeStateSource
@@ -92,7 +93,7 @@ type NodeStateSource interface {
 }
 
 // SetNodeStateSource wires the storage node's state machine into the admin
-// surface (docs/storage-node-state-machine-plan.md §6). Optional: without it
+// surface (docs/已实施/storage-node-state-machine-plan.md §6). Optional: without it
 // GetSystemStatus omits node_state/version_states and HealthCheck says nothing
 // about the node's phase, which is the pre-existing behaviour.
 func (s *AdminServiceImpl) SetNodeStateSource(src NodeStateSource) {
@@ -164,7 +165,7 @@ func (s *AdminServiceImpl) SetStorageDegradationSource(src StorageDegradationSou
 // status call would probe versions that were allocated a moment ago.
 //
 // Placeholder: the value belongs with the other consistency-budget numbers
-// (Stratum_设计文档v13.md §10.4) once they are calibrated by measurement.
+// (docs/参考/历史/Stratum_设计文档v13.md §10.4) once they are calibrated by measurement.
 // It is a var (not a const) only so tests can shorten it.
 var dataMissingMinAgeSec int64 = 120
 
@@ -217,7 +218,7 @@ func (s *AdminServiceImpl) HealthCheck(ctx context.Context, req *pb.HealthCheckR
 		details += "index manager: " + err.Error()
 	}
 
-	// Storage redundancy (docs/storage-degradation-signal-plan.md §4.5).
+	// Storage redundancy (docs/已实施/storage-degradation-signal-plan.md §4.5).
 	//
 	// It belongs in Details and NOT in the status, deliberately: a probe that
 	// turned UNHEALTHY here would have a load balancer pull traffic off a node
@@ -250,7 +251,7 @@ func (s *AdminServiceImpl) HealthCheck(ctx context.Context, req *pb.HealthCheckR
 	}
 
 	// The node's own phase and redundancy verdict
-	// (docs/storage-node-state-machine-plan.md §6.2). Reported in Details and
+	// (docs/已实施/storage-node-state-machine-plan.md §6.2). Reported in Details and
 	// NOT in the status, for the reason the storage line above gives: a probe
 	// that turned UNHEALTHY here would have a load balancer pull traffic off a
 	// node whose reads are perfectly fine.
@@ -388,7 +389,7 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 	// A PENDING version that no candidate replica holds cannot become READY on
 	// its own: its data never landed, so it is only recoverable by the writer
 	// re-sending its changes under the same client_request_id
-	// (Stratum_设计文档v13.md §7.12). Surface it instead of leaving it to look
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.12). Surface it instead of leaving it to look
 	// like an index build that is merely slow.
 	dataMissing := s.collectDataMissingVersions(ctx, pendingVersions)
 
@@ -416,7 +417,7 @@ func (s *AdminServiceImpl) GetSystemStatus(ctx context.Context, req *pb.GetSyste
 			JudgementAvailable: reclaimJudgeable,
 			Blocked:            reclaimBlocked,
 		},
-		// This node's own state (docs/storage-node-state-machine-plan.md §6.1).
+		// This node's own state (docs/已实施/storage-node-state-machine-plan.md §6.1).
 		// It answers a different question from every field above: those name
 		// conditions that need a human, this one describes the node itself.
 		NodeState:     s.nodeStatePayload(),
@@ -512,10 +513,25 @@ func (s *AdminServiceImpl) gcBlockedVersions() []*pb.GCBlockedVersion {
 // version and reports the ones nobody holds. It is a no-op when the node has
 // no replica set or no presence checker.
 func (s *AdminServiceImpl) collectDataMissingVersions(ctx context.Context, versions []types.VersionMeta) []*pb.StuckVersion {
-	if s.presence == nil || s.replicas == nil || len(versions) == 0 {
+	if s.presence == nil || (s.replicas == nil && s.kbReplicas == nil) || len(versions) == 0 {
 		return nil
 	}
-	missing := dataMissingVersions(ctx, versions, s.replicas(), s.presence, time.Now().Unix(), dataMissingMinAgeSec)
+	var missing []types.VersionMeta
+	if s.kbReplicas != nil {
+		byKB := make(map[string][]types.VersionMeta)
+		for _, v := range versions {
+			byKB[v.KBID] = append(byKB[v.KBID], v)
+		}
+		for kbID, subset := range byKB {
+			peers, err := s.kbReplicas(ctx, kbID)
+			if err != nil {
+				continue
+			}
+			missing = append(missing, dataMissingVersions(ctx, subset, peers, s.presence, time.Now().Unix(), dataMissingMinAgeSec)...)
+		}
+	} else {
+		missing = dataMissingVersions(ctx, versions, s.replicas(), s.presence, time.Now().Unix(), dataMissingMinAgeSec)
+	}
 	if len(missing) == 0 {
 		return nil
 	}
@@ -554,7 +570,7 @@ func (s *AdminServiceImpl) GetClusterStatus(ctx context.Context, req *pb.GetClus
 // authorized for kb-A could name its own kb_id and another KB's version_id and have
 // that version's status changed — flipping someone else's active version to
 // PENDING, which refuses queries, rollback and parenting until a human notices (C6
-// of docs/code-review-2026-10-18.md). GetVersion is what refuses the combination:
+// of docs/参考/code-review-2026-10-18.md). GetVersion is what refuses the combination:
 // it answers ErrVersionNotFound when v.KBID != kbID.
 func (s *AdminServiceImpl) requireVersionInKB(ctx context.Context, kbID string, versionID int64) error {
 	if kbID == "" || versionID == 0 {
@@ -626,7 +642,7 @@ func (s *AdminServiceImpl) WarmupVersion(ctx context.Context, req *pb.WarmupVers
 }
 
 // failedVersionsOf collects the versions the control layer declared
-// FAILED_PERMANENT on either side (Stratum_设计文档v13.md §10.1, §10.1b).
+// FAILED_PERMANENT on either side (docs/参考/历史/Stratum_设计文档v13.md §10.1, §10.1b).
 //
 // Either side's verdict counts: a version whose data will never arrive is just as
 // dead as one whose index never built, and leaving the data side out would hide
@@ -663,7 +679,7 @@ func failedVersionsOf(versions []types.VersionMeta) []*pb.FailedVersion {
 }
 
 // ListFailedVersions implements AdminServiceServer: the queue of versions waiting
-// for a human (Stratum_设计文档v13.md §10.1). Nothing retries them automatically, so
+// for a human (docs/参考/历史/Stratum_设计文档v13.md §10.1). Nothing retries them automatically, so
 // this list IS the work — an operator should not have to read it out of
 // GetSystemStatus's much larger payload.
 //
@@ -700,7 +716,7 @@ func (s *AdminServiceImpl) ListFailedVersions(ctx context.Context, req *pb.ListF
 
 // ForceRetryVersion implements AdminServiceServer: an operator revoking the index
 // side's terminal verdict and asking for another build
-// (Stratum_设计文档v13.md §10.1).
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 //
 // The DATA side is not retried here, and that refusal is explicit rather than quiet:
 // its verdict says the version's data will never arrive, so a rebuild would have
@@ -749,7 +765,7 @@ func (s *AdminServiceImpl) ForceRetryVersion(ctx context.Context, req *pb.ForceR
 }
 
 // ForceAbandonVersion implements AdminServiceServer: the other answer to a terminal
-// verdict — the version leaves the chain (Stratum_设计文档v13.md §10.1).
+// verdict — the version leaves the chain (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 //
 // It is DeleteVersion under SINGLE semantics plus one admission rule: the version
 // must actually carry a FAILED_PERMANENT verdict. That rule is why this is its own
