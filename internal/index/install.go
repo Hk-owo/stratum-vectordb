@@ -31,7 +31,7 @@ func installShardOf(key indexKey) int {
 
 // InstallIndex writes an index built elsewhere into this node's index
 // directory and loads it, so a replica can serve a version it never built
-// (Stratum_设计文档v13.md §8.4: "建一次、分发 N 份").
+// (docs/参考/历史/Stratum_设计文档v13.md §8.4: "建一次、分发 N 份").
 //
 // Both files go in through a temporary name and are renamed into place, the
 // same discipline the local build path follows: a concurrent Load — or a crash
@@ -49,9 +49,22 @@ func installShardOf(key indexKey) int {
 // Load with `checksum mismatch` (measured on a 3-node cluster). The lock spans
 // both renames, so "sidecar first, then index" is atomic to a reader.
 func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versionID int64, indexData, sidecarData []byte) error {
+	guarded, release, guardErr := im.serviceLease.Load().Enter(ctx)
+	if guardErr != nil {
+		return guardErr
+	}
+	defer release()
+	ctx = guarded
+
 	shard := &im.installShards[installShardOf(indexKey{kbID, versionID})]
 	shard.Lock()
 	defer shard.Unlock()
+	im.mu.Lock()
+	blocked := im.pausedKB[kbID] || im.deletedKBs[kbID] || im.deletedVersions[indexKey{kbID, versionID}]
+	im.mu.Unlock()
+	if blocked {
+		return fmt.Errorf("index: InstallIndex: knowledge base/version is reclaimed or paused")
+	}
 
 	if im.cfg.IndexDataDir == "" {
 		return fmt.Errorf("index: InstallIndex: persistence not configured")
@@ -103,11 +116,14 @@ func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versi
 	// for a version the sender just spent bandwidth shipping.
 	im.recordInterestNow(kbID, versionID)
 
-	// docs/storage-node-state-machine-plan.md §7 item 4: the artifact is on this
+	// docs/已实施/storage-node-state-machine-plan.md §7 item 4: the artifact is on this
 	// node's disk, so the version is READY here — recorded as a DISK FACT rather
 	// than as a build, because no build happened on this node. The artifact was
 	// produced elsewhere and copied, which is the whole point of §8.4's "build
 	// once, distribute N".
+	if err := im.serviceLease.Load().CheckContext(ctx); err != nil {
+		return err
+	}
 	im.reportIndexInstalled(kbID, versionID)
 
 	// Report the artifact as READY on THIS node, through the same callback the
@@ -133,12 +149,20 @@ func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versi
 	// lock, the callback is a Raft proposal, and the sender of the push is waiting
 	// on this call's ack. invokeCallback covers its own retries.
 	im.mu.Lock()
-	callbacks := append([]BuildCompleteCallback(nil), im.callbacks...)
+	hasCallbacks := len(im.callbacks)+len(im.contextCallbacks) > 0
 	im.mu.Unlock()
-	if len(callbacks) > 0 {
+	if hasCallbacks {
+		callbackCtx, leave, err := im.serviceLease.Load().Fork(ctx)
+		if err != nil {
+			return err
+		}
+		im.mu.Lock()
+		callbacks := im.callbacksLocked(callbackCtx)
+		im.mu.Unlock()
 		go func() {
+			defer leave()
 			for _, cb := range callbacks {
-				im.invokeCallback(cb, kbID, versionID, types.IndexStatusReady)
+				im.invokeCallback(cb, kbID, versionID, types.IndexStatusReady, callbackCtx)
 			}
 		}()
 	}

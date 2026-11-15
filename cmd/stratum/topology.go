@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"sort"
 
 	"stratum/internal/raft"
+	"stratum/internal/storage"
 )
 
 // clusterTopology is the deployment shape the assembly asks about over and over:
@@ -48,6 +50,36 @@ type clusterTopology struct {
 	selfID       int64
 }
 
+// directoryNodes is the full legacy replica set, including silent members.
+// Missing addresses are errors: registration must not shrink durability policy.
+func (t *clusterTopology) directoryNodes() ([]storage.Node, error) {
+	ids, err := t.requiredReplicaIDs()
+	if err != nil {
+		return nil, err
+	}
+	if len(t.storageNodes) == 0 && len(ids) != t.peerCount {
+		return nil, fmt.Errorf("storage directory: a replica has no service address")
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("storage directory: no declared replicas")
+	}
+	nodes := make([]storage.Node, 0, len(ids))
+	for _, id := range ids {
+		addr := t.peerAddrByID[id]
+		for _, n := range t.storageNodes {
+			if n.ID == id {
+				addr = n.Addr
+				break
+			}
+		}
+		if addr == "" {
+			return nil, fmt.Errorf("storage directory: replica %d has no service address", id)
+		}
+		nodes = append(nodes, storage.Node{ID: id, Addr: addr, State: storage.NodeActive})
+	}
+	return nodes, nil
+}
+
 // newClusterTopology derives the deployment shape from the configuration.
 func newClusterTopology(cfg appConfig) *clusterTopology {
 	t := &clusterTopology{
@@ -60,6 +92,19 @@ func newClusterTopology(cfg appConfig) *clusterTopology {
 	for _, p := range cfg.Peers {
 		if p.ServiceAddr != "" {
 			t.peerAddrByID[p.ID] = p.ServiceAddr
+		}
+	}
+	// A single all-in-one node already declares its own service bind address.
+	// Older single-node configs omit the redundant peer service_addr. This is
+	// an explicit local identity, not evidence that a silent remote member left.
+	if len(t.storageNodes) == 0 && cfg.Role != NodeRoleControl && cfg.NodeID > 0 && len(cfg.Peers) <= 1 && (len(cfg.Peers) == 0 || cfg.Peers[0].ID == cfg.NodeID) && t.peerAddrByID[cfg.NodeID] == "" && cfg.GRPCAddr != "" {
+		addr := cfg.GRPCAddr
+		if host, port, err := net.SplitHostPort(addr); err == nil && (host == "" || host == "0.0.0.0" || host == "::") {
+			addr = net.JoinHostPort("localhost", port)
+		}
+		t.peerAddrByID[cfg.NodeID] = addr
+		if t.peerCount == 0 {
+			t.peerCount = 1
 		}
 	}
 	if len(t.storageNodes) > 0 {

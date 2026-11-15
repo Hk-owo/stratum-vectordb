@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sort"
 
 	"github.com/cockroachdb/pebble"
 	"google.golang.org/grpc/codes"
@@ -19,7 +20,7 @@ import (
 // node's *export* side — the half of DataSyncService that hands this node's
 // data to a peer — and it works the same whether or not this node leads. The
 // name survives because it appears in a lot of call sites; renaming it is a
-// pure cleanup, tracked in Stratum_设计文档v13.md §7.10.
+// pure cleanup, tracked in docs/参考/历史/Stratum_设计文档v13.md §7.10.
 //
 // LeaderHandler implements the server side of DataSyncService. It is
 // registered on the leader's gRPC server so followers can pull
@@ -78,7 +79,7 @@ func (h *LeaderHandler) PullVersionData(
 // forwards to the target replica's PushVersionData stream, so both directions
 // export through identical logic.
 func (h *LeaderHandler) ExportVersion(ctx context.Context, kbID string, versionID int64, send func(*pb.SyncEntry) error) error {
-	return h.exportVersion(kbID, versionID, entrySinkFunc(send))
+	return h.exportVersion(kbID, versionID, contextualEntrySink{ctx: ctx, send: send})
 }
 
 func (h *LeaderHandler) exportVersion(kbID string, versionID int64, stream entrySink) error {
@@ -110,6 +111,7 @@ func (h *LeaderHandler) exportVersion(kbID string, versionID int64, stream entry
 		chunkIDs = append(chunkIDs, chunkID)
 	}
 
+	sort.Strings(chunkIDs)
 	// 4. ChunkDocMapper forward: chunkID → docID.
 	if err := h.streamChunkDocForward(kbID, chunkIDs, stream); err != nil {
 		return fmt.Errorf("sync: stream ChunkDocMapper forward: %w", err)
@@ -206,7 +208,7 @@ func (h *LeaderHandler) streamDocStore(
 		// SeekLT lands on the document's NEWEST entry; when the document was
 		// updated after versionID, the version check that used to sit below then
 		// dropped it and the export shipped no record for it at all (C4 of
-		// docs/code-review-2026-10-18.md). Pulling a middle version — which the
+		// docs/参考/code-review-2026-10-18.md). Pulling a middle version — which the
 		// gap backfill does for every version between this node's cursor and the
 		// one being applied — therefore produced a version whose document list
 		// was complete and whose bodies were missing, and the follower advanced
@@ -396,7 +398,11 @@ func (h *LeaderHandler) streamChunkVectors(
 	stream entrySink,
 ) error {
 	for _, chunkID := range chunkIDs {
-		resp, err := h.vecstore.Read(context.Background(), &vecstorepb.ReadChunkRequest{
+		ctx := context.Background()
+		if contextual, ok := stream.(interface{ Context() context.Context }); ok {
+			ctx = contextual.Context()
+		}
+		resp, err := h.vecstore.Read(ctx, &vecstorepb.ReadChunkRequest{
 			Key: encodeVecstoreKey(kbID, chunkID),
 		})
 		if err != nil {
@@ -465,3 +471,16 @@ func bytesToFloat32s(b []byte) []float32 {
 
 // Compile-time check.
 var _ pb.DataSyncServiceServer = (*LeaderHandler)(nil)
+
+type contextualEntrySink struct {
+	ctx  context.Context
+	send func(*pb.SyncEntry) error
+}
+
+func (s contextualEntrySink) Context() context.Context { return s.ctx }
+func (s contextualEntrySink) Send(e *pb.SyncEntry) error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	return s.send(e)
+}

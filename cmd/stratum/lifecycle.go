@@ -15,6 +15,7 @@ import (
 	"stratum/internal/nodestate"
 	"stratum/internal/plane"
 	stratumsync "stratum/internal/sync"
+	"stratum/service"
 )
 
 // shutdownDeps is what watching for a signal needs: the server to stop taking
@@ -28,6 +29,8 @@ type shutdownDeps struct {
 	indexMgr   *index.IndexManagerImpl
 	// chunkStore is only ever asked for a disk figure; nil on a control node.
 	chunkStore *chunkstore.VecstoreChunkStore
+	// rpcMetrics is the same counter set the gRPC server increments.
+	rpcMetrics *service.RPCMetrics
 }
 
 // startShutdownWatcher turns SIGINT/SIGTERM into an orderly stop: declare
@@ -45,7 +48,7 @@ func startShutdownWatcher(d shutdownDeps) {
 	// one. Started before the signal handler so the handler can close it, and a
 	// listen failure is only a warning — losing metrics must not keep the node
 	// from serving.
-	metricsSource := nodeMetricsSource{}
+	metricsSource := nodeMetricsSource{RPCMetrics: d.rpcMetrics}
 	if indexMgr != nil {
 		metricsSource.LoadedIndexes = indexMgr.LoadedCount
 	}
@@ -60,7 +63,7 @@ func startShutdownWatcher(d shutdownDeps) {
 	go func() {
 		sig := <-sigCh
 		logger.Info("received signal, shutting down", zap.String("signal", sig.String()))
-		// docs/storage-node-state-machine-plan.md §3.1: STOPPING is terminal, and
+		// docs/已实施/storage-node-state-machine-plan.md §3.1: STOPPING is terminal, and
 		// it is declared before the server stops taking work — so a status call
 		// arriving mid-shutdown sees the wind-down rather than a healthy node
 		// that then stops answering.
@@ -99,7 +102,7 @@ func newLagCatchup(d lagCatchupDeps) stratumsync.ChainTailSink {
 
 	var chainTails stratumsync.ChainTailSink
 
-	// docs/active-lag-detection-design.md: turn the chain tail the leader sends back
+	// docs/已实施/active-lag-detection-design.md: turn the chain tail the leader sends back
 	// into a background catch-up. There is no switch, and it is deliberately damped — a
 	// random delay per signal and a bound on how many knowledge bases may catch up at
 	// once — because the alternative is a node returning from an outage starting every
@@ -123,14 +126,14 @@ func newLagCatchup(d lagCatchupDeps) stratumsync.ChainTailSink {
 			HoldersRefreshInterval: cfg.LagCatchupHoldersRefresh,
 			Ensure:                 dataPlane.EnsureIndex,
 			Cursor:                 dataPlane.DataVersionsSnapshot,
-			// docs/data-source-holders-fallback-plan.md: a node that is behind finds out
+			// docs/已实施/data-source-holders-fallback-plan.md: a node that is behind finds out
 			// who can serve it, off the Raft apply path where the lookup cannot ask.
 			FindHolders: func(ctx context.Context, kbID string) {
 				if version, addrs, ok := dataPlane.PeerHolders(ctx, kbID); ok {
 					holdersCache.Store(kbID, version, addrs)
 				}
 			},
-			// docs/storage-node-state-machine-plan.md §3.3: declare the
+			// docs/已实施/storage-node-state-machine-plan.md §3.3: declare the
 			// knowledge bases this node is catching up on, so the node's state
 			// answers "is it behind" without re-deriving it from the cursors at
 			// each reader. Only reachable inside this branch, where the machine

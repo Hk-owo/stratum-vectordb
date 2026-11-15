@@ -1,7 +1,7 @@
 // knowledgebase.proto — external KnowledgeBaseService contract: knowledge
 // base lifecycle and version management.
 //
-// See Stratum_接口设计v9.md "KnowledgeBaseService" for the authoritative
+// See docs/参考/历史/Stratum_接口设计v9.md "KnowledgeBaseService" for the authoritative
 // specification.
 //
 // Reserved (not implemented): DiffVersions, TagVersion. Per
@@ -12,7 +12,7 @@
 //
 // GetVersion is no longer on this list: the control layer reads a single
 // version through raft.RaftNode.GetVersion, and callers reach the same
-// information through AwaitVersion below (docs/await-version-plan.md §7).
+// information through AwaitVersion below (docs/已实施/await-version-plan.md §7).
 syntax = "proto3";
 package stratum;
 
@@ -35,7 +35,7 @@ enum IndexStatus {
 // DataStatus mirrors internal/types.DataStatus: a version's DATA-side state,
 // kept separate from IndexStatus because the two fail apart — a version whose
 // data is durable may still have no working index, and an index that never built
-// says nothing about whether the data landed (Stratum_设计文档v13.md §10.1b).
+// says nothing about whether the data landed (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 enum DataStatus {
   DATA_STATUS_PENDING = 0;          // metadata allocated, storage-layer write in flight
   DATA_STATUS_DURABLE = 1;          // a quorum of replicas confirmed the data durable
@@ -66,7 +66,7 @@ enum Similarity {
 }
 
 // QuantizerType mirrors the vecstore-side QuantizerTypeProto
-// (Stratum_设计文档v12.md 2.4): how the in-memory index stores vector
+// (docs/参考/历史/Stratum_设计文档v12.md 2.4): how the in-memory index stores vector
 // payloads. QUANTIZER_OFF keeps full-precision HNSW (single-stage exact
 // search); the others build quantized coarse retrievers whose results are
 // re-ranked against full-precision vectors on disk.
@@ -166,7 +166,7 @@ service KnowledgeBaseService {
 
   // AwaitVersion waits for a version to reach a target state. It reports the
   // version's current stage instead of failing when the target has not been
-  // reached yet ("not yet" is not an error — docs/await-version-plan.md §5).
+  // reached yet ("not yet" is not an error — docs/已实施/await-version-plan.md §5).
   //
   // It is a READ: it holds no state, may be repeated, run concurrently, and
   // sent to any control node, so a caller that reconnects or moves does not
@@ -177,7 +177,7 @@ service KnowledgeBaseService {
   rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse);
 
   // DiscardVersion is the CALLER's declaration that it is abandoning a version
-  // whose write never landed (docs/await-version-plan.md §5 contract 7, §7
+  // whose write never landed (docs/已实施/await-version-plan.md §5 contract 7, §7
   // Step 6). It is not DeleteVersion under another name: discarding has no data
   // to reclaim and no children to rewire — removing the metadata is the whole
   // operation.
@@ -223,11 +223,14 @@ message CreateKnowledgeBaseRequest {
   QuantizerType quantizer = 7;  // optional; defaults to QUANTIZER_OFF
   int32 pq_m = 8;               // PQ only; 0 = default 96
   int32 pq_nbits = 9;           // PQ only; 0 = default 8
+  // Initial placement for a NEW KB only. Empty preserves the full deployment
+  // policy. Changing an existing KB's members requires a migration.
+  repeated int64 storage_replica_ids = 10;
 }
 message CreateKnowledgeBaseResponse {
   string knowledge_base_id = 1;
   // initial_version_id is always 0: creating a knowledge base no longer creates
-  // a version (docs/cursor-persistence-plan.md §5). A version's document set is
+  // a version (docs/已实施/cursor-persistence-plan.md §5). A version's document set is
   // inherited from its parent, so a version created with an empty changes list
   // would mean "unchanged", not "empty" — and the two were only ever the same
   // thing at the root of a chain. A first version now appears when something is
@@ -252,7 +255,7 @@ message CreateVersionRequest {
   // (for the same knowledge base) reuses the version the first attempt
   // allocated instead of allocating another one — which is what lets a client
   // re-send the changes for a version whose data never landed
-  // (Stratum_设计文档v13.md §7.12). Empty keeps the historical behaviour: every
+  // (docs/参考/历史/Stratum_设计文档v13.md §7.12). Empty keeps the historical behaviour: every
   // call allocates a new version.
   string client_request_id = 4;
 }
@@ -262,7 +265,7 @@ message CreateVersionResponse {
   // caller's own when it sent one, otherwise the one the control layer generated.
   // It travels back so a caller that omitted it still has something to re-send
   // under — the only way to recover a version whose data never landed
-  // (Stratum_设计文档v13.md §7.12, docs/await-version-plan.md §7 Step 4).
+  // (docs/参考/历史/Stratum_设计文档v13.md §7.12, docs/已实施/await-version-plan.md §7 Step 4).
   //
   // What it is NOT: a promise that the version will complete. It is a handle for
   // a decision the caller owns (§2.1).
@@ -297,7 +300,7 @@ message ListVersionsResponse {
 // a version is built when something asks for it, so a version nobody has queried
 // never reaches INDEX_READY however long a caller waits. Waiting for a state the
 // design deliberately does not produce is not a contract, it is a deadlock with
-// a timeout (docs/index-owner-sharding-plan.md §4).
+// a timeout (docs/已实施/index-owner-sharding-plan.md §4).
 //
 // A caller that needs the INDEX ready should ask for it (WarmupVersion) or query
 // the version, rather than wait for it to happen.
@@ -323,7 +326,7 @@ message AwaitVersionResponse {
   // while the version is PENDING and older than the probe's age threshold, and
   // it does NOT change stage — it is the fact a caller needs in order to decide
   // between re-sending its changes and discarding the version. The server never
-  // makes that choice for the caller (docs/await-version-plan.md §4.3).
+  // makes that choice for the caller (docs/已实施/await-version-plan.md §4.3).
   bool data_missing = 4;
 }
 

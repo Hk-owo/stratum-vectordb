@@ -11,11 +11,12 @@ import (
 	"go.uber.org/zap"
 
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/storage"
 	"stratum/internal/types"
 )
 
 // LocalControlPlane is the in-process ControlPlane for stage ① of
-// control-data-separation-design.md §7: it translates storage-layer reports
+// docs/已实施/control-data-separation-design.md §7: it translates storage-layer reports
 // into the metadata proposals the control layer already understands. It is
 // meant to be the only channel through which the storage layer reaches
 // replicated state — which is what keeps the boundary honest while both
@@ -33,12 +34,13 @@ type MetadataProposer interface {
 
 // DefaultFailureBudget is how many failed attempts a version tolerates before
 // the control layer declares it permanently failed
-// (Stratum_设计文档v13.md §10.1). Like the other §10.4 numbers it is a starting
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1). Like the other §10.4 numbers it is a starting
 // point still to be calibrated against real workloads.
 const DefaultFailureBudget = 5
 
 type LocalControlPlane struct {
-	rn MetadataProposer
+	placements storage.Resolver
+	rn         MetadataProposer
 
 	// nodeID is the node this plane speaks for, set by WithNodeID. It is what
 	// makes an index-readiness report say WHO is ready rather than "someone is"
@@ -73,13 +75,44 @@ type LocalControlPlane struct {
 
 	// silenceWindow is how long a required replica may go without a heartbeat
 	// before the redundancy verdict stops counting it as live
-	// (docs/storage-degradation-signal-plan.md §3.2). It is the verdict's
+	// (docs/已实施/storage-degradation-signal-plan.md §3.2). It is the verdict's
 	// hysteresis: see Degrade. Zero means DefaultStorageSilenceWindow.
 	silenceWindow time.Duration
 }
 
 // ControlPlaneOption configures a LocalControlPlane.
 type ControlPlaneOption func(*LocalControlPlane)
+
+func WithKBPlacement(resolve storage.Resolver) ControlPlaneOption {
+	return func(c *LocalControlPlane) { c.placements = resolve }
+}
+
+// The heartbeat/export layer holds a ControlPlane rather than the Raft adapter.
+// Delegate directory reads through this boundary; the periodic revision read
+// stays O(1) and never materializes all KBs.
+func (c *LocalControlPlane) StorageDirectory(ctx context.Context) (storage.Directory, error) {
+	reader, ok := c.rn.(storage.Reader)
+	if !ok {
+		return storage.Directory{}, stratumerrors.ErrPlacementUnknown
+	}
+	return reader.StorageDirectory(ctx)
+}
+func (c *LocalControlPlane) GetKBPlacement(ctx context.Context, kbID string) (storage.Snapshot, error) {
+	if c.placements != nil {
+		return c.placements(ctx, kbID)
+	}
+	reader, ok := c.rn.(storage.Reader)
+	if !ok {
+		return storage.Snapshot{}, stratumerrors.ErrPlacementUnknown
+	}
+	return reader.GetKBPlacement(ctx, kbID)
+}
+func (c *LocalControlPlane) StorageDirectoryRevision() uint64 {
+	if source, ok := c.rn.(interface{ StorageDirectoryRevision() uint64 }); ok {
+		return source.StorageDirectoryRevision()
+	}
+	return 0
+}
 
 // WithLivenessView wires the leader's record of the storage nodes' heartbeats, so the
 // control plane can judge storage redundancy. Passing the gate alongside it is what makes
@@ -148,7 +181,7 @@ func NewLocalControlPlane(rn MetadataProposer, opts ...ControlPlaneOption) *Loca
 
 // ReportVersionFailure records a failed attempt and, once the budget is spent —
 // or immediately, for a globally fatal failure — records the terminal verdict
-// (Stratum_设计文档v13.md §10.1).
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 //
 // The counter is kept per (version, side): the data side and the index side
 // fail independently, so an index build that keeps failing must not spend the
@@ -174,7 +207,7 @@ func (c *LocalControlPlane) ReportVersionFailure(ctx context.Context, kbID strin
 	// A globally fatal failure does not wait for the budget: retrying cannot
 	// help, so spending the remaining retries would only delay the terminal
 	// verdict and keep the version PENDING meanwhile
-	// (Stratum_设计文档v13.md §10.1).
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 	if class != types.FailureFatalGlobal && count < budget {
 		return false, nil // still inside the budget: the next attempt may succeed
 	}
@@ -184,7 +217,7 @@ func (c *LocalControlPlane) ReportVersionFailure(ctx context.Context, kbID strin
 		// failure this report describes has been resolved by events. Answered as
 		// "already settled" instead of as a report failure, and with terminal=false
 		// rather than true: the caller must stop retrying, but must NOT reclaim data
-		// a child version may already depend on (docs/known-gaps.md §K).
+		// a child version may already depend on (docs/未实施/known-gaps.md §K).
 		if errors.Is(err, stratumerrors.ErrVersionDataSettled) {
 			c.clearFailures(kbID, versionID, side)
 			c.logger.Debug("plane: the version is already durable; the failure report is discarded",
@@ -199,7 +232,7 @@ func (c *LocalControlPlane) ReportVersionFailure(ctx context.Context, kbID strin
 
 // SetFailureBudget records the retry budget declared for kbID. It is how a
 // KB's declared failure budget would reach the layer that owns the terminal
-// verdict (Stratum_设计文档v13.md §10.1); nothing in the node assembly calls it
+// verdict (docs/参考/历史/Stratum_设计文档v13.md §10.1); nothing in the node assembly calls it
 // today, so the process default governs. A non-positive value clears any
 // override, falling back to the process default.
 func (c *LocalControlPlane) SetFailureBudget(_ context.Context, kbID string, maxFailures int) error {
@@ -225,7 +258,7 @@ func failureKey(kbID string, versionID int64) string {
 
 // sideFailureKey namespaces a FAILURE COUNTER per knowledge base, version, and
 // side. The data side and the index side fail independently, so their budgets
-// must not share a counter (Stratum_设计文档v13.md §10.1b).
+// must not share a counter (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 func sideFailureKey(kbID string, versionID int64, side types.FailureSide) string {
 	return failureKey(kbID, versionID) + "\x00" + side.String()
 }
@@ -248,7 +281,7 @@ var _ ControlPlane = (*LocalControlPlane)(nil)
 // Whether a late confirmation still applies is decided by the state machine
 // rather than here: it holds the version's status deterministically, needs no
 // extra read on the write path, and is the same on every replica. A report for
-// an already settled version is dropped there (Stratum_设计文档v13.md §10.6).
+// an already settled version is dropped there (docs/参考/历史/Stratum_设计文档v13.md §10.6).
 func (c *LocalControlPlane) ReportDataDurable(ctx context.Context, kbID string, versionID int64, digest string) error {
 	if err := c.rn.ProposeUpdateVersionSummary(ctx, versionID, digest); err != nil {
 		return err
@@ -270,7 +303,7 @@ func (c *LocalControlPlane) ReportDataDurable(ctx context.Context, kbID string, 
 // A successful build also clears the INDEX side's failure counter: the side
 // that just succeeded is the one whose budget has been reset, and clearing only
 // that side is what keeps an index build's history from spending the data
-// side's retries (Stratum_设计文档v13.md §10.1b).
+// side's retries (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 func (c *LocalControlPlane) ReportIndexReady(ctx context.Context, kbID string, versionID int64) error {
 	if err := c.rn.ProposeUpdateVersionStatus(ctx, versionID, types.IndexStatusReady, c.nodeID); err != nil {
 		return err
@@ -292,6 +325,14 @@ func (c *LocalControlPlane) ReportIndexReady(ctx context.Context, kbID string, v
 // zero: "this version is gone" and "nobody is serving it" call for opposite
 // actions, and only the caller knows which it meant to ask about.
 func (c *LocalControlPlane) IndexReadyReplicaCount(ctx context.Context, kbID string, versionID int64, except int64) (int, error) {
+	var placement *storage.Placement
+	if c.placements != nil {
+		snap, err := storage.Resolve(ctx, c.placements, kbID)
+		if err != nil {
+			return 0, err
+		}
+		placement = &snap.Placement
+	}
 	if versionID <= 0 {
 		// Version ids start at 1; a non-positive ask would make the lower bound a
 		// no-op for the range filter and pull the whole chain back.
@@ -311,7 +352,7 @@ func (c *LocalControlPlane) IndexReadyReplicaCount(ctx context.Context, kbID str
 		}
 		count := 0
 		for _, node := range v.IndexReadyNodes {
-			if node != except {
+			if node != except && (placement == nil || placement.Contains(node)) {
 				count++
 			}
 		}
@@ -380,7 +421,7 @@ func (c *LocalControlPlane) ReportEpoch(ctx context.Context, _ uint64, dataVersi
 
 // promoteDurableData records the data side as durable for every version at or
 // below the reported cursor that the control layer still holds as PENDING
-// (Stratum_设计文档v13.md §10.1b; §7.9 owns the payload).
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1b; §7.9 owns the payload).
 //
 // The cursor is a scalar because the chain is linear: version numbering is dense
 // over the versions that still exist, so "at or below the cursor" is exactly
@@ -418,7 +459,7 @@ func (c *LocalControlPlane) promoteDurableData(ctx context.Context, kbID string,
 
 // WithStorageSilenceWindow sets how long a required replica may go without
 // reporting before the redundancy verdict stops counting it live
-// (docs/storage-degradation-signal-plan.md §3.2). Non-positive values keep
+// (docs/已实施/storage-degradation-signal-plan.md §3.2). Non-positive values keep
 // DefaultStorageSilenceWindow, which is three heartbeat intervals.
 func WithStorageSilenceWindow(d time.Duration) ControlPlaneOption {
 	return func(c *LocalControlPlane) {
@@ -438,12 +479,9 @@ func WithStorageSilenceWindow(d time.Duration) ControlPlaneOption {
 // gate, so "cannot tell" must not become a refusal — see Degradation.Known and
 // the plan's §3.3 (fail-open).
 //
-// kbID is deliberately not part of the judgement. The question a write gate has
-// to answer is "can a quorum of the replicas that must hold this version be
-// reached", and with a single cluster-wide replica topology that answer is the
-// same for every knowledge base (docs/storage-degradation-signal-plan.md §3.1).
-// Per-KB placement (§10.2) is what would separate the two scopes; until then kbID
-// is carried only so the diagnosis names the knowledge base it was asked about.
+// With placement wired, kbID selects the fixed required member set. Silent or
+// draining members remain in its denominator. The global required-replica
+// callback is retained only for legacy embedded stacks.
 //
 // The verdict is soft state and can be stale in either direction, so a refusal
 // must be retryable: the record moves with the heartbeats, and the caller's
@@ -452,10 +490,20 @@ func (c *LocalControlPlane) StorageDegradation(kbID string) (StorageState, strin
 	if c.liveness == nil || c.leaderGate == nil || !c.leaderGate.IsLeader() {
 		return StorageHealthy, "storage redundancy unknown: not the control leader", false
 	}
-	if c.requiredReplicas == nil {
+	if c.requiredReplicas == nil && c.placements == nil {
 		return StorageHealthy, "storage redundancy unknown: replica topology not wired", false
 	}
-	required, err := c.requiredReplicas()
+	var required []int64
+	var err error
+	if c.placements != nil && kbID != "" {
+		snap, resolveErr := c.placements(context.Background(), kbID)
+		err = resolveErr
+		required = snap.Placement.ReplicaIDs
+	} else if c.placements != nil {
+		return StorageHealthy, "KB-scoped storage redundancy requires a knowledge base", false
+	} else {
+		required, err = c.requiredReplicas()
+	}
 	if err != nil {
 		// An unreadable topology is "unknown", never "unavailable": §3.3 lists it
 		// beside the empty record for exactly that reason.
@@ -529,7 +577,7 @@ func (c *LocalControlPlane) ChainGeneration() (term, seq uint64, ok bool) {
 
 // ChainTails answers "what is the newest version the control layer has accepted?" for
 // every knowledge base — the tails a node compares its own cursors against to decide
-// whether it has fallen behind (docs/active-lag-detection-design.md).
+// whether it has fallen behind (docs/已实施/active-lag-detection-design.md).
 //
 // It reads the replicated metadata directly, so this is the leader's answer and nobody
 // else's: a follower's metadata view can lag, and a lagging tail would tell a node it is

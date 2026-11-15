@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"stratum/internal/storage"
 	"stratum/internal/types"
 )
 
@@ -12,24 +13,43 @@ import (
 type commandType string
 
 const (
-	cmdCreateKB             commandType = "CreateKB"
-	cmdMarkKBDeleting       commandType = "MarkKBDeleting"
-	cmdMarkKBDeleteFailed   commandType = "MarkKBDeleteFailed"
-	cmdRemoveKBMeta         commandType = "RemoveKBMeta"
-	cmdCreateVersion        commandType = "CreateVersion"
-	cmdUpdateVersionStatus  commandType = "UpdateVersionStatus"
-	cmdUpdateVersionSummary commandType = "UpdateVersionSummary"
-	cmdRollback             commandType = "Rollback"
-	cmdMarkVersionDeleting  commandType = "MarkVersionDeleting"
-	cmdRemoveVersionMeta    commandType = "RemoveVersionMeta"
+	cmdDrainStorageNode             commandType = "DrainStorageNode"
+	cmdGetStorageMaintenance        commandType = "GetStorageMaintenance"
+	cmdActivateKBMigration          commandType = "ActivateKBMigration"
+	cmdAckStorageCleanup            commandType = "AckStorageCleanup"
+	cmdManageStorageNode            commandType = "ManageStorageNode"
+	cmdGetKBMigrationTransfer       commandType = "GetKBMigrationTransfer"
+	cmdRecordKBMigrationStage       commandType = "RecordKBMigrationStage"
+	cmdRecordKBMigrationInstall     commandType = "RecordKBMigrationInstall"
+	cmdRecordKBMigrationServe       commandType = "RecordKBMigrationServe"
+	cmdConfirmStorageServiceRevoked commandType = "ConfirmStorageServiceRevoked"
+	cmdRenewStorageService          commandType = "RenewStorageService"
+	cmdBlockStorageService          commandType = "BlockStorageService"
+	cmdResumeStorageService         commandType = "ResumeStorageService"
+	cmdBeginKBMigration             commandType = "BeginKBMigration"
+	cmdFenceKBMigration             commandType = "FenceKBMigration"
+	cmdAckKBMigrationFence          commandType = "AckKBMigrationFence"
+	cmdCancelKBMigration            commandType = "CancelKBMigration"
+	cmdRegisterStorageNodes         commandType = "RegisterStorageNodes"
+	cmdAssignKBPlacement            commandType = "AssignKBPlacement"
+	cmdCreateKB                     commandType = "CreateKB"
+	cmdMarkKBDeleting               commandType = "MarkKBDeleting"
+	cmdMarkKBDeleteFailed           commandType = "MarkKBDeleteFailed"
+	cmdRemoveKBMeta                 commandType = "RemoveKBMeta"
+	cmdCreateVersion                commandType = "CreateVersion"
+	cmdUpdateVersionStatus          commandType = "UpdateVersionStatus"
+	cmdUpdateVersionSummary         commandType = "UpdateVersionSummary"
+	cmdRollback                     commandType = "Rollback"
+	cmdMarkVersionDeleting          commandType = "MarkVersionDeleting"
+	cmdRemoveVersionMeta            commandType = "RemoveVersionMeta"
 
 	// cmdMarkVersionFailedPermanent records the control layer's verdict that a
 	// version has spent its retry budget and will not be retried again
-	// (Stratum_设计文档v13.md §10.1).
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 	cmdMarkVersionFailedPermanent commandType = "MarkVersionFailedPermanent"
 
 	// cmdRetryVersion is an OPERATOR's revocation of one side's terminal verdict
-	// (Stratum_设计文档v13.md §10.1): it puts that side back to PENDING and drops the
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1): it puts that side back to PENDING and drops the
 	// recorded cause chain once neither side is terminal any more.
 	//
 	// It exists because "nothing re-triggers it automatically" is a statement about
@@ -43,13 +63,13 @@ const (
 	// cmdMarkDataDurable records the DATA side as durable on the control layer's
 	// own authority rather than a writer's report: the startup reconcile knows a
 	// version's data sits on a quorum's worth of disks, and this is how that fact
-	// becomes replicated state (Stratum_设计文档v13.md §10.1b, §7.9).
+	// becomes replicated state (docs/参考/历史/Stratum_设计文档v13.md §10.1b, §7.9).
 	cmdMarkDataDurable commandType = "MarkDataDurable"
 
 	// cmdDiscardVersion is the CALLER's declaration that it is abandoning a
 	// version whose write never landed — the counterpart of §7.12's re-send,
 	// for a caller that no longer holds the changes
-	// (docs/await-version-plan.md §7 Step 6). It is deliberately not a
+	// (docs/已实施/await-version-plan.md §7 Step 6). It is deliberately not a
 	// DeleteVersion: discarding has nothing to reclaim, so the whole operation
 	// is removing metadata that never came with data.
 	cmdDiscardVersion commandType = "DiscardVersion"
@@ -61,7 +81,20 @@ const (
 // for debuggability: log entries dumped during troubleshooting are
 // human-readable without needing a decoder.
 type command struct {
-	Type commandType `json:"type"`
+	Drain             *storage.DrainRequest            `json:"drain,omitempty"`
+	Activation        *storage.MigrationActivation     `json:"activation,omitempty"`
+	NodeChange        *storage.NodeChange              `json:"node_change,omitempty"`
+	StageReceipt      *storage.MigrationStageReceipt   `json:"stage_receipt,omitempty"`
+	InstallReceipt    *storage.MigrationInstallReceipt `json:"install_receipt,omitempty"`
+	ServeReceipt      *storage.MigrationServeReceipt   `json:"serve_receipt,omitempty"`
+	Service           *storage.ServiceRequest          `json:"service,omitempty"`
+	Type              commandType                      `json:"type"`
+	StorageNodes      *storage.NodeRegistration        `json:"storage_nodes,omitempty"`
+	DirectoryRevision uint64                           `json:"directory_revision,omitempty"`
+	Placement         *storage.Placement               `json:"placement,omitempty"`
+	Migration         *storage.MigrationRequest        `json:"migration,omitempty"`
+	OperationID       string                           `json:"operation_id,omitempty"`
+	PlacementEpoch    uint64                           `json:"placement_epoch,omitempty"`
 
 	// cmdCreateKB
 	KB *types.KnowledgeBaseMeta `json:"kb,omitempty"`
@@ -76,7 +109,7 @@ type command struct {
 	// cmdCreateVersion: optional client idempotency key. Re-applying a command
 	// with the same (KBID, ClientRequestID) returns the version the first
 	// apply allocated instead of allocating another one
-	// (Stratum_设计文档v13.md §7.12).
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.12).
 	ClientRequestID string `json:"client_request_id,omitempty"`
 
 	// cmdUpdateVersionStatus / cmdMarkVersionDeleting / cmdRemoveVersionMeta
@@ -102,7 +135,7 @@ type command struct {
 	FailureReason string `json:"failure_reason,omitempty"`
 	FailureCount  int32  `json:"failure_count,omitempty"`
 	// cmdMarkVersionFailedPermanent / cmdRetryVersion: which side the command
-	// settles (Stratum_设计文档v13.md §10.1b). Omitted means the data side, which is
+	// settles (docs/参考/历史/Stratum_设计文档v13.md §10.1b). Omitted means the data side, which is
 	// what every command written before the two sides were separated meant — and for
 	// the retry command the same zero value keeps that reading rather than falling
 	// through to a convenient default: the state machine refuses a data-side retry
@@ -209,7 +242,7 @@ func newRetryVersionCommand(kbID string, versionID int64, side types.FailureSide
 }
 
 // newMarkDataDurableCommand is the control layer's own data-side promotion
-// (Stratum_设计文档v13.md §10.1b): no KB ID, because the version ID is globally
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1b): no KB ID, because the version ID is globally
 // unique and the state machine looks the version up by it.
 func newMarkDataDurableCommand(versionID int64) command {
 	return command{Type: cmdMarkDataDurable, VersionID: versionID}

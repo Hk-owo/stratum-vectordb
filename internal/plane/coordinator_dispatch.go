@@ -12,13 +12,14 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/storage"
 	stratuminternalsync "stratum/internal/sync"
 	"stratum/internal/types"
 )
 
 // CoordinatorDispatcher hands a committed version's write to one of the
 // knowledge base's replicas, which then acts as that write's coordinator
-// (Stratum_设计文档v13.md §7.13.2): the control layer picks the node, the node
+// (docs/参考/历史/Stratum_设计文档v13.md §7.13.2): the control layer picks the node, the node
 // runs the storage-layer transaction locally and fans out from there. This is
 // what moves the data-plane cost (split/embed/store + fan-out) off the control
 // leader, which is the whole point of the §7.13 model.
@@ -30,11 +31,12 @@ import (
 // is unreachable, must still make progress — the leader simply coordinates
 // itself.
 type CoordinatorDispatcher struct {
-	replicas  ReplicaResolver
-	selfAddr  string
-	localhost func(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error
-	dial      func(ctx context.Context, addr string) (*grpc.ClientConn, error)
-	logger    *zap.Logger
+	placements storage.Resolver
+	replicas   ReplicaResolver
+	selfAddr   string
+	localhost  func(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error
+	dial       func(ctx context.Context, addr string) (*grpc.ClientConn, error)
+	logger     *zap.Logger
 
 	// candidateTimeout bounds one candidate's turn at the write.
 	candidateTimeout time.Duration
@@ -94,6 +96,7 @@ const maxCandidateTimeout = 10 * time.Minute
 
 // CoordinatorDispatcherConfig wires a CoordinatorDispatcher.
 type CoordinatorDispatcherConfig struct {
+	Placement storage.Resolver
 	// Replicas lists the other replicas that should hold a written version.
 	// Optional: without it this node is the only candidate.
 	Replicas ReplicaResolver
@@ -162,6 +165,7 @@ func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispa
 		health = NewLocalHealthView(HealthViewConfig{})
 	}
 	return &CoordinatorDispatcher{
+		placements:             cfg.Placement,
 		replicas:               cfg.Replicas,
 		selfAddr:               cfg.SelfAddr,
 		localhost:              cfg.LocalWrite,
@@ -198,6 +202,13 @@ func (d *CoordinatorDispatcher) candidateBudget(docs int) time.Duration {
 // wraps the last failure — the caller treats it as transient and lets the retry
 // budget decide (§7.13.2: "try candidates in order until one succeeds").
 func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) (string, error) {
+	if d.placements != nil {
+		snap, err := storage.Resolve(ctx, d.placements, kbID)
+		if err != nil {
+			return "", err
+		}
+		ctx = storage.Bind(ctx, snap)
+	}
 	// Per-stage timings of one dispatch, at debug level.
 	//
 	// Why they are here: the client was already answered when the version was
@@ -229,7 +240,7 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 	}()
 
 	resolveStart := time.Now()
-	candidates, err := d.candidates(ctx)
+	candidates, err := d.candidates(ctx, kbID)
 	resolveUs = time.Since(resolveStart)
 	if err != nil {
 		return "", err
@@ -279,7 +290,7 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 		// §7.13.5: the attempt just made IS the observation — no probe loop,
 		// no extra RPC. It only ever reorders later dispatches.
 		d.health.Observe(addr, err == nil)
-		// docs/storage-node-state-machine-plan.md §3.2: the same observation is
+		// docs/已实施/storage-node-state-machine-plan.md §3.2: the same observation is
 		// what this node knows about its own redundancy. Derived here rather than
 		// on a timer, so the verdict follows real traffic — and so a node that
 		// talks to nobody keeps saying UNKNOWN instead of guessing.
@@ -304,8 +315,20 @@ func (d *CoordinatorDispatcher) Dispatch(ctx context.Context, kbID string, versi
 // candidates returns the addresses to try, in a stable order: the other
 // replicas sorted, then this node last (so the local fallback is the last
 // resort rather than the default).
-func (d *CoordinatorDispatcher) candidates(ctx context.Context) ([]string, error) {
+func (d *CoordinatorDispatcher) candidates(ctx context.Context, kbIDs ...string) ([]string, error) {
 	var others []string
+	if d.placements != nil {
+		if len(kbIDs) != 1 {
+			return nil, fmt.Errorf("dispatch: knowledge base is required")
+		}
+		snap, err := storage.Resolve(ctx, d.placements, kbIDs[0])
+		if err != nil {
+			return nil, err
+		}
+		others = snap.Addresses(0)
+		sort.Strings(others)
+		return d.health.Rank(others), nil
+	}
 	if d.replicas != nil {
 		got, err := d.replicas(ctx)
 		if err != nil {
@@ -341,7 +364,7 @@ func (d *CoordinatorDispatcher) candidates(ctx context.Context) ([]string, error
 // its view from every replica's periodic reports and can only do so while it
 // leads, whereas this node computes its own from the calls it happened to make.
 // The two disagreeing is expected — a health view needs no consensus
-// (§5.1 of docs/coordinator-selection-and-node-liveness-design.md).
+// (§5.1 of docs/已实施/coordinator-selection-and-node-liveness-design.md).
 //
 // The verdict is UNKNOWN whenever ANY required peer has never been observed:
 // "I have not talked to it" is not evidence that it is up, and a verdict from a

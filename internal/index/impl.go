@@ -3,7 +3,9 @@ package index
 import (
 	"context"
 	"os"
+	"stratum/internal/storage"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -49,7 +51,7 @@ type IndexManagerConfig struct {
 	IndexDataDir string
 
 	// IndexRetentionCount bounds how many on-disk index files are kept
-	// per knowledge base (Stratum_设计文档v10.md "磁盘保留策略": the most
+	// per knowledge base (docs/参考/历史/Stratum_设计文档v10.md "磁盘保留策略": the most
 	// recent N versions stay persisted; older ones are deleted and
 	// rebuilt on demand via RebuildIndex). Applied after every successful
 	// build and at startup. <= 0 disables the policy (keep everything).
@@ -82,12 +84,12 @@ type IndexManagerConfig struct {
 	// loaded indexes (vector payload bytes, summed and tracked per loaded
 	// index). When the estimate exceeds the threshold, new loads/builds
 	// evict least-recently-used, ref-count-zero indexes first
-	// (Stratum_设计文档v10.md "内存换入换出"). <= 0 disables the byte
+	// (docs/参考/历史/Stratum_设计文档v10.md "内存换入换出"). <= 0 disables the byte
 	// threshold; LRUCapacity still applies.
 	MemoryThresholdMB int64
 
 	// CandidateN is the coarse-pass budget every search asks the vector store
-	// to use (Stratum_设计文档v12.md §2.2). It is the one knob that trades
+	// to use (docs/参考/历史/Stratum_设计文档v12.md §2.2). It is the one knob that trades
 	// quantized recall for latency: the candidate set is what gets re-ranked
 	// against full-precision vectors, so a wider set covers more of the true
 	// neighbours and costs more disk reads.
@@ -118,7 +120,7 @@ type IndexManagerConfig struct {
 
 	// BuildAbandonTimeout bounds how long a half-built index artifact may sit on
 	// disk before the sweeper deletes it
-	// (coordinator-selection-and-node-liveness-design.md §6, "索引构建失败产物的回收").
+	// (docs/已实施/coordinator-selection-and-node-liveness-design.md §6, "索引构建失败产物的回收").
 	//
 	// The gap it closes: a build that dies or times out leaves an artifact that
 	// no one will ever look at again — the control layer simply moves on to the
@@ -162,7 +164,7 @@ type IndexManagerConfig struct {
 	AppendMaxDeadRatio float64
 
 	// MaxCodebookDriftRatio and MaxCodebookAppends are the two triggers that
-	// retire a stale quantizer codebook (docs/codebook-refresh-plan.md §3):
+	// retire a stale quantizer codebook (docs/已实施/codebook-refresh-plan.md §3):
 	// either one fires and the build abandons append reuse, rebuilding from
 	// scratch — which is the only path that trains a NEW codebook.
 	//
@@ -262,7 +264,7 @@ type IndexManagerConfig struct {
 	BuildConcurrency int
 
 	// BuildState reports this manager's build transitions to the node state
-	// machine (docs/storage-node-state-machine-plan.md §7, item 4). Optional:
+	// machine (docs/已实施/storage-node-state-machine-plan.md §7, item 4). Optional:
 	// nil means they are simply not reported, which is the unit-test default.
 	//
 	// It belongs here rather than at the call sites because the manager is the
@@ -280,7 +282,7 @@ type IndexManagerConfig struct {
 // and owner sets that is no longer true — a replica nothing routes to never builds
 // the artifact, so "2 others serving" actually demanded that ALL THREE replicas hold
 // it, and collection could never start. Measured on the 3+3 cluster:
-// `others_serving=1, minimum_required=2` (docs/stress-test-report.md §E). What the
+// `others_serving=1, minimum_required=2` (docs/参考/stress-test-report.md §E). What the
 // gate is FOR is "some other replica still answers after I leave", and 1 delivers
 // exactly that; raise it for a deployment that wants more slack while rotating.
 const DefaultIndexServingReplicaMin = 1
@@ -312,7 +314,7 @@ const DefaultAppendMaxDeadRatio = 0.2
 
 // DefaultMaxCodebookDriftRatio is the cumulative-new-vector share at which a
 // version stops appending to its parent's artifact and rebuilds from scratch to
-// retrain the quantizer's codebook (docs/codebook-refresh-plan.md §3). The
+// retrain the quantizer's codebook (docs/已实施/codebook-refresh-plan.md §3). The
 // share is (totalChunks - trainedNtotal) / trainedNtotal.
 //
 // 0.25 is a starting point, not a measured optimum: large enough that a KB whose
@@ -351,7 +353,9 @@ const DefaultMinCodebookBaselineVectors = 1000
 // stays as-is (PENDING), to be resumed by an explicit rebuild or a node
 // restart.
 type IndexManagerImpl struct {
-	cfg IndexManagerConfig
+	pausedKB     map[string]bool
+	serviceLease atomic.Pointer[storage.ServiceLease]
+	cfg          IndexManagerConfig
 
 	// Build data-source callbacks, wired to real PebbleDB-backed modules
 	// (VersionDocList, ChunkDocMapper, ChunkStore) by the caller.
@@ -405,7 +409,7 @@ type IndexManagerImpl struct {
 	loadedBytes int64
 
 	// lastPinWarn rate-limits the "over capacity, nothing evictable" warning that
-	// makeRoomLocked emits (M8 of docs/code-review-2026-09-24.md). The condition
+	// makeRoomLocked emits (M8 of docs/参考/code-review-2026-09-24.md). The condition
 	// lasts as long as a burst of concurrent searches pins every resident index,
 	// and every one of them calls makeRoomLocked — one line per minute is enough
 	// to make the overage visible without turning it into the loudest thing in the
@@ -514,7 +518,8 @@ type IndexManagerImpl struct {
 	deletedKBs      map[string]bool
 	deletedVersions map[indexKey]bool
 
-	callbacks []BuildCompleteCallback
+	callbacks        []BuildCompleteCallback
+	contextCallbacks []func(context.Context, string, int64, types.IndexStatus) error
 
 	logger *zap.Logger
 }
@@ -653,7 +658,7 @@ func (im *IndexManagerImpl) Close() error {
 	// client for its whole Build → AddChunks → Save sequence, so closing the
 	// connection under it turns an orderly shutdown into a burst of failures — and
 	// leaving the pool running leaves its workers parked in cond.Wait() forever
-	// (M7 of docs/code-review-2026-10-18.md). A manager that never built anything has
+	// (M7 of docs/参考/code-review-2026-10-18.md). A manager that never built anything has
 	// no pool, which is the common case in tests.
 	im.buildPoolMu.Lock()
 	pool := im.buildPool
@@ -693,3 +698,5 @@ const (
 	// written to its .used sidecar.
 	accessPersistInterval = time.Minute
 )
+
+func (im *IndexManagerImpl) SetServiceLease(g *storage.ServiceLease) { im.serviceLease.Store(g) }

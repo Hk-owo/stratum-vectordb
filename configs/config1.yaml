@@ -21,7 +21,7 @@ node:
   station_mark_ttl_ms: 0
 
 control_plane:
-  # 判 FAILED_PERMANENT 之前容忍的失败次数（Stratum_设计文档v13.md §10.1）。
+  # 判 FAILED_PERMANENT 之前容忍的失败次数（docs/参考/历史/Stratum_设计文档v13.md §10.1）。
   # 0 = 用 plane.DefaultFailureBudget（5）。
   failure_budget: 0
 
@@ -29,6 +29,7 @@ raft:
   peers:
     - id: 1
       addr: "localhost:8000"
+      service_addr: "localhost:7000"
   # 控制层**有界删除日志**的条数上限；<= 0 用默认的 10000。存储节点靠它做增量对账：
   # 调大 ⇒ 节点可以落后更久才必须回退全量活链读；代价是每条都随 raft 快照往返。
   deleted_log_limit: 0
@@ -86,7 +87,7 @@ delete_coordinator:
   deleting_kb_sweep_interval_ms: 0
 
 # 对账（reconcile）—— 把"元数据里已经删除、但本节点还留着字节"的残留版本清掉
-# （docs/known-gaps.md §B/§C 那个窗口）。判据是控制层的当前状态：本节点持有的版本号
+# （docs/未实施/known-gaps.md §B/§C 那个窗口）。判据是控制层的当前状态：本节点持有的版本号
 # 是否已分配、且不在存活集合里。
 #
 # 两个开关分开：启动那一趟和运行期那一趟是同一个不可逆动作，但回答的是不同的问题
@@ -138,12 +139,12 @@ reconcile:
 
 index_manager:
   lru_capacity: 16
-  # 内存字节阈值。记账口径见 Stratum_设计文档v12.md 3.3：OFF(全精度)KB
+  # 内存字节阈值。记账口径见 docs/参考/历史/Stratum_设计文档v12.md 3.3：OFF(全精度)KB
   # 按 4×d×n 向量载荷记账；SQ/PQ 量化 KB 按 vecstore 报告的「图边+量化码」
   # 粗筛器口径记账（单条目显著变小）。启用量化后同样预算可驻留更多版本，
   # 阈值可按部署内存压力自行调整（调低 = 更早换出冷版本粗筛器）。
   memory_threshold_mb: 4096
-  # 量化粗筛的候选数（Stratum_设计文档v12.md §2.2）。它是「量化召回 / 延迟」
+  # 量化粗筛的候选数（docs/参考/历史/Stratum_设计文档v12.md §2.2）。它是「量化召回 / 延迟」
   # 之间唯一的旋钮：候选集就是拿去与全精度向量 rerank 的那批，放大它覆盖更多
   # 真实近邻、代价是更多磁盘读。0 = 不发送该字段，由 vecstore 用自带默认
   # clamp(top_k × 8, 16, 4096)。
@@ -166,7 +167,7 @@ index_manager:
   # §8.6(c) 的增量复用门槛与 §8.6(d) 的回收报告门槛。**2026-10 起两者分开**：
   # 复用门槛 append_max_dead_ratio 默认 0.2，回收报告门槛 gc_ratio_threshold
   # 默认 0.3。相等时（都曾是 0.2）§8.6(c) 恰好会在 §8.6(d) 开始关心的那一刻
-  # 重建，于是 (d) 永远看不到候选 —— 这正是 docs/known-gaps.md §G 记的那件事，
+  # 重建，于是 (d) 永远看不到候选 —— 这正是 docs/未实施/known-gaps.md §G 记的那件事，
   # 现在把报告门槛抬到复用门槛之上来解开它。0 = 用 IndexManager 默认值（0.3）。
   gc_ratio_threshold: 0
   # 磁盘保留策略的「访问保护」。retention 默认只按版本号保新
@@ -202,7 +203,7 @@ index_manager:
   # 默认曾为 2，2026-10 改为 1：索引是**按需构建**的（§8.6(b)），叠加 owner 分片
   # （§8.5），一个没被路由到的副本不会持有该版本的索引 —— 于是「除我之外还有 2 个
   # 在服务」实际等于要求**三个副本都持有**，收集永远启不动（实测 others_serving=1
-  # < 2，见 docs/stress-test-report.md §E）。闸门的本意是「我下线后仍有人答得上」，
+  # < 2，见 docs/参考/stress-test-report.md §E）。闸门的本意是「我下线后仍有人答得上」，
   # 1 就满足它。要在滚动时留更多余量、或用更大的副本数，就调大这个值。
   serving_replica_min: 0
   # 带图形态没有「原地删向量」这条路（faiss 的 HNSW 不支持 RemoveIds），只能整图
@@ -346,7 +347,7 @@ gc:
   # 的记录只是省空间，没人等它，所以可以慢。0 = 5 分钟。
   wal_reclaim_interval_s: 0
 
-# 主动落后追赶（docs/active-lag-detection-design.md）。节点每 5 秒向控制 leader 发心跳，
+# 主动落后追赶（docs/已实施/active-lag-detection-design.md）。节点每 5 秒向控制 leader 发心跳，
 # 响应里的 chain_generation 变化时拉取每 KB 的「链尾」（已提交的最新版本）；本节点若发现
 # 自己落后，就在后台追一次——复用查询路径（EnsureIndex），所以既有的闸门照旧生效，
 # 这里只决定「什么时候开始」——没有开关：落后副本自己追上来是常态，而不是「等谁撞上」。

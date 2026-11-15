@@ -8,27 +8,85 @@ import (
 
 	pb "stratum/api/proto/stratum"
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/storage"
+	"stratum/internal/wire"
 )
 
 // InternalServiceServer serves node-to-node control-plane traffic — currently
 // only Propose, the funnel that lets any node initiate a Raft proposal
-// (Stratum_设计文档v13.md §7.3).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.3).
 type InternalServiceServer struct {
 	pb.UnimplementedInternalServiceServer
 
-	node *RaftNodeImpl
+	node   *RaftNodeImpl
+	health func(string) storage.Health
 }
 
 // NewInternalServiceServer returns the handler for node's internal service.
-func NewInternalServiceServer(node *RaftNodeImpl) *InternalServiceServer {
-	return &InternalServiceServer{node: node}
+func NewInternalServiceServer(node *RaftNodeImpl, health ...func(string) storage.Health) *InternalServiceServer {
+	s := &InternalServiceServer{node: node}
+	if len(health) > 0 {
+		s.health = health[0]
+	}
+	return s
+}
+
+func (s *InternalServiceServer) directoryResponse(d storage.Directory) *pb.GetStorageDirectoryResponse {
+	resp := wire.StorageDirectoryToProto(d)
+	if s.health != nil {
+		resp.Health = make(map[string]*pb.KBStorageHealth, len(d.Placements))
+		for kb := range d.Placements {
+			h := s.health(kb)
+			resp.Health[kb] = &pb.KBStorageHealth{Known: h.Known, Degraded: h.Degraded, Unavailable: h.Unavailable, Detail: h.Detail}
+		}
+	}
+	return resp
 }
 
 var _ pb.InternalServiceServer = (*InternalServiceServer)(nil)
 
+func (s *InternalServiceServer) GetStorageDirectory(ctx context.Context, req *pb.GetStorageDirectoryRequest) (*pb.GetStorageDirectoryResponse, error) {
+	// A lagging follower's absence is not authoritative placement absence.
+	if !s.node.IsLeader() {
+		return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrNoLeaderYet)
+	}
+	if req.GetNodeId() != 0 {
+		if req.GetNodeId() < 0 || req.GetKnowledgeBaseId() != "" {
+			return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrInvalidArgument)
+		}
+		d, err := s.node.GetNodeStorageDirectory(ctx, req.GetNodeId())
+		if err != nil {
+			return nil, stratumerrors.ToGRPCStatus(err)
+		}
+		return s.directoryResponse(d), nil
+	}
+	if req.GetKnowledgeBaseId() != "" {
+		snap, err := s.node.GetKBPlacement(ctx, req.GetKnowledgeBaseId())
+		if err != nil {
+			return nil, stratumerrors.ToGRPCStatus(err)
+		}
+		d := storage.NewDirectory()
+		d.Revision = snap.Revision
+		d.Placements[snap.Placement.KBID] = snap.Placement
+		if snap.Migration != nil {
+			d.Migrations = map[string]storage.Migration{snap.Migration.Request.OperationID: snap.Migration.Clone()}
+		}
+		d.ActiveVersions = map[string]int64{snap.Placement.KBID: snap.ActiveVersion}
+		for _, n := range snap.Nodes {
+			d.Nodes[n.ID] = n
+		}
+		return s.directoryResponse(d), nil
+	}
+	d, err := s.node.StorageDirectory(ctx)
+	if err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	return s.directoryResponse(d), nil
+}
+
 // VersionLiveness answers "which of these versions are still alive, and how far has
 // allocation got" — the liveness read that does not decay: neither fact has a
-// lifetime, so nothing can take the evidence away (docs/known-gaps.md §B).
+// lifetime, so nothing can take the evidence away (docs/未实施/known-gaps.md §B).
 //
 // No leader requirement, unlike Propose: the fact is replicated state, so any node
 // holding it answers the same thing, and finding the leader would add a redirect hop.

@@ -225,7 +225,7 @@ func (d *LocalDataPlane) PendingTerminalReclaims() int {
 // acknowledged the write: when the control layer declares a version permanently
 // failed it does not know which replicas actually landed the data, so a no-op
 // on a replica that never received it is far cheaper than leaking the data on
-// the one that did (Stratum_设计文档v13.md §10.6).
+// the one that did (docs/参考/历史/Stratum_设计文档v13.md §10.6).
 //
 // The cursor is advanced past the version: a permanently failed version will
 // never have data, so treating it as "known" is what keeps the gap from
@@ -238,11 +238,12 @@ func (d *LocalDataPlane) DropVersionData(ctx context.Context, kbID string, versi
 		}
 	}
 
-	if d.cleaner != nil && d.resolveReplicas != nil {
-		peers, err := d.resolveReplicas(ctx)
+	if d.cleaner != nil && d.hasReplicaResolver() {
+		cleanupCtx, peers, err := d.cleanupPeers(ctx, kbID)
 		if err != nil {
 			record(fmt.Errorf("plane: DropVersionData: resolve replicas: %w", err))
 		} else {
+			ctx = cleanupCtx
 			for _, peer := range peers {
 				if err := d.cleaner.DeleteVersionData(ctx, peer, kbID, versionID, "permanently failed version"); err != nil {
 					record(fmt.Errorf("plane: DropVersionData: broadcast to %s: %w", peer, err))
@@ -297,6 +298,10 @@ func (d *LocalDataPlane) EnforceRetention(ctx context.Context, meta MetadataList
 		return fmt.Errorf("plane: EnforceRetention: list knowledge bases: %w", err)
 	}
 	for _, kb := range kbs {
+		owned, ownErr := d.OwnsKnowledgeBase(ctx, kb.KBID)
+		if ownErr != nil || !owned {
+			continue
+		}
 		if err := d.indexMgr.EnforceDiskRetention(ctx, kb.KBID, []int64{kb.ActiveVersionID}); err != nil {
 			d.logger.Warn("plane: retention: EnforceDiskRetention failed",
 				zap.String("kb_id", kb.KBID), zap.Error(err))

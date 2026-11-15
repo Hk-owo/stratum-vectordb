@@ -35,6 +35,9 @@ func buildPriorityName(p BuildPriority) string {
 // is why a post-restart sweep could outrank live work; reconcile now uses
 // TriggerBuildBackfill below.
 func (im *IndexManagerImpl) TriggerBuild(ctx context.Context, kbID string, versionID int64) error {
+	if err := im.serviceLease.Load().CheckContext(ctx); err != nil {
+		return err
+	}
 	return im.triggerBuild(kbID, versionID, im.coldShapeFor(ctx, kbID, versionID), BuildPriorityInteractive)
 }
 
@@ -44,6 +47,9 @@ func (im *IndexManagerImpl) TriggerBuild(ctx context.Context, kbID string, versi
 // It yields to every interactive build, so no backlog of these can starve a live
 // write of its build.
 func (im *IndexManagerImpl) TriggerBuildBackfill(ctx context.Context, kbID string, versionID int64) error {
+	if err := im.serviceLease.Load().CheckContext(ctx); err != nil {
+		return err
+	}
 	return im.triggerBuild(kbID, versionID, im.coldShapeFor(ctx, kbID, versionID), BuildPriorityBackfill)
 }
 
@@ -51,6 +57,10 @@ func (im *IndexManagerImpl) triggerBuild(kbID string, versionID int64, graphFree
 	key := indexKey{kbID, versionID}
 
 	im.mu.Lock()
+	if im.pausedKB[kbID] {
+		im.mu.Unlock()
+		return stratumerrors.ErrNotKBReplica
+	}
 	if im.loading[key] {
 		im.mu.Unlock()
 		return nil // build already in progress
@@ -107,6 +117,16 @@ func (im *IndexManagerImpl) submitBuild(req buildRequest) bool {
 }
 
 func (im *IndexManagerImpl) doBuild(req buildRequest) {
+	lease := im.serviceLease.Load()
+	buildCtx, release, guardErr := lease.Enter(context.Background())
+	if guardErr != nil {
+		im.mu.Lock()
+		delete(im.loading, indexKey{req.kbID, req.versionID})
+		im.cond.Broadcast()
+		im.mu.Unlock()
+		return
+	}
+	defer release()
 	kbID, versionID, graphFree := req.kbID, req.versionID, req.graphFree
 	key := indexKey{kbID, versionID}
 
@@ -141,6 +161,15 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 			status = types.IndexStatusFailed
 		}
 
+		// Expired or pre-authorization workers cannot publish outcomes into
+		// a later service generation. Leave metadata pending for a fresh retry.
+		if im.serviceLease.Load() != lease || lease.CheckContext(buildCtx) != nil {
+			im.mu.Lock()
+			delete(im.loading, key)
+			im.cond.Broadcast()
+			im.mu.Unlock()
+			return
+		}
 		// Emitted HERE, and not from a defer of its own, for two reasons.
 		//
 		// Ordering: this line must be in the log before anything downstream of
@@ -175,7 +204,7 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 			// The key may ALREADY be resident: a version that is loaded and gets
 			// rebuilt (needsReshape → TriggerBuild → here, §8.6a) arrives with its
 			// entry in place. Replacing that entry wholesale loses two things that are
-			// not this build's to lose (H8 of docs/code-review-2026-10-18.md):
+			// not this build's to lose (H8 of docs/参考/code-review-2026-10-18.md):
 			//
 			//   - the refCount pins held by searches already in flight. release() looks
 			//     up the CURRENT entry, so it decrements a fresh zero and does nothing,
@@ -205,7 +234,7 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 			// last relevant.
 			im.seedAccessLocked(key)
 		}
-		callbacks := append([]BuildCompleteCallback(nil), im.callbacks...)
+		callbacks := im.callbacksLocked(buildCtx)
 		im.cond.Broadcast()
 		im.mu.Unlock()
 		im.dropEvicted(evicted)
@@ -241,13 +270,16 @@ func (im *IndexManagerImpl) doBuild(req buildRequest) {
 		// registered BuildCompleteCallback in cmd/stratum/main.go
 		// applies the policy instead.
 		for _, cb := range callbacks {
-			im.invokeCallback(cb, kbID, versionID, status)
+			im.invokeCallback(cb, kbID, versionID, status, buildCtx)
 		}
 	}()
 
 	var err error
-	sizeBytes, err = im.buildWithRetry(kbID, versionID, graphFree)
+	sizeBytes, err = im.buildWithRetry(kbID, versionID, graphFree, buildCtx)
 	buildUs = time.Since(buildStart)
+	if lease.CheckContext(buildCtx) != nil {
+		return
+	}
 	if err != nil {
 		im.logger.Error("index build failed",
 			zap.String("kb_id", kbID),
@@ -325,8 +357,12 @@ func chunkVectorReadErr(chunkID string, err error) error {
 	return fmt.Errorf("index: read chunk vector %s: %w", chunkID, err)
 }
 
-func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64, graphFree bool) (int64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), im.cfg.BuildRetryTimeout)
+func (im *IndexManagerImpl) buildWithRetry(kbID string, versionID int64, graphFree bool, parents ...context.Context) (int64, error) {
+	parent := context.Background()
+	if len(parents) > 0 {
+		parent = parents[0]
+	}
+	ctx, cancel := context.WithTimeout(parent, im.cfg.BuildRetryTimeout)
 	defer cancel()
 
 	var lastErr error
@@ -371,7 +407,7 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 		return 0, fmt.Errorf("index: ListChunkIDsByDocs: %w", err)
 	}
 
-	// 码本刷新判定（docs/codebook-refresh-plan.md §3）：只在"追加复用本来会发生"
+	// 码本刷新判定（docs/已实施/codebook-refresh-plan.md §3）：只在"追加复用本来会发生"
 	// 时才需要 —— 判定成立就把它关掉，让下面走全量重建，而全量重建正是重训码本
 	// 的唯一途径。放在 appendBase 之前，是为了不先白付一次 LoadForAppend。
 	if !skipReuse {
@@ -417,7 +453,7 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 				// The ratio is reported here too: this path still pays for a full
 				// rebuild, and without the number beside it there is no way to see
 				// which versions keep drifting past the limit
-				// (docs/content-defined-chunking-plan.md §5).
+				// (docs/已实施/content-defined-chunking-plan.md §5).
 				im.logger.Info("index: append reuse not worth it; rebuilding from scratch",
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
 					zap.Int64("parent_version_id", parentID),
@@ -481,7 +517,7 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 					zap.String("kb_id", kbID),
 					zap.Int64("version_id", versionID),
 					zap.Int("documents", len(ids)))
-				// Reporting is not enough (H7 of docs/code-review-2026-10-18.md).
+				// Reporting is not enough (H7 of docs/参考/code-review-2026-10-18.md).
 				// Returning (0, nil) marked this build as SUCCEEDED: doBuild kept the
 				// status at READY, inserted the version into `loaded` and told the
 				// control layer this node serves it. But nothing was ever built in
@@ -540,7 +576,7 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 		}
 	}
 
-	// Memory accounting (Stratum_设计文档v12.md 3.3): for quantized KBs the
+	// Memory accounting (docs/参考/历史/Stratum_设计文档v12.md 3.3): for quantized KBs the
 	// vecstore reports the index's resident estimate on the coarse-
 	// retriever basis (HNSW graph edges + quantized codes); prefer that
 	// over the 4×d×n vector-payload estimate (which is only right for
@@ -783,7 +819,11 @@ func (im *IndexManagerImpl) collectChunkBatches(ctx context.Context, kbID string
 }
 
 // invokeCallback calls cb with exponential backoff retry.
-func (im *IndexManagerImpl) invokeCallback(cb BuildCompleteCallback, kbID string, versionID int64, status types.IndexStatus) {
+func (im *IndexManagerImpl) invokeCallback(cb BuildCompleteCallback, kbID string, versionID int64, status types.IndexStatus, parents ...context.Context) {
+	parent := context.Background()
+	if len(parents) > 0 {
+		parent = parents[0]
+	}
 	base := time.Duration(im.cfg.CallbackRetryBaseMS) * time.Millisecond
 	if base <= 0 {
 		base = 200 * time.Millisecond
@@ -798,6 +838,9 @@ func (im *IndexManagerImpl) invokeCallback(cb BuildCompleteCallback, kbID string
 	// 就是因为这一行为空，才只能一路读代码去猜失败落在了哪一环。
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if im.serviceLease.Load().CheckContext(parent) != nil {
+			return
+		}
 		err := cb(kbID, versionID, status)
 		if err == nil {
 			return
@@ -821,7 +864,11 @@ func (im *IndexManagerImpl) invokeCallback(cb BuildCompleteCallback, kbID string
 		lastErr = err
 		if attempt < maxRetries {
 			backoff := base * time.Duration(int64(math.Pow(2, float64(attempt))))
-			time.Sleep(backoff)
+			select {
+			case <-parent.Done():
+				return
+			case <-time.After(backoff):
+			}
 		}
 	}
 	im.logger.Error("build callback retries exhausted",
@@ -838,4 +885,22 @@ func (im *IndexManagerImpl) RegisterBuildCallback(cb BuildCompleteCallback) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 	im.callbacks = append(im.callbacks, cb)
+}
+
+// RegisterBuildContextCallback preserves authorization cancellation through
+// metadata reporting and maintenance initiated by an asynchronous build.
+func (im *IndexManagerImpl) RegisterBuildContextCallback(cb func(context.Context, string, int64, types.IndexStatus) error) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.contextCallbacks = append(im.contextCallbacks, cb)
+}
+
+// The caller holds im.mu. Each wrapper captures its operation context.
+func (im *IndexManagerImpl) callbacksLocked(ctx context.Context) []BuildCompleteCallback {
+	out := append([]BuildCompleteCallback(nil), im.callbacks...)
+	for _, callback := range im.contextCallbacks {
+		cb := callback
+		out = append(out, func(kb string, v int64, s types.IndexStatus) error { return cb(ctx, kb, v, s) })
+	}
+	return out
 }

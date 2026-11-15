@@ -3,7 +3,7 @@
 // splits documents into chunks, embeds them into vectors, indexes them
 // with HNSW (Faiss), and serves similarity queries.
 //
-// See doc/Stratum_设计文档v10.md for the full architecture.
+// See doc/docs/参考/历史/Stratum_设计文档v10.md for the full architecture.
 package main
 
 import (
@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,11 +24,13 @@ import (
 	"stratum/internal/coordinator"
 	"stratum/internal/docstore"
 	"stratum/internal/embed"
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
 	"stratum/internal/nodestate"
 	"stratum/internal/plane"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
+	"stratum/internal/storage"
 	stratumsync "stratum/internal/sync"
 	"stratum/internal/tombstone"
 	"stratum/internal/types"
@@ -83,7 +86,7 @@ func main() {
 	// --- Storage layer (local) ---
 	//
 	// A control node keeps no data storage: it owns replicated metadata only
-	// (Stratum_设计文档v13.md §7.0), and every path that used to reach into a
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.0), and every path that used to reach into a
 	// local store now goes through the storage contract instead. What it keeps
 	// is the WAL and data directory above — Raft's own log and snapshots, which
 	// are what make this node a member rather than a holder of data.
@@ -92,6 +95,14 @@ func main() {
 	// a latent panic: the code paths that would dereference them are the ones
 	// the role split removed.
 	storageLocal := cfg.Role != NodeRoleControl
+	var executionGate *storage.ExecutionGate
+	if storageLocal {
+		var gateErr error
+		executionGate, gateErr = storage.NewExecutionGate(filepath.Join(dataDir, "storage-fences"))
+		if gateErr != nil {
+			logger.Fatal("cannot restore storage execution fences", zap.Error(gateErr))
+		}
+	}
 	// The data-plane helpers that actually touch stores. A control node builds
 	// none of them: what it keeps is the broadcast side of the contract plus the
 	// leader-side record of the storage nodes' heartbeats.
@@ -108,7 +119,7 @@ func main() {
 	// told it are deleted. Nil on a control node (no storage, nothing to refuse).
 	var versionTombstones *tombstone.PebbleStore
 
-	// docs/storage-node-state-machine-plan.md §3: this node's own state, in one
+	// docs/已实施/storage-node-state-machine-plan.md §3: this node's own state, in one
 	// place. Created only where there is storage — a control node keeps none, so
 	// it has no phases to report, and its admin surface omits node_state rather
 	// than claiming a phase it does not have.
@@ -124,7 +135,7 @@ func main() {
 	ctx := context.Background()
 	if storageLocal {
 		// nodeState goes in here because the index manager owns the version layer's
-		// build transitions (docs/storage-node-state-machine-plan.md §7, item 4):
+		// build transitions (docs/已实施/storage-node-state-machine-plan.md §7, item 4):
 		// every build and every installed artifact passes through it, and the one
 		// build that never starts is only visible from inside.
 		stack, err := buildStorageStack(cfg, dataDir, rn, logger, nodeState)
@@ -153,7 +164,7 @@ func main() {
 	}
 
 	// controlPlane is the storage layer's only channel to replicated state
-	// (control-data-separation-design.md §4.2); stage ① runs it in-process.
+	// (docs/已实施/control-data-separation-design.md §4.2); stage ① runs it in-process.
 	//
 	// The leader's record of the storage nodes' heartbeats, plus the gate that clears it
 	// when this node takes over leadership. Clearing on takeover is the point: a new leader
@@ -177,6 +188,7 @@ func main() {
 		// "someone is" — the rolling cleanup asks that before taking one out of
 		// service.
 		plane.WithNodeID(cfg.NodeID),
+		plane.WithKBPlacement(rn.(storage.Reader).GetKBPlacement),
 		plane.WithLivenessView(livenessRegistry, livenessGate),
 		// The replica set a write must reach, for the redundancy verdict. It comes from
 		// the cluster topology — never from who has reported — so a node that is merely
@@ -207,7 +219,7 @@ func main() {
 	}
 	// A control node has no index manager, so no builds to observe.
 	if indexMgr != nil {
-		indexMgr.RegisterBuildCallback(func(kbID string, versionID int64, status types.IndexStatus) error {
+		indexMgr.RegisterBuildContextCallback(func(ctx context.Context, kbID string, versionID int64, status types.IndexStatus) error {
 			// NOTE: the node state machine's build transitions are NOT reported
 			// here. They belong to the index manager itself (its BuildState
 			// recorder, wired in buildStorageStack), which is the single entry
@@ -223,11 +235,11 @@ func main() {
 			// never dropped. Best-effort: a policy failure is logged upstream
 			// and does not fail the build.
 			if status == types.IndexStatusReady {
-				if kb, err := rn.GetKB(context.Background(), kbID); err == nil {
-					_ = indexMgr.EnforceDiskRetention(context.Background(), kbID, []int64{kb.ActiveVersionID, versionID})
+				if kb, err := rn.GetKB(ctx, kbID); err == nil {
+					_ = indexMgr.EnforceDiskRetention(ctx, kbID, []int64{kb.ActiveVersionID, versionID})
 				}
 			}
-			return reportIndexStatus(context.Background(), controlPlane, kbID, versionID, status)
+			return reportIndexStatus(ctx, controlPlane, kbID, versionID, status)
 		})
 	}
 
@@ -236,7 +248,7 @@ func main() {
 	// CreateVersion transaction (BEGIN through COMMIT). It is shared with the
 	// orphan-chunk GC's reclaim phase so a sweep re-validates and deletes candidates
 	// under mutual exclusion with writes to the SAME knowledge base, while writes to
-	// other knowledge bases proceed (M7 of docs/code-review-2026-09-24.md). Both
+	// other knowledge bases proceed (M7 of docs/参考/code-review-2026-09-24.md). Both
 	// sides MUST receive the same set.
 	// dispatchVersionWrite and resolveReplicaAddrs are late-bound: the coordinator
 	// needs a dispatcher, the dispatcher needs the data plane, and the data plane
@@ -244,7 +256,8 @@ func main() {
 	// the assembly acyclic (the same late-binding trick dispatchVersionWrite and
 	// resolveReplicaAddrs already use).
 	a := &nodeAssembly{
-		cfg: cfg, logger: logger, ctx: ctx,
+		executionGate: executionGate,
+		cfg:           cfg, logger: logger, ctx: ctx,
 		walImpl: walImpl, rn: rn, raftNode: raftNode,
 		storageLocal: storageLocal, nodeState: nodeState, controlPlane: controlPlane,
 		ds: ds, cdm: cdm, vd: vd, chunkStore: chunkStore,
@@ -284,13 +297,54 @@ func main() {
 
 	// --- Data sync (leader→follower) ---
 	a.wireDataPlane()
+	if storageLocal {
+		a.gcImpl.SetStorageMutationGuard(func(c context.Context, kbID string) (context.Context, func(), error) {
+			if snap, ok := storage.Bound(c, kbID); ok {
+				return storage.EnterMutation(c, executionGate, snap)
+			}
+			snap, err := rn.(storage.Reader).GetKBPlacement(c, kbID)
+			if err != nil {
+				if errors.Is(err, stratumerrors.ErrKnowledgeBaseDeleted) {
+					return storage.EnterCleanup(c, executionGate, rn.(storage.Reader), cfg.NodeID, kbID)
+				}
+				return c, func() {}, err
+			}
+			if !snap.Placement.Contains(cfg.NodeID) {
+				return c, func() {}, stratumerrors.ErrNotKBReplica
+			}
+			return storage.EnterMutation(storage.Bind(c, snap), executionGate, snap)
+		})
+	}
 	requiredReplicaIDs = a.topology.requiredReplicaIDs
 
 	// --- WAL crash recovery ---
 	epochDurable := a.recoverStartup(records)
 
+	// Volatile service authorization starts closed after local crash recovery.
+	// No client or peer data RPC is admitted before a quorum grant and directory
+	// reconciliation; subsequent local DATA mutations use the same gate.
+	var serviceLease *storage.ServiceLease
+	if storageLocal {
+		serviceLease = storage.NewServiceLease(cfg.NodeID, a.topology.localAddr)
+		executionGate.SetServiceLease(serviceLease)
+		a.gcImpl.SetServiceLease(serviceLease)
+		indexMgr.SetServiceLease(serviceLease)
+		defer serviceLease.Pause()
+		go (&stratumsync.ServiceRenewer{NodeID: cfg.NodeID, Address: a.topology.localAddr, Gate: serviceLease, ResolveLeader: a.topology.resolveControlLeader(rn), Directory: func(c context.Context) (storage.Directory, error) {
+			return rn.(storage.NodeDirectoryReader).GetNodeStorageDirectory(c, cfg.NodeID)
+		}, Logger: logger.Named("authorization")}).Run(ctx)
+	}
+
+	// One counter set for the process: the gRPC server increments it and the
+	// metrics endpoint registers it. Two instances would make /metrics report
+	// zeros for traffic the server did count.
+	rpcMetrics := service.NewRPCMetrics()
+
 	grpcServer, lis, err := startGRPCServer(grpcDeps{
-		cfg: cfg, logger: logger, mark: mark,
+		migrationStagingDir: filepath.Join(dataDir, "migration-staging"),
+		serviceLease:        serviceLease,
+		rpcMetrics:          rpcMetrics,
+		cfg:                 cfg, logger: logger, mark: mark,
 		rn: rn, raftNode: raftNode, storageLocal: storageLocal,
 		writeCoord: a.writeCoord, deleteCoord: a.deleteCoord, deleteVersionCoord: a.deleteVersionCoord,
 		indexMgr: indexMgr, cdm: cdm, vd: vd, ds: ds, vBloomStore: vBloomStore,
@@ -307,7 +361,7 @@ func main() {
 	// --- Signal handling ---
 	startShutdownWatcher(shutdownDeps{
 		cfg: cfg, logger: logger, nodeState: nodeState, grpcServer: grpcServer,
-		indexMgr: indexMgr, chunkStore: chunkStore,
+		indexMgr: indexMgr, chunkStore: chunkStore, rpcMetrics: rpcMetrics,
 	})
 
 	chainTails := newLagCatchup(lagCatchupDeps{
@@ -345,7 +399,7 @@ func main() {
 
 	logger.Info("Stratum gRPC server listening", zap.String("addr", cfg.GRPCAddr))
 
-	// docs/storage-node-state-machine-plan.md §3.1: reconciliation is done and
+	// docs/已实施/storage-node-state-machine-plan.md §3.1: reconciliation is done and
 	// the listener is accepting, so the node is SERVING. It is the last phase
 	// transition of startup and the one an operator's status call should see for
 	// the life of the process.
@@ -438,7 +492,7 @@ func (r replicaPusher) PushVersion(ctx context.Context, targetAddr, kbID string,
 // reportIndexStatus maps an index build outcome onto the ControlPlane
 // contract: a finished build reports the index ready, a failed one reports a
 // failure on the INDEX side, which is where a build's retry budget and its
-// terminal verdict live (Stratum_设计文档v13.md §10.1, §10.1b).
+// terminal verdict live (docs/参考/历史/Stratum_设计文档v13.md §10.1, §10.1b).
 //
 // It deliberately no longer goes through the storage layer's availability
 // channel (plane.ControlPlane had a ReportAvailability method, now removed):
@@ -612,10 +666,10 @@ func runCrashRecovery(
 // durable set is reported up so the control layer promotes versions whose
 // READY proposal was lost (ControlPlane.ReportEpoch). Before stage ① this
 // function walked local disks and proposed status itself — see
-// control-data-separation-design.md §5.3/§7 and the decision table at the
+// docs/已实施/control-data-separation-design.md §5.3/§7 and the decision table at the
 // call site.
 // projectNodeState rebuilds the version layer from disk facts at startup
-// (docs/storage-node-state-machine-plan.md §5.1).
+// (docs/已实施/storage-node-state-machine-plan.md §5.1).
 //
 // Both inputs are facts this process has already established by the time it is
 // called: the reconciled durable set (an artifact is on disk) and the recovered
@@ -727,7 +781,7 @@ func reconcileIndexStatus(ctx context.Context, logger *zap.Logger, dp *plane.Loc
 //     56 seconds, with "Stratum gRPC server listening" landing 0.4 ms after the
 //     last one. Every version then sat at DATA_STATUS_PENDING, which in turn made
 //     cursor recovery overclaim a node's position — see
-//     docs/active-lag-detection-design.md.
+//     docs/已实施/active-lag-detection-design.md.
 func reportEpoch(ctx context.Context, logger *zap.Logger, dp *plane.LocalDataPlane, cp plane.ControlPlane, durable []plane.VersionRef) int {
 	// §7.9: the payload keeps the two sides separate — a scalar cursor per KB for
 	// the data side (linearization makes a scalar sufficient), an explicit version
@@ -853,7 +907,7 @@ func verifyVersionPull(ctx context.Context, rn raft.RaftNode, vd versiondoc.Vers
 }
 
 // NodeRole selects which half of Stratum a process runs
-// (Stratum_设计文档v13.md §7.0 的 v1 演进阶段 2、§11 阶段 ④「存储集群独立进程」).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.0 的 v1 演进阶段 2、§11 阶段 ④「存储集群独立进程」).
 type NodeRole string
 
 const (
@@ -909,7 +963,7 @@ type appConfig struct {
 
 	// RequireAuthenticated makes this node accept client-facing calls
 	// (KnowledgeBaseService / QueryService / AdminService) only when they carry
-	// the service station's trust mark (Stratum_设计文档v13.md §9.3(5)).
+	// the service station's trust mark (docs/参考/历史/Stratum_设计文档v13.md §9.3(5)).
 	//
 	// Off by default because a deployment without a station must keep working.
 	// It is the setting to turn ON wherever a station sits in front of the
@@ -920,7 +974,7 @@ type appConfig struct {
 	// A configured StationSecret switches the default to true: a node that has
 	// the station's shared key is, by that fact, part of a deployment with a
 	// station in front of it, which is exactly the condition the gate exists for
-	// (H4 of docs/code-review-2026-09-24.md). Setting `require_authenticated:
+	// (H4 of docs/参考/code-review-2026-09-24.md). Setting `require_authenticated:
 	// false` explicitly still wins — some deployments front a node with only
 	// proxy-level access control and do not want a second gate.
 	//
@@ -945,7 +999,7 @@ type appConfig struct {
 	// failure an operator with a half-configured deployment should get.
 	StationSecret string
 
-	// StorageNodes is the storage group (Stratum_设计文档v13.md §11 阶段 ④).
+	// StorageNodes is the storage group (docs/参考/历史/Stratum_设计文档v13.md §11 阶段 ④).
 	//
 	// On a control node it is the replica topology a committed write is
 	// dispatched to and a built index is distributed across. On a storage node
@@ -974,7 +1028,7 @@ type appConfig struct {
 
 	// ControlPlaneFailureBudget is the global default for how many failed
 	// attempts a version tolerates before the control layer declares it
-	// FAILED_PERMANENT (Stratum_设计文档v13.md §10.1), from
+	// FAILED_PERMANENT (docs/参考/历史/Stratum_设计文档v13.md §10.1), from
 	// control_plane.failure_budget. Zero or negative keeps
 	// plane.DefaultFailureBudget.
 	//
@@ -1031,7 +1085,7 @@ type appConfig struct {
 	// IndexBuildAbandonTimeout is how long a half-built index artifact may sit
 	// on disk before the sweeper reclaims it
 	// (index_manager.build_abandon_timeout_ms; §6 of
-	// coordinator-selection-and-node-liveness-design.md).
+	// docs/已实施/coordinator-selection-and-node-liveness-design.md).
 	//
 	// Semantics deliberately invert those of the cold threshold: reclaiming an
 	// artifact that no one sealed is pure hygiene with no behavioural risk, so it
@@ -1055,7 +1109,7 @@ type appConfig struct {
 	// decision: with both at the same value §8.6(c) rebuilds exactly when §8.6(d)
 	// starts caring, so (d) never observes a candidate. Exposing the knob is what
 	// lets a deployment separate them without a code change; the value itself waits
-	// for deployment data (docs/known-gaps.md §G).
+	// for deployment data (docs/未实施/known-gaps.md §G).
 	IndexGCRatioThreshold float64
 
 	// IndexMaxCodebookDriftRatio / IndexMaxCodebookAppends are §3's two triggers
@@ -1083,7 +1137,7 @@ type appConfig struct {
 	IndexGCEnabled bool
 
 	// ReconcileDeletedVersions reclaims this node's leftovers of DELETED versions
-	// (reconcile.deleted_versions) — the half of docs/known-gaps.md §B that the
+	// (reconcile.deleted_versions) — the half of docs/未实施/known-gaps.md §B that the
 	// control layer's current state makes safe to act on. The scan always runs and
 	// REPORTS; this decides whether the bytes are reclaimed.
 	//
@@ -1152,7 +1206,7 @@ type appConfig struct {
 
 	// LagCatchup configures the background catch-up that turns the chain tail the
 	// control leader reports into an occasional recovery
-	// (lag_catchup.*, docs/active-lag-detection-design.md). There is no switch: a
+	// (lag_catchup.*, docs/已实施/active-lag-detection-design.md). There is no switch: a
 	// replica that is behind and stays behind is one nothing routes to, so catching up
 	// is ordinary behaviour rather than an operator's opt-in.
 	//
@@ -1416,7 +1470,7 @@ type fileConfig struct {
 	// pass separately, since they are different decisions about one irreversible action.
 	Reconcile struct {
 		// DeletedVersions reclaims local leftovers of deleted versions at start-up
-		// (docs/known-gaps.md §B). The scan itself always runs and reports; this
+		// (docs/未实施/known-gaps.md §B). The scan itself always runs and reports; this
 		// only decides whether the bytes are reclaimed. On by default — see the
 		// appConfig field comment for why this one differs from the other
 		// irreversibility switches.
@@ -1583,7 +1637,7 @@ type fileConfig struct {
 	} `yaml:"gc"`
 
 	// LagCatchup is the background catch-up described in
-	// docs/active-lag-detection-design.md: the node reads the chain tail the control
+	// docs/已实施/active-lag-detection-design.md: the node reads the chain tail the control
 	// leader carries back on its cursor report and catches up when it is behind.
 	LagCatchup struct {
 		MinLagVersions   int `yaml:"min_lag_versions"`
@@ -2138,7 +2192,7 @@ type versionWriteDispatcher interface {
 
 // dispatchCommittedVersion is the §7.13.2 hand-off, extracted from the apply
 // callback so the case Step 0 is about can be tested without a live cluster
-// (docs/await-version-plan.md §4.3, §7 Step 0).
+// (docs/已实施/await-version-plan.md §4.3, §7 Step 0).
 //
 // The changes live in THIS process's memory — the Raft command deliberately
 // carries none (§7.7) — so a missing TakePendingDispatch means one of two

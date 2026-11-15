@@ -19,6 +19,7 @@ import (
 	"stratum/internal/nodestate"
 	"stratum/internal/plane"
 	"stratum/internal/raft"
+	"stratum/internal/storage"
 	stratumsync "stratum/internal/sync"
 	"stratum/internal/tombstone"
 	"stratum/internal/versiondoc"
@@ -32,9 +33,11 @@ import (
 // halves of this — a control node takes the control services, a storage node
 // takes the storage ones, and a node playing both takes everything.
 type grpcDeps struct {
-	cfg    appConfig
-	logger *zap.Logger
-	mark   *authmeta.Signer
+	migrationStagingDir string
+	serviceLease        *storage.ServiceLease
+	cfg                 appConfig
+	logger              *zap.Logger
+	mark                *authmeta.Signer
 
 	// The metadata channel and the local half's flag.
 	rn           raft.RaftNode
@@ -68,6 +71,19 @@ type grpcDeps struct {
 
 	// resolveReplicaAddrs answers "who else holds this" for the presence probe.
 	resolveReplicaAddrs func(context.Context) ([]string, error)
+
+	// rpcMetrics counts what this server handles. Nil is the normal state for a
+	// node started without a metrics endpoint, and every method on it is nil-safe.
+	rpcMetrics *service.RPCMetrics
+}
+
+// migrationServingSurface keeps a nil index manager out of the interface: a typed
+// nil would satisfy the interface and panic on first use.
+func migrationServingSurface(m *index.IndexManagerImpl) stratumsync.MigrationServing {
+	if m == nil {
+		return nil
+	}
+	return m
 }
 
 // startGRPCServer builds the gRPC server and binds it. The caller owns Serve.
@@ -105,11 +121,20 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 	grpcServer := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			service.RecoveryUnary(logger.Sugar().Errorf),
+			// Behind recovery (so it never sees a panic) and in front of the
+			// gates (so a refused call is counted too): the point of the series
+			// is control-side traffic per method, and a rejected call is traffic
+			// the node did handle.
+			d.rpcMetrics.UnaryInterceptor(),
 			service.UnaryAuthGate(cfg.RequireAuthenticated, mark),
+			service.UnaryStorageServiceLease(d.serviceLease),
+			service.UnaryStoragePlacement(rn.(storage.Reader).GetKBPlacement, cfg.NodeID),
 		),
 		grpc.ChainStreamInterceptor(
 			service.RecoveryStream(logger.Sugar().Errorf),
+			d.rpcMetrics.StreamInterceptor(),
 			service.StreamAuthGate(cfg.RequireAuthenticated, mark),
+			service.StreamStorageServiceLease(d.serviceLease),
 		),
 	)
 
@@ -127,9 +152,17 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 		}
 		return addrs
 	}
+	kbReplicaAddrs := func(ctx context.Context, kbID string) ([]string, error) {
+		snap, err := rn.(storage.Reader).GetKBPlacement(ctx, kbID)
+		if err != nil {
+			return nil, err
+		}
+		return snap.Addresses(0), nil
+	}
 
 	if raftNode != nil {
 		kbSvc := service.NewKnowledgeBaseService(rn, writeCoord, deleteCoord, deleteVersionCoord)
+		kbSvc.SetKBReplicaResolver(kbReplicaAddrs)
 		// §4.3: whether a write can still reach quorum, judged from the storage nodes'
 		// heartbeats, so a doomed write is refused before the version number,
 		// the Raft entry and the retry budget are spent on it. An unreadable
@@ -144,7 +177,7 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 		// The await path's data_missing probe asks the same two questions
 		// AdminService's status view asks — "which nodes may hold this version"
 		// and "does any of them actually have it" — so it is wired from the same
-		// sources (docs/await-version-plan.md §6.4). A control node holds no
+		// sources (docs/已实施/await-version-plan.md §6.4). A control node holds no
 		// chunks itself, which is precisely why this probe goes over the network,
 		// and an unreachable replica counts as unknown rather than missing.
 		kbSvc.SetPresenceProbe(stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{}), replicaAddrsForProbe)
@@ -156,7 +189,7 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 		pb.RegisterKnowledgeBaseServiceServer(grpcServer, kbSvc)
 	}
 
-	// Data-missing detection (Stratum_设计文档v13.md §7.12): the control layer
+	// Data-missing detection (docs/参考/历史/Stratum_设计文档v13.md §7.12): the control layer
 	// asks every candidate replica whether it holds a version whose data may
 	// never have landed, and surfaces the ones nobody has.
 	// These read the local stores by construction, so only a node holding data
@@ -179,7 +212,7 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 		// this a replica that missed a version's data can never fetch it, because
 		// the only path that triggers a pull is the query being refused.
 		querySvc.SetBackfiller(dataPlane)
-		// docs/index-owner-sharding-plan.md §4.2: a node that has been asked for a
+		// docs/已实施/index-owner-sharding-plan.md §4.2: a node that has been asked for a
 		// version first asks the peers for the artifact and only builds if nobody
 		// has one. The router decides which node is asked (§5), so this is reached
 		// on the versions a caller actually wants.
@@ -193,6 +226,7 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 			replicaAddrsForProbe,
 			presenceChecker,
 		)
+		adminSvc.SetKBReplicaResolver(kbReplicaAddrs)
 		// §8.6(d): surface versions whose dead weight cannot be collected because
 		// too few replicas would remain serving. Nothing else clears that — the
 		// remedy is a larger replica count — so it goes out with the other
@@ -213,7 +247,7 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 		// §7.5: "which replica kept this knowledge base's reclaim watermark unavailable" —
 		// the state that otherwise stops WAL reclamation silently.
 		adminSvc.SetReclaimDiagnosticsSource(reclaimDiagnosticsSource{dataPlane})
-		// docs/storage-node-state-machine-plan.md §6: surface this node's own
+		// docs/已实施/storage-node-state-machine-plan.md §6: surface this node's own
 		// phase and its not-at-rest versions through the existing admin entry
 		// points. Inside this branch the machine always exists — the typed-nil
 		// guard is here so a later move of this line cannot quietly turn into a
@@ -235,11 +269,19 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 
 	// One data-plane service per node: it both exports versions to peers (the
 	// pull path) and receives pushed ones, and answers presence/cursor
-	// queries (Stratum_设计文档v13.md §7.2/§7.6).
+	// queries (docs/参考/历史/Stratum_设计文档v13.md §7.2/§7.6).
 	nodeHandler := stratumsync.NewNodeHandler(
 		syncLeader,
 		stratumsync.NewPushHandler(syncFollower, cfg.NodeID,
-			// docs/index-owner-sharding-plan.md §5.2: only the version's owner HEAD
+			stratumsync.WithExecutionGate(dataPlane.ExecutionGate(), rn.(storage.Reader)),
+			stratumsync.WithStoragePlacement(rn.(storage.Reader).GetKBPlacement),
+			// A migration target's serving step needs the index surface: it rebuilds
+			// the local document filters, advances the data cursor and waits for the
+			// active version's artifact before the task can be activated. A node
+			// without an index manager passes no surface at all, so the step refuses
+			// instead of reporting readiness it cannot check.
+			stratumsync.WithMigrationServing(migrationServingSurface(indexMgr)),
+			// docs/已实施/index-owner-sharding-plan.md §5.2: only the version's owner HEAD
 			// builds, so a push landing here does not start a build on every replica
 			// (the measured baseline was N builds per version, with §8.4's
 			// distribution never sending a byte). An empty member set — a single-node
@@ -269,7 +311,7 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 			// The gate clears it on each leadership term, so a new leader never judges from
 			// heartbeats it never received.
 			stratumsync.WithHeartbeatRecorder(livenessRegistry, livenessGate.IsLeader),
-			// docs/active-lag-detection-design.md: the leader is the only one that knows
+			// docs/已实施/active-lag-detection-design.md: the leader is the only one that knows
 			// where the chain ends, and the node is the one that must decide whether it has
 			// fallen behind. A heartbeat's response says when the tails moved, and
 			// GetChainTails serves them.
@@ -278,24 +320,30 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 			// deleted is drained and refused here rather than written, so a late push
 			// cannot re-land data whose metadata is gone. nil on a node with no table.
 			tombstoneOption(versionTombstones)),
-		// docs/index-owner-sharding-plan.md §7: the export half of the fetch.
+		// docs/已实施/index-owner-sharding-plan.md §7: the export half of the fetch.
 		// Without it a peer asking this node for an artifact gets "this node does
 		// not export index artifacts", every fetch fails, and every node falls
 		// back to building — the cost the sharding exists to remove, silently
 		// restored. Measured on the 3+3 cluster: 34 builds for 10 versions with
 		// this missing, against 10 with it wired.
 		stratumsync.WithNodeIndexReader(indexMgr),
+		stratumsync.WithMigrationStaging(rn.(stratumsync.MigrationMetadata), d.migrationStagingDir),
+		stratumsync.WithMigrationCleanup(coordinator.LocalKBDropper{IndexManager: indexMgr, DocStore: ds, ChunkStore: chunkStore, ChunkDocMapper: cdm, VersionDocList: vd, VersionBloom: vBloomStore}),
 		// §8.4(a) survives the push direction: this is the serving side's gate,
 		// and with distribution pull-only it is the only one left.
 		stratumsync.WithMaxConcurrentIndexFetch(cfg.IndexFetchConcurrency),
 	)
 	pb.RegisterDataSyncServiceServer(grpcServer, nodeHandler)
+	pb.RegisterStorageAdminServiceServer(grpcServer, service.NewStorageAdminService(rn))
 
 	// The internal service is how a peer forwards a proposal to this node —
 	// which only a node holding a log can serve, so a storage node leaves it
 	// unregistered rather than being asked to append to a log it does not have.
 	if raftNode != nil {
-		pb.RegisterInternalServiceServer(grpcServer, raft.NewInternalServiceServer(raftNode))
+		pb.RegisterInternalServiceServer(grpcServer, raft.NewInternalServiceServer(raftNode, func(kbID string) storage.Health {
+			state, detail, known := controlPlane.StorageDegradation(kbID)
+			return storage.Health{Known: known, Degraded: state == plane.StorageDegraded, Unavailable: state == plane.StorageUnavailable, Detail: detail}
+		}))
 	}
 
 	lis, err := net.Listen("tcp", cfg.GRPCAddr)

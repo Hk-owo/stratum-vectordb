@@ -5,7 +5,7 @@
 // node needs to report do not always originate there. A storage replica that
 // finished writing a version, or any node running its startup reconcile, has
 // something to say regardless of where it landed
-// (Stratum_设计文档v13.md §7.3/§7.8).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.3/§7.8).
 //
 // Propose is the single funnel for that: the caller hands over the encoded
 // command, and the receiving node runs it through Raft (it is the leader).
@@ -16,6 +16,13 @@ package stratum;
 option go_package = "stratum/api/proto/stratum";
 
 service InternalService {
+ rpc GetStorageMaintenance(GetStorageDirectoryRequest) returns (GetStorageDirectoryResponse);
+ rpc GetKBMigrationTransfer(GetKBMigrationTransferRequest) returns (GetKBMigrationTransferResponse);
+  rpc RenewStorageService(RenewStorageServiceRequest) returns (RenewStorageServiceResponse);
+  // Explicit directory reads; never included in the periodic heartbeat.
+  // Empty KB id returns the management snapshot. A KB id narrows the response
+  // to that placement and its node addresses, with distinct unknown/deleted errors.
+  rpc GetStorageDirectory(GetStorageDirectoryRequest) returns (GetStorageDirectoryResponse);
   // Propose runs one command through Raft on the caller's behalf. The
   // receiving node must be the leader; a node that is not answers with a
   // redirect instead of forwarding again, so a forward never chains.
@@ -34,7 +41,7 @@ service InternalService {
   //
   // Neither fact has a lifetime, and that is what replaced the removal records this RPC
   // took the place of: a removal record is history that pruning could drop
-  // (docs/known-gaps.md §B), while these are properties of the current state — nothing to
+  // (docs/未实施/known-gaps.md §B), while these are properties of the current state — nothing to
   // keep, nothing to prune, and no window in which the evidence can disappear. A storage
   // node has no state machine of its own, so this is how it judges its own leftovers.
   //
@@ -63,6 +70,69 @@ service InternalService {
   // consumer that sees a different epoch must void its watermark rather than read the
   // difference as "I am ahead".
   rpc DeletionsSince(DeletionsSinceRequest) returns (DeletionsSinceResponse);
+}
+
+message GetStorageDirectoryRequest {
+ int64 node_id = 2;
+  string knowledge_base_id = 1;
+}
+
+message StorageNodeEntry {
+  int64 node_id = 1;
+  string address = 2;
+  string management_state = 3;
+}
+
+message KBPlacementEntry {
+  string knowledge_base_id = 1;
+  uint64 placement_epoch = 2;
+  repeated int64 replica_ids = 3;
+  int32 required_replicas = 4;
+  string operation_id = 5;
+}
+
+message KBStorageTombstone {
+  string knowledge_base_id = 1;
+  uint64 deletion_epoch = 2;
+  repeated int64 cleanup_node_ids = 3;
+}
+
+message GetStorageDirectoryResponse {
+  uint64 revision = 1;
+  repeated StorageNodeEntry nodes = 2;
+  repeated KBPlacementEntry placements = 3;
+  repeated KBStorageTombstone tombstones = 4;
+  // Read atomically with placement and node addresses, never from another RPC.
+  map<string, int64> active_versions = 5;
+  // Advisory observations, omitted/unknown after a leader change.
+  map<string, KBStorageHealth> health = 6;
+  repeated KBMigrationEntry migrations = 7;
+ map<int64, StorageServiceBlock> service_blocks = 8;
+ repeated StorageCleanupEntry cleanups = 9;
+}
+
+message KBMigrationEntry {
+  string operation_id = 1;
+  string knowledge_base_id = 2;
+  uint64 expected_epoch = 3;
+  int64 from_node_id = 4;
+  int64 to_node_id = 5;
+  KBPlacementEntry old_placement = 6;
+  repeated int64 new_replica_ids = 7;
+  string phase = 8;
+  repeated int64 fenced_node_ids = 9;
+ bool fault = 10;
+ StorageServiceBlock failed_block = 11;
+ MigrationStageEntry stage = 12;
+ MigrationInstallEntry install = 13;
+ MigrationServeEntry serve = 14;
+}
+
+message KBStorageHealth {
+  bool known = 1;
+  bool degraded = 2;
+  bool unavailable = 3;
+  string detail = 4;
 }
 
 message DeletionsSinceRequest {
@@ -129,3 +199,18 @@ message ProposeResponse {
   // caller who to ask instead of forwarding the proposal onwards.
   int64 leader_id = 5;
 }
+
+message StorageServiceBlock { string operation_id = 1; uint64 revision = 2; bool revoked = 3; }
+message RenewStorageServiceRequest { int64 node_id = 1; string address = 2; string request_id = 3; }
+message RenewStorageServiceResponse { int64 duration_ms = 1; uint64 directory_revision = 2; string request_id = 3; }
+
+message MigrationStageEntry { int64 source_node_id = 1; int64 target_node_id = 2; string manifest_sha256 = 3; string payload_sha256 = 4; uint64 entry_count = 5; uint64 byte_count = 6; }
+// The target's proof that it wrote the staged artifact into its own stores.
+message MigrationInstallEntry { int64 source_node_id = 1; int64 target_node_id = 2; string manifest_sha256 = 3; string stage_sha256 = 4; uint64 version_count = 5; uint64 document_count = 6; uint64 chunk_count = 7; }
+// Local serving evidence. Deliberately separate from the DATA install receipt.
+message MigrationServeEntry { int64 target_node_id = 1; string manifest_sha256 = 2; int64 active_version = 3; int64 cursor_version = 4; uint64 bloom_version_count = 5; bool index_ready = 6; }
+
+message GetKBMigrationTransferRequest { string operation_id = 1; }
+message GetKBMigrationTransferResponse { GetStorageDirectoryResponse directory = 1; bytes manifest = 2; }
+
+message StorageCleanupEntry { string id = 1; string knowledge_base_id = 2; string operation_id = 3; int64 node_id = 4; uint64 epoch = 5; bool artifacts_only = 6; bool done = 7; }

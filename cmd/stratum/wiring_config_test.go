@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -20,6 +21,11 @@ import (
 	"testing"
 
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
+
+	pb "stratum/api/proto/stratum"
+	"stratum/service"
 )
 
 func writeConfigFile(t *testing.T, content string) string {
@@ -154,5 +160,57 @@ func TestMetricsEndpoint_OmitsWhatTheNodeCannotAnswer(t *testing.T) {
 	}
 	if !strings.Contains(text, "go_goroutines") {
 		t.Error("the standard collectors must still be served")
+	}
+}
+
+// TestMetricsEndpoint_ReportsRPCTrafficSeries: the node always installs the
+// counting interceptor, but the counters only reach a scrape if the same
+// instance is registered here. Two instances, or none, read as "no traffic" —
+// which is the failure mode a performance measurement would never notice.
+func TestMetricsEndpoint_ReportsRPCTrafficSeries(t *testing.T) {
+	metrics := service.NewRPCMetrics()
+	// One completed call, so the counter vector has a series to report: an empty
+	// *Vec exports nothing at all, which would make "registered" and "not
+	// registered" indistinguishable from a scrape.
+	//
+	// The messages are REAL generated protobufs. A local stand-in with its own
+	// Size() method is what hid a live defect: protobuf-go ≥ 1.27 generates no
+	// Size(), so the interceptor's assertion matched only the test's fake type and
+	// every production message contributed 0 bytes (see
+	// docs/实施中/storage-topology-plan.md §25.4).
+	queryReq := &pb.QueryRequest{KnowledgeBaseId: "kb-1", TopK: 3}
+	queryResp := &pb.QueryResponse{VersionId: 4}
+	info := &grpc.UnaryServerInfo{FullMethod: "/stratum.QueryService/Query"}
+	handler := func(ctx context.Context, r any) (any, error) { return queryResp, nil }
+	if _, err := metrics.UnaryInterceptor()(context.Background(), queryReq, info, handler); err != nil {
+		t.Fatalf("interceptor: %v", err)
+	}
+	src := nodeMetricsSource{RPCMetrics: metrics}
+	srv, err := startMetricsServer("127.0.0.1:0", zap.NewNop(), src)
+	if err != nil {
+		t.Fatalf("startMetricsServer: %v", err)
+	}
+	defer func() { _ = srv.Shutdown(context.Background()) }()
+
+	resp, err := http.Get("http://" + srv.Addr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	text := string(body)
+	for _, want := range []string{
+		`stratum_grpc_requests_total{code="OK",method="Query",service="QueryService"} 1`,
+		fmt.Sprintf(`stratum_grpc_request_bytes_total{method="Query",service="QueryService"} %d`, proto.Size(queryReq)),
+		fmt.Sprintf(`stratum_grpc_response_bytes_total{method="Query",service="QueryService"} %d`, proto.Size(queryResp)),
+		`stratum_grpc_duration_seconds_count{method="Query",service="QueryService"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("/metrics does not carry %q", want)
+		}
 	}
 }

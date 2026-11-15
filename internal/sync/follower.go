@@ -16,6 +16,7 @@ import (
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/storage"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
 )
@@ -25,11 +26,14 @@ import (
 // applies each SyncEntry to the local stores, and then triggers an
 // HNSW index build via IndexManager.
 type Follower struct {
-	docStore     docstore.DocStore
-	chunkDoc     chunkdoc.ChunkDocMapper
-	versionDoc   versiondoc.VersionDocList
-	chunkStore   chunkstore.ChunkStore
-	indexManager IndexBuildTrigger
+	executionGate *storage.ExecutionGate
+	placements    storage.Resolver
+	nodeID        int64
+	docStore      docstore.DocStore
+	chunkDoc      chunkdoc.ChunkDocMapper
+	versionDoc    versiondoc.VersionDocList
+	chunkStore    chunkstore.ChunkStore
+	indexManager  IndexBuildTrigger
 
 	// advanceVersion records that this node now holds a version contiguously,
 	// once a pull has written its records. Optional, but without it a replica
@@ -63,6 +67,19 @@ type Follower struct {
 	// Optional: without it a pull of such a version writes it back and the reverse
 	// reconciliation finds it later.
 	tombstones VersionTombstoneReader
+}
+
+func (f *Follower) SetStoragePlacement(resolver storage.Resolver, nodeID int64) {
+	f.placements, f.nodeID = resolver, nodeID
+}
+
+func (f *Follower) SetExecutionGate(gate *storage.ExecutionGate) { f.executionGate = gate }
+
+func (f *Follower) flushReceivedData(ctx context.Context) error {
+	if f.chunkStore == nil {
+		return nil
+	}
+	return f.chunkStore.FlushWAL(ctx)
 }
 
 // SetVersionTombstones wires this node's record of deleted versions.
@@ -128,7 +145,7 @@ func (f *Follower) SetVersionBloom(b VersionBloomStore) {
 }
 
 // VersionDocIDSetHash answers the document-set digest the writer committed for a version
-// (Stratum_设计文档v13.md §7.12). Declared here because it is the one fact the sync paths need
+// (docs/参考/历史/Stratum_设计文档v13.md §7.12). Declared here because it is the one fact the sync paths need
 // from the replicated metadata: an empty receive is only a version with no documents if
 // the writer said so.
 //
@@ -160,6 +177,23 @@ func (f *Follower) rebuildVersionBloom(ctx context.Context, kbID string, version
 	if _, err := f.versionBloom.BuildAndPersist(kbID, versionID, docIDs); err != nil {
 		_ = err // non-fatal; the next transfer or the query path rebuilds it
 	}
+}
+
+// rebuildVersionBloomStrict is rebuildVersionBloom for a caller that must know the
+// filter is really rebuilt: a migration target claiming it can serve without its
+// document filter would answer "nothing matched" for a version it holds in full.
+func (f *Follower) rebuildVersionBloomStrict(ctx context.Context, kbID string, versionID int64) error {
+	if f.versionBloom == nil || f.versionDoc == nil {
+		return stratumerrors.ErrPlacementChangeUnsafe
+	}
+	docIDs, err := f.versionDoc.ListDocIDs(ctx, kbID, versionID)
+	if err != nil {
+		return err
+	}
+	if _, err := f.versionBloom.BuildAndPersist(kbID, versionID, docIDs); err != nil {
+		return err
+	}
+	return nil
 }
 
 // markVersionContiguous moves the cursor if an advancer is wired.
@@ -249,6 +283,27 @@ func NewFollower(
 // version's data reaches, so building here meant every replica built every
 // version, which is the cost lazy construction exists to remove.
 func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID string, versionID int64) error {
+	var guardErr error
+	ctx, guardErr = bindStoragePlacement(ctx, f.placements, f.nodeID, kbID)
+	if guardErr != nil {
+		return guardErr
+	}
+	if snap, ok := storage.Bound(ctx, kbID); ok {
+		var release func()
+		ctx, release, guardErr = storage.EnterMutation(ctx, f.executionGate, snap)
+		if guardErr != nil {
+			return guardErr
+		}
+		defer release()
+	} else if f.executionGate != nil {
+		return stratumerrors.ErrPlacementUnknown
+	}
+	if f.placements != nil {
+		snap, _ := storage.Bound(ctx, kbID)
+		if !snap.HasAddress(leaderAddr) {
+			return stratumerrors.ErrNotKBReplica
+		}
+	}
 	// Refused before the connection is made: this node was told the version is
 	// deleted, so pulling it would write data back that the deletion already
 	// reclaimed. The refusal is a RETURN VALUE rather than a silent success because
@@ -332,6 +387,9 @@ func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID 
 	}
 
 	// Every record is in the local stores, so this node holds the version —
+	if err := f.flushReceivedData(ctx); err != nil {
+		return err
+	}
 	// move the cursor now, before the build and before anything can ask about
 	// it. The cursor is what §9.3(2) reads, and a replica whose cursor never
 	// moves is refused as stale however complete its data is.

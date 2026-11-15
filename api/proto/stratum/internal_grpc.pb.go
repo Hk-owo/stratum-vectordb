@@ -5,7 +5,7 @@
 // node needs to report do not always originate there. A storage replica that
 // finished writing a version, or any node running its startup reconcile, has
 // something to say regardless of where it landed
-// (Stratum_设计文档v13.md §7.3/§7.8).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.3/§7.8).
 //
 // Propose is the single funnel for that: the caller hands over the encoded
 // command, and the receiving node runs it through Raft (it is the leader).
@@ -32,15 +32,26 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	InternalService_Propose_FullMethodName         = "/stratum.InternalService/Propose"
-	InternalService_VersionLiveness_FullMethodName = "/stratum.InternalService/VersionLiveness"
-	InternalService_DeletionsSince_FullMethodName  = "/stratum.InternalService/DeletionsSince"
+	InternalService_GetStorageMaintenance_FullMethodName  = "/stratum.InternalService/GetStorageMaintenance"
+	InternalService_GetKBMigrationTransfer_FullMethodName = "/stratum.InternalService/GetKBMigrationTransfer"
+	InternalService_RenewStorageService_FullMethodName    = "/stratum.InternalService/RenewStorageService"
+	InternalService_GetStorageDirectory_FullMethodName    = "/stratum.InternalService/GetStorageDirectory"
+	InternalService_Propose_FullMethodName                = "/stratum.InternalService/Propose"
+	InternalService_VersionLiveness_FullMethodName        = "/stratum.InternalService/VersionLiveness"
+	InternalService_DeletionsSince_FullMethodName         = "/stratum.InternalService/DeletionsSince"
 )
 
 // InternalServiceClient is the client API for InternalService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type InternalServiceClient interface {
+	GetStorageMaintenance(ctx context.Context, in *GetStorageDirectoryRequest, opts ...grpc.CallOption) (*GetStorageDirectoryResponse, error)
+	GetKBMigrationTransfer(ctx context.Context, in *GetKBMigrationTransferRequest, opts ...grpc.CallOption) (*GetKBMigrationTransferResponse, error)
+	RenewStorageService(ctx context.Context, in *RenewStorageServiceRequest, opts ...grpc.CallOption) (*RenewStorageServiceResponse, error)
+	// Explicit directory reads; never included in the periodic heartbeat.
+	// Empty KB id returns the management snapshot. A KB id narrows the response
+	// to that placement and its node addresses, with distinct unknown/deleted errors.
+	GetStorageDirectory(ctx context.Context, in *GetStorageDirectoryRequest, opts ...grpc.CallOption) (*GetStorageDirectoryResponse, error)
 	// Propose runs one command through Raft on the caller's behalf. The
 	// receiving node must be the leader; a node that is not answers with a
 	// redirect instead of forwarding again, so a forward never chains.
@@ -57,7 +68,7 @@ type InternalServiceClient interface {
 	//
 	// Neither fact has a lifetime, and that is what replaced the removal records this RPC
 	// took the place of: a removal record is history that pruning could drop
-	// (docs/known-gaps.md §B), while these are properties of the current state — nothing to
+	// (docs/未实施/known-gaps.md §B), while these are properties of the current state — nothing to
 	// keep, nothing to prune, and no window in which the evidence can disappear. A storage
 	// node has no state machine of its own, so this is how it judges its own leftovers.
 	//
@@ -95,6 +106,46 @@ func NewInternalServiceClient(cc grpc.ClientConnInterface) InternalServiceClient
 	return &internalServiceClient{cc}
 }
 
+func (c *internalServiceClient) GetStorageMaintenance(ctx context.Context, in *GetStorageDirectoryRequest, opts ...grpc.CallOption) (*GetStorageDirectoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetStorageDirectoryResponse)
+	err := c.cc.Invoke(ctx, InternalService_GetStorageMaintenance_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalServiceClient) GetKBMigrationTransfer(ctx context.Context, in *GetKBMigrationTransferRequest, opts ...grpc.CallOption) (*GetKBMigrationTransferResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetKBMigrationTransferResponse)
+	err := c.cc.Invoke(ctx, InternalService_GetKBMigrationTransfer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalServiceClient) RenewStorageService(ctx context.Context, in *RenewStorageServiceRequest, opts ...grpc.CallOption) (*RenewStorageServiceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RenewStorageServiceResponse)
+	err := c.cc.Invoke(ctx, InternalService_RenewStorageService_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalServiceClient) GetStorageDirectory(ctx context.Context, in *GetStorageDirectoryRequest, opts ...grpc.CallOption) (*GetStorageDirectoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetStorageDirectoryResponse)
+	err := c.cc.Invoke(ctx, InternalService_GetStorageDirectory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *internalServiceClient) Propose(ctx context.Context, in *ProposeRequest, opts ...grpc.CallOption) (*ProposeResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ProposeResponse)
@@ -129,6 +180,13 @@ func (c *internalServiceClient) DeletionsSince(ctx context.Context, in *Deletion
 // All implementations must embed UnimplementedInternalServiceServer
 // for forward compatibility.
 type InternalServiceServer interface {
+	GetStorageMaintenance(context.Context, *GetStorageDirectoryRequest) (*GetStorageDirectoryResponse, error)
+	GetKBMigrationTransfer(context.Context, *GetKBMigrationTransferRequest) (*GetKBMigrationTransferResponse, error)
+	RenewStorageService(context.Context, *RenewStorageServiceRequest) (*RenewStorageServiceResponse, error)
+	// Explicit directory reads; never included in the periodic heartbeat.
+	// Empty KB id returns the management snapshot. A KB id narrows the response
+	// to that placement and its node addresses, with distinct unknown/deleted errors.
+	GetStorageDirectory(context.Context, *GetStorageDirectoryRequest) (*GetStorageDirectoryResponse, error)
 	// Propose runs one command through Raft on the caller's behalf. The
 	// receiving node must be the leader; a node that is not answers with a
 	// redirect instead of forwarding again, so a forward never chains.
@@ -145,7 +203,7 @@ type InternalServiceServer interface {
 	//
 	// Neither fact has a lifetime, and that is what replaced the removal records this RPC
 	// took the place of: a removal record is history that pruning could drop
-	// (docs/known-gaps.md §B), while these are properties of the current state — nothing to
+	// (docs/未实施/known-gaps.md §B), while these are properties of the current state — nothing to
 	// keep, nothing to prune, and no window in which the evidence can disappear. A storage
 	// node has no state machine of its own, so this is how it judges its own leftovers.
 	//
@@ -183,6 +241,18 @@ type InternalServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedInternalServiceServer struct{}
 
+func (UnimplementedInternalServiceServer) GetStorageMaintenance(context.Context, *GetStorageDirectoryRequest) (*GetStorageDirectoryResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetStorageMaintenance not implemented")
+}
+func (UnimplementedInternalServiceServer) GetKBMigrationTransfer(context.Context, *GetKBMigrationTransferRequest) (*GetKBMigrationTransferResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetKBMigrationTransfer not implemented")
+}
+func (UnimplementedInternalServiceServer) RenewStorageService(context.Context, *RenewStorageServiceRequest) (*RenewStorageServiceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RenewStorageService not implemented")
+}
+func (UnimplementedInternalServiceServer) GetStorageDirectory(context.Context, *GetStorageDirectoryRequest) (*GetStorageDirectoryResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetStorageDirectory not implemented")
+}
 func (UnimplementedInternalServiceServer) Propose(context.Context, *ProposeRequest) (*ProposeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Propose not implemented")
 }
@@ -211,6 +281,78 @@ func RegisterInternalServiceServer(s grpc.ServiceRegistrar, srv InternalServiceS
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&InternalService_ServiceDesc, srv)
+}
+
+func _InternalService_GetStorageMaintenance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetStorageDirectoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServiceServer).GetStorageMaintenance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InternalService_GetStorageMaintenance_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServiceServer).GetStorageMaintenance(ctx, req.(*GetStorageDirectoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _InternalService_GetKBMigrationTransfer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetKBMigrationTransferRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServiceServer).GetKBMigrationTransfer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InternalService_GetKBMigrationTransfer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServiceServer).GetKBMigrationTransfer(ctx, req.(*GetKBMigrationTransferRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _InternalService_RenewStorageService_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewStorageServiceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServiceServer).RenewStorageService(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InternalService_RenewStorageService_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServiceServer).RenewStorageService(ctx, req.(*RenewStorageServiceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _InternalService_GetStorageDirectory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetStorageDirectoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServiceServer).GetStorageDirectory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InternalService_GetStorageDirectory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServiceServer).GetStorageDirectory(ctx, req.(*GetStorageDirectoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _InternalService_Propose_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -274,6 +416,22 @@ var InternalService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "stratum.InternalService",
 	HandlerType: (*InternalServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetStorageMaintenance",
+			Handler:    _InternalService_GetStorageMaintenance_Handler,
+		},
+		{
+			MethodName: "GetKBMigrationTransfer",
+			Handler:    _InternalService_GetKBMigrationTransfer_Handler,
+		},
+		{
+			MethodName: "RenewStorageService",
+			Handler:    _InternalService_RenewStorageService_Handler,
+		},
+		{
+			MethodName: "GetStorageDirectory",
+			Handler:    _InternalService_GetStorageDirectory_Handler,
+		},
 		{
 			MethodName: "Propose",
 			Handler:    _InternalService_Propose_Handler,

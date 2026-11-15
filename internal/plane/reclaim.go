@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"go.uber.org/zap"
+	"stratum/internal/storage"
 )
 
 // WALCompactor is the reclaim capability a WAL may expose: rewrite the log,
@@ -26,7 +27,7 @@ type WALKnowledgeBases interface {
 }
 
 // ReclaimChanges compacts the WAL, discarding the recorded changes of versions that
-// every replica already holds (Stratum_设计文档v13.md §7.5).
+// every replica already holds (docs/参考/历史/Stratum_设计文档v13.md §7.5).
 //
 // The judgement is made here, from the replicas' own answers: this node asks each one
 // how far its contiguous history reaches and takes the minimum, its own cursor included.
@@ -51,13 +52,7 @@ type WALKnowledgeBases interface {
 // wants to see; an empty map means nothing was reclaimed.
 func (d *LocalDataPlane) ReclaimChanges(ctx context.Context) (map[string]int64, error) {
 	compactor, ok := d.wal.(WALCompactor)
-	if !ok || d.cursorQuerier == nil || d.resolveReplicas == nil {
-		return nil, nil
-	}
-	peers, err := d.resolveReplicas(ctx)
-	if err != nil {
-		// An unreadable topology is "cannot prove safety", not a failed pass.
-		d.logger.Warn("plane: reclaim changes: resolve replicas", zap.Error(err))
+	if !ok || d.cursorQuerier == nil || !d.hasReplicaResolver() {
 		return nil, nil
 	}
 
@@ -67,6 +62,12 @@ func (d *LocalDataPlane) ReclaimChanges(ctx context.Context) (map[string]int64, 
 	}
 
 	keep := make(map[string]int64)
+	var releases []func()
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
 	blocked := make(map[string][]ReclaimBlocker)
 	// A peer that failed once this pass is not asked again until the next one, so a
 	// dead peer costs one timeout per pass rather than one per knowledge base.
@@ -75,7 +76,27 @@ func (d *LocalDataPlane) ReclaimChanges(ctx context.Context) (map[string]int64, 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		watermark, blockers := d.reclaimWatermark(ctx, kbID, peers, unreachable)
+		kbCtx, err := d.bindPlacement(ctx, kbID)
+		if err != nil {
+			continue
+		}
+		if snap, ok := storage.Bound(kbCtx, kbID); ok {
+			if snap.Migration != nil && snap.Migration.Active() {
+				continue
+			}
+			var release func()
+			kbCtx, release, err = storage.EnterMutation(kbCtx, d.executionGate, snap)
+			if err != nil {
+				continue
+			}
+			releases = append(releases, release)
+		}
+		peers, err := d.replicaPeers(kbCtx, kbID)
+		if err != nil {
+			d.logger.Warn("plane: reclaim changes: resolve replicas", zap.String("kb_id", kbID), zap.Error(err))
+			continue
+		}
+		watermark, blockers := d.reclaimWatermark(kbCtx, kbID, peers, unreachable)
 		if len(blockers) > 0 {
 			blocked[kbID] = blockers
 			continue

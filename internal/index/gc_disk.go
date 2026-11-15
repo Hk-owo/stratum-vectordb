@@ -16,7 +16,7 @@ import (
 )
 
 // StartAbandonSweeper reclaims index artifacts whose build was abandoned
-// (coordinator-selection-and-node-liveness-design.md §6).
+// (docs/已实施/coordinator-selection-and-node-liveness-design.md §6).
 //
 // The gap it closes: a build that dies or times out leaves a half-written
 // artifact behind, and nothing will ever come back for it. The control layer
@@ -143,7 +143,7 @@ func (im *IndexManagerImpl) sweepAbandonedArtifacts(now time.Time) {
 				// (see install.go's installFile). Those names matched none of the
 				// patterns here, so a process killed mid-fetch left one remainder per
 				// attempt — each a whole index's size — that nothing would ever delete
-				// (L5 of docs/code-review-2026-10-18.md). The payload is another node's
+				// (L5 of docs/参考/code-review-2026-10-18.md). The payload is another node's
 				// artifact, and an abandoned copy is as much a remainder as a Save's.
 				im.removeIfStale(dir, kb.Name(), e, now, timeout,
 					"an abandoned InstallIndex temporary")
@@ -263,17 +263,25 @@ func (im *IndexManagerImpl) DeleteFilesByKB(_ context.Context, kbID string) erro
 	dir := filepath.Join(im.cfg.IndexDataDir, "index", kbID)
 	// Every shard, because this removes a directory whose versions are not named
 	// here: a fetch reading one version's pair must not have the tree pulled out from
-	// under it (M8 of docs/code-review-2026-10-18.md).
+	// under it (M8 of docs/参考/code-review-2026-10-18.md).
 	return im.withAllInstallShards(func() error {
 		if err := os.RemoveAll(dir); err != nil {
 			return fmt.Errorf("index: DeleteFilesByKB(%s): %w", kbID, err)
 		}
-		return nil
+		parent, err := os.Open(filepath.Dir(dir))
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer parent.Close()
+		return parent.Sync()
 	})
 }
 
 // EnforceDiskRetention implements the per-KB on-disk retention policy
-// (Stratum_设计文档v10.md "磁盘保留策略"): keeps the most recent
+// (docs/参考/历史/Stratum_设计文档v10.md "磁盘保留策略"): keeps the most recent
 // IndexRetentionCount index files per knowledge base and deletes older
 // ones (plus their .ids / size sidecars). protectedIDs are never
 // deleted — used to shield the active version at startup. Missing files
@@ -283,7 +291,14 @@ func (im *IndexManagerImpl) DeleteFilesByKB(_ context.Context, kbID string) erro
 // Deleting an index file does not affect a loaded in-memory index; a
 // later query against an evicted, retention-dropped version reports
 // ErrIndexNotReady and can be recovered via RebuildIndex ("需要时重建").
-func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string, protectedIDs []int64) error {
+func (im *IndexManagerImpl) EnforceDiskRetention(ctx context.Context, kbID string, protectedIDs []int64) error {
+	guarded, release, guardErr := im.serviceLease.Load().Enter(ctx)
+	if guardErr != nil {
+		return guardErr
+	}
+	defer release()
+	ctx = guarded
+
 	if im.cfg.IndexRetentionCount <= 0 || im.cfg.IndexDataDir == "" {
 		return nil
 	}
@@ -394,7 +409,7 @@ func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string,
 	// retention shield above) is <versionID>.index.used.
 	for _, f := range files[:len(files)-im.cfg.IndexRetentionCount] {
 		// This version's shard: retention must not delete an artifact another node is
-		// in the middle of fetching (M8 of docs/code-review-2026-10-18.md). Taken per
+		// in the middle of fetching (M8 of docs/参考/code-review-2026-10-18.md). Taken per
 		// version rather than for the whole loop, so one slow fetch cannot stall the
 		// rest of the pass.
 		f := f
@@ -409,7 +424,7 @@ func (im *IndexManagerImpl) EnforceDiskRetention(_ context.Context, kbID string,
 		}); err != nil {
 			return err
 		}
-		// docs/storage-node-state-machine-plan.md §5.2 and §7 item 5: the disk is
+		// docs/已实施/storage-node-state-machine-plan.md §5.2 and §7 item 5: the disk is
 		// the authority and the state machine is its projection, so a version
 		// whose artifact just went away stops being READY here. Reported per
 		// version rather than in a batch, because the machine's correction is

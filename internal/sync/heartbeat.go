@@ -44,13 +44,13 @@ type HeartbeaterConfig struct {
 
 	// ChainTails receives the chain tails on every accepted heartbeat: per knowledge
 	// base, the newest version the control layer has accepted. It is the signal a node uses to notice it has fallen behind
-	// (docs/active-lag-detection-design.md). Optional: without it this node keeps the
+	// (docs/已实施/active-lag-detection-design.md). Optional: without it this node keeps the
 	// lazy recovery it has always had. *plane.LagCatchup implements it.
 	ChainTails ChainTailSink
 }
 
 // ChainTailSink receives the chain tails: per knowledge base, the version at the tail of
-// the replicated chain (docs/active-lag-detection-design.md). What it does with them — and
+// the replicated chain (docs/已实施/active-lag-detection-design.md). What it does with them — and
 // whether it does anything at all — is its own decision. Declared here because plane
 // imports this package.
 type ChainTailSink interface {
@@ -74,12 +74,13 @@ type Heartbeater struct {
 
 	// chainTails receives the chain tails on every accepted heartbeat: per knowledge
 	// base, the newest version the control layer has accepted
-	// (docs/active-lag-detection-design.md). A sink decides for itself what to do
+	// (docs/已实施/active-lag-detection-design.md). A sink decides for itself what to do
 	// with them — including nothing.
 	chainTails ChainTailSink
 	// tails and tailsGeneration are the last pull. Only Run's goroutine touches them.
-	tails           map[string]int64
-	tailsGeneration *pb.ChainGeneration
+	tails                  map[string]int64
+	tailsGeneration        *pb.ChainGeneration
+	tailsDirectoryRevision uint64
 }
 
 // NewHeartbeater returns a heartbeater that dials leaders directly.
@@ -162,7 +163,7 @@ func (r *Heartbeater) ReportOnce(ctx context.Context) error {
 	// Only an accepted answer may act on this node: a stale or refused response says
 	// nothing about where the chain is.
 	if r.chainTails != nil {
-		r.syncChainTails(ctx, client, resp.GetChainGeneration())
+		r.syncChainTails(ctx, client, resp.GetChainGeneration(), resp.GetDirectoryRevision())
 	}
 	return nil
 }
@@ -197,9 +198,13 @@ func (r *Heartbeater) closeConn() {
 // coming whether or not anything changed. It costs a local comparison, not a network trip.
 //
 // A failed pull keeps the old generation, so the next heartbeat tries again.
-func (r *Heartbeater) syncChainTails(ctx context.Context, client pb.DataSyncServiceClient, generation *pb.ChainGeneration) {
-	if generation != nil && !sameGeneration(generation, r.tailsGeneration) {
-		resp, err := client.GetChainTails(ctx, &pb.GetChainTailsRequest{})
+func (r *Heartbeater) syncChainTails(ctx context.Context, client pb.DataSyncServiceClient, generation *pb.ChainGeneration, revisions ...uint64) {
+	var revision uint64
+	if len(revisions) > 0 {
+		revision = revisions[0]
+	}
+	if generation != nil && (!sameGeneration(generation, r.tailsGeneration) || revision != r.tailsDirectoryRevision) {
+		resp, err := client.GetChainTails(ctx, &pb.GetChainTailsRequest{NodeId: r.nodeID})
 		switch {
 		case err != nil:
 			if r.logger != nil {
@@ -208,6 +213,7 @@ func (r *Heartbeater) syncChainTails(ctx context.Context, client pb.DataSyncServ
 		case resp.GetAccepted() && resp.GetGeneration() != nil:
 			r.tails = resp.GetChainTails()
 			r.tailsGeneration = resp.GetGeneration()
+			r.tailsDirectoryRevision = resp.GetDirectoryRevision()
 			if r.logger != nil {
 				r.logger.Debug("sync: chain tails pulled", zap.Int("chain_tails", len(r.tails)))
 			}

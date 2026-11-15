@@ -26,7 +26,7 @@ import (
 // it in: always the data, and the index only if this node owns the version.
 //
 // The data half is the "replication lives inside the storage layer" move of
-// control-data-separation-design.md §7. The index half is §8.4's owner sharding:
+// docs/已实施/control-data-separation-design.md §7. The index half is §8.4's owner sharding:
 // one node builds and everyone else takes the artifact from it, so a node that
 // is not the owner ends up here with data and no index, and that is the intended
 // end state rather than a half-done job.
@@ -45,6 +45,11 @@ import (
 //
 // Idempotent, so re-running it after a crash is safe.
 func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID int64) error {
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
+		return bindErr
+	}
 	if d.puller == nil {
 		// Nowhere to fetch from: this node has no storage-layer connection to a peer
 		// (a control node, or a plane assembled without one). Failing loudly beats
@@ -82,7 +87,7 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 	// without the records it indexes. See that function for the ordering bug that
 	// taught this — asking for the artifact first let a node return "done" holding
 	// a peer's index and none of the version's data.
-	addr, ok, err := d.resolve(ctx, kbID, versionID)
+	addr, ok, err := d.resolveSource(ctx, kbID, versionID)
 	if err != nil {
 		return fmt.Errorf("plane: EnsureIndex(%s, %d): resolve data source: %w", kbID, versionID, err)
 	}
@@ -118,7 +123,7 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 	}
 
 	// A node must never hold version V without holding V-1: fill any known gap
-	// before pulling versionID itself (Stratum_设计文档v13.md §7.5). Without
+	// before pulling versionID itself (docs/参考/历史/Stratum_设计文档v13.md §7.5). Without
 	// this a node that missed a version would apply the next one onto an
 	// incomplete document set, and "version number comparison implies
 	// completeness" would stop holding.
@@ -156,7 +161,7 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 	var lastErr error
 	backoff := 200 * time.Millisecond
 	for {
-		// M10 of docs/code-review-2026-09-24.md: the loop has to notice the
+		// M10 of docs/参考/code-review-2026-09-24.md: the loop has to notice the
 		// caller's context. Nothing else here does — every failure below is
 		// treated as "try again" — so a cancelled pull kept running to its idle
 		// timeout (30 s) or its ceiling (10 min) while the goroutine that asked
@@ -176,7 +181,7 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 			// The data arrived some other way while this loop ran — this node's own
 			// write, or another path's pull. Arm the §7.3 quorum check anyway: nothing
 			// says a confirmation will follow, and a version every replica holds must
-			// not stay PENDING (docs/known-gaps.md §K). watchForDurability skips the
+			// not stay PENDING (docs/未实施/known-gaps.md §K). watchForDurability skips the
 			// arming when the version is already settled.
 			d.watchForDurability(ctx, kbID, versionID)
 			return nil
@@ -186,7 +191,7 @@ func (d *LocalDataPlane) EnsureIndex(ctx context.Context, kbID string, versionID
 		// resolution legitimately answers "the leader", which holds no such
 		// data. Holding on to that answer would mean pulling from a pointless
 		// source for the whole timeout while the announcement sits unread.
-		if fresh, freshOK, freshErr := d.resolve(ctx, kbID, versionID); freshErr != nil {
+		if fresh, freshOK, freshErr := d.resolveSource(ctx, kbID, versionID); freshErr != nil {
 			d.logger.Warn("plane: resolve data source failed, will retry",
 				zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(freshErr))
 		} else if freshOK && fresh != addr {
@@ -353,7 +358,7 @@ func (d *LocalDataPlane) ensureOwnIndex(ctx context.Context, kbID string, versio
 		return nil
 	}
 	// The artifact on THIS node's disk is the cheaper and more authoritative answer,
-	// so it is asked FIRST (H9 of docs/code-review-2026-10-18.md). The order used to
+	// so it is asked FIRST (H9 of docs/参考/code-review-2026-10-18.md). The order used to
 	// be the other way round, which meant a version that already had a READY artifact
 	// here still asked every replica for a copy on every EnsureIndex — every catch-up
 	// round, every query — and installed the first one that answered, re-downloading
@@ -390,7 +395,7 @@ func (d *LocalDataPlane) ensureOwnIndex(ctx context.Context, kbID string, versio
 //
 // Deprecated: this is the FALLBACK, reached only for a knowledge base that has
 // no persisted cursor record — an older WAL, or one this node has not advanced
-// since the record type existed (docs/cursor-persistence-plan.md §3.5). Every
+// since the record type existed (docs/已实施/cursor-persistence-plan.md §3.5). Every
 // knowledge base with a record is answered by that record instead, which is the
 // only evidence here that is not a cache: both branches below bottom out in an
 // index artifact, which the retention policy is free to delete.
@@ -442,7 +447,7 @@ func (d *LocalDataPlane) holdsVersionLocally(ctx context.Context, kbID string, v
 //
 // Deprecated: only the holdsVersionLocally fallback calls this. An artifact is a
 // cache, not a source of truth about what this node holds — the persisted cursor
-// record is (docs/cursor-persistence-plan.md §4.1).
+// record is (docs/已实施/cursor-persistence-plan.md §4.1).
 func (d *LocalDataPlane) hasLocalArtifact(ctx context.Context, kbID string, versionID int64) bool {
 	if d.indexMgr == nil {
 		return false
@@ -457,7 +462,7 @@ func (d *LocalDataPlane) hasLocalArtifact(ctx context.Context, kbID string, vers
 }
 
 // ReconcileIndexes is the storage layer's half of the startup reconcile — the
-// "block report" of control-data-separation-design.md §5.3. It walks the
+// "block report" of docs/已实施/control-data-separation-design.md §5.3. It walks the
 // versions the control layer knows about, compares them against the indexes
 // actually present on this node's disk, (re)schedules builds for the ones
 // missing inside the retention window, and returns the versions whose index is
@@ -475,6 +480,10 @@ func (d *LocalDataPlane) ReconcileIndexes(ctx context.Context, meta MetadataList
 
 	var durable []VersionRef
 	for _, kb := range kbs {
+		owned, ownErr := d.OwnsKnowledgeBase(ctx, kb.KBID)
+		if ownErr != nil || !owned {
+			continue
+		}
 		versions, err := meta.ListVersions(ctx, kb.KBID)
 		if err != nil {
 			d.logger.Warn("plane: reconcile: ListVersions failed",
@@ -636,12 +645,17 @@ func retentionCutoffOf(onDisk []int64, retentionCount int) int64 {
 // caller falls through to building. Errors are reserved for transport trouble
 // worth a log line, and even then the caller may still build.
 func (d *LocalDataPlane) FetchIndexFromPeers(ctx context.Context, kbID string, versionID int64) (bool, error) {
-	if d.indexFetcher == nil || d.indexInstaller == nil || d.resolveReplicas == nil {
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
+		return false, bindErr
+	}
+	if d.indexFetcher == nil || d.indexInstaller == nil || !d.hasReplicaResolver() {
 		return false, nil // nothing to fetch with, or nobody to fetch from
 	}
 
 	// One fetch per version at a time, shared with everyone who asks meanwhile (H9 of
-	// docs/code-review-2026-10-18.md). Without this, N concurrent asks produced N
+	// docs/参考/code-review-2026-10-18.md). Without this, N concurrent asks produced N
 	// downloads of the same artifact and N serialised rewrites of the same file.
 	key := fetchInflightKey{kbID: kbID, versionID: versionID}
 	d.indexFetchMu.Lock()
@@ -672,7 +686,7 @@ func (d *LocalDataPlane) FetchIndexFromPeers(ctx context.Context, kbID string, v
 
 // fetchIndexFromPeers is the unshared body of FetchIndexFromPeers.
 func (d *LocalDataPlane) fetchIndexFromPeers(ctx context.Context, kbID string, versionID int64) (bool, error) {
-	peers, err := d.resolveReplicas(ctx)
+	peers, err := d.replicaPeers(ctx, kbID)
 	if err != nil {
 		return false, fmt.Errorf("plane: FetchIndexFromPeers: resolve replicas: %w", err)
 	}

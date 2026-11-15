@@ -131,6 +131,20 @@ func TestNodeHandler_ForwardsEveryDataSyncMethod(t *testing.T) {
 		}},
 	}
 
+	cases = append(cases, struct {
+		method string
+		call   func() error
+	}{"ExportKBMigration", func() error {
+		stream, err := client.ExportKBMigration(ctx, &pb.MigrationTransferRequest{})
+		if err != nil {
+			return err
+		}
+		_, err = stream.Recv()
+		return err
+	}}, struct {
+		method string
+		call   func() error
+	}{"StageKBMigration", func() error { _, err := client.StageKBMigration(ctx, &pb.MigrationTransferRequest{}); return err }})
 	for _, tc := range cases {
 		t.Run(tc.method, func(t *testing.T) {
 			err := tc.call()

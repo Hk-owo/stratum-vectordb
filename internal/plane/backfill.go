@@ -26,6 +26,11 @@ import (
 // the version to count as durable, but building an index nobody may ever query
 // is wasted work. A later query builds it lazily.
 func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, versionID int64) error {
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
+		return bindErr
+	}
 	// Same fact as in EnsureIndex: this node holding the version already means
 	// there is nothing to fetch — which after §8.5 can no longer be inferred
 	// from "I am the leader/writer".
@@ -33,7 +38,7 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 	// build, on any node. The version is built when a query asks for it
 	// (service/query.go) or an operator warms it, and the router's owner set is
 	// what decides which nodes those requests reach (internal/router, §5 of
-	// docs/index-owner-sharding-plan.md).
+	// docs/已实施/index-owner-sharding-plan.md).
 	//
 	// It is tempting to build here "because the data just arrived anyway". That is
 	// exactly the eager behaviour §8.6(b) removed, and on a bulk import it is the
@@ -47,7 +52,7 @@ func (d *LocalDataPlane) FetchVersionData(ctx context.Context, kbID string, vers
 	if d.skipIfDeleted(ctx, kbID, versionID, "FetchVersionData") {
 		return nil
 	}
-	addr, ok, err := d.resolve(ctx, kbID, versionID)
+	addr, ok, err := d.resolveSource(ctx, kbID, versionID)
 	if err != nil {
 		return fmt.Errorf("plane: FetchVersionData(%s, %d): resolve data source: %w", kbID, versionID, err)
 	}
@@ -81,7 +86,7 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 	}
 	// Pick a peer that actually holds the gap: the default source (the leader)
 	// is precisely what a lagging follower cannot rely on
-	// (Stratum_设计文档v13.md §7.6).
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.6).
 	source := d.pickBackfillSource(ctx, kbID, versionID-1, sourceAddr)
 
 	// The replicated metadata is read ONCE here and BOTH paths share it: the delta
@@ -102,7 +107,7 @@ func (d *LocalDataPlane) backfillTo(ctx context.Context, sourceAddr, kbID string
 		// The judgement is "which of these versions is GONE" — asked of the CURRENT state:
 		// alive-in-range plus how far allocation got. An id at or below lastAllocated that
 		// is not alive was handed out and is gone, and THAT answer cannot be pruned away
-		// (docs/known-gaps.md §B). The older shape asked for a removal record instead, and
+		// (docs/未实施/known-gaps.md §B). The older shape asked for a removal record instead, and
 		// a removal record has a lifetime: once pruning drops it, the gap reads as "nothing
 		// was removed" and the deleted version is replayed.
 		//
@@ -344,10 +349,13 @@ func (d *LocalDataPlane) backfillByChanges(ctx context.Context, sourceAddr, kbID
 // reached is skipped: it cannot serve as a source, but its silence says
 // nothing about the others.
 func (d *LocalDataPlane) pickBackfillSource(ctx context.Context, kbID string, need int64, fallback string) string {
-	if d.cursorQuerier == nil || d.resolveReplicas == nil {
+	if !d.sourceAllowed(ctx, kbID, fallback) {
+		fallback = ""
+	}
+	if d.cursorQuerier == nil || !d.hasReplicaResolver() {
 		return fallback
 	}
-	peers, err := d.resolveReplicas(ctx)
+	peers, err := d.replicaPeers(ctx, kbID)
 	if err != nil {
 		return fallback
 	}
@@ -387,6 +395,9 @@ func (d *LocalDataPlane) pickBackfillSource(ctx context.Context, kbID string, ne
 // the pre-existing behaviour for a plane assembled without one, and it keeps those
 // deployments and tests working unchanged.
 func (d *LocalDataPlane) pickTransferSource(ctx context.Context, kbID string, need int64, also string) (string, bool) {
+	if !d.sourceAllowed(ctx, kbID, also) {
+		also = ""
+	}
 	if d.cursorQuerier == nil {
 		if also == "" {
 			return "", false
@@ -394,8 +405,8 @@ func (d *LocalDataPlane) pickTransferSource(ctx context.Context, kbID string, ne
 		return also, true
 	}
 	candidates := make([]string, 0, 4)
-	if d.resolveReplicas != nil {
-		if peers, err := d.resolveReplicas(ctx); err == nil {
+	if d.hasReplicaResolver() {
+		if peers, err := d.replicaPeers(ctx, kbID); err == nil {
 			candidates = append(candidates, peers...)
 		}
 	}
@@ -434,10 +445,15 @@ func (d *LocalDataPlane) pickTransferSource(ctx context.Context, kbID string, ne
 // ok=false means no peer holds anything it could say so about: a silent peer is not
 // evidence of anything, so it is skipped rather than held against the answer.
 func (d *LocalDataPlane) PeerHolders(ctx context.Context, kbID string) (version int64, addrs []string, ok bool) {
-	if d.cursorQuerier == nil || d.resolveReplicas == nil {
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
 		return 0, nil, false
 	}
-	peers, err := d.resolveReplicas(ctx)
+	if d.cursorQuerier == nil || !d.hasReplicaResolver() {
+		return 0, nil, false
+	}
+	peers, err := d.replicaPeers(ctx, kbID)
 	if err != nil {
 		return 0, nil, false
 	}

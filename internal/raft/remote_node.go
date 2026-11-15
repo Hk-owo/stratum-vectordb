@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -20,7 +21,7 @@ import (
 )
 
 // RemoteRaftNode is the RaftNode a storage-layer node holds when the control
-// layer runs in its own process (Stratum_设计文档v13.md §7.0 的 v1 演进阶段 2、
+// layer runs in its own process (docs/参考/历史/Stratum_设计文档v13.md §7.0 的 v1 演进阶段 2、
 // §11 阶段 ④「存储集群独立进程」).
 //
 // A storage node is not a Raft member: it holds no log, votes in no election,
@@ -58,6 +59,23 @@ type RemoteRaftNode struct {
 
 	mu       sync.Mutex
 	leaderID int64 // 0 = not yet learned
+
+	// readPreferred is the control node ID that answered this storage node's last
+	// metadata read; 0 means "nothing learned yet".
+	//
+	// Why it exists: reads may go to any control node, but the DIRECTORY read is
+	// answered only by the leader (§13.3), and readAtAnyControl used to walk the
+	// control nodes in ID order. With a leader that is not the lowest ID, every
+	// metadata read paid one guaranteed failed round trip first. Measured on the
+	// 5-storage-node cluster during a performance run: `Unavailable/GetStorageDirectory`
+	// 1,264 times on control1 and 1,259 on control2 against 1,284 successful answers —
+	// i.e. every directory read cost two useless hops, because a storage node reads
+	// the directory on its own timer.
+	//
+	// Storing the LAST SUCCESS (not the leader it was told about) keeps this honest
+	// across a leadership change: the stale entry costs one failed probe, and the
+	// next success overwrites it.
+	readPreferred atomic.Int64
 
 	// connMu guards conns: one long-lived connection per control address.
 	//
@@ -134,7 +152,7 @@ func (r *RemoteRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, 
 }
 
 // ProposeRetryVersion forwards the operator's retry of one side's terminal verdict
-// to the leader (Stratum_设计文档v13.md §10.1): it is a write to replicated state, and
+// to the leader (docs/参考/历史/Stratum_设计文档v13.md §10.1): it is a write to replicated state, and
 // the verdict itself belongs to the state machine's apply.
 func (r *RemoteRaftNode) ProposeRetryVersion(ctx context.Context, kbID string, versionID int64, side types.FailureSide) error {
 	res, err := r.propose(ctx, newRetryVersionCommand(kbID, versionID, side))
@@ -384,7 +402,7 @@ func (r *RemoteRaftNode) ListVersions(ctx context.Context, kbID string) ([]types
 // STORAGE node answers with, and a storage node serves the query path: §F's meta
 // stage runs on every query, so a whole-chain read here was paid per query, per
 // storage node, no matter how little the caller needed. The await path
-// (docs/await-version-plan.md §7 Step 2) reads this too, for the same reason.
+// (docs/已实施/await-version-plan.md §7 Step 2) reads this too, for the same reason.
 //
 // The control node's shape of the same call is the O(1) map lookup in
 // RaftNodeImpl.GetVersion; both answer the same question at their own cost.
@@ -539,6 +557,25 @@ func (r *RemoteRaftNode) GetClusterStatus(ctx context.Context) (types.ClusterSta
 // here is either a transport failure (another node may be up) or a
 // deterministic answer the next node will repeat (which costs one wasted call,
 // not a wrong result).
+// orderFromPreferred puts preferred at the head of ids when it is present,
+// keeping every other element in its existing (ascending) order.
+//
+// Pure and separate so the "nothing learned yet" case, a preferred ID that is no
+// longer configured, and the ordering invariant are testable without a server.
+func orderFromPreferred(ids []int64, preferred int64) []int64 {
+	if preferred == 0 || len(ids) < 2 {
+		return ids
+	}
+	out := make([]int64, 0, len(ids))
+	out = append(out, preferred)
+	for _, id := range ids {
+		if id != preferred {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 func (r *RemoteRaftNode) readAtAnyControl(ctx context.Context, op func(ctx context.Context, conn *grpc.ClientConn) error) error {
 	ids := make([]int64, 0, len(r.ControlAddrs))
 	for id := range r.ControlAddrs {
@@ -548,6 +585,7 @@ func (r *RemoteRaftNode) readAtAnyControl(ctx context.Context, op func(ctx conte
 		return errors.New("raft: remote: no control node configured")
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	ids = orderFromPreferred(ids, r.readPreferred.Load())
 
 	var lastErr error
 	for _, id := range ids {
@@ -565,6 +603,7 @@ func (r *RemoteRaftNode) readAtAnyControl(ctx context.Context, op func(ctx conte
 		// fails. That is how this was found.
 		err = op(r.Mark.Stamp(ctx), conn)
 		if err == nil {
+			r.readPreferred.Store(id)
 			return nil
 		}
 		lastErr = fmt.Errorf("raft: remote: read at control node %d (%s): %w", id, r.ControlAddrs[id], err)

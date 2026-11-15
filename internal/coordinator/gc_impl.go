@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"stratum/internal/storage"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -24,9 +26,15 @@ import (
 const defaultGCSweepIntervalSec = 3600
 
 // ChunkGarbageCollectorImpl is the real ChunkGarbageCollector.
+type gcMutationGuard struct {
+	enter func(context.Context, string) (context.Context, func(), error)
+}
+
 type ChunkGarbageCollectorImpl struct {
-	cfg    ChunkGarbageCollectorConfig
-	logger *zap.Logger
+	mutationGuard atomic.Pointer[gcMutationGuard]
+	serviceLease  atomic.Pointer[storage.ServiceLease]
+	cfg           ChunkGarbageCollectorConfig
+	logger        *zap.Logger
 }
 
 // NewChunkGarbageCollectorImpl constructs a ChunkGarbageCollectorImpl,
@@ -43,6 +51,26 @@ func NewChunkGarbageCollectorImpl(cfg ChunkGarbageCollectorConfig) *ChunkGarbage
 		cfg.Locks = NewKBLockSet()
 	}
 	return &ChunkGarbageCollectorImpl{cfg: cfg}
+}
+
+func (g *ChunkGarbageCollectorImpl) SetServiceLease(lease *storage.ServiceLease) {
+	g.serviceLease.Store(lease)
+}
+
+// SetStorageMutationGuard binds the per-KB placement/execution lifetime. Node
+// service authorization alone cannot stop GC after a KB enters fencing.
+func (g *ChunkGarbageCollectorImpl) SetStorageMutationGuard(enter func(context.Context, string) (context.Context, func(), error)) {
+	if enter == nil {
+		g.mutationGuard.Store(nil)
+		return
+	}
+	g.mutationGuard.Store(&gcMutationGuard{enter: enter})
+}
+func (g *ChunkGarbageCollectorImpl) enterMutation(ctx context.Context, kb string) (context.Context, func(), error) {
+	if guard := g.mutationGuard.Load(); guard != nil {
+		return guard.enter(ctx, kb)
+	}
+	return ctx, func() {}, nil
 }
 
 // SetLogger attaches a logger for sweep progress and errors. Optional:
@@ -70,13 +98,20 @@ func (g *ChunkGarbageCollectorImpl) Run(ctx context.Context) {
 
 // Sweep implements ChunkGarbageCollector.
 func (g *ChunkGarbageCollectorImpl) Sweep(ctx context.Context) error {
+	c, release, guardErr := g.serviceLease.Load().Enter(ctx)
+	if guardErr != nil {
+		return guardErr
+	}
+	defer release()
+	ctx = c
+
 	kbs, err := g.cfg.RaftNode.ListKnowledgeBases(ctx)
 	if err != nil {
 		return fmt.Errorf("chunk-gc: ListKnowledgeBases: %w", err)
 	}
 
 	// One knowledge base's failure must not stop the rest (M18 of
-	// docs/code-review-2026-10-18.md). Returning at the first error meant a single KB
+	// docs/参考/code-review-2026-10-18.md). Returning at the first error meant a single KB
 	// whose LastVersionID (or one of its chunk deletes) kept failing left every KB
 	// after it in the list unreclaimed — for good, every sweep — while the log showed
 	// one warning. Same policy as deleting_sweep.go: note it, keep going, report the
@@ -102,6 +137,13 @@ func (g *ChunkGarbageCollectorImpl) Sweep(ctx context.Context) error {
 
 // sweepKB reclaims every orphan chunk of a single knowledge base.
 func (g *ChunkGarbageCollectorImpl) sweepKB(ctx context.Context, kbID string) error {
+	mutationCtx, leaveMutation, mutationErr := g.enterMutation(ctx, kbID)
+	if mutationErr != nil {
+		return mutationErr
+	}
+	defer leaveMutation()
+	ctx = mutationCtx
+
 	// The LIVE CHAIN, not the newest version. A version stays queryable
 	// (QueryRequest.version_id) until its metadata is removed, so a document
 	// that the newest version no longer contains can still be part of an older
@@ -113,7 +155,7 @@ func (g *ChunkGarbageCollectorImpl) sweepKB(ctx context.Context, kbID string) er
 	// whose RaftNode is remote. That is the price of the correct liveness
 	// question; a cheap answer needs a control-layer read that returns the id
 	// list (or a per-document "is this visible anywhere" judgement) instead of
-	// full VersionMeta rows, which docs/known-gaps.md §F already asks for.
+	// full VersionMeta rows, which docs/未实施/known-gaps.md §F already asks for.
 	// Keeping it to ONE read per KB is why the reclaim pass re-uses this
 	// snapshot unless the tail moved (see reclaimOrphan).
 	snapshot, err := g.liveVersionIDs(ctx, kbID, 0)
@@ -216,7 +258,7 @@ func (g *ChunkGarbageCollectorImpl) liveVersionIDs(ctx context.Context, kbID str
 // sweep.
 //
 // Why the re-check itself cannot leave the critical section (M9 of
-// docs/code-review-2026-09-24.md suggests moving the confirmation stage out): the
+// docs/参考/code-review-2026-09-24.md suggests moving the confirmation stage out): the
 // cheap-looking shortcut is to compare the current tail against the snapshot's and
 // skip the document re-read when they match. That is wrong, and a test says so
 // (TestGC_SharedWriteMu_ConcurrentWriteAndSweep_KeepsLiveChunk): a version's data
@@ -296,6 +338,20 @@ func (g *ChunkGarbageCollectorImpl) reclaimOrphan(ctx context.Context, kbID, chu
 // (a replica that never received it) — the delete flow can call it any number of
 // times, from a retry or from the tombstone's own retry loop.
 func (g *ChunkGarbageCollectorImpl) ReclaimVersionChunks(ctx context.Context, kbID string, versionID int64) error {
+	mutationCtx, leaveMutation, mutationErr := g.enterMutation(ctx, kbID)
+	if mutationErr != nil {
+		return mutationErr
+	}
+	defer leaveMutation()
+	ctx = mutationCtx
+
+	c, release, guardErr := g.serviceLease.Load().Enter(ctx)
+	if guardErr != nil {
+		return guardErr
+	}
+	defer release()
+	ctx = c
+
 	if versionID <= 0 {
 		return fmt.Errorf("chunk-gc: reclaim version chunks %s: invalid version id %d", kbID, versionID)
 	}
@@ -357,8 +413,8 @@ func (g *ChunkGarbageCollectorImpl) ReclaimVersionChunks(ctx context.Context, kb
 // second.
 //
 // docIDs is the list isOrphanChunk already scanned, reused rather than re-scanned
-// (M9 of docs/code-review-2026-09-24.md). DeleteMapping, not DeleteByDoc, is the
-// delete (H3 of docs/code-review-2026-10-18.md): DeleteByDoc removes the
+// (M9 of docs/参考/code-review-2026-09-24.md). DeleteMapping, not DeleteByDoc, is the
+// delete (H3 of docs/参考/code-review-2026-10-18.md): DeleteByDoc removes the
 // document's mapping to every chunk it has, so the document's OTHER chunks would
 // vanish from the sweep's candidate set (found by scanning the forward keyspace)
 // while their vectors stayed in the store forever. Reclaiming one chunk may only
@@ -368,6 +424,20 @@ func (g *ChunkGarbageCollectorImpl) ReclaimVersionChunks(ctx context.Context, kb
 // doc comment): a crash between them leaves a vector no mapping names, which no
 // caller scans again.
 func (g *ChunkGarbageCollectorImpl) deleteChunk(ctx context.Context, kbID, chunkID string, docIDs []string, reason string) error {
+	mutationCtx, leaveMutation, mutationErr := g.enterMutation(ctx, kbID)
+	if mutationErr != nil {
+		return mutationErr
+	}
+	defer leaveMutation()
+	ctx = mutationCtx
+
+	c, release, guardErr := g.serviceLease.Load().Enter(ctx)
+	if guardErr != nil {
+		return guardErr
+	}
+	defer release()
+	ctx = c
+
 	for _, docID := range docIDs {
 		if err := g.cfg.ChunkDocMapper.DeleteMapping(ctx, kbID, chunkID, docID); err != nil {
 			return fmt.Errorf("chunk-gc: DeleteMapping(%s,%s,%s): %w", kbID, chunkID, docID, err)
@@ -387,7 +457,7 @@ func (g *ChunkGarbageCollectorImpl) deleteChunk(ctx context.Context, kbID, chunk
 // ANY of live's versions — i.e. every referencing document is tombstoned or
 // absent in each live version — and returns the document list it consulted so
 // the caller can reuse it instead of scanning the mapping again (M9 of
-// docs/code-review-2026-09-24.md).
+// docs/参考/code-review-2026-09-24.md).
 func (g *ChunkGarbageCollectorImpl) isOrphanChunk(ctx context.Context, kbID, chunkID string, live []int64) (bool, []string, error) {
 	docIDs, err := g.cfg.ChunkDocMapper.ListDocIDs(ctx, kbID, chunkID)
 	if err != nil {
@@ -423,7 +493,7 @@ func (g *ChunkGarbageCollectorImpl) isOrphanChunk(ctx context.Context, kbID, chu
 // "this document has no entry at or before this version" is the store being
 // unable to answer, and treating that as "the document is gone" reclaims a LIVE
 // document's chunks on the strength of a read failure (H2 of
-// docs/code-review-2026-10-18.md).
+// docs/参考/code-review-2026-10-18.md).
 func (g *ChunkGarbageCollectorImpl) docReadableFromAny(ctx context.Context, kbID, docID string, live []int64) (bool, error) {
 	for i := len(live) - 1; i >= 0; i-- {
 		v := live[i]

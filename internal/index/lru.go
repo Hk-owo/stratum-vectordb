@@ -231,7 +231,7 @@ func (im *IndexManagerImpl) makeRoomLocked() []indexKey {
 		if !found {
 			// Everything resident is pinned by a caller in flight, so the overage
 			// cannot be corrected right now. Say so, once in a while: the state is
-			// the one M8 of docs/code-review-2026-09-24.md describes — the bound is
+			// the one M8 of docs/参考/code-review-2026-09-24.md describes — the bound is
 			// exceeded and looks enforced — and the fix for "silent" is a line, not
 			// a refusal (the overage is transient by construction: the pins belong
 			// to searches that are about to finish).
@@ -285,7 +285,7 @@ const pinnedOverflowWarnInterval = time.Minute
 // dropEvicted tells the vecstore to release the indexes this node has stopped
 // tracking.
 //
-// H5 of docs/code-review-2026-09-24.md: the vecstore's index map only ever grew,
+// H5 of docs/参考/code-review-2026-09-24.md: the vecstore's index map only ever grew,
 // because the Go side's view (loaded / sizeByKey) was the only one being pruned
 // and a pruned version's object stayed resident for the life of the process — so
 // RSS tracked how many versions had been touched, not how many were held.
@@ -357,7 +357,14 @@ func (im *IndexManagerImpl) reloadAfterDrop(ctx context.Context, key indexKey) {
 }
 
 // Evict implements IndexManager.
-func (im *IndexManagerImpl) Evict(_ context.Context, kbID string, versionID int64) error {
+func (im *IndexManagerImpl) Evict(ctx context.Context, kbID string, versionID int64) error {
+	guarded, release, guardErr := im.serviceLease.Load().Enter(ctx)
+	if guardErr != nil {
+		return guardErr
+	}
+	defer release()
+	ctx = guarded
+
 	im.mu.Lock()
 	key := indexKey{kbID, versionID}
 	var evicted []indexKey
@@ -372,7 +379,7 @@ func (im *IndexManagerImpl) Evict(_ context.Context, kbID string, versionID int6
 	im.mu.Unlock()
 
 	// Same release every other eviction path performs (L6 of
-	// docs/code-review-2026-10-18.md): the vecstore keeps its own copy of each
+	// docs/参考/code-review-2026-10-18.md): the vecstore keeps its own copy of each
 	// resident index, so dropping only this side's view leaves that copy resident for
 	// the life of the process. EvictByKB and Discard already do this; this entry
 	// point was the one H5 of the 09-24 review missed.
@@ -381,7 +388,14 @@ func (im *IndexManagerImpl) Evict(_ context.Context, kbID string, versionID int6
 }
 
 // EvictByKB implements IndexManager.
-func (im *IndexManagerImpl) EvictByKB(_ context.Context, kbID string) error {
+func (im *IndexManagerImpl) EvictByKB(ctx context.Context, kbID string) error {
+	guarded, release, guardErr := im.serviceLease.Load().Enter(ctx)
+	if guardErr != nil {
+		return guardErr
+	}
+	defer release()
+	ctx = guarded
+
 	im.mu.Lock()
 	var dropped []indexKey
 	for k := range im.loaded {
@@ -397,7 +411,7 @@ func (im *IndexManagerImpl) EvictByKB(_ context.Context, kbID string) error {
 	im.mu.Unlock()
 	// The vecstore keeps its own object per resident index, so pruning only this
 	// node's view left the whole knowledge base resident in the vecstore process
-	// for the rest of its life (H5 of docs/code-review-2026-09-24.md). Done after
+	// for the rest of its life (H5 of docs/参考/code-review-2026-09-24.md). Done after
 	// the unlock, because it is a network call.
 	im.dropEvicted(dropped)
 	return nil

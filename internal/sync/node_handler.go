@@ -7,6 +7,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
+	serrors "stratum/internal/errors"
 )
 
 // NodeHandler is a node's complete data-plane service. A single gRPC service
@@ -38,6 +39,8 @@ import (
 // registered NodeHandler and fails if any of them answers Unimplemented, so the
 // next method added to the proto fails a test instead of a feature.
 type NodeHandler struct {
+	cleanup   MigrationCleanup
+	migration *migrationStager
 	pb.UnimplementedDataSyncServiceServer
 
 	exporter *LeaderHandler
@@ -45,7 +48,7 @@ type NodeHandler struct {
 
 	// indexReader reads a locally built artifact back off disk so a peer can
 	// FETCH it — §8.4's "分发 N 份", and since the push half was removed, its only
-	// direction (docs/index-owner-sharding-plan.md §7). Optional: without it
+	// direction (docs/已实施/index-owner-sharding-plan.md §7). Optional: without it
 	// FetchIndexData answers Unimplemented and replicas fall back to building
 	// their own, which is the behaviour before on-demand fetch existed — and the
 	// documented fallback (a node that cannot fetch a version's artifact builds
@@ -109,6 +112,13 @@ func NewNodeHandler(exporter *LeaderHandler, receiver *PushHandler, opts ...Node
 
 var _ pb.DataSyncServiceServer = (*NodeHandler)(nil)
 
+func (h *NodeHandler) FenceKBReplica(ctx context.Context, req *pb.FenceKBReplicaRequest) (*pb.FenceKBReplicaResponse, error) {
+	if h.receiver == nil {
+		return nil, status.Error(codes.Unimplemented, "sync: no replica executor")
+	}
+	return h.receiver.FenceKBReplica(ctx, req)
+}
+
 // ExecuteVersionWrite runs a version's storage transaction on this node on the
 // control layer's behalf (§7.13.2): the leader picks the coordinator from the
 // knowledge base's replica topology and dispatches the work here.
@@ -121,6 +131,9 @@ func (h *NodeHandler) PullVersionData(
 	req *pb.PullVersionDataRequest,
 	stream pb.DataSyncService_PullVersionDataServer,
 ) error {
+	if _, err := h.receiver.bindPlacement(stream.Context(), req.GetKnowledgeBaseId()); err != nil {
+		return serrors.ToGRPCStatus(err)
+	}
 	// A node with no storage of its own exports nothing — a control node is
 	// exactly that, and it still serves this service for the cursor reports it
 	// owns as leader. Saying so is better than a nil dereference.
@@ -159,6 +172,9 @@ func (h *NodeHandler) ConfirmVersionWrite(ctx context.Context, req *pb.ConfirmVe
 // PullVersionChanges serves a lagging peer replaying a range of versions'
 // recorded changes instead of pulling each version in full (§7.5).
 func (h *NodeHandler) PullVersionChanges(req *pb.PullVersionChangesRequest, stream pb.DataSyncService_PullVersionChangesServer) error {
+	if _, err := h.receiver.bindPlacement(stream.Context(), req.GetKnowledgeBaseId()); err != nil {
+		return serrors.ToGRPCStatus(err)
+	}
 	return h.receiver.PullVersionChanges(req, stream)
 }
 
@@ -180,6 +196,9 @@ func (h *NodeHandler) GetChainTails(ctx context.Context, req *pb.GetChainTailsRe
 // someone else or build" — so the failure has to keep its wire name rather than
 // collapsing into a generic Internal.
 func (h *NodeHandler) FetchIndexData(req *pb.FetchIndexDataRequest, stream pb.DataSyncService_FetchIndexDataServer) error {
+	if _, err := h.receiver.bindPlacement(stream.Context(), req.GetKnowledgeBaseId()); err != nil {
+		return serrors.ToGRPCStatus(err)
+	}
 	if h.indexReader == nil {
 		return status.Error(codes.Unimplemented, "sync: this node does not export index artifacts")
 	}

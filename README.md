@@ -274,8 +274,10 @@ scripts/cluster.sh --topology two-tier up
 <summary><b>部署形态与配置</b></summary>
 
 - **单节点**：`cmd/stratum`（gRPC，默认 `127.0.0.1:7000`）+ 外部 C++ vecstore 进程。`cmd/stratum` 接受可选 YAML 配置，命令行 flag 优先：`go run ./cmd/stratum/ -config integration/docker/config1.yaml`。
-- **角色分离**：`node.role` 取 `all`（默认，两层同进程）、`control`（只有 Raft 日志与元数据，不建数据目录）、`storage`（只跑存储层，不参与选举，元数据经 `RemoteRaftNode` 读取）。存储组由 `storage.nodes` 声明，省略即每个 Raft 成员都持有数据。
+- **角色分离**：`node.role` 取 `all`（默认，两层同进程）、`control`（只有 Raft 日志与元数据，不建数据目录）、`storage`（只跑存储层，不参与选举，元数据经 `RemoteRaftNode` 读取）。`storage.nodes` 只播种空的 Raft 存储目录，省略时以部署中的存储成员播种；目录建立后以持久化状态为准，重启不会覆盖动态节点或 draining 状态。
 - **两层拓扑的硬约束**：控制层 ID（`1..N`）与存储层 ID（`11..1N`）不得重叠；写入由控制层在 apply 时指派给某个存储节点执行（`ExecuteVersionWrite`），该节点作为协调者再扇出。
+- **按 KB 放置**：创建 KB 可通过 `replica_node_ids` 指定副本；复制、查询、追赶、健康与 quorum 都以该 KB 的有效集合为准。新增节点不会扩大已有 KB。`StorageAdminService` 提供目录查询、节点登记、单 KB 迁移、取消、整节点排空、地址更新和退役；启用服务站鉴权时须给管理凭据显式配置 `storage_admin: true`，普通 `kb_ids: ["*"]` 不包含集群管理权限。
+- **安全切换**：迁移先围栏、复制和安装保留数据，再恢复本地服务状态，最后以 Raft 原子提交新集合、新 epoch 和退出副本清理义务。故障替换先确认旧节点服务授权失效；离线旧节点恢复后按持久化义务清理。地址更新需要先排空节点、完成清理并撤销旧授权，退役的 node ID 永不复用。
 
 ```yaml
 # 一个只跑存储层的节点：数据在这里，元数据在控制集群

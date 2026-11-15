@@ -6,15 +6,19 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
+	stratumerrors "stratum/internal/errors"
+	"stratum/internal/storage"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -28,7 +32,7 @@ type VersionExporter interface {
 
 // Pusher replicates one version's records to a target replica by driving that
 // replica's PushVersionData stream. It is the write coordinator's side of the
-// push direction (Stratum_设计文档v13.md §7.2): the coordinator exports from
+// push direction (docs/参考/历史/Stratum_设计文档v13.md §7.2): the coordinator exports from
 // its own stores and the target applies, so a version that was just written
 // reaches its replicas instead of waiting for them to poll for it.
 type Pusher struct {
@@ -66,6 +70,11 @@ func NewPusher(cfg PusherConfig) *Pusher {
 // for its acknowledgement. The receiving side applies records idempotently, so
 // retrying after a lost acknowledgement is safe.
 func (p *Pusher) PushVersion(ctx context.Context, targetAddr, kbID string, versionID int64) (*pb.PushVersionDataResponse, error) {
+	md, _ := metadata.FromOutgoingContext(ctx)
+	md = md.Copy()
+	md.Set("x-stratum-push-kb", kbID)
+	md.Set("x-stratum-push-version", strconv.FormatInt(versionID, 10))
+	ctx = metadata.NewOutgoingContext(ctx, md)
 	conn, err := p.dial(ctx, targetAddr)
 	if err != nil {
 		return nil, fmt.Errorf("sync: dial replica %s: %w", targetAddr, err)
@@ -102,6 +111,9 @@ func (p *Pusher) PushVersion(ctx context.Context, targetAddr, kbID string, versi
 	if err != nil {
 		return nil, fmt.Errorf("sync: close PushVersionData to %s: %w", targetAddr, err)
 	}
+	if ack.GetKnowledgeBaseId() != kbID || ack.GetVersionId() != versionID || ack.GetAcceptorId() <= 0 {
+		return nil, fmt.Errorf("sync: replica %s acknowledged a different KB, version or node", targetAddr)
+	}
 	return ack, nil
 }
 
@@ -110,13 +122,16 @@ func (p *Pusher) PushVersion(ctx context.Context, targetAddr, kbID string, versi
 // the logic the pull path uses (Follower.applyEntry), so both directions
 // converge on the same local state.
 type PushHandler struct {
+	executionGate *storage.ExecutionGate
+	directory     storage.Reader
+	placements    storage.Resolver
 	pb.UnimplementedDataSyncServiceServer
 
 	follower *Follower
 	nodeID   int64
 
 	// localVersion reports this node's contiguous data cursor, so peers can
-	// ask how far its history reaches (Stratum_设计文档v13.md §7.6). Optional:
+	// ask how far its history reaches (docs/参考/历史/Stratum_设计文档v13.md §7.6). Optional:
 	// without it the node answers 0 ("nothing known"), which makes it a
 	// useless backfill source rather than a wrong one.
 	localVersion LocalVersionReporter
@@ -129,6 +144,11 @@ type PushHandler struct {
 
 	// dropper reclaims a version's physical data on request (v13 §10.6).
 	dropper VersionDataDropper
+
+	// serving is the index surface a migration target needs before it can be
+	// activated. Optional: without it the serving step refuses to run, because
+	// "index readiness could not be checked" must not be reported as ready.
+	serving MigrationServing
 
 	// tombstones is this node's record of versions it has been told are deleted.
 	// Two jobs: DeleteVersionData writes it (before reclaiming), and the landing
@@ -156,7 +176,7 @@ type PushHandler struct {
 
 	// members is the replica set owner sets are computed over, and inactiveK is
 	// the k used for versions that are not the active one
-	// (docs/index-owner-sharding-plan.md §3/§5.2). Optional: with no members this
+	// (docs/已实施/index-owner-sharding-plan.md §3/§5.2). Optional: with no members this
 	// handler builds on every landing, which is exactly the pre-sharding
 	// behaviour — the safe default for a deployment that has not opted in.
 	//
@@ -184,7 +204,7 @@ type PushHandler struct {
 	// base's replicated chain — the newest version the control layer has accepted.
 	// A node whose own cursor is behind it has fallen behind and may start catching up;
 	// whether and when it does is the node's own decision
-	// (docs/active-lag-detection-design.md §5).
+	// (docs/已实施/active-lag-detection-design.md §5).
 	chainTails ChainTailSource
 }
 
@@ -247,7 +267,7 @@ func WithHeartbeatRecorder(rec HeartbeatRecorder, isLeader func() bool) PushHand
 
 // WithChainTails wires the source of the chain generation carried back on a heartbeat's
 // response and of the tails GetChainTails answers with
-// (docs/active-lag-detection-design.md).
+// (docs/已实施/active-lag-detection-design.md).
 func WithChainTails(src ChainTailSource) PushHandlerOption {
 	return func(h *PushHandler) { h.chainTails = src }
 }
@@ -410,6 +430,29 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 	// wanted again. Nothing of it is written, and this node does not claim it — no
 	// cursor move, no bloom rebuild, no takeover timer.
 	deletedHere := false
+	var streamKB string
+	var streamVersion int64
+	releaseMutation := func() {}
+	defer func() { releaseMutation() }()
+	// RPC metadata names even an empty version, which has no document frames.
+	// Raw legacy streams still learn the target from VersionDocList frames.
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		kbs, versions := md.Get("x-stratum-push-kb"), md.Get("x-stratum-push-version")
+		if len(kbs) > 0 || len(versions) > 0 {
+			if len(kbs) != 1 || len(versions) != 1 || kbs[0] == "" {
+				return status.Error(codes.InvalidArgument, "sync: invalid push identity")
+			}
+			v, err := strconv.ParseInt(versions[0], 10, 64)
+			if err != nil || v <= 0 {
+				return status.Error(codes.InvalidArgument, "sync: invalid push version")
+			}
+			streamKB, kbID, streamVersion, versionID = kbs[0], kbs[0], v, v
+			ctx, releaseMutation, err = h.enterMutation(ctx, kbID)
+			if err != nil {
+				return stratumerrors.ToGRPCStatus(err)
+			}
+		}
+	}
 	for {
 		entry, err := stream.Recv()
 		if err == io.EOF {
@@ -422,7 +465,25 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 		// last non-zero one rather than the last record's value. Recorded before the
 		// check below, because the FIRST frame is what names the version.
 		kbID = entry.GetKbId()
-		if v := entry.GetVersionId(); v != 0 {
+		if streamKB == "" {
+			streamKB = kbID
+			var guardErr error
+			ctx, releaseMutation, guardErr = h.enterMutation(ctx, kbID)
+			if guardErr != nil {
+				return stratumerrors.ToGRPCStatus(guardErr)
+			}
+		} else if kbID != streamKB {
+			return status.Error(codes.InvalidArgument, "sync: a push cannot span knowledge bases")
+		}
+		if v := entry.GetVersionId(); v != 0 && entry.GetEntryType() == pb.SyncEntryType_SYNC_ENTRY_TYPE_VERSION_DOC_LIST {
+			if streamVersion != 0 && streamVersion != v {
+				return status.Error(codes.InvalidArgument, "sync: a push cannot span versions")
+			}
+			streamVersion = v
+			versionID = v
+		} else if v != 0 && streamVersion == 0 {
+			// MVCC document rows may name an older version. Once the document
+			// set named this transfer's target, these rows cannot change it.
 			versionID = v
 		}
 		if !deletedHere && versionID != 0 && h.tombstones != nil {
@@ -475,6 +536,10 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 	}
 
 	if kbID != "" {
+		// ACK and the persisted contiguous cursor must not outlive chunk data.
+		if err := h.follower.flushReceivedData(ctx); err != nil {
+			return err
+		}
 		// Same post-apply step as the pull path: the records are in the local
 		// stores, so this node holds the version — move the cursor, then
 		// schedule this node's own index build.
@@ -493,7 +558,7 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 		// got there first and §8.4(a)'s probe then found an artifact already held.
 		//
 		// The build is therefore restricted to the replica that OWNS the version
-		// (docs/index-owner-sharding-plan.md §5.2): owners() is a pure function of
+		// (docs/已实施/index-owner-sharding-plan.md §5.2): owners() is a pure function of
 		// (kbID, versionID) and the member set, so every replica computes the same
 		// answer without asking anyone.
 		//
@@ -504,7 +569,7 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 		// (cmd/stratum's version-created callback, §8.6b). Every other version is
 		// built when something asks for it — a query (service/query.go) or an
 		// explicit operator request — and the router's owner set decides which
-		// nodes those requests reach (docs/index-owner-sharding-plan.md §5).
+		// nodes those requests reach (docs/已实施/index-owner-sharding-plan.md §5).
 		//
 		// This handler used to build here for every landing. Whatever gate it had
 		// (the owner set, the active version, nothing at all) was answering the
@@ -527,15 +592,27 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 
 // ConfirmVersionWrite implements DataSyncService.ConfirmVersionWrite: the
 // coordinator says the version reached quorum, so this node stands down its
-// §7.3 takeover timer (Stratum_设计文档v13.md §7.3). The same message is §8.5's
+// §7.3 takeover timer (docs/参考/历史/Stratum_设计文档v13.md §7.3). The same message is §8.5's
 // data-source announcement — req.source_addr names the writer — so this node
 // records where the version's data lives; later readers resolve it from that
 // fact instead of asking the leader (see plane.DataSourceRegistry).
 //
 // It is also this node's cue that the version exists — a replica that missed the
 // push learns of it here, which is why it does not merely stop a timer.
-func (h *PushHandler) ConfirmVersionWrite(_ context.Context, req *pb.ConfirmVersionWriteRequest) (*pb.ConfirmVersionWriteResponse, error) {
+func (h *PushHandler) ConfirmVersionWrite(ctx context.Context, req *pb.ConfirmVersionWriteRequest) (*pb.ConfirmVersionWriteResponse, error) {
 	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
+	if _, err := h.bindPlacement(ctx, kbID); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
+	if h.placements != nil && req.GetSourceAddr() != "" {
+		snap, err := storage.Resolve(ctx, h.placements, kbID)
+		if err != nil {
+			return nil, stratumerrors.ToGRPCStatus(err)
+		}
+		if !snap.HasAddress(req.GetSourceAddr()) {
+			return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrNotKBReplica)
+		}
+	}
 	if h.watcher != nil {
 		h.watcher.ConfirmVersionWrite(kbID, versionID)
 	}
@@ -552,6 +629,16 @@ func (h *PushHandler) ConfirmVersionWrite(_ context.Context, req *pb.ConfirmVers
 // the local transaction is keyed and replayable (§7.12), so a dispatched retry
 // and a client retry of the same write converge.
 func (h *PushHandler) ExecuteVersionWrite(ctx context.Context, req *pb.ExecuteVersionWriteRequest) (*pb.ExecuteVersionWriteResponse, error) {
+	ctx, release, enterErr := h.enterMutation(ctx, req.GetKnowledgeBaseId())
+	if enterErr != nil {
+		return nil, stratumerrors.ToGRPCStatus(enterErr)
+	}
+	defer release()
+	var guardErr error
+	ctx, guardErr = h.bindPlacement(ctx, req.GetKnowledgeBaseId())
+	if guardErr != nil {
+		return nil, stratumerrors.ToGRPCStatus(guardErr)
+	}
 	if h.writeExecutor == nil {
 		// Loud, not silent: a dispatch that lands nowhere would leave the
 		// version's data missing while the control layer believes it was
@@ -624,6 +711,9 @@ func (h *PushHandler) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*p
 	// heartbeat of every node, so it must stay the same size however many knowledge bases
 	// there are. A node pulls the tails only when this changes (GetChainTails).
 	if h.chainTails != nil {
+		if source, ok := h.chainTails.(interface{ StorageDirectoryRevision() uint64 }); ok {
+			resp.DirectoryRevision = source.StorageDirectoryRevision()
+		}
 		if term, seq, ok := h.chainTails.ChainGeneration(); ok {
 			resp.ChainGeneration = &pb.ChainGeneration{Term: term, Seq: seq}
 		}
@@ -635,7 +725,7 @@ func (h *PushHandler) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*p
 //
 // A non-leader answers accepted=false, like Heartbeat, because a follower's
 // metadata can lag and a lagging tail would tell a node it is fine when it is not.
-func (h *PushHandler) GetChainTails(ctx context.Context, _ *pb.GetChainTailsRequest) (*pb.GetChainTailsResponse, error) {
+func (h *PushHandler) GetChainTails(ctx context.Context, req *pb.GetChainTailsRequest) (*pb.GetChainTailsResponse, error) {
 	if h.chainTails == nil || h.isLeader == nil || !h.isLeader() {
 		return &pb.GetChainTailsResponse{Accepted: false}, nil
 	}
@@ -650,6 +740,27 @@ func (h *PushHandler) GetChainTails(ctx context.Context, _ *pb.GetChainTailsRequ
 		return nil, status.Errorf(codes.Unavailable, "sync: GetChainTails: %v", err)
 	}
 	resp.ChainTails = tails
+	if h.placements != nil {
+		if req.GetNodeId() <= 0 {
+			return nil, status.Error(codes.InvalidArgument, "sync: node identity is required")
+		}
+		reader, ok := h.chainTails.(storage.Reader)
+		if !ok {
+			return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrPlacementUnknown)
+		}
+		dir, err := reader.StorageDirectory(ctx)
+		if err != nil {
+			return nil, stratumerrors.ToGRPCStatus(err)
+		}
+		resp.DirectoryRevision = dir.Revision
+		filtered := make(map[string]int64)
+		for kb, tail := range tails {
+			if p, err := dir.Lookup(kb); err == nil && p.Contains(req.GetNodeId()) {
+				filtered[kb] = tail
+			}
+		}
+		resp.ChainTails = filtered
+	}
 	return resp, nil
 }
 
@@ -702,8 +813,11 @@ func docChangesFromProto(in []*pb.DocChange) []types.DocChange {
 // whether this node holds (kbID, versionID)'s data. The control layer asks
 // every candidate replica, and a version none of them holds is one whose data
 // never landed — as opposed to one that is merely waiting for its index build
-// (Stratum_设计文档v13.md §7.12 step ①).
+// (docs/参考/历史/Stratum_设计文档v13.md §7.12 step ①).
 func (h *PushHandler) VersionPresence(ctx context.Context, req *pb.VersionPresenceRequest) (*pb.VersionPresenceResponse, error) {
+	if _, err := h.bindPlacement(ctx, req.GetKnowledgeBaseId()); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
 	// Presence is answered from the local document list, so a node without one
 	// cannot answer it at all. That has to be an error and not "present: false":
 	// the caller uses a negative answer to conclude a version's data never
@@ -730,11 +844,11 @@ func (h *PushHandler) VersionPresence(ctx context.Context, req *pb.VersionPresen
 
 // DeleteVersionData implements DataSyncService.DeleteVersionData: it reclaims
 // the version's physical data here, on the control layer's instruction
-// (Stratum_设计文档v13.md §10.6).
+// (docs/参考/历史/Stratum_设计文档v13.md §10.6).
 //
 // A node with NO dropper wired is an ERROR, not a "nothing to drop" answer. The
 // two are indistinguishable on the wire otherwise, and that is exactly how the
-// window in docs/known-gaps.md §B/§C opens: the broadcaster reads "success", the
+// window in docs/未实施/known-gaps.md §B/§C opens: the broadcaster reads "success", the
 // control layer goes on to remove the version's metadata, and whatever bytes this
 // node still holds lose the last row that could name them — the terminal-reclaim
 // queue, the delete flow's re-discovery and the startup reconcile all key off
@@ -745,6 +859,16 @@ func (h *PushHandler) VersionPresence(ctx context.Context, req *pb.VersionPresen
 // is an idempotent prefix delete, so "I hold nothing" is an ordinary outcome and
 // must not be reported as a failure.
 func (h *PushHandler) DeleteVersionData(ctx context.Context, req *pb.DeleteVersionDataRequest) (*pb.DeleteVersionDataResponse, error) {
+	if h.executionGate != nil {
+		if err := storage.RequireRequestEpoch(ctx, req.GetKnowledgeBaseId()); err != nil {
+			return nil, stratumerrors.ToGRPCStatus(err)
+		}
+	}
+	ctx, release, enterErr := storage.EnterCleanup(ctx, h.executionGate, h.directory, h.nodeID, req.GetKnowledgeBaseId())
+	if enterErr != nil {
+		return nil, stratumerrors.ToGRPCStatus(enterErr)
+	}
+	defer release()
 	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
 	if h.dropper == nil {
 		return nil, status.Errorf(codes.FailedPrecondition,
@@ -785,8 +909,11 @@ func (h *PushHandler) DeleteVersionData(ctx context.Context, req *pb.DeleteVersi
 // LocalVersion implements DataSyncService.LocalVersion: it reports how far
 // this node's contiguous history reaches for the knowledge base, which is what
 // lets a node that is behind pick a peer able to fill its gap
-// (Stratum_设计文档v13.md §7.6).
-func (h *PushHandler) LocalVersion(_ context.Context, req *pb.LocalVersionRequest) (*pb.LocalVersionResponse, error) {
+// (docs/参考/历史/Stratum_设计文档v13.md §7.6).
+func (h *PushHandler) LocalVersion(ctx context.Context, req *pb.LocalVersionRequest) (*pb.LocalVersionResponse, error) {
+	if _, err := h.bindPlacement(ctx, req.GetKnowledgeBaseId()); err != nil {
+		return nil, stratumerrors.ToGRPCStatus(err)
+	}
 	var version int64
 	if h.localVersion != nil {
 		version = h.localVersion.LocalVersionOf(req.GetKnowledgeBaseId())

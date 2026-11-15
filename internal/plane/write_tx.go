@@ -23,8 +23,18 @@ import (
 // already-allocated version: BEGIN (persisting the replay input) → the
 // per-change storage writes → COMMIT. The control layer only allocated the
 // version ID; the transaction that makes the data durable is entirely the
-// storage layer's (Stratum_设计文档v13.md §7.12).
+// storage layer's (docs/参考/历史/Stratum_设计文档v13.md §7.12).
 func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error {
+	ctx, release, enterErr := d.enterMutation(ctx, kbID)
+	if enterErr != nil {
+		return enterErr
+	}
+	defer release()
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
+		return bindErr
+	}
 	// Per-stage timings of one write transaction, at debug level.
 	//
 	// Why they are here: a dispatched write is bounded by the candidate budget
@@ -61,7 +71,7 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 
 	// One version is one Saga. Queue behind the writes already in flight for
 	// this KB instead of letting them pile up on the storage nodes
-	// (Stratum_设计文档v13.md §7.7). The wait honours ctx, so a caller that gives
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.7). The wait honours ctx, so a caller that gives
 	// up stops waiting rather than holding a place it no longer wants.
 	stepStart := time.Now()
 	if err := d.limiter.Acquire(ctx, kbID); err != nil {
@@ -75,7 +85,7 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 	tLocal = time.Since(stepStart)
 	if err != nil {
 		// The storage layer reports that an attempt failed; the control layer
-		// owns the terminal verdict (Stratum_设计文档v13.md §10.1).
+		// owns the terminal verdict (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 		d.reportFailure(ctx, kbID, versionID, classifyLocalWriteFailure(err), fmt.Sprintf("local write failed: %v", err))
 		return err
 	}
@@ -87,7 +97,7 @@ func (d *LocalDataPlane) WriteVersionData(ctx context.Context, kbID string, vers
 }
 
 // classifyLocalWriteFailure decides how the control layer should treat a failed
-// local write (Stratum_设计文档v13.md §10.1).
+// local write (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 //
 // Only the cases that no amount of retrying can fix are fatal: a knowledge base
 // that is gone, or input the state machine will keep rejecting. Everything
@@ -131,6 +141,16 @@ type localStages struct {
 // the data it claims. Writing the commit without that ordering is the silent
 // version of this bug: recovery trusts a present COMMIT and never replays.
 func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange, st *localStages) ([]string, error) {
+	ctx, release, enterErr := d.enterMutation(ctx, kbID)
+	if enterErr != nil {
+		return nil, enterErr
+	}
+	defer release()
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
+		return nil, bindErr
+	}
 	if d.wal == nil || d.executor == nil {
 		return nil, fmt.Errorf("plane: WriteVersionData: the storage write transaction is not configured")
 	}
@@ -181,6 +201,16 @@ func (d *LocalDataPlane) writeLocalTransaction(ctx context.Context, kbID string,
 // recovery drove this path). Same durability barrier as writeLocalTransaction —
 // the storage step flushes the chunk vectors before the COMMIT vouches for them.
 func (d *LocalDataPlane) ResumeVersionWrite(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error {
+	ctx, release, enterErr := d.enterMutation(ctx, kbID)
+	if enterErr != nil {
+		return enterErr
+	}
+	defer release()
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
+		return bindErr
+	}
 	if d.wal == nil || d.executor == nil {
 		return fmt.Errorf("plane: ResumeVersionWrite: the storage write transaction is not configured")
 	}

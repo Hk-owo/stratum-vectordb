@@ -8,6 +8,7 @@ import (
 	"time"
 
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/storage"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -24,9 +25,10 @@ import (
 // It is not a substitute for the real kvserver-Raft-backed implementation's
 // own tests, which additionally cover multi-node consensus, leader
 // election, and network partition behavior (see T3-* / T4-* in
-// Stratum_测试顺序.md).
+// docs/已实施/Stratum_测试顺序.md).
 type MockRaftNode struct {
-	mu sync.Mutex
+	mu        sync.Mutex
+	directory storage.Directory
 
 	wal wal.WAL // used by ProposeCreateVersion to enforce the WAL-before-state-machine ordering
 
@@ -36,7 +38,7 @@ type MockRaftNode struct {
 	nextVersionID int64
 	// versionsByRequest mirrors the real state machine's idempotency map so
 	// the two implementations agree on retry semantics
-	// (Stratum_设计文档v13.md §7.12). Tests are short-lived, so unlike the
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.12). Tests are short-lived, so unlike the
 	// real state machine this map is not pruned on version/KB removal.
 	versionsByRequest map[string]int64
 }
@@ -48,6 +50,7 @@ type MockRaftNode struct {
 // RaftNodeImpl would be wired to the real WAL implementation.
 func NewMockRaftNode(w wal.WAL) *MockRaftNode {
 	return &MockRaftNode{
+		directory:         storage.NewDirectory(),
 		wal:               w,
 		kbs:               make(map[string]types.KnowledgeBaseMeta),
 		versions:          make(map[int64]types.VersionMeta),
@@ -71,8 +74,33 @@ func (r *MockRaftNode) IsLeader() bool {
 func (r *MockRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBaseMeta) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.createKBLocked(kb, nil)
+}
+
+func (r *MockRaftNode) createKBLocked(kb types.KnowledgeBaseMeta, placement *storage.Placement) error {
+	if kb.KBID == "" {
+		return stratumerrors.ErrInvalidArgument
+	}
+	if _, deleted := r.directory.Tombstones[kb.KBID]; deleted {
+		return stratumerrors.ErrKnowledgeBaseDeleted
+	}
+	if _, assigned := r.directory.Placements[kb.KBID]; assigned {
+		return stratumerrors.ErrInvalidArgument
+	}
 	if kb.Status == 0 {
 		kb.Status = types.KBStatusActive
+	}
+	if placement != nil && kb.Status != types.KBStatusActive {
+		return stratumerrors.ErrInvalidArgument
+	}
+	if len(r.directory.Nodes) > 0 && kb.Status == types.KBStatusActive {
+		p := r.directory.InitialPlacement(kb.KBID, "create/"+kb.KBID)
+		if placement != nil {
+			p = placement.Clone()
+		}
+		if err := r.directory.AssignNew(p); err != nil {
+			return err
+		}
 	}
 	r.kbs[kb.KBID] = kb
 	return nil
@@ -81,11 +109,15 @@ func (r *MockRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBase
 func (r *MockRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.migrationBlocksLocked(newMarkKBDeletingCommand(kbID)) {
+		return stratumerrors.ErrMigrationInProgress
+	}
 	kb, ok := r.kbs[kbID]
 	if !ok {
 		return stratumerrors.ErrKnowledgeBaseNotFound
 	}
 	kb.Status = types.KBStatusDeleting
+	r.directory.Delete(kbID)
 	r.kbs[kbID] = kb
 	return nil
 }
@@ -93,6 +125,9 @@ func (r *MockRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) err
 func (r *MockRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, kbID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.migrationBlocksLocked(newMarkKBDeleteFailedCommand(kbID)) {
+		return stratumerrors.ErrMigrationInProgress
+	}
 	kb, ok := r.kbs[kbID]
 	if !ok {
 		return stratumerrors.ErrKnowledgeBaseNotFound
@@ -109,6 +144,12 @@ func (r *MockRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, kbID string)
 func (r *MockRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.migrationBlocksLocked(newRemoveKBMetaCommand(kbID)) {
+		return stratumerrors.ErrMigrationInProgress
+	}
+	if _, exists := r.kbs[kbID]; exists {
+		r.directory.Delete(kbID)
+	}
 	delete(r.kbs, kbID)
 	for _, vID := range r.versionsByKB[kbID] {
 		delete(r.versions, vID)
@@ -139,6 +180,10 @@ func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, pa
 		if id, ok := r.versionsByRequest[requestKey(kbID, clientRequestID)]; ok {
 			return id, nil
 		}
+	}
+
+	if _, active := r.directory.ActiveMigration(kbID); active {
+		return 0, stratumerrors.ErrMigrationInProgress
 	}
 
 	// parentVersionID == 0 is treated as "no parent" (initial version of a
@@ -176,7 +221,7 @@ func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, pa
 	// Critical ordering: WAL.WriteVersionID must succeed before the
 	// version is allocated into the state machine. This is what
 	// eliminates orphan versions on crash recovery — see the WAL package
-	// doc comment and Stratum_设计文档v10.md "关键时序约束".
+	// doc comment and docs/参考/历史/Stratum_设计文档v10.md "关键时序约束".
 	if r.wal != nil {
 		if err := r.wal.WriteVersionID(ctx, kbID, versionID); err != nil {
 			return 0, fmt.Errorf("raft: WAL.WriteVersionID failed during apply: %w", err)
@@ -200,13 +245,16 @@ func (r *MockRaftNode) ProposeCreateVersion(ctx context.Context, kbID string, pa
 }
 
 // ProposeMarkVersionFailedPermanent mirrors the real state machine's terminal
-// verdict, for the side the verdict names (Stratum_设计文档v13.md §10.1/§10.1b).
+// verdict, for the side the verdict names (docs/参考/历史/Stratum_设计文档v13.md §10.1/§10.1b).
 func (r *MockRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	v, ok := r.versions[versionID]
 	if !ok || v.KBID != kbID {
 		return stratumerrors.ErrVersionNotFound
+	}
+	if m, active := r.directory.ActiveMigration(kbID); active && m.BlocksDataWrites() && side != types.FailureSideIndex && v.DataStatus != types.DataStatusFailedPermanent {
+		return stratumerrors.ErrMigrationInProgress
 	}
 	switch side {
 	case types.FailureSideIndex:
@@ -222,12 +270,15 @@ func (r *MockRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, kbID
 }
 
 // ProposeRetryVersion mirrors the real state machine's revocation of one side's
-// terminal verdict (Stratum_设计文档v13.md §10.1), refusals included: only a terminal
+// terminal verdict (docs/参考/历史/Stratum_设计文档v13.md §10.1), refusals included: only a terminal
 // index side is accepted, and a data-side verdict is never retryable — so a test
 // driving the mock sees the behaviour it would get from a real cluster.
 func (r *MockRaftNode) ProposeRetryVersion(_ context.Context, kbID string, versionID int64, side types.FailureSide) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.migrationBlocksLocked(newRetryVersionCommand(kbID, versionID, side)) {
+		return stratumerrors.ErrMigrationInProgress
+	}
 	v, ok := r.versions[versionID]
 	if !ok || v.KBID != kbID {
 		return stratumerrors.ErrVersionNotFound
@@ -251,6 +302,9 @@ func (r *MockRaftNode) ProposeRetryVersion(_ context.Context, kbID string, versi
 func (r *MockRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, blocked := r.directory.ServiceBlocks[nodeID]; nodeID > 0 && blocked {
+		return stratumerrors.ErrStorageServicePaused
+	}
 	v, ok := r.versions[versionID]
 	if !ok {
 		return stratumerrors.ErrVersionNotFound
@@ -265,7 +319,7 @@ func (r *MockRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID i
 
 // ProposeMarkVersionDataDurable mirrors the state machine's data-side promotion:
 // only a PENDING side moves, so a reconcile snapshot cannot undo a verdict
-// (Stratum_设计文档v13.md §10.1b).
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 func (r *MockRaftNode) ProposeMarkVersionDataDurable(_ context.Context, versionID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -288,6 +342,9 @@ func (r *MockRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID 
 	if !ok {
 		return stratumerrors.ErrVersionNotFound
 	}
+	if m, active := r.directory.ActiveMigration(v.KBID); active && m.BlocksDataWrites() && v.DocIDSetHash != docIDSetHash {
+		return stratumerrors.ErrKBWritePaused
+	}
 	v.DocIDSetHash = docIDSetHash
 	r.versions[versionID] = v
 	return nil
@@ -301,6 +358,9 @@ func (r *MockRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID 
 func (r *MockRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.migrationBlocksLocked(newRollbackCommand(kbID, targetVersionID)) {
+		return stratumerrors.ErrMigrationInProgress
+	}
 	kb, ok := r.kbs[kbID]
 	if !ok {
 		return stratumerrors.ErrKnowledgeBaseNotFound
@@ -325,6 +385,9 @@ func (r *MockRaftNode) ProposeRollback(_ context.Context, kbID string, targetVer
 func (r *MockRaftNode) ProposeMarkVersionDeleting(_ context.Context, kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.migrationBlocksLocked(newMarkVersionDeletingCommand(kbID, versionID, mode)) {
+		return nil, stratumerrors.ErrMigrationInProgress
+	}
 	if _, ok := r.kbs[kbID]; !ok {
 		return nil, stratumerrors.ErrKnowledgeBaseNotFound
 	}
@@ -474,6 +537,9 @@ func (r *MockRaftNode) mockSpliceParent(kbID string, parentVersionID int64) int6
 func (r *MockRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.migrationBlocksLocked(newRemoveVersionMetaCommand(kbID, versionID)) {
+		return stratumerrors.ErrMigrationInProgress
+	}
 	v, ok := r.versions[versionID]
 	if !ok {
 		return nil
@@ -518,7 +584,7 @@ func (r *MockRaftNode) VersionLiveness(_ context.Context, kbID string, fromExclu
 // ProposeDiscardVersion implements RaftNode.
 //
 // The mock mirrors the state machine's compare-and-set so service-level tests
-// exercise the same admission rule (docs/await-version-plan.md §5 contract 7):
+// exercise the same admission rule (docs/已实施/await-version-plan.md §5 contract 7):
 // only a PENDING, non-active, childless version can be discarded. Unlike the
 // mock's other removals it ALSO prunes versionsByRequest — that pruning is part
 // of what discarding means (a re-send under the same key must allocate a new
@@ -527,6 +593,9 @@ func (r *MockRaftNode) VersionLiveness(_ context.Context, kbID string, fromExclu
 func (r *MockRaftNode) ProposeDiscardVersion(_ context.Context, kbID string, versionID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.migrationBlocksLocked(newDiscardVersionCommand(kbID, versionID)) {
+		return stratumerrors.ErrMigrationInProgress
+	}
 	kb, ok := r.kbs[kbID]
 	if !ok {
 		return stratumerrors.ErrKnowledgeBaseNotFound
@@ -704,6 +773,8 @@ func (r *MockRaftNode) Reset() {
 	r.versions = make(map[int64]types.VersionMeta)
 	r.versionsByKB = make(map[string][]int64)
 	r.nextVersionID = 1
+	r.directory = storage.NewDirectory()
+	r.versionsByRequest = make(map[string]int64)
 }
 
 var _ RaftNode = (*MockRaftNode)(nil)

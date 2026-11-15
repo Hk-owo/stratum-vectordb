@@ -32,6 +32,7 @@ func TestToGRPCStatus(t *testing.T) {
 		{"ErrInvalidParentVersion", ErrInvalidParentVersion, codes.InvalidArgument, false},
 		{"ErrParentNotDurable", ErrParentNotDurable, codes.FailedPrecondition, false},
 		{"ErrNoLeaderYet", ErrNoLeaderYet, codes.Unavailable, false},
+		{"ErrStorageServicePaused", ErrStorageServicePaused, codes.Unavailable, false},
 		{"unknown error", errors.New("unknown"), codes.Internal, false},
 		{"nil", nil, codes.OK, true},
 	}

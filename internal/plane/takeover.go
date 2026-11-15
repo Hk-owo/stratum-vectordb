@@ -22,7 +22,7 @@ import (
 )
 
 // takeoverTimeout is how long a replica waits for the coordinator's "quorum
-// reached" signal before checking for itself (Stratum_设计文档v13.md §7.3).
+// reached" signal before checking for itself (docs/参考/历史/Stratum_设计文档v13.md §7.3).
 // Short by design: replicas sit on the same LAN as the coordinator, and the
 // cost of waiting too long is a version stranded in PENDING. Like the other
 // §10.4 numbers it is a placeholder.
@@ -92,7 +92,7 @@ const maxTakeoverRetryDelay = 5 * time.Second
 // "the third replica caught up later" self-healing: the late replica announces
 // the version itself, so no single node has to poll forever.
 func (d *LocalDataPlane) WatchVersionWrite(kbID string, versionID int64) {
-	if d.control == nil || d.resolveReplicas == nil || d.presence == nil || d.digest == nil {
+	if d.control == nil || !d.hasReplicaResolver() || d.presence == nil || d.digest == nil {
 		return // takeover not wired; the client-retry path still covers this
 	}
 	d.armTakeover(kbID, versionID, 0, d.takeoverTimeout)
@@ -108,7 +108,7 @@ func (d *LocalDataPlane) WatchVersionWrite(kbID string, versionID int64) {
 // confirmed. The announcement has to come from the same quorum check every
 // other replica runs (attemptTakeover), which is what this arms.
 func (d *LocalDataPlane) watchForDurability(ctx context.Context, kbID string, versionID int64) {
-	if d.control == nil || d.resolveReplicas == nil || d.presence == nil || d.digest == nil {
+	if d.control == nil || !d.hasReplicaResolver() || d.presence == nil || d.digest == nil {
 		return
 	}
 	// Cheap gate first: a version already announced needs no timer at all, and
@@ -158,7 +158,7 @@ func (d *LocalDataPlane) armTakeover(kbID string, versionID int64, attempts int,
 
 // ConfirmVersionWrite cancels the takeover timer: the coordinator reported that
 // the version reached quorum, so there is nothing left for a replica to
-// announce (Stratum_设计文档v13.md §7.3).
+// announce (docs/参考/历史/Stratum_设计文档v13.md §7.3).
 func (d *LocalDataPlane) ConfirmVersionWrite(kbID string, versionID int64) {
 	key := failureKey(kbID, versionID)
 	d.takeoverMu.Lock()
@@ -204,6 +204,11 @@ func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64, gen uint6
 	// now, and the announcement is this node's own business.
 	ctx, cancel := context.WithTimeout(context.Background(), d.takeoverCheckTimeout)
 	defer cancel()
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
+		return
+	}
 
 	// Already announced? Then there is nothing to say. This is the check that
 	// makes arming on every pull affordable: without it every fetch of an
@@ -221,7 +226,7 @@ func (d *LocalDataPlane) attemptTakeover(kbID string, versionID int64, gen uint6
 		}
 	}
 
-	peers, err := d.resolveReplicas(ctx)
+	peers, err := d.replicaPeers(ctx, kbID)
 	if err != nil {
 		d.logger.Warn("plane: takeover: resolve replicas",
 			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
@@ -307,7 +312,7 @@ func (d *LocalDataPlane) retryTakeover(kbID string, versionID int64, attempts in
 
 // SafeDurableVersion reports the highest version this node may claim durable
 // for kbID after a restart: the largest version a quorum's worth of cursors
-// still reaches (Stratum_设计文档v13.md §7.8).
+// still reaches (docs/参考/历史/Stratum_设计文档v13.md §7.8).
 //
 // The contiguous cursor lives in memory, so a restarted node starts at 0 and
 // cannot tell how far behind it is. Asking the peers is the only way to find
@@ -320,10 +325,15 @@ func (d *LocalDataPlane) retryTakeover(kbID string, versionID int64, attempts in
 // there is nobody to disagree with. An error means a quorum could not be
 // assembled: "no answer" must never be mistaken for "no data".
 func (d *LocalDataPlane) SafeDurableVersion(ctx context.Context, kbID string) (int64, bool, error) {
-	if d.cursorQuerier == nil || d.resolveReplicas == nil {
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
+		return 0, false, bindErr
+	}
+	if d.cursorQuerier == nil || !d.hasReplicaResolver() {
 		return 0, false, nil
 	}
-	peers, err := d.resolveReplicas(ctx)
+	peers, err := d.replicaPeers(ctx, kbID)
 	if err != nil {
 		return 0, false, fmt.Errorf("plane: SafeDurableVersion: resolve replicas: %w", err)
 	}

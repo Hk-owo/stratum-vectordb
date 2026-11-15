@@ -457,7 +457,7 @@ func TestRemoteRaftNode_SkipsAFailingReadNode(t *testing.T) {
 
 // TestRemoteRaftNode_GetVersionReadsOneVersionAndReportsMissing covers the
 // storage node's shape of a single-version read: the await path
-// (docs/await-version-plan.md §7 Step 2), and — since a storage node serves the
+// (docs/已实施/await-version-plan.md §7 Step 2), and — since a storage node serves the
 // query path — the meta stage of EVERY query. A storage node has no state
 // machine, so this goes to the control tier; what it must not do is drag the
 // whole chain along (§F's second half: "look at one version, read one version").
@@ -508,3 +508,184 @@ func TestRemoteRaftNode_GetVersionReadsOneVersionAndReportsMissing(t *testing.T)
 		t.Error("GetVersion with an unreachable control tier = nil error, want a failure")
 	}
 }
+
+// TestRemoteReadsPreferTheControlNodeThatAnswered is the regression for a measured
+// waste: readAtAnyControl walked the control nodes in ID order, so a storage node
+// whose leader was not the lowest ID paid one failed round trip on EVERY metadata
+// read (including the directory read on its own timer).
+//
+// Measured on the 5-storage-node cluster during a performance run:
+// `Unavailable/GetStorageDirectory` 1,264 times on control1 + 1,259 on control2
+// against 1,284 successful answers.
+func TestRemoteReadsPreferTheControlNodeThatAnswered(t *testing.T) {
+	peers := newFakeControlPeers(t, 2)
+	// Node 2 is the one that answers (a follower answers Unavailable, like the real
+	// leader-only directory read does).
+	peers.setLeader(2)
+	rn := peers.remote(t)
+
+	if _, err := rn.GetNodeStorageDirectory(context.Background(), 11); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if got := peers.calls(1); got != 1 {
+		t.Errorf("follower 1 was asked %d time(s) on the first read, want 1 (discovery)", got)
+	}
+	if got := peers.calls(2); got != 1 {
+		t.Errorf("answerer 2 was asked %d time(s) on the first read, want 1", got)
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, err := rn.GetNodeStorageDirectory(context.Background(), 11); err != nil {
+			t.Fatalf("read %d: %v", i+2, err)
+		}
+	}
+	if got := peers.calls(1); got != 1 {
+		t.Errorf("follower 1 was asked %d time(s) after the first read, want 1 — reads still start at the lowest ID", got)
+	}
+	if got := peers.calls(2); got != 6 {
+		t.Errorf("answerer 2 was asked %d time(s), want 6 (once per read)", got)
+	}
+}
+
+// TestRemoteReadsFollowALeadershipChange: a remembered node that stops answering
+// costs exactly one failed probe, then the preference moves.
+func TestRemoteReadsFollowALeadershipChange(t *testing.T) {
+	peers := newFakeControlPeers(t, 3)
+	peers.setLeader(1)
+	rn := peers.remote(t)
+	if _, err := rn.GetNodeStorageDirectory(context.Background(), 11); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	// Leadership moves to node 3.
+	peers.setLeader(3)
+	if _, err := rn.GetNodeStorageDirectory(context.Background(), 11); err != nil {
+		t.Fatalf("read after the change: %v", err)
+	}
+	if got := peers.calls(3); got != 1 {
+		t.Errorf("new answerer 3 was asked %d time(s), want 1", got)
+	}
+	before := peers.calls(1)
+	for i := 0; i < 3; i++ {
+		if _, err := rn.GetNodeStorageDirectory(context.Background(), 11); err != nil {
+			t.Fatalf("read %d after the change: %v", i, err)
+		}
+	}
+	if got := peers.calls(1); got != before {
+		t.Errorf("the deposed node was asked %d more time(s) after the new one answered, want 0", got-before)
+	}
+}
+
+// TestOrderFromPreferred pins the arithmetic: nothing learned, a preferred ID that
+// is no longer configured, and "every ID appears exactly once".
+func TestOrderFromPreferred(t *testing.T) {
+	cases := []struct {
+		ids       []int64
+		preferred int64
+		want      []int64
+	}{
+		{[]int64{1, 2, 3}, 0, []int64{1, 2, 3}},
+		{[]int64{1, 2, 3}, 2, []int64{2, 1, 3}},
+		{[]int64{1, 2, 3}, 3, []int64{3, 1, 2}},
+		{[]int64{1, 2, 3}, 9, []int64{9, 1, 2, 3}}, // not configured any more: one wasted probe
+		{[]int64{7}, 1, []int64{7}},                // single node: nothing to reorder
+	}
+	for _, c := range cases {
+		got := orderFromPreferred(append([]int64(nil), c.ids...), c.preferred)
+		if len(got) != len(c.want) {
+			t.Fatalf("orderFromPreferred(%v, %d) = %v, want %v", c.ids, c.preferred, got, c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("orderFromPreferred(%v, %d) = %v, want %v", c.ids, c.preferred, got, c.want)
+			}
+		}
+	}
+}
+
+// dirControlNode answers only the directory read, and only when it is the leader —
+// which is the shape that matters here: every other control RPC may be answered by
+// any node, so a follower is a perfectly good metadata source EXCEPT for the
+// directory.
+type dirControlNode struct {
+	pb.UnimplementedInternalServiceServer
+	mu     sync.Mutex
+	leader bool
+	calls  int
+}
+
+func (f *dirControlNode) GetStorageDirectory(context.Context, *pb.GetStorageDirectoryRequest) (*pb.GetStorageDirectoryResponse, error) {
+	f.mu.Lock()
+	f.calls++
+	leader := f.leader
+	f.mu.Unlock()
+	if !leader {
+		return nil, status.Error(codes.Unavailable, "router: no leader available")
+	}
+	return &pb.GetStorageDirectoryResponse{Revision: 3}, nil
+}
+
+// fakeControlPeers is a control group in which exactly one node answers the
+// directory read.
+type fakeControlPeers struct {
+	nodes map[int64]*dirControlNode
+	rn    *RemoteRaftNode
+}
+
+func newFakeControlPeers(t *testing.T, n int) *fakeControlPeers {
+	t.Helper()
+	nodes := make(map[int64]*dirControlNode, n)
+	addrs := make(map[int64]string, n)
+	listeners := make(map[int64]*bufconn.Listener, n)
+	servers := make([]*grpc.Server, 0, n)
+	for i := 1; i <= n; i++ {
+		id := int64(i)
+		node := &dirControlNode{}
+		lis := bufconn.Listen(1 << 20)
+		srv := grpc.NewServer()
+		pb.RegisterInternalServiceServer(srv, node)
+		go func(s *grpc.Server, l *bufconn.Listener) { _ = s.Serve(l) }(srv, lis)
+		nodes[id] = node
+		addrs[id] = fmt.Sprintf("control-%d", id)
+		listeners[id] = lis
+		servers = append(servers, srv)
+	}
+	rn := &RemoteRaftNode{
+		ControlAddrs: addrs,
+		Dial: func(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+			id, err := strconv.ParseInt(strings.TrimPrefix(addr, "control-"), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("unexpected address %q", addr)
+			}
+			lis, ok := listeners[id]
+			if !ok {
+				return nil, fmt.Errorf("no listener for %q", addr)
+			}
+			return grpc.NewClient("passthrough:///"+addr,
+				grpc.WithContextDialer(func(c context.Context, _ string) (net.Conn, error) { return lis.DialContext(c) }),
+				grpc.WithTransportCredentials(insecure.NewCredentials()))
+		},
+	}
+	t.Cleanup(func() {
+		for _, s := range servers {
+			s.Stop()
+		}
+	})
+	return &fakeControlPeers{nodes: nodes, rn: rn}
+}
+
+func (p *fakeControlPeers) setLeader(id int64) {
+	for nodeID, n := range p.nodes {
+		n.mu.Lock()
+		n.leader = nodeID == id
+		n.mu.Unlock()
+	}
+}
+
+func (p *fakeControlPeers) calls(id int64) int {
+	n := p.nodes[id]
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.calls
+}
+
+func (p *fakeControlPeers) remote(*testing.T) *RemoteRaftNode { return p.rn }

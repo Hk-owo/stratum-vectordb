@@ -90,6 +90,7 @@ func main() {
 	defer func() { _ = logger.Sync() }()
 
 	cfg := router.Config{
+		RequireDirectory:      true,
 		Addrs:                 addrs,
 		StorageAddrs:          storage,
 		OwnerInactiveK:        *ownerInactiveK,
@@ -97,7 +98,7 @@ func main() {
 		RouteRefreshInterval:  *routeRefresh,
 		Logger:                logger,
 		// The mark is what makes "this came through the station" a claim a node
-		// can check (H4 of docs/code-review-2026-09-24.md). Without a secret it
+		// can check (H4 of docs/参考/code-review-2026-09-24.md). Without a secret it
 		// stamps nothing, which is only safe for nodes that do not require the
 		// mark — those nodes have no station_secret either.
 		Mark: authmeta.NewSigner([]byte(*stationSecret), 0),
@@ -151,6 +152,7 @@ func main() {
 	pb.RegisterKnowledgeBaseServiceServer(gs, router.NewKBServer(rt))
 	pb.RegisterQueryServiceServer(gs, router.NewQueryServer(rt))
 	pb.RegisterAdminServiceServer(gs, router.NewAdminServer(rt))
+	pb.RegisterStorageAdminServiceServer(gs, router.NewStorageAdminServer(rt))
 
 	lis, err := net.Listen("tcp", *listen)
 	if err != nil {

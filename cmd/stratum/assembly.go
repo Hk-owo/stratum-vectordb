@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -16,11 +17,13 @@ import (
 	"stratum/internal/coordinator"
 	"stratum/internal/docstore"
 	"stratum/internal/embed"
+	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
 	"stratum/internal/nodestate"
 	"stratum/internal/plane"
 	"stratum/internal/raft"
 	"stratum/internal/splitter"
+	"stratum/internal/storage"
 	stratumsync "stratum/internal/sync"
 	"stratum/internal/tombstone"
 	"stratum/internal/types"
@@ -38,9 +41,10 @@ import (
 // service locator: every field is written once by the stage that builds it, and
 // the stage methods below read only what earlier stages produced.
 type nodeAssembly struct {
-	cfg    appConfig
-	logger *zap.Logger
-	ctx    context.Context
+	executionGate *storage.ExecutionGate
+	cfg           appConfig
+	logger        *zap.Logger
+	ctx           context.Context
 
 	// The metadata channel, and Raft's own log (which every node keeps).
 	walImpl  *wal.FileWAL
@@ -360,7 +364,7 @@ func (a *nodeAssembly) wireDataPlane() {
 	// writing, or a node running its startup reconcile. Raft still only
 	// appends on the leader, so the access layer carries those proposals
 	// there instead of the caller having to know who leads
-	// (Stratum_设计文档v13.md §7.3/§7.8).
+	// (docs/参考/历史/Stratum_设计文档v13.md §7.3/§7.8).
 	// Only a node that holds a log forwards a proposal to whoever leads; a
 	// storage node reports through the same commands, but they travel to a
 	// control node that appends them (RemoteRaftNode).
@@ -396,10 +400,10 @@ func (a *nodeAssembly) wireDataPlane() {
 
 	// DataPlane owns "does this node need the version's data, and where from"
 	// (stage ① of the control/data separation: replication moved inside the
-	// storage layer — control-data-separation-design.md §7).
+	// storage layer — docs/已实施/control-data-separation-design.md §7).
 	// Write-path replication: the coordinator exports the version's records to
 	// the other replicas and requires a quorum of acknowledgements before the
-	// storage layer reports it durable (Stratum_设计文档v13.md §7.1/§7.2).
+	// storage layer reports it durable (docs/参考/历史/Stratum_设计文档v13.md §7.1/§7.2).
 	if storageLocal {
 		syncPusher = stratumsync.NewPusher(stratumsync.PusherConfig{
 			Exporter: syncLeader,
@@ -407,7 +411,7 @@ func (a *nodeAssembly) wireDataPlane() {
 		})
 	}
 
-	// §8.5's fourth layer (docs/data-source-holders-fallback-plan.md): the table
+	// §8.5's fourth layer (docs/已实施/data-source-holders-fallback-plan.md): the table
 	// above is filled only by a writer's confirmation, which is a bounded
 	// fire-and-forget broadcast. A replica that missed it has no source at all —
 	// the leader this lookup falls back to is the control leader, which in a
@@ -436,7 +440,8 @@ func (a *nodeAssembly) wireDataPlane() {
 	}
 
 	dataPlane = plane.NewLocalDataPlane(dataPlaneDeps{
-		cfg: cfg, logger: logger, rn: rn, controlPlane: controlPlane,
+		executionGate: a.executionGate,
+		cfg:           cfg, logger: logger, rn: rn, controlPlane: controlPlane,
 		indexMgr: indexMgr, vd: vd, ds: ds, cdm: cdm, chunkStore: chunkStore,
 		vBloomStore: vBloomStore, walImpl: walImpl, writeCoord: writeCoord,
 		syncFollower: syncFollower, syncPusher: syncPusher,
@@ -461,6 +466,8 @@ func (a *nodeAssembly) wireDataPlane() {
 	// landed here, and this plane is what owns the cursor §9.3(2) reads. Wired
 	// after the plane exists because the follower is built well before it.
 	if syncFollower != nil {
+		syncFollower.SetExecutionGate(a.executionGate)
+		syncFollower.SetStoragePlacement(rn.(storage.Reader).GetKBPlacement, cfg.NodeID)
 		syncFollower.SetLocalVersionAdvancer(dataPlane)
 		// An empty transfer is ambiguous — a version with no documents and a source
 		// with no data for it look identical on the wire — and the writer's committed
@@ -488,9 +495,10 @@ func (a *nodeAssembly) wireDataPlane() {
 	// candidates are the storage group and every dispatch is remote, which is what
 	// the topology asks for.
 	dispatcherCfg := plane.CoordinatorDispatcherConfig{
-		Replicas: resolveReplicaAddrs,
-		SelfAddr: topology.localAddr,
-		Logger:   logger,
+		Placement: rn.(storage.Reader).GetKBPlacement,
+		Replicas:  resolveReplicaAddrs,
+		SelfAddr:  topology.localAddr,
+		Logger:    logger,
 		// dispatcher.*: one candidate's budget — a floor, a per-document
 		// allowance and the cap on their sum. Zero takes the plane's defaults.
 		CandidateTimeout:       cfg.CandidateTimeout,
@@ -504,7 +512,7 @@ func (a *nodeAssembly) wireDataPlane() {
 			DemoteFor:   cfg.HealthDemoteFor,
 		}),
 	}
-	// docs/storage-node-state-machine-plan.md §3.2: this node's own redundancy
+	// docs/已实施/storage-node-state-machine-plan.md §3.2: this node's own redundancy
 	// verdict — what IT observed while reaching its peers, not the control
 	// leader's aggregate over everyone's reports. The two are computed from
 	// different evidence, which is why they are expected to disagree; neither is
@@ -595,7 +603,7 @@ func (a *nodeAssembly) recoverStartup(records []types.PendingRecord) []plane.Ver
 	// Startup maintenance across the contract: the storage layer trims index
 	// files by the retention policy, then reconciles — and the control layer
 	// promotes versions whose READY proposal was lost
-	// (control-data-separation-design.md §5.3/§7). Retention runs first so the
+	// (docs/已实施/control-data-separation-design.md §5.3/§7). Retention runs first so the
 	// reconcile sees post-retention disk facts.
 	// Both halves are about on-disk index facts this node is assumed to have.
 	//
@@ -608,7 +616,7 @@ func (a *nodeAssembly) recoverStartup(records []types.PendingRecord) []plane.Ver
 		}
 		epochDurable = reconcileIndexStatus(ctx, logger, a.dataPlane, controlPlane, rn, cfg.IndexRetentionCount)
 
-		// docs/storage-node-state-machine-plan.md §5.1: project the reconciled
+		// docs/已实施/storage-node-state-machine-plan.md §5.1: project the reconciled
 		// disk facts into the version layer. Done ONCE, here, before the node
 		// serves — which is what lets every later reader treat the machine as
 		// complete, with no "no entry, go ask the disk" fallback on the read
@@ -688,7 +696,7 @@ func (a *nodeAssembly) recoverStartup(records []types.PendingRecord) []plane.Ver
 	//
 	// It existed to bound the removal records, because every judgement about "was this
 	// version removed?" read them — and a record that pruning had dropped took the evidence
-	// with it (docs/known-gaps.md §B: "delete a version below the watermark" and the row is
+	// with it (docs/未实施/known-gaps.md §B: "delete a version below the watermark" and the row is
 	// gone on the next tick). That judgement no longer reads them (see
 	// plane.VersionLivenessLister): it reads the CURRENT state — an allocation counter that
 	// only grows and the live version list. So a pruned row now costs an operator a
@@ -701,7 +709,7 @@ func (a *nodeAssembly) recoverStartup(records []types.PendingRecord) []plane.Ver
 	// the snapshot field, the internal read and the loop that drove them are gone.
 
 	// Bounds how many on-apply version transfers run at once (M19 of
-	// docs/code-review-2026-10-18.md). A bulk import — or a log replay after a
+	// docs/参考/code-review-2026-10-18.md). A bulk import — or a log replay after a
 	// restart — produces one cmdCreateVersion per version, and raft/impl.go runs this
 	// hook on its own goroutine for each of them. Every hook that decides it needs the
 	// data then starts a whole version transfer, so N versions meant N simultaneous
@@ -720,6 +728,14 @@ func (a *nodeAssembly) recoverStartup(records []types.PendingRecord) []plane.Ver
 		raftNode.SetOnVersionFailedPermanent(a.dataPlane.NoteTerminalVersion)
 
 		raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
+			owned, err := a.dataPlane.OwnsKnowledgeBase(ctx, kbID)
+			if err != nil {
+				logger.Debug("placement unavailable; chain-tail catch-up will retry", zap.String("kb_id", kbID), zap.Error(err))
+				return
+			}
+			if !owned {
+				return
+			}
 			// Take a transfer slot before doing any work, and give it back however this
 			// returns. A caller that gives up (shutdown) just leaves the version to the
 			// next sweep — the data is not lost, only not fetched now.
@@ -784,6 +800,46 @@ func (a *nodeAssembly) recoverStartup(records []types.PendingRecord) []plane.Ver
 		raftNode.SetOnVersionCommittedAsLeader(func(kbID string, versionID, parentVersionID int64, clientRequestID string) {
 			dispatchCommittedVersion(a.writeCoord, a.writeDispatcher, logger, kbID, versionID, parentVersionID, clientRequestID)
 		})
+		go func() {
+			client := &stratumsync.FenceClient{}
+			defer client.Close()
+			(&storage.FenceScheduler{Manager: raftNode, IsLeader: raftNode.IsLeader, Versions: raftNode.ListVersions, Fence: client.Fence, Stage: client.Stage, Install: client.Install, Serve: client.PrepareServing, Activate: client.Activate, Cleanup: client.Cleanup, Revoke: func(c context.Context, nodeID int64, block storage.ServiceBlock) error {
+				return raftNode.WaitStorageServiceRevoked(c, storage.ServiceRequest{NodeID: nodeID, OperationID: block.OperationID, BlockRevision: block.Revision})
+			}, Logger: logger.Named("migration")}).Run(ctx)
+		}()
+
+		// Configuration seeds an empty directory only. Persisted runtime node
+		// registrations and draining state survive restarts unchanged.
+		go func() {
+			nodes, err := a.topology.directoryNodes()
+			if err != nil {
+				logger.Error("storage directory bootstrap refused", zap.Error(err))
+				return
+			}
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				if raftNode.IsLeader() {
+					attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
+					err := storage.Initialize(attempt, raftNode, nodes)
+					cancel()
+					if err == nil {
+						logger.Info("storage directory initialized")
+						return
+					}
+					if errors.Is(err, stratumerrors.ErrPlacementChangeUnsafe) {
+						logger.Error("storage directory differs from deployment; topology migration is required", zap.Error(err))
+						return
+					}
+					logger.Warn("storage directory bootstrap will retry", zap.Error(err))
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
 
 		// The one state a delete can reach and never leave: DeleteVersion marks the
 		// version set in the state machine (durable, replicated, and where the API
@@ -803,7 +859,7 @@ func (a *nodeAssembly) recoverStartup(records []types.PendingRecord) []plane.Ver
 		go coordinator.NewDeletingVersionSweeper(raftNode, raftNode, a.deleteVersionCoord, cfg.DeletingVersionSweepInterval, logger).Run(ctx)
 
 		// The knowledge-base half of the same repair (M3 of
-		// docs/code-review-2026-10-18.md). DeleteKnowledgeBase proposes the
+		// docs/参考/code-review-2026-10-18.md). DeleteKnowledgeBase proposes the
 		// Deleting status first and starts the cleanup — which is what writes the
 		// WAL's delete mark — only afterwards, so a crash in between used to leave
 		// the KB stuck in DELETING with nothing that would finish it: no WAL record
@@ -864,7 +920,7 @@ func bootstrapNode() *nodeBoot {
 	vecstoreAddrFlag := flag.String("vecstore-addr", "", "vecstore gRPC address (default 127.0.0.1:7100)")
 	embedAddrFlag := flag.String("embed-addr", "", "embed service address (default http://localhost:8080)")
 	// How long a required replica may go quiet before the storage-redundancy
-	// verdict stops counting it live (docs/storage-degradation-signal-plan.md
+	// verdict stops counting it live (docs/已实施/storage-degradation-signal-plan.md
 	// §3.2). Zero keeps the plane's own default, which is three report intervals.
 	//
 	// A flag rather than a YAML key on purpose: it is one of the §10.4 numbers
@@ -942,7 +998,7 @@ func bootstrapNode() *nodeBoot {
 	//
 	// rn is how this process reaches replicated metadata, whoever holds it: its
 	// own Raft node when it runs one, the remote proxy when it does not
-	// (Stratum_设计文档v13.md §11 阶段 ④「存储集群独立进程」).
+	// (docs/参考/历史/Stratum_设计文档v13.md §11 阶段 ④「存储集群独立进程」).
 	//
 	// A storage node keeps no log, votes in no election and never leads, so it
 	// holds no RaftNodeImpl: raftNode stays nil and every control-layer callback
@@ -957,7 +1013,7 @@ func bootstrapNode() *nodeBoot {
 	// The station's trust mark is signed with a key shared with the station
 	// (internal/authmeta.Signer): this node verifies what the station stamped, so
 	// a "1" forged by whoever reached the port directly no longer satisfies the
-	// gate (H4 of docs/code-review-2026-09-24.md). An empty secret disables both
+	// gate (H4 of docs/参考/code-review-2026-09-24.md). An empty secret disables both
 	// halves — it stamps nothing and verifies nothing — which is what a cluster
 	// that does not require the mark needs.
 	mark := authmeta.NewSigner([]byte(cfg.StationSecret), cfg.StationMarkTTL)

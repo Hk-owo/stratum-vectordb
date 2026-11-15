@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap"
 
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/storage"
 	stratinternalsync "stratum/internal/sync"
 	"stratum/internal/types"
 )
@@ -78,8 +79,8 @@ var (
 // quorum ever formed, the version's digest was never committed, and a returning
 // node could not tell that version from an empty one — it advances over an empty
 // version without fetching anything, so the miss reads as a successful catch-up.
-func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64) {
-	if d.confirmer == nil || d.resolveReplicas == nil {
+func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64, operation ...context.Context) {
+	if d.confirmer == nil || !d.hasReplicaResolver() {
 		return
 	}
 	go func() {
@@ -88,7 +89,12 @@ func (d *LocalDataPlane) broadcastConfirmation(kbID string, versionID int64) {
 		// peer cannot starve the ones behind it.
 		ctx, cancel := context.WithTimeout(context.Background(), d.confirmBudget)
 		defer cancel()
-		peers, err := d.resolveReplicas(ctx)
+		if len(operation) > 0 {
+			if snap, ok := storage.Bound(operation[0], kbID); ok {
+				ctx = storage.Bind(ctx, snap)
+			}
+		}
+		peers, err := d.replicaPeers(ctx, kbID)
 		if err != nil {
 			return
 		}
@@ -217,17 +223,38 @@ const replicaPushTimeout = 3 * time.Second
 const pushTimeoutPerDoc = 20 * time.Millisecond
 
 func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int64, docs int, st *fanoutStages) error {
-	if d.pusher == nil || d.resolveReplicas == nil {
+	if d.placements == nil && (d.pusher == nil || !d.hasReplicaResolver()) {
 		return nil // replication not configured: the local write is the quorum
 	}
+	var bindErr error
+	ctx, bindErr = d.bindPlacement(ctx, kbID)
+	if bindErr != nil {
+		return bindErr
+	}
 	resolveStart := time.Now()
-	targets, err := d.resolveReplicas(ctx)
+	targets, err := d.replicaPeers(ctx, kbID)
 	if st != nil {
 		st.resolve = time.Since(resolveStart)
 		st.targets = len(targets)
 	}
 	if err != nil {
 		return fmt.Errorf("plane: fan-out for version %d: resolve replicas: %w", versionID, err)
+	}
+	expectedIDs := make(map[string]int64)
+	if d.placements != nil {
+		snap, _ := storage.Bound(ctx, kbID)
+		for _, node := range snap.Nodes {
+			expectedIDs[node.Addr] = node.ID
+		}
+		if len(targets)+1 != snap.Placement.RequiredReplicas {
+			return stratumerrors.ErrPlacementUnknown
+		}
+		if len(targets) == 0 {
+			return nil
+		}
+		if d.pusher == nil {
+			return stratumerrors.ErrStorageUnavailable
+		}
 	}
 	if len(targets) == 0 {
 		// 解析不出任何副本。"没有副本"在 quorum 判定上与"副本就是我自己"是同一
@@ -291,7 +318,11 @@ func (d *LocalDataPlane) fanOut(ctx context.Context, kbID string, versionID int6
 			defer wg.Done()
 			pushCtx, cancel := context.WithTimeout(ctx, pushBudget)
 			defer cancel()
-			if _, err := d.pusher.PushVersion(pushCtx, target, kbID, versionID); err != nil {
+			acceptor, err := d.pusher.PushVersion(pushCtx, target, kbID, versionID)
+			if err == nil && d.placements != nil && acceptor != expectedIDs[target] {
+				err = fmt.Errorf("replica identity mismatch: address %s acknowledged as %d, expected %d", target, acceptor, expectedIDs[target])
+			}
+			if err != nil {
 				d.logger.Warn("plane: replica push failed",
 					zap.String("replica", target), zap.String("kb_id", kbID),
 					zap.Int64("version_id", versionID), zap.Error(err))
@@ -401,7 +432,7 @@ func (d *LocalDataPlane) finishVersionWrite(ctx context.Context, kbID string, ve
 	// and their cursors would stay behind it, which the station reads as "stale"
 	// (§9.3(2)).
 	confirmStart := time.Now()
-	d.broadcastConfirmation(kbID, versionID)
+	d.broadcastConfirmation(kbID, versionID, ctx)
 	if st != nil {
 		st.confirm = time.Since(confirmStart)
 	}

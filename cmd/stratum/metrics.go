@@ -30,6 +30,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
+
+	"stratum/service"
 )
 
 // nodeMetricsSource is the node state the endpoint reads.
@@ -44,6 +46,9 @@ type nodeMetricsSource struct {
 	// ChunkStoreBytes is the chunk store's on-disk footprint
 	// (ChunkStore.DiskUsage).
 	ChunkStoreBytes func(ctx context.Context) (uint64, error)
+	// RPCMetrics is the per-method traffic the gRPC server counted. Nil means
+	// the server was assembled without it, and then no series appear.
+	RPCMetrics *service.RPCMetrics
 }
 
 // metricsRegistry builds what /metrics serves: the standard Go runtime and
@@ -62,6 +67,9 @@ func metricsRegistry(src nodeMetricsSource) *prometheus.Registry {
 			Name: "stratum_loaded_indexes",
 			Help: "Version indexes currently resident in this node's memory.",
 		}, func() float64 { return float64(src.LoadedIndexes()) }))
+	}
+	for _, c := range src.RPCMetrics.Collectors() {
+		reg.MustRegister(c)
 	}
 	if src.ChunkStoreBytes != nil {
 		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{

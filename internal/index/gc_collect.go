@@ -71,6 +71,13 @@ func (im *IndexManagerImpl) setMaintenance(key indexKey, active bool) {
 // collectCandidates turns scan candidates into collections, one at a time, each
 // gated on the control layer's answer about remaining service capacity.
 func (im *IndexManagerImpl) collectCandidates(ctx context.Context, candidates []gcCandidate) {
+	guarded, release, guardErr := im.serviceLease.Load().Enter(ctx)
+	if guardErr != nil {
+		return
+	}
+	defer release()
+	ctx = guarded
+
 	if !im.cfg.GCEnabled || len(candidates) == 0 {
 		return
 	}
@@ -168,7 +175,7 @@ func (im *IndexManagerImpl) collectCandidates(ctx context.Context, candidates []
 		// it. Clearing here (and only here, on success) is what makes the report
 		// mean "stuck now" rather than "was stuck once".
 		im.clearGCBlocked(indexKey{c.KBID, c.VersionID})
-		im.notifyArtifactRewritten(c.KBID, c.VersionID)
+		im.notifyArtifactRewritten(c.KBID, c.VersionID, ctx)
 	}
 }
 
@@ -364,12 +371,22 @@ func (im *IndexManagerImpl) collectGraphFree(ctx context.Context, kbID string, v
 // same instruction the §8.6a cold reshape gives through the same path. A version's
 // state does not change here — it stays READY throughout — only its bytes do,
 // which is exactly what distribution cares about.
-func (im *IndexManagerImpl) notifyArtifactRewritten(kbID string, versionID int64) {
+func (im *IndexManagerImpl) notifyArtifactRewritten(kbID string, versionID int64, parents ...context.Context) {
+	ctx := context.Background()
+	if len(parents) > 0 {
+		ctx = parents[0]
+	}
+	if im.serviceLease.Load().CheckContext(ctx) != nil {
+		return
+	}
 	im.mu.Lock()
-	callbacks := append([]BuildCompleteCallback(nil), im.callbacks...)
+	callbacks := im.callbacksLocked(ctx)
 	im.mu.Unlock()
 
 	for _, cb := range callbacks {
+		if im.serviceLease.Load().CheckContext(ctx) != nil {
+			return
+		}
 		if cb == nil {
 			continue
 		}

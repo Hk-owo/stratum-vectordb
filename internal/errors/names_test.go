@@ -8,9 +8,13 @@ import (
 
 // Every sentinel must survive the round trip: a proposal forwarded to the
 // leader crosses a process boundary, and the caller's errors.Is checks have to
-// keep working afterwards (Stratum_设计文档v13.md §7.3).
+// keep working afterwards (docs/参考/历史/Stratum_设计文档v13.md §7.3).
 func TestNameByNameRoundTripEverySentinel(t *testing.T) {
 	for _, err := range []error{
+		ErrMigrationInProgress, ErrMigrationConflict, ErrMigrationNotFound, ErrMigrationBusy, ErrKBWritePaused,
+		ErrPlacementUnknown,
+		ErrPlacementStale,
+		ErrPlacementChangeUnsafe,
 		ErrVersionNotFound,
 		ErrVersionPending,
 		ErrVersionFailed,

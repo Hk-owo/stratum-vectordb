@@ -1,6 +1,6 @@
 // Package raft implements Stratum's RaftNode interface (defined in
 // raft.go) on top of internal/kvraft's Raft consensus library, per
-// Stratum_实现顺序.md 阶段 3: "依赖现有 kvserver Raft，扩展状态机支持知识库和
+// docs/已实施/Stratum_实现顺序.md 阶段 3: "依赖现有 kvserver Raft，扩展状态机支持知识库和
 // 版本元数据".
 //
 // Architecture: internal/kvraft handles consensus (leader election, log
@@ -269,6 +269,7 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 	}
 
 	impl := &RaftNodeImpl{
+		nodeID:        cfg.NodeID,
 		raft:          rf,
 		wal:           cfg.WAL,
 		sm:            newStateMachineWithDeletedLogLimit(cfg.DeletedLogLimit),
@@ -519,7 +520,7 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 	}
 
 	// Wake local awaiters: this version's replicated state just moved
-	// (docs/await-version-plan.md §12 item 1). Cheap and unconditional — a map
+	// (docs/已实施/await-version-plan.md §12 item 1). Cheap and unconditional — a map
 	// lookup plus a non-blocking send — and it fires for every applied command
 	// that names a version, which is exactly the set that can change what a
 	// waiter is looking at.
@@ -667,7 +668,7 @@ func (impl *RaftNodeImpl) handleSnapshotMsg(msg kvraft.ApplyMsg) {
 	// the state machine, so without durable snapshot data a restart would find a
 	// trimmed log with no matching state — the state machine boots empty while
 	// lastApplied claims the compacted entries were applied, and the metadata they
-	// carried is gone from both places (H5 of docs/code-review-2026-10-18.md).
+	// carried is gone from both places (H5 of docs/参考/code-review-2026-10-18.md).
 	// Failing here leaves the node untouched; the leader will send the snapshot
 	// again.
 	if err := impl.persister.SaveSnapshot(msg.SnapshotData, msg.SnapshotIndex); err != nil {
@@ -720,7 +721,7 @@ func (impl *RaftNodeImpl) proposeAndWait(ctx context.Context, cmd command) (appl
 	if err != nil {
 		// Raft appends on the leader only, but any node may have a fact worth
 		// reporting. The access layer carries it to whoever can append — the
-		// Raft core stays unaware of the network (Stratum_设计文档v13.md §7.3).
+		// Raft core stays unaware of the network (docs/参考/历史/Stratum_设计文档v13.md §7.3).
 		if errors.Is(err, kvraft.ErrNotLeader) && impl.forwarder != nil {
 			if leaderID, known := impl.raft.LeaderID(); known && leaderID != impl.nodeID {
 				forwarded, ferr := impl.forwarder.ForwardPropose(ctx, leaderID, data)
@@ -925,7 +926,7 @@ func (impl *RaftNodeImpl) SetNodeID(id int64) {
 }
 
 // SetForwarder wires the path that carries a proposal to the leader when this
-// node is not it (Stratum_设计文档v13.md §7.3). Without it, a non-leader
+// node is not it (docs/参考/历史/Stratum_设计文档v13.md §7.3). Without it, a non-leader
 // proposal fails exactly as before.
 func (impl *RaftNodeImpl) SetForwarder(f ProposeForwarder) {
 	impl.forwarder = f
@@ -933,7 +934,7 @@ func (impl *RaftNodeImpl) SetForwarder(f ProposeForwarder) {
 
 // ProposeMarkVersionFailedPermanent implements RaftNode: the terminal verdict
 // for one side of a version whose Saga has spent its retry budget
-// (Stratum_设计文档v13.md §10.1, §10.1b).
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1, §10.1b).
 func (impl *RaftNodeImpl) ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error {
 	res, err := impl.proposeAndWait(ctx, newMarkVersionFailedPermanentCommand(kbID, versionID, side, reason, count))
 	if err != nil {
@@ -943,7 +944,7 @@ func (impl *RaftNodeImpl) ProposeMarkVersionFailedPermanent(ctx context.Context,
 }
 
 // ProposeRetryVersion implements RaftNode: an operator's revocation of one side's
-// terminal verdict (Stratum_设计文档v13.md §10.1). The narrow rules (index side only,
+// terminal verdict (docs/参考/历史/Stratum_设计文档v13.md §10.1). The narrow rules (index side only,
 // terminal side only, cause chain dropped only once nothing is terminal any more)
 // live in the state machine's apply, where every replica reaches the same verdict,
 // rather than here: a proposer that decided them would let two callers disagree.
@@ -1069,7 +1070,7 @@ func (impl *RaftNodeImpl) ListVersions(_ context.Context, kbID string) ([]types.
 
 // GetVersion returns one version's metadata, read straight out of the state
 // machine under the same RLock ListVersions takes. It is the O(1) sibling the
-// await path polls (docs/await-version-plan.md §7 Step 2).
+// await path polls (docs/已实施/await-version-plan.md §7 Step 2).
 func (impl *RaftNodeImpl) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
 	impl.sm.mu.RLock()
 	defer impl.sm.mu.RUnlock()
@@ -1234,7 +1235,7 @@ func (impl *RaftNodeImpl) DeletingVersionIDs(_ context.Context, kbID string) ([]
 //
 // It exists because a KB deletion has the same crash window a version deletion
 // has, and no equivalent repair until now (M3 of
-// docs/code-review-2026-10-18.md): DeleteKnowledgeBase proposes the Deleting
+// docs/参考/code-review-2026-10-18.md): DeleteKnowledgeBase proposes the Deleting
 // status first (durable, replicated, the moment the API answers the caller) and
 // only then starts the cleanup goroutine, which is what writes the WAL's delete
 // mark. A process that dies in between leaves the KB in DELETING with neither a

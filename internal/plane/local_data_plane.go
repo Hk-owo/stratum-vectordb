@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"stratum/internal/nodestate"
+	"stratum/internal/storage"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -137,7 +138,7 @@ type VersionDataCleaner interface {
 // CursorQuerier asks a peer how far its contiguous history reaches, so a node
 // that is backfilling can pick a source that actually holds the gap instead of
 // always asking the leader — which fails when the leader is the one that is
-// behind (Stratum_设计文档v13.md §7.6). *sync.LocalVersionQuerier implements it;
+// behind (docs/参考/历史/Stratum_设计文档v13.md §7.6). *sync.LocalVersionQuerier implements it;
 // keeping it an interface keeps the DataPlane independent of the transport.
 type CursorQuerier interface {
 	LocalVersionOf(ctx context.Context, peerAddr, kbID string) (int64, error)
@@ -148,7 +149,7 @@ type CursorQuerier interface {
 // test), in which case the local write is the whole quorum.
 //
 // The target list is storage-layer topology, so it is resolved here rather
-// than sent down by the control layer (Stratum_设计文档v13.md §7.1).
+// than sent down by the control layer (docs/参考/历史/Stratum_设计文档v13.md §7.1).
 type ReplicaResolver func(ctx context.Context) ([]string, error)
 
 // IndexStore is the slice of the storage layer's index manager the DataPlane
@@ -169,12 +170,16 @@ type IndexStore interface {
 	EnforceDiskRetention(ctx context.Context, kbID string, protectedIDs []int64) error
 }
 
-// LocalDataPlane is the in-process DataPlane (control-data-separation-design.md
+// LocalDataPlane is the in-process DataPlane (docs/已实施/control-data-separation-design.md
 // §4.1, stage ① of §7). It owns everything the control layer must not know:
 // whether this node needs a version's data at all, which peer to fetch it
 // from, how long to retry a pull, how many replicas must acknowledge a write
 // before it counts as durable, and how a build gets scheduled.
 type LocalDataPlane struct {
+	executionGate   *storage.ExecutionGate
+	placements      storage.Resolver
+	directory       storage.Reader
+	nodeID          int64
 	indexMgr        IndexStore
 	puller          VersionPuller
 	changesFetcher  VersionChangesFetcher
@@ -260,14 +265,14 @@ type LocalDataPlane struct {
 	selfDataSyncAddr string
 
 	// limiter queues writes per knowledge base so a stalled version cannot let
-	// an unbounded backlog form behind it (Stratum_设计文档v13.md §7.7).
+	// an unbounded backlog form behind it (docs/参考/历史/Stratum_设计文档v13.md §7.7).
 	limiter *writeLimiter
 
 	logger *zap.Logger
 
 	// versionMu guards deletedReconcileDirty and nothing else. The cursor and
 	// the two accounts it advances over used to live behind it; they are the
-	// state machine's now (docs/storage-node-state-machine-plan.md §7, item 3),
+	// state machine's now (docs/已实施/storage-node-state-machine-plan.md §7, item 3),
 	// which is what makes one component answerable for the whole data layer's
 	// local position.
 	versionMu sync.RWMutex
@@ -317,7 +322,7 @@ type LocalDataPlane struct {
 
 	// state is the node state machine: the version layer's entries, the data
 	// cursor, and the two accounts the cursor advances over
-	// (docs/storage-node-state-machine-plan.md §7). Never nil — see
+	// (docs/已实施/storage-node-state-machine-plan.md §7). Never nil — see
 	// NewLocalDataPlane for why an unwired plane still gets one.
 	state *nodestate.Machine
 
@@ -325,7 +330,7 @@ type LocalDataPlane struct {
 	// running, one per (kb, version).
 	//
 	// The deduplication is not an optimisation (H9 of
-	// docs/code-review-2026-10-18.md). Two callers ask about the same version as a
+	// docs/参考/code-review-2026-10-18.md). Two callers ask about the same version as a
 	// matter of course — the query path on every PENDING query, the catch-up loop on
 	// every round — so N concurrent asks used to mean N downloads of the same
 	// artifact, and InstallIndex's per-version shard lock then serialised them into N
@@ -350,6 +355,11 @@ type indexFetchCall struct {
 
 // LocalDataPlaneConfig wires a LocalDataPlane.
 type LocalDataPlaneConfig struct {
+	ExecutionGate *storage.ExecutionGate
+	// Placement is authoritative when supplied; legacy resolvers are ignored.
+	Placement storage.Resolver
+	Directory storage.Reader
+	NodeID    int64
 	// IndexManager schedules and serves version indexes.
 	IndexManager IndexStore
 	// Puller copies a version's storage-layer data from a peer.
@@ -375,7 +385,7 @@ type LocalDataPlaneConfig struct {
 	// WAL frames the storage layer's write transaction (WriteVersionData).
 	WAL TransactionWAL
 	// CursorWAL persists this node's contiguous data cursor, so a restart reads
-	// it back instead of inferring it from disk facts (docs/cursor-persistence-plan.md
+	// it back instead of inferring it from disk facts (docs/已实施/cursor-persistence-plan.md
 	// §3). Optional: without it the cursor stays in memory and startup falls back
 	// to the inference below, exactly as before.
 	CursorWAL CursorStore
@@ -527,7 +537,7 @@ type LocalDataPlaneConfig struct {
 	TerminalReclaimAttempts int
 
 	// State is the node state machine this plane maintains
-	// (docs/storage-node-state-machine-plan.md §7). Optional: a plane built
+	// (docs/已实施/storage-node-state-machine-plan.md §7). Optional: a plane built
 	// without one makes its own, which is what every test gets — and what a
 	// single-node deployment would want anyway. The machine has no dependencies
 	// of its own, so requiring the wiring would only add a failure mode.
@@ -544,6 +554,14 @@ type LocalDataPlaneConfig struct {
 
 // NewLocalDataPlane returns a DataPlane over the given storage-layer pieces.
 func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
+	if cfg.ExecutionGate != nil {
+		if cfg.DataDropper != nil {
+			cfg.DataDropper = gatedVersionDropper{cfg.ExecutionGate, cfg.Directory, cfg.NodeID, cfg.DataDropper}
+		}
+		if cfg.KBDropper != nil {
+			cfg.KBDropper = gatedKBDropper{cfg.ExecutionGate, cfg.Directory, cfg.NodeID, cfg.KBDropper}
+		}
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = zap.NewNop()
@@ -577,6 +595,10 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		control:               cfg.Control,
 		pusher:                cfg.Pusher,
 		resolveReplicas:       cfg.ResolveReplicas,
+		placements:            cfg.Placement,
+		executionGate:         cfg.ExecutionGate,
+		directory:             cfg.Directory,
+		nodeID:                cfg.NodeID,
 		replicaCount:          cfg.ReplicaCount,
 		cursorQuerier:         cfg.CursorQuerier,
 		dropper:               cfg.DataDropper,
@@ -667,6 +689,11 @@ func (d *LocalDataPlane) effectivePullMaxDuration() time.Duration {
 
 // Search runs a vector query against versionID's index.
 func (d *LocalDataPlane) Search(ctx context.Context, kbID string, versionID int64, vector []float32, topK int) ([]types.SearchResult, error) {
+	var err error
+	ctx, err = d.bindPlacement(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
 	return d.indexMgr.Search(ctx, kbID, versionID, vector, topK)
 }
 
@@ -718,7 +745,7 @@ func (d *LocalDataPlane) ApplyBackfillChanges(ctx context.Context, kbID string, 
 	return nil
 }
 
-// QuorumSize is the durable threshold for n replicas (Stratum_设计文档v13.md
+// QuorumSize is the durable threshold for n replicas (docs/参考/历史/Stratum_设计文档v13.md
 // §7.1): ⌈(n+1)/2⌉, a bare majority, so any two quorums intersect.
 func QuorumSize(n int) int {
 	if n <= 0 {
@@ -737,7 +764,7 @@ type TransactionWAL interface {
 
 // CursorStore persists this node's contiguous data cursor per knowledge base,
 // so a restart reads the local fact back instead of inferring it from disk
-// (Stratum_设计文档v13.md §7.8; docs/cursor-persistence-plan.md §3). *wal.FileWAL
+// (docs/参考/历史/Stratum_设计文档v13.md §7.8; docs/已实施/cursor-persistence-plan.md §3). *wal.FileWAL
 // satisfies it. Deliberately narrow — two calls, not the whole log surface —
 // so the plane stays independent of the WAL's transaction and recovery halves.
 type CursorStore interface {

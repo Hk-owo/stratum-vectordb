@@ -16,6 +16,7 @@ import (
 	"stratum/internal/nodestate"
 	"stratum/internal/plane"
 	"stratum/internal/raft"
+	"stratum/internal/storage"
 	"stratum/internal/versiondoc"
 	"stratum/internal/wal"
 
@@ -31,8 +32,9 @@ import (
 // being assigned. The field names deliberately match the locals main() used, so
 // moving the literal here changed no expression — only where it sits.
 type dataPlaneDeps struct {
-	cfg    appConfig
-	logger *zap.Logger
+	executionGate *storage.ExecutionGate
+	cfg           appConfig
+	logger        *zap.Logger
 
 	// The control layer it reports to and reads metadata from.
 	rn           raft.RaftNode
@@ -77,6 +79,10 @@ func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 	nodeState, liveness := d.nodeState, d.liveness
 
 	return plane.LocalDataPlaneConfig{
+		ExecutionGate: d.executionGate,
+		Placement:     rn.(storage.Reader).GetKBPlacement,
+		Directory:     rn.(storage.Reader),
+		NodeID:        cfg.NodeID,
 		IndexManager:  indexMgr,
 		LocalVersions: vd,
 		// §8.4 owner sharding is decided in the STATION, not here: the router
@@ -88,7 +94,7 @@ func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 		Liveness: liveness,
 		Puller:   syncFollower,
 		WAL:      walImpl,
-		// §7.8/docs/cursor-persistence-plan.md §3: the cursor is persisted in the
+		// §7.8/docs/已实施/cursor-persistence-plan.md §3: the cursor is persisted in the
 		// WAL this node already fsyncs, so a restart reads it back instead of
 		// inferring it from index artifacts the retention policy may have
 		// deleted. Same file, one more record type.
@@ -120,13 +126,13 @@ func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 		// PENDING: this reads the local metadata replica so a takeover on an
 		// already-durable version costs nothing. It also covers the catch-up
 		// path, which arms the same check after replaying a version nobody
-		// confirmed (docs/known-gaps.md §K).
+		// confirmed (docs/未实施/known-gaps.md §K).
 		DataStatus: controlPlane,
 		Confirmer:  stratumsync.NewConfirmBroadcaster(stratumsync.PresenceCheckerConfig{}),
 		// §8.4: "建一次、分发 N 份" — the builder reads its own index files and
 		// ships them; replicas install them instead of building their own.
 		IndexFetcher: stratumsync.NewIndexFetcher(),
-		// docs/index-owner-sharding-plan.md §7: where an artifact FETCHED from a
+		// docs/已实施/index-owner-sharding-plan.md §7: where an artifact FETCHED from a
 		// peer lands. The same call the push direction ends in, so a fetched
 		// artifact and a shipped one are indistinguishable once installed.
 		IndexInstaller:  indexMgr,
@@ -230,7 +236,7 @@ func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 		TakeoverMaxRetryDelay:   cfg.TakeoverMaxRetryDelay,
 		TerminalReclaimInterval: cfg.TerminalReclaimInterval,
 		TerminalReclaimAttempts: cfg.TerminalReclaimAttempts,
-		// docs/storage-node-state-machine-plan.md §7: the machine this plane
+		// docs/已实施/storage-node-state-machine-plan.md §7: the machine this plane
 		// maintains — the version layer's entries, the data cursor, and the two
 		// accounts the cursor advances over. nil on a control node, where the
 		// plane makes its own: it has no storage to be authoritative about, and

@@ -23,11 +23,21 @@ import (
 // status code, and one to sentinelNames so the identity survives a process
 // boundary.
 var (
-	ErrVersionNotFound = errors.New("version not found")
-	ErrVersionPending  = errors.New("version is pending")   // storage-layer write for the version still in progress; not queryable
-	ErrVersionFailed   = errors.New("version index failed") // index build failed; not queryable
+	ErrStorageServicePaused  = errors.New("storage service authorization is absent or expired")
+	ErrMigrationInProgress   = errors.New("knowledge base migration is in progress")
+	ErrMigrationConflict     = errors.New("migration operation or phase conflicts")
+	ErrMigrationNotFound     = errors.New("migration operation not found")
+	ErrMigrationBusy         = errors.New("migration is waiting for pending versions to settle")
+	ErrKBWritePaused         = errors.New("knowledge base storage writes are fenced")
+	ErrNotKBReplica          = errors.New("node is not a replica of this knowledge base")
+	ErrPlacementUnknown      = errors.New("knowledge base placement is unknown")
+	ErrPlacementStale        = errors.New("storage directory revision is stale")
+	ErrPlacementChangeUnsafe = errors.New("existing placement membership changes require a migration")
+	ErrVersionNotFound       = errors.New("version not found")
+	ErrVersionPending        = errors.New("version is pending")   // storage-layer write for the version still in progress; not queryable
+	ErrVersionFailed         = errors.New("version index failed") // index build failed; not queryable
 	// ErrVersionDataFailed is the DATA side's terminal verdict reaching a READER
-	// (Stratum_设计文档v13.md §10.1b): the version's data will never arrive, so
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1b): the version's data will never arrive, so
 	// nothing will ever make it queryable.
 	//
 	// Deliberately not ErrVersionPending, which every reader retries: a version
@@ -47,7 +57,7 @@ var (
 	// since resolved — typically a push that timed out while a lagging replica was
 	// already catching up. Letting it through marks a perfectly good version
 	// terminal, and every replica's apply then reclaims data a child version
-	// already depends on (docs/known-gaps.md §K).
+	// already depends on (docs/未实施/known-gaps.md §K).
 	//
 	// NOT a retryable answer for the reporter: retrying the same report reaches the
 	// same state machine and the same verdict. Callers treat it as "already
@@ -71,7 +81,7 @@ var (
 	// list does not mean "the empty set" — it means "the same set as my parent",
 	// and only at the ROOT of a chain is there no parent to inherit from. The
 	// control layer therefore refuses the write rather than creating a version
-	// whose document set it cannot state (docs/cursor-persistence-plan.md §5).
+	// whose document set it cannot state (docs/已实施/cursor-persistence-plan.md §5).
 	ErrEmptyChanges         = errors.New("empty changes")
 	ErrIndexLoadTimeout     = errors.New("index load timeout")
 	ErrInvalidParentVersion = errors.New("invalid parent version")
@@ -84,7 +94,7 @@ var (
 	// parent's INDEX before the writer's digest round trip finishes, and callers
 	// wait on index readiness. So the answer is "not yet, retry", never "your request
 	// is invalid" — the latter made a transient state a permanent client error and
-	// stalled write chains at 11–19 batches on the 3+3 cluster (docs/known-gaps.md §K).
+	// stalled write chains at 11–19 batches on the 3+3 cluster (docs/未实施/known-gaps.md §K).
 	// The code is FailedPrecondition; grpcCodeMap says why it is not Unavailable.
 	//
 	// It deliberately does NOT spend the failure budget: the write was never
@@ -100,18 +110,18 @@ var (
 	// ErrVersionNotPending rejects a DiscardVersion for a version that is not
 	// (or no longer) PENDING. Discarding is for a write that never landed; a
 	// version whose data side has already settled is DeleteVersion's business
-	// (docs/await-version-plan.md §5 contract 7, §7 Step 6).
+	// (docs/已实施/await-version-plan.md §5 contract 7, §7 Step 6).
 	ErrVersionNotPending = errors.New("version is not pending")
 	// ErrVersionNotFailedPermanent rejects a ForceRetryVersion (or
 	// ForceAbandonVersion) for a side that is not FAILED_PERMANENT. Retrying is an
-	// operator's answer to a terminal verdict (Stratum_设计文档v13.md §10.1): a side
+	// operator's answer to a terminal verdict (docs/参考/历史/Stratum_设计文档v13.md §10.1): a side
 	// that is merely FAILED is already retried by the ordinary paths, and one that
 	// is PENDING or READY has nothing to retry at all. Refusing loudly is the point
 	// — silently "succeeding" at retrying a healthy version would tell an operator
 	// the state changed when it did not.
 	ErrVersionNotFailedPermanent = errors.New("version is not failed permanently")
 	// ErrKBStorageDegraded refuses a WRITE to a knowledge base whose live
-	// replicas are below quorum (docs/storage-degradation-signal-plan.md §4.1).
+	// replicas are below quorum (docs/已实施/storage-degradation-signal-plan.md §4.1).
 	//
 	// It is deliberately Unavailable — retryable — and not a terminal
 	// FailedPrecondition: the judgement behind it is soft state (a periodic
@@ -154,6 +164,16 @@ var sentinelNames = []struct {
 	name     string
 	sentinel error
 }{
+	{"storage_service_paused", ErrStorageServicePaused},
+	{"migration_in_progress", ErrMigrationInProgress},
+	{"migration_conflict", ErrMigrationConflict},
+	{"migration_not_found", ErrMigrationNotFound},
+	{"migration_busy", ErrMigrationBusy},
+	{"kb_write_paused", ErrKBWritePaused},
+	{"not_kb_replica", ErrNotKBReplica},
+	{"placement_unknown", ErrPlacementUnknown},
+	{"placement_stale", ErrPlacementStale},
+	{"placement_change_unsafe", ErrPlacementChangeUnsafe},
 	{"version_not_found", ErrVersionNotFound},
 	{"version_pending", ErrVersionPending},
 	{"version_failed", ErrVersionFailed},
@@ -207,6 +227,16 @@ func ByName(name string) error {
 // grpcCodeMap is the single source of truth for business-error -> gRPC
 // status code translation. Errors not present here map to codes.Internal.
 var grpcCodeMap = map[error]codes.Code{
+	ErrStorageServicePaused:      codes.Unavailable,
+	ErrMigrationInProgress:       codes.Unavailable,
+	ErrMigrationConflict:         codes.FailedPrecondition,
+	ErrMigrationNotFound:         codes.NotFound,
+	ErrMigrationBusy:             codes.Unavailable,
+	ErrKBWritePaused:             codes.Unavailable,
+	ErrNotKBReplica:              codes.FailedPrecondition,
+	ErrPlacementUnknown:          codes.Unavailable,
+	ErrPlacementStale:            codes.Aborted,
+	ErrPlacementChangeUnsafe:     codes.FailedPrecondition,
 	ErrVersionNotFound:           codes.NotFound,
 	ErrVersionPending:            codes.FailedPrecondition,
 	ErrVersionFailed:             codes.FailedPrecondition,

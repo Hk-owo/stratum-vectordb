@@ -150,9 +150,8 @@ func TestRaftNodeImpl_InstalledSnapshotTriggersVersionSync(t *testing.T) {
 	impl, _ := newTestRaftNodeImpl(t)
 	ctx := proposeCtx(t)
 
-	// Build a KB with two READY versions plus one PENDING version (whose
-	// storage write has not completed) — the PENDING one must NOT be
-	// synced.
+	// Snapshot installation must announce PENDING versions just as applying
+	// CreateVersion does. A lazy pending index cannot suppress DATA recovery.
 	mustCreateKBImpl(t, impl, "kb1")
 	v1, err := impl.ProposeCreateVersion(ctx, "kb1", 0)
 	if err != nil {
@@ -193,8 +192,8 @@ func TestRaftNodeImpl_InstalledSnapshotTriggersVersionSync(t *testing.T) {
 		SnapshotTerm:  term,
 	})
 
-	// v1 and v2 must be synced; v3 (PENDING) must not.
-	want := map[string]bool{"kb1/1": true, "kb1/2": true}
+	// All three need the data-plane hook; the hook itself proves no durability.
+	want := map[string]bool{"kb1/1": true, "kb1/2": true, "kb1/3": true}
 	for len(want) > 0 {
 		select {
 		case got := <-synced:
@@ -205,7 +204,7 @@ func TestRaftNodeImpl_InstalledSnapshotTriggersVersionSync(t *testing.T) {
 	}
 	select {
 	case got := <-synced:
-		t.Fatalf("unexpected sync hook for %s (PENDING version must be skipped)", got)
+		t.Fatalf("unexpected duplicate sync hook for %s", got)
 	case <-time.After(200 * time.Millisecond):
 	}
 }

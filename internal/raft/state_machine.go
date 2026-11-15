@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/storage"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -24,7 +25,10 @@ import (
 // invalid parent version), or, for cmdCreateVersion specifically, the
 // newly assigned VersionID.
 type applyResult struct {
-	VersionID int64
+	MigrationRead        bool
+	ServiceRevision      uint64
+	ServiceBlockRevision uint64
+	VersionID            int64
 	// DeletedVersionIDs is set by cmdMarkVersionDeleting: every version
 	// that command marked Deleting, so the caller can report the exact
 	// impact set (for ANCESTORS that is every swept-up 前置版本).
@@ -41,6 +45,7 @@ type applyResult struct {
 // so still need the mutex.
 type stateMachine struct {
 	mu            sync.RWMutex
+	directory     storage.Directory
 	kbs           map[string]types.KnowledgeBaseMeta
 	versions      map[int64]types.VersionMeta
 	versionsByKB  map[string][]int64
@@ -49,7 +54,7 @@ type stateMachine struct {
 	// version ID the first apply of that request allocated. It is what lets a
 	// retried CreateVersion reuse its version instead of allocating another
 	// one, so a client can re-send the changes for a version whose data never
-	// landed (Stratum_设计文档v13.md §7.12). Entries live exactly as long as
+	// landed (docs/参考/历史/Stratum_设计文档v13.md §7.12). Entries live exactly as long as
 	// the version metadata they point at.
 	versionsByRequest map[string]int64
 
@@ -57,7 +62,7 @@ type stateMachine struct {
 	// storage node consumes incrementally (see RaftNodeImpl.DeletionsSince).
 	//
 	// It is a removal record, which this system deliberately removed once before
-	// (docs/known-gaps.md §B: a record is history, pruning can drop it, and a
+	// (docs/未实施/known-gaps.md §B: a record is history, pruning can drop it, and a
 	// leftover whose evidence was pruned is invisible forever). What makes it
 	// acceptable now is that it is NOT the judgement: the live-chain read
 	// (VersionLiveness) stays and remains the authority, so a consumer that falls
@@ -103,6 +108,7 @@ func newStateMachine() *stateMachine {
 // at most limit entries (0 = defaultDeletedLogLimit).
 func newStateMachineWithDeletedLogLimit(limit int) *stateMachine {
 	return &stateMachine{
+		directory:         storage.NewDirectory(),
 		kbs:               make(map[string]types.KnowledgeBaseMeta),
 		versions:          make(map[int64]types.VersionMeta),
 		versionsByKB:      make(map[string][]int64),
@@ -156,12 +162,80 @@ func (sm *stateMachine) recordDeletion(kbID string, versionID int64) {
 func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logger *zap.Logger) applyResult {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	if sm.migrationBlocksCommand(cmd) {
+		return applyResult{Err: stratumerrors.ErrMigrationInProgress}
+	}
 
 	switch cmd.Type {
+	case cmdGetStorageMaintenance:
+		return applyResult{MigrationRead: true}
+	case cmdGetKBMigrationTransfer:
+		// A small committed read barrier; build the detached view once on
+		// the reader, not on every follower or in the settled-result cache.
+		return applyResult{MigrationRead: true, ServiceRevision: sm.directory.Revision}
+	case cmdRenewStorageService, cmdBlockStorageService, cmdResumeStorageService, cmdConfirmStorageServiceRevoked:
+		return sm.applyService(cmd)
+	case cmdDrainStorageNode, cmdActivateKBMigration, cmdAckStorageCleanup, cmdManageStorageNode, cmdBeginKBMigration, cmdFenceKBMigration, cmdAckKBMigrationFence, cmdCancelKBMigration, cmdRecordKBMigrationStage, cmdRecordKBMigrationInstall, cmdRecordKBMigrationServe:
+		return applyResult{Err: sm.applyMigration(cmd)}
+	case cmdRegisterStorageNodes:
+		if cmd.StorageNodes == nil {
+			return applyResult{Err: stratumerrors.ErrInvalidArgument}
+		}
+		return applyResult{Err: sm.directory.RegisterNodes(cmd.DirectoryRevision, cmd.StorageNodes.Nodes)}
+	case cmdAssignKBPlacement:
+		if cmd.Placement == nil {
+			return applyResult{Err: stratumerrors.ErrInvalidArgument}
+		}
+		if _, deleted := sm.directory.Tombstones[cmd.Placement.KBID]; deleted {
+			return applyResult{Err: stratumerrors.ErrKnowledgeBaseDeleted}
+		}
+		kb, ok := sm.kbs[cmd.Placement.KBID]
+		if !ok {
+			return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
+		}
+		if kb.Status != types.KBStatusActive {
+			return applyResult{Err: stratumerrors.ErrKnowledgeBaseDeleted}
+		}
+		return applyResult{Err: sm.directory.AssignInitial(*cmd.Placement)}
 	case cmdCreateKB:
+		if cmd.KB == nil || cmd.KB.KBID == "" {
+			return applyResult{Err: stratumerrors.ErrInvalidArgument}
+		}
 		kb := *cmd.KB
+		if cmd.Placement != nil {
+			if _, exists := sm.kbs[kb.KBID]; exists {
+				return applyResult{Err: stratumerrors.ErrPlacementChangeUnsafe}
+			}
+			if cmd.Placement.KBID != kb.KBID {
+				return applyResult{Err: stratumerrors.ErrInvalidArgument}
+			}
+			if len(sm.directory.Nodes) == 0 {
+				return applyResult{Err: stratumerrors.ErrPlacementUnknown}
+			}
+		}
+		if _, deleted := sm.directory.Tombstones[kb.KBID]; deleted {
+			return applyResult{Err: stratumerrors.ErrKnowledgeBaseDeleted}
+		}
+		// Never overwrite business metadata under an already registered identity.
+		if _, assigned := sm.directory.Placements[kb.KBID]; assigned {
+			return applyResult{Err: stratumerrors.ErrInvalidArgument}
+		}
 		if kb.Status == types.KBStatusActive || kb.Status == 0 {
 			kb.Status = types.KBStatusActive
+		}
+		if cmd.Placement != nil && kb.Status != types.KBStatusActive {
+			return applyResult{Err: stratumerrors.ErrInvalidArgument}
+		}
+		// Creation and the original full placement share one committed command.
+		// Scheduling and RPCs remain outside apply.
+		if len(sm.directory.Nodes) > 0 && kb.Status == types.KBStatusActive {
+			p := sm.directory.InitialPlacement(kb.KBID, "create/"+kb.KBID)
+			if cmd.Placement != nil {
+				p = cmd.Placement.Clone()
+			}
+			if err := sm.directory.AssignNew(p); err != nil {
+				return applyResult{Err: err}
+			}
 		}
 		sm.kbs[kb.KBID] = kb
 		return applyResult{}
@@ -172,6 +246,7 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 			return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
 		}
 		kb.Status = types.KBStatusDeleting
+		sm.directory.Delete(cmd.KBID)
 		sm.kbs[cmd.KBID] = kb
 		return applyResult{}
 
@@ -185,6 +260,9 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		return applyResult{}
 
 	case cmdRemoveKBMeta:
+		if _, exists := sm.kbs[cmd.KBID]; exists {
+			sm.directory.Delete(cmd.KBID)
+		}
 		// Idempotent: deleting an already-absent key is a no-op, not an
 		// error, so the delete flow's crash-recovery path can safely
 		// re-propose this any number of times.
@@ -207,6 +285,14 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		return sm.applyCreateVersion(ctx, cmd, w, logger)
 
 	case cmdUpdateVersionStatus:
+		if v, ok := sm.versions[cmd.VersionID]; ok && cmd.NodeID > 0 {
+			if p, exists := sm.directory.Placements[v.KBID]; exists && !p.Contains(cmd.NodeID) {
+				return applyResult{Err: stratumerrors.ErrNotKBReplica}
+			}
+		}
+		if _, blocked := sm.directory.ServiceBlocks[cmd.NodeID]; cmd.NodeID > 0 && blocked {
+			return applyResult{Err: stratumerrors.ErrStorageServicePaused}
+		}
 		v, ok := sm.versions[cmd.VersionID]
 		if !ok {
 			return applyResult{Err: stratumerrors.ErrVersionNotFound}
@@ -234,7 +320,7 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 			return applyResult{Err: stratumerrors.ErrVersionNotFound}
 		}
 		// A late confirmation must not resurrect a settled version
-		// (Stratum_设计文档v13.md §10.6): the client may already have given up
+		// (docs/参考/历史/Stratum_设计文档v13.md §10.6): the client may already have given up
 		// on this write and run its compensation path, so letting the data
 		// suddenly become queryable would be worse than the original failure.
 		// The check belongs here because the state machine knows the status
@@ -262,11 +348,14 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 				zap.String("index_status", v.IndexStatus.String()))
 			return applyResult{}
 		}
+		if migration, active := sm.directory.ActiveMigration(v.KBID); active && migration.BlocksDataWrites() && v.DocIDSetHash != cmd.DocIDSetHash {
+			return applyResult{Err: stratumerrors.ErrKBWritePaused}
+		}
 		v.DocIDSetHash = cmd.DocIDSetHash
 		// The writer commits this digest only after its own storage writes
 		// finished and a quorum confirmed them (ControlPlane.ReportDataDurable),
 		// so its arrival is exactly what makes the DATA side durable
-		// (Stratum_设计文档v13.md §10.1b).
+		// (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 		v.DataStatus = types.DataStatusDurable
 		sm.versions[cmd.VersionID] = v
 		return applyResult{}
@@ -311,7 +400,7 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 }
 
 // applyMarkDataDurable records the control layer's own promotion of a version's
-// DATA side to durable (Stratum_设计文档v13.md §10.1b).
+// DATA side to durable (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 //
 // It is the startup reconcile's path: the storage layer reports a contiguous
 // cursor (§7.8's quorum minimum) and §7.9 turns it into replicated state. The
@@ -336,7 +425,7 @@ func (sm *stateMachine) applyMarkDataDurable(cmd command) applyResult {
 
 // applyMarkVersionFailedPermanent records the terminal state for ONE SIDE of a
 // version: the control layer has decided that side's Saga will not be retried
-// automatically (Stratum_设计文档v13.md §10.1, §10.1b). The storage layer only
+// automatically (docs/参考/历史/Stratum_设计文档v13.md §10.1, §10.1b). The storage layer only
 // reports failures — deciding when the budget is spent belongs to the control
 // layer, and keeping the verdict here (rather than in a node's memory) is what
 // makes it deterministic across replicas.
@@ -366,7 +455,7 @@ func (sm *stateMachine) applyMarkVersionFailedPermanent(cmd command) applyResult
 		// since resolved (a push that timed out while a lagging replica was already
 		// catching up). Overwriting would mark a healthy version terminal, and every
 		// replica's apply would then reclaim data a CHILD version already depends on
-		// — data loss no later write can repair (docs/known-gaps.md §K).
+		// — data loss no later write can repair (docs/未实施/known-gaps.md §K).
 		//
 		// Returning an error (rather than silently ignoring) is what keeps the
 		// reporter honest: ReportVersionFailure maps it to "already settled" and the
@@ -383,14 +472,14 @@ func (sm *stateMachine) applyMarkVersionFailedPermanent(cmd command) applyResult
 	v.FailureCount = cmd.FailureCount
 	// Recorded, not inferred: a version can end up terminal on BOTH sides, and
 	// then only this field says which one the cause chain above describes
-	// (Stratum_设计文档v13.md §10.1b).
+	// (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 	v.FailureSide = cmd.FailureSide
 	sm.versions[cmd.VersionID] = v
 	return applyResult{}
 }
 
 // applyRetryVersion handles cmdRetryVersion: an operator revoking the control
-// layer's terminal verdict for ONE side of a version (Stratum_设计文档v13.md §10.1).
+// layer's terminal verdict for ONE side of a version (docs/参考/历史/Stratum_设计文档v13.md §10.1).
 //
 // It is deliberately narrow in three ways, each of which encodes a decision rather
 // than an omission:
@@ -593,7 +682,7 @@ func (sm *stateMachine) validateSurvivorsNotPending(kbID string, removed []int64
 //
 // The rules were written when ONE status field carried both halves of a version's
 // Saga, and they read that field as a proxy for "writes not finished"
-// (Stratum_设计文档v13.md §10.1b). Now that the halves are separate, the proxy has to be
+// (docs/参考/历史/Stratum_设计文档v13.md §10.1b). Now that the halves are separate, the proxy has to be
 // read off the DATA side, and the one status that must NOT be read as "still
 // writing" is the data side's terminal verdict: a version whose data will never
 // arrive has no write left to wait for, and §10.6 has already reclaimed whatever had
@@ -773,7 +862,7 @@ func (sm *stateMachine) applyRemoveVersionMeta(cmd command) applyResult {
 
 // applyDiscardVersion handles cmdDiscardVersion: the CALLER's declaration that
 // it is abandoning a version whose write never landed
-// (docs/await-version-plan.md §7 Step 6).
+// (docs/已实施/await-version-plan.md §7 Step 6).
 //
 // It is not DeleteVersion under another name, and the two refuse each other's
 // work on purpose:
@@ -880,6 +969,9 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 			return applyResult{VersionID: id}
 		}
 	}
+	if _, active := sm.directory.ActiveMigration(cmd.KBID); active {
+		return applyResult{Err: stratumerrors.ErrMigrationInProgress}
+	}
 
 	if cmd.ParentVersionID != 0 {
 		parent, ok := sm.versions[cmd.ParentVersionID]
@@ -901,7 +993,7 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 			//
 			// 两个非 durable 的原因必须分开：PENDING 是"还没到"（可重试），终态是
 			// "永远不到"（重试无用）。混成一个是这条链在 20,000 档反复断掉的原因
-			// （docs/known-gaps.md §K）——追赶副本建好父版本的索引在先、写方 digest
+			// （docs/未实施/known-gaps.md §K）——追赶副本建好父版本的索引在先、写方 digest
 			// 绕 Raft 回来在后，调用方等的是索引 READY，于是必然撞上这个窗口。
 			if parent.DataStatus == types.DataStatusPending {
 				return applyResult{Err: fmt.Errorf("parent version %d has no durable data (data_status=%s): %w",
@@ -935,7 +1027,7 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 	// applies this entry — not just the leader — because any node could
 	// become leader after a restart and would then need its OWN WAL to
 	// correctly detect and resume an incomplete write (see
-	// Stratum_设计文档v10.md "关键时序约束").
+	// docs/参考/历史/Stratum_设计文档v10.md "关键时序约束").
 	//
 	// A WAL write failure here is treated as a local durability problem,
 	// not a reason to diverge this node's replicated state from its
@@ -969,6 +1061,7 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 // snapshotState is the gob-serializable form of the full state machine,
 // used by serialize/restore for Raft log compaction.
 type snapshotState struct {
+	Directory         storage.Directory
 	KBs               map[string]types.KnowledgeBaseMeta
 	Versions          map[int64]types.VersionMeta
 	VersionsByKB      map[string][]int64
@@ -1010,6 +1103,7 @@ func (sm *stateMachine) deepCopy() snapshotState {
 		versionsByRequest[k] = v
 	}
 	return snapshotState{
+		Directory:         sm.directory.Clone(),
 		KBs:               kbs,
 		Versions:          versions,
 		VersionsByKB:      versionsByKB,
@@ -1047,6 +1141,7 @@ func (sm *stateMachine) restore(data []byte) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.kbs = snap.KBs
+	sm.directory = snap.Directory.Clone()
 	sm.versions = snap.Versions
 	sm.versionsByKB = snap.VersionsByKB
 	sm.nextVersionID = snap.NextVersionID
@@ -1078,9 +1173,11 @@ func (sm *stateMachine) restore(data []byte) error {
 }
 
 // listAllVersions returns a snapshot of every version that still needs
-// storage-layer data sync: PENDING versions (their writes have not
-// completed and no digest is committed yet) and Deleting versions (their
-// data is being cleaned up) are excluded.
+// storage-layer data sync. Index readiness says nothing about whether data
+// needs recovery: lazy indexes can be PENDING for durable versions. Announce
+// pending data too, just as applying CreateVersion would have done; the data
+// plane waits for actual data rather than treating the hook as a durability
+// proof. Deleted and permanently lost DATA are never restored.
 //
 // Used after installing a leader-pushed snapshot: the snapshot covers log
 // entries that are never applied individually on this node, so the normal
@@ -1091,7 +1188,7 @@ func (sm *stateMachine) listAllVersions() []types.VersionMeta {
 	defer sm.mu.RUnlock()
 	out := make([]types.VersionMeta, 0, len(sm.versions))
 	for _, v := range sm.versions {
-		if v.IndexStatus == types.IndexStatusPending || v.Deleting {
+		if v.DataStatus == types.DataStatusFailedPermanent || v.Deleting {
 			continue
 		}
 		out = append(out, v)
