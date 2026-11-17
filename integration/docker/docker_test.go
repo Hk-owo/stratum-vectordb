@@ -34,6 +34,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -263,25 +265,63 @@ func stressQuantizer() pb.QuantizerType {
 	}
 }
 
-// measurementKB returns the knowledge base a measurement case should fill.
-//
-// With the default quantizer it is the leader probe's own KB, unchanged. With a
-// quantizer set it is a fresh KB built for the purpose: the probe's KB is created
-// before the quantizer is known and holds a single document — far too few to
-// train SQ8/PQ's codebook — and the quantizer is immutable after creation, so
-// getting it wrong there could not be repaired by a later call.
-func measurementKB(t *testing.T, ctx context.Context, addr, label, probeKB string) string {
-	q := stressQuantizer()
-	if q == pb.QuantizerType_QUANTIZER_OFF {
-		return probeKB
+// stressReplicas returns the replica count stress/volume measurement KBs use
+// when the storage tier has more nodes than that (e.g. 3 replicas on a 3+5
+// cluster). Override with STRATUM_STRESS_REPLICAS (0 = full deployment).
+func stressReplicas() int {
+	if v := os.Getenv("STRATUM_STRESS_REPLICAS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
 	}
-	t.Helper()
+	return 3
+}
 
+// stressReplicaIDs chooses a deterministic subset of active storage node IDs
+// for stress/volume KBs so a 3+5 cluster runs 3-replica measurements rather than
+// defaulting to all 5 storage nodes. Returns nil when full deployment already
+// has <= target nodes or when STRATUM_STRESS_REPLICAS=0.
+func stressReplicaIDs(t *testing.T, ctx context.Context) []int64 {
+	t.Helper()
+	target := stressReplicas()
+	if target <= 0 || len(storageServices) <= target {
+		return nil
+	}
+	admin, conn, err := dialStorageAdmin(nodeAddrs[0])
+	if err != nil {
+		t.Fatalf("dial StorageAdminService: %v", err)
+	}
+	defer conn.Close()
+	dir, err := admin.GetDirectory(ctx, &pb.GetStorageDirectoryRequest{})
+	if err != nil {
+		t.Fatalf("GetDirectory: %v", err)
+	}
+	var active []int64
+	for _, n := range dir.GetNodes() {
+		if n.GetManagementState() == "" || n.GetManagementState() == "active" {
+			active = append(active, n.GetNodeId())
+		}
+	}
+	sort.Slice(active, func(i, j int) bool { return active[i] < active[j] })
+	if len(active) <= target {
+		return nil
+	}
+	return active[:target]
+}
+
+// createStressKB creates a fresh KB for a stress/volume/GC case, scoped to
+// stressReplicaIDs when the storage tier is larger than STRATUM_STRESS_REPLICAS.
+func createStressKB(t *testing.T, ctx context.Context, addr, label string, q pb.QuantizerType) (string, []int64) {
+	t.Helper()
+	replicas := stressReplicaIDs(t, ctx)
 	req := newKBRequest(label)
 	req.Quantizer = q
 	if q == pb.QuantizerType_QUANTIZER_PQ {
 		req.PqM = 96 // d=768 → 96 sub-vectors of 8 dims
 		req.PqNbits = 8
+	}
+	if len(replicas) > 0 {
+		req.StorageReplicaIds = replicas
 	}
 
 	kb, _, _, conn, err := dialNode(addr)
@@ -292,10 +332,30 @@ func measurementKB(t *testing.T, ctx context.Context, addr, label, probeKB strin
 
 	resp, err := kb.CreateKnowledgeBase(ctx, req)
 	if err != nil {
-		t.Fatalf("CreateKnowledgeBase(quantizer=%v): %v", q, err)
+		t.Fatalf("CreateKnowledgeBase(quantizer=%v, replicas=%v): %v", q, replicas, err)
 	}
-	t.Logf("measuring with quantizer %v, KB %s", q, resp.GetKnowledgeBaseId())
-	return resp.GetKnowledgeBaseId()
+	kbID := resp.GetKnowledgeBaseId()
+	if len(replicas) > 0 {
+		t.Logf("created measurement KB %s (quantizer=%v, replicas=%v)", kbID, q, replicas)
+	} else if q != pb.QuantizerType_QUANTIZER_OFF {
+		t.Logf("measuring with quantizer %v, KB %s", q, kbID)
+	}
+	return kbID, replicas
+}
+
+// measurementKB returns the knowledge base a measurement case should fill.
+//
+// When neither a custom quantizer nor a partial replica subset is needed it
+// reuses the leader probe's own KB; otherwise it creates a clean KB with the
+// requested quantizer and replica placement (3 replicas on a 3+5 cluster).
+func measurementKB(t *testing.T, ctx context.Context, addr, label, probeKB string) string {
+	t.Helper()
+	q := stressQuantizer()
+	if q == pb.QuantizerType_QUANTIZER_OFF && len(stressReplicaIDs(t, ctx)) == 0 {
+		return probeKB
+	}
+	kbID, _ := createStressKB(t, ctx, addr, label, q)
+	return kbID
 }
 
 // probeLeaderOnce finds the node that actually accepts writes, returning its

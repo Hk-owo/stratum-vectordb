@@ -35,7 +35,7 @@
   <!-- 服务站 -->
   <rect x="140" y="162" width="760" height="78" rx="10" fill="#fdf4e4" stroke="#d9a441" stroke-width="1.6"/>
   <text x="520" y="186" text-anchor="middle" class="box-title">服务站 station（stratum-router）—— 集群唯一对外检索入口 + 鉴权闸门</text>
-  <text x="520" y="208" text-anchor="middle" class="body">按 min_version 取副本 · 副本不健康换候选 · 索引维护中可重试 · 存储层退化时拒绝写入（读照常服务）</text>
+  <text x="520" y="208" text-anchor="middle" class="body">按 KB 放置目录路由 · 新鲜度凭证 · 副本不健康换候选 · 退化拒绝写入（读照常）</text>
   <text x="520" y="228" text-anchor="middle" class="note">不持有任何状态：它坏掉只影响路由，不影响正确性</text>
 
   <!-- 分叉 -->
@@ -51,11 +51,11 @@
   <text x="60" y="310" class="box-title">控制面节点（role=control）</text>
   <text x="60" y="330" class="box-sub">只拥有 Raft 复制的元数据 · 不写本地存储（只有日志与快照）</text>
   <text x="60" y="356" class="body">知识库 · 版本链 · 活跃版本（子版本至多一个）</text>
-  <text x="60" y="378" class="body">抽象可用性 · READY 副本计数</text>
+  <text x="60" y="378" class="body">按 KB 副本放置目录 · 迁移调度 · 服务授权 · 清理义务</text>
   <text x="60" y="400" class="body">数据侧 / 索引侧各自独立的状态与终态</text>
   <text x="60" y="422" class="body">Raft 共识：日志复制 · 快照 · 选举</text>
   <text x="60" y="444" class="body">非 leader 也能发起写：经 InternalService.Propose 转发</text>
-  <text x="60" y="466" class="body">退化判据来自周期上报的聚合，未知一律放行</text>
+  <text x="60" y="466" class="body">退化判据来自周期心跳与有效目录，未知一律放行</text>
 
   <!-- 存储面 -->
   <rect x="580" y="284" width="420" height="212" rx="10" fill="#eae8f8" stroke="#6a5acd" stroke-width="1.6"/>
@@ -65,7 +65,7 @@
   <text x="600" y="378" class="body">IndexManager：每版本索引 LRU + 引用计数</text>
   <text x="600" y="400" class="body"> + 两级优先构建池 + owner 分片 + 按需拉取产物</text>
   <text x="600" y="422" class="body">PebbleDB：DocStore · ChunkDoc 映射 · VersionDoc</text>
-  <text x="600" y="444" class="body">落后副本自愈：周期上报游标 → 追链补齐</text>
+  <text x="600" y="444" class="body">落后副本自愈：心跳代号触发 → 按需拉取链尾追齐</text>
   <text x="600" y="466" class="body">周期 chunk GC · 每版本布隆过滤器 · 墓碑回收</text>
 
   <!-- 两层契约 -->

@@ -307,9 +307,10 @@ func TestT4_DataVolume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), dataVolumeTimeout())
 	defer cancel()
 
-	leaderIdx, kbID := waitForLeader(t, ctx, "datavolume", 30*time.Second)
+	leaderIdx, probeKB := waitForLeader(t, ctx, "datavolume", 30*time.Second)
 	leaderAddr := nodeAddrs[leaderIdx]
-	kbID = measurementKB(t, ctx, leaderAddr, "datavolume", kbID)
+	replicaIDs := stressReplicaIDs(t, ctx)
+	kbID := measurementKB(t, ctx, leaderAddr, "datavolume", probeKB)
 	t.Logf("leader is node %d (%s), KB %s, writing %d documents", leaderIdx, leaderAddr, kbID, docCount)
 
 	_, _, _, conn, err := dialNode(leaderAddr)
@@ -376,11 +377,26 @@ func TestT4_DataVolume(t *testing.T) {
 	// directory is keyed by node_id, which the container name no longer spells
 	// out. The vecstore's RocksDB sits in the same container, so its bytes are
 	// already inside these numbers.
-	var totalNodeBytes int64
+	replicaSet := make(map[int64]bool, len(replicaIDs))
+	for _, id := range replicaIDs {
+		replicaSet[id] = true
+	}
+	var totalNodeBytes, replicaNodeBytes int64
 	for i, svc := range storageServices {
 		n := duNodeBytes(t, svc, storageDataDir(i))
-		t.Logf("storage %s: %d bytes (%.2f MiB)", svc, n, float64(n)/(1024*1024))
+		id := int64(10 + i + 1)
+		role := "replica"
+		if len(replicaSet) > 0 && !replicaSet[id] {
+			role = "non-replica"
+		} else {
+			replicaNodeBytes += n
+		}
+		t.Logf("storage %s (%s): %d bytes (%.2f MiB)", svc, role, n, float64(n)/(1024*1024))
 		totalNodeBytes += n
+	}
+	if len(replicaSet) > 0 {
+		t.Logf("replica total (%d nodes): %d bytes (%.2f MiB)",
+			len(replicaSet), replicaNodeBytes, float64(replicaNodeBytes)/(1024*1024))
 	}
 	t.Logf("storage total (%d nodes): %d bytes (%.2f MiB)",
 		len(storageServices), totalNodeBytes, float64(totalNodeBytes)/(1024*1024))
@@ -410,6 +426,6 @@ func TestT4_DataVolume(t *testing.T) {
 		t.Logf("Query returned %d results (top-k=10)", len(queryResp.Results))
 	}
 
-	t.Logf("DATA-VOLUME SUMMARY: docs=%d write=%v build=%v nodeBytes=%d",
-		docCount, writeDur, buildDur, totalNodeBytes)
+	t.Logf("DATA-VOLUME SUMMARY: docs=%d write=%v build=%v nodeBytes=%d replicaBytes=%d",
+		docCount, writeDur, buildDur, totalNodeBytes, replicaNodeBytes)
 }

@@ -615,9 +615,10 @@ func TestT4_QueryLatency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), stressTimeout())
 	defer cancel()
 
-	leaderIdx, kbID := waitForLeader(t, ctx, "stress-latency", 30*time.Second)
+	leaderIdx, probeKB := waitForLeader(t, ctx, "stress-latency", 30*time.Second)
 	leaderAddr := nodeAddrs[leaderIdx]
-	kbID = measurementKB(t, ctx, leaderAddr, "stress-latency", kbID)
+	replicaIDs := stressReplicaIDs(t, ctx)
+	kbID := measurementKB(t, ctx, leaderAddr, "stress-latency", probeKB)
 	docCount := stressDocs()
 	t.Logf("leader is node %d (%s), KB %s, writing %d documents", leaderIdx, leaderAddr, kbID, docCount)
 
@@ -625,16 +626,28 @@ func TestT4_QueryLatency(t *testing.T) {
 	waitVersionStatus(t, ctx, leaderAddr, kbID, versionID, pb.IndexStatus_INDEX_STATUS_READY, indexBuildTimeout())
 	t.Logf("version %d is READY", versionID)
 
-	// Every storage replica must serve the version before the cold measurement means
+	// Every KB replica must serve the version before the cold measurement means
 	// anything: a replica that never received the artifact would answer — or fail —
 	// for an entirely different reason.
-	for i, addr := range storageAddrs {
-		awaitServable(t, ctx, addr, kbID, versionID, indexBuildTimeout())
-		t.Logf("storage %d serves the version", i+1)
+	coldIdx := 0
+	if len(replicaIDs) > 0 {
+		for _, id := range replicaIDs {
+			if resp := awaitDirectServable(t, ctx, storageAddrOf(t, id), kbID, versionID, indexBuildTimeout()); resp == nil {
+				t.Fatalf("storage node %d (%s) never served %s v%d directly", id, storageAddrOf(t, id), kbID, versionID)
+			}
+			t.Logf("storage node %d serves the version", id)
+		}
+		if idx := int(replicaIDs[0] - 11); idx >= 0 && idx < len(storageServices) {
+			coldIdx = idx
+		}
+	} else {
+		for i, addr := range storageAddrs {
+			awaitServable(t, ctx, addr, kbID, versionID, indexBuildTimeout())
+			t.Logf("storage %d serves the version", i+1)
+		}
 	}
 
 	// --- Cold: restart one storage node and time its FIRST query. ---
-	coldIdx := 0
 	killNode(t, storageServices[coldIdx])
 	startNode(t, storageServices[coldIdx])
 	if err := waitForListen(storageAddrs[coldIdx], 60*time.Second); err != nil {
@@ -727,8 +740,17 @@ func TestT4_GCPressure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), stressTimeout())
 	defer cancel()
 
-	leaderIdx, kbID := waitForLeader(t, ctx, "stress-gc", 30*time.Second)
+	leaderIdx, probeKB := waitForLeader(t, ctx, "stress-gc", 30*time.Second)
 	leaderAddr := nodeAddrs[leaderIdx]
+	kbID := probeKB
+	replicaIDs := stressReplicaIDs(t, ctx)
+	if len(replicaIDs) > 0 {
+		kbID, replicaIDs = createStressKB(t, ctx, leaderAddr, "stress-gc", pb.QuantizerType_QUANTIZER_OFF)
+	}
+	replicaCount := len(storageServices)
+	if len(replicaIDs) > 0 {
+		replicaCount = len(replicaIDs)
+	}
 	docCount := stressDocs()
 	deletePct := stressDeletePercent()
 	docs := genUniqueDocs(docCount, 1000)
@@ -861,7 +883,7 @@ func TestT4_GCPressure(t *testing.T) {
 	scratchOn := versionLogLines(t, builtFromScratchMessage, kbID, trimmed)
 	t.Logf("§8.6(c) reused the parent on %d/%d storage replicas, built from scratch on %d/%d "+
 		"(deletion-only version: an empty delta is a gate, not a defect)",
-		len(reuseOn), len(storageServices), len(scratchOn), len(storageServices))
+		len(reuseOn), replicaCount, len(scratchOn), replicaCount)
 
 	// Make the tombstoned version the ACTIVE one. §8.6(d) scans two sources: the
 	// active version, and the knowledge base's chain tail — the tail source exists
@@ -984,8 +1006,12 @@ func TestT4_MultiVersionEviction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), stressTimeout())
 	defer cancel()
 
-	leaderIdx, kbID := waitForLeader(t, ctx, "stress-evict", 30*time.Second)
+	leaderIdx, probeKB := waitForLeader(t, ctx, "stress-evict", 30*time.Second)
 	leaderAddr := nodeAddrs[leaderIdx]
+	kbID := probeKB
+	if len(stressReplicaIDs(t, ctx)) > 0 {
+		kbID, _ = createStressKB(t, ctx, leaderAddr, "stress-evict", pb.QuantizerType_QUANTIZER_OFF)
+	}
 	versions := stressVersions()
 	perVersion := stressDocs() / versions
 	if perVersion < 10 {

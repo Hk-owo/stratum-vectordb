@@ -25,12 +25,13 @@ Stratum 只做 RAG 管线的**存储与检索层**；聊天历史、会话与 pr
 
 | 指标 | 结果 | 说明 |
 |---|---|---|
-| 查询延迟（热 p50） | **3.78 / 9.78 / 22.13 ms** | 2k / 8k / 20k 篇文档，768 维，3+3 集群，经服务站测量 |
+| 查询延迟（热 p50） | **4.20 / 9.63 / 16.08 ms** | 2k / 8k / 20k 篇文档，768 维，3+5 集群每库 3 副本，经服务站测量 |
+| 按 KB 放置（3+5 每库 3 副本） | 副本放大率 **0.60×**；热 p50 **2.77 ms** | 5 存储节点承载 5 个 KB，每节点仅存 3/5 个 KB，控制面非 OK RPC 为 0 |
 | 中部编辑后 chunk 复用 | ChunkID 保留率 **0% → ~95%**；需重新 embed 的文本 **64% → 10%** | CDC 对比滑动窗口，同一批真实语料 |
 | 索引构建次数 | **−24%**（8 个版本：21 → 16 次） | 索引 owner 分片：每版本只由 owner 集持有 |
-| 墓碑回收 | 索引产物 33.1 MB → 16.2 MB（**−51%**） | 2,000 篇删除 80% 后，滚动回收，回收期间查询不中断 |
-| 写入 API | 20,000 篇 / 20 批合计 **0.63 s** | 写入与索引构建解耦，构建异步进行 |
-| 测试 | **1,283** 个 Go 测试函数 + vecstore **71** 个 C++ 用例 + 12 组 Docker 集群集成测试 | CI 跑单测、`-race` 与真实集群集成 |
+| 墓碑回收 | 索引产物 66.1 MB → 24.3 MB（**−63.2%**） | 2,000 篇删除 80% 后，3+5 每库 3 副本滚动回收，回收期间查询不中断 |
+| 写入 API | 20,000 篇 / 20 批合计 **0.55 s** | 写入与索引构建解耦；3+5 放置下 10,000 篇提交 0.31 s（≈ 32.2k docs/s） |
+| 测试 | **1,744** 个 Go 测试函数 + vecstore **74** 个 C++ 用例 + **35** 个 Docker 集群集成测试 | CI 跑单测、`-race` 与真实集群集成 |
 
 完整读数与测量口径见下方[性能实测](#性能实测)。
 
@@ -79,7 +80,7 @@ Stratum 只做 RAG 管线的**存储与检索层**；聊天历史、会话与 pr
 
 - **做法**：每个 (知识库, 版本) 一份独立 HNSW 索引，版本之间零干扰；索引**不在所有副本上复制**，而是按 (知识库, 版本) 确定性算出 owner 集（活跃版本所有副本都是 owner，非活跃版本按近期是否被查询加档）。需要索引的副本向持有者**拉取**产物直接装载，拉不到再自建；同一版本的并发拉取会合并成一次读盘。
 - **调度**：构建池是两级优先队列——有人在等的实时构建永远先于后台补建，补建积压再多也挡不住一次实时写入。
-- **代价**：构建总成本随**版本数**超线性增长（8 批 → 20 批：48 s → 266 s）。owner 分片减少的是持有份数，而非单份成本；纯追加的版本会以父版本产物为起点只追加新 chunk 来缓解。
+- **代价**：构建总成本随**版本数**超线性增长（3+5 每库 3 副本下 8 批 → 20 批：2 m 10 s → 8 m 59 s）。owner 分片减少的是持有份数，而非单份成本；纯追加的版本会以父版本产物为起点只追加新 chunk 来缓解。
 
 ### 4. Raft + WAL，围绕"崩溃后仍然正确"设计
 
@@ -87,6 +88,7 @@ Stratum 只做 RAG 管线的**存储与检索层**；聊天历史、会话与 pr
 - **任何节点都能发起写**：非 leader 经 `InternalService.Propose` 转给 leader，不成链；错误以稳定的 wire name 跨进程传递，转发后 `errors.Is` 依然成立。
 - **写幂等**：`CreateVersion.client_request_id` 让重试复用首次分配的版本，而不是再分配一个。
 - 存储节点的"连续数据游标"同样持久化在 WAL 中，重启后立即准确，不靠扫描磁盘推断。
+- **落盘校验与顺序**：WAL 记录帧与 vecstore 索引旁车统一采用硬件加速的 **CRC-32C**（Castagnoli）；WAL 启用分组提交与目录 fsync，写/删路径在写 WAL 提交记录前先 flush vecstore。
 
 ### 5. 卡住的版本必须有名字
 
@@ -99,16 +101,16 @@ Stratum 只做 RAG 管线的**存储与检索层**；聊天历史、会话与 pr
 
 ### 6. 落后副本自愈 + 读的新鲜度凭证
 
-- 存储节点每 5 秒发一次固定大小的心跳，响应里只带 `chain_generation`；它变化时节点才拉一次链尾。落后节点在后台先补数据、再补索引。缺口能逐版本重放时走 WAL 增量，缺口里含已删除版本时退回全量状态传输。这里**没有开关**，能调的只是节奏（滞后阈值、抖动、并发上限）。
+- 存储节点每 5 秒发一次固定大小的心跳，响应里只带 `chain_generation` 与 `directory_revision`；任一代号变化时节点才按自身负责的 KB 拉取链尾或刷新放置。落后节点在后台先补数据、再补索引。缺口能逐版本重放时走 WAL 增量，缺口里含已删除版本时退回全量状态传输。这里**没有开关**，能调的只是节奏（滞后阈值、抖动、并发上限）。
 - 追赶拿到的数据**不由追赶方宣布 durable**：单副本持有不等于 quorum。追赶完成后它启动的是一次 quorum 检查，数够了才上报——已 durable 的版本直接跳过。
-- 数据源解析有四层兜底：本地注册表 → leader → 游标探测 → 落后节点探测 peer 游标后写入的本地缓存（查表即得，绝不在 Raft apply 路径上发 RPC）。
-- 服务站转发查询时附上"应看到的最低版本"，存储节点游标不够就拒——**把"悄悄返回过时结果"变成显式失败**，再换一个达标副本。
-- 服务站路由不依赖任何节点上报：先问版本的 owner（哈希算出），都失败再问其余节点。拒绝里带着节点游标，服务站记 3 秒，这期间把它排到最后而不是剔除，记录丢了最多多一次往返。
+- 数据源解析有四层兜底（全部限定在当前 KB 的有效副本集内）：本地注册表 → leader → 游标探测 → 落后节点探测 peer 游标后写入的本地缓存（查表即得，绝不在 Raft apply 路径上发 RPC）。
+- 服务站转发查询时附上"应看到的最低版本"与 `placement_epoch`，存储节点游标不够就拒——**把"悄悄返回过时结果"变成显式失败**，再换一个达标副本；过期 epoch 或非成员响应触发单次目录刷新重试。
+- 服务站路由不依赖任何节点上报：先问当前 KB 放置内该版本的 owner（哈希算出），都失败再问集合内其余副本。拒绝里带着节点游标，服务站记 3 秒，这期间把它排到最后而不是剔除，记录丢了最多多一次往返。
 
 ### 7. 存储退化是显式信号：写拒绝、读照常
 
-- 副本低于 quorum 时写入返回 `kb_storage_degraded` / `storage_unavailable`（可重试），读照常服务，查询响应带 `storage_degraded` 位，只读客户端无需先撞一次写失败才知道。
-- 判据来自周期心跳，**判不出时一律放行**：leader 换届瞬间变成写熔断是不可接受的。
+- 按 KB 有效副本集合计算 quorum；低于 quorum 时写入返回 `kb_storage_degraded` / `storage_unavailable`（可重试），正在删除或删除失败（`DELETING` / `DELETE_FAILED`）的 KB 直接拒绝写入 `knowledge_base_deleted`。读照常服务，查询响应带 `storage_degraded` 位，只读客户端无需先撞一次写失败才知道。
+- 判据来自周期心跳与有效放置目录，**判不出时一律放行**：leader 换届瞬间变成写熔断是不可接受的。
 - 两道门：服务站转发前拦一次（省掉往返），控制面在提交 Raft 前再拦一次（不浪费版本号与日志），两处报同一个错误名。
 
 ### 8. 可选的量化两段式检索
@@ -120,69 +122,83 @@ Stratum 只做 RAG 管线的**存储与检索层**；聊天历史、会话与 pr
 
 ### 9. 服务站与网关分成两层，安全边界只有一处
 
-- 服务站（gRPC，`:7009`）负责 leader 发现、写转发、读均衡、熔断与鉴权；网关（HTTP，`:8081`）只做 HTTP→gRPC 转换并托管 Web 控制台，不知道集群拓扑。程序接入只需服务站，网关是可选适配层。
-- 节点只接受带服务站信任标记的客户端调用，标记是带时间戳的 **HMAC-SHA256**，不可伪造且过期即失效；vecstore 的文件类 RPC 只允许在索引目录内读写，且明确排除 RocksDB 目录。
+- 服务站（gRPC，`:7009`）负责 leader 发现、按 KB 目录路由、写转发、读均衡、熔断与鉴权；网关（HTTP，`:8081`）只做 HTTP→gRPC 转换并托管 Web 控制台，不知道集群拓扑。程序接入只需服务站，网关是可选适配层；两层容器部署下目录登记容器名时，服务站需跑在集群网络内。
+- 节点只接受带服务站信任标记的客户端调用，标记是带时间戳的 **HMAC-SHA256**，不可伪造且过期即失效；`StorageAdminService` 另要求凭据显式配置 `storage_admin: true`；vecstore 的文件类 RPC 只允许在索引目录内读写，且明确排除 RocksDB 目录。
+
+### 10. 按 KB 副本放置与在线单成员迁移
+
+- **做法**：控制层 Raft 目录维护稳定节点表、每 KB 有效副本集合（建库可通过 `storage_replica_ids` 指定，缺省覆盖全部活跃未屏蔽存储节点）、单调 `placement_epoch` 与 KB tombstone；非成员节点拒绝数据写入、追赶与查询（`not_kb_replica`）。`StorageAdminService` 支持在线单成员替换与整节点原子排空（`DrainNode`）：先持久化执行围栏（`ExecutionGate`）排空旧写入 → 导出并校验全量传输帧 → 独占导入并重读可服务状态 → Raft 原子切换集合、提升 epoch 并持久化退出副本的后台清理义务。
+- **代价**：单次迁移只替换一个成员，且同一 KB 不允许并发迁移；地址更新与节点退役要求先排空且无未完成清理义务，退役节点 ID 永不复用。
 
 ## 工程实践
 
-- **测试**：33 个 Go 包中 28 个带测试，共 1,283 个测试函数；vecstore 71 个 C++ 用例；`integration/docker` 在真实 3+3 集群上覆盖幂等、追赶、退化、换出、回收等场景。CI 跑单测 + 覆盖率、`-race`（共识与索引核心）与 Docker 集成。
-- **可观测**：三态健康检查、Prometheus `/metrics`、查询分段计时（`query: stage timings`），以及 `GetSystemStatus` 中的卡住 / 数据缺失 / 永久失败 / GC 受阻版本列表。
+- **测试**：35 个 Go 包中 30 个带测试，共 **1,744** 个常规测试函数；vecstore **74** 个 C++ 用例（另有 3 个基准测试）；`integration/docker` **35** 个集群集成测试在真实 3+3 / 3+5 集群上覆盖幂等、追赶、退化、换出、回收、重叠放置、迁移与排空退役等场景。CI 跑单测 + 覆盖率、`-race`（共识与索引核心）与 Docker 集成。
+- **可观测**：三态健康检查、Prometheus `/metrics`（含每方法 gRPC 请求计数、请求/响应字节与耗时直方图）、查询与写入分段计时（`query: stage timings` / `write: stage timings`），以及 `GetSystemStatus` 中的卡住 / 数据缺失 / 永久失败 / GC 受阻版本列表。
 
 ## 性能实测
 
-> 2026-10-16，两层拓扑（控制组 3 + 存储组 3，每个存储容器自带真实 Faiss HNSW + RocksDB，768 维），宿主 7.2 GiB 内存，经服务站测量，**默认配置**（owner 分片开启、墓碑回收开启、冷版本分层关闭）。轮间差异主要来自宿主与页缓存状态，因此只比较同一轮内的数据。
->
-> **2026-11-04 复查（当前代码，三档，全精度）**：同步与路由重构（周期上报只留心跳、链尾改 `chain_generation` + 按需拉取、服务站路由改为确定性分片 + 被动学习）之后重测同一用例，`clean` 集群、`info` 级日志。热 p50：**2,000 篇 5.23 / 5.38 ms**（下表 3.78）、**8,000 篇 10.47 ms**（9.78）、**20,000 篇 18.82 ms**（22.13）；p95 分别为 7.56 / 7.91、14.34、24.15 ms。
->
-> 差异随规模单调收敛（+40% / +7% / **−15%**），零向量对照同向变化 —— 这与"路由改确定性分片 + 被动学习"带来的**每次请求固定开销**相符，而不是查询执行路径变慢；**未做同环境 A/B，不作为因果结论**。同一份代码的功能侧全绿：29 个 Go 包单测、`-race`、T4 集群套件 26 PASS / 2 SKIP / 0 FAIL。20,000 档最初在默认配置下写入链会断在第 11–19 批（数据侧卡在 PENDING、下一批以它为父版本被拒），**该缺陷已修复**：现在默认 `min_lag_versions=1` 直接跑通，读数就是上方的 18.82 ms。**本节的表格与下图仍是 2026-10-16 的读数**，复查值以上方这段为准。
+> **2026-11-17（当前代码，两层 3+5 拓扑）**：控制组 3 + 存储组 5（每个存储容器自带真实 Faiss HNSW + RocksDB，768 维），宿主 12 核 / 7.2 GiB 内存，服务站运行在集群网络 `stratum-net` 内。每档前均执行 `clean` 重建全新集群、`info` 级日志（`debug` 分段采样单列）。压测用例通过 `STRATUM_STRESS_REPLICAS=3` 显式按 `storage_replica_ids=[11,12,13]` 落入 3 个存储副本（quorum 2），其余 2 个存储节点（14/15）不承接该库；多库轮转分摊由 `TestStorageTopologyPerf_PlacementProfile` 测量。
 
-### 查询延迟（全精度，`TestT4_QueryLatency`，每档 200 次热查询）
+### 查询延迟（全精度，`TestT4_QueryLatency`，每档 200 次热查询，3 副本）
 
 ![查询延迟随文档规模的变化](assets/latency-vs-scale.svg)
 
 | 指标 | 2,000 篇 | 8,000 篇 | 20,000 篇 |
 |---|---|---|---|
-| 冷查询（重启副本后首次，需从磁盘 Load） | 7.67 ms | 18.23 ms | 39.95 ms |
-| p50（热） | **3.78 ms** | **9.78 ms** | **22.13 ms** |
-| p95 | 5.41 ms | 13.27 ms | 31.00 ms |
-| p99 | 6.37 ms | 17.62 ms | 37.83 ms |
+| 冷查询（重启副本后首次，需从磁盘 Load） | 4.50 ms | 15.57 ms | 20.78 ms |
+| p50（热） | **4.20 ms** | **9.63 ms** | **16.08 ms** |
+| p95 | 5.95 ms | 12.67 ms | 19.88 ms |
+| p99 | 7.45 ms | 16.41 ms | 21.91 ms |
+| 全零向量对照 p50 | 4.44 ms | 9.15 ms | 14.57 ms |
 
-热 p50 随文档数近似线性。冷热分开报：首次查询要把产物从磁盘装回内存，两者混在一起取平均既不描述常见情况，也不描述最坏情况。
+热 p50 随文档数呈次线性增长（1 : 2.29 : 3.83，文档数 1 : 4 : 10）。冷热分开报：首次查询要把产物从磁盘装回内存，两者混在一起取平均既不描述常见情况，也不描述最坏情况。
 
 ### 查询耗时构成（存储节点内，µs）
 
 | 段 | 做什么 | 2,000 篇 p50 | 8,000 篇 p50 |
 |---|---|---|---|
-| `filter_us` | 候选的版本过滤 + 聚合 | **2061** | **6722** |
-| ↳ `chunkmap_us` | 每个候选 chunk 查一次所属文档 | 1138 | 2903 |
-| `meta_us` | 读版本元数据 | 295 | 345 |
-| `search_us` | vecstore HNSW 检索 | 324 | 381 |
-| `read_us` | 读命中文档正文 | 87 | 157 |
-| `bloom_us` | 布隆过滤 + 文档 ID 集合 | 37 | 164 |
-| **`total_us`** | 合计 | **3026** | **9005** |
+| `filter_us` | 候选的版本过滤 + 聚合 | **2325** | **5460** |
+| ↳ `chunkmap_us` | 每个候选 chunk 查一次所属文档 | 1252 | 2742 |
+| `search_us` | vecstore HNSW 检索 | 383 | 280 |
+| `meta_us` | 读版本元数据 | 245 | 178 |
+| `read_us` | 读命中文档正文 | 86 | 122 |
+| `bloom_us` | 布隆过滤（版本文档集指纹缓存后） | **2** | **2** |
+| **`total_us`** | 合计 | **3375** | **6846** |
 
-（`debug` 日志级别下采集，绝对值略高于 `info` 级，此表看构成与占比。）
+（`debug` 日志级别下采集，每档 256 / 260 条样本，此表看构成与占比。）
 
-### 量化对照（`SQ8` vs 全精度）
+### 量化对照（`SQ8` vs 全精度，三档全部实测）
 
 ![全精度 OFF 与 SQ8 的查询延迟对照](assets/quantization-off-vs-sq8.svg)
 
-| 热 p50 | 2,000 篇 | 8,000 篇 |
+| 规模 | `OFF` 冷 / p50 / p95 / p99 | `SQ8` 冷 / p50 / p95 / p99 |
 |---|---|---|
-| `OFF` | 3.78 ms | 9.78 ms |
-| `SQ8` | 3.55 ms | 11.82 ms |
+| 2,000 篇 | 4.50 / **4.20** / 5.95 / 7.45 ms | 9.05 / **5.94** / 9.29 / 12.28 ms |
+| 8,000 篇 | 15.57 / **9.63** / 12.67 / 16.41 ms | 12.47 / **8.93** / 13.24 / 16.49 ms |
+| 20,000 篇 | 20.78 / **16.08** / 19.88 / 21.91 ms | 33.21 / **18.65** / 23.83 / 25.55 ms |
 
-两个方向的差值都小于轮间波动，结论是"内存降为 1/4，延迟无可测差异"。
+三档下 `SQ8` 与全精度延迟差均落在轮间噪声范围内（不作因果归因）；结合 1 B/维的向量存储，结论依然是"买的是内存（降为 1/4），不是延迟"。
 
-### 写入与索引构建（`TestT4_DataVolume`，每批 1,000 篇）
+### 写入与索引构建（`TestT4_DataVolume`，每批 1,000 篇，3 副本）
 
-| 规模 | 写入 API 合计 | 累计索引构建 | 端到端 |
-|---|---|---|---|
-| 2,000 篇（2 批） | 52.8 ms | 9.90 s | 10.7 s |
-| 8,000 篇（8 批） | 200.6 ms | 48.27 s | 49.5 s |
-| 20,000 篇（20 批） | 626.9 ms | 4 m 25.6 s | 267.8 s |
+| 规模 | 写入 API 合计 | 累计索引构建 | 端到端 | 3 副本目录合计（非副本 2 节点） |
+|---|---|---|---|---|
+| 2,000 篇（2 批） | 66.2 ms | 46.40 s | 46.47 s | 69.42 MiB（各 2.33 MiB 基线） |
+| 8,000 篇（8 批） | 183.7 ms | 2 m 09.9 s | 2 m 10.1 s | 170.36 MiB（各 2.33 MiB 基线） |
+| 20,000 篇（20 批） | 553.6 ms | 8 m 58.6 s | 8 m 59.1 s | 324.56 MiB（各 2.33 MiB 基线） |
 
-写入 API 几乎与规模无关，代价集中在索引构建，并随版本数超线性增长。干净环境下 20,000 篇的 3 节点数据目录合计 346 MiB。
+写入 API 几乎与规模无关，代价集中在异步索引构建，并随版本数超线性增长；非副本存储节点（`storage4` / `storage5`）保持 2.33 MiB 空库基线不落入数据。同轮多版本换出（`TestT4_MultiVersionEviction`，8 版本 × 3 轮共 24 次查询）全部应答（91.9 s）；墓碑回收（`TestT4_GCPressure`，2,000 篇删 80%）产物由 66.1 MB 降至 24.3 MB（**−63.2%**），回收后查询正常（79.9 s）。
+
+### 按 KB 副本放置（`TestStorageTopologyPerf_PlacementProfile`，3+5 集群，每库 3 副本）
+
+5 个 KB 轮转放置在 5 个存储节点上（`[11,12,13]` … `[15,11,12]`），每库写入 2,000 篇（分 2 批 × 1,000）并执行 100 次热查询（共 10,000 篇、500 次查询）：
+
+| 维度 | 实测读数 | 说明 |
+|---|---|---|
+| 写提交（10 批） | 合计 **310 ms**（均值 **31 ms/批**，**32,215 docs/s**） | 异步接受；全成员追赶合计 1 m 22.0 s |
+| 经服务站热查询（500 次） | p50 **2.77 ms** · p95 **5.91 ms** · p99 **10.63 ms** | 含偶发冷构建的均值 32.61 ms |
+| 放置与磁盘 | 每节点 **3/5** 个 KB（102–107 MiB/节点） | 配置 15 副本 vs 全量 25 副本，**放大率 0.60×** |
+| 控制面 RPC 流量 | `GetStorageDirectory` 10.73/s（0.06 ms）· `Heartbeat` 1.62/s（0.85 ms） | **非 OK 调用 0 次** |
 
 ## 快速开始
 
@@ -195,14 +211,15 @@ go test -race ./internal/kvraft/... ./internal/raft/... ./internal/index/...
 # 一键拉起完整链路：vecstore(C++) → stratum → 服务站 → 网关 + Web 控制台
 scripts/gateway.sh --with-db        # 然后打开 http://localhost:8081
 
-# 3 节点 Docker 集群（与 CI 相同）
+# 3 节点单层 Docker 集群
 scripts/cluster.sh up 3 --with-embed
 go test ./integration/docker/... -tags=docker -timeout 300s
 scripts/cluster.sh down
 
-# 两层拓扑：控制组 1..3 + 存储组 11..13 + mock-embed
+# 两层拓扑：控制组 1..3 + 存储组 11..13（或 -s 5 起 3+5）+ mock-embed
 scripts/cluster.sh --topology two-tier build
-scripts/cluster.sh --topology two-tier up
+scripts/cluster.sh --topology two-tier --storage-nodes 5 up
+scripts/t4-integration.sh -s 5 --no-up
 ```
 
 更多脚本用法见 [`scripts/README.md`](scripts/README.md)。
@@ -212,20 +229,22 @@ scripts/cluster.sh --topology two-tier up
 | 路径 | 内容 |
 |---|---|
 | `internal/kvraft` | Raft 共识：选举、日志复制、快照、持久化 |
-| `internal/raft` | 版本元数据状态机：版本链、活跃版本、终态裁决、提案转发 |
-| `internal/wal` | 预写日志：写事务、数据游标、变更记录（供落后副本增量重放） |
+| `internal/raft` | 版本元数据与存储目录状态机：版本链、活跃版本、终态裁决、放置/迁移提交、提案转发 |
+| `internal/storage` | 稳定节点目录、按 KB 副本放置解析、迁移状态机、持久化执行围栏（`ExecutionGate`）与服务授权 |
+| `internal/wal` | 预写日志：写事务、数据游标、变更记录（供落后副本增量重放）、CRC-32C 帧校验与分组提交 |
 | `internal/coordinator` | 写路径编排、版本删除、chunk GC、per-KB 写锁 |
 | `internal/plane` | 控制面 / 存储面契约及同进程实现；追赶、数据源解析、按需拉取索引 |
 | `internal/index` | 索引管理：LRU 驻留、引用计数、两级优先构建池、保留与墓碑回收 |
-| `internal/nodestate` | 存储节点状态机：每版本状态与连续数据游标 |
+| `internal/nodestate` · `tombstone` · `owner` | 存储节点状态机、删除墓碑表、每版本索引 owner 确定性分片 |
 | `internal/splitter` | 内容定义分块（Rabin 指纹）与滑动窗口对照实现 |
 | `internal/docstore` · `chunkdoc` · `versiondoc` · `bloom` | PebbleDB 上的 MVCC 文档存储、chunk↔文档映射、版本文档集、每版本布隆过滤器 |
-| `internal/router` · `cmd/stratum-router` | 服务站：路由表、新鲜度凭证、熔断、鉴权、写入门控 |
-| `internal/sync` | 节点间数据推送 / 拉取 / 增量流 |
-| `service/` | 对外 gRPC 服务实现 |
-| `vecstore/` | C++17 向量存储：Faiss HNSW / 量化粗筛 + RocksDB 全精度向量 |
+| `internal/router` · `cmd/stratum-router` | 服务站：按 KB 目录路由、新鲜度凭证、熔断、鉴权（含 `storage_admin`）、写入门控 |
+| `internal/sync` | 节点间数据推送 / 拉取 / 增量流、心跳与在线迁移导出/安装 |
+| `internal/wire` · `authmeta` · `errors` | 控制/存储协议编解码、服务站 HMAC 信任标记、跨进程错误码 |
+| `service/` | 对外 gRPC 服务实现（含 `StorageAdminService`）与 `/metrics` gRPC 计数指标 |
+| `vecstore/` | C++17 向量存储：Faiss HNSW / 量化粗筛 + RocksDB 全精度向量（CRC-32C 旁车） |
 | `cmd/stratum-gateway` · `web/` | HTTP 网关、运维台与 Web 控制台 |
-| `integration/` | 进程内集成测试与 Docker 集群测试 |
+| `integration/` | 进程内集成测试与 Docker 集群测试（含 3+5 放置与迁移验收） |
 
 ---
 
@@ -276,7 +295,7 @@ scripts/cluster.sh --topology two-tier up
 - **单节点**：`cmd/stratum`（gRPC，默认 `127.0.0.1:7000`）+ 外部 C++ vecstore 进程。`cmd/stratum` 接受可选 YAML 配置，命令行 flag 优先：`go run ./cmd/stratum/ -config integration/docker/config1.yaml`。
 - **角色分离**：`node.role` 取 `all`（默认，两层同进程）、`control`（只有 Raft 日志与元数据，不建数据目录）、`storage`（只跑存储层，不参与选举，元数据经 `RemoteRaftNode` 读取）。`storage.nodes` 只播种空的 Raft 存储目录，省略时以部署中的存储成员播种；目录建立后以持久化状态为准，重启不会覆盖动态节点或 draining 状态。
 - **两层拓扑的硬约束**：控制层 ID（`1..N`）与存储层 ID（`11..1N`）不得重叠；写入由控制层在 apply 时指派给某个存储节点执行（`ExecuteVersionWrite`），该节点作为协调者再扇出。
-- **按 KB 放置**：创建 KB 可通过 `replica_node_ids` 指定副本；复制、查询、追赶、健康与 quorum 都以该 KB 的有效集合为准。新增节点不会扩大已有 KB。`StorageAdminService` 提供目录查询、节点登记、单 KB 迁移、取消、整节点排空、地址更新和退役；启用服务站鉴权时须给管理凭据显式配置 `storage_admin: true`，普通 `kb_ids: ["*"]` 不包含集群管理权限。
+- **按 KB 放置**：创建 KB 可通过 `storage_replica_ids` 指定副本；复制、查询、追赶、健康与 quorum 都以该 KB 的有效集合为准。新增节点不会扩大已有 KB。`StorageAdminService` 提供目录查询、节点登记、单 KB 迁移、取消、整节点排空、地址更新和退役；启用服务站鉴权时须给管理凭据显式配置 `storage_admin: true`，普通 `kb_ids: ["*"]` 不包含集群管理权限。
 - **安全切换**：迁移先围栏、复制和安装保留数据，再恢复本地服务状态，最后以 Raft 原子提交新集合、新 epoch 和退出副本清理义务。故障替换先确认旧节点服务授权失效；离线旧节点恢复后按持久化义务清理。地址更新需要先排空节点、完成清理并撤销旧授权，退役的 node ID 永不复用。
 
 ```yaml
@@ -296,7 +315,7 @@ storage:
 ```
 
 - **vecstore 路径闸门**：索引文件类 RPC（`Save` / `Load` / `LoadForAppend` / `ExistsIndex`）只允许在 `--index_dir` 内读写，默认 `<rocksdb_path 的父目录>/index`，并始终排除 RocksDB 目录本身；部署脚本与网关 supervisor 传节点级的 `<data_dir>/index`。
-- **服务站鉴权**：客户端凭据只在服务站校验（`-tokens`，按 token 的 sha256 存取，拒绝空 token），`kb_ids: ["*"]` 表示所有知识库。节点侧要求三个对外服务带服务站的 HMAC 信任标记（`-station-secret` / `node.station_secret`，两边必须成对配置）；节点间服务不受影响。
+- **服务站鉴权**：客户端凭据只在服务站校验（`-tokens`，按 token 的 sha256 存取，拒绝空 token），`kb_ids: ["*"]` 表示所有知识库，`storage_admin: true` 授予存储管理权限。节点侧要求四个对外服务带服务站的 HMAC 信任标记（`-station-secret` / `node.station_secret`，两边必须成对配置）；节点间服务不受影响。
 - **网关**：默认只绑回环 `127.0.0.1:8081`（`/ops` 能启停服务）。控制台的兜底凭据只施加给同源的 `/api/*` 请求，其余匿名请求返回 401；`bin_dir`、编排脚本路径、`station_secret` 等决定"执行什么"的字段不接受 HTTP 改写。
 - **环境变量**：`STRATUM_HTTP_ADDR`、`STRATUM_ROUTER_ADDR`（默认 `127.0.0.1:7009`）、`STRATUM_GRPC_ADDR`、`STRATUM_STATION_SECRET`、`STRATUM_STATION_TOKENS`。
 - Docker 集群模式下若 vecstore 跑在宿主机，需监听 `0.0.0.0:7100`，否则容器内无法访问。
@@ -307,13 +326,13 @@ storage:
 <details>
 <summary><b>gRPC API</b></summary>
 
-Protobuf 定义在 `api/proto/`：三个对外服务，加三个只供节点间使用的内部服务。
+Protobuf 定义在 `api/proto/`：四个对外服务，加三个只供节点间使用的内部服务。
 
 **KnowledgeBaseService**
 
 | RPC | 说明 |
 |---|---|
-| `CreateKnowledgeBase` | 创建知识库（embed 配置、切块参数、索引与量化类型），不创建版本 |
+| `CreateKnowledgeBase` | 创建知识库（embed 配置、切块参数、索引与量化类型，可选 `storage_replica_ids` 指定初始副本），不创建版本 |
 | `DeleteKnowledgeBase` | 标记删除，清理异步执行 |
 | `CreateVersion` | 应用文档变更产出新版本；可带幂等键 `client_request_id`；空 changes 被拒 |
 | `ListVersions` | 版本链，含数据侧与索引侧状态 |
@@ -342,12 +361,22 @@ Protobuf 定义在 `api/proto/`：三个对外服务，加三个只供节点间�
 | `ForceRetryVersion` | 撤销索引侧终态并重建（数据侧终态不可重试） |
 | `ForceAbandonVersion` | 放弃判死版本，按 `DeleteVersion` 的 `SINGLE` 语义处理 |
 
+**StorageAdminService**
+
+| RPC | 说明 |
+|---|---|
+| `GetDirectory` | 读取权威存储节点目录、KB 放置集合、迁移任务与 tombstone |
+| `RegisterNodes` | 基于 revision CAS 登记存储节点目录 |
+| `ManageNode` | 节点生命周期管理（`drain` / `address` / `retire` / `block` / `confirm_revoked` / `resume`） |
+| `MigrateKB` / `CancelMigration` | 发起或取消单 KB 在线单成员迁移 |
+| `DrainNode` | 原子规划整节点全部 KB 迁出 |
+
 **内部服务**（不对外）
 
 | 服务 | RPC |
 |---|---|
-| `InternalService` | `Propose`：把已编码的 Raft 命令交给 leader，非 leader 回传 `leader_id` |
-| `DataSyncService` | `ExecuteVersionWrite`（执行已提交版本的写事务）· `PushVersionData` / `PullVersionData` / `PullVersionChanges`（全量与增量传输）· `LocalVersion` / `VersionPresence`（游标与持有探测）· `Heartbeat`（周期心跳，响应捎带 `chain_generation`）· `GetChainTails`（按需拉取链尾）· `DeleteVersionData`（物理回收，无法执行时以错误回答）· `ConfirmVersionWrite` · `FetchIndexData`（按需拉取索引产物） |
+| `InternalService` | `Propose`（向 leader 提交编码 Raft 命令）· `GetStorageDirectory` / `GetStorageMaintenance` / `GetKBMigrationTransfer` · `RenewStorageService` · `VersionLiveness` / `DeletionsSince` |
+| `DataSyncService` | `ExecuteVersionWrite` · `PushVersionData` / `PullVersionData` / `PullVersionChanges` · `LocalVersion` / `VersionPresence` · `Heartbeat`（带 `chain_generation` 与 `directory_revision`）· `GetChainTails` · `DeleteVersionData` · `ConfirmVersionWrite` · `FetchIndexData` · 迁移与清理（`FenceKBReplica` / `ExportKBMigration` / `StageKBMigration` / `InstallKBMigration` / `PrepareKBMigrationServing` / `ActivateKBMigration` / `CleanupStorage`） |
 | vecstore（C++） | 索引构建、加载、检索与 chunk 向量存储 |
 
 </details>
