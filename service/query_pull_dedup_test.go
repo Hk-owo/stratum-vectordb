@@ -54,10 +54,8 @@ func (b *blockingBackfiller) calls() int {
 // refused caller learns nothing from the duplicates (they were already being
 // refused by the freshness check).
 func TestQueryService_DedupesConcurrentBackgroundPulls(t *testing.T) {
-	h := newQuerySvcHarness(t)
-	h.svc.SetLocalVersionReporter(stubCursor(5)) // this node's history reaches version 5
 	puller := newBlockingBackfiller()
-	h.svc.SetBackfiller(puller)
+	h := newQuerySvcHarness(t, WithLocalVersionReporter(stubCursor(5)), WithBackfiller(puller)) // this node's history reaches version 5
 
 	required := int64(7)
 	ask := func() {

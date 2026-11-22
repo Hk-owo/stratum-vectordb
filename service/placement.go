@@ -29,8 +29,3 @@ func UnaryStoragePlacement(resolver storage.Resolver, nodeID int64) grpc.UnarySe
 }
 
 type KBReplicaResolver func(context.Context, string) ([]string, error)
-
-func (s *KnowledgeBaseServiceImpl) SetKBReplicaResolver(resolve KBReplicaResolver) {
-	s.kbReplicas = resolve
-}
-func (s *AdminServiceImpl) SetKBReplicaResolver(resolve KBReplicaResolver) { s.kbReplicas = resolve }

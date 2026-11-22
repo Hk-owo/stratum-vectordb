@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	pb "stratum/api/proto/stratum"
 	serrors "stratum/internal/errors"
+	"stratum/internal/fsutil"
 	"stratum/internal/storage"
 	"strings"
 )
@@ -105,7 +106,7 @@ func (s *migrationStager) prepareDirectory() error {
 	if err := os.MkdirAll(s.dir, 0700); err != nil {
 		return err
 	}
-	if err := syncMigrationDir(filepath.Dir(s.dir)); err != nil {
+	if err := fsutil.SyncDir(filepath.Dir(s.dir)); err != nil {
 		return err
 	}
 	files, err := os.ReadDir(s.dir)
@@ -123,7 +124,7 @@ func (s *migrationStager) prepareDirectory() error {
 		}
 	}
 	if changed {
-		return syncMigrationDir(s.dir)
+		return fsutil.SyncDir(s.dir)
 	}
 	return nil
 }

@@ -26,9 +26,8 @@ func (s nodeStateStub) NonSteadyVersions() []nodestate.VersionEntry { return s.v
 // TestAdmin_GetSystemStatus_SurfacesNodeState: the node's own state reaches the
 // status response, with the version layer's not-at-rest entries alongside it.
 func TestAdmin_GetSystemStatus_SurfacesNodeState(t *testing.T) {
-	h := newAdminHarness()
 	entered := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	h.svc.SetNodeStateSource(nodeStateStub{
+	h := newAdminHarness(WithNodeStateSource(nodeStateStub{
 		snap: nodestate.NodeSnapshot{
 			State:            nodestate.NodeServing,
 			Since:            entered,
@@ -45,7 +44,7 @@ func TestAdmin_GetSystemStatus_SurfacesNodeState(t *testing.T) {
 				Detail:    "vecstore: connection refused",
 			},
 		},
-	})
+	}))
 
 	resp, err := h.svc.GetSystemStatus(context.Background(), &pb.GetSystemStatusRequest{})
 	if err != nil {
@@ -110,14 +109,13 @@ func TestAdmin_GetSystemStatus_OmitsNodeStateWhenUnwired(t *testing.T) {
 // turning it into UNHEALTHY would have a load balancer pull traffic off a node
 // that is answering reads.
 func TestAdmin_HealthCheck_ReportsNodePhase(t *testing.T) {
-	h := newAdminHarness()
-	h.svc.SetNodeStateSource(nodeStateStub{
+	h := newAdminHarness(WithNodeStateSource(nodeStateStub{
 		snap: nodestate.NodeSnapshot{
 			State:      nodestate.NodeReconciling,
 			Redundancy: nodestate.RedundancyUnknown,
 			Actions:    []string{"reconciling indexes"},
 		},
-	})
+	}))
 
 	resp, err := h.svc.HealthCheck(context.Background(), &pb.HealthCheckRequest{})
 	if err != nil {
@@ -139,14 +137,13 @@ func TestAdmin_HealthCheck_ReportsNodePhase(t *testing.T) {
 // non-leader answers, and printing it would put a line on every one of them —
 // which is exactly the noise that hides a real degradation.
 func TestAdmin_HealthCheck_RedundancyVerdictOnlyWhenItIsOne(t *testing.T) {
-	h := newAdminHarness()
-	h.svc.SetNodeStateSource(nodeStateStub{
+	h := newAdminHarness(WithNodeStateSource(nodeStateStub{
 		snap: nodestate.NodeSnapshot{
 			State:            nodestate.NodeServing,
 			Redundancy:       nodestate.RedundancyDegraded,
 			RedundancyDetail: "2 of 3 required replicas live",
 		},
-	})
+	}))
 
 	resp, err := h.svc.HealthCheck(context.Background(), &pb.HealthCheckRequest{})
 	if err != nil {
@@ -167,13 +164,12 @@ func TestAdmin_HealthCheck_RedundancyVerdictOnlyWhenItIsOne(t *testing.T) {
 // non-leader, serving with no verdict to offer, must produce the same "ok" it
 // did before the state machine existed.
 func TestAdmin_HealthCheck_QuietWhenServingAndRedundancyUnknown(t *testing.T) {
-	h := newAdminHarness()
-	h.svc.SetNodeStateSource(nodeStateStub{
+	h := newAdminHarness(WithNodeStateSource(nodeStateStub{
 		snap: nodestate.NodeSnapshot{
 			State:      nodestate.NodeServing,
 			Redundancy: nodestate.RedundancyUnknown,
 		},
-	})
+	}))
 
 	resp, err := h.svc.HealthCheck(context.Background(), &pb.HealthCheckRequest{})
 	if err != nil {

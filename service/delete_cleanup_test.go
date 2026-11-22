@@ -22,9 +22,8 @@ import (
 // 没了，而调用方早就被告知成功。结果是集群里堆着一堆 DELETING 的东西，没有任何
 // 一条线索指向"为什么"——实测在容器集群上堆了 26 个。
 func TestDeleteKnowledgeBase_VoicesACleanupThatDidNotFinish(t *testing.T) {
-	h := newKBSvcTestHarness()
 	core, logs := observer.New(zap.WarnLevel)
-	h.svc.SetLogger(zap.New(core))
+	h := newKBSvcTestHarness(WithKBLogger(zap.New(core)))
 	kbID, _, _, _ := kbSvcTestHarnessWithChain(t, h)
 
 	boom := errors.New("storage layer refused to drop the version")
@@ -57,9 +56,8 @@ func TestDeleteKnowledgeBase_VoicesACleanupThatDidNotFinish(t *testing.T) {
 }
 
 func TestDeleteVersion_VoicesACleanupThatDidNotFinish(t *testing.T) {
-	h := newKBSvcTestHarness()
 	core, logs := observer.New(zap.WarnLevel)
-	h.svc.SetLogger(zap.New(core))
+	h := newKBSvcTestHarness(WithKBLogger(zap.New(core)))
 	kbID, _, v2, _ := kbSvcTestHarnessWithChain(t, h)
 
 	boom := errors.New("index file is gone")
@@ -88,9 +86,8 @@ func TestDeleteVersion_VoicesACleanupThatDidNotFinish(t *testing.T) {
 // 清理成功时不该有噪音。这条钉住的是"别把日志加过头"——一个每次删库都响的
 // warning 会和这次修的缺陷一样没用。
 func TestDeleteKnowledgeBase_QuietWhenCleanupSucceeds(t *testing.T) {
-	h := newKBSvcTestHarness()
 	core, logs := observer.New(zap.WarnLevel)
-	h.svc.SetLogger(zap.New(core))
+	h := newKBSvcTestHarness(WithKBLogger(zap.New(core)))
 	kbID, _, _, _ := kbSvcTestHarnessWithChain(t, h)
 
 	done := make(chan struct{})

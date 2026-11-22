@@ -43,7 +43,7 @@ func (d recordingDropper) DropVersion(context.Context, string, int64) error {
 	return d.err
 }
 
-func resumeConfig(w wal.WAL, rn raft.RaftNode, events *[]string, dropErr error, blame *tombstone.MemoryStore) DeleteVersionCoordinatorConfig {
+func resumeConfig(w wal.WAL, rn DeleteVersionRaft, events *[]string, dropErr error, blame *tombstone.MemoryStore) DeleteVersionCoordinatorConfig {
 	return DeleteVersionCoordinatorConfig{
 		MaxRetries:          1,
 		RetryBaseIntervalMS: 1,
@@ -222,7 +222,7 @@ func (w failingWAL) WriteVersionDeleteComplete(ctx context.Context, kbID string,
 // failingRemoveMeta refuses the metadata removal, standing in for a control tier that
 // cannot be reached at that step.
 type failingRemoveMeta struct {
-	raft.RaftNode
+	DeleteVersionRaft
 	err error
 }
 
@@ -268,7 +268,7 @@ func TestDeleteVersionCoordinator_ResumeKeepsTheRecordWhenTheMetadataRemovalFail
 	removeErr := errors.New("no leader")
 
 	cfg := resumeConfig(w, raft.NewMockRaftNode(w), &events, nil, tombstone.NewMemoryStore())
-	cfg.RaftNode = failingRemoveMeta{RaftNode: cfg.RaftNode, err: removeErr}
+	cfg.RaftNode = failingRemoveMeta{DeleteVersionRaft: cfg.RaftNode, err: removeErr}
 	coord := NewDeleteVersionCoordinatorImpl(cfg)
 
 	if err := coord.ResumeVersionDelete(ctx, "kb-1", 8); !errors.Is(err, removeErr) {

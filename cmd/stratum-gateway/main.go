@@ -36,9 +36,7 @@ import (
 	"syscall"
 	"time"
 
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -48,6 +46,7 @@ import (
 	"stratum/internal/authmeta"
 	"stratum/internal/embed"
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/rpcpool"
 	"stratum/internal/types"
 )
 
@@ -120,9 +119,7 @@ func main() {
 	// and /api calls return UNAVAILABLE until the connection is established
 	// (so the frontend health badge can report the outage instead of the
 	// gateway itself hanging on startup).
-	conn, err := grpc.Dial(*grpcAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
+	conn, err := rpcpool.DefaultDialer().Dial(*grpcAddr)
 	if err != nil {
 		log.Fatalf("failed to dial %s: %v", *grpcAddr, err)
 	}

@@ -10,7 +10,6 @@ import (
 
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/authmeta"
-	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/coordinator"
@@ -19,10 +18,12 @@ import (
 	"stratum/internal/nodestate"
 	"stratum/internal/plane"
 	"stratum/internal/raft"
+	"stratum/internal/rpcpool"
 	"stratum/internal/storage"
 	stratumsync "stratum/internal/sync"
 	"stratum/internal/tombstone"
 	"stratum/internal/versiondoc"
+	"stratum/internal/versionview"
 	"stratum/internal/wal"
 
 	"stratum/service"
@@ -50,14 +51,14 @@ type grpcDeps struct {
 	deleteVersionCoord *coordinator.DeleteVersionCoordinatorImpl
 
 	// The storage the storage services read.
-	indexMgr    *index.IndexManagerImpl
-	cdm         *chunkdoc.PebbleChunkDocMapper
-	vd          *versiondoc.PebbleVersionDocList
-	ds          *docstore.PebbleDocStore
-	vBloomStore *bloom.VersionBloomStore
-	chunkStore  *chunkstore.VecstoreChunkStore
-	walImpl     *wal.FileWAL
-	dataPlane   *plane.LocalDataPlane
+	indexMgr     *index.IndexManagerImpl
+	cdm          *chunkdoc.PebbleChunkDocMapper
+	vd           *versiondoc.PebbleVersionDocList
+	ds           *docstore.PebbleDocStore
+	versionViews *versionview.Store
+	chunkStore   *chunkstore.VecstoreChunkStore
+	walImpl      *wal.FileWAL
+	dataPlane    *plane.LocalDataPlane
 
 	// The node-to-node halves the DataSync service is assembled from.
 	syncLeader        *stratumsync.LeaderHandler
@@ -75,6 +76,8 @@ type grpcDeps struct {
 	// rpcMetrics counts what this server handles. Nil is the normal state for a
 	// node started without a metrics endpoint, and every method on it is nil-safe.
 	rpcMetrics *service.RPCMetrics
+
+	peerPool *rpcpool.Pool
 }
 
 // migrationServingSurface keeps a nil index manager out of the interface: a typed
@@ -92,7 +95,7 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 	rn, raftNode, storageLocal := d.rn, d.raftNode, d.storageLocal
 	writeCoord, deleteCoord, deleteVersionCoord := d.writeCoord, d.deleteCoord, d.deleteVersionCoord
 	indexMgr, cdm, vd, ds := d.indexMgr, d.cdm, d.vd, d.ds
-	vBloomStore, chunkStore, walImpl, dataPlane := d.vBloomStore, d.chunkStore, d.walImpl, d.dataPlane
+	versionViews, chunkStore, walImpl, dataPlane := d.versionViews, d.chunkStore, d.walImpl, d.dataPlane
 	syncLeader, syncFollower := d.syncLeader, d.syncFollower
 	controlPlane, dataSources := d.controlPlane, d.dataSources
 	livenessRegistry, livenessGate := d.livenessRegistry, d.livenessGate
@@ -161,31 +164,18 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 	}
 
 	if raftNode != nil {
-		kbSvc := service.NewKnowledgeBaseService(rn, writeCoord, deleteCoord, deleteVersionCoord)
-		kbSvc.SetKBReplicaResolver(kbReplicaAddrs)
-		// §4.3: whether a write can still reach quorum, judged from the storage nodes'
-		// heartbeats, so a doomed write is refused before the version number,
-		// the Raft entry and the retry budget are spent on it. An unreadable
-		// verdict allows the write, which is how a leadership change stays a
-		// failover rather than an outage.
-		kbSvc.SetStorageDegradationSource(storageGateSource{controlPlane})
-		// Per-stage write timings, at debug level. The storage node's own
-		// stages (write: stage timings) already existed; what was missing is the
-		// half the CLIENT waits for — the control node's handling up to the
-		// version commit — which is only observable from here.
-		kbSvc.SetLogger(logger)
-		// The await path's data_missing probe asks the same two questions
-		// AdminService's status view asks — "which nodes may hold this version"
-		// and "does any of them actually have it" — so it is wired from the same
-		// sources (docs/已实施/await-version-plan.md §6.4). A control node holds no
-		// chunks itself, which is precisely why this probe goes over the network,
-		// and an unreachable replica counts as unknown rather than missing.
-		kbSvc.SetPresenceProbe(stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{}), replicaAddrsForProbe)
-		// The event-driven half of await (§12 item 1): the node tells the service
-		// when a version's replicated state moves, so the wait wakes on the apply
-		// instead of on the next poll. Only a node holding the state machine can do
-		// this, which is exactly the node the service is registered on.
-		kbSvc.SetVersionWatcher(raftNode)
+		kbSvc := service.NewKnowledgeBaseService(rn, writeCoord, deleteCoord, deleteVersionCoord,
+			service.WithKBReplicaResolver(kbReplicaAddrs),
+			// §4.3: whether a write can still reach quorum, judged from the storage nodes'
+			// heartbeats, so a doomed write is refused before the version number,
+			// the Raft entry and the retry budget are spent on it.
+			service.WithKBStorageDegradationSource(storageGateSource{controlPlane}),
+			service.WithKBLogger(logger),
+			// The await path's data_missing probe asks which nodes may hold this
+			// version and whether any of them actually has it.
+			service.WithPresenceProbe(stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{Pool: d.peerPool}), replicaAddrsForProbe),
+			service.WithVersionWatcher(raftNode),
+		)
 		pb.RegisterKnowledgeBaseServiceServer(grpcServer, kbSvc)
 	}
 
@@ -201,60 +191,29 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 	// Registering it here alone left GetClusterStatus unreachable, which is what
 	// broke the storage layer's cursor reporter (see control_admin.go).
 	if storageLocal {
-		presenceChecker := stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{})
-		querySvc := service.NewQueryService(rn, indexMgr, cdm, vd, ds, vBloomStore)
-		// §9.3(2): honouring a freshness credential requires being able to
-		// answer "how far does my history reach". Without this the node can only
-		// ignore credentials, which is not the same as refusing a stale answer.
-		querySvc.SetLocalVersionReporter(dataPlane)
-		// §9.3(2): the freshness check can also REPAIR a node that is behind —
-		// pulling the history it is missing — instead of only refusing. Without
-		// this a replica that missed a version's data can never fetch it, because
-		// the only path that triggers a pull is the query being refused.
-		querySvc.SetBackfiller(dataPlane)
-		// docs/已实施/index-owner-sharding-plan.md §4.2: a node that has been asked for a
-		// version first asks the peers for the artifact and only builds if nobody
-		// has one. The router decides which node is asked (§5), so this is reached
-		// on the versions a caller actually wants.
-		querySvc.SetIndexFetcher(dataPlane)
-		// Per-stage query timings, at debug level. Without this the query path
-		// is opaque from the node's own log — localizing the O(candidates ×
-		// documents) defect needed an outside-in probe plus temporary C++
-		// instrumentation (v13 §5 #18).
-		querySvc.SetLogger(logger)
+		presenceChecker := stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{Pool: d.peerPool})
+		querySvc := service.NewQueryService(rn, indexMgr, cdm, vd, ds, versionViews,
+			service.WithLocalVersionReporter(dataPlane),
+			service.WithBackfiller(dataPlane),
+			service.WithIndexFetcher(dataPlane),
+			service.WithQueryLogger(logger),
+		)
+		adminOpts := []service.AdminOption{
+			service.WithAdminKBReplicaResolver(kbReplicaAddrs),
+			service.WithGCPressureReporter(indexMgr),
+			service.WithAdminLogger(logger),
+			service.WithDeleteVersionCoordinator(deleteVersionCoord),
+			service.WithAdminStorageDegradationSource(storageGateSource{controlPlane}),
+			service.WithReclaimDiagnosticsSource(reclaimDiagnosticsSource{dataPlane}),
+		}
+		if nodeState != nil {
+			adminOpts = append(adminOpts, service.WithNodeStateSource(nodeState))
+		}
 		adminSvc := service.NewAdminService(cfg.NodeID, rn, indexMgr, ds, chunkStore, walImpl,
 			replicaAddrsForProbe,
 			presenceChecker,
+			adminOpts...,
 		)
-		adminSvc.SetKBReplicaResolver(kbReplicaAddrs)
-		// §8.6(d): surface versions whose dead weight cannot be collected because
-		// too few replicas would remain serving. Nothing else clears that — the
-		// remedy is a larger replica count — so it goes out with the other
-		// needs-a-human signals rather than only into the node's log.
-		adminSvc.SetGCPressureReporter(indexMgr)
-		// The operator's three verbs for a FAILED_PERMANENT version (§10.1):
-		// retrying one needs the index manager, abandoning one needs the
-		// delete-version cleanup, and both are storage-side facts — so this is the
-		// node that can serve them.
-		adminSvc.SetLogger(logger)
-		adminSvc.SetDeleteVersionCoordinator(deleteVersionCoord)
-		// §4.5: report storage redundancy through health details. It stays out of
-		// the health STATUS on purpose — a probe that reported UNHEALTHY here
-		// would pull traffic off a node whose reads are still being served. The
-		// verdict is unknown on a node that does not lead, and unknown reports
-		// nothing rather than vouching for storage it cannot see.
-		adminSvc.SetStorageDegradationSource(storageGateSource{controlPlane})
-		// §7.5: "which replica kept this knowledge base's reclaim watermark unavailable" —
-		// the state that otherwise stops WAL reclamation silently.
-		adminSvc.SetReclaimDiagnosticsSource(reclaimDiagnosticsSource{dataPlane})
-		// docs/已实施/storage-node-state-machine-plan.md §6: surface this node's own
-		// phase and its not-at-rest versions through the existing admin entry
-		// points. Inside this branch the machine always exists — the typed-nil
-		// guard is here so a later move of this line cannot quietly turn into a
-		// call on a nil receiver.
-		if nodeState != nil {
-			adminSvc.SetNodeStateSource(nodeState)
-		}
 		pb.RegisterQueryServiceServer(grpcServer, querySvc)
 		pb.RegisterAdminServiceServer(grpcServer, adminSvc)
 	} else {
@@ -328,7 +287,8 @@ func startGRPCServer(d grpcDeps) (*grpc.Server, net.Listener, error) {
 		// this missing, against 10 with it wired.
 		stratumsync.WithNodeIndexReader(indexMgr),
 		stratumsync.WithMigrationStaging(rn.(stratumsync.MigrationMetadata), d.migrationStagingDir),
-		stratumsync.WithMigrationCleanup(coordinator.LocalKBDropper{IndexManager: indexMgr, DocStore: ds, ChunkStore: chunkStore, ChunkDocMapper: cdm, VersionDocList: vd, VersionBloom: vBloomStore}),
+		stratumsync.WithMigrationPool(d.peerPool),
+		stratumsync.WithMigrationCleanup(coordinator.LocalKBDropper{IndexManager: indexMgr, DocStore: ds, ChunkStore: chunkStore, ChunkDocMapper: cdm, VersionDocList: vd, VersionViews: versionViewCleaner(versionViews)}),
 		// §8.4(a) survives the push direction: this is the serving side's gate,
 		// and with distribution pull-only it is the only one left.
 		stratumsync.WithMaxConcurrentIndexFetch(cfg.IndexFetchConcurrency),

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"stratum/internal/bloom"
+	"stratum/internal/versionview"
 )
 
 // discardingIndexMgr records Discard calls while inheriting every other
@@ -106,38 +106,36 @@ func TestWriteCoordinatorImpl_DropVersionStorage_WithoutIndexManager(t *testing.
 	}
 }
 
-// The per-version reclaim must take the version's bloom filter too. It used to be the
-// one layer this path skipped while the DeleteVersion flow's LocalVersionDropper always
-// removed it — so a version retired by a terminal verdict left a filter on disk for
-// good: never queryable (the verdict is terminal), never rebuilt, and invisible to the
-// reverse reconciliation (which looks for versions whose metadata is GONE, while this
-// one is still in the metadata, marked terminal).
-func TestWriteCoordinatorImpl_DropVersionStorage_ReclaimsTheVersionBloom(t *testing.T) {
+func TestWriteCoordinatorImpl_DropVersionStorage_ReclaimsTheVersionView(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	vd := newTestVersionDocList()
-	blooms := bloom.NewVersionBloomStore(dir, 100, 0.01, vd)
+	views := versionview.NewStore(versionview.Config{
+		DataDir:        dir,
+		MaxEntries:     4,
+		VersionDocList: vd,
+	})
 
 	const kbID = "kb-1"
 	const versionID int64 = 7
-	if _, err := blooms.BuildAndPersist(kbID, versionID, []string{"doc-1", "doc-2"}); err != nil {
-		t.Fatalf("BuildAndPersist: %v", err)
+	if err := views.Warm(kbID, versionID, []string{"doc-1", "doc-2"}, map[string][]uint32{}); err != nil {
+		t.Fatalf("Warm: %v", err)
 	}
-	if n := countVersionBloomFiles(t, dir, kbID); n != 1 {
-		t.Fatalf("bloom files before the reclaim = %d, want 1", n)
+	if n := countVersionViewFiles(t, dir, kbID); n != 1 {
+		t.Fatalf("vview files before the reclaim = %d, want 1", n)
 	}
 
 	c := NewWriteCoordinatorImpl(WriteCoordinatorConfig{
 		DocStore:       newTestDocStore(),
 		VersionDocList: vd,
 		IndexManager:   newDiscardingIndexMgr(),
-		VersionBloom:   blooms,
+		VersionViews:   views,
 	})
 	if err := c.DropVersionStorage(ctx, kbID, versionID); err != nil {
 		t.Fatalf("DropVersionStorage: %v", err)
 	}
-	if n := countVersionBloomFiles(t, dir, kbID); n != 0 {
-		t.Errorf("bloom files after the reclaim = %d, want 0", n)
+	if n := countVersionViewFiles(t, dir, kbID); n != 0 {
+		t.Errorf("vview files after the reclaim = %d, want 0", n)
 	}
 
 	// Idempotent like every other layer: the cleanup queue retries, and every candidate
@@ -147,9 +145,9 @@ func TestWriteCoordinatorImpl_DropVersionStorage_ReclaimsTheVersionBloom(t *test
 	}
 }
 
-// A node that wired no filter store must still reclaim what it can; skipping this step
+// A node that wired no read-view store must still reclaim what it can; skipping this step
 // is a degradation, not a failure.
-func TestWriteCoordinatorImpl_DropVersionStorage_WithoutVersionBloom(t *testing.T) {
+func TestWriteCoordinatorImpl_DropVersionStorage_WithoutVersionViews(t *testing.T) {
 	ctx := context.Background()
 	c := NewWriteCoordinatorImpl(WriteCoordinatorConfig{
 		DocStore:       newTestDocStore(),
@@ -157,18 +155,18 @@ func TestWriteCoordinatorImpl_DropVersionStorage_WithoutVersionBloom(t *testing.
 		IndexManager:   newDiscardingIndexMgr(),
 	})
 	if err := c.DropVersionStorage(ctx, "kb-1", 7); err != nil {
-		t.Fatalf("DropVersionStorage without a bloom store: %v", err)
+		t.Fatalf("DropVersionStorage without a versionview store: %v", err)
 	}
 }
 
-func countVersionBloomFiles(t *testing.T, dir, kbID string) int {
+func countVersionViewFiles(t *testing.T, dir, kbID string) int {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(dir, "bloom-version", kbID))
+	entries, err := os.ReadDir(filepath.Join(dir, "version-view", kbID))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0
 		}
-		t.Fatalf("read the version-bloom dir: %v", err)
+		t.Fatalf("read the version-view dir: %v", err)
 	}
 	return len(entries)
 }

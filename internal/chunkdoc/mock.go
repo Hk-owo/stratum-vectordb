@@ -97,6 +97,31 @@ func (m *MockChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, 
 	return out, nil
 }
 
+// MapChunksByDocs implements ChunkDocBatchMapper.
+func (m *MockChunkDocMapper) MapChunksByDocs(_ context.Context, kbID string, docIDs []string) ([]string, map[string][]uint32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(docIDs) == 0 {
+		return nil, map[string][]uint32{}, nil
+	}
+	chunkToDocs := make(map[string][]uint32)
+	var chunkIDs []string
+	for i, docID := range docIDs {
+		idx := uint32(i)
+		for chunkID := range m.reverse[kbID][docID] {
+			docs := chunkToDocs[chunkID]
+			if docs == nil {
+				chunkIDs = append(chunkIDs, chunkID)
+			}
+			if len(docs) == 0 || docs[len(docs)-1] != idx {
+				chunkToDocs[chunkID] = append(docs, idx)
+			}
+		}
+	}
+	return chunkIDs, chunkToDocs, nil
+}
+
 func (m *MockChunkDocMapper) DeleteByKB(_ context.Context, kbID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -154,4 +179,7 @@ func (m *MockChunkDocMapper) Reset() {
 	m.reverse = make(map[string]map[string]map[string]struct{})
 }
 
-var _ ChunkDocMapper = (*MockChunkDocMapper)(nil)
+var (
+	_ ChunkDocMapper      = (*MockChunkDocMapper)(nil)
+	_ ChunkDocBatchMapper = (*MockChunkDocMapper)(nil)
+)

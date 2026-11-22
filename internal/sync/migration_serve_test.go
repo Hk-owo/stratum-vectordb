@@ -62,10 +62,9 @@ func (f *fakeIndex) TriggerBuildBackfill(_ context.Context, _ string, versionID 
 
 // newServeHandler returns a handler wired with the serving surface: the cursor,
 // the document filter store and the index manager a target needs.
-func newServeHandler(t *testing.T, f *migrationTransferFixture, root string, nodeID int64, cursor *fakeCursor, index MigrationServing) (*NodeHandler, *recordingBloom) {
+func newServeHandler(t *testing.T, f *migrationTransferFixture, root string, nodeID int64, cursor *fakeCursor, index MigrationServing) *NodeHandler {
 	t.Helper()
 	chunks := chunkstore.NewMockChunkStore()
-	follower := NewFollower(f.target.docStore, f.target.chunkDoc, f.target.versionDoc, chunks, nil)
 	gate, err := storage.NewExecutionGate(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -73,10 +72,10 @@ func newServeHandler(t *testing.T, f *migrationTransferFixture, root string, nod
 	if err := gate.Fence(context.Background(), "kb", f.request.ExpectedEpoch, f.request.OperationId); err != nil {
 		t.Fatal(err)
 	}
-	follower.SetExecutionGate(gate)
-	follower.SetLocalVersionAdvancer(cursor)
-	bloom := &recordingBloom{}
-	follower.SetVersionBloom(bloom)
+	follower := NewFollower(f.target.docStore, f.target.chunkDoc, f.target.versionDoc, chunks, nil,
+		WithFollowerExecutionGate(gate),
+		WithFollowerLocalVersionAdvancer(cursor),
+	)
 	handler := NewNodeHandler(f.target.handler, NewPushHandler(follower, nodeID,
 		WithStoragePlacement(f.metadata.GetKBPlacement),
 		WithExecutionGate(gate, f.metadata),
@@ -84,7 +83,7 @@ func newServeHandler(t *testing.T, f *migrationTransferFixture, root string, nod
 		WithMigrationServing(index),
 	), WithMigrationStaging(f.metadata, root))
 	handler.migration.dial = f.targetHandler.migration.dial
-	return handler, bloom
+	return handler
 }
 
 // installedFixture stages and installs one artifact, leaving the task INSTALLED
@@ -107,7 +106,7 @@ func TestMigrationServeRestoresLocalStateAndWaitsForIndex(t *testing.T) {
 	f, installHandler, _ := installedFixture(t, 1)
 	ctx := context.Background()
 	cursor, index := newFakeCursor(), newFakeIndex()
-	handler, bloom := newServeHandler(t, f, f.root, 3, cursor, index)
+	handler := newServeHandler(t, f, f.root, 3, cursor, index)
 	if _, err := handler.PrepareKBMigrationServing(ctx, f.request); err != nil {
 		t.Fatal(err)
 	}
@@ -120,9 +119,6 @@ func TestMigrationServeRestoresLocalStateAndWaitsForIndex(t *testing.T) {
 	}
 	if cursor.LocalVersionOf("kb") != f.versions[2] {
 		t.Fatal("data cursor was not advanced to the active version")
-	}
-	if got := bloom.count(); got != 6 {
-		t.Fatalf("document filters rebuilt %d times across two serving steps, want 6", got)
 	}
 	if len(index.builds) != 1 || index.builds[0] != f.versions[1] {
 		t.Fatal("active version index was not built exactly once", index.builds)
@@ -151,7 +147,7 @@ func TestMigrationServeWaitsWithinBudgetAndNeverReportsUnreadyIndex(t *testing.T
 	cursor.MarkVersionContiguous("kb", f.versions[2])
 	index := newFakeIndex()
 	index.never = true
-	handler, _ := newServeHandler(t, f, f.root, 3, cursor, index)
+	handler := newServeHandler(t, f, f.root, 3, cursor, index)
 	handler.migration.serveWait = 100 * time.Millisecond
 	if _, err := handler.PrepareKBMigrationServing(ctx, f.request); status.Code(err) != codes.Unavailable {
 		t.Fatal("missing index artifact was reported as serviceable:", err)
@@ -169,7 +165,7 @@ func TestMigrationServeRequiresInstalledData(t *testing.T) {
 	f, handler, _, _ := stagedInstallFixture(t)
 	ctx := context.Background()
 	cursor, index := newFakeCursor(), newFakeIndex()
-	serving, _ := newServeHandler(t, f, f.root, 3, cursor, index)
+	serving := newServeHandler(t, f, f.root, 3, cursor, index)
 	cursor.MarkVersionContiguous("kb", f.versions[2])
 	if _, err := serving.PrepareKBMigrationServing(ctx, f.request); status.Code(err) != codes.FailedPrecondition {
 		t.Fatal("serving step ran before installation:", err)

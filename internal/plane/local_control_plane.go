@@ -23,7 +23,8 @@ import (
 // layers still live in one process.
 // MetadataProposer is the slice of the control layer's metadata API the storage
 // layer reports through. Keeping it narrow means the ControlPlane — and its
-// tests — depend only on what they actually use; *raft.RaftNode satisfies it.
+// tests — depend only on what they actually use; raft.MetaReader +
+// raft.VersionWriter (and thus raft.RaftNode) satisfies it.
 type MetadataProposer interface {
 	MetadataLister
 	ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error

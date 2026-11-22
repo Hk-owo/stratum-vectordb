@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	pb "stratum/api/proto/stratum"
 	serrors "stratum/internal/errors"
+	"stratum/internal/fsutil"
 	"stratum/internal/pebbleutil"
 	"stratum/internal/raft"
 	"stratum/internal/storage"
@@ -287,7 +288,7 @@ func TestMigrationTransferDurabilityFailureMustBeRetriedBeforeAck(t *testing.T) 
 		if path == f.root && fail {
 			return errors.New("directory fsync failed")
 		}
-		return syncMigrationDir(path)
+		return fsutil.SyncDir(path)
 	}
 	if _, err := f.targetHandler.StageKBMigration(ctx, f.request); err == nil {
 		t.Fatal("fsync failure acknowledged")

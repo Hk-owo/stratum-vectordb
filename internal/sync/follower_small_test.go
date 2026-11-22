@@ -41,17 +41,17 @@ func TestFollower_DigestOfReadsItsOwnDocumentSet(t *testing.T) {
 
 // The pull handshake bound is configuration, and a non-positive value must keep the
 // default rather than become an instant timeout.
-func TestFollower_SetPullDialTimeout(t *testing.T) {
-	f := &Follower{}
+func TestFollower_WithPullDialTimeout(t *testing.T) {
+	f := NewFollower(nil, nil, nil, nil, nil)
 	if got := f.dialTimeout(); got != DefaultPullDialTimeout {
 		t.Errorf("default = %v, want %v", got, DefaultPullDialTimeout)
 	}
-	f.SetPullDialTimeout(0)
-	if got := f.dialTimeout(); got != DefaultPullDialTimeout {
+	fZero := NewFollower(nil, nil, nil, nil, nil, WithPullDialTimeout(0))
+	if got := fZero.dialTimeout(); got != DefaultPullDialTimeout {
 		t.Errorf("zero value = %v, want the default kept", got)
 	}
-	f.SetPullDialTimeout(3 * time.Second)
-	if got := f.dialTimeout(); got != 3*time.Second {
+	fConfigured := NewFollower(nil, nil, nil, nil, nil, WithPullDialTimeout(3*time.Second))
+	if got := fConfigured.dialTimeout(); got != 3*time.Second {
 		t.Errorf("configured = %v, want 3s", got)
 	}
 }

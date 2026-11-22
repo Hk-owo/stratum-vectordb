@@ -14,7 +14,7 @@ import (
 // newVersionReclaimGC builds a collector wired for the event-driven path
 // (ReclaimVersionChunks): the two stores, the version document list and a static
 // version chain.
-func newVersionReclaimGC(t *testing.T, versions map[string][]types.VersionMeta) (*ChunkGarbageCollectorImpl, *chunkdoc.PebbleChunkDocMapper, *testDocStore, *gcChunkStore, *testVersionDocList) {
+func newVersionReclaimGC(t *testing.T, versions map[string][]types.VersionMeta, guard ...func(context.Context, string) (context.Context, func(), error)) (*ChunkGarbageCollectorImpl, *chunkdoc.PebbleChunkDocMapper, *testDocStore, *gcChunkStore, *testVersionDocList) {
 	t.Helper()
 	cdm, err := chunkdoc.NewPebbleChunkDocMapper(t.TempDir())
 	if err != nil {
@@ -25,13 +25,18 @@ func newVersionReclaimGC(t *testing.T, versions map[string][]types.VersionMeta) 
 	ds := newTestDocStore()
 	cs := newGCChunkStore()
 	vd := newTestVersionDocList()
+	var mutationGuard func(context.Context, string) (context.Context, func(), error)
+	if len(guard) > 0 {
+		mutationGuard = guard[0]
+	}
 	gc := NewChunkGarbageCollectorImpl(ChunkGarbageCollectorConfig{
-		SweepIntervalSec: 1,
-		RaftNode:         &gcTestRaftNode{kbs: []types.KnowledgeBaseMeta{{KBID: "kb-1"}}, versions: versions},
-		ChunkDocMapper:   cdm,
-		DocStore:         ds,
-		ChunkStore:       cs,
-		VersionDocList:   vd,
+		SweepIntervalSec:     1,
+		RaftNode:             &gcTestRaftNode{kbs: []types.KnowledgeBaseMeta{{KBID: "kb-1"}}, versions: versions},
+		ChunkDocMapper:       cdm,
+		DocStore:             ds,
+		ChunkStore:           cs,
+		VersionDocList:       vd,
+		StorageMutationGuard: mutationGuard,
 	})
 	return gc, cdm, ds, cs, vd
 }
@@ -422,7 +427,15 @@ func TestReclaimVersionChunks_ReportsEveryFailure(t *testing.T) {
 		gc, cdm, _, cs, vd := newVersionReclaimGC(t, map[string][]types.VersionMeta{
 			"kb-1": {{VersionID: 2, KBID: "kb-1"}},
 		})
-		gc.SetLogger(zap.NewNop())
+		gc = NewChunkGarbageCollectorImpl(ChunkGarbageCollectorConfig{
+			SweepIntervalSec: 1,
+			RaftNode:         gc.cfg.RaftNode,
+			ChunkDocMapper:   cdm,
+			DocStore:         gc.cfg.DocStore,
+			ChunkStore:       cs,
+			VersionDocList:   vd,
+			Logger:           zap.NewNop(),
+		})
 		if err := cdm.Write(ctx, "kb-1", "chunk-D", "doc-D"); err != nil {
 			t.Fatalf("cdm.Write: %v", err)
 		}

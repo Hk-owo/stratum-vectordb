@@ -26,13 +26,13 @@ type kbSvcTestHarness struct {
 	wal            *wal.MockWAL
 }
 
-func newKBSvcTestHarness() *kbSvcTestHarness {
+func newKBSvcTestHarness(opts ...KnowledgeBaseOption) *kbSvcTestHarness {
 	w := wal.NewMockWAL()
 	rn := raft.NewMockRaftNode(w)
 	wc := coordinator.NewMockWriteCoordinator()
 	dc := coordinator.NewMockDeleteCoordinator()
 	dvc := coordinator.NewMockDeleteVersionCoordinator()
-	svc := NewKnowledgeBaseService(rn, wc, dc, dvc)
+	svc := NewKnowledgeBaseService(rn, wc, dc, dvc, opts...)
 	return &kbSvcTestHarness{
 		svc:            svc,
 		raftNode:       rn,

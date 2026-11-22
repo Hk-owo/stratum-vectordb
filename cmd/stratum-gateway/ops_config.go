@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
+	"stratum/internal/fsutil"
 )
 
 // OpsConfig is the on-disk console configuration for one node.
@@ -376,20 +377,13 @@ func applyOpsDefaults(cfg *OpsConfig) {
 	}
 }
 
-// saveOpsConfig writes the config as YAML (creating parent dirs).
+// saveOpsConfig writes the config as YAML atomically and durably (creating parent dirs).
 func saveOpsConfig(path string, cfg *OpsConfig) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsutil.AtomicWriteFile(path, data, fsutil.WithMkdirAll(0o755))
 }
 
 // binPath resolves the executable for a service, preferring the console

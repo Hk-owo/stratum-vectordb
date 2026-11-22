@@ -7,9 +7,9 @@ import (
 	stdsync "sync"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	pb "stratum/api/proto/stratum"
 	serrors "stratum/internal/errors"
+	"stratum/internal/rpcpool"
 	"stratum/internal/storage"
 )
 
@@ -53,10 +53,14 @@ func (h *PushHandler) FenceKBReplica(ctx context.Context, req *pb.FenceKBReplica
 type FenceClient struct {
 	mu    stdsync.Mutex
 	conns map[string]*grpc.ClientConn
+	Pool  *rpcpool.Pool
 	Dial  func(context.Context, string) (*grpc.ClientConn, error)
 }
 
 func (c *FenceClient) connection(ctx context.Context, node storage.Node) (*grpc.ClientConn, error) {
+	if c.Dial == nil && c.Pool != nil {
+		return c.Pool.GetContext(ctx, node.Addr)
+	}
 	c.mu.Lock()
 	if c.conns == nil {
 		c.conns = make(map[string]*grpc.ClientConn)
@@ -67,7 +71,7 @@ func (c *FenceClient) connection(ctx context.Context, node storage.Node) (*grpc.
 		if c.Dial != nil {
 			conn, err = c.Dial(ctx, node.Addr)
 		} else {
-			conn, err = grpc.NewClient(node.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, err = rpcpool.DefaultDialer().DialContext(ctx, node.Addr)
 		}
 		if err != nil {
 			c.mu.Unlock()

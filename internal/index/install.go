@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"stratum/internal/fsutil"
 	"stratum/internal/types"
 )
 
@@ -182,60 +183,17 @@ func (im *IndexManagerImpl) InstallIndex(ctx context.Context, kbID string, versi
 // writer publish its own complete copy and the last rename win — the payloads
 // are the same version's index, so either winner is correct.
 func installFile(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, filepath.Base(path)+".installing.*")
-	if err != nil {
-		return fmt.Errorf("index: InstallIndex: create temp beside %s: %w", path, err)
-	}
-	tmp := f.Name()
 	// 0666 for the same reason the target directory is 0777: the file has to be
 	// readable however the writer happens to be running.
-	if err := f.Chmod(0o666); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("index: InstallIndex: chmod %s: %w", tmp, err)
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("index: InstallIndex: write %s: %w", tmp, err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("index: InstallIndex: fsync %s: %w", tmp, err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("index: InstallIndex: close %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("index: InstallIndex: rename %s -> %s: %w", tmp, path, err)
-	}
-	// The fsync above makes the artifact's CONTENTS durable; this makes its NAME
-	// durable. rename is atomic with respect to the directory entry, not with respect
-	// to a power loss: without the directory fsync the index file can be missing after
-	// a crash even though the rename returned success — while the metadata on the
-	// control layer already says READY for this version, so every query routed to this
-	// node fails until something rebuilds the artifact.
-	if err := syncDirOf(dir); err != nil {
-		return fmt.Errorf("index: InstallIndex: fsync %s: %w", dir, err)
+	if err := fsutil.AtomicWriteFile(
+		path,
+		data,
+		fsutil.WithPerm(0o666),
+		fsutil.WithTempPattern(filepath.Base(path)+".installing.*"),
+	); err != nil {
+		return fmt.Errorf("index: InstallIndex: %w", err)
 	}
 	return nil
-}
-
-// syncDirOf fsyncs a directory so renames inside it survive a power loss.
-func syncDirOf(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if err := d.Sync(); err != nil {
-		d.Close()
-		return err
-	}
-	return d.Close()
 }
 
 // sidecarPath returns the on-disk path of (kbID, versionID)'s sidecar — the

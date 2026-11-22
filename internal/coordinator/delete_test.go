@@ -8,15 +8,15 @@ import (
 	"sync"
 	"testing"
 
-	"stratum/internal/bloom"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/index"
 	"stratum/internal/raft"
 	"stratum/internal/types"
+	"stratum/internal/versionview"
 	"stratum/internal/wal"
 )
 
-// deleteTestRaftNode is a RaftNode double for DeleteCoordinator tests.
+// deleteTestRaftNode is a raft.KBWriter double for DeleteCoordinator tests.
 type deleteTestRaftNode struct {
 	mu              sync.Mutex
 	removedMetadata []string
@@ -24,36 +24,13 @@ type deleteTestRaftNode struct {
 	removeErr       error
 }
 
+var _ raft.KBWriter = (*deleteTestRaftNode)(nil)
+
 func newDeleteTestRaftNode() *deleteTestRaftNode {
 	return &deleteTestRaftNode{}
 }
 
 func (r *deleteTestRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBaseMeta) error {
-	return nil
-}
-func (r *deleteTestRaftNode) IsLeader() bool { return true }
-
-func (r *deleteTestRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64, opts ...raft.ProposeOption) (int64, error) {
-	return 0, nil
-}
-func (r *deleteTestRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ types.FailureSide, _ string, _ int32) error {
-	return nil
-}
-
-// ProposeRetryVersion mirrors the revocation ForceRetryVersion drives (§10.1):
-// this stub is not exercised by it, so there is nothing to record.
-func (r *deleteTestRaftNode) ProposeRetryVersion(_ context.Context, _ string, _ int64, _ types.FailureSide) error {
-	return nil
-}
-
-func (r *deleteTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, _ int64) error {
-	return nil
-}
-func (r *deleteTestRaftNode) ProposeMarkVersionDataDurable(_ context.Context, _ int64) error {
-	return nil
-}
-
-func (r *deleteTestRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {
 	return nil
 }
 func (r *deleteTestRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) error { return nil }
@@ -71,48 +48,6 @@ func (r *deleteTestRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string)
 	}
 	r.removedMetadata = append(r.removedMetadata, kbID)
 	return nil
-}
-func (r *deleteTestRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
-	return nil
-}
-func (r *deleteTestRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string, _ int64, _ types.VersionDeleteMode) ([]int64, error) {
-	return nil, nil
-}
-func (r *deleteTestRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.removedMetadata = append(r.removedMetadata, kbID)
-	return nil
-}
-
-// ProposeDiscardVersion satisfies raft.RaftNode; these tests never discard.
-func (r *deleteTestRaftNode) ProposeDiscardVersion(_ context.Context, _ string, _ int64) error {
-	return nil
-}
-func (r *deleteTestRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
-	return types.KnowledgeBaseMeta{}, nil
-}
-func (r *deleteTestRaftNode) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
-	return nil, nil
-}
-
-// LastVersionID mirrors the interface; this stub holds no versions.
-func (r *deleteTestRaftNode) LastVersionID(context.Context, string) (int64, error) { return 0, nil }
-
-// ListVersionsInRange mirrors the interface; this stub is not exercised by it.
-func (r *deleteTestRaftNode) ListVersionsInRange(context.Context, string, *int64, *int64) ([]types.VersionMeta, error) {
-	return nil, nil
-}
-
-// GetVersion satisfies raft.RaftNode; this stub models no versions.
-func (r *deleteTestRaftNode) GetVersion(_ context.Context, _ string, _ int64) (types.VersionMeta, error) {
-	return types.VersionMeta{}, nil
-}
-func (r *deleteTestRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
-	return nil, nil
-}
-func (r *deleteTestRaftNode) GetClusterStatus(_ context.Context) (types.ClusterStatus, error) {
-	return types.ClusterStatus{}, nil
 }
 
 // deleteTestDocStore tracks DeleteByKB calls.
@@ -445,22 +380,22 @@ func TestDeleteCoordinator_FullCleanup(t *testing.T) {
 	}
 }
 
-// TestDeleteCoordinator_DeletesVersionBloomFiles verifies that when a
-// VersionBloomStore is wired, the cleanup removes its on-disk files for
+// TestDeleteCoordinator_DeletesVersionViewFiles verifies that when a
+// versionview.Store is wired, the cleanup removes its on-disk .vview files for
 // the KB.
-func TestDeleteCoordinator_DeletesVersionBloomFiles(t *testing.T) {
+func TestDeleteCoordinator_DeletesVersionViewFiles(t *testing.T) {
 	w := wal.NewMockWAL()
 	rn := newDeleteTestRaftNode()
 	vdl := newDeleteTestVersionDocList()
 	im := newDeleteTestIndexManager()
 
 	dir := t.TempDir()
-	vBloom := bloom.NewVersionBloomStore(dir, 1000, 0.01, vdl)
-	if _, err := vBloom.BuildAndPersist("kb-1", 1, []string{"doc-a"}); err != nil {
-		t.Fatalf("BuildAndPersist: %v", err)
+	views := versionview.NewStore(versionview.Config{DataDir: dir, MaxEntries: 4, VersionDocList: vdl})
+	if err := views.Warm("kb-1", 1, []string{"doc-a"}, map[string][]uint32{}); err != nil {
+		t.Fatalf("Warm: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "bloom-version", "kb-1", "1.bloom")); err != nil {
-		t.Fatalf("bloom file should exist before cleanup: %v", err)
+	if _, err := os.Stat(filepath.Join(dir, "version-view", "kb-1", "1.vview")); err != nil {
+		t.Fatalf("vview file should exist before cleanup: %v", err)
 	}
 
 	coord := NewDeleteCoordinatorImpl(DeleteCoordinatorConfig{
@@ -473,14 +408,14 @@ func TestDeleteCoordinator_DeletesVersionBloomFiles(t *testing.T) {
 		ChunkStore:          newDeleteTestChunkStore(),
 		ChunkDocMapper:      newDeleteTestChunkDocMapper(),
 		VersionDocList:      vdl,
-		VersionBloom:        vBloom,
+		VersionViews:        views,
 	})
 
 	if err := coord.Execute(context.Background(), "kb-1"); err != nil {
 		t.Fatalf("Execute failed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "bloom-version", "kb-1")); !os.IsNotExist(err) {
-		t.Errorf("version-bloom directory should be gone, stat err: %v", err)
+	if _, err := os.Stat(filepath.Join(dir, "version-view", "kb-1")); !os.IsNotExist(err) {
+		t.Errorf("version-view directory should be gone, stat err: %v", err)
 	}
 }
 

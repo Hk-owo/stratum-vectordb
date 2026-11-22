@@ -306,7 +306,17 @@ const pinnedOverflowWarnInterval = time.Minute
 // answers "index not ready", which is exactly what
 // TestRealStack_ThreeNodeCluster_SnapshotPipeline caught.
 func (im *IndexManagerImpl) dropEvicted(keys []indexKey) {
-	if len(keys) == 0 || im.vectorIndexClient == nil {
+	if len(keys) == 0 {
+		return
+	}
+	if im.cfg.VersionView != nil {
+		for _, key := range keys {
+			if !im.IsLoaded(key.kbID, key.versionID) {
+				im.cfg.VersionView.Evict(key.kbID, key.versionID)
+			}
+		}
+	}
+	if im.vectorIndexClient == nil {
 		return
 	}
 	// Its own bounded context: this runs off the back of a build or an eviction,
@@ -384,6 +394,9 @@ func (im *IndexManagerImpl) Evict(ctx context.Context, kbID string, versionID in
 	// the life of the process. EvictByKB and Discard already do this; this entry
 	// point was the one H5 of the 09-24 review missed.
 	im.dropEvicted(evicted)
+	if len(evicted) == 0 && im.cfg.VersionView != nil {
+		im.cfg.VersionView.Evict(kbID, versionID)
+	}
 	return nil
 }
 
@@ -414,5 +427,8 @@ func (im *IndexManagerImpl) EvictByKB(ctx context.Context, kbID string) error {
 	// for the rest of its life (H5 of docs/参考/code-review-2026-09-24.md). Done after
 	// the unlock, because it is a network call.
 	im.dropEvicted(dropped)
+	if im.cfg.VersionView != nil {
+		im.cfg.VersionView.EvictByKB(kbID)
+	}
 	return nil
 }

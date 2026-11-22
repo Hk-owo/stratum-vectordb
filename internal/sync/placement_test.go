@@ -76,8 +76,10 @@ func TestPlacementFiveNodeOverlappingReceivers(t *testing.T) {
 			t.Fatal("stale epoch was accepted:", err)
 		}
 	}
-	followers[4].SetStoragePlacement(resolve, 5)
-	if err := followers[4].PullVersionData(ctx, "unused", "A", 1); !errors.Is(err, serrors.ErrNotKBReplica) {
+	puller := NewFollower(followers[4].docStore, followers[4].chunkDoc, followers[4].versionDoc, chunkstore.NewMockChunkStore(), nil,
+		WithFollowerStoragePlacement(resolve, 5),
+	)
+	if err := puller.PullVersionData(ctx, "unused", "A", 1); !errors.Is(err, serrors.ErrNotKBReplica) {
 		t.Fatal("nonmember attempted background pull:", err)
 	}
 }

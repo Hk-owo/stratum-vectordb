@@ -27,11 +27,19 @@ import (
 	"stratum/internal/types"
 )
 
+// KnowledgeBaseRaft is the Raft subset KnowledgeBaseServiceImpl uses:
+// metadata reads plus KB and version lifecycle proposals.
+type KnowledgeBaseRaft interface {
+	raft.MetaReader
+	raft.KBWriter
+	raft.VersionWriter
+}
+
 // KnowledgeBaseServiceImpl implements pb.KnowledgeBaseServiceServer.
 type KnowledgeBaseServiceImpl struct {
 	pb.UnimplementedKnowledgeBaseServiceServer
 
-	raftNode           raft.RaftNode
+	raftNode           KnowledgeBaseRaft
 	writeCoord         coordinator.WriteCoordinator
 	deleteCoord        coordinator.DeleteCoordinator
 	deleteVersionCoord coordinator.DeleteVersionCoordinator
@@ -101,10 +109,19 @@ type StorageDegradationSource interface {
 	StorageUnavailable(kbID string) (unavailable bool, detail string, ok bool)
 }
 
-// SetStorageDegradationSource wires the redundancy verdict that the CreateVersion
+// KnowledgeBaseOption configures optional capabilities of KnowledgeBaseServiceImpl
+// at construction time.
+type KnowledgeBaseOption func(*KnowledgeBaseServiceImpl)
+
+// WithKBStorageDegradationSource wires the redundancy verdict that the CreateVersion
 // gate and GetStorageDegradation both read.
-func (s *KnowledgeBaseServiceImpl) SetStorageDegradationSource(src StorageDegradationSource) {
-	s.storageGate = src
+func WithKBStorageDegradationSource(src StorageDegradationSource) KnowledgeBaseOption {
+	return func(s *KnowledgeBaseServiceImpl) { s.storageGate = src }
+}
+
+// WithKBReplicaResolver wires the per-KB replica resolver for KnowledgeBaseServiceImpl.
+func WithKBReplicaResolver(resolve KBReplicaResolver) KnowledgeBaseOption {
+	return func(s *KnowledgeBaseServiceImpl) { s.kbReplicas = resolve }
 }
 
 // GetStorageDegradation answers the station's write gate: can the storage layer still
@@ -163,12 +180,13 @@ func (s *KnowledgeBaseServiceImpl) checkStorageWritable(kbID string) error {
 
 // NewKnowledgeBaseService constructs a KnowledgeBaseServiceImpl.
 func NewKnowledgeBaseService(
-	rn raft.RaftNode,
+	rn KnowledgeBaseRaft,
 	wc coordinator.WriteCoordinator,
 	dc coordinator.DeleteCoordinator,
 	dvc coordinator.DeleteVersionCoordinator,
+	opts ...KnowledgeBaseOption,
 ) *KnowledgeBaseServiceImpl {
-	return &KnowledgeBaseServiceImpl{
+	s := &KnowledgeBaseServiceImpl{
 		raftNode:           rn,
 		writeCoord:         wc,
 		deleteCoord:        dc,
@@ -176,14 +194,21 @@ func NewKnowledgeBaseService(
 		logger:             zap.NewNop(),
 		probeCache:         newAwaitProbe(),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
 }
 
-// SetLogger wires the logger that carries CreateVersion's per-stage timings.
-// Optional: without it those timings go nowhere, which is the pre-existing
-// behaviour (nothing about correctness depends on them).
-func (s *KnowledgeBaseServiceImpl) SetLogger(l *zap.Logger) {
-	if l != nil {
-		s.logger = l
+// WithKBLogger wires the logger that carries CreateVersion's per-stage timings.
+// Optional: without it those timings go nowhere.
+func WithKBLogger(l *zap.Logger) KnowledgeBaseOption {
+	return func(s *KnowledgeBaseServiceImpl) {
+		if l != nil {
+			s.logger = l
+		}
 	}
 }
 

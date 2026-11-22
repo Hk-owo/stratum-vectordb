@@ -1,301 +1,38 @@
 package raft
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/gob"
-	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
 	stratumerrors "stratum/internal/errors"
-	"stratum/internal/storage"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
 
-// applyResult is what a single command application produces: an error if
-// the command was rejected by a deterministic validation check (e.g. an
-// invalid parent version), or, for cmdCreateVersion specifically, the
-// newly assigned VersionID.
-type applyResult struct {
-	MigrationRead        bool
-	ServiceRevision      uint64
-	ServiceBlockRevision uint64
-	VersionID            int64
-	// DeletedVersionIDs is set by cmdMarkVersionDeleting: every version
-	// that command marked Deleting, so the caller can report the exact
-	// impact set (for ANCESTORS that is every swept-up 前置版本).
-	// Empty for every other command.
-	DeletedVersionIDs []int64
-	Err               error
-}
-
-// stateMachine holds the in-memory knowledge base and version metadata
-// replicated via Raft. It is mutated exclusively by stateMachine.apply,
-// called from RaftNodeImpl's single apply-dispatch loop — so apply itself
-// needs no internal synchronization against concurrent writers, but reads
-// (GetKB, ListVersions) can happen concurrently from other goroutines and
-// so still need the mutex.
-type stateMachine struct {
-	mu            sync.RWMutex
-	directory     storage.Directory
-	kbs           map[string]types.KnowledgeBaseMeta
-	versions      map[int64]types.VersionMeta
-	versionsByKB  map[string][]int64
-	nextVersionID int64
-	// versionsByRequest maps a client idempotency key (see requestKey) to the
-	// version ID the first apply of that request allocated. It is what lets a
-	// retried CreateVersion reuse its version instead of allocating another
-	// one, so a client can re-send the changes for a version whose data never
-	// landed (docs/参考/历史/Stratum_设计文档v13.md §7.12). Entries live exactly as long as
-	// the version metadata they point at.
-	versionsByRequest map[string]int64
-
-	// deletedEpoch / deletedSeq / deletedLog are the BOUNDED deletion log a
-	// storage node consumes incrementally (see RaftNodeImpl.DeletionsSince).
-	//
-	// It is a removal record, which this system deliberately removed once before
-	// (docs/未实施/known-gaps.md §B: a record is history, pruning can drop it, and a
-	// leftover whose evidence was pruned is invisible forever). What makes it
-	// acceptable now is that it is NOT the judgement: the live-chain read
-	// (VersionLiveness) stays and remains the authority, so a consumer that falls
-	// behind the log, or a node that never had a watermark at all, falls back to it
-	// and loses nothing. The log only spares a consumer from re-reading a whole
-	// range when nothing was deleted.
-	//
-	// deletedEpoch changes when the state machine is created anew (a rebuilt
-	// cluster). A consumer's watermark is (epoch, seq): the epoch is what tells
-	// "your sequence numbers are from another cluster" apart from "you are reading a
-	// replica that is behind" — without it a rebuilt cluster's seq=0 would look like
-	// an ordinary lagging read forever.
-	deletedEpoch    string
-	deletedSeq      int64
-	deletedLog      []types.DeletedVersion
-	deletedLogLimit int
-
-	// chainSeq counts the applies that may have moved a knowledge base's chain tail. It
-	// is local to this replica and never persisted: only the leader's value is read, and
-	// the term it travels with is what separates one leader's count from another's.
-	chainSeq uint64
-}
-
-// deletedLogLimit bounds the deletion log. A thousand deletions an hour for ten
-// hours, i.e. enough that a consumer polling on any sane cadence never falls behind
-// it — and small enough that a snapshot carries ~300 KB of it. A consumer that DOES
-// fall behind is told so (truncated) and re-judges from the live chain.
-const defaultDeletedLogLimit = 10_000
-
-// deletedLogLimit returns the effective bound.
-func (sm *stateMachine) deletedLogLimitOrDefault() int {
-	if sm.deletedLogLimit > 0 {
-		return sm.deletedLogLimit
-	}
-	return defaultDeletedLogLimit
-}
-
-func newStateMachine() *stateMachine {
-	return newStateMachineWithDeletedLogLimit(0)
-}
-
-// newStateMachineWithDeletedLogLimit builds a state machine whose deletion log keeps
-// at most limit entries (0 = defaultDeletedLogLimit).
-func newStateMachineWithDeletedLogLimit(limit int) *stateMachine {
-	return &stateMachine{
-		directory:         storage.NewDirectory(),
-		kbs:               make(map[string]types.KnowledgeBaseMeta),
-		versions:          make(map[int64]types.VersionMeta),
-		versionsByKB:      make(map[string][]int64),
-		nextVersionID:     1,
-		deletedEpoch:      newDeletionEpoch(),
-		deletedLogLimit:   limit,
-		versionsByRequest: make(map[string]int64),
-	}
-}
-
-// newDeletionEpoch mints the identity of one state machine's deletion log. Random
-// rather than derived: the whole point is to be different in a rebuilt cluster, and
-// a counter or a timestamp can collide with the previous life.
-func newDeletionEpoch() string {
-	var suffix [8]byte
-	if _, err := rand.Read(suffix[:]); err != nil {
-		// No randomness means no way to tell "another cluster" apart from "a lagging
-		// replica", which is the difference between a full re-judge and a skip. A
-		// fixed value would make it silently wrong, so refuse to guess.
-		panic(fmt.Sprintf("raft: no randomness for the deletion epoch: %v", err))
-	}
-	return hex.EncodeToString(suffix[:])
-}
-
-// recordDeletion appends one completed deletion to the bounded log. Must be called
-// with sm.mu held.
-func (sm *stateMachine) recordDeletion(kbID string, versionID int64) {
-	sm.deletedSeq++
-	sm.deletedLog = append(sm.deletedLog, types.DeletedVersion{
-		Seq:       sm.deletedSeq,
-		KBID:      kbID,
-		VersionID: versionID,
-	})
-	limit := sm.deletedLogLimitOrDefault()
-	if over := len(sm.deletedLog) - limit; over > 0 {
-		// Copy rather than reslice: reslicing would keep the trimmed entries (and
-		// their strings) reachable from the backing array for as long as the log
-		// lives.
-		kept := make([]types.DeletedVersion, limit)
-		copy(kept, sm.deletedLog[over:])
-		sm.deletedLog = kept
-	}
-}
-
-// apply deterministically applies cmd to the state machine. Called from
-// the single apply-dispatch loop, identically (same input, same code
-// path) on every node that applies this log entry — followers included,
-// not just whichever node originally proposed it. w is the Stratum WAL
-// (used only by cmdCreateVersion, for the WAL-before-state-machine
-// ordering described on RaftNodeImpl).
-func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logger *zap.Logger) applyResult {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	if sm.migrationBlocksCommand(cmd) {
-		return applyResult{Err: stratumerrors.ErrMigrationInProgress}
-	}
-
+// applyVersion applies version-chain lifecycle, status, durability, rollback,
+// and deletion commands. The caller holds sm.mu.
+func (sm *stateMachine) applyVersion(ctx context.Context, cmd command, w wal.WAL, logger *zap.Logger) (applyResult, bool) {
 	switch cmd.Type {
-	case cmdGetStorageMaintenance:
-		return applyResult{MigrationRead: true}
-	case cmdGetKBMigrationTransfer:
-		// A small committed read barrier; build the detached view once on
-		// the reader, not on every follower or in the settled-result cache.
-		return applyResult{MigrationRead: true, ServiceRevision: sm.directory.Revision}
-	case cmdRenewStorageService, cmdBlockStorageService, cmdResumeStorageService, cmdConfirmStorageServiceRevoked:
-		return sm.applyService(cmd)
-	case cmdDrainStorageNode, cmdActivateKBMigration, cmdAckStorageCleanup, cmdManageStorageNode, cmdBeginKBMigration, cmdFenceKBMigration, cmdAckKBMigrationFence, cmdCancelKBMigration, cmdRecordKBMigrationStage, cmdRecordKBMigrationInstall, cmdRecordKBMigrationServe:
-		return applyResult{Err: sm.applyMigration(cmd)}
-	case cmdRegisterStorageNodes:
-		if cmd.StorageNodes == nil {
-			return applyResult{Err: stratumerrors.ErrInvalidArgument}
-		}
-		return applyResult{Err: sm.directory.RegisterNodes(cmd.DirectoryRevision, cmd.StorageNodes.Nodes)}
-	case cmdAssignKBPlacement:
-		if cmd.Placement == nil {
-			return applyResult{Err: stratumerrors.ErrInvalidArgument}
-		}
-		if _, deleted := sm.directory.Tombstones[cmd.Placement.KBID]; deleted {
-			return applyResult{Err: stratumerrors.ErrKnowledgeBaseDeleted}
-		}
-		kb, ok := sm.kbs[cmd.Placement.KBID]
-		if !ok {
-			return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
-		}
-		if kb.Status != types.KBStatusActive {
-			return applyResult{Err: stratumerrors.ErrKnowledgeBaseDeleted}
-		}
-		return applyResult{Err: sm.directory.AssignInitial(*cmd.Placement)}
-	case cmdCreateKB:
-		if cmd.KB == nil || cmd.KB.KBID == "" {
-			return applyResult{Err: stratumerrors.ErrInvalidArgument}
-		}
-		kb := *cmd.KB
-		if cmd.Placement != nil {
-			if _, exists := sm.kbs[kb.KBID]; exists {
-				return applyResult{Err: stratumerrors.ErrPlacementChangeUnsafe}
-			}
-			if cmd.Placement.KBID != kb.KBID {
-				return applyResult{Err: stratumerrors.ErrInvalidArgument}
-			}
-			if len(sm.directory.Nodes) == 0 {
-				return applyResult{Err: stratumerrors.ErrPlacementUnknown}
-			}
-		}
-		if _, deleted := sm.directory.Tombstones[kb.KBID]; deleted {
-			return applyResult{Err: stratumerrors.ErrKnowledgeBaseDeleted}
-		}
-		// Never overwrite business metadata under an already registered identity.
-		if _, assigned := sm.directory.Placements[kb.KBID]; assigned {
-			return applyResult{Err: stratumerrors.ErrInvalidArgument}
-		}
-		if kb.Status == types.KBStatusActive || kb.Status == 0 {
-			kb.Status = types.KBStatusActive
-		}
-		if cmd.Placement != nil && kb.Status != types.KBStatusActive {
-			return applyResult{Err: stratumerrors.ErrInvalidArgument}
-		}
-		// Creation and the original full placement share one committed command.
-		// Scheduling and RPCs remain outside apply.
-		if len(sm.directory.Nodes) > 0 && kb.Status == types.KBStatusActive {
-			p := sm.directory.InitialPlacement(kb.KBID, "create/"+kb.KBID)
-			if cmd.Placement != nil {
-				p = cmd.Placement.Clone()
-			}
-			if err := sm.directory.AssignNew(p); err != nil {
-				return applyResult{Err: err}
-			}
-		}
-		sm.kbs[kb.KBID] = kb
-		return applyResult{}
-
-	case cmdMarkKBDeleting:
-		kb, ok := sm.kbs[cmd.KBID]
-		if !ok {
-			return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
-		}
-		kb.Status = types.KBStatusDeleting
-		sm.directory.Delete(cmd.KBID)
-		sm.kbs[cmd.KBID] = kb
-		return applyResult{}
-
-	case cmdMarkKBDeleteFailed:
-		kb, ok := sm.kbs[cmd.KBID]
-		if !ok {
-			return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
-		}
-		kb.Status = types.KBStatusDeleteFailed
-		sm.kbs[cmd.KBID] = kb
-		return applyResult{}
-
-	case cmdRemoveKBMeta:
-		if _, exists := sm.kbs[cmd.KBID]; exists {
-			sm.directory.Delete(cmd.KBID)
-		}
-		// Idempotent: deleting an already-absent key is a no-op, not an
-		// error, so the delete flow's crash-recovery path can safely
-		// re-propose this any number of times.
-		delete(sm.kbs, cmd.KBID)
-		for _, versionID := range sm.versionsByKB[cmd.KBID] {
-			delete(sm.versions, versionID)
-		}
-		delete(sm.versionsByKB, cmd.KBID)
-		sm.chainSeq++
-		sm.dropRequestMappings(cmd.KBID, 0)
-		// ONE entry for the whole knowledge base, never one per version: a KB can hold
-		// hundreds of thousands of versions, and appending them would flush the bounded
-		// log (and everything a consumer had not yet read) in a single apply. The entry
-		// names the KB itself — VersionID 0 — and the consumer's reclaim is the KB-wide
-		// prefix delete.
-		sm.recordDeletion(cmd.KBID, 0)
-		return applyResult{}
-
 	case cmdCreateVersion:
-		return sm.applyCreateVersion(ctx, cmd, w, logger)
+		return sm.applyCreateVersion(ctx, cmd, w, logger), true
 
 	case cmdUpdateVersionStatus:
 		if v, ok := sm.versions[cmd.VersionID]; ok && cmd.NodeID > 0 {
 			if p, exists := sm.directory.Placements[v.KBID]; exists && !p.Contains(cmd.NodeID) {
-				return applyResult{Err: stratumerrors.ErrNotKBReplica}
+				return applyResult{Err: stratumerrors.ErrNotKBReplica}, true
 			}
 		}
 		if _, blocked := sm.directory.ServiceBlocks[cmd.NodeID]; cmd.NodeID > 0 && blocked {
-			return applyResult{Err: stratumerrors.ErrStorageServicePaused}
+			return applyResult{Err: stratumerrors.ErrStorageServicePaused}, true
 		}
 		v, ok := sm.versions[cmd.VersionID]
 		if !ok {
-			return applyResult{Err: stratumerrors.ErrVersionNotFound}
+			return applyResult{Err: stratumerrors.ErrVersionNotFound}, true
 		}
 		v.IndexStatus = cmd.Status
 		// §8.6(d)/§1.2: a replica reporting its own index READY is recorded by
@@ -312,12 +49,12 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 			v.IndexReadyNodes = withIndexReadyNode(v.IndexReadyNodes, cmd.NodeID)
 		}
 		sm.versions[cmd.VersionID] = v
-		return applyResult{}
+		return applyResult{}, true
 
 	case cmdUpdateVersionSummary:
 		v, ok := sm.versions[cmd.VersionID]
 		if !ok {
-			return applyResult{Err: stratumerrors.ErrVersionNotFound}
+			return applyResult{Err: stratumerrors.ErrVersionNotFound}, true
 		}
 		// A late confirmation must not resurrect a settled version
 		// (docs/参考/历史/Stratum_设计文档v13.md §10.6): the client may already have given up
@@ -346,10 +83,10 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 				zap.Int64("version_id", cmd.VersionID),
 				zap.String("data_status", v.DataStatus.String()),
 				zap.String("index_status", v.IndexStatus.String()))
-			return applyResult{}
+			return applyResult{}, true
 		}
 		if migration, active := sm.directory.ActiveMigration(v.KBID); active && migration.BlocksDataWrites() && v.DocIDSetHash != cmd.DocIDSetHash {
-			return applyResult{Err: stratumerrors.ErrKBWritePaused}
+			return applyResult{Err: stratumerrors.ErrKBWritePaused}, true
 		}
 		v.DocIDSetHash = cmd.DocIDSetHash
 		// The writer commits this digest only after its own storage writes
@@ -358,44 +95,44 @@ func (sm *stateMachine) apply(ctx context.Context, cmd command, w wal.WAL, logge
 		// (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
 		v.DataStatus = types.DataStatusDurable
 		sm.versions[cmd.VersionID] = v
-		return applyResult{}
+		return applyResult{}, true
 
 	case cmdMarkDataDurable:
-		return sm.applyMarkDataDurable(cmd)
+		return sm.applyMarkDataDurable(cmd), true
 
 	case cmdMarkVersionFailedPermanent:
-		return sm.applyMarkVersionFailedPermanent(cmd)
+		return sm.applyMarkVersionFailedPermanent(cmd), true
 
 	case cmdRollback:
 		kb, ok := sm.kbs[cmd.KBID]
 		if !ok {
-			return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}
+			return applyResult{Err: stratumerrors.ErrKnowledgeBaseNotFound}, true
 		}
 		v, ok := sm.versions[cmd.TargetVersionID]
 		if !ok || v.KBID != cmd.KBID {
-			return applyResult{Err: stratumerrors.ErrVersionNotFound}
+			return applyResult{Err: stratumerrors.ErrVersionNotFound}, true
 		}
 		if v.Deleting {
-			return applyResult{Err: fmt.Errorf("target version %d is being deleted: %w", cmd.TargetVersionID, stratumerrors.ErrVersionDeleting)}
+			return applyResult{Err: fmt.Errorf("target version %d is being deleted: %w", cmd.TargetVersionID, stratumerrors.ErrVersionDeleting)}, true
 		}
 		kb.ActiveVersionID = cmd.TargetVersionID
 		sm.kbs[cmd.KBID] = kb
-		return applyResult{}
+		return applyResult{}, true
 
 	case cmdRetryVersion:
-		return sm.applyRetryVersion(cmd)
+		return sm.applyRetryVersion(cmd), true
 
 	case cmdMarkVersionDeleting:
-		return sm.applyMarkVersionDeleting(cmd)
+		return sm.applyMarkVersionDeleting(cmd), true
 
 	case cmdRemoveVersionMeta:
-		return sm.applyRemoveVersionMeta(cmd)
+		return sm.applyRemoveVersionMeta(cmd), true
 
 	case cmdDiscardVersion:
-		return sm.applyDiscardVersion(cmd)
+		return sm.applyDiscardVersion(cmd), true
 
 	default:
-		return applyResult{Err: fmt.Errorf("raft: unknown command type %q", cmd.Type)}
+		return applyResult{}, false
 	}
 }
 
@@ -1056,144 +793,6 @@ func (sm *stateMachine) applyCreateVersion(ctx context.Context, cmd command, w w
 	}
 
 	return applyResult{VersionID: versionID}
-}
-
-// snapshotState is the gob-serializable form of the full state machine,
-// used by serialize/restore for Raft log compaction.
-type snapshotState struct {
-	Directory         storage.Directory
-	KBs               map[string]types.KnowledgeBaseMeta
-	Versions          map[int64]types.VersionMeta
-	VersionsByKB      map[string][]int64
-	NextVersionID     int64
-	VersionsByRequest map[string]int64
-	// The deletion log travels with the snapshot: a node restored from it must be
-	// able to answer a consumer's incremental read. Losing it is survivable (an empty
-	// log with a live sequence reads as "truncated", which sends the consumer back to
-	// the live chain), which is why it is a plain field rather than a durability
-	// mechanism of its own.
-	DeletedEpoch string
-	DeletedSeq   int64
-	DeletedLog   []types.DeletedVersion
-}
-
-// deepCopy returns a stable copy of the current state machine under RLock.
-// It is the fast, lock-bounded step of the async snapshot path: the copy
-// is cheap (KB/version metadata only), so apply is blocked for a moment;
-// the slow gob encoding and disk write happen later on the copy without
-// holding any lock, so a slow snapshot can never stall the apply loop.
-func (sm *stateMachine) deepCopy() snapshotState {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
-	kbs := make(map[string]types.KnowledgeBaseMeta, len(sm.kbs))
-	for k, v := range sm.kbs {
-		kbs[k] = v
-	}
-	versions := make(map[int64]types.VersionMeta, len(sm.versions))
-	for k, v := range sm.versions {
-		versions[k] = v
-	}
-	versionsByKB := make(map[string][]int64, len(sm.versionsByKB))
-	for k, v := range sm.versionsByKB {
-		versionsByKB[k] = append([]int64(nil), v...)
-	}
-	versionsByRequest := make(map[string]int64, len(sm.versionsByRequest))
-	for k, v := range sm.versionsByRequest {
-		versionsByRequest[k] = v
-	}
-	return snapshotState{
-		Directory:         sm.directory.Clone(),
-		KBs:               kbs,
-		Versions:          versions,
-		VersionsByKB:      versionsByKB,
-		NextVersionID:     sm.nextVersionID,
-		VersionsByRequest: versionsByRequest,
-		DeletedEpoch:      sm.deletedEpoch,
-		DeletedSeq:        sm.deletedSeq,
-		DeletedLog:        append([]types.DeletedVersion(nil), sm.deletedLog...),
-	}
-}
-
-// serialize encodes the full current state machine for a Raft snapshot.
-func (sm *stateMachine) serialize() ([]byte, error) {
-	return encodeSnapshot(sm.deepCopy())
-}
-
-// encodeSnapshot gob-encodes a (copied) snapshotState without touching the
-// live state machine, so it can run off the state-machine lock.
-func encodeSnapshot(snap snapshotState) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(snap); err != nil {
-		return nil, fmt.Errorf("raft: serialize state machine snapshot: %w", err)
-	}
-	return buf.Bytes(), nil
-}
-
-// restore replaces the state machine's contents with a previously
-// serialized snapshot.
-func (sm *stateMachine) restore(data []byte) error {
-	var snap snapshotState
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&snap); err != nil {
-		return fmt.Errorf("raft: restore state machine snapshot: %w", err)
-	}
-
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	sm.kbs = snap.KBs
-	sm.directory = snap.Directory.Clone()
-	sm.versions = snap.Versions
-	sm.versionsByKB = snap.VersionsByKB
-	sm.nextVersionID = snap.NextVersionID
-	sm.versionsByRequest = snap.VersionsByRequest
-	sm.deletedEpoch = snap.DeletedEpoch
-	sm.deletedSeq = snap.DeletedSeq
-	sm.deletedLog = snap.DeletedLog
-	sm.chainSeq++
-	if sm.deletedEpoch == "" {
-		// A snapshot written before the log existed. Mint a fresh epoch rather than
-		// reusing "": consumers compare epochs, and an empty one must not read as "the
-		// same cluster".
-		sm.deletedEpoch = newDeletionEpoch()
-	}
-	if sm.kbs == nil {
-		sm.kbs = make(map[string]types.KnowledgeBaseMeta)
-	}
-	if sm.versions == nil {
-		sm.versions = make(map[int64]types.VersionMeta)
-	}
-	if sm.versionsByKB == nil {
-		sm.versionsByKB = make(map[string][]int64)
-	}
-	// A snapshot written before the idempotency map existed decodes to nil.
-	if sm.versionsByRequest == nil {
-		sm.versionsByRequest = make(map[string]int64)
-	}
-	return nil
-}
-
-// listAllVersions returns a snapshot of every version that still needs
-// storage-layer data sync. Index readiness says nothing about whether data
-// needs recovery: lazy indexes can be PENDING for durable versions. Announce
-// pending data too, just as applying CreateVersion would have done; the data
-// plane waits for actual data rather than treating the hook as a durability
-// proof. Deleted and permanently lost DATA are never restored.
-//
-// Used after installing a leader-pushed snapshot: the snapshot covers log
-// entries that are never applied individually on this node, so the normal
-// per-version onVersionCreated hook would never fire for them — the caller
-// triggers it explicitly for every version returned here.
-func (sm *stateMachine) listAllVersions() []types.VersionMeta {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	out := make([]types.VersionMeta, 0, len(sm.versions))
-	for _, v := range sm.versions {
-		if v.DataStatus == types.DataStatusFailedPermanent || v.Deleting {
-			continue
-		}
-		out = append(out, v)
-	}
-	return out
 }
 
 // withIndexReadyNode returns nodes with id present, kept sorted and free of

@@ -10,12 +10,12 @@ import (
 	"strings"
 	"testing"
 
-	"stratum/internal/bloom"
 	"stratum/internal/docstore"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/raft"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
+	"stratum/internal/versionview"
 	"stratum/internal/wal"
 )
 
@@ -442,11 +442,10 @@ func TestDeleteVersionCoordinator_KeepsRecordsForLinearDeletion(t *testing.T) {
 	}
 }
 
-// TestDeleteVersionCoordinator_DeletesVersionBloomFiles verifies the cleanup
-// reclaims the deleted versions' on-disk document bloom filters while the
-// surviving version's filter stays. Before this step existed, one file per
-// deleted version leaked until the whole knowledge base was dropped.
-func TestDeleteVersionCoordinator_DeletesVersionBloomFiles(t *testing.T) {
+// TestDeleteVersionCoordinator_DeletesVersionViewFiles verifies the cleanup
+// reclaims the deleted versions' on-disk .vview files while the surviving
+// version's view stays.
+func TestDeleteVersionCoordinator_DeletesVersionViewFiles(t *testing.T) {
 	ctx := context.Background()
 	w := wal.NewMockWAL()
 	rn := raft.NewMockRaftNode(w)
@@ -481,16 +480,16 @@ func TestDeleteVersionCoordinator_DeletesVersionBloomFiles(t *testing.T) {
 	v3 := create(v2)
 
 	dir := t.TempDir()
-	vBloom := bloom.NewVersionBloomStore(dir, 1000, 0.01, vdl)
-	bloomFile := func(versionID int64) string {
-		return filepath.Join(dir, "bloom-version", kbID, fmt.Sprintf("%d.bloom", versionID))
+	views := versionview.NewStore(versionview.Config{DataDir: dir, MaxEntries: 4, VersionDocList: vdl})
+	viewFile := func(versionID int64) string {
+		return filepath.Join(dir, "version-view", kbID, fmt.Sprintf("%d.vview", versionID))
 	}
 	for _, vid := range []int64{v1, v2, v3} {
-		if _, err := vBloom.BuildAndPersist(kbID, vid, []string{"doc-a"}); err != nil {
-			t.Fatalf("BuildAndPersist v%d: %v", vid, err)
+		if err := views.Warm(kbID, vid, []string{"doc-a"}, map[string][]uint32{}); err != nil {
+			t.Fatalf("Warm v%d: %v", vid, err)
 		}
-		if _, err := os.Stat(bloomFile(vid)); err != nil {
-			t.Fatalf("v%d bloom file should exist before cleanup: %v", vid, err)
+		if _, err := os.Stat(viewFile(vid)); err != nil {
+			t.Fatalf("v%d vview file should exist before cleanup: %v", vid, err)
 		}
 	}
 
@@ -506,19 +505,19 @@ func TestDeleteVersionCoordinator_DeletesVersionBloomFiles(t *testing.T) {
 		IndexManager:        im,
 		DocStore:            ds,
 		VersionDocList:      vdl,
-		VersionBloom:        vBloom,
+		VersionViews:        views,
 	})
 	if err := coord.Execute(ctx, kbID); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
 
 	for _, vid := range []int64{v2, v3} {
-		if _, err := os.Stat(bloomFile(vid)); !os.IsNotExist(err) {
-			t.Errorf("v%d bloom file should be gone after cleanup, stat err = %v", vid, err)
+		if _, err := os.Stat(viewFile(vid)); !os.IsNotExist(err) {
+			t.Errorf("v%d vview file should be gone after cleanup, stat err = %v", vid, err)
 		}
 	}
-	if _, err := os.Stat(bloomFile(v1)); err != nil {
-		t.Errorf("v1 bloom file should survive cleanup: %v", err)
+	if _, err := os.Stat(viewFile(v1)); err != nil {
+		t.Errorf("v1 vview file should survive cleanup: %v", err)
 	}
 }
 

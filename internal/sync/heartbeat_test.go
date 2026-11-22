@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/rpcpool"
 )
 
 // recordingRecorder stands in for the leader's heartbeat record.
@@ -106,13 +107,12 @@ func TestHeartbeater_ReusesItsConnectionUntilTheLeaderMoves(t *testing.T) {
 
 	leader := first
 	dials := map[string]int{}
-	checker := NewPresenceChecker(PresenceCheckerConfig{})
 	r := NewHeartbeater(HeartbeaterConfig{
 		NodeID:        3,
 		ResolveLeader: func(context.Context) (string, bool, error) { return leader, true, nil },
 		Dial: func(ctx context.Context, addr string) (*grpc.ClientConn, error) {
 			dials[addr]++
-			return checker.dial(ctx, addr)
+			return rpcpool.DefaultDialer().DialContext(ctx, addr)
 		},
 	})
 	defer r.closeConn()

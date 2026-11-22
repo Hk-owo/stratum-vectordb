@@ -73,3 +73,11 @@ type ChunkDocMapper interface {
 	// must only unpin that chunk.
 	DeleteMapping(ctx context.Context, kbID, chunkID, docID string) error
 }
+
+// ChunkDocBatchMapper is an optional extension of ChunkDocMapper that builds
+// the deduplicated chunk set and chunk -> []docIdx inverted index in a single
+// reverse pass over docIDs. Each uint32 entry in chunkToDocs is an index into
+// the caller-supplied docIDs slice, appended in ascending docIDs order.
+type ChunkDocBatchMapper interface {
+	MapChunksByDocs(ctx context.Context, kbID string, docIDs []string) (chunkIDs []string, chunkToDocs map[string][]uint32, err error)
+}

@@ -57,40 +57,31 @@ const (
 	chunkIDLength = 64
 )
 
-// SetActiveVersionsProvider wires one of §8.6(d)'s two target sources: which version
+// WithActiveVersionsProvider wires one of §8.6(d)'s two target sources: which version
 // is each knowledge base serving right now.
 //
 // Active versions are scanned because a historical version is queried too rarely for
 // the cleanup to be worth its service interruption, and because a version WITH a
 // successor is the append path's business. The other half of that reasoning — a
-// version with no successor — is what SetChainTailVersionsProvider supplies, and it
+// version with no successor — is what WithChainTailVersionsProvider supplies, and it
 // is not optional in practice: CreateVersion does not move the active pointer.
-func (im *IndexManagerImpl) SetActiveVersionsProvider(fn func(ctx context.Context) (map[string]int64, error)) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-	im.activeVersions = fn
+func WithActiveVersionsProvider(fn func(ctx context.Context) (map[string]int64, error)) IndexManagerOption {
+	return func(im *IndexManagerImpl) { im.activeVersions = fn }
 }
 
-// SetChainTailVersionsProvider wires §8.6(d)'s second target source: the version with
+// WithChainTailVersionsProvider wires §8.6(d)'s second target source: the version with
 // nothing after it, per knowledge base.
 //
 // Without it the scan has a hole that is not hypothetical. CreateVersion does not move
 // the active pointer (only RollbackVersion does), so on a knowledge base that was never
 // rolled back the active map is EMPTY — the scan examines nothing at all — while the
-// tail keeps whatever tombstones its writes left. The tail is also the only version
-// that can be named for a knowledge base nobody has served yet, and it is the version
-// the append path can never reclaim (there is no append to trigger a rebuild).
+// tail keeps whatever tombstones its writes left.
 //
-// Optional: unwired means "active versions only". A storage node can wire it from the
+// Optional: unwired means "active versions only". A storage node wires it from the
 // chain tails its heartbeat already keeps current (the same signal §7.5's catch-up
 // reads), so this needs no new RPC.
-//
-// An absent knowledge base means "the control layer said nothing about it", never
-// "it has no tail" — the caller decides whether absence is worth a fallback.
-func (im *IndexManagerImpl) SetChainTailVersionsProvider(fn func(ctx context.Context) (map[string]int64, error)) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-	im.chainTailVersions = fn
+func WithChainTailVersionsProvider(fn func(ctx context.Context) (map[string]int64, error)) IndexManagerOption {
+	return func(im *IndexManagerImpl) { im.chainTailVersions = fn }
 }
 
 // StartGCScanner starts the background scan. Like the §8.8 artifact sweeper, it

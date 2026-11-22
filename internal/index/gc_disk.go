@@ -4,12 +4,14 @@ package index
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go.uber.org/zap"
 	"os"
 	"path/filepath"
 	"sort"
 	vecstorepb "stratum/api/proto/vecstore"
+	"stratum/internal/fsutil"
 	"strconv"
 	"strings"
 	"time"
@@ -217,8 +219,8 @@ func fileExists(path string) bool {
 // unvalidated id names a directory OUTSIDE IndexDataDir, and the RemoveAll
 // built from it deletes whatever the caller chose.
 func checkKBDirName(kbID string) error {
-	if kbID == "" || kbID == "." || kbID == ".." || filepath.Base(kbID) != kbID {
-		return fmt.Errorf("index: refused kb_id %q: must be a single path component", kbID)
+	if err := fsutil.ValidatePathSegment(kbID); err != nil {
+		return fmt.Errorf("index: refused kb_id %q: %w", kbID, err)
 	}
 	return nil
 }
@@ -257,6 +259,9 @@ func (im *IndexManagerImpl) DeleteFilesByKB(_ context.Context, kbID string) erro
 	}
 	im.mu.Unlock()
 
+	if im.cfg.VersionView != nil {
+		_ = im.cfg.VersionView.DeleteKB(kbID)
+	}
 	if im.cfg.IndexDataDir == "" {
 		return nil
 	}
@@ -268,15 +273,10 @@ func (im *IndexManagerImpl) DeleteFilesByKB(_ context.Context, kbID string) erro
 		if err := os.RemoveAll(dir); err != nil {
 			return fmt.Errorf("index: DeleteFilesByKB(%s): %w", kbID, err)
 		}
-		parent, err := os.Open(filepath.Dir(dir))
-		if os.IsNotExist(err) {
-			return nil
-		}
-		if err != nil {
+		if err := fsutil.SyncDir(filepath.Dir(dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		defer parent.Close()
-		return parent.Sync()
+		return nil
 	})
 }
 
@@ -423,6 +423,9 @@ func (im *IndexManagerImpl) EnforceDiskRetention(ctx context.Context, kbID strin
 			return nil
 		}); err != nil {
 			return err
+		}
+		if im.cfg.VersionView != nil {
+			_ = im.cfg.VersionView.DeleteVersion(kbID, f.versionID)
 		}
 		// docs/已实施/storage-node-state-machine-plan.md §5.2 and §7 item 5: the disk is
 		// the authority and the state machine is its projection, so a version

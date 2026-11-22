@@ -777,4 +777,10 @@ func (r *MockRaftNode) Reset() {
 	r.versionsByRequest = make(map[string]int64)
 }
 
-var _ RaftNode = (*MockRaftNode)(nil)
+var (
+	_ ClusterReader = (*MockRaftNode)(nil)
+	_ MetaReader    = (*MockRaftNode)(nil)
+	_ KBWriter      = (*MockRaftNode)(nil)
+	_ VersionWriter = (*MockRaftNode)(nil)
+	_ RaftNode      = (*MockRaftNode)(nil)
+)

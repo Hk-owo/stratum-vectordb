@@ -104,9 +104,8 @@ func createKBForResponseTest(t *testing.T, h *kbSvcTestHarness) string {
 // line is what a human reading the service log can see, and without it the
 // version merely stops existing.
 func TestDiscardVersion_RecordsTheAbandonmentInTheLog(t *testing.T) {
-	svc, _, kbID, v := newAwaitHarness(t)
 	core, logs := observer.New(zap.InfoLevel)
-	svc.SetLogger(zap.New(core))
+	svc, _, kbID, v := newAwaitHarness(t, WithKBLogger(zap.New(core)))
 
 	if _, err := svc.DiscardVersion(context.Background(), &pb.DiscardVersionRequest{
 		KnowledgeBaseId: kbID,

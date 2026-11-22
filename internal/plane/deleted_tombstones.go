@@ -137,13 +137,6 @@ type DeletionSweepResult struct {
 	BehindLeader bool
 }
 
-// SetVersionTombstones wires this node's deletion table. Optional: without it
-// everything here is a no-op and the reverse reconciliation is the only path, which
-// is the behaviour before this table existed.
-func (d *LocalDataPlane) SetVersionTombstones(t VersionTombstones) {
-	d.tombstones = t
-}
-
 // skipIfDeleted reports whether the version must not be written on this node, because
 // this node already knows it (or its whole knowledge base) is deleted.
 //

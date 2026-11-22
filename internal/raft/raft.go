@@ -40,13 +40,69 @@ import (
 // sets KBStatusDeleting; ProposeRemoveKBMeta removes the metadata once
 // cleanup has finished; ProposeMarkKBDeleteFailed sets KBStatusDeleteFailed
 // once retries are exhausted, surfacing the failure to GetSystemStatus.
-type RaftNode interface {
+// ClusterReader provides read-only access to the node's leadership role and
+// cluster membership view.
+type ClusterReader interface {
 	// IsLeader reports whether this node currently believes it leads the
 	// cluster. The §7.13.2 dispatch hook reads it at APPLY time: that is when
 	// the answer matters, since a forwarded proposal is applied by whoever leads
 	// then, and a since-deposed leader must not dispatch.
 	IsLeader() bool
 
+	// GetClusterStatus returns Raft cluster connectivity information,
+	// independent of any specific knowledge base. Used by HealthCheck's
+	// Raft connectivity probe.
+	GetClusterStatus(ctx context.Context) (types.ClusterStatus, error)
+}
+
+// MetaReader provides read-only access to replicated knowledge-base and
+// version metadata.
+type MetaReader interface {
+	// GetKB returns kbID's current metadata.
+	GetKB(ctx context.Context, kbID string) (types.KnowledgeBaseMeta, error)
+
+	// ListKnowledgeBases returns metadata for every knowledge base known to
+	// the Raft state machine. Used by the console (ListKnowledgeBases RPC)
+	// and by GetSystemStatus to scan for stuck versions / delete-failed KBs.
+	ListKnowledgeBases(ctx context.Context) ([]types.KnowledgeBaseMeta, error)
+
+	// GetVersion returns ONE version's metadata within kbID, so a caller can
+	// ask about a single version without pulling the whole chain: ListVersions
+	// is O(versions) in the KB and the await path polls it repeatedly
+	// (docs/已实施/await-version-plan.md §7 Step 2).
+	//
+	// kbID is required because a version id is unique within a knowledge base,
+	// not globally. Unknown kbID → ErrKnowledgeBaseNotFound; an unknown version
+	// id, or one belonging to another knowledge base → ErrVersionNotFound.
+	GetVersion(ctx context.Context, kbID string, versionID int64) (types.VersionMeta, error)
+
+	// ListVersions returns the full version list for kbID.
+	ListVersions(ctx context.Context, kbID string) ([]types.VersionMeta, error)
+
+	// ListVersionsInRange is ListVersions narrowed to (fromExclusive, toInclusive].
+	//
+	// It exists so a caller that needs a few versions does not pay for the whole chain:
+	// the answer carries about 89 B per version (mostly the document-set digest), and
+	// the callers that ask are on the read path — the §7.5 backfill asks which of a
+	// gap's versions still exist, a freshness check asks about one. A nil bound means
+	// "no bound on that side", so both nil is exactly ListVersions.
+	ListVersionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error)
+
+	// LastVersionID returns the highest version id still in kbID's metadata, or 0
+	// when the knowledge base has no versions. Unknown kbID → ErrKnowledgeBaseNotFound.
+	//
+	// It is the EXTREME-VALUE read, and it exists because a caller that only needs
+	// the chain's tail must not pull the whole chain to find its maximum: the lag signal
+	// asks for the tail of every knowledge base each time the chain generation moves.
+	// The control node answers in O(1) — the version set is kept in allocation order,
+	// so its last element is the highest surviving id — and the remote shape falls
+	// back to a whole-chain read, which is correct but not cheap (only a leader asks,
+	// so a storage node never takes that path).
+	LastVersionID(ctx context.Context, kbID string) (int64, error)
+}
+
+// KBWriter proposes knowledge-base lifecycle mutations through Raft consensus.
+type KBWriter interface {
 	// ProposeCreateKB commits new knowledge base metadata.
 	ProposeCreateKB(ctx context.Context, kb types.KnowledgeBaseMeta) error
 
@@ -61,10 +117,14 @@ type RaftNode interface {
 	// ProposeRemoveKBMeta removes kbID's metadata entirely. Idempotent:
 	// returns success if the metadata is already gone.
 	ProposeRemoveKBMeta(ctx context.Context, kbID string) error
+}
 
+// VersionWriter proposes version-chain, status, durability, rollback, and
+// deletion mutations through Raft consensus.
+type VersionWriter interface {
 	// ProposeCreateVersion allocates and commits a new version for kbID,
 	// with parentVersionID as its parent. Returns the newly allocated
-	// version ID. See the type-level doc comment for the WAL ordering and
+	// version ID. See the RaftNode doc comment for the WAL ordering and
 	// parent-version constraints enforced during apply.
 	ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64, opts ...ProposeOption) (int64, error)
 
@@ -147,53 +207,16 @@ type RaftNode interface {
 	// ErrInvalidParentVersion (it has a child, which a PENDING version should
 	// never have).
 	ProposeDiscardVersion(ctx context.Context, kbID string, versionID int64) error
+}
 
-	// GetKB returns kbID's current metadata.
-	GetKB(ctx context.Context, kbID string) (types.KnowledgeBaseMeta, error)
-
-	// ListVersions returns the full version list for kbID.
-	ListVersions(ctx context.Context, kbID string) ([]types.VersionMeta, error)
-
-	// ListVersionsInRange is ListVersions narrowed to (fromExclusive, toInclusive].
-	//
-	// It exists so a caller that needs a few versions does not pay for the whole chain:
-	// the answer carries about 89 B per version (mostly the document-set digest), and
-	// the callers that ask are on the read path — the §7.5 backfill asks which of a
-	// gap's versions still exist, a freshness check asks about one. A nil bound means
-	// "no bound on that side", so both nil is exactly ListVersions.
-	ListVersionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error)
-
-	// GetVersion returns ONE version's metadata within kbID, so a caller can
-	// ask about a single version without pulling the whole chain: ListVersions
-	// is O(versions) in the KB and the await path polls it repeatedly
-	// (docs/已实施/await-version-plan.md §7 Step 2).
-	//
-	// kbID is required because a version id is unique within a knowledge base,
-	// not globally. Unknown kbID → ErrKnowledgeBaseNotFound; an unknown version
-	// id, or one belonging to another knowledge base → ErrVersionNotFound.
-	GetVersion(ctx context.Context, kbID string, versionID int64) (types.VersionMeta, error)
-
-	// LastVersionID returns the highest version id still in kbID's metadata, or 0
-	// when the knowledge base has no versions. Unknown kbID → ErrKnowledgeBaseNotFound.
-	//
-	// It is the EXTREME-VALUE read, and it exists because a caller that only needs
-	// the chain's tail must not pull the whole chain to find its maximum: the lag signal
-	// asks for the tail of every knowledge base each time the chain generation moves.
-	// The control node answers in O(1) — the version set is kept in allocation order,
-	// so its last element is the highest surviving id — and the remote shape falls
-	// back to a whole-chain read, which is correct but not cheap (only a leader asks,
-	// so a storage node never takes that path).
-	LastVersionID(ctx context.Context, kbID string) (int64, error)
-
-	// ListKnowledgeBases returns metadata for every knowledge base known to
-	// the Raft state machine. Used by the console (ListKnowledgeBases RPC)
-	// and by GetSystemStatus to scan for stuck versions / delete-failed KBs.
-	ListKnowledgeBases(ctx context.Context) ([]types.KnowledgeBaseMeta, error)
-
-	// GetClusterStatus returns Raft cluster connectivity information,
-	// independent of any specific knowledge base. Used by HealthCheck's
-	// Raft connectivity probe.
-	GetClusterStatus(ctx context.Context) (types.ClusterStatus, error)
+// RaftNode is the full control-layer consensus metadata contract, composed of
+// the four domain sub-interfaces. Callers should depend on the narrowest
+// sub-interface (or composition) they need.
+type RaftNode interface {
+	ClusterReader
+	MetaReader
+	KBWriter
+	VersionWriter
 }
 
 // ProposeOption tweaks a ProposeCreateVersion call without changing the

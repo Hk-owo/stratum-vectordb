@@ -7,7 +7,8 @@ import (
 )
 
 func TestMaintenancePausesBuildsAndNewImportResumesDeletedKB(t *testing.T) {
-	im := newIndexManagerWithData(t)
+	service := storage.NewServiceLease(1, "s1")
+	im := newIndexManagerWithData(t, WithServiceLease(service))
 	defer im.Close()
 	ctx := context.Background()
 	if err := im.PauseKnowledgeBase(ctx, "kb"); err != nil {
@@ -34,9 +35,7 @@ func TestMaintenancePausesBuildsAndNewImportResumesDeletedKB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := storage.NewServiceLease(1, "s1")
 	gate.SetServiceLease(service)
-	im.SetServiceLease(service)
 	c, release, err := gate.EnterMaintenance(ctx, storage.Cleanup{ID: "cleanup", KBID: "kb", Epoch: 1})
 	if err != nil {
 		t.Fatal(err)

@@ -6,10 +6,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
 
 	vecstorepb "stratum/api/proto/vecstore"
+	"stratum/internal/rpcpool"
 )
 
 // VecstoreChunkStore is the real ChunkStore implementation: a gRPC client
@@ -20,8 +19,9 @@ import (
 // different knowledge base whose ID happens to be a string prefix of
 // another (e.g. "kb" vs "kb-extended").
 type VecstoreChunkStore struct {
-	conn   *grpc.ClientConn
-	client vecstorepb.ChunkStorageServiceClient
+	conn     *grpc.ClientConn
+	ownsConn bool
+	client   vecstorepb.ChunkStorageServiceClient
 }
 
 // ClientOptions tunes the gRPC channel this client owns. The zero value takes
@@ -38,8 +38,8 @@ type ClientOptions struct {
 // DefaultKeepaliveInterval / DefaultKeepaliveTimeout are the values a client
 // built without ClientOptions uses.
 const (
-	DefaultKeepaliveInterval = 60 * time.Second
-	DefaultKeepaliveTimeout  = 3 * time.Second
+	DefaultKeepaliveInterval = rpcpool.DefaultKeepaliveInterval
+	DefaultKeepaliveTimeout  = rpcpool.DefaultKeepaliveTimeout
 )
 
 // NewVecstoreChunkStore dials addr (the vecstore.grpc_addr config value)
@@ -58,35 +58,40 @@ func NewVecstoreChunkStore(addr string) (*VecstoreChunkStore, error) {
 // NewVecstoreChunkStoreWithOptions is NewVecstoreChunkStore with the channel's
 // keepalive parameters exposed.
 func NewVecstoreChunkStoreWithOptions(addr string, opts ClientOptions) (*VecstoreChunkStore, error) {
-	if opts.KeepaliveInterval <= 0 {
-		opts.KeepaliveInterval = DefaultKeepaliveInterval
-	}
-	if opts.KeepaliveTimeout <= 0 {
-		opts.KeepaliveTimeout = DefaultKeepaliveTimeout
-	}
-	conn, err := grpc.NewClient(addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			// 10s 无流 ping + PermitWithoutStream 会被 vecstore 的 C++
-			// 服务端以 too_many_pings GoAway 踢掉连接；改为仅在活动流
-			// 上以 60s 间隔探测。
-			Time:                opts.KeepaliveInterval,
-			Timeout:             opts.KeepaliveTimeout,
-			PermitWithoutStream: false,
-		}),
-	)
+	conn, err := rpcpool.NewDialer(rpcpool.DialConfig{
+		KeepaliveInterval: opts.KeepaliveInterval,
+		KeepaliveTimeout:  opts.KeepaliveTimeout,
+	}).Dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("chunkstore: dial %s: %w", addr, err)
 	}
 	return &VecstoreChunkStore{
-		conn:   conn,
-		client: vecstorepb.NewChunkStorageServiceClient(conn),
+		conn:     conn,
+		ownsConn: true,
+		client:   vecstorepb.NewChunkStorageServiceClient(conn),
 	}, nil
 }
 
-// Close releases the underlying gRPC connection.
+// NewVecstoreChunkStoreFromConn wraps an externally managed gRPC connection to
+// vecstore. Close() leaves conn untouched so the caller can share one channel
+// across ChunkStore and IndexManager.
+func NewVecstoreChunkStoreFromConn(conn *grpc.ClientConn) (*VecstoreChunkStore, error) {
+	if conn == nil {
+		return nil, fmt.Errorf("chunkstore: nil vecstore connection")
+	}
+	return &VecstoreChunkStore{
+		conn:     conn,
+		ownsConn: false,
+		client:   vecstorepb.NewChunkStorageServiceClient(conn),
+	}, nil
+}
+
+// Close releases the underlying gRPC connection when owned by this client.
 func (s *VecstoreChunkStore) Close() error {
-	return s.conn.Close()
+	if s.ownsConn && s.conn != nil {
+		return s.conn.Close()
+	}
+	return nil
 }
 
 // VecstoreClient returns the underlying ChunkStorageServiceClient. Used

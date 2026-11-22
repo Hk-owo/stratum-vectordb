@@ -14,7 +14,16 @@ import (
 
 func TestChunkGCMigrationFenceProtectsPhysicalRecordsUntilNewEpoch(t *testing.T) {
 	ctx := context.Background()
-	gc, mapper, _, chunks, versions := newVersionReclaimGC(t, map[string][]types.VersionMeta{"kb-1": {}})
+	gate, err := storage.NewExecutionGate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := storage.Snapshot{Placement: storage.Placement{KBID: "kb-1", Epoch: 1, ReplicaIDs: []int64{1}, RequiredReplicas: 1}}
+	gc, mapper, _, chunks, versions := newVersionReclaimGC(t, map[string][]types.VersionMeta{"kb-1": {}},
+		func(c context.Context, kb string) (context.Context, func(), error) {
+			return storage.EnterMutation(storage.Bind(c, snap), gate, snap)
+		},
+	)
 	if err := mapper.Write(ctx, "kb-1", "orphan", "gone"); err != nil {
 		t.Fatal(err)
 	}
@@ -24,14 +33,6 @@ func TestChunkGCMigrationFenceProtectsPhysicalRecordsUntilNewEpoch(t *testing.T)
 	if err := versions.Write(ctx, "kb-1", 1, "gone"); err != nil {
 		t.Fatal(err)
 	}
-	gate, err := storage.NewExecutionGate(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	snap := storage.Snapshot{Placement: storage.Placement{KBID: "kb-1", Epoch: 1, ReplicaIDs: []int64{1}, RequiredReplicas: 1}}
-	gc.SetStorageMutationGuard(func(c context.Context, kb string) (context.Context, func(), error) {
-		return storage.EnterMutation(storage.Bind(c, snap), gate, snap)
-	})
 	if err := gate.Fence(ctx, "kb-1", 1, "move"); err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +72,16 @@ func (s migrationBlockingChunkStore) Delete(ctx context.Context, kb, chunk strin
 func TestChunkGCMigrationFenceDrainsEnteredPhysicalDelete(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	gc, mapper, _, chunks, versions := newVersionReclaimGC(t, map[string][]types.VersionMeta{"kb-1": {}})
+	gate, err := storage.NewExecutionGate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap := storage.Snapshot{Placement: storage.Placement{KBID: "kb-1", Epoch: 1, ReplicaIDs: []int64{1}, RequiredReplicas: 1}}
+	gc, mapper, _, chunks, versions := newVersionReclaimGC(t, map[string][]types.VersionMeta{"kb-1": {}},
+		func(c context.Context, _ string) (context.Context, func(), error) {
+			return storage.EnterMutation(storage.Bind(c, snap), gate, snap)
+		},
+	)
 	if err := mapper.Write(ctx, "kb-1", "orphan", "gone"); err != nil {
 		t.Fatal(err)
 	}
@@ -86,14 +96,6 @@ func TestChunkGCMigrationFenceDrainsEnteredPhysicalDelete(t *testing.T) {
 	unblock := func() { once.Do(func() { close(resume) }) }
 	defer unblock()
 	gc.cfg.ChunkStore = migrationBlockingChunkStore{gcChunkStore: chunks, entered: entered, resume: resume}
-	gate, err := storage.NewExecutionGate(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	snap := storage.Snapshot{Placement: storage.Placement{KBID: "kb-1", Epoch: 1, ReplicaIDs: []int64{1}, RequiredReplicas: 1}}
-	gc.SetStorageMutationGuard(func(c context.Context, _ string) (context.Context, func(), error) {
-		return storage.EnterMutation(storage.Bind(c, snap), gate, snap)
-	})
 	reclaimed := make(chan error, 1)
 	go func() { reclaimed <- gc.ReclaimVersionChunks(ctx, "kb-1", 1) }()
 	select {

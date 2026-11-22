@@ -15,13 +15,13 @@ func newTombstonePlane(t *testing.T, store VersionTombstones, dropper VersionDat
 	t.Helper()
 	puller := &recordingPuller{}
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
-		IndexManager: &stubIndexStore{},
-		Puller:       puller,
-		Verify:       func(context.Context, string, int64) bool { return true },
-		Resolve:      func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil },
-		DataDropper:  dropper,
+		IndexManager:      &stubIndexStore{},
+		Puller:            puller,
+		VersionTombstones: store,
+		Verify:            func(context.Context, string, int64) bool { return true },
+		Resolve:           func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil },
+		DataDropper:       dropper,
 	})
-	dp.SetVersionTombstones(store)
 	return dp, puller
 }
 

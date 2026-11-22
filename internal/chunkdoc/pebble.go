@@ -203,18 +203,41 @@ func (m *PebbleChunkDocMapper) ListChunkIDs(_ context.Context, kbID string) ([]s
 // scan needs a fresh iterator: the prefixes are disjoint, and SeekGE positions the
 // same one at each in turn. The upper bound is checked by hand (HasPrefix) because
 // it differs per document, which is why this cannot use IterOptions bounds.
-func (m *PebbleChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string, docIDs []string) ([]string, error) {
+func (m *PebbleChunkDocMapper) ListChunkIDsByDocs(ctx context.Context, kbID string, docIDs []string) ([]string, error) {
+	chunkIDs, _, err := m.scanChunksByDocs(ctx, kbID, docIDs, false)
+	return chunkIDs, err
+}
+
+// MapChunksByDocs implements ChunkDocBatchMapper: scans each document's reverse
+// prefix once using a single Pebble iterator and builds both the deduplicated
+// chunk list and the ascending chunk -> []docIdx inverted map.
+func (m *PebbleChunkDocMapper) MapChunksByDocs(ctx context.Context, kbID string, docIDs []string) ([]string, map[string][]uint32, error) {
+	return m.scanChunksByDocs(ctx, kbID, docIDs, true)
+}
+
+func (m *PebbleChunkDocMapper) scanChunksByDocs(_ context.Context, kbID string, docIDs []string, buildMap bool) ([]string, map[string][]uint32, error) {
+	if len(docIDs) == 0 {
+		if buildMap {
+			return nil, map[string][]uint32{}, nil
+		}
+		return nil, nil, nil
+	}
 	seen := make(map[string]struct{})
 	var out []string
+	var chunkToDocs map[string][]uint32
+	if buildMap {
+		chunkToDocs = make(map[string][]uint32)
+	}
 
 	iter, err := m.db.NewIter(nil)
 	if err != nil {
-		return nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): new iterator: %w", kbID, err)
+		return nil, nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): new iterator: %w", kbID, err)
 	}
 	defer iter.Close()
 
-	for _, docID := range docIDs {
+	for i, docID := range docIDs {
 		prefix := encodeReversePrefix(kbID, docID)
+		docIdx := uint32(i)
 
 		for iter.SeekGE(prefix); iter.Valid(); iter.Next() {
 			key := iter.Key()
@@ -223,18 +246,24 @@ func (m *PebbleChunkDocMapper) ListChunkIDsByDocs(_ context.Context, kbID string
 			}
 			chunkID, decErr := decodeSuffixString(key, prefix)
 			if decErr != nil {
-				return nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): %w", kbID, decErr)
+				return nil, nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): %w", kbID, decErr)
 			}
 			if _, ok := seen[chunkID]; !ok {
 				seen[chunkID] = struct{}{}
 				out = append(out, chunkID)
 			}
+			if buildMap {
+				docs := chunkToDocs[chunkID]
+				if len(docs) == 0 || docs[len(docs)-1] != docIdx {
+					chunkToDocs[chunkID] = append(docs, docIdx)
+				}
+			}
 		}
 		if iterErr := iter.Error(); iterErr != nil {
-			return nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): iterator error for doc %s: %w", kbID, docID, iterErr)
+			return nil, nil, fmt.Errorf("chunkdoc: ListChunkIDsByDocs(%s): iterator error for doc %s: %w", kbID, docID, iterErr)
 		}
 	}
-	return out, nil
+	return out, chunkToDocs, nil
 }
 
 // DeleteByKB implements ChunkDocMapper: range-deletes every forward and
@@ -344,4 +373,7 @@ func decodeSuffixString(key, prefix []byte) (string, error) {
 	return string(suffix[4 : 4+strLen]), nil
 }
 
-var _ ChunkDocMapper = (*PebbleChunkDocMapper)(nil)
+var (
+	_ ChunkDocMapper      = (*PebbleChunkDocMapper)(nil)
+	_ ChunkDocBatchMapper = (*PebbleChunkDocMapper)(nil)
+)

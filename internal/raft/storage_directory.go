@@ -23,14 +23,6 @@ func newCreateKBWithPlacementCommand(kb types.KnowledgeBaseMeta, ids []int64) co
 	return c
 }
 
-func (impl *RaftNodeImpl) ProposeCreateKBWithPlacement(ctx context.Context, kb types.KnowledgeBaseMeta, ids []int64) error {
-	res, err := impl.proposeAndWait(ctx, newCreateKBWithPlacementCommand(kb, ids))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
 func (r *RemoteRaftNode) ProposeCreateKBWithPlacement(ctx context.Context, kb types.KnowledgeBaseMeta, ids []int64) error {
 	res, err := r.propose(ctx, newCreateKBWithPlacementCommand(kb, ids))
 	if err != nil {
@@ -46,67 +38,6 @@ func registerStorageNodesCommand(revision uint64, nodes []storage.Node) command 
 func assignKBPlacementCommand(p storage.Placement) command {
 	p = p.Clone()
 	return command{Type: cmdAssignKBPlacement, Placement: &p}
-}
-
-func (impl *RaftNodeImpl) ProposeRegisterStorageNodes(ctx context.Context, revision uint64, nodes []storage.Node) error {
-	res, err := impl.proposeAndWait(ctx, registerStorageNodesCommand(revision, nodes))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) ProposeAssignKBPlacement(ctx context.Context, p storage.Placement) error {
-	res, err := impl.proposeAndWait(ctx, assignKBPlacementCommand(p))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) StorageDirectory(ctx context.Context) (storage.Directory, error) {
-	if err := ctx.Err(); err != nil {
-		return storage.Directory{}, err
-	}
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	d := impl.sm.directory.Clone()
-	d.ActiveVersions = make(map[string]int64, len(d.Placements))
-	for id := range d.Placements {
-		d.ActiveVersions[id] = impl.sm.kbs[id].ActiveVersionID
-	}
-	return d, nil
-}
-
-func (impl *RaftNodeImpl) GetKBPlacement(ctx context.Context, kbID string) (storage.Snapshot, error) {
-	if kbID == "" {
-		return storage.Snapshot{}, serrors.ErrInvalidArgument
-	}
-	if err := ctx.Err(); err != nil {
-		return storage.Snapshot{}, err
-	}
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	if _, deleted := impl.sm.directory.Tombstones[kbID]; deleted {
-		return storage.Snapshot{}, serrors.ErrKnowledgeBaseDeleted
-	}
-	kb, ok := impl.sm.kbs[kbID]
-	if !ok {
-		return storage.Snapshot{}, serrors.ErrKnowledgeBaseNotFound
-	}
-	if kb.Status != types.KBStatusActive {
-		return storage.Snapshot{}, serrors.ErrKnowledgeBaseDeleted
-	}
-	snap, err := impl.sm.directory.Resolve(kbID)
-	snap.ActiveVersion = kb.ActiveVersionID
-	return snap, err
-}
-
-// StorageDirectoryRevision is O(1); periodic heartbeats never scan the directory.
-func (impl *RaftNodeImpl) StorageDirectoryRevision() uint64 {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	return impl.sm.directory.Revision
 }
 
 func (r *RemoteRaftNode) ProposeRegisterStorageNodes(ctx context.Context, revision uint64, nodes []storage.Node) error {

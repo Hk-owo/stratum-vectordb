@@ -10,6 +10,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"stratum/internal/fsutil"
 )
 
 // Compact rewrites the log, dropping the BEGIN records of versions that every
@@ -227,13 +229,7 @@ func (w *FileWAL) Compact(ctx context.Context, keepThrough map[string]int64) err
 	// failure here is NOT reported before the handle is reopened: the file has already
 	// been swapped, and leaving w.file pointing at the closed descriptor would break
 	// every later append. The error is carried to the end of the function instead.
-	var dirSyncErr error
-	if dir, err := os.Open(filepath.Dir(w.path)); err == nil {
-		if serr := dir.Sync(); serr != nil {
-			dirSyncErr = serr
-		}
-		_ = dir.Close()
-	}
+	dirSyncErr := fsutil.SyncDir(filepath.Dir(w.path))
 
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -416,13 +412,7 @@ func (w *FileWAL) DeleteByKB(ctx context.Context, kbID string) error {
 	// Compact, a failure is carried to the end of the function rather than returned
 	// here: the file has already been swapped, and bailing out now would leave w.file
 	// pointing at the closed descriptor.
-	var dirSyncErr error
-	if dir, err := os.Open(filepath.Dir(w.path)); err == nil {
-		if serr := dir.Sync(); serr != nil {
-			dirSyncErr = serr
-		}
-		_ = dir.Close()
-	}
+	dirSyncErr := fsutil.SyncDir(filepath.Dir(w.path))
 
 	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {

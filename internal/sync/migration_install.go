@@ -8,12 +8,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"time"
 
 	pb "stratum/api/proto/stratum"
 	serrors "stratum/internal/errors"
+	"stratum/internal/fsutil"
 	"stratum/internal/storage"
 	"stratum/internal/types"
 )
@@ -261,27 +261,16 @@ func (h *NodeHandler) InstallKBMigration(ctx context.Context, req *pb.MigrationT
 // staging artifact uses: content fsync, atomic rename, directory fsync. A failed
 // directory fsync leaves no acknowledged receipt, so a retry repeats it.
 func (s *migrationStager) writeInstallRecord(path string, record migrationInstallRecord) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".install-*.tmp")
+	data, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
-	temporary := f.Name()
-	defer os.Remove(temporary)
-	if err := json.NewEncoder(f).Encode(record); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(temporary, path); err != nil {
-		return err
-	}
-	return s.syncDirectory(filepath.Dir(path))
+	return fsutil.AtomicWriteFile(
+		path,
+		append(data, '\n'),
+		fsutil.WithTempPattern(".install-*.tmp"),
+		fsutil.WithSyncDir(s.syncDirectory),
+	)
 }
 
 func installReceiptToProto(r storage.MigrationInstallReceipt) *pb.MigrationInstallReceipt {

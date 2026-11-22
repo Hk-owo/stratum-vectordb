@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"math"
+	"sort"
 	vecstorepb "stratum/api/proto/vecstore"
 	stratumerrors "stratum/internal/errors"
 	"stratum/internal/types"
@@ -402,9 +403,21 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 		return 0, fmt.Errorf("index: ListDocIDs: %w", err)
 	}
 
-	chunkIDs, err := im.listChunkIDsByDocs(ctx, kbID, docIDs)
-	if err != nil {
-		return 0, fmt.Errorf("index: ListChunkIDsByDocs: %w", err)
+	var (
+		chunkIDs    []string
+		chunkToDocs map[string][]uint32
+	)
+	if im.cfg.VersionView != nil && im.cfg.MapChunksByDocs != nil {
+		sort.Strings(docIDs)
+		chunkIDs, chunkToDocs, err = im.cfg.MapChunksByDocs(ctx, kbID, docIDs)
+		if err != nil {
+			return 0, fmt.Errorf("index: MapChunksByDocs: %w", err)
+		}
+	} else {
+		chunkIDs, err = im.listChunkIDsByDocs(ctx, kbID, docIDs)
+		if err != nil {
+			return 0, fmt.Errorf("index: ListChunkIDsByDocs: %w", err)
+		}
 	}
 
 	// 码本刷新判定（docs/已实施/codebook-refresh-plan.md §3）：只在"追加复用本来会发生"
@@ -439,6 +452,7 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 		if parentID, delta, dead, ok := im.appendBase(ctx, kbID, versionID, graphFree, chunkIDs); ok {
 			size, appendErr := im.buildFromBase(ctx, kbID, versionID, parentID, delta, dead, len(chunkIDs), graphFree)
 			if appendErr == nil {
+				im.warmVersionView(kbID, versionID, docIDs, chunkToDocs)
 				im.logger.Info("index: built by appending to the parent version's artifact (§8.6c)",
 					zap.String("kb_id", kbID), zap.Int64("version_id", versionID),
 					zap.Int64("parent_version_id", parentID),
@@ -590,7 +604,21 @@ func (im *IndexManagerImpl) build(ctx context.Context, kbID string, versionID in
 	// status is derived from. A failed save means the build is not
 	// durable, so it is reported as a build failure (the caller marks the
 	// version FAILED instead of READY).
-	return sizeBytes, im.saveToDisk(ctx, kbID, versionID)
+	if err := im.saveToDisk(ctx, kbID, versionID); err != nil {
+		return sizeBytes, err
+	}
+	im.warmVersionView(kbID, versionID, docIDs, chunkToDocs)
+	return sizeBytes, nil
+}
+
+func (im *IndexManagerImpl) warmVersionView(kbID string, versionID int64, docIDs []string, chunkToDocs map[string][]uint32) {
+	if im.cfg.VersionView == nil || chunkToDocs == nil {
+		return
+	}
+	if err := im.cfg.VersionView.Warm(kbID, versionID, docIDs, chunkToDocs); err != nil {
+		im.logger.Debug("index: warm version view failed",
+			zap.String("kb_id", kbID), zap.Int64("version_id", versionID), zap.Error(err))
+	}
 }
 
 // maxBuildMessageBytes 是单次 Build/AddChunks RPC 载荷的字节预算上限。

@@ -6,7 +6,7 @@
 // Architecture: internal/kvraft handles consensus (leader election, log
 // replication, snapshotting) over an opaque []byte command stream; this
 // package defines that command encoding (command.go), the deterministic
-// state machine that interprets committed commands (state_machine.go),
+// state machine that interprets committed commands (sm_*.go),
 // and RaftNodeImpl, which wires the two together and implements the
 // RaftNode interface's Propose-and-wait semantics on top of kvraft's
 // non-blocking Propose primitive.
@@ -29,14 +29,11 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 
-	stratumerrors "stratum/internal/errors"
 	"stratum/internal/kvraft"
 	"stratum/internal/kvstorage"
 	"stratum/internal/types"
@@ -168,7 +165,7 @@ type RaftNodeImpl struct {
 	// "the leader is elsewhere" before forwarding.
 	nodeID int64
 	// forwarder carries proposals to the leader when this node is not it
-	// (SetForwarder). Optional: without it a non-leader proposal fails the
+	// (WithForwarder). Optional: without it a non-leader proposal fails the
 	// way it always did.
 	forwarder ProposeForwarder
 
@@ -179,41 +176,12 @@ type RaftNodeImpl struct {
 	// applied (Config.ProposeApplyTimeout, or defaultProposeApplyTimeout).
 	proposeApplyTimeout time.Duration
 
-	// onVersionCreated is an optional callback invoked after a cmdCreateVersion
-	// is applied on this node — on EVERY applier, the proposer included. It is a
-	// data-plane notification ("this version now exists; make sure you hold it"),
-	// so each node has to react for itself, and the plane skips the pull when its
-	// own cursor already covers the version. Set by the startup wiring (main.go)
-	// to trigger data sync (internal/sync.FollowerSync.PullVersionData).
-	//
-	// The three hooks here are read by the apply loop and written by that
-	// startup wiring, which runs AFTER NewRaftNodeImpl has already started the
-	// loop — and on a restart the loop is replaying the log at that moment. So
-	// they are held atomically rather than as plain fields: a plain field was a
-	// real data race (the detector caught SetOnVersionCreated against
-	// handleEntryMsg), not a theoretical one.
-	onVersionCreated atomic.Pointer[func(kbID string, versionID int64)]
-
-	// onVersionFailedPermanent is an optional callback invoked after a
-	// cmdMarkVersionFailedPermanent is applied on this node — on EVERY applier, and
-	// for a different reason than onVersionCreated: §10.6's reclaim is a broadcast to
-	// the candidate replicas and is best-effort, so a replica that is partitioned (or
-	// restarting) when it fires never hears it, and its data stays behind with nothing
-	// left to notice it. Every node applies the same Raft entry, so the apply path is
-	// how a verdict reaches the nodes that have to act on it. The reclaim itself is
-	// idempotent — a node that never held the version runs a prefix delete over
-	// nothing — and it runs off the apply loop, because it broadcasts.
-	onVersionFailedPermanent atomic.Pointer[func(kbID string, versionID int64)]
-
-	// onVersionCommittedAsLeader is an optional callback invoked after a
-	// cmdCreateVersion is applied on a node that, AT APPLY TIME, believes it is
-	// the leader. Unlike onVersionCreated it must fire on exactly one node: it
-	// triggers external side effects — choosing the write's coordinator and
-	// having that node run the write (§7.13.2) — which would otherwise be
-	// attempted once per replica. The leadership check happens in the apply loop
-	// rather than at propose time, because a forwarded proposal is applied by
-	// whoever leads then, and a since-deposed leader must not dispatch.
-	onVersionCommittedAsLeader atomic.Pointer[func(kbID string, versionID, parentVersionID int64, clientRequestID string)]
+	// The three apply/snapshot lifecycle hooks are supplied at construction via
+	// RaftOption before runApplyLoop starts, making them immutable once the
+	// background loop is running.
+	onVersionCreated           func(kbID string, versionID int64)
+	onVersionFailedPermanent   func(kbID string, versionID int64)
+	onVersionCommittedAsLeader func(kbID string, versionID, parentVersionID int64, clientRequestID string)
 
 	// versionWatchers are the local waiters registered through WatchVersion,
 	// keyed by version ID. Its own mutex, not sm.mu: notifications come from the
@@ -224,13 +192,47 @@ type RaftNodeImpl struct {
 	versionWatchers   map[int64]map[chan struct{}]struct{}
 }
 
+// RaftOption configures optional collaborators and apply hooks on RaftNodeImpl
+// before its background apply loop starts.
+type RaftOption func(*RaftNodeImpl)
+
+// WithNodeID overrides the node's own ID used to distinguish "leader is me"
+// from "leader is elsewhere" when forwarding proposals.
+func WithNodeID(id int64) RaftOption {
+	return func(impl *RaftNodeImpl) { impl.nodeID = id }
+}
+
+// WithForwarder wires the path that carries a proposal to the leader when this
+// node is not leading.
+func WithForwarder(f ProposeForwarder) RaftOption {
+	return func(impl *RaftNodeImpl) { impl.forwarder = f }
+}
+
+// WithOnVersionCreated registers the callback invoked when cmdCreateVersion is
+// applied (including snapshot restores).
+func WithOnVersionCreated(fn func(kbID string, versionID int64)) RaftOption {
+	return func(impl *RaftNodeImpl) { impl.onVersionCreated = fn }
+}
+
+// WithOnVersionFailedPermanent registers the callback invoked when a terminal
+// DATA-side failure verdict is applied.
+func WithOnVersionFailedPermanent(fn func(kbID string, versionID int64)) RaftOption {
+	return func(impl *RaftNodeImpl) { impl.onVersionFailedPermanent = fn }
+}
+
+// WithOnVersionCommittedAsLeader registers the §7.13.2 dispatch hook invoked
+// when cmdCreateVersion applies while this node leads.
+func WithOnVersionCommittedAsLeader(fn func(kbID string, versionID, parentVersionID int64, clientRequestID string)) RaftOption {
+	return func(impl *RaftNodeImpl) { impl.onVersionCommittedAsLeader = fn }
+}
+
 // NewRaftNodeImpl constructs and starts a RaftNodeImpl: it starts the
 // underlying kvraft node's gRPC server and background consensus loops,
 // and starts this package's own apply-dispatch loop. Returns once
 // everything is running (does not wait for a leader to be elected —
 // callers should poll, e.g. via GetClusterStatus, if they need to know
 // when this node believes there's a leader).
-func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
+func NewRaftNodeImpl(cfg Config, opts ...RaftOption) (*RaftNodeImpl, error) {
 	if cfg.WAL == nil {
 		return nil, fmt.Errorf("raft: Config.WAL is required")
 	}
@@ -252,18 +254,18 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 	applyCh := make(chan kvraft.ApplyMsg, 256)
 	persister := kvstorage.NewPersister(filepath.Join(cfg.DataDir, "raft"))
 
-	opts := []kvraft.Option{kvraft.WithLogger(logger)}
+	kvOpts := []kvraft.Option{kvraft.WithLogger(logger)}
 	if cfg.MaxLogLength > 0 {
-		opts = append(opts, kvraft.WithMaxLogLength(cfg.MaxLogLength))
+		kvOpts = append(kvOpts, kvraft.WithMaxLogLength(cfg.MaxLogLength))
 	}
 	if cfg.HeartbeatInterval > 0 {
-		opts = append(opts, kvraft.WithHeartbeatInterval(cfg.HeartbeatInterval))
+		kvOpts = append(kvOpts, kvraft.WithHeartbeatInterval(cfg.HeartbeatInterval))
 	}
 	if cfg.ElectionTimeoutMin > 0 && cfg.ElectionTimeoutMax > 0 {
-		opts = append(opts, kvraft.WithElectionTimeoutRange(cfg.ElectionTimeoutMin, cfg.ElectionTimeoutMax))
+		kvOpts = append(kvOpts, kvraft.WithElectionTimeoutRange(cfg.ElectionTimeoutMin, cfg.ElectionTimeoutMax))
 	}
 
-	rf, err := kvraft.NewRaft(cfg.NodeID, transport, applyCh, persister, opts...)
+	rf, err := kvraft.NewRaft(cfg.NodeID, transport, applyCh, persister, kvOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("raft: node %d: %w", cfg.NodeID, err)
 	}
@@ -281,6 +283,11 @@ func NewRaftNodeImpl(cfg Config) (*RaftNodeImpl, error) {
 		applyLoopDone: make(chan struct{}),
 
 		proposeApplyTimeout: cfg.ProposeApplyTimeout,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(impl)
+		}
 	}
 
 	// Restore the state machine from any persisted snapshot (taken
@@ -365,30 +372,6 @@ func (impl *RaftNodeImpl) failAllPending(err error) {
 		// gave up on its own (ctx cancellation, apply budget) a moment ago.
 		p.resultCh <- applyResult{Err: err}
 	}
-}
-
-// SetOnVersionCreated registers a callback that is invoked when a
-// cmdCreateVersion is applied on a non-proposer node (follower). The
-// leader does its own storage-layer writes inline and does not use this
-// hook. Safe to call at any time, including after the apply loop has
-// started — see the field comment for why that matters.
-func (impl *RaftNodeImpl) SetOnVersionCreated(fn func(kbID string, versionID int64)) {
-	impl.onVersionCreated.Store(&fn)
-}
-
-// SetOnVersionFailedPermanent registers the callback invoked when a version's
-// terminal DATA-side verdict is applied on this node — every applier, not only the
-// one that reported the failure. Safe to call at any time, including after the
-// apply loop has started.
-func (impl *RaftNodeImpl) SetOnVersionFailedPermanent(fn func(kbID string, versionID int64)) {
-	impl.onVersionFailedPermanent.Store(&fn)
-}
-
-// SetOnVersionCommittedAsLeader registers the §7.13.2 dispatch hook: invoked
-// when a cmdCreateVersion is applied on a node that believes it leads at that
-// moment. Safe to call at any time, including after the apply loop has started.
-func (impl *RaftNodeImpl) SetOnVersionCommittedAsLeader(fn func(kbID string, versionID, parentVersionID int64, clientRequestID string)) {
-	impl.onVersionCommittedAsLeader.Store(&fn)
 }
 
 // IsLeader reports whether this node currently believes it leads the cluster.
@@ -567,55 +550,32 @@ func (impl *RaftNodeImpl) handleEntryMsg(msg kvraft.ApplyMsg) {
 		// (dial + stream + retries), and a blocked apply loop would
 		// stall every subsequent committed entry — most visible when
 		// a follower replays its log after a restart.
-		if fn := impl.onVersionCreated.Load(); fn != nil {
+		if fn := impl.onVersionCreated; fn != nil {
 			impl.callbackWG.Add(1)
 			go func() {
 				defer impl.callbackWG.Done()
-				(*fn)(cmd.KBID, result.VersionID)
+				fn(cmd.KBID, result.VersionID)
 			}()
 		}
 	}
 
 	if err == nil && result.Err == nil && cmd.Type == cmdMarkVersionFailedPermanent &&
 		cmd.FailureSide == types.FailureSideData {
-		// A refused verdict must not get here: the state machine refuses one for a version
-		// already DURABLE, and this hook deletes the version's data on every replica.
-		//
-		// Only the DATA side reaches this hook. Its consumers reclaim the version's
-		// PHYSICAL data, and an index-side verdict says a BUILD failed, not that the
-		// data is gone — a version with durable data and a dead index is exactly the
-		// state §10.1b keeps apart, and reclaiming storage on its behalf would delete
-		// good records that ForceRetryVersion may yet need. This is the same filter
-		// ReclaimTerminalVersions applies to its startup sweep; leaving it out here
-		// made the apply path the one place that ignored the side.
-		//
-		// Asynchronous for the same reason as the notification above: reclaiming a
-		// version's data can block (a local prefix delete, and on a control node a
-		// broadcast), and a blocked apply loop would stall every later committed entry.
-		if fn := impl.onVersionFailedPermanent.Load(); fn != nil {
+		if fn := impl.onVersionFailedPermanent; fn != nil {
 			impl.callbackWG.Add(1)
 			go func() {
 				defer impl.callbackWG.Done()
-				(*fn)(cmd.KBID, cmd.VersionID)
+				fn(cmd.KBID, cmd.VersionID)
 			}()
 		}
 	}
 
-	// The §7.13.2 dispatch hook, unlike the notification above, must fire on
-	// exactly one node: it triggers external side effects (picking the write's
-	// coordinator and having it run the write), which must not be attempted once
-	// per replica. "Am I the leader" is asked HERE, at apply time — not when the
-	// entry was proposed — because a forwarded proposal is applied by whoever
-	// leads then, and a since-deposed leader must not dispatch. The narrow window
-	// where two nodes both believe they lead is accepted: writes are
-	// content-addressed and idempotent (§1.4), and the dispatcher's take-once
-	// registration (§7.13.2) makes a repeated dispatch a no-op.
 	if err == nil && result.Err == nil && cmd.Type == cmdCreateVersion && impl.IsLeader() {
-		if fn := impl.onVersionCommittedAsLeader.Load(); fn != nil {
+		if fn := impl.onVersionCommittedAsLeader; fn != nil {
 			impl.callbackWG.Add(1)
 			go func() {
 				defer impl.callbackWG.Done()
-				(*fn)(cmd.KBID, result.VersionID, cmd.ParentVersionID, cmd.ClientRequestID)
+				fn(cmd.KBID, result.VersionID, cmd.ParentVersionID, cmd.ClientRequestID)
 			}()
 		}
 	}
@@ -697,12 +657,12 @@ func (impl *RaftNodeImpl) handleSnapshotMsg(msg kvraft.ApplyMsg) {
 	// cmdCreateVersion. PullVersionData is idempotent (re-pulls are no-ops),
 	// and the callback runs asynchronously so the apply loop is not
 	// blocked; Stop() waits for these goroutines via callbackWG.
-	if fn := impl.onVersionCreated.Load(); fn != nil {
+	if fn := impl.onVersionCreated; fn != nil {
 		for _, v := range impl.sm.listAllVersions() {
 			impl.callbackWG.Add(1)
 			go func(kbID string, versionID int64) {
 				defer impl.callbackWG.Done()
-				(*fn)(kbID, versionID)
+				fn(kbID, versionID)
 			}(v.KBID, v.VersionID)
 		}
 	}
@@ -875,463 +835,6 @@ func (impl *RaftNodeImpl) takeSettledLocked(index uint64) (settledResult, bool) 
 	return s, ok
 }
 
-func (impl *RaftNodeImpl) ProposeCreateKB(ctx context.Context, kb types.KnowledgeBaseMeta) error {
-	res, err := impl.proposeAndWait(ctx, newCreateKBCommand(kb))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) ProposeMarkKBDeleting(ctx context.Context, kbID string) error {
-	res, err := impl.proposeAndWait(ctx, newMarkKBDeletingCommand(kbID))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) ProposeMarkKBDeleteFailed(ctx context.Context, kbID string) error {
-	res, err := impl.proposeAndWait(ctx, newMarkKBDeleteFailedCommand(kbID))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) ProposeRemoveKBMeta(ctx context.Context, kbID string) error {
-	res, err := impl.proposeAndWait(ctx, newRemoveKBMetaCommand(kbID))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) ProposeCreateVersion(ctx context.Context, kbID string, parentVersionID int64, opts ...ProposeOption) (int64, error) {
-	o := resolveProposeOptions(opts)
-	res, err := impl.proposeAndWait(ctx, newCreateVersionCommand(kbID, parentVersionID, o.clientRequestID))
-	if err != nil {
-		return 0, err
-	}
-	if res.Err != nil {
-		return 0, res.Err
-	}
-	return res.VersionID, nil
-}
-
-// SetNodeID records this node's own ID, needed to tell "the leader is me" from
-// "the leader is elsewhere" before forwarding a proposal.
-func (impl *RaftNodeImpl) SetNodeID(id int64) {
-	impl.nodeID = id
-}
-
-// SetForwarder wires the path that carries a proposal to the leader when this
-// node is not it (docs/参考/历史/Stratum_设计文档v13.md §7.3). Without it, a non-leader
-// proposal fails exactly as before.
-func (impl *RaftNodeImpl) SetForwarder(f ProposeForwarder) {
-	impl.forwarder = f
-}
-
-// ProposeMarkVersionFailedPermanent implements RaftNode: the terminal verdict
-// for one side of a version whose Saga has spent its retry budget
-// (docs/参考/历史/Stratum_设计文档v13.md §10.1, §10.1b).
-func (impl *RaftNodeImpl) ProposeMarkVersionFailedPermanent(ctx context.Context, kbID string, versionID int64, side types.FailureSide, reason string, count int32) error {
-	res, err := impl.proposeAndWait(ctx, newMarkVersionFailedPermanentCommand(kbID, versionID, side, reason, count))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-// ProposeRetryVersion implements RaftNode: an operator's revocation of one side's
-// terminal verdict (docs/参考/历史/Stratum_设计文档v13.md §10.1). The narrow rules (index side only,
-// terminal side only, cause chain dropped only once nothing is terminal any more)
-// live in the state machine's apply, where every replica reaches the same verdict,
-// rather than here: a proposer that decided them would let two callers disagree.
-func (impl *RaftNodeImpl) ProposeRetryVersion(ctx context.Context, kbID string, versionID int64, side types.FailureSide) error {
-	res, err := impl.proposeAndWait(ctx, newRetryVersionCommand(kbID, versionID, side))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) ProposeUpdateVersionStatus(ctx context.Context, versionID int64, status types.IndexStatus, nodeID int64) error {
-	res, err := impl.proposeAndWait(ctx, newUpdateVersionStatusCommand(versionID, status, nodeID))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-// ProposeUpdateVersionSummary implements RaftNode.
-func (impl *RaftNodeImpl) ProposeUpdateVersionSummary(ctx context.Context, versionID int64, docIDSetHash string) error {
-	res, err := impl.proposeAndWait(ctx, newUpdateVersionSummaryCommand(versionID, docIDSetHash))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-// ProposeMarkVersionDataDurable implements RaftNode: the control layer's own
-// promotion of a version's data side (§10.1b).
-func (impl *RaftNodeImpl) ProposeMarkVersionDataDurable(ctx context.Context, versionID int64) error {
-	res, err := impl.proposeAndWait(ctx, newMarkDataDurableCommand(versionID))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) ProposeRollback(ctx context.Context, kbID string, targetVersionID int64) error {
-	res, err := impl.proposeAndWait(ctx, newRollbackCommand(kbID, targetVersionID))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-// ProposeMarkVersionDeleting implements RaftNode.
-func (impl *RaftNodeImpl) ProposeMarkVersionDeleting(ctx context.Context, kbID string, versionID int64, mode types.VersionDeleteMode) ([]int64, error) {
-	res, err := impl.proposeAndWait(ctx, newMarkVersionDeletingCommand(kbID, versionID, mode))
-	if err != nil {
-		return nil, err
-	}
-	if res.Err != nil {
-		return nil, res.Err
-	}
-	return res.DeletedVersionIDs, nil
-}
-
-// ProposeRemoveVersionMeta implements RaftNode.
-func (impl *RaftNodeImpl) ProposeRemoveVersionMeta(ctx context.Context, kbID string, versionID int64) error {
-	res, err := impl.proposeAndWait(ctx, newRemoveVersionMetaCommand(kbID, versionID))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) ProposeDiscardVersion(ctx context.Context, kbID string, versionID int64) error {
-	res, err := impl.proposeAndWait(ctx, newDiscardVersionCommand(kbID, versionID))
-	if err != nil {
-		return err
-	}
-	return res.Err
-}
-
-func (impl *RaftNodeImpl) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	kb, ok := impl.sm.kbs[kbID]
-	if !ok {
-		return types.KnowledgeBaseMeta{}, stratumerrors.ErrKnowledgeBaseNotFound
-	}
-	return kb, nil
-}
-
-// ListVersionsInRange implements RaftNode: the same set, narrowed.
-//
-// A linear walk with two comparisons per version, and that is deliberate — the cost
-// worth saving here is the WIRE (89 B per version), not this. The version set is a
-// slice in allocation order that deletions splice, so a binary search would be buying
-// microseconds with a new invariant to keep.
-func (impl *RaftNodeImpl) ListVersionsInRange(ctx context.Context, kbID string, fromExclusive, toInclusive *int64) ([]types.VersionMeta, error) {
-	all, err := impl.ListVersions(ctx, kbID)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]types.VersionMeta, 0, len(all))
-	for _, v := range all {
-		if fromExclusive != nil && v.VersionID <= *fromExclusive {
-			continue
-		}
-		if toInclusive != nil && v.VersionID > *toInclusive {
-			continue
-		}
-		out = append(out, v)
-	}
-	return out, nil
-}
-
-func (impl *RaftNodeImpl) ListVersions(_ context.Context, kbID string) ([]types.VersionMeta, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	if _, ok := impl.sm.kbs[kbID]; !ok {
-		return nil, stratumerrors.ErrKnowledgeBaseNotFound
-	}
-	ids := impl.sm.versionsByKB[kbID]
-	out := make([]types.VersionMeta, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, impl.sm.versions[id])
-	}
-	return out, nil
-}
-
-// GetVersion returns one version's metadata, read straight out of the state
-// machine under the same RLock ListVersions takes. It is the O(1) sibling the
-// await path polls (docs/已实施/await-version-plan.md §7 Step 2).
-func (impl *RaftNodeImpl) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	if _, ok := impl.sm.kbs[kbID]; !ok {
-		return types.VersionMeta{}, stratumerrors.ErrKnowledgeBaseNotFound
-	}
-	v, ok := impl.sm.versions[versionID]
-	if !ok || v.KBID != kbID {
-		// One answer for "no such version" and for "that version belongs to a
-		// different knowledge base": the caller asked about (kbID, versionID)
-		// and from its side both mean "not in this KB".
-		return types.VersionMeta{}, stratumerrors.ErrVersionNotFound
-	}
-	return v, nil
-}
-
-// LastVersionID implements RaftNode: O(1), because the version set is kept in
-// allocation order (see the interface comment).
-func (impl *RaftNodeImpl) LastVersionID(_ context.Context, kbID string) (int64, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	if _, ok := impl.sm.kbs[kbID]; !ok {
-		return 0, stratumerrors.ErrKnowledgeBaseNotFound
-	}
-	ids := impl.sm.versionsByKB[kbID]
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	// Append-ordered, and deletions splice the slice in place, so the last element
-	// IS the highest surviving id — no scan, and no second invariant to keep in
-	// step with anything else.
-	return ids[len(ids)-1], nil
-}
-
-// ChainGeneration names the current state of the chain tails: it changes whenever one
-// may have, and a new leader's term keeps its count apart from its predecessor's.
-//
-// Not on the RaftNode interface: only a leader's answer means anything, and every other
-// shape would have to invent one.
-func (impl *RaftNodeImpl) ChainGeneration() (term, seq uint64) {
-	// Read apart: the apply path takes the state-machine lock while Raft is working, so
-	// holding it across a call into Raft is an ordering nobody needs to reason about.
-	term = impl.raft.Term()
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	return term, impl.sm.chainSeq
-}
-
-// VersionLiveness answers "which of these versions are still alive, and how far has
-// allocation got" for one knowledge base.
-//
-// Not on the RaftNode interface: its consumers are the readers that judge leftovers,
-// and widening the interface would oblige
-// every shape (including a storage node that has no state machine) to answer a question
-// only a state machine can.
-//
-// Both facts come from ONE lock hold, because they must agree: "id <= lastAllocated" is
-// what proves this view has already applied that id's allocation, so only then does "and
-// it is not alive" mean removed rather than "not seen yet".
-func (impl *RaftNodeImpl) VersionLiveness(_ context.Context, kbID string, fromExclusive, toInclusive *int64) ([]int64, int64, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	if _, ok := impl.sm.kbs[kbID]; !ok {
-		return nil, 0, stratumerrors.ErrKnowledgeBaseNotFound
-	}
-	// versionsByKB is in allocation order, so the range can be walked once and cut short.
-	ids := impl.sm.versionsByKB[kbID]
-	alive := make([]int64, 0, len(ids))
-	for _, id := range ids {
-		if fromExclusive != nil && id <= *fromExclusive {
-			continue
-		}
-		if toInclusive != nil && id > *toInclusive {
-			break
-		}
-		alive = append(alive, id)
-	}
-	return alive, impl.sm.nextVersionID - 1, nil
-}
-
-// DeletionsSince answers a consumer's incremental read of the bounded deletion log:
-// every entry after afterSeq, up to limit of them, plus the three facts the caller
-// needs to interpret what it got.
-//
-// latest is the log's current sequence number, oldest the sequence of its oldest
-// retained entry (0 when the log is empty). A caller whose afterSeq is older than
-// oldest cannot be served incrementally — entries it has not seen are already gone —
-// and that is what truncated means at the consumer's end. The three are returned
-// together, from one lock hold, because they must agree: reading "latest" and "the
-// entries" separately could hand back a sequence number newer than the entries it
-// describes, and a consumer would then advance its watermark past entries it never
-// received.
-//
-// epoch identifies the state machine that minted these sequence numbers. A rebuilt
-// cluster mints a new one, and a consumer that sees a different epoch must treat its
-// watermark as void rather than as "I am ahead" — the two look identical on the
-// sequence alone.
-//
-// Not on the RaftNode interface, for the same reason VersionLiveness is not: its
-// consumer is the storage layer's reconciliation, and a shape without a state
-// machine answers it through RemoteRaftNode.
-func (impl *RaftNodeImpl) DeletionsSince(_ context.Context, afterSeq int64, limit int) ([]types.DeletedVersion, int64, int64, string, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-
-	latest := impl.sm.deletedSeq
-	epoch := impl.sm.deletedEpoch
-	var oldest int64
-	if len(impl.sm.deletedLog) > 0 {
-		oldest = impl.sm.deletedLog[0].Seq
-	}
-
-	if afterSeq >= latest || len(impl.sm.deletedLog) == 0 {
-		return nil, latest, oldest, epoch, nil
-	}
-	out := make([]types.DeletedVersion, 0, limit)
-	for _, entry := range impl.sm.deletedLog {
-		if entry.Seq <= afterSeq {
-			continue
-		}
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-		out = append(out, entry)
-	}
-	return out, latest, oldest, epoch, nil
-}
-
-// DeletingVersionIDs answers "which of this knowledge base's versions are still marked
-// Deleting", returning ids only.
-//
-// It exists because that is all its consumers want: the sweep runs every minute and only
-// needs to know whether there is anything to resume, and DeleteVersionCoordinator.Execute
-// re-scans a knowledge base the same way. ListVersions answers the same question at the
-// cost of a VersionMeta value copy per version (~112 bytes) — measured at 42 µs per 1000
-// versions on this machine, against 17 µs for this shape. The O(n) that remains is one
-// map lookup per version, which no narrower return type can remove.
-//
-// Not on the RaftNode interface, for the reason VersionLiveness is not: its consumers are
-// the sweeps, and widening the interface would oblige every shape — including a storage
-// node, which has no state machine to scan — to answer it.
-func (impl *RaftNodeImpl) DeletingVersionIDs(_ context.Context, kbID string) ([]int64, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	if _, ok := impl.sm.kbs[kbID]; !ok {
-		return nil, stratumerrors.ErrKnowledgeBaseNotFound
-	}
-	var out []int64
-	for _, id := range impl.sm.versionsByKB[kbID] {
-		if v, ok := impl.sm.versions[id]; ok && v.Deleting {
-			out = append(out, id)
-		}
-	}
-	return out, nil
-}
-
-// DeletingKBIDs answers the knowledge-base half of the delete sweep: which
-// knowledge bases are still marked Deleting. Straight out of the in-memory state
-// machine and ids only — the same shape as DeletingVersionIDs, for the same
-// reason, and what lets the sweep run without walking the metadata of every KB a
-// node happens to hold.
-//
-// It exists because a KB deletion has the same crash window a version deletion
-// has, and no equivalent repair until now (M3 of
-// docs/参考/code-review-2026-10-18.md): DeleteKnowledgeBase proposes the Deleting
-// status first (durable, replicated, the moment the API answers the caller) and
-// only then starts the cleanup goroutine, which is what writes the WAL's delete
-// mark. A process that dies in between leaves the KB in DELETING with neither a
-// WAL record to resume from nor anything else that would notice.
-func (impl *RaftNodeImpl) DeletingKBIDs(_ context.Context) ([]string, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	var out []string
-	for kbID, kb := range impl.sm.kbs {
-		if kb.Status == types.KBStatusDeleting {
-			out = append(out, kbID)
-		}
-	}
-	// Sorted so the sweep's order — and any log line or test asserting on it — does
-	// not depend on Go's map iteration order.
-	sort.Strings(out)
-	return out, nil
-}
-
-// MarkDeletingDirty records that kbID has had a version marked Deleting. Called from the
-// apply path, so it does no I/O and holds its own lock for the length of one map write.
-// Exported because the sweep's DirtyDeletingTracker puts a knowledge base back with it
-// when a pass could not finish.
-func (impl *RaftNodeImpl) MarkDeletingDirty(kbID string) {
-	if kbID == "" {
-		return
-	}
-	impl.deletingDirtyMu.Lock()
-	defer impl.deletingDirtyMu.Unlock()
-	if impl.deletingDirty == nil {
-		impl.deletingDirty = make(map[string]bool)
-	}
-	impl.deletingDirty[kbID] = true
-}
-
-// MarkAllDeletingDirty treats every knowledge base in the state machine as dirty.
-//
-// Two moments need it, and both are moments when this node may have MISSED a deletion
-// mark rather than received one:
-//
-//   - start-up: the set is memory, so a restart begins with nothing dirty;
-//   - a snapshot install: the entries a node never applied one by one are exactly the
-//     deletions it was never told about.
-//
-// Both are the conservative direction — the next sweep asks about every knowledge base,
-// which is what the sweep did before this set existed.
-func (impl *RaftNodeImpl) MarkAllDeletingDirty() {
-	impl.sm.mu.RLock()
-	kbs := make([]string, 0, len(impl.sm.kbs))
-	for kbID := range impl.sm.kbs {
-		kbs = append(kbs, kbID)
-	}
-	impl.sm.mu.RUnlock()
-
-	impl.deletingDirtyMu.Lock()
-	defer impl.deletingDirtyMu.Unlock()
-	if impl.deletingDirty == nil {
-		impl.deletingDirty = make(map[string]bool)
-	}
-	for _, kbID := range kbs {
-		impl.deletingDirty[kbID] = true
-	}
-}
-
-// TakeDirtyDeletingKBs consumes the set: the caller gets the knowledge bases that have
-// changed since the last call, and the set is cleared in the same hold, so two sweeps
-// cannot both act on one change (harmless, since the action is idempotent, but it would
-// double the work).
-func (impl *RaftNodeImpl) TakeDirtyDeletingKBs() []string {
-	impl.deletingDirtyMu.Lock()
-	defer impl.deletingDirtyMu.Unlock()
-	if len(impl.deletingDirty) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(impl.deletingDirty))
-	for kbID := range impl.deletingDirty {
-		out = append(out, kbID)
-	}
-	impl.deletingDirty = make(map[string]bool)
-	return out
-}
-
-// ListKnowledgeBases returns metadata for every knowledge base in the
-// state machine. Order is not specified (map iteration).
-func (impl *RaftNodeImpl) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
-	impl.sm.mu.RLock()
-	defer impl.sm.mu.RUnlock()
-	out := make([]types.KnowledgeBaseMeta, 0, len(impl.sm.kbs))
-	for _, kb := range impl.sm.kbs {
-		out = append(out, kb)
-	}
-	// map 遍历顺序随机，按 KBID 字典序排序，保证列表顺序稳定可预期。
-	sort.Slice(out, func(i, j int) bool { return out[i].KBID < out[j].KBID })
-	return out, nil
-}
-
 // GetClusterStatus reports Raft cluster connectivity, independent of any
 // specific knowledge base.
 //
@@ -1354,4 +857,10 @@ func (impl *RaftNodeImpl) GetClusterStatus(_ context.Context) (types.ClusterStat
 	}, nil
 }
 
-var _ RaftNode = (*RaftNodeImpl)(nil)
+var (
+	_ ClusterReader = (*RaftNodeImpl)(nil)
+	_ MetaReader    = (*RaftNodeImpl)(nil)
+	_ KBWriter      = (*RaftNodeImpl)(nil)
+	_ VersionWriter = (*RaftNodeImpl)(nil)
+	_ RaftNode      = (*RaftNodeImpl)(nil)
+)

@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
@@ -331,4 +332,38 @@ func keysOf(m map[string][]float32) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+func TestVecstoreChunkStoreFromConn_CloseDoesNotShutdownSharedConn(t *testing.T) {
+	srv := newFakeChunkStorageService()
+	lis := bufconn.Listen(1 << 20)
+	server := grpc.NewServer()
+	vecstorepb.RegisterChunkStorageServiceServer(server, srv)
+	go func() { _ = server.Serve(lis) }()
+	t.Cleanup(server.Stop)
+
+	conn, err := grpc.NewClient("passthrough:///bufconn",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	store, err := NewVecstoreChunkStoreFromConn(conn)
+	if err != nil {
+		t.Fatalf("NewVecstoreChunkStoreFromConn: %v", err)
+	}
+	if err := store.Write(context.Background(), "kb1", "c1", []float32{1, 2}); err != nil {
+		t.Fatalf("Write over shared conn: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	if st := conn.GetState(); st == connectivity.Shutdown {
+		t.Fatal("store.Close() shut down caller-owned shared vecstore connection")
+	}
 }

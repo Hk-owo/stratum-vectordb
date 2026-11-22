@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
-	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/docstore"
 	stratumerrors "stratum/internal/errors"
@@ -21,24 +20,19 @@ import (
 	"stratum/internal/raft"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
+	"stratum/internal/versionview"
 )
 
 // QueryServiceImpl implements pb.QueryServiceServer.
 type QueryServiceImpl struct {
 	pb.UnimplementedQueryServiceServer
 
-	raftNode       raft.RaftNode
+	raftNode       raft.MetaReader
 	indexManager   index.IndexManager
 	chunkDocMapper chunkdoc.ChunkDocMapper
 	versionDocList versiondoc.VersionDocList
 	docStore       docstore.DocStore
-	vBloomStore    *bloom.VersionBloomStore
-
-	// docSets memoizes version document-ID sets this replica has verified against
-	// the control layer's committed digest, so the O(documents) read behind
-	// doclist_us is paid once per version rather than once per query. See
-	// docSetCache for why a verified set is safe to reuse.
-	docSets docSetCache
+	versionViews   *versionview.Store
 
 	// logger carries the per-stage timings of a query. Debug level and silent by
 	// default: one line per query at info would be noise, while the point is that
@@ -91,7 +85,9 @@ type pullKey struct {
 	kbID string
 }
 
-// NewQueryService constructs a QueryServiceImpl.
+// QueryOption configures optional capabilities of QueryServiceImpl at construction time.
+type QueryOption func(*QueryServiceImpl)
+
 // LocalVersionReporter reports this node's contiguous data cursor for a
 // knowledge base — the highest version whose history it holds completely. It is
 // what §9.3(2)'s freshness check compares against.
@@ -99,11 +95,11 @@ type LocalVersionReporter interface {
 	LocalVersionOf(kbID string) int64
 }
 
-// SetLocalVersionReporter wires the cursor the freshness check reads. Optional:
+// WithLocalVersionReporter wires the cursor the freshness check reads. Optional:
 // without it the node cannot verify a credential and therefore ignores one,
 // which is the pre-§9 behaviour rather than a broken one.
-func (s *QueryServiceImpl) SetLocalVersionReporter(r LocalVersionReporter) {
-	s.localVersion = r
+func WithLocalVersionReporter(r LocalVersionReporter) QueryOption {
+	return func(s *QueryServiceImpl) { s.localVersion = r }
 }
 
 // Backfiller fetches a knowledge base's data on this node up to versionID — the
@@ -112,11 +108,11 @@ type Backfiller interface {
 	EnsureIndex(ctx context.Context, kbID string, versionID int64) error
 }
 
-// SetBackfiller wires the pull the freshness check uses to repair itself.
+// WithBackfiller wires the pull the freshness check uses to repair itself.
 // Optional: without it the check refuses exactly as it did before and the node
 // simply never catches up on demand, which is the pre-existing behaviour.
-func (s *QueryServiceImpl) SetBackfiller(b Backfiller) {
-	s.backfiller = b
+func WithBackfiller(b Backfiller) QueryOption {
+	return func(s *QueryServiceImpl) { s.backfiller = b }
 }
 
 // IndexFetcher asks the other replicas whether any holds a version's built index,
@@ -129,11 +125,21 @@ type IndexFetcher interface {
 	FetchIndexFromPeers(ctx context.Context, kbID string, versionID int64) (installed bool, err error)
 }
 
-// SetIndexFetcher wires the on-demand artifact fetch. Optional: without it a
+// WithIndexFetcher wires the on-demand artifact fetch. Optional: without it a
 // queried replica builds the index for itself, which is correct — it is the
 // fallback — but it skips the cheap route of taking a peer's artifact.
-func (s *QueryServiceImpl) SetIndexFetcher(f IndexFetcher) {
-	s.indexFetcher = f
+func WithIndexFetcher(f IndexFetcher) QueryOption {
+	return func(s *QueryServiceImpl) { s.indexFetcher = f }
+}
+
+// WithQueryLogger wires the logger that carries Query per-stage timings.
+// Optional: without it those timings go nowhere.
+func WithQueryLogger(l *zap.Logger) QueryOption {
+	return func(s *QueryServiceImpl) {
+		if l != nil {
+			s.logger = l
+		}
+	}
 }
 
 // hasLocalIndexArtifact reports whether this node already has the version's index on
@@ -282,32 +288,38 @@ func (s *QueryServiceImpl) endPull(kbID string) {
 	delete(s.pulls, key)
 }
 
+// NewQueryService constructs a QueryServiceImpl with required storage/Raft
+// dependencies and optional QueryOption capabilities.
 func NewQueryService(
-	rn raft.RaftNode,
+	rn raft.MetaReader,
 	im index.IndexManager,
 	cdm chunkdoc.ChunkDocMapper,
 	vdl versiondoc.VersionDocList,
 	ds docstore.DocStore,
-	vBloomStore *bloom.VersionBloomStore,
+	versionViews *versionview.Store,
+	opts ...QueryOption,
 ) *QueryServiceImpl {
-	return &QueryServiceImpl{
+	if versionViews == nil {
+		versionViews = versionview.NewStore(versionview.Config{
+			VersionDocList: vdl,
+			ChunkDocMapper: cdm,
+		})
+	}
+	s := &QueryServiceImpl{
 		raftNode:       rn,
 		indexManager:   im,
 		chunkDocMapper: cdm,
 		versionDocList: vdl,
 		docStore:       ds,
-		vBloomStore:    vBloomStore,
+		versionViews:   versionViews,
 		logger:         zap.NewNop(),
 	}
-}
-
-// SetLogger wires the logger that carries the per-stage timings below. Optional:
-// without it those timings go nowhere, which is the pre-existing behaviour
-// (nothing about correctness depends on them).
-func (s *QueryServiceImpl) SetLogger(l *zap.Logger) {
-	if l != nil {
-		s.logger = l
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
 	}
+	return s
 }
 
 // MaxQueryTopK bounds the caller-supplied top_k on Query.
@@ -367,6 +379,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	//	read_calls      — how many documents read_us paid for (its denominator)
 	var stageActive, stageDocList, stageBloomBuild, stageAgg time.Duration
 	var candidateCount, matched, chunkMapCalls, readCalls int
+	vcmHit := versionview.HitNone
 	defer func() {
 		s.logger.Debug("query: stage timings",
 			zap.String("kb_id", kbID),
@@ -375,6 +388,7 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 			zap.Int("matched_docs", matched),
 			zap.Int("chunkmap_calls", chunkMapCalls),
 			zap.Int("read_calls", readCalls),
+			zap.String("vcm_hit", string(vcmHit)),
 			zap.Int64("active_us", stageActive.Microseconds()),
 			zap.Int64("meta_us", stageMeta.Microseconds()),
 			zap.Int64("bloom_us", stageBloom.Microseconds()),
@@ -642,212 +656,73 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 		threshold = *req.Threshold
 	}
 
-	// Map chunk results to document results.
-	type docScore struct {
-		docID  string
-		scores []float32
+	viewStart := time.Now()
+	view, hit, viewErr := s.versionViews.Lookup(ctx, kbID, versionID, targetVersion.DocIDSetHash)
+	stageDocList = time.Since(viewStart)
+	stageBloom = stageDocList
+	vcmHit = hit
+	if viewErr != nil && errors.Is(viewErr, stratumerrors.ErrIndexNotReady) {
+		return nil, stratumerrors.ToGRPCStatus(viewErr)
 	}
-	docMap := make(map[string]*docScore)
-
-	// Per-version document state, read ONCE for the whole query: the document-ID set is
-	// both the filter's input and the authoritative membership test below.
-	//
-	// Derived from one snapshot on purpose. The filter decides which search hits are
-	// dropped, so a filter that disagrees with the set it is meant to describe does not
-	// merely lose precision — it deletes hits that are really there. The store rebuilds
-	// a filter whenever that set changes (bloom.VersionBloomStore.GetForDocuments), and
-	// handing the set over here is what keeps the two in step.
-	//
-	// bloom_us covers the set plus the filter: both are local reads, so this is what
-	// "reading our own storage" costs.
-	//
-	// A failed read leaves both empty and filtering is then SKIPPED rather than applied
-	// with an empty set: "the set is unavailable" must not read as "no document is in
-	// this version", which would drop every hit and answer empty.
-	bloomStart := time.Now()
-	// The read behind doclist_us is O(documents) and used to run on every query.
-	// A version's set is immutable once written, so it is memoized — but only
-	// after it hashes to the digest the control layer committed for the version
-	// (targetVersion.DocIDSetHash, already in hand from meta_us). A cache hit is
-	// then equivalent to re-reading the store and verifying it, and a replica
-	// whose data has not arrived is never cached. See docSetCache.
-	//
-	// The set comes back with its fingerprint, so the bloom store below does not have
-	// to re-derive it from the IDs on every query — on a hit that is the difference
-	// between O(1) and a copy-plus-sort of the whole set per request.
-	vSet, idsErr := s.docSets.lookup(ctx, s.versionDocList, kbID, versionID, targetVersion.DocIDSetHash)
-	stageDocList = time.Since(bloomStart)
-	var (
-		vBloom    bloom.BloomFilter
-		vBloomErr error
-	)
-	if idsErr != nil {
-		// A document set that does not hash to the committed digest is this replica
-		// being INCOMPLETE, not an answer: filtering search hits against it drops the
-		// ones whose documents have not arrived yet, and the caller gets a well-formed
-		// result with matches silently missing. Refused retryably instead, so the station
-		// asks a replica that can serve the version.
-		//
-		// Other read failures (the store itself) keep the older, conservative treatment:
-		// filtering is SKIPPED rather than applied to an empty set, because "the set is
-		// unavailable" must not read as "no document is in this version".
-		if errors.Is(idsErr, stratumerrors.ErrIndexNotReady) {
-			return nil, stratumerrors.ToGRPCStatus(idsErr)
-		}
-		vBloomErr = idsErr
-	}
-
-	// An empty read is only an answer when the VERSION is empty. A replica that
-	// has not received the version's documents yet reads the set successfully and
-	// gets nothing back, and the two states must not collapse: "this version has
-	// no documents" is a legitimate empty result, while "this replica does not
-	// know the version's documents" cannot serve the query at all and has to say
-	// so retryably, so the station asks a replica that can.
-	//
-	// The control layer already carries the distinction — the version's
-	// document-set digest. The empty set has its own digest
-	// (types.EmptyDocIDSetHash), so an empty read for a version that does NOT
-	// carry that digest is this replica missing the data, not an empty version.
-	// The Search-side branch below makes exactly this test for the same reason;
-	// the filter path needs it too because search can succeed while the set does
-	// not (the chunk mapping and the document set land separately).
-	//
-	// Measured on the 3+3 cluster, one replica having missed the write: its query
-	// log read `candidates=1 matched_docs=0 chunkmap_calls=1` — the search found
-	// the chunk, the filter dropped it because the set it was filtering against
-	// was empty — and the caller got `results=0, err=nil` for ~14 s (t+6…+18 s)
-	// until the replica caught up.
-	if idsErr == nil && len(vSet.ids) == 0 && targetVersion.DocIDSetHash != types.EmptyDocIDSetHash {
+	if viewErr == nil && len(view.DocIDs) == 0 && targetVersion.DocIDSetHash != types.EmptyDocIDSetHash {
 		return nil, stratumerrors.ToGRPCStatus(fmt.Errorf(
 			"%w: %s: version %d's document set is not on this replica yet (its committed digest is not the empty set's)",
 			stratumerrors.ErrIndexNotReady, kbID, versionID))
 	}
-
-	// The version's document-ID set, materialized ONCE for the whole query.
-	//
-	// It used to be fetched INSIDE the loop below — once per candidate chunk,
-	// again per docID — and every fetch was a prefix scan returning the version's
-	// entire document list, which was then walked linearly to answer "is this
-	// docID in the version?". One query therefore cost O(candidates × documents).
-	// Measured on the 3+3 cluster: 2,000 documents → 207 ms, 8,000 → 2.73 s, while
-	// the HNSW search inside vecstore took 16 µs (probe: VECPROBE search
-	// ntotal=18 took_us=16). A single fetch plus a set makes membership O(1) and
-	// the whole query O(documents) once.
-	//
-	// A failed fetch leaves the set's map nil, and every membership test then fails —
-	// the same conservative "cannot confirm, so skip" the per-candidate fetch
-	// had when its own call errored.
-	if idsErr == nil {
-		// bloom_build_us is inside bloom_us: the store's filter lookup, which rebuilds
-		// and caches the version filter when the set has changed. Separated from
-		// doclist_us because one is a read of our own storage and the other is CPU
-		// plus its own bookkeeping. Neither the membership map nor the set's
-		// fingerprint is derived here any more: docSets.lookup returns both, from the
-		// cache when the set has already been verified, so a warm query hands the
-		// store a fingerprint it can compare instead of one it has to recompute.
-		bloomBuildStart := time.Now()
-		vBloom = s.vBloomStore.GetForDocumentsWithFingerprint(kbID, versionID, vSet.fingerprint, vSet.ids)
-		stageBloomBuild = time.Since(bloomBuildStart)
+	if viewErr == nil && len(view.DocIDs) == 0 {
+		return &pb.QueryResponse{Results: nil, VersionId: versionID}, nil
 	}
-	stageBloom = time.Since(bloomStart)
 
-	filterStart := time.Now()
-	for _, r := range searchResults {
-		if r.Score < threshold {
-			continue
-		}
-		// Two passes, and the first one is deliberate.
-		//
-		// This loop was rewritten to consume the mapping as it is decoded — an
-		// IterateDocIDs callback instead of ListDocIDs plus a second walk — on the
-		// theory that the slice and the extra pass were pure overhead. Measured on
-		// the 3+3 cluster at 2,000 and 8,000 documents, it bought nothing: the
-		// closure's captured variables are reached through an indirect load on
-		// every one of the (candidates × documents) iterations, which cost as much
-		// as the allocation it removed. The measurement could not even reproduce a
-		// direction across runs — the same case's p50 moved ±40% between runs, far
-		// more than the effect — so the version that is simpler and has no extra
-		// interface surface is the one that stayed.
-		chunkMapStart := time.Now()
-		docIDs, err := s.chunkDocMapper.ListDocIDs(ctx, kbID, r.ChunkID)
-		stageChunkMap += time.Since(chunkMapStart)
-		chunkMapCalls++
-		if err != nil {
-			continue
-		}
-		for _, docID := range docIDs {
-			// Version filter: a bloom miss means the document is
-			// definitely not in this version's document set (no false
-			// negatives), so it is skipped without an authoritative
-			// check. A bloom hit may be a false positive, so it is
-			// confirmed against the version doc list.
-			if vBloomErr == nil {
-				if !vBloom.Test(docID) {
-					continue
-				}
-				if _, ok := vSet.docs[docID]; !ok {
-					continue
-				}
-			}
-			if ds, ok := docMap[docID]; ok {
-				ds.scores = append(ds.scores, r.Score)
-			} else {
-				docMap[docID] = &docScore{docID: docID, scores: []float32{r.Score}}
-			}
-		}
-	}
-	stageFilter = time.Since(filterStart)
-	matched = len(docMap)
-
-	// Aggregate per-document scores.
 	agg := req.Aggregation
-	// 0 is the default (MEDIAN), so treat it as MEDIAN.
-
 	type scoredDoc struct {
 		docID   string
 		score   float32
 		content string
 	}
 
-	// Aggregate, rank, THEN read — in that order.
-	//
-	// Reading content used to happen while building the candidate list, so one
-	// query read every matched document's text and threw almost all of it away
-	// when it truncated to top_k. That is not a rare case: chunks are
-	// content-addressed, so one chunk can belong to thousands of documents (a
-	// corpus of near-identical documents collapses to a handful of chunks), and
-	// the debug timings made it visible — `matched_docs: 1000`, `read_us: 8684`
-	// out of `total_us: 22909` on a 2,000-document version, against
-	// `search_us: 389`. Ranking first costs nothing (the scores are already in
-	// memory) and turns O(matched) document reads into O(top_k).
-	// agg_us: aggregation + ranking, between the filter loop and the reads. It was
-	// inside no stage, so it silently inflated total_us − (all named stages).
-	aggStart := time.Now()
-	candidates := make([]scoredDoc, 0, len(docMap))
-	for docID, ds := range docMap {
-		candidates = append(candidates, scoredDoc{docID: docID, score: aggregate(ds.scores, agg)})
-	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].score > candidates[j].score })
-	stageAgg = time.Since(aggStart)
-
-	// Read content for the winners, stopping as soon as top_k readable documents
-	// are found. A candidate whose content cannot be read is skipped and the next
-	// one takes its place, which is what the previous "read everything, then
-	// truncate" ordering did as well.
-	readStart := time.Now()
 	results := make([]scoredDoc, 0, topK)
-	for _, cand := range candidates {
-		if len(results) >= topK {
-			break
+	if viewErr == nil {
+		var idxCandidates []scoredIdx
+		idxCandidates, stageFilter, stageAgg = filterAndAggregateFromView(searchResults, threshold, agg, view)
+		matched = len(idxCandidates)
+
+		readStart := time.Now()
+		for _, cand := range idxCandidates {
+			if len(results) >= topK {
+				break
+			}
+			docID := view.DocIDs[cand.docIdx]
+			readCalls++
+			content, err := s.docStore.ReadAt(ctx, kbID, docID, versionID)
+			if err != nil {
+				continue
+			}
+			results = append(results, scoredDoc{docID: docID, score: cand.score, content: string(content)})
 		}
-		readCalls++
-		content, err := s.docStore.ReadAt(ctx, kbID, cand.docID, versionID)
-		if err != nil {
-			continue
+		stageRead = time.Since(readStart)
+	} else {
+		// Conservative fallback when VersionDocList itself fails with a real
+		// underlying I/O error: skip version filtering and fall back to
+		// ChunkDocMapper.ListDocIDs so transient store read issues do not drop
+		// valid documents silently.
+		var candidates []scoredFallback
+		candidates, stageFilter, stageChunkMap, chunkMapCalls, stageAgg = s.filterAndAggregateFallback(ctx, kbID, searchResults, threshold, agg)
+		matched = len(candidates)
+
+		readStart := time.Now()
+		for _, cand := range candidates {
+			if len(results) >= topK {
+				break
+			}
+			readCalls++
+			content, err := s.docStore.ReadAt(ctx, kbID, cand.docID, versionID)
+			if err != nil {
+				continue
+			}
+			results = append(results, scoredDoc{docID: cand.docID, score: cand.score, content: string(content)})
 		}
-		results = append(results, scoredDoc{docID: cand.docID, score: cand.score, content: string(content)})
+		stageRead = time.Since(readStart)
 	}
-	stageRead = time.Since(readStart)
 
 	out := make([]*pb.QueryResult, len(results))
 	for i, r := range results {
@@ -859,6 +734,154 @@ func (s *QueryServiceImpl) Query(ctx context.Context, req *pb.QueryRequest) (*pb
 	}
 
 	return &pb.QueryResponse{Results: out, VersionId: versionID}, nil
+}
+
+const denseDocIndexThreshold = 65536
+
+type docHit struct {
+	docIdx uint32
+	first  float32
+	extra  []float32
+}
+
+type scoredIdx struct {
+	docIdx uint32
+	score  float32
+}
+
+type scoredFallback struct {
+	docID string
+	score float32
+}
+
+func filterAndAggregateFromView(
+	searchResults []types.SearchResult,
+	threshold float32,
+	agg pb.AggregationMethod,
+	view *versionview.View,
+) ([]scoredIdx, time.Duration, time.Duration) {
+	filterStart := time.Now()
+	numDocs := len(view.DocIDs)
+	hits := make([]docHit, 0, min(len(searchResults)*2, numDocs))
+
+	if numDocs <= denseDocIndexThreshold {
+		// 1-based slot index so Go's zero-initialized slice means "unseen".
+		slots := make([]int32, numDocs)
+		for _, r := range searchResults {
+			if r.Score < threshold {
+				continue
+			}
+			for _, docIdx := range view.ChunkToDocs[r.ChunkID] {
+				if int(docIdx) >= numDocs {
+					continue
+				}
+				slot := slots[docIdx]
+				if slot == 0 {
+					hits = append(hits, docHit{docIdx: docIdx, first: r.Score})
+					slots[docIdx] = int32(len(hits))
+				} else {
+					h := &hits[slot-1]
+					h.extra = append(h.extra, r.Score)
+				}
+			}
+		}
+	} else {
+		slots := make(map[uint32]int32, min(len(searchResults)*2, 1024))
+		for _, r := range searchResults {
+			if r.Score < threshold {
+				continue
+			}
+			for _, docIdx := range view.ChunkToDocs[r.ChunkID] {
+				if int(docIdx) >= numDocs {
+					continue
+				}
+				slot := slots[docIdx]
+				if slot == 0 {
+					hits = append(hits, docHit{docIdx: docIdx, first: r.Score})
+					slots[docIdx] = int32(len(hits))
+				} else {
+					h := &hits[slot-1]
+					h.extra = append(h.extra, r.Score)
+				}
+			}
+		}
+	}
+	filterDur := time.Since(filterStart)
+
+	aggStart := time.Now()
+	candidates := make([]scoredIdx, len(hits))
+	var scratch []float32
+	for i := range hits {
+		h := &hits[i]
+		var score float32
+		if len(h.extra) == 0 {
+			score = h.first
+		} else {
+			scratch = append(scratch[:0], h.first)
+			scratch = append(scratch, h.extra...)
+			score = aggregate(scratch, agg)
+		}
+		candidates[i] = scoredIdx{docIdx: h.docIdx, score: score}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].score > candidates[j].score })
+	aggDur := time.Since(aggStart)
+	return candidates, filterDur, aggDur
+}
+
+func (s *QueryServiceImpl) filterAndAggregateFallback(
+	ctx context.Context,
+	kbID string,
+	searchResults []types.SearchResult,
+	threshold float32,
+	agg pb.AggregationMethod,
+) ([]scoredFallback, time.Duration, time.Duration, int, time.Duration) {
+	type docScore struct {
+		first float32
+		extra []float32
+	}
+	docMap := make(map[string]*docScore)
+	var stageChunkMap time.Duration
+	chunkMapCalls := 0
+
+	filterStart := time.Now()
+	for _, r := range searchResults {
+		if r.Score < threshold {
+			continue
+		}
+		chunkMapStart := time.Now()
+		docIDs, err := s.chunkDocMapper.ListDocIDs(ctx, kbID, r.ChunkID)
+		stageChunkMap += time.Since(chunkMapStart)
+		chunkMapCalls++
+		if err != nil {
+			continue
+		}
+		for _, docID := range docIDs {
+			if ds, ok := docMap[docID]; ok {
+				ds.extra = append(ds.extra, r.Score)
+			} else {
+				docMap[docID] = &docScore{first: r.Score}
+			}
+		}
+	}
+	filterDur := time.Since(filterStart)
+
+	aggStart := time.Now()
+	candidates := make([]scoredFallback, 0, len(docMap))
+	var scratch []float32
+	for docID, ds := range docMap {
+		var score float32
+		if len(ds.extra) == 0 {
+			score = ds.first
+		} else {
+			scratch = append(scratch[:0], ds.first)
+			scratch = append(scratch, ds.extra...)
+			score = aggregate(scratch, agg)
+		}
+		candidates = append(candidates, scoredFallback{docID: docID, score: score})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].score > candidates[j].score })
+	aggDur := time.Since(aggStart)
+	return candidates, filterDur, stageChunkMap, chunkMapCalls, aggDur
 }
 
 // aggregate combines per-chunk scores into a per-document score using the

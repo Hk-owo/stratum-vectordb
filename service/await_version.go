@@ -260,10 +260,10 @@ type VersionWatcher interface {
 	WatchVersion(versionID int64) (<-chan struct{}, func())
 }
 
-// SetVersionWatcher wires the event-driven half of the await path. Without it
+// WithVersionWatcher wires the event-driven half of the await path. Without it
 // await polls, which is correct but pays up to awaitPollInterval of latency.
-func (s *KnowledgeBaseServiceImpl) SetVersionWatcher(w VersionWatcher) {
-	s.versionWatcher = w
+func WithVersionWatcher(w VersionWatcher) KnowledgeBaseOption {
+	return func(s *KnowledgeBaseServiceImpl) { s.versionWatcher = w }
 }
 
 // notVisibleYet reports whether err is the "I cannot see it" family: the version
@@ -275,15 +275,17 @@ func notVisibleYet(err error) bool {
 		errors.Is(err, stratumerrors.ErrKnowledgeBaseNotFound)
 }
 
-// SetPresenceProbe wires the data_missing probe's inputs: the presence checker
+// WithPresenceProbe wires the data_missing probe's inputs: the presence checker
 // and the candidate-replica list AdminService's status view already uses
 // (§6.4). Both optional — unwired, the probe is skipped and data_missing answers
 // false, which reads as "unknown" and is never a claim that the data is there.
-func (s *KnowledgeBaseServiceImpl) SetPresenceProbe(presence PresenceChecker, replicas func() []string) {
-	s.presence = presence
-	s.replicas = replicas
-	if s.probeCache == nil {
-		s.probeCache = newAwaitProbe()
+func WithPresenceProbe(presence PresenceChecker, replicas func() []string) KnowledgeBaseOption {
+	return func(s *KnowledgeBaseServiceImpl) {
+		s.presence = presence
+		s.replicas = replicas
+		if s.probeCache == nil {
+			s.probeCache = newAwaitProbe()
+		}
 	}
 }
 

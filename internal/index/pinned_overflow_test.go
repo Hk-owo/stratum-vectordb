@@ -16,9 +16,8 @@ import (
 // by construction and failing a query over it would trade a short spike for an
 // outage.
 func TestMakeRoomLockedWarnsWhenEverythingIsPinned(t *testing.T) {
-	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 1, MemoryThresholdMB: 0})
 	core, logs := observer.New(zap.WarnLevel)
-	im.SetLogger(zap.New(core))
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 1, MemoryThresholdMB: 0}, WithLogger(zap.New(core)))
 
 	im.mu.Lock()
 	im.loaded[indexKey{"kb-1", 1}] = &loadedIndex{refCount: 1, lastAccess: time.Now().Add(-time.Minute)}
@@ -56,9 +55,8 @@ func TestMakeRoomLockedWarnsWhenEverythingIsPinned(t *testing.T) {
 // The ordinary case stays quiet: an evictable index is evicted to get under the
 // bound, and nothing is logged about memory.
 func TestMakeRoomLockedStaysQuietWhenSomethingIsEvictable(t *testing.T) {
-	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 2})
 	core, logs := observer.New(zap.WarnLevel)
-	im.SetLogger(zap.New(core))
+	im := NewIndexManager(IndexManagerConfig{LRUCapacity: 2}, WithLogger(zap.New(core)))
 
 	im.mu.Lock()
 	// Two residents against a capacity of two: making room for one more needs

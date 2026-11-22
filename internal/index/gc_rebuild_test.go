@@ -22,9 +22,10 @@ func newRebuildTestManager(t *testing.T, others int) *IndexManagerImpl {
 		GCEnabled:              true,
 		IndexServingReplicaMin: 2,
 		NodeID:                 1,
-	})
-	im.logger = zap.NewNop()
-	im.SetGCReplicaCounter(&gcCountingCounter{others: others}, 1)
+	},
+		WithLogger(zap.NewNop()),
+		WithGCReplicaCounter(&gcCountingCounter{others: others}, 1),
+	)
 	return im
 }
 

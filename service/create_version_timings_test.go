@@ -20,9 +20,8 @@ import (
 // than a rounding difference, which is only true because both are measured at the
 // same boundary.
 func TestKnowledgeBaseService_CreateVersionReportsStageTimings(t *testing.T) {
-	h := newKBSvcTestHarness()
 	core, logs := observer.New(zap.DebugLevel)
-	h.svc.SetLogger(zap.New(core))
+	h := newKBSvcTestHarness(WithKBLogger(zap.New(core)))
 
 	createResp, err := h.svc.CreateKnowledgeBase(context.Background(), &pb.CreateKnowledgeBaseRequest{
 		Name:             "test-kb",
@@ -88,9 +87,8 @@ func TestKnowledgeBaseService_CreateVersionReportsStageTimings(t *testing.T) {
 // refusal is exactly the case an operator wants the cost of, and a
 // success-only line would not show it.
 func TestKnowledgeBaseService_CreateVersionReportsTimingsWhenRefused(t *testing.T) {
-	h := newKBSvcTestHarness()
 	core, logs := observer.New(zap.DebugLevel)
-	h.svc.SetLogger(zap.New(core))
+	h := newKBSvcTestHarness(WithKBLogger(zap.New(core)))
 
 	// The harness wires no storage-degradation source, so the gate allows this
 	// write. The failure comes from the coordinator instead — which is the case

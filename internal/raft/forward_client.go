@@ -6,10 +6,10 @@ import (
 	"fmt"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	pb "stratum/api/proto/stratum"
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/rpcpool"
 )
 
 // GRPCProposeForwarder carries proposals to the leader over the internal
@@ -17,18 +17,13 @@ import (
 type GRPCProposeForwarder struct {
 	// AddrByID resolves a node ID to its gRPC address.
 	AddrByID func(id int64) (string, bool)
-	// Dial is injectable for tests; nil means a plain insecure dial.
+	// Pool supplies long-lived control-plane channels when Dial is nil.
+	Pool *rpcpool.Pool
+	// Dial is injectable for tests; nil uses Pool or rpcpool's default dialer.
 	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 }
 
 var _ ProposeForwarder = (*GRPCProposeForwarder)(nil)
-
-func (f *GRPCProposeForwarder) dial(ctx context.Context, addr string) (*grpc.ClientConn, error) {
-	if f.Dial != nil {
-		return f.Dial(ctx, addr)
-	}
-	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-}
 
 // ForwardPropose asks the leader to run cmd and returns its apply outcome.
 //
@@ -43,11 +38,11 @@ func (f *GRPCProposeForwarder) ForwardPropose(ctx context.Context, leaderID int6
 	if !ok {
 		return ForwardedResult{}, fmt.Errorf("raft: forward proposal: no address for leader %d", leaderID)
 	}
-	conn, err := f.dial(ctx, addr)
+	conn, release, err := rpcpool.Acquire(ctx, f.Pool, f.Dial, nil, addr)
 	if err != nil {
 		return ForwardedResult{}, fmt.Errorf("raft: forward proposal: dial %s: %w", addr, err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer release()
 
 	resp, err := pb.NewInternalServiceClient(conn).Propose(ctx, &pb.ProposeRequest{Command: cmd})
 	if err != nil {

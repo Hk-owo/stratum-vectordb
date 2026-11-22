@@ -21,12 +21,20 @@ import (
 	"stratum/internal/wal"
 )
 
+// AdminRaft is the Raft subset AdminServiceImpl uses: cluster connectivity
+// and metadata reads plus index-status and retry proposals.
+type AdminRaft interface {
+	raft.ClusterReader
+	raft.MetaReader
+	raft.VersionWriter
+}
+
 // AdminServiceImpl implements pb.AdminServiceServer.
 type AdminServiceImpl struct {
 	pb.UnimplementedAdminServiceServer
 
 	nodeID       int64
-	raftNode     raft.RaftNode
+	raftNode     AdminRaft
 	indexManager index.IndexManager
 	docStore     docstore.DocStore
 	chunkStore   chunkstore.ChunkStore
@@ -92,12 +100,13 @@ type NodeStateSource interface {
 	NonSteadyVersions() []nodestate.VersionEntry
 }
 
-// SetNodeStateSource wires the storage node's state machine into the admin
-// surface (docs/已实施/storage-node-state-machine-plan.md §6). Optional: without it
-// GetSystemStatus omits node_state/version_states and HealthCheck says nothing
-// about the node's phase, which is the pre-existing behaviour.
-func (s *AdminServiceImpl) SetNodeStateSource(src NodeStateSource) {
-	s.nodeState = src
+// AdminOption configures optional capabilities of AdminServiceImpl at construction time.
+type AdminOption func(*AdminServiceImpl)
+
+// WithNodeStateSource wires the storage node's state machine into the admin
+// surface (docs/已实施/storage-node-state-machine-plan.md §6).
+func WithNodeStateSource(src NodeStateSource) AdminOption {
+	return func(s *AdminServiceImpl) { s.nodeState = src }
 }
 
 // GCPressureReporter reports the versions whose §8.6(d) dead-weight collection is
@@ -110,9 +119,9 @@ type GCPressureReporter interface {
 	BlockedCollections() []index.GCPressure
 }
 
-// SetGCPressureReporter wires the §8.6(d) blocked-collection report.
-func (s *AdminServiceImpl) SetGCPressureReporter(r GCPressureReporter) {
-	s.gcPressure = r
+// WithGCPressureReporter wires the §8.6(d) blocked-collection report.
+func WithGCPressureReporter(r GCPressureReporter) AdminOption {
+	return func(s *AdminServiceImpl) { s.gcPressure = r }
 }
 
 // ReclaimBlockedReplica names one replica that kept a knowledge base's §7.5 reclaim
@@ -134,30 +143,36 @@ type ReclaimDiagnosticsSource interface {
 	ReclaimBlockedReplicas(kbID string) ([]ReclaimBlockedReplica, bool)
 }
 
-// SetReclaimDiagnosticsSource wires the §7.5 watermark diagnosis that GetSystemStatus
+// WithReclaimDiagnosticsSource wires the §7.5 watermark diagnosis that GetSystemStatus
 // reports.
-func (s *AdminServiceImpl) SetReclaimDiagnosticsSource(src ReclaimDiagnosticsSource) {
-	s.reclaimDiag = src
+func WithReclaimDiagnosticsSource(src ReclaimDiagnosticsSource) AdminOption {
+	return func(s *AdminServiceImpl) { s.reclaimDiag = src }
 }
 
-// SetLogger wires the logger the operator-facing actions write to. Optional:
-// without it those lines go nowhere, which is the pre-existing behaviour.
-func (s *AdminServiceImpl) SetLogger(l *zap.Logger) {
-	if l != nil {
-		s.logger = l
+// WithAdminLogger wires the logger the operator-facing actions write to. Optional:
+// without it those lines go nowhere.
+func WithAdminLogger(l *zap.Logger) AdminOption {
+	return func(s *AdminServiceImpl) {
+		if l != nil {
+			s.logger = l
+		}
 	}
 }
 
-// SetDeleteVersionCoordinator wires the cleanup flow ForceAbandonVersion drives.
-func (s *AdminServiceImpl) SetDeleteVersionCoordinator(c coordinator.DeleteVersionCoordinator) {
-	s.deleteVersionCoord = c
+// WithDeleteVersionCoordinator wires the cleanup flow ForceAbandonVersion drives.
+func WithDeleteVersionCoordinator(c coordinator.DeleteVersionCoordinator) AdminOption {
+	return func(s *AdminServiceImpl) { s.deleteVersionCoord = c }
 }
 
-// SetStorageDegradationSource wires the storage-redundancy verdict that
-// HealthCheck reports in its details. Optional: without it health says nothing
-// about storage rather than reporting it as fine.
-func (s *AdminServiceImpl) SetStorageDegradationSource(src StorageDegradationSource) {
-	s.storageGate = src
+// WithAdminStorageDegradationSource wires the storage-redundancy verdict that
+// HealthCheck reports in its details.
+func WithAdminStorageDegradationSource(src StorageDegradationSource) AdminOption {
+	return func(s *AdminServiceImpl) { s.storageGate = src }
+}
+
+// WithAdminKBReplicaResolver wires the per-KB replica resolver for AdminServiceImpl.
+func WithAdminKBReplicaResolver(resolve KBReplicaResolver) AdminOption {
+	return func(s *AdminServiceImpl) { s.kbReplicas = resolve }
 }
 
 // dataMissingMinAgeSec is how long a PENDING version may legitimately still be
@@ -174,15 +189,16 @@ var dataMissingMinAgeSec int64 = 120
 // routing layer can resolve the leader's gRPC address from its node list.
 func NewAdminService(
 	nodeID int64,
-	rn raft.RaftNode,
+	rn AdminRaft,
 	im index.IndexManager,
 	ds docstore.DocStore,
 	cs chunkstore.ChunkStore,
 	w wal.WAL,
 	replicas func() []string,
 	presence PresenceChecker,
+	opts ...AdminOption,
 ) *AdminServiceImpl {
-	return &AdminServiceImpl{
+	s := &AdminServiceImpl{
 		nodeID:       nodeID,
 		raftNode:     rn,
 		indexManager: im,
@@ -193,6 +209,12 @@ func NewAdminService(
 		presence:     presence,
 		logger:       zap.NewNop(),
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
 }
 
 // HealthCheck implements AdminServiceServer.

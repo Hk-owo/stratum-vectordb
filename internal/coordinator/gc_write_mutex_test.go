@@ -172,10 +172,7 @@ func (r *gcWriteRaftNode) ProposeMarkVersionDataDurable(_ context.Context, _ int
 func (r *gcWriteRaftNode) ProposeUpdateVersionSummary(_ context.Context, _ int64, _ string) error {
 	return nil
 }
-func (r *gcWriteRaftNode) ProposeMarkKBDeleting(_ context.Context, _ string) error     { return nil }
-func (r *gcWriteRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, _ string) error { return nil }
-func (r *gcWriteRaftNode) ProposeRemoveKBMeta(_ context.Context, _ string) error       { return nil }
-func (r *gcWriteRaftNode) ProposeRollback(_ context.Context, _ string, _ int64) error  { return nil }
+func (r *gcWriteRaftNode) ProposeRollback(_ context.Context, _ string, _ int64) error { return nil }
 
 // ProposeMarkVersionDeleting mirrors the state machine closely enough for these
 // tests: it flags the target (SUBTREE: the target and its descendants) Deleting
@@ -581,4 +578,7 @@ func TestGC_SharedWriteMu_ConcurrentWriteAndSweep_KeepsLiveChunk(t *testing.T) {
 	}
 }
 
-var _ raft.RaftNode = (*gcWriteRaftNode)(nil)
+var (
+	_ WriteRaft       = (*gcWriteRaftNode)(nil)
+	_ raft.MetaReader = (*gcWriteRaftNode)(nil)
+)

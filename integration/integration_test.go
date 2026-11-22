@@ -30,6 +30,7 @@ import (
 	"stratum/internal/splitter"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
+	"stratum/internal/versionview"
 	"stratum/internal/wal"
 	"stratum/service"
 )
@@ -69,7 +70,12 @@ func newTestCluster(t testing.TB) *testCluster {
 	vd := versiondoc.NewMockVersionDocList()
 	ec := embed.NewMockEmbedClient(4) // 4-dim vectors
 	chunkBF := bloom.NewMockBloomFilter()
-	vBloomStore := bloom.NewVersionBloomStore(t.TempDir(), 4096, 0.01, vd)
+	versionViews := versionview.NewStore(versionview.Config{
+		DataDir:        t.TempDir(),
+		MaxEntries:     16,
+		VersionDocList: vd,
+		ChunkDocMapper: cdm,
+	})
 
 	// Use mock index manager that integrates with the mock stores.
 	im := index.NewMockIndexManager(index.MockIndexManagerDeps{
@@ -122,7 +128,7 @@ func newTestCluster(t testing.TB) *testCluster {
 		DocStore:            ds,
 		VersionDocList:      vd,
 	}))
-	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, vBloomStore)
+	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, versionViews)
 	adminSvc := service.NewAdminService(1, rn, im, ds, cs, w, nil, nil)
 
 	srv := grpc.NewServer()

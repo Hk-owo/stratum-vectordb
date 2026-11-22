@@ -19,6 +19,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	pb "stratum/api/proto/stratum"
 	serrors "stratum/internal/errors"
+	"stratum/internal/fsutil"
 	"stratum/internal/pebbleutil"
 	"stratum/internal/storage"
 )
@@ -340,10 +341,10 @@ func TestMigrationStageHelpers(t *testing.T) {
 		t.Error("stage path ignores the KB or the operation")
 	}
 
-	if err := syncMigrationDir(root); err != nil {
+	if err := fsutil.SyncDir(root); err != nil {
 		t.Errorf("sync of a real directory = %v", err)
 	}
-	if err := syncMigrationDir(filepath.Join(root, "missing")); err == nil {
+	if err := fsutil.SyncDir(filepath.Join(root, "missing")); err == nil {
 		t.Error("sync of a missing directory reported success")
 	}
 

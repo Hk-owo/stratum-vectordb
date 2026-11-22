@@ -333,5 +333,8 @@ func (im *IndexManagerImpl) Discard(ctx context.Context, kbID string, versionID 
 			return err
 		}
 	}
+	if im.cfg.VersionView != nil {
+		_ = im.cfg.VersionView.DeleteVersion(kbID, versionID)
+	}
 	return nil
 }

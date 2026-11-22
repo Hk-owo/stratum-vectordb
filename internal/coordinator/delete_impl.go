@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
@@ -23,17 +22,15 @@ type DeleteCoordinatorConfig struct {
 	RetryBaseIntervalMS int
 
 	WAL            wal.WAL
-	RaftNode       raft.RaftNode
+	RaftNode       raft.KBWriter
 	IndexManager   index.IndexManager
 	DocStore       docstore.DocStore
 	ChunkStore     chunkstore.ChunkStore
 	ChunkDocMapper chunkdoc.ChunkDocMapper
 	VersionDocList versiondoc.VersionDocList
 
-	// VersionBloom persists each version's on-disk document bloom filter.
-	// May be nil when the filter store is not wired; the cleanup then
-	// skips its on-disk file deletion.
-	VersionBloom *bloom.VersionBloomStore
+	// VersionViews reclaims the knowledge base's L0 + L1 read views. Optional.
+	VersionViews VersionViewCleaner
 
 	// Dropper reclaims the knowledge base's physical data.
 	//
@@ -131,7 +128,7 @@ func (c *DeleteCoordinatorImpl) Execute(ctx context.Context, kbID string) error 
 			ChunkStore:     c.cfg.ChunkStore,
 			ChunkDocMapper: c.cfg.ChunkDocMapper,
 			VersionDocList: c.cfg.VersionDocList,
-			VersionBloom:   c.cfg.VersionBloom,
+			VersionViews:   c.cfg.VersionViews,
 		}
 	}
 	// A failed reclaim ABORTS the deletion, and it stays that way for the whole-KB

@@ -24,10 +24,9 @@ func testIndexManagerWithEmptyKB(t *testing.T) *IndexManagerImpl {
 }
 
 func TestBuildForwardsKBQuantizerConfig(t *testing.T) {
-	im := testIndexManagerWithEmptyKB(t)
-	im.SetKBMetaGetter(func(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
+	im := newIndexManagerWithData(t, WithKBMetaGetter(func(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
 		return types.KnowledgeBaseMeta{KBID: kbID, QuantizerType: "SQ8"}, nil
-	})
+	}))
 
 	if _, err := im.buildWithRetry("kb-quant", 1, false); err != nil {
 		t.Fatalf("buildWithRetry: %v", err)
@@ -42,12 +41,11 @@ func TestBuildForwardsKBQuantizerConfig(t *testing.T) {
 }
 
 func TestBuildForwardsPQParams(t *testing.T) {
-	im := testIndexManagerWithEmptyKB(t)
-	im.SetKBMetaGetter(func(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
+	im := newIndexManagerWithData(t, WithKBMetaGetter(func(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
 		return types.KnowledgeBaseMeta{
 			KBID: kbID, QuantizerType: "PQ", QuantizerPQM: 32, QuantizerPQNBits: 8,
 		}, nil
-	})
+	}))
 
 	if _, err := im.buildWithRetry("kb-pq", 1, false); err != nil {
 		t.Fatalf("buildWithRetry: %v", err)
@@ -75,19 +73,21 @@ func TestBuildDefaultsToOffWithoutKBMeta(t *testing.T) {
 
 // newIndexManagerWithData returns an IndexManager whose build data flow
 // yields exactly one chunk ("c1", 4 dims), so a single Build RPC fires.
-func newIndexManagerWithData(t *testing.T) *IndexManagerImpl {
+func newIndexManagerWithData(t *testing.T, opts ...IndexManagerOption) *IndexManagerImpl {
 	t.Helper()
+	baseOpts := []IndexManagerOption{
+		WithBuildDataSources(BuildDataSources{
+			ListDocIDs:         func(_ context.Context, _ string, _ int64) ([]string, error) { return []string{"d1"}, nil },
+			ListChunkIDsByDocs: func(_ context.Context, _ string, _ []string) ([]string, error) { return []string{"c1"}, nil },
+			ReadChunkVector:    func(_ context.Context, _, _ string) ([]float32, error) { return []float32{1, 1, 1, 1}, nil },
+		}),
+	}
 	im := NewIndexManager(IndexManagerConfig{
 		LRUCapacity:     4,
 		LoadWaitTimeout: 5 * time.Second,
 		IndexDataDir:    t.TempDir(),
-	})
+	}, append(baseOpts, opts...)...)
 	im.vectorIndexClient = newMockVectorIndexClient()
-	im.SetBuildDataSources(
-		func(_ context.Context, _ string, _ int64) ([]string, error) { return []string{"d1"}, nil },
-		func(_ context.Context, _ string, _ []string) ([]string, error) { return []string{"c1"}, nil },
-		func(_ context.Context, _, _ string) ([]float32, error) { return []float32{1, 1, 1, 1}, nil },
-	)
 	return im
 }
 
@@ -96,12 +96,11 @@ func newIndexManagerWithData(t *testing.T) *IndexManagerImpl {
 // retriever basis) replaces the historical 4×d×n payload estimate in the
 // returned size (which feeds .index.mem and LRU byte accounting).
 func TestBuildAccountingPrefersReportedMemForQuantized(t *testing.T) {
-	im := newIndexManagerWithData(t)
+	im := newIndexManagerWithData(t, WithKBMetaGetter(func(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
+		return types.KnowledgeBaseMeta{KBID: kbID, QuantizerType: "SQ8"}, nil
+	}))
 	vc := im.vectorIndexClient.(*mockVectorIndexClient)
 	vc.memToReport = 50000
-	im.SetKBMetaGetter(func(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
-		return types.KnowledgeBaseMeta{KBID: kbID, QuantizerType: "SQ8"}, nil
-	})
 
 	size, err := im.buildWithRetry("kb-sq8", 1, false)
 	if err != nil {

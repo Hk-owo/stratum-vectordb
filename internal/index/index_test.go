@@ -921,9 +921,9 @@ func waitForCondition(timeout time.Duration, cond func() bool) bool {
 	return cond()
 }
 
-func newColdPolicyManager(t *testing.T, vc *mockVectorIndexClient, ds *docSource, cfg IndexManagerConfig) *IndexManagerImpl {
+func newColdPolicyManager(t *testing.T, vc *mockVectorIndexClient, ds *docSource, cfg IndexManagerConfig, opts ...IndexManagerOption) *IndexManagerImpl {
 	t.Helper()
-	im := NewIndexManager(cfg)
+	im := NewIndexManager(cfg, opts...)
 	im.vectorIndexClient = vc
 	im.listDocIDs = ds.ListDocIDs
 	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
@@ -1831,13 +1831,12 @@ func appendTestCaseWith(t *testing.T, ds *docSource, maxDeadRatio float64) (*moc
 		// graph-free build by ageing the version, which only reads cold if the
 		// policy is on.
 		ColdThreshold: time.Minute,
-	})
-	im.SetVersionParentGetter(func(_ context.Context, _ string, versionID int64) (int64, error) {
+	}, WithVersionParentGetter(func(_ context.Context, _ string, versionID int64) (int64, error) {
 		if versionID == 2 {
 			return 1, nil
 		}
 		return 0, nil
-	})
+	}))
 	return vc, im
 }
 
@@ -2905,6 +2904,19 @@ func codebookRefreshManagerFull(
 	maxDrift float64, maxAppends, minBaseline int64,
 ) *IndexManagerImpl {
 	t.Helper()
+	opts := []IndexManagerOption{
+		WithVersionParentGetter(func(_ context.Context, _ string, versionID int64) (int64, error) {
+			if versionID == 2 {
+				return 1, nil
+			}
+			return 0, nil
+		}),
+	}
+	if quantizer != "" {
+		opts = append(opts, WithKBMetaGetter(func(_ context.Context, _ string) (types.KnowledgeBaseMeta, error) {
+			return types.KnowledgeBaseMeta{QuantizerType: quantizer}, nil
+		}))
+	}
 	im := newColdPolicyManager(t, vc, ds, IndexManagerConfig{
 		LRUCapacity:                4,
 		LoadWaitTimeout:            5 * time.Second,
@@ -2912,18 +2924,7 @@ func codebookRefreshManagerFull(
 		MaxCodebookDriftRatio:      maxDrift,
 		MaxCodebookAppends:         maxAppends,
 		MinCodebookBaselineVectors: minBaseline,
-	})
-	im.SetVersionParentGetter(func(_ context.Context, _ string, versionID int64) (int64, error) {
-		if versionID == 2 {
-			return 1, nil
-		}
-		return 0, nil
-	})
-	if quantizer != "" {
-		im.SetKBMetaGetter(func(_ context.Context, _ string) (types.KnowledgeBaseMeta, error) {
-			return types.KnowledgeBaseMeta{QuantizerType: quantizer}, nil
-		})
-	}
+	}, opts...)
 	return im
 }
 

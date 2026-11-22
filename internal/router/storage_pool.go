@@ -7,10 +7,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	pb "stratum/api/proto/stratum"
 	serrors "stratum/internal/errors"
 	"stratum/internal/owner"
+	"stratum/internal/rpcpool"
 	"stratum/internal/storage"
 )
 
@@ -45,8 +45,9 @@ type storagePool struct {
 }
 
 func newStoragePool() *storagePool {
+	dialer := rpcpool.DefaultDialer()
 	return &storagePool{desired: map[endpointKey]bool{}, peers: map[endpointKey]*storagePeer{}, dial: func(addr string) (*grpc.ClientConn, error) {
-		return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		return dialer.Dial(addr)
 	}}
 }
 

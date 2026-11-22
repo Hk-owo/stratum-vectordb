@@ -16,7 +16,7 @@ import (
 // fresh in-memory WAL and a temp-dir-backed kvraft instance, already
 // running and elected leader (single-node clusters always win their own
 // election — see internal/kvraft's single-node fixes).
-func newTestRaftNodeImpl(t *testing.T) (*RaftNodeImpl, *wal.MockWAL) {
+func newTestRaftNodeImpl(t *testing.T, opts ...RaftOption) (*RaftNodeImpl, *wal.MockWAL) {
 	t.Helper()
 	w := wal.NewMockWAL()
 	impl, err := NewRaftNodeImpl(Config{
@@ -27,7 +27,7 @@ func newTestRaftNodeImpl(t *testing.T) (*RaftNodeImpl, *wal.MockWAL) {
 		ElectionTimeoutMin: 30 * time.Millisecond,
 		ElectionTimeoutMax: 60 * time.Millisecond,
 		HeartbeatInterval:  15 * time.Millisecond,
-	})
+	}, opts...)
 	if err != nil {
 		t.Fatalf("NewRaftNodeImpl: %v", err)
 	}

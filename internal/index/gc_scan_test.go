@@ -41,41 +41,42 @@ func gcHeader() []string {
 }
 
 // newGCManager wires a manager whose document lookups are the supplied maps.
-func newGCManager(t *testing.T, dataDir string, liveChunksByVersion map[int64][]string, active map[string]int64) *IndexManagerImpl {
+func newGCManager(t *testing.T, dataDir string, liveChunksByVersion map[int64][]string, active map[string]int64, extra ...IndexManagerOption) *IndexManagerImpl {
 	t.Helper()
-	im := NewIndexManager(IndexManagerConfig{
+	opts := []IndexManagerOption{
+		WithLogger(zap.NewNop()),
+		WithBuildDataSources(BuildDataSources{
+			ListDocIDs: func(_ context.Context, _ string, versionID int64) ([]string, error) {
+				if _, ok := liveChunksByVersion[versionID]; !ok {
+					return nil, nil
+				}
+				// One document per live chunk is enough: the scan counts DISTINCT
+				// chunks, not documents.
+				docs := make([]string, 0, len(liveChunksByVersion[versionID]))
+				for i := range liveChunksByVersion[versionID] {
+					docs = append(docs, fmt.Sprintf("doc-%d", i))
+				}
+				return docs, nil
+			},
+			ListChunkIDsByDocs: func(_ context.Context, _ string, _ []string) ([]string, error) {
+				// Any doc id resolves to the version's live chunk set; the mapping
+				// itself is not what this test is about.
+				for _, chunks := range liveChunksByVersion {
+					return chunks, nil
+				}
+				return nil, nil
+			},
+		}),
+	}
+	if active != nil {
+		opts = append(opts, WithActiveVersionsProvider(func(context.Context) (map[string]int64, error) { return active, nil }))
+	}
+	opts = append(opts, extra...)
+	return NewIndexManager(IndexManagerConfig{
 		LRUCapacity:     4,
 		LoadWaitTimeout: time.Second,
 		IndexDataDir:    dataDir,
-	})
-	im.logger = zap.NewNop()
-	im.SetBuildDataSources(
-		func(_ context.Context, _ string, versionID int64) ([]string, error) {
-			if _, ok := liveChunksByVersion[versionID]; !ok {
-				return nil, nil
-			}
-			// One document per live chunk is enough: the scan counts DISTINCT
-			// chunks, not documents.
-			docs := make([]string, 0, len(liveChunksByVersion[versionID]))
-			for i := range liveChunksByVersion[versionID] {
-				docs = append(docs, fmt.Sprintf("doc-%d", i))
-			}
-			return docs, nil
-		},
-		func(_ context.Context, _ string, _ []string) ([]string, error) {
-			// Any doc id resolves to the version's live chunk set; the mapping
-			// itself is not what this test is about.
-			for _, chunks := range liveChunksByVersion {
-				return chunks, nil
-			}
-			return nil, nil
-		},
-		nil,
-	)
-	if active != nil {
-		im.SetActiveVersionsProvider(func(context.Context) (map[string]int64, error) { return active, nil })
-	}
-	return im
+	}, opts...)
 }
 
 // TestGCScan_ReportsAnActiveVersionCarryingDeadWeight is the §8.6(d) phase-1
@@ -200,9 +201,10 @@ func TestGCScan_StartStop(t *testing.T) {
 		LoadWaitTimeout: time.Second,
 		IndexDataDir:    dir,
 		GCSweepInterval: -1,
-	})
-	disabled.logger = zap.NewNop()
-	disabled.SetActiveVersionsProvider(func(context.Context) (map[string]int64, error) { return nil, nil })
+	},
+		WithLogger(zap.NewNop()),
+		WithActiveVersionsProvider(func(context.Context) (map[string]int64, error) { return nil, nil }),
+	)
 	disabled.StartGCScanner()
 	disabled.mu.Lock()
 	running := disabled.gcCancel != nil
@@ -270,10 +272,11 @@ func TestGCScan_ReportsAChainTailThatNothingServes(t *testing.T) {
 	gcArtifact(t, dir, "kb-1", 7, gcHeader(), all)
 
 	// Nothing is active: the tail is the only thing that can name this version.
-	im := newGCManager(t, dir, map[int64][]string{7: all[:5]}, nil)
-	im.SetChainTailVersionsProvider(func(context.Context) (map[string]int64, error) {
-		return map[string]int64{"kb-1": 7}, nil
-	})
+	im := newGCManager(t, dir, map[int64][]string{7: all[:5]}, nil,
+		WithChainTailVersionsProvider(func(context.Context) (map[string]int64, error) {
+			return map[string]int64{"kb-1": 7}, nil
+		}),
+	)
 
 	got := im.scanGCCandidates(context.Background())
 	if len(got) != 1 || got[0].VersionID != 7 {
@@ -296,10 +299,11 @@ func TestGCScan_ExaminesAVersionNamedByBothSourcesOnce(t *testing.T) {
 	}
 	gcArtifact(t, dir, "kb-1", 7, gcHeader(), all)
 
-	im := newGCManager(t, dir, map[int64][]string{7: all[:5]}, map[string]int64{"kb-1": 7})
-	im.SetChainTailVersionsProvider(func(context.Context) (map[string]int64, error) {
-		return map[string]int64{"kb-1": 7}, nil
-	})
+	im := newGCManager(t, dir, map[int64][]string{7: all[:5]}, map[string]int64{"kb-1": 7},
+		WithChainTailVersionsProvider(func(context.Context) (map[string]int64, error) {
+			return map[string]int64{"kb-1": 7}, nil
+		}),
+	)
 
 	got := im.scanGCCandidates(context.Background())
 	if len(got) != 1 {

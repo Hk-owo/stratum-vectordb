@@ -2,7 +2,6 @@ package sync
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -10,9 +9,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
@@ -22,100 +19,6 @@ import (
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
-
-// VersionExporter is the storage layer's "hand one version's records to a
-// sink" capability. *LeaderHandler implements it (it reads the local stores);
-// keeping it an interface lets the Pusher be tested against a fake exporter.
-type VersionExporter interface {
-	ExportVersion(ctx context.Context, kbID string, versionID int64, send func(*pb.SyncEntry) error) error
-}
-
-// Pusher replicates one version's records to a target replica by driving that
-// replica's PushVersionData stream. It is the write coordinator's side of the
-// push direction (docs/参考/历史/Stratum_设计文档v13.md §7.2): the coordinator exports from
-// its own stores and the target applies, so a version that was just written
-// reaches its replicas instead of waiting for them to poll for it.
-type Pusher struct {
-	exporter VersionExporter
-	nodeID   int64
-	dial     func(ctx context.Context, addr string) (*grpc.ClientConn, error)
-}
-
-// PusherConfig wires a Pusher.
-type PusherConfig struct {
-	// Exporter supplies the version's records (see VersionExporter).
-	Exporter VersionExporter
-	// NodeID identifies this coordinator; echoed in diagnostics.
-	NodeID int64
-	// Dial overrides the default gRPC dialer, so tests can target an
-	// in-process listener. Optional.
-	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
-}
-
-// NewPusher returns a Pusher over the given exporter.
-func NewPusher(cfg PusherConfig) *Pusher {
-	dial := cfg.Dial
-	if dial == nil {
-		dial = func(ctx context.Context, addr string) (*grpc.ClientConn, error) {
-			return grpc.DialContext(ctx, addr,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithBlock(),
-			)
-		}
-	}
-	return &Pusher{exporter: cfg.Exporter, nodeID: cfg.NodeID, dial: dial}
-}
-
-// PushVersion hands (kbID, versionID) to the replica at targetAddr and waits
-// for its acknowledgement. The receiving side applies records idempotently, so
-// retrying after a lost acknowledgement is safe.
-func (p *Pusher) PushVersion(ctx context.Context, targetAddr, kbID string, versionID int64) (*pb.PushVersionDataResponse, error) {
-	md, _ := metadata.FromOutgoingContext(ctx)
-	md = md.Copy()
-	md.Set("x-stratum-push-kb", kbID)
-	md.Set("x-stratum-push-version", strconv.FormatInt(versionID, 10))
-	ctx = metadata.NewOutgoingContext(ctx, md)
-	conn, err := p.dial(ctx, targetAddr)
-	if err != nil {
-		return nil, fmt.Errorf("sync: dial replica %s: %w", targetAddr, err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	stream, err := pb.NewDataSyncServiceClient(conn).PushVersionData(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("sync: open PushVersionData to %s: %w", targetAddr, err)
-	}
-
-	// A client stream's Send only ever says io.EOF once the stream has ended, whatever ended
-	// it: the receiver refusing, or this push's own budget running out. The status that
-	// says which comes from CloseAndRecv. Without it a timed-out push and a broken replica
-	// read the same, as `stream ChunkDocMapper forward: EOF`.
-	streamEnded := false
-	send := func(entry *pb.SyncEntry) error {
-		err := stream.Send(entry)
-		if errors.Is(err, io.EOF) {
-			streamEnded = true
-		}
-		return err
-	}
-	if err := p.exporter.ExportVersion(ctx, kbID, versionID, send); err != nil {
-		if streamEnded {
-			if _, recvErr := stream.CloseAndRecv(); recvErr != nil {
-				return nil, fmt.Errorf("sync: export version %d to %s stopped at %q: %w", versionID, targetAddr, err.Error(), recvErr)
-			}
-		}
-		return nil, fmt.Errorf("sync: export version %d to %s: %w", versionID, targetAddr, err)
-	}
-
-	ack, err := stream.CloseAndRecv()
-	if err != nil {
-		return nil, fmt.Errorf("sync: close PushVersionData to %s: %w", targetAddr, err)
-	}
-	if ack.GetKnowledgeBaseId() != kbID || ack.GetVersionId() != versionID || ack.GetAcceptorId() <= 0 {
-		return nil, fmt.Errorf("sync: replica %s acknowledged a different KB, version or node", targetAddr)
-	}
-	return ack, nil
-}
 
 // PushHandler is this node's data-plane service: it receives pushed versions
 // and answers presence queries about what it holds. Writes go through exactly
@@ -432,6 +335,8 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 	deletedHere := false
 	var streamKB string
 	var streamVersion int64
+	var pendingDocIDs []string
+	var pendingDocVersion int64
 	releaseMutation := func() {}
 	defer func() { releaseMutation() }()
 	// RPC metadata names even an empty version, which has no document frames.
@@ -513,6 +418,22 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 		if deletedHere {
 			continue
 		}
+		// Defer VERSION_DOC_LIST until all DocStore/ChunkDocMapper/ChunkVector
+		// frames have applied and flushed so concurrent readers never observe
+		// a complete DocIDSetHash before the version's chunks and documents land.
+		if entry.GetEntryType() == pb.SyncEntryType_SYNC_ENTRY_TYPE_VERSION_DOC_LIST {
+			v := entry.GetVersionId()
+			if v == 0 {
+				v = versionID
+			}
+			if pendingDocVersion == 0 {
+				pendingDocVersion = v
+			}
+			if entry.GetKbId() == kbID && v == pendingDocVersion {
+				pendingDocIDs = append(pendingDocIDs, entry.GetDocId())
+				continue
+			}
+		}
 		if err := h.follower.applyEntry(ctx, entry); err != nil {
 			// Logged HERE, before the error becomes a gRPC status: the sender only
 			// ever sees "stream ended early" (a Send that returns io.EOF once this
@@ -536,8 +457,9 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 	}
 
 	if kbID != "" {
-		// ACK and the persisted contiguous cursor must not outlive chunk data.
-		if err := h.follower.flushReceivedData(ctx); err != nil {
+		// ACK and the persisted contiguous cursor must not outlive chunk data,
+		// and VersionDocList must not become visible before chunk/doc rows land.
+		if err := h.follower.flushAndCommitVersionDocList(ctx, kbID, pendingDocVersion, pendingDocIDs); err != nil {
 			return err
 		}
 		// Same post-apply step as the pull path: the records are in the local
@@ -545,11 +467,6 @@ func (h *PushHandler) PushVersionData(stream pb.DataSyncService_PushVersionDataS
 		// schedule this node's own index build.
 		if h.advanceVersion != nil {
 			h.advanceVersion.MarkVersionContiguous(kbID, versionID)
-		}
-		// Same step as the pull path: the version's document filter is derived from the
-		// document set that just landed here (see Follower.SetVersionBloom).
-		if h.follower != nil {
-			h.follower.rebuildVersionBloom(ctx, kbID, versionID)
 		}
 		// §8.4: a replica INSTALLS the coordinator's artifact rather than building
 		// its own. Building here anyway is what made distribution a no-op — this
@@ -693,155 +610,6 @@ func (h *PushHandler) PullVersionChanges(req *pb.PullVersionChangesRequest, stre
 	return nil
 }
 
-// Heartbeat receives one node's periodic "I am alive" and, if this node is the control
-// leader, records it.
-//
-// A non-leader answers accepted=false rather than an error: the reporter's next interval
-// re-resolves the leader (§7.13.1's pattern), and an error would have it retry the same
-// wrong address. accepted=false is deliberately a success on the wire — "you reached the
-// wrong node" is not a transport failure.
-func (h *PushHandler) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
-	if h.heartbeats == nil || h.isLeader == nil || !h.isLeader() {
-		return &pb.HeartbeatResponse{Accepted: false, NodeId: h.nodeID}, nil
-	}
-	h.heartbeats.Record(req.GetNodeId())
-
-	resp := &pb.HeartbeatResponse{Accepted: true, NodeId: h.nodeID}
-	// Carry back the chain generation, not the tails: this answer goes out on every
-	// heartbeat of every node, so it must stay the same size however many knowledge bases
-	// there are. A node pulls the tails only when this changes (GetChainTails).
-	if h.chainTails != nil {
-		if source, ok := h.chainTails.(interface{ StorageDirectoryRevision() uint64 }); ok {
-			resp.DirectoryRevision = source.StorageDirectoryRevision()
-		}
-		if term, seq, ok := h.chainTails.ChainGeneration(); ok {
-			resp.ChainGeneration = &pb.ChainGeneration{Term: term, Seq: seq}
-		}
-	}
-	return resp, nil
-}
-
-// GetChainTails answers a node whose last pull is at a different chain generation.
-//
-// A non-leader answers accepted=false, like Heartbeat, because a follower's
-// metadata can lag and a lagging tail would tell a node it is fine when it is not.
-func (h *PushHandler) GetChainTails(ctx context.Context, req *pb.GetChainTailsRequest) (*pb.GetChainTailsResponse, error) {
-	if h.chainTails == nil || h.isLeader == nil || !h.isLeader() {
-		return &pb.GetChainTailsResponse{Accepted: false}, nil
-	}
-	// The generation first: the tails read after it are at least as new as it says, so a
-	// change landing between the two reads costs one extra pull rather than a missed one.
-	resp := &pb.GetChainTailsResponse{Accepted: true}
-	if term, seq, ok := h.chainTails.ChainGeneration(); ok {
-		resp.Generation = &pb.ChainGeneration{Term: term, Seq: seq}
-	}
-	tails, err := h.chainTails.ChainTails(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "sync: GetChainTails: %v", err)
-	}
-	resp.ChainTails = tails
-	if h.placements != nil {
-		if req.GetNodeId() <= 0 {
-			return nil, status.Error(codes.InvalidArgument, "sync: node identity is required")
-		}
-		reader, ok := h.chainTails.(storage.Reader)
-		if !ok {
-			return nil, stratumerrors.ToGRPCStatus(stratumerrors.ErrPlacementUnknown)
-		}
-		dir, err := reader.StorageDirectory(ctx)
-		if err != nil {
-			return nil, stratumerrors.ToGRPCStatus(err)
-		}
-		resp.DirectoryRevision = dir.Revision
-		filtered := make(map[string]int64)
-		for kb, tail := range tails {
-			if p, err := dir.Lookup(kb); err == nil && p.Contains(req.GetNodeId()) {
-				filtered[kb] = tail
-			}
-		}
-		resp.ChainTails = filtered
-	}
-	return resp, nil
-}
-
-// DocChangesToProto is the wire form of a change list — the counterpart of
-// docChangesFromProto.
-//
-// Exported because the storage layer encodes the same payload: the coordinator
-// dispatcher ships a version's changes to the peer that will coordinate it
-// (plane.CoordinatorDispatcher), so the two encodings have to stay one function
-// rather than two that can drift.
-func DocChangesToProto(in []types.DocChange) []*pb.DocChange {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]*pb.DocChange, len(in))
-	for i, c := range in {
-		op := pb.ChangeOp_CHANGE_OP_ADD
-		switch c.Op {
-		case types.ChangeOpDelete:
-			op = pb.ChangeOp_CHANGE_OP_DELETE
-		case types.ChangeOpUpdate:
-			op = pb.ChangeOp_CHANGE_OP_UPDATE
-		}
-		out[i] = &pb.DocChange{Op: op, DocId: c.DocID, Content: c.Content}
-	}
-	return out
-}
-
-// docChangesFromProto converts the wire form of a change list into the storage
-// layer's own type.
-func docChangesFromProto(in []*pb.DocChange) []types.DocChange {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]types.DocChange, len(in))
-	for i, c := range in {
-		op := types.ChangeOpAdd
-		switch c.GetOp() {
-		case pb.ChangeOp_CHANGE_OP_DELETE:
-			op = types.ChangeOpDelete
-		case pb.ChangeOp_CHANGE_OP_UPDATE:
-			op = types.ChangeOpUpdate
-		}
-		out[i] = types.DocChange{Op: op, DocID: c.GetDocId(), Content: c.GetContent()}
-	}
-	return out
-}
-
-// VersionPresence implements DataSyncService.VersionPresence: it reports
-// whether this node holds (kbID, versionID)'s data. The control layer asks
-// every candidate replica, and a version none of them holds is one whose data
-// never landed — as opposed to one that is merely waiting for its index build
-// (docs/参考/历史/Stratum_设计文档v13.md §7.12 step ①).
-func (h *PushHandler) VersionPresence(ctx context.Context, req *pb.VersionPresenceRequest) (*pb.VersionPresenceResponse, error) {
-	if _, err := h.bindPlacement(ctx, req.GetKnowledgeBaseId()); err != nil {
-		return nil, stratumerrors.ToGRPCStatus(err)
-	}
-	// Presence is answered from the local document list, so a node without one
-	// cannot answer it at all. That has to be an error and not "present: false":
-	// the caller uses a negative answer to conclude a version's data never
-	// landed anywhere (§7.12 step ①), and "I hold no data" is not that claim.
-	//
-	// A control node is exactly such a node — it serves this service for the
-	// cursor reports it owns as leader, so a request here is possible rather
-	// than hypothetical, and without this it was a nil dereference that took
-	// the process down.
-	if h.follower == nil {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"sync: VersionPresence: this node holds no storage")
-	}
-	kbID, versionID := req.GetKnowledgeBaseId(), req.GetVersionId()
-	docIDs, err := h.follower.versionDoc.ListDocIDs(ctx, kbID, versionID)
-	if err != nil {
-		return nil, fmt.Errorf("sync: presence check (%s v%d): %w", kbID, versionID, err)
-	}
-	return &pb.VersionPresenceResponse{
-		Present: len(docIDs) > 0,
-		NodeId:  h.nodeID,
-	}, nil
-}
-
 // DeleteVersionData implements DataSyncService.DeleteVersionData: it reclaims
 // the version's physical data here, on the control layer's instruction
 // (docs/参考/历史/Stratum_设计文档v13.md §10.6).
@@ -904,19 +672,4 @@ func (h *PushHandler) DeleteVersionData(ctx context.Context, req *pb.DeleteVersi
 		h.dataSources.ForgetVersion(kbID, versionID)
 	}
 	return &pb.DeleteVersionDataResponse{Dropped: true, NodeId: h.nodeID}, nil
-}
-
-// LocalVersion implements DataSyncService.LocalVersion: it reports how far
-// this node's contiguous history reaches for the knowledge base, which is what
-// lets a node that is behind pick a peer able to fill its gap
-// (docs/参考/历史/Stratum_设计文档v13.md §7.6).
-func (h *PushHandler) LocalVersion(ctx context.Context, req *pb.LocalVersionRequest) (*pb.LocalVersionResponse, error) {
-	if _, err := h.bindPlacement(ctx, req.GetKnowledgeBaseId()); err != nil {
-		return nil, stratumerrors.ToGRPCStatus(err)
-	}
-	var version int64
-	if h.localVersion != nil {
-		version = h.localVersion.LocalVersionOf(req.GetKnowledgeBaseId())
-	}
-	return &pb.LocalVersionResponse{Version: version, NodeId: h.nodeID}, nil
 }

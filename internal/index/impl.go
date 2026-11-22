@@ -10,10 +10,9 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
 
 	vecstorepb "stratum/api/proto/vecstore"
+	"stratum/internal/rpcpool"
 	"stratum/internal/types"
 )
 
@@ -271,6 +270,15 @@ type IndexManagerConfig struct {
 	// single entry point every build passes through — including the one that
 	// never starts.
 	BuildState BuildStateRecorder
+
+	// VersionView receives lifecycle updates (warm/evict/delete) for the
+	// per-version read view cache. Optional.
+	VersionView VersionViewSink
+
+	// MapChunksByDocs optionally replaces listChunkIDsByDocs during builds so
+	// both the deduplicated chunk list and the chunk -> []docIdx inverted map
+	// are produced in one reverse pass and forwarded to VersionView.Warm.
+	MapChunksByDocs func(ctx context.Context, kbID string, docIDs []string) ([]string, map[string][]uint32, error)
 }
 
 // DefaultIndexServingReplicaMin is the default for IndexServingReplicaMin (§8.6(d)):
@@ -377,7 +385,8 @@ type IndexManagerImpl struct {
 
 	// vecstore gRPC client for Build/Search/Save/LoadForAppend/Load/Reset.
 	vectorIndexClient vecstorepb.VectorIndexServiceClient
-	vecstoreConn      *grpc.ClientConn // owned; closed on shutdown
+	vecstoreConn      *grpc.ClientConn
+	ownsVecstoreConn  bool
 
 	mu      sync.Mutex
 	cond    *sync.Cond
@@ -531,20 +540,76 @@ type loadedIndex struct {
 
 var _ IndexManager = (*IndexManagerImpl)(nil)
 
-// defaultKeepaliveInterval / defaultKeepaliveTimeout are the vecstore channel's
-// keepalive defaults when the config leaves them unset (vecstore.keepalive_*).
-// The same numbers chunkstore uses; kept here rather than imported so this
-// package does not take a dependency for two literals.
-const (
-	defaultKeepaliveInterval = 60 * time.Second
-	defaultKeepaliveTimeout  = 3 * time.Second
-)
+// IndexManagerOption configures optional collaborators and loggers on
+// IndexManagerImpl at construction time.
+type IndexManagerOption func(*IndexManagerImpl)
+
+// WithVecstoreConn injects a pre-built, caller-managed gRPC connection to the
+// local vecstore process. Close() leaves conn open so ChunkStore and
+// IndexManager can share a single channel managed by the node host.
+func WithVecstoreConn(conn *grpc.ClientConn) IndexManagerOption {
+	return func(im *IndexManagerImpl) {
+		if conn != nil {
+			im.vecstoreConn = conn
+			im.vectorIndexClient = vecstorepb.NewVectorIndexServiceClient(conn)
+			im.ownsVecstoreConn = false
+		}
+	}
+}
+
+// BuildDataSources groups the three storage callbacks consumed by async index
+// builds and GC dead-share estimation (VersionDocList, ChunkDocMapper,
+// ChunkStore).
+type BuildDataSources struct {
+	ListDocIDs         func(ctx context.Context, kbID string, versionID int64) ([]string, error)
+	ListChunkIDsByDocs func(ctx context.Context, kbID string, docIDs []string) ([]string, error)
+	ReadChunkVector    func(ctx context.Context, kbID, chunkID string) ([]float32, error)
+}
+
+// WithLogger binds a logger for lifecycle and error messages.
+func WithLogger(l *zap.Logger) IndexManagerOption {
+	return func(im *IndexManagerImpl) {
+		if l != nil {
+			im.logger = l
+		}
+	}
+}
+
+// WithBuildDataSources wires the three data-source callbacks to real
+// implementations (VersionDocList, ChunkDocMapper, ChunkStore). Callers must
+// supply this option whenever TriggerBuild is used.
+func WithBuildDataSources(ds BuildDataSources) IndexManagerOption {
+	return func(im *IndexManagerImpl) {
+		im.listDocIDs = ds.ListDocIDs
+		im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
+		im.readChunkVector = ds.ReadChunkVector
+	}
+}
+
+// WithKBMetaGetter wires a function returning a KB's metadata (e.g.
+// RaftNode.GetKB). Used by async builds to read the KB-level quantizer
+// configuration and forward it in the Build RPC.
+func WithKBMetaGetter(getter func(ctx context.Context, kbID string) (types.KnowledgeBaseMeta, error)) IndexManagerOption {
+	return func(im *IndexManagerImpl) { im.kbMetaGetter = getter }
+}
+
+// WithVersionParentGetter wires a lookup from a version to its parent version
+// (0 when it has none). §8.6(c)'s pure-append reuse reads it to find the
+// artifact a build may start from; without it every build rebuilds from scratch.
+func WithVersionParentGetter(getter func(ctx context.Context, kbID string, versionID int64) (int64, error)) IndexManagerOption {
+	return func(im *IndexManagerImpl) { im.versionParent = getter }
+}
+
+// WithServiceLease binds the storage node's volatile service authorization lease
+// enforced around background builds and callbacks.
+func WithServiceLease(g *storage.ServiceLease) IndexManagerOption {
+	return func(im *IndexManagerImpl) { im.serviceLease.Store(g) }
+}
 
 // NewIndexManager constructs an IndexManagerImpl. The caller must either
 // set cfg.VecstoreAddr (and the constructor will dial it), or inject
-// vectorIndexClient and the build data-source callbacks directly before
-// use (used by tests).
-func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
+// vectorIndexClient and WithBuildDataSources before use (used by tests).
+func NewIndexManager(cfg IndexManagerConfig, opts ...IndexManagerOption) *IndexManagerImpl {
 	// Fill the timing defaults once, so every reader below can use the config
 	// value directly (the same shape the other components use).
 	if cfg.BuildAbandonSweepInterval <= 0 {
@@ -560,10 +625,10 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		cfg.AccessPersistInterval = accessPersistInterval
 	}
 	if cfg.KeepaliveInterval <= 0 {
-		cfg.KeepaliveInterval = defaultKeepaliveInterval
+		cfg.KeepaliveInterval = rpcpool.DefaultKeepaliveInterval
 	}
 	if cfg.KeepaliveTimeout <= 0 {
-		cfg.KeepaliveTimeout = defaultKeepaliveTimeout
+		cfg.KeepaliveTimeout = rpcpool.DefaultKeepaliveTimeout
 	}
 	im := &IndexManagerImpl{
 		cfg:             cfg,
@@ -583,34 +648,26 @@ func NewIndexManager(cfg IndexManagerConfig) *IndexManagerImpl {
 		logger:          zap.NewNop(),
 	}
 	im.cond = sync.NewCond(&im.mu)
+	for _, opt := range opts {
+		if opt != nil {
+			opt(im)
+		}
+	}
 
-	if cfg.VecstoreAddr != "" {
-		conn, err := grpc.NewClient(cfg.VecstoreAddr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				// 10s 无流 ping + PermitWithoutStream 会被 vecstore 的
-				// C++ 服务端以 too_many_pings GoAway 踢掉连接（压测中
-				// 导致 build RPC 挂起、版本永久 PENDING）。改为仅在
-				// 活动流上以 60s 间隔探测：既保留死连接检测，又不再
-				// 触发服务端 keepalive 强制策略。
-				Time:                cfg.KeepaliveInterval,
-				Timeout:             cfg.KeepaliveTimeout,
-				PermitWithoutStream: false,
-			}),
-		)
+	if cfg.VecstoreAddr != "" && im.vecstoreConn == nil {
+		conn, err := rpcpool.NewDialer(rpcpool.DialConfig{
+			KeepaliveInterval: cfg.KeepaliveInterval,
+			KeepaliveTimeout:  cfg.KeepaliveTimeout,
+		}).Dial(cfg.VecstoreAddr)
 		if err != nil {
 			im.logger.Error("failed to dial vecstore for IndexManager", zap.Error(err))
 		} else {
 			im.vecstoreConn = conn
+			im.ownsVecstoreConn = true
 			im.vectorIndexClient = vecstorepb.NewVectorIndexServiceClient(conn)
 		}
 	}
 	return im
-}
-
-// SetLogger binds a logger for lifecycle and error messages.
-func (im *IndexManagerImpl) SetLogger(l *zap.Logger) {
-	im.logger = l
 }
 
 // loggerOrNop returns the configured logger, or a no-op one.
@@ -636,19 +693,6 @@ func (im *IndexManagerImpl) buildLogger() *zap.Logger {
 	return im.loggerOrNop()
 }
 
-// SetBuildDataSources wires the three data-source callbacks to real
-// implementations (VersionDocList, ChunkDocMapper, ChunkStore). Callers
-// must call this once before TriggerBuild is used.
-func (im *IndexManagerImpl) SetBuildDataSources(
-	listDocIDs func(ctx context.Context, kbID string, versionID int64) ([]string, error),
-	listChunkIDsByDocs func(ctx context.Context, kbID string, docIDs []string) ([]string, error),
-	readChunkVector func(ctx context.Context, kbID, chunkID string) ([]float32, error),
-) {
-	im.listDocIDs = listDocIDs
-	im.listChunkIDsByDocs = listChunkIDsByDocs
-	im.readChunkVector = readChunkVector
-}
-
 // Close releases the vecstore gRPC connection, if one was created. It
 // also stops the background sweeps this node runs.
 func (im *IndexManagerImpl) Close() error {
@@ -666,27 +710,10 @@ func (im *IndexManagerImpl) Close() error {
 	if pool != nil {
 		pool.Close()
 	}
-	if im.vecstoreConn != nil {
+	if im.ownsVecstoreConn && im.vecstoreConn != nil {
 		return im.vecstoreConn.Close()
 	}
 	return nil
-}
-
-// SetKBMetaGetter wires a function returning a KB's metadata (e.g.
-// RaftNode.GetKB). Used by async builds to read the KB-level quantizer
-// configuration and forward it in the Build RPC.
-func (im *IndexManagerImpl) SetKBMetaGetter(
-	getter func(ctx context.Context, kbID string) (types.KnowledgeBaseMeta, error)) {
-	im.kbMetaGetter = getter
-}
-
-// SetVersionParentGetter wires a lookup from a version to its parent version
-// (0 when it has none, e.g. a knowledge base's first version). §8.6(c)'s
-// pure-append reuse reads it to find the artifact a build may start from;
-// without it every build rebuilds from scratch.
-func (im *IndexManagerImpl) SetVersionParentGetter(
-	getter func(ctx context.Context, kbID string, versionID int64) (int64, error)) {
-	im.versionParent = getter
 }
 
 const (
@@ -698,5 +725,3 @@ const (
 	// written to its .used sidecar.
 	accessPersistInterval = time.Minute
 )
-
-func (im *IndexManagerImpl) SetServiceLease(g *storage.ServiceLease) { im.serviceLease.Store(g) }

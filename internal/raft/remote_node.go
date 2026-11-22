@@ -10,12 +10,12 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
 	"stratum/internal/authmeta"
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/rpcpool"
 	"stratum/internal/types"
 	"stratum/internal/wire"
 )
@@ -47,8 +47,12 @@ type RemoteRaftNode struct {
 	// proposals must reach the leader, which the redirect below finds.
 	ControlAddrs map[int64]string
 
-	// Dial is injectable for tests; nil means a plain insecure dial.
+	// Dial is injectable for tests; nil uses Pool (when set) or rpcpool's default dialer.
 	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
+
+	// Pool supplies long-lived outbound control-plane channels when Dial is nil.
+	// The pool retains ownership and closes those channels on shutdown.
+	Pool *rpcpool.Pool
 
 	// Mark stamps the calls this node makes to the control layer, so a control
 	// node with require_authenticated accepts them (internal/authmeta.Signer).
@@ -91,7 +95,13 @@ type RemoteRaftNode struct {
 	conns  map[string]*grpc.ClientConn
 }
 
-var _ RaftNode = (*RemoteRaftNode)(nil)
+var (
+	_ ClusterReader = (*RemoteRaftNode)(nil)
+	_ MetaReader    = (*RemoteRaftNode)(nil)
+	_ KBWriter      = (*RemoteRaftNode)(nil)
+	_ VersionWriter = (*RemoteRaftNode)(nil)
+	_ RaftNode      = (*RemoteRaftNode)(nil)
+)
 
 // IsLeader always answers false, and that is the correct answer rather than a
 // stub: a storage node is not a Raft member, so it can never be the leader.
@@ -103,10 +113,7 @@ func (r *RemoteRaftNode) IsLeader() bool { return false }
 
 // --- proposals (forwarded to whichever control node leads) ---
 
-// ProposeCreateKB implements RaftNode. A storage node has no reason to create a
-// knowledge base, but the interface is implemented in full rather than partially:
-// a half-implemented interface would fail at the call site with a panic, in
-// production, on the path that was never exercised.
+// ProposeCreateKB implements KBWriter / RaftNode by forwarding to the control leader.
 func (r *RemoteRaftNode) ProposeCreateKB(ctx context.Context, kb types.KnowledgeBaseMeta) error {
 	res, err := r.propose(ctx, newCreateKBCommand(kb))
 	if err != nil {
@@ -633,20 +640,24 @@ func (r *RemoteRaftNode) dial(ctx context.Context, addr string) (*grpc.ClientCon
 	if r.Dial != nil {
 		return r.Dial(ctx, addr)
 	}
-	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	return rpcpool.DefaultDialer().DialContext(ctx, addr)
 }
 
-// connFor returns a connection to a control address, dialing it once and
-// reusing it afterwards.
+// connFor returns a connection to a control address, using Pool when wired
+// (with Dial unset) or dialing once and reusing it afterwards.
 //
 // Why it exists: readAtAnyControl and proposeAt used to call dial() and close
 // the connection immediately after, so every read a storage node served paid a
 // fresh TCP + HTTP/2 handshake — to fetch metadata the control node answers from
 // an in-memory map. Measured: ListVersions cost 7–22 ms per query and was 72–95%
 // of the query's total time, while the actual work (vecstore search, chunk→doc
-// mapping, document reads) came to ~1–2.5 ms. See the comment on the conns
-// field for the rest.
+// mapping, document reads) came to ~1–2.5 ms. Connections live for
+// the process's lifetime; a control node that goes away is grpc-go's to
+// reconnect, which is what a pooled connection is for.
 func (r *RemoteRaftNode) connFor(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+	if r.Dial == nil && r.Pool != nil {
+		return r.Pool.GetContext(ctx, addr)
+	}
 	r.connMu.Lock()
 	defer r.connMu.Unlock()
 	if conn, ok := r.conns[addr]; ok {

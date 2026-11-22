@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc"
 	pb "stratum/api/proto/stratum"
 	serrors "stratum/internal/errors"
+	"stratum/internal/rpcpool"
 	"stratum/internal/storage"
 )
 
@@ -22,6 +23,7 @@ type ServiceRenewer struct {
 	Gate          *storage.ServiceLease
 	ResolveLeader LeaderAddrResolver
 	Directory     func(context.Context) (storage.Directory, error)
+	Pool          *rpcpool.Pool
 	Dial          func(context.Context, string) (*grpc.ClientConn, error)
 	Logger        *zap.Logger
 	now           func() time.Time
@@ -71,24 +73,33 @@ func (r *ServiceRenewer) ReportOnce(ctx context.Context) error {
 	if !ok || addr == "" {
 		return serrors.ErrNoLeaderYet
 	}
-	if r.conn == nil || addr != r.addr {
-		r.close()
-		dial := r.Dial
-		if dial == nil {
-			dial = NewPresenceChecker(PresenceCheckerConfig{}).dial
-		}
-		r.conn, err = dial(c, addr)
+	var rpcConn *grpc.ClientConn
+	if r.Dial == nil && r.Pool != nil {
+		rpcConn, err = r.Pool.GetContext(c, addr)
 		if err != nil {
 			return err
 		}
-		r.addr = addr
+	} else {
+		if r.conn == nil || addr != r.addr {
+			r.close()
+			if r.Dial != nil {
+				r.conn, err = r.Dial(c, addr)
+			} else {
+				r.conn, err = rpcpool.DefaultDialer().DialContext(c, addr)
+			}
+			if err != nil {
+				return err
+			}
+			r.addr = addr
+		}
+		rpcConn = r.conn
 	}
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return err
 	}
 	requestID := hex.EncodeToString(nonce[:])
-	resp, err := pb.NewInternalServiceClient(r.conn).RenewStorageService(c, &pb.RenewStorageServiceRequest{NodeId: r.NodeID, Address: r.Address, RequestId: requestID})
+	resp, err := pb.NewInternalServiceClient(rpcConn).RenewStorageService(c, &pb.RenewStorageServiceRequest{NodeId: r.NodeID, Address: r.Address, RequestId: requestID})
 	if err != nil {
 		if serrors.ReasonOf(err) == "storage_service_paused" {
 			r.Gate.Pause()

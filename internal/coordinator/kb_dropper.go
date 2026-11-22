@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sync"
 
-	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
@@ -15,6 +14,13 @@ import (
 	"stratum/internal/raft"
 	"stratum/internal/versiondoc"
 )
+
+// VersionViewCleaner reclaims per-version read views (L0 + L1 .vview files)
+// when a version or knowledge base is deleted. *versionview.Store satisfies it.
+type VersionViewCleaner interface {
+	DeleteVersion(kbID string, versionID int64) error
+	DeleteKB(kbID string) error
+}
 
 // KBStorageDropper reclaims a knowledge base's physical data.
 //
@@ -39,9 +45,9 @@ type LocalKBDropper struct {
 	ChunkDocMapper chunkdoc.ChunkDocMapper
 	VersionDocList versiondoc.VersionDocList
 
-	// VersionBloom may be nil when the filter store is not wired; its on-disk
-	// file deletion is then skipped.
-	VersionBloom *bloom.VersionBloomStore
+	// VersionViews may be nil when the read-view store is not wired; its on-disk
+	// .vview file deletion is then skipped.
+	VersionViews VersionViewCleaner
 }
 
 var _ KBStorageDropper = LocalKBDropper{}
@@ -57,9 +63,9 @@ func (d LocalKBDropper) DropKnowledgeBase(ctx context.Context, kbID string) erro
 	if err := d.IndexManager.DeleteFilesByKB(ctx, kbID); err != nil {
 		return fmt.Errorf("IndexManager.DeleteFilesByKB: %w", err)
 	}
-	if d.VersionBloom != nil {
-		if err := d.VersionBloom.DeleteByKB(kbID); err != nil {
-			return fmt.Errorf("VersionBloom.DeleteByKB: %w", err)
+	if d.VersionViews != nil {
+		if err := d.VersionViews.DeleteKB(kbID); err != nil {
+			return fmt.Errorf("VersionViews.DeleteKB: %w", err)
 		}
 	}
 	if err := d.DocStore.DeleteByKB(ctx, kbID); err != nil {
@@ -189,28 +195,19 @@ type LocalVersionDropper struct {
 	// with no chunk store).
 	ChunkReclaimer VersionChunkReclaimer
 
-	// VersionBloom may be nil when the filter store is not wired; its file is
+	// VersionViews may be nil when the read-view store is not wired; its file is
 	// then left for the next whole-KB delete.
-	VersionBloom *bloom.VersionBloomStore
+	VersionViews VersionViewCleaner
 
 	// Metadata supplies the version chain the visibility anchor is computed
 	// from. On a storage node this is the remote proxy, so the rule is applied
 	// by whichever node holds the records.
-	Metadata raft.RaftNode
+	Metadata raft.MetaReader
 }
 
 var _ VersionStorageDropper = LocalVersionDropper{}
 
 // DropVersion reclaims one version's physical layers on this node.
-//
-// The bloom filter is dropped here rather than after the metadata removal the
-// delete flow used to wait for. That ordering existed so no new query could
-// reach a version whose filter was gone; the consequence of losing it is the
-// one the flow already documents as harmless — an in-flight query rebuilds an
-// empty filter from the (already deleted) document list and leaves a stray file
-// that the next whole-KB delete removes. Reclaiming everything reachable in one
-// contract call is worth that, and it is what lets the whole step travel to
-// another node.
 func (d LocalVersionDropper) DropVersion(ctx context.Context, kbID string, versionID int64) error {
 	// Chunk vectors first — while the version's document set still names them.
 	// This is the moment a chunk can become an orphan (the version that referenced
@@ -238,9 +235,9 @@ func (d LocalVersionDropper) DropVersion(ctx context.Context, kbID string, versi
 		return fmt.Errorf("DocStore.DeleteByVersionExceptVisibleFrom: %w", err)
 	}
 
-	if d.VersionBloom != nil {
-		if err := d.VersionBloom.DeleteByVersion(kbID, versionID); err != nil {
-			return fmt.Errorf("VersionBloom.DeleteByVersion: %w", err)
+	if d.VersionViews != nil {
+		if err := d.VersionViews.DeleteVersion(kbID, versionID); err != nil {
+			return fmt.Errorf("VersionViews.DeleteVersion: %w", err)
 		}
 	}
 	return nil

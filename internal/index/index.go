@@ -58,6 +58,18 @@ type BuildStateRecorder interface {
 	IndexDropped(kbID string, versionID int64) error
 }
 
+// VersionViewSink receives per-version read-view lifecycle notifications from
+// IndexManagerImpl (warm on build, evict from L0 on LRU/explicit eviction,
+// delete L0+L1 on discard/delete/retention). Declared here as a narrow
+// interface so internal/index has no dependency on internal/versionview.
+type VersionViewSink interface {
+	Warm(kbID string, versionID int64, docIDs []string, chunkToDocs map[string][]uint32) error
+	Evict(kbID string, versionID int64)
+	EvictByKB(kbID string)
+	DeleteVersion(kbID string, versionID int64) error
+	DeleteKB(kbID string) error
+}
+
 // IndexManager manages the lifecycle of per-version HNSW indexes:
 // asynchronous building, in-memory LRU caching with reference-counted
 // eviction protection, and search.

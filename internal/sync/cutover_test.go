@@ -16,7 +16,7 @@ import (
 func liveCutoverFixture(t *testing.T) (*migrationTransferFixture, *NodeHandler, *chunkstore.MockChunkStore) {
 	t.Helper()
 	f, _, chunks := installedFixture(t)
-	h, _ := newServeHandler(t, f, f.root, 3, newFakeCursor(), newFakeIndex())
+	h := newServeHandler(t, f, f.root, 3, newFakeCursor(), newFakeIndex())
 	h.receiver.follower.chunkStore = chunks
 	serve, err := h.PrepareKBMigrationServing(context.Background(), f.request)
 	if err != nil {
@@ -225,7 +225,7 @@ func TestMigrationCutoverWithRealControlRaft(t *testing.T) {
 	if err := control.ProposeRecordKBMigrationInstall(ctx, "move", installReceiptFromProto(install)); err != nil {
 		t.Fatal(err)
 	}
-	serving, _ := newServeHandler(t, f, f.root, 3, newFakeCursor(), newFakeIndex())
+	serving := newServeHandler(t, f, f.root, 3, newFakeCursor(), newFakeIndex())
 	serving.receiver.follower.chunkStore = chunks
 	receipt, err := serving.PrepareKBMigrationServing(ctx, f.request)
 	if err != nil {

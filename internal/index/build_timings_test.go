@@ -24,18 +24,20 @@ func TestIndexManager_ReportsBuildStageTimings(t *testing.T) {
 	ds := newDocSource()
 	ds.addDoc(1, "doc-1", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.1, 0.2, 0.3}})
 
+	core, logs := observer.New(zap.DebugLevel)
 	im := NewIndexManager(IndexManagerConfig{
 		LRUCapacity:     4,
 		LoadWaitTimeout: 5 * time.Second,
 		VecstoreAddr:    "unused", // the client is injected directly
-	})
+	},
+		WithLogger(zap.New(core)),
+		WithBuildDataSources(BuildDataSources{
+			ListDocIDs:         ds.ListDocIDs,
+			ListChunkIDsByDocs: ds.ListChunkIDsByDocs,
+			ReadChunkVector:    ds.ReadChunkVector,
+		}),
+	)
 	im.vectorIndexClient = vc
-	im.listDocIDs = ds.ListDocIDs
-	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
-	im.readChunkVector = ds.ReadChunkVector
-
-	core, logs := observer.New(zap.DebugLevel)
-	im.SetLogger(zap.New(core))
 
 	done := make(chan types.IndexStatus, 1)
 	im.RegisterBuildCallback(func(_ string, _ int64, status types.IndexStatus) error {
@@ -97,18 +99,20 @@ func TestIndexManager_ReportsBuildStageTimingsOnFailure(t *testing.T) {
 	ds := newDocSource()
 	ds.addDoc(1, "doc-1", []string{"chunk-a"}, map[string][]float32{"chunk-a": {0.1, 0.2, 0.3}})
 
+	core, logs := observer.New(zap.DebugLevel)
 	im := NewIndexManager(IndexManagerConfig{
 		LRUCapacity:     4,
 		LoadWaitTimeout: 2 * time.Second,
 		VecstoreAddr:    "unused",
-	})
+	},
+		WithLogger(zap.New(core)),
+		WithBuildDataSources(BuildDataSources{
+			ListDocIDs:         ds.ListDocIDs,
+			ListChunkIDsByDocs: ds.ListChunkIDsByDocs,
+			ReadChunkVector:    ds.ReadChunkVector,
+		}),
+	)
 	im.vectorIndexClient = vc
-	im.listDocIDs = ds.ListDocIDs
-	im.listChunkIDsByDocs = ds.ListChunkIDsByDocs
-	im.readChunkVector = ds.ReadChunkVector
-
-	core, logs := observer.New(zap.DebugLevel)
-	im.SetLogger(zap.New(core))
 
 	done := make(chan types.IndexStatus, 1)
 	im.RegisterBuildCallback(func(_ string, _ int64, status types.IndexStatus) error {

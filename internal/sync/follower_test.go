@@ -580,11 +580,12 @@ func TestFollower_PullVersion_EmptyTransferIsConfirmedAgainstTheMetadata(t *test
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { ds.Close() })
-		f := NewFollower(ds, chunkdoc.NewMockChunkDocMapper(), versiondoc.NewMockVersionDocList(),
-			chunkstore.NewMockChunkStore(), nil)
 		adv := &recordingAdvancer{}
-		f.SetLocalVersionAdvancer(adv)
-		f.SetVersionDocIDSetHash(reader)
+		f := NewFollower(ds, chunkdoc.NewMockChunkDocMapper(), versiondoc.NewMockVersionDocList(),
+			chunkstore.NewMockChunkStore(), nil,
+			WithFollowerLocalVersionAdvancer(adv),
+			WithVersionDocIDSetHash(reader),
+		)
 		return f, adv
 	}
 
@@ -621,11 +622,12 @@ func TestFollower_PullVersion_UnreadableDigestFailsTheEmptyTransfer(t *testing.T
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ds.Close() })
-	f := NewFollower(ds, chunkdoc.NewMockChunkDocMapper(), versiondoc.NewMockVersionDocList(),
-		chunkstore.NewMockChunkStore(), nil)
 	adv := &recordingAdvancer{}
-	f.SetLocalVersionAdvancer(adv)
-	f.SetVersionDocIDSetHash(stubDocIDSetHash{err: errors.New("metadata unavailable")})
+	f := NewFollower(ds, chunkdoc.NewMockChunkDocMapper(), versiondoc.NewMockVersionDocList(),
+		chunkstore.NewMockChunkStore(), nil,
+		WithFollowerLocalVersionAdvancer(adv),
+		WithVersionDocIDSetHash(stubDocIDSetHash{err: errors.New("metadata unavailable")}),
+	)
 
 	if err := f.PullVersionData(ctx, addr, "kb-1", 3); err == nil {
 		t.Fatal("an empty transfer must not be accepted when the digest cannot be read")
@@ -654,16 +656,118 @@ func TestFollower_PullVersion_NonEmptyTransferNeedsNoConfirmation(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ds.Close() })
-	f := NewFollower(ds, chunkdoc.NewMockChunkDocMapper(), versiondoc.NewMockVersionDocList(),
-		chunkstore.NewMockChunkStore(), nil)
 	adv := &recordingAdvancer{}
-	f.SetLocalVersionAdvancer(adv)
-	f.SetVersionDocIDSetHash(stubDocIDSetHash{err: errors.New("must not be consulted")})
+	f := NewFollower(ds, chunkdoc.NewMockChunkDocMapper(), versiondoc.NewMockVersionDocList(),
+		chunkstore.NewMockChunkStore(), nil,
+		WithFollowerLocalVersionAdvancer(adv),
+		WithVersionDocIDSetHash(stubDocIDSetHash{err: errors.New("must not be consulted")}),
+	)
 
 	if err := f.PullVersionData(ctx, addr, "kb-1", 3); err != nil {
 		t.Fatalf("a transfer that delivered records must not be confirmed against the metadata: %v", err)
 	}
 	if got := adv.got(); len(got) != 1 || got[0] != "kb-1/3" {
 		t.Errorf("cursor marks = %v, want [kb-1/3]", got)
+	}
+}
+
+type stagedPullServer struct {
+	pb.UnimplementedDataSyncServiceServer
+	sentVD  chan struct{}
+	unblock chan struct{}
+}
+
+func (s *stagedPullServer) PullVersionData(req *pb.PullVersionDataRequest, stream pb.DataSyncService_PullVersionDataServer) error {
+	if err := stream.Send(&pb.SyncEntry{
+		EntryType: pb.SyncEntryType_SYNC_ENTRY_TYPE_VERSION_DOC_LIST,
+		KbId:      req.GetKnowledgeBaseId(),
+		VersionId: req.GetVersionId(),
+		DocId:     "doc-1",
+	}); err != nil {
+		return err
+	}
+	close(s.sentVD)
+	<-s.unblock
+	if err := stream.Send(&pb.SyncEntry{
+		EntryType: pb.SyncEntryType_SYNC_ENTRY_TYPE_DOC_STORE,
+		KbId:      req.GetKnowledgeBaseId(),
+		VersionId: req.GetVersionId(),
+		DocId:     "doc-1",
+		Payload:   []byte{tagContent, 'h', 'i'},
+	}); err != nil {
+		return err
+	}
+	return stream.Send(&pb.SyncEntry{
+		EntryType: pb.SyncEntryType_SYNC_ENTRY_TYPE_CHUNK_DOC_FORWARD,
+		KbId:      req.GetKnowledgeBaseId(),
+		ChunkId:   "chunk-1",
+		DocId:     "doc-1",
+	})
+}
+
+func TestFollower_PullVersion_DefersVersionDocListUntilStreamCompletes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ds, err := docstore.NewPebbleDocStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cdm, err := chunkdoc.NewPebbleChunkDocMapper(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	vd, err := versiondoc.NewPebbleVersionDocList(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ds.Close()
+		cdm.Close()
+		vd.Close()
+	})
+
+	f := NewFollower(ds, cdm, vd, chunkstore.NewMockChunkStore(), &recordingTrigger{})
+	srvImpl := &stagedPullServer{
+		sentVD:  make(chan struct{}),
+		unblock: make(chan struct{}),
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	pb.RegisterDataSyncServiceServer(srv, srvImpl)
+	go srv.Serve(lis)
+	t.Cleanup(srv.Stop)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- f.PullVersionData(ctx, lis.Addr().String(), "kb-stage", 3)
+	}()
+
+	<-srvImpl.sentVD
+	// Allow the client loop time to process the VERSION_DOC_LIST frame.
+	time.Sleep(30 * time.Millisecond)
+	midDocs, err := vd.ListDocIDs(ctx, "kb-stage", 3)
+	if err != nil {
+		t.Fatalf("ListDocIDs mid-pull: %v", err)
+	}
+	if len(midDocs) != 0 {
+		close(srvImpl.unblock)
+		t.Fatalf("VersionDocList exposed %v mid-pull before chunk/doc rows arrived", midDocs)
+	}
+
+	close(srvImpl.unblock)
+	if err := <-errCh; err != nil {
+		t.Fatalf("PullVersionData: %v", err)
+	}
+	docs, err := vd.ListDocIDs(ctx, "kb-stage", 3)
+	if err != nil || len(docs) != 1 || docs[0] != "doc-1" {
+		t.Fatalf("VersionDocList after pull = %v, %v, want [doc-1]", docs, err)
+	}
+	chunks, err := cdm.ListChunkIDsByDocs(ctx, "kb-stage", docs)
+	if err != nil || len(chunks) != 1 || chunks[0] != "chunk-1" {
+		t.Fatalf("ChunkDocMapper after pull = %v, %v, want [chunk-1]", chunks, err)
 	}
 }

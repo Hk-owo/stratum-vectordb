@@ -16,11 +16,12 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 	pb "stratum/api/proto/stratum"
 	serrors "stratum/internal/errors"
+	"stratum/internal/fsutil"
 	"stratum/internal/pebbleutil"
+	"stratum/internal/rpcpool"
 	"stratum/internal/storage"
 	"stratum/internal/types"
 )
@@ -34,12 +35,28 @@ type migrationStager struct {
 	dir       string
 	sem       chan struct{}
 	serveWait time.Duration
+	pool      *rpcpool.Pool
 	dial      func(context.Context, string) (*grpc.ClientConn, error)
 }
 
 func WithMigrationStaging(metadata MigrationMetadata, dir string) NodeHandlerOption {
 	return func(h *NodeHandler) {
-		h.migration = &migrationStager{metadata: metadata, dir: dir, sem: make(chan struct{}, 1)}
+		if h.migration == nil {
+			h.migration = &migrationStager{sem: make(chan struct{}, 1)}
+		}
+		h.migration.metadata = metadata
+		h.migration.dir = dir
+	}
+}
+
+// WithMigrationPool binds a shared outbound storage-peer connection pool for
+// streaming KB migration exports from peer storage nodes.
+func WithMigrationPool(pool *rpcpool.Pool) NodeHandlerOption {
+	return func(h *NodeHandler) {
+		if h.migration == nil {
+			h.migration = &migrationStager{sem: make(chan struct{}, 1)}
+		}
+		h.migration.pool = pool
 	}
 }
 
@@ -202,14 +219,6 @@ func migrationStagePath(root, kb, op string) string {
 	sum := sha256.Sum256(append(pebbleutil.EncodeString(kb), pebbleutil.EncodeString(op)...))
 	return filepath.Join(root, hex.EncodeToString(sum[:])+".stage")
 }
-func syncMigrationDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
-}
 func writeMigrationFrame(w io.Writer, b []byte) error {
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], uint32(len(b)))
@@ -366,16 +375,11 @@ func (h *NodeHandler) StageKBMigration(ctx context.Context, req *pb.MigrationTra
 	if !ok || source.Addr == "" {
 		return nil, serrors.ToGRPCStatus(serrors.ErrPlacementUnknown)
 	}
-	var conn *grpc.ClientConn
-	if h.migration.dial != nil {
-		conn, err = h.migration.dial(ctx, source.Addr)
-	} else {
-		conn, err = grpc.NewClient(source.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	}
+	conn, release, err := rpcpool.Acquire(ctx, h.migration.pool, h.migration.dial, nil, source.Addr)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer release()
 	stream, err := pb.NewDataSyncServiceClient(conn).ExportKBMigration(ctx, req, grpc.MaxCallRecvMsgSize(maxMigrationFrame))
 	if err != nil {
 		return nil, err
@@ -446,7 +450,7 @@ func (s *migrationStager) syncDirectory(path string) error {
 	if s.syncDir != nil {
 		return s.syncDir(path)
 	}
-	return syncMigrationDir(path)
+	return fsutil.SyncDir(path)
 }
 
 // Ordinary export starts from reverse mappings. Independently scan forward

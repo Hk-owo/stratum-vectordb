@@ -32,8 +32,7 @@ func TestGcBlockedVersions_MapsTheReport(t *testing.T) {
 		MinimumRequired: 2,
 		Since:           since,
 	}}}
-	s := &AdminServiceImpl{}
-	s.SetGCPressureReporter(reporter)
+	s := NewAdminService(1, nil, nil, nil, nil, nil, nil, nil, WithGCPressureReporter(reporter))
 
 	got := s.gcBlockedVersions()
 	if len(got) != 1 {
@@ -63,14 +62,14 @@ func TestGcBlockedVersions_MapsTheReport(t *testing.T) {
 // same empty answer. Nothing here should be mistaken for a failure.
 func TestGcBlockedVersions_IsEmptyWithoutAReporterOrWithoutBlockedWork(t *testing.T) {
 	// No reporter: a control node keeps no index manager.
-	s := &AdminServiceImpl{}
+	s := NewAdminService(1, nil, nil, nil, nil, nil, nil, nil)
 	if got := s.gcBlockedVersions(); got != nil {
 		t.Fatalf("without a reporter the field must be empty, got %+v", got)
 	}
 
 	// A reporter with nothing blocked: the normal state of a deployment with slack.
-	s.SetGCPressureReporter(&stubGCPressure{})
-	if got := s.gcBlockedVersions(); got != nil {
+	sWithReporter := NewAdminService(1, nil, nil, nil, nil, nil, nil, nil, WithGCPressureReporter(&stubGCPressure{}))
+	if got := sWithReporter.gcBlockedVersions(); got != nil {
 		t.Fatalf("nothing blocked must mean no entries, got %+v", got)
 	}
 }

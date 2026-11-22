@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 
 	vecstorepb "stratum/api/proto/vecstore"
 	"stratum/internal/bloom"
@@ -14,9 +15,12 @@ import (
 	"stratum/internal/embed"
 	"stratum/internal/index"
 	"stratum/internal/raft"
+	"stratum/internal/rpcpool"
 	"stratum/internal/splitter"
+	"stratum/internal/storage"
 	"stratum/internal/tombstone"
 	"stratum/internal/versiondoc"
+	"stratum/internal/versionview"
 )
 
 // storageStack is the storage layer's local state: its stores, the index
@@ -39,10 +43,11 @@ type storageStack struct {
 	VersionDocList *versiondoc.PebbleVersionDocList
 	ChunkStore     *chunkstore.VecstoreChunkStore
 	ChunkBloom     *bloom.BitsAndBloomsFilter
-	VersionBloom   *bloom.VersionBloomStore
+	VersionViews   *versionview.Store
 	ChunkSplitter  splitter.ChunkSplitter
 	IndexManager   *index.IndexManagerImpl
 	EmbedClient    *embed.HTTPEmbedClient
+	vecstoreConn   *grpc.ClientConn
 
 	// Tombstones is this node's durable record of versions the control layer told
 	// it are deleted. It lives beside the other stores because it is storage-layer
@@ -63,7 +68,16 @@ type storageStack struct {
 // (docs/已实施/storage-node-state-machine-plan.md §7, item 4). The index manager is
 // where it belongs: every build — and every install of a distributed artifact —
 // passes through that one component.
-func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *zap.Logger, buildState index.BuildStateRecorder) (*storageStack, error) {
+func buildStorageStack(
+	cfg appConfig,
+	dataDir string,
+	rn raft.RaftNode,
+	logger *zap.Logger,
+	buildState index.BuildStateRecorder,
+	replicaCounter index.ReplicaCounter,
+	serviceLease *storage.ServiceLease,
+	chainTailVersions func(ctx context.Context) (map[string]int64, error),
+) (*storageStack, error) {
 	ds, err := docstore.NewPebbleDocStore(dataDir + "/docstore")
 	if err != nil {
 		return nil, fmt.Errorf("open DocStore: %w", err)
@@ -84,13 +98,19 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		return nil, fmt.Errorf("open Tombstones: %w", err)
 	}
 
-	chunkStore, err := chunkstore.NewVecstoreChunkStoreWithOptions(cfg.VecstoreGRPCAddr,
-		chunkstore.ClientOptions{
-			KeepaliveInterval: cfg.VecstoreKeepaliveInterval,
-			KeepaliveTimeout:  cfg.VecstoreKeepaliveTimeout,
-		})
+	vecstoreDialer := rpcpool.NewDialer(rpcpool.DialConfig{
+		KeepaliveInterval: cfg.VecstoreKeepaliveInterval,
+		KeepaliveTimeout:  cfg.VecstoreKeepaliveTimeout,
+	})
+	vecstoreConn, err := vecstoreDialer.Dial(cfg.VecstoreGRPCAddr)
 	if err != nil {
 		return nil, fmt.Errorf("connect to vecstore at %s: %w", cfg.VecstoreGRPCAddr, err)
+	}
+
+	chunkStore, err := chunkstore.NewVecstoreChunkStoreFromConn(vecstoreConn)
+	if err != nil {
+		_ = vecstoreConn.Close()
+		return nil, fmt.Errorf("init chunkstore client for vecstore at %s: %w", cfg.VecstoreGRPCAddr, err)
 	}
 
 	stack := &storageStack{
@@ -100,13 +120,22 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 		ChunkStore:     chunkStore,
 		Tombstones:     tombstones,
 		EmbedClient:    embed.NewHTTPEmbedClient(cfg.EmbedServiceAddr, cfg.EmbedTimeout),
+		vecstoreConn:   vecstoreConn,
 	}
 
-	// Bloom filters: the chunk-existence filter on the write path and the
-	// version-document filter on the read path. Sized from config
-	// (bloom_filter.expected_items / false_positive_rate).
+	// Chunk-existence bloom filter on the write path + unified three-tier
+	// per-version read view cache on the query path.
 	stack.ChunkBloom = bloom.NewBitsAndBloomsFilter(cfg.BloomExpectedItems, cfg.BloomFalsePositiveRate)
-	stack.VersionBloom = bloom.NewVersionBloomStore(dataDir, cfg.BloomExpectedItems, cfg.BloomFalsePositiveRate, vd)
+	maxViews := cfg.IndexLRUCapacity + 4
+	if maxViews < 8 {
+		maxViews = 8
+	}
+	stack.VersionViews = versionview.NewStore(versionview.Config{
+		DataDir:        dataDir,
+		MaxEntries:     maxViews,
+		VersionDocList: vd,
+		ChunkDocMapper: cdm,
+	})
 
 	// Rebuild the chunk-existence filter from the authoritative chunk-doc
 	// mapping (the design's "从 chunk store 重建" is served from the Go-side
@@ -139,123 +168,87 @@ func buildStorageStack(cfg appConfig, dataDir string, rn raft.RaftNode, logger *
 	stack.ChunkSplitter = splitter.NewDefault()
 
 	indexMgr := index.NewIndexManager(index.IndexManagerConfig{
-		LRUCapacity:         cfg.IndexLRUCapacity,
-		LoadWaitTimeout:     cfg.IndexLoadWaitTimeout,
-		CallbackMaxRetries:  cfg.IndexCallbackMaxRetries,
-		CallbackRetryBaseMS: cfg.IndexCallbackRetryBaseMS,
-		VecstoreAddr:        cfg.VecstoreGRPCAddr,
-		IndexDataDir:        dataDir,
-		IndexRetentionCount: cfg.IndexRetentionCount,
-		// Retention shield: keep recently-queried versions on disk even when
-		// they fall outside the newest IndexRetentionCount.
-		RetentionProtectWindow: cfg.IndexRetentionProtectWindow,
-		RetentionProtectMax:    cfg.IndexRetentionProtectMax,
-		MemoryThresholdMB:      cfg.IndexMemoryThresholdMB,
-		// §2.2: the coarse-pass budget for quantized search. 0 leaves the field
-		// off the request, so the vector store applies clamp(top_k × 8, 16, 4096).
-		CandidateN:         cfg.IndexCandidateN,
-		ColdThreshold:      cfg.IndexColdThreshold,
-		AppendMaxDeadRatio: cfg.IndexAppendMaxDeadRatio,
-		GCRatioThreshold:   cfg.IndexGCRatioThreshold,
-		// §3 codebook refresh (docs/已实施/codebook-refresh-plan.md §3). Firing either
-		// trigger rebuilds the version from scratch, which is the only way to
-		// retrain the quantizer. Gated by the KB's quantizer inside the
-		// IndexManager: only SQ8 / PQ learn a codebook, so OFF / SQ_FP16 /
-		// SQ_BF16 KBs never trigger it.
+		LRUCapacity:                cfg.IndexLRUCapacity,
+		LoadWaitTimeout:            cfg.IndexLoadWaitTimeout,
+		CallbackMaxRetries:         cfg.IndexCallbackMaxRetries,
+		CallbackRetryBaseMS:        cfg.IndexCallbackRetryBaseMS,
+		VecstoreAddr:               cfg.VecstoreGRPCAddr,
+		IndexDataDir:               dataDir,
+		IndexRetentionCount:        cfg.IndexRetentionCount,
+		RetentionProtectWindow:     cfg.IndexRetentionProtectWindow,
+		RetentionProtectMax:        cfg.IndexRetentionProtectMax,
+		MemoryThresholdMB:          cfg.IndexMemoryThresholdMB,
+		CandidateN:                 cfg.IndexCandidateN,
+		ColdThreshold:              cfg.IndexColdThreshold,
+		AppendMaxDeadRatio:         cfg.IndexAppendMaxDeadRatio,
+		GCRatioThreshold:           cfg.IndexGCRatioThreshold,
 		MaxCodebookDriftRatio:      cfg.IndexMaxCodebookDriftRatio,
 		MaxCodebookAppends:         cfg.IndexMaxCodebookAppends,
 		MinCodebookBaselineVectors: cfg.IndexMinCodebookBaselineVectors,
 		BuildAbandonTimeout:        cfg.IndexBuildAbandonTimeout,
-		// §8.6(d) collection. NodeID is deliberately NOT set here: it arrives with
-		// SetGCReplicaCounter below, together with the control-plane client that
-		// answers "how many other replicas are serving" — and without that client
-		// a node ID would be a number nobody could act on.
-		GCEnabled:              cfg.IndexGCEnabled,
-		IndexServingReplicaMin: cfg.IndexServingReplicaMin,
-		GCGraphRebuildRatio:    cfg.IndexGCGraphRebuildRatio,
-		GCSweepInterval:        cfg.IndexGCSweepInterval,
-		BuildConcurrency:       cfg.IndexBuildConcurrency,
-		// index_manager.*: the build-side timing knobs, all of which read 0 as
-		// "the IndexManager's own default".
-		BruteForceMaxChunks:       cfg.IndexBruteForceMaxChunks,
-		BuildAbandonSweepInterval: cfg.IndexBuildAbandonSweepInterval,
-		BuildRetryTimeout:         cfg.IndexBuildRetryTimeout,
-		BuildRetryInterval:        cfg.IndexBuildRetryInterval,
-		AccessPersistInterval:     cfg.IndexAccessPersistInterval,
-		KeepaliveInterval:         cfg.VecstoreKeepaliveInterval,
-		KeepaliveTimeout:          cfg.VecstoreKeepaliveTimeout,
-		// docs/已实施/storage-node-state-machine-plan.md §7 item 4: the manager owns the
-		// version layer's build transitions, including the install path and the
-		// build that never starts.
-		BuildState: buildState,
-	})
-	indexMgr.SetLogger(logger.Named("index"))
-	// §6: reclaim index artifacts whose build was abandoned. This is local and
-	// passive — it reads only this node's own disk — so it starts here rather
-	// than being driven from the control layer.  On by
-	// default: the artifact it removes was never sealed by a Save, so nothing can
-	// serve from it and nothing else will ever come back for it.
-	indexMgr.StartAbandonSweeper()
-
-	// §8.6(d) phase 1: report — do not yet clean — active versions whose sealed
-	// artifact carries more dead weight than the current document set justifies.
-	// The scan covers ACTIVE versions only, so it needs to know which version
-	// each knowledge base is serving; that fact lives in the control layer's
-	// metadata, which a storage node reads over gRPC like any other metadata.
-	indexMgr.SetActiveVersionsProvider(func(ctx context.Context) (map[string]int64, error) {
-		kbs, err := rn.ListKnowledgeBases(ctx)
-		if err != nil {
-			return nil, err
-		}
-		active := make(map[string]int64, len(kbs))
-		for _, kb := range kbs {
-			if kb.ActiveVersionID == 0 {
-				continue
-			}
-			active[kb.KBID] = kb.ActiveVersionID
-		}
-		return active, nil
-	})
-
-	indexMgr.StartGCScanner()
-
-	// Build data sources: the IndexManager's async build reads the version's
-	// document IDs via ChunkDocMapper and pulls each chunk vector from the
-	// vecstore's ChunkStorageService (the same keys the write path used).
-	// Without this wiring the build goroutine would invoke nil callbacks and
-	// crash the process on the first CreateVersion.
-	indexMgr.SetBuildDataSources(
-		vd.ListDocIDs,
-		cdm.ListChunkIDsByDocs,
-		func(ctx context.Context, kbID, chunkID string) ([]float32, error) {
-			resp, err := chunkStore.VecstoreClient().Read(ctx, &vecstorepb.ReadChunkRequest{
-				Key: chunkstore.EncodeKey(kbID, chunkID),
-			})
+		GCEnabled:                  cfg.IndexGCEnabled,
+		IndexServingReplicaMin:     cfg.IndexServingReplicaMin,
+		GCGraphRebuildRatio:        cfg.IndexGCGraphRebuildRatio,
+		GCSweepInterval:            cfg.IndexGCSweepInterval,
+		BuildConcurrency:           cfg.IndexBuildConcurrency,
+		BruteForceMaxChunks:        cfg.IndexBruteForceMaxChunks,
+		BuildAbandonSweepInterval:  cfg.IndexBuildAbandonSweepInterval,
+		BuildRetryTimeout:          cfg.IndexBuildRetryTimeout,
+		BuildRetryInterval:         cfg.IndexBuildRetryInterval,
+		AccessPersistInterval:      cfg.IndexAccessPersistInterval,
+		KeepaliveInterval:          cfg.VecstoreKeepaliveInterval,
+		KeepaliveTimeout:           cfg.VecstoreKeepaliveTimeout,
+		BuildState:                 buildState,
+		VersionView:                stack.VersionViews,
+		MapChunksByDocs:            cdm.MapChunksByDocs,
+	},
+		index.WithVecstoreConn(vecstoreConn),
+		index.WithLogger(logger.Named("index")),
+		index.WithServiceLease(serviceLease),
+		index.WithGCReplicaCounter(replicaCounter, cfg.NodeID),
+		index.WithActiveVersionsProvider(func(ctx context.Context) (map[string]int64, error) {
+			kbs, err := rn.ListKnowledgeBases(ctx)
 			if err != nil {
 				return nil, err
 			}
-			return resp.GetVector(), nil
-		},
-	)
-	// KB metadata source: async builds read the KB-level quantizer
-	// configuration from the replicated metadata and forward it to the vecstore
-	// with each Build RPC (docs/参考/历史/Stratum_设计文档v12.md 2.4).
-	indexMgr.SetKBMetaGetter(rn.GetKB)
-	// §8.6(c): a pure-append version may start its index from its parent
-	// version's artifact instead of rebuilding. The parent link lives in the
-	// replicated version metadata, which the storage layer reads read-only.
-	indexMgr.SetVersionParentGetter(func(ctx context.Context, kbID string, versionID int64) (int64, error) {
-		versions, err := rn.ListVersions(ctx, kbID)
-		if err != nil {
-			return 0, err
-		}
-		for _, v := range versions {
-			if v.VersionID == versionID {
-				return v.ParentVersionID, nil
+			active := make(map[string]int64, len(kbs))
+			for _, kb := range kbs {
+				if kb.ActiveVersionID == 0 {
+					continue
+				}
+				active[kb.KBID] = kb.ActiveVersionID
 			}
-		}
-		return 0, nil
-	})
+			return active, nil
+		}),
+		index.WithChainTailVersionsProvider(chainTailVersions),
+		index.WithBuildDataSources(index.BuildDataSources{
+			ListDocIDs:         vd.ListDocIDs,
+			ListChunkIDsByDocs: cdm.ListChunkIDsByDocs,
+			ReadChunkVector: func(ctx context.Context, kbID, chunkID string) ([]float32, error) {
+				resp, err := chunkStore.VecstoreClient().Read(ctx, &vecstorepb.ReadChunkRequest{
+					Key: chunkstore.EncodeKey(kbID, chunkID),
+				})
+				if err != nil {
+					return nil, err
+				}
+				return resp.GetVector(), nil
+			},
+		}),
+		index.WithKBMetaGetter(rn.GetKB),
+		index.WithVersionParentGetter(func(ctx context.Context, kbID string, versionID int64) (int64, error) {
+			versions, err := rn.ListVersions(ctx, kbID)
+			if err != nil {
+				return 0, err
+			}
+			for _, v := range versions {
+				if v.VersionID == versionID {
+					return v.ParentVersionID, nil
+				}
+			}
+			return 0, nil
+		}),
+	)
+	indexMgr.StartAbandonSweeper()
 
 	stack.IndexManager = indexMgr
 	return stack, nil
@@ -271,11 +264,14 @@ func (s *storageStack) Close() {
 	if s.Tombstones != nil {
 		_ = s.Tombstones.Close()
 	}
-	if s.ChunkStore != nil {
-		s.ChunkStore.Close()
-	}
 	if s.IndexManager != nil {
-		// Stops the cold-policy goroutine as well as the manager's own work.
-		s.IndexManager.Close()
+		// Stops workers/buildPool before closing the shared vecstore channel.
+		_ = s.IndexManager.Close()
+	}
+	if s.ChunkStore != nil {
+		_ = s.ChunkStore.Close()
+	}
+	if s.vecstoreConn != nil {
+		_ = s.vecstoreConn.Close()
 	}
 }

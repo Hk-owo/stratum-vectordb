@@ -11,8 +11,6 @@ import (
 )
 
 func TestServiceLeaseExpiredBuildDoesNotPublishFailedOrReady(t *testing.T) {
-	im := newIndexManagerWithData(t)
-	defer im.Close()
 	gate := storage.NewServiceLease(1, "s1")
 	defer gate.Pause()
 	d := storage.NewDirectory()
@@ -22,7 +20,8 @@ func TestServiceLeaseExpiredBuildDoesNotPublishFailedOrReady(t *testing.T) {
 	if err := gate.Install(time.Now(), storage.ServiceLeaseDuration, d.Revision, d); err != nil {
 		t.Fatal(err)
 	}
-	im.SetServiceLease(gate)
+	im := newIndexManagerWithData(t, WithServiceLease(gate))
+	defer im.Close()
 	var calls atomic.Int32
 	im.RegisterBuildCallback(func(string, int64, types.IndexStatus) error { calls.Add(1); return nil })
 	im.listDocIDs = func(ctx context.Context, _ string, _ int64) ([]string, error) {
@@ -49,8 +48,6 @@ func TestServiceLeaseExpiredBuildDoesNotPublishFailedOrReady(t *testing.T) {
 }
 
 func TestServiceLeaseContextCallbackCancelsInFlightReport(t *testing.T) {
-	im := newIndexManagerWithData(t)
-	defer im.Close()
 	gate := storage.NewServiceLease(1, "s1")
 	defer gate.Pause()
 	d := storage.NewDirectory()
@@ -60,7 +57,8 @@ func TestServiceLeaseContextCallbackCancelsInFlightReport(t *testing.T) {
 	if err := gate.Install(time.Now(), storage.ServiceLeaseDuration, d.Revision, d); err != nil {
 		t.Fatal(err)
 	}
-	im.SetServiceLease(gate)
+	im := newIndexManagerWithData(t, WithServiceLease(gate))
+	defer im.Close()
 	var calls atomic.Int32
 	im.RegisterBuildContextCallback(func(ctx context.Context, _ string, _ int64, _ types.IndexStatus) error {
 		calls.Add(1)

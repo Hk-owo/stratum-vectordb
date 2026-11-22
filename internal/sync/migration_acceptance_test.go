@@ -93,7 +93,7 @@ func TestMigrationServeCommittedEmptyActiveNeedsNoIndex(t *testing.T) {
 	f, _, _ := installedFixture(t)
 	index := newFakeIndex()
 	index.never = true
-	h, _ := newServeHandler(t, f, f.root, 3, newFakeCursor(), index)
+	h := newServeHandler(t, f, f.root, 3, newFakeCursor(), index)
 	h.migration.serveWait = 20 * time.Millisecond
 	receipt, err := h.PrepareKBMigrationServing(context.Background(), f.request)
 	if err != nil || !receipt.GetIndexReady() || len(index.builds) != 0 {
@@ -136,7 +136,7 @@ func TestMigrationServeDoesNotReturnLateEvidence(t *testing.T) {
 			t.Fatal(err)
 		}
 	}}
-	h, _ := newServeHandler(t, f, f.root, 3, newFakeCursor(), index)
+	h := newServeHandler(t, f, f.root, 3, newFakeCursor(), index)
 	if _, err := h.PrepareKBMigrationServing(context.Background(), f.request); err == nil {
 		t.Fatal("cancelled task returned serving evidence")
 	}
@@ -155,7 +155,7 @@ func TestMigrationServeIndexWaitMayCrossCheckpoint(t *testing.T) {
 	f, _, _ := installedFixture(t, 1)
 	i := &delayedMigrationIndex{fakeIndex: newFakeIndex(), readyAt: time.Now().Add(serveCheckpoint + 100*time.Millisecond)}
 	i.never = true
-	h, _ := newServeHandler(t, f, f.root, 3, newFakeCursor(), i)
+	h := newServeHandler(t, f, f.root, 3, newFakeCursor(), i)
 	h.migration.serveWait = 8 * time.Second
 	if receipt, err := h.PrepareKBMigrationServing(context.Background(), f.request); err != nil || !receipt.GetIndexReady() {
 		t.Fatal("installed serving task rejected at periodic checkpoint", receipt, err)

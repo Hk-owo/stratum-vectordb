@@ -18,7 +18,6 @@ import (
 func newInstallHandler(t *testing.T, f *migrationTransferFixture, root string, nodeID int64) (*NodeHandler, *storage.ExecutionGate, *chunkstore.MockChunkStore) {
 	t.Helper()
 	chunks := chunkstore.NewMockChunkStore()
-	follower := NewFollower(f.target.docStore, f.target.chunkDoc, f.target.versionDoc, chunks, nil)
 	gate, err := storage.NewExecutionGate(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -26,7 +25,9 @@ func newInstallHandler(t *testing.T, f *migrationTransferFixture, root string, n
 	if err := gate.Fence(context.Background(), "kb", f.request.ExpectedEpoch, f.request.OperationId); err != nil {
 		t.Fatal(err)
 	}
-	follower.SetExecutionGate(gate)
+	follower := NewFollower(f.target.docStore, f.target.chunkDoc, f.target.versionDoc, chunks, nil,
+		WithFollowerExecutionGate(gate),
+	)
 	handler := NewNodeHandler(f.target.handler, NewPushHandler(follower, nodeID,
 		WithStoragePlacement(f.metadata.GetKBPlacement),
 		WithExecutionGate(gate, f.metadata),

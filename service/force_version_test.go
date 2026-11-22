@@ -217,10 +217,9 @@ func TestForceRetryVersion_Refusals(t *testing.T) {
 // ForceAbandonVersion is the other answer: the terminated version leaves the chain,
 // with the same asynchronous cleanup DeleteVersion uses.
 func TestForceAbandonVersion_RemovesATerminatedVersion(t *testing.T) {
-	h := newAdminHarness()
 	ctx := context.Background()
 	dvc := coordinator.NewMockDeleteVersionCoordinator()
-	h.svc.SetDeleteVersionCoordinator(dvc)
+	h := newAdminHarness(WithDeleteVersionCoordinator(dvc))
 
 	mustKB(t, h, "kb-1")
 	versionID := mustVersion(t, h, "kb-1")
@@ -261,8 +260,7 @@ func TestForceAbandonVersion_Refusals(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("a healthy version is DeleteVersion's business", func(t *testing.T) {
-		h := newAdminHarness()
-		h.svc.SetDeleteVersionCoordinator(coordinator.NewMockDeleteVersionCoordinator())
+		h := newAdminHarness(WithDeleteVersionCoordinator(coordinator.NewMockDeleteVersionCoordinator()))
 		mustKB(t, h, "kb-1")
 		versionID := mustVersion(t, h, "kb-1")
 		_ = h.raftNode.ProposeMarkVersionDataDurable(ctx, versionID)
@@ -277,8 +275,7 @@ func TestForceAbandonVersion_Refusals(t *testing.T) {
 	})
 
 	t.Run("missing version", func(t *testing.T) {
-		h := newAdminHarness()
-		h.svc.SetDeleteVersionCoordinator(coordinator.NewMockDeleteVersionCoordinator())
+		h := newAdminHarness(WithDeleteVersionCoordinator(coordinator.NewMockDeleteVersionCoordinator()))
 		mustKB(t, h, "kb-1")
 
 		_, err := h.svc.ForceAbandonVersion(ctx, &pb.ForceAbandonVersionRequest{KnowledgeBaseId: "kb-1", VersionId: 999})

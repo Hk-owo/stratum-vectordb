@@ -9,20 +9,15 @@ import (
 )
 
 // clusterStatusRaftNode answers GetClusterStatus with a fixed view, so the
-// control-node admin service can be tested without the rest of the node. It
-// embeds the reconcile stub for the remaining methods (a control node never calls
-// them here) and overrides the one that matters.
+// control-node admin service can be tested without the rest of the node.
 type clusterStatusRaftNode struct {
-	*reconcileRaftNode
 	status types.ClusterStatus
 }
 
+func (clusterStatusRaftNode) IsLeader() bool { return true }
+
 func (r clusterStatusRaftNode) GetClusterStatus(context.Context) (types.ClusterStatus, error) {
 	return r.status, nil
-}
-
-func (r clusterStatusRaftNode) ProposeRetryVersion(context.Context, string, int64, types.FailureSide) error {
-	return nil
 }
 
 // A control node must be able to answer GetClusterStatus. It is the only node

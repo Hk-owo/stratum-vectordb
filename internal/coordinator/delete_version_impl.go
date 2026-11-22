@@ -6,13 +6,19 @@ import (
 	"fmt"
 	"time"
 
-	"stratum/internal/bloom"
 	"stratum/internal/docstore"
 	"stratum/internal/index"
 	"stratum/internal/raft"
 	"stratum/internal/versiondoc"
 	"stratum/internal/wal"
 )
+
+// DeleteVersionRaft is the Raft subset DeleteVersionCoordinatorImpl uses:
+// metadata reads and version-chain removal proposals.
+type DeleteVersionRaft interface {
+	raft.MetaReader
+	raft.VersionWriter
+}
 
 // DeleteVersionCoordinatorConfig bundles all dependencies for
 // DeleteVersionCoordinatorImpl.
@@ -21,14 +27,13 @@ type DeleteVersionCoordinatorConfig struct {
 	RetryBaseIntervalMS int
 
 	WAL            wal.WAL
-	RaftNode       raft.RaftNode
+	RaftNode       DeleteVersionRaft
 	IndexManager   index.IndexManager
 	DocStore       docstore.DocStore
 	VersionDocList versiondoc.VersionDocList
-	// VersionBloom reclaims the version's document bloom filter. Optional
-	// (may be nil when the on-disk bloom store is not wired), mirroring
-	// DeleteCoordinatorConfig.VersionBloom.
-	VersionBloom *bloom.VersionBloomStore
+	// VersionViews reclaims the version's cached read view (L0 + L1 .vview file).
+	// Optional.
+	VersionViews VersionViewCleaner
 
 	// Dropper reclaims the version's physical data. When set it is what the
 	// flow calls instead of reaching into the stores above, so the reclaim
@@ -162,7 +167,7 @@ func (c *DeleteVersionCoordinatorImpl) dropperFor() VersionStorageDropper {
 		IndexManager:   c.cfg.IndexManager,
 		DocStore:       c.cfg.DocStore,
 		VersionDocList: c.cfg.VersionDocList,
-		VersionBloom:   c.cfg.VersionBloom,
+		VersionViews:   c.cfg.VersionViews,
 		Metadata:       c.cfg.RaftNode,
 		ChunkReclaimer: c.cfg.ChunkReclaimer,
 	}

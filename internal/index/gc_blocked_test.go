@@ -88,9 +88,10 @@ func TestCollectCandidates_RecordsWhyItSkipped(t *testing.T) {
 		GCEnabled:              true,
 		IndexServingReplicaMin: 3,
 		NodeID:                 1,
-	})
-	im.logger = zap.NewNop()
-	im.SetGCReplicaCounter(&gcCountingCounter{others: 2}, 1) // 2 < 3: no slack
+	},
+		WithLogger(zap.NewNop()),
+		WithGCReplicaCounter(&gcCountingCounter{others: 2}, 1), // 2 < 3: no slack
+	)
 
 	im.collectCandidates(context.Background(), []gcCandidate{{KBID: "kb-1", VersionID: 7, DeadShare: 0.5}})
 

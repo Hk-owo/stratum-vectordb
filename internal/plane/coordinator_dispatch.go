@@ -9,9 +9,9 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/rpcpool"
 	"stratum/internal/storage"
 	stratuminternalsync "stratum/internal/sync"
 	"stratum/internal/types"
@@ -35,6 +35,7 @@ type CoordinatorDispatcher struct {
 	replicas   ReplicaResolver
 	selfAddr   string
 	localhost  func(ctx context.Context, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error
+	pool       *rpcpool.Pool
 	dial       func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 	logger     *zap.Logger
 
@@ -116,6 +117,10 @@ type CoordinatorDispatcherConfig struct {
 	CandidateTimeoutPerDoc time.Duration
 	MaxCandidateTimeout    time.Duration
 
+	// Pool supplies long-lived outbound storage-peer channels when Dial is nil.
+	// The pool retains ownership and closes those channels on shutdown.
+	Pool *rpcpool.Pool
+
 	// Dial overrides the gRPC dialer, so tests can point at an in-process
 	// listener. Optional.
 	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
@@ -144,18 +149,8 @@ type CoordinatorDispatcherConfig struct {
 	Logger *zap.Logger
 }
 
-// NewCoordinatorDispatcher returns a dispatcher that dials replicas directly.
+// NewCoordinatorDispatcher returns a dispatcher that dials replicas via Pool or Dial.
 func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispatcher {
-	dial := cfg.Dial
-	if dial == nil {
-		// grpc.NewClient, not DialContext with WithBlock: a candidate that is
-		// gone rather than slow must fail fast so the next one gets its turn.
-		// Blocking here blocks the whole dispatch (see candidateTimeout).
-		dial = func(_ context.Context, addr string) (*grpc.ClientConn, error) {
-			return grpc.NewClient(addr,
-				grpc.WithTransportCredentials(insecure.NewCredentials()))
-		}
-	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = zap.NewNop()
@@ -169,7 +164,8 @@ func NewCoordinatorDispatcher(cfg CoordinatorDispatcherConfig) *CoordinatorDispa
 		replicas:               cfg.Replicas,
 		selfAddr:               cfg.SelfAddr,
 		localhost:              cfg.LocalWrite,
-		dial:                   dial,
+		pool:                   cfg.Pool,
+		dial:                   cfg.Dial,
 		logger:                 logger,
 		candidateTimeout:       durationOr(cfg.CandidateTimeout, defaultCandidateTimeout),
 		candidateTimeoutPerDoc: durationOr(cfg.CandidateTimeoutPerDoc, candidateTimeoutPerDoc),
@@ -423,11 +419,11 @@ func (d *CoordinatorDispatcher) reportRedundancy(candidates []string) {
 // candidate that accepts the call but does not complete the transaction is not a
 // coordinator, and the caller must move on to the next one.
 func (d *CoordinatorDispatcher) dispatchTo(ctx context.Context, addr, kbID string, versionID, parentVersionID int64, changes []types.DocChange) error {
-	conn, err := d.dial(ctx, addr)
+	conn, release, err := rpcpool.Acquire(ctx, d.pool, d.dial, nil, addr)
 	if err != nil {
 		return fmt.Errorf("dial replica %s: %w", addr, err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer release()
 
 	resp, err := pb.NewDataSyncServiceClient(conn).ExecuteVersionWrite(ctx, &pb.ExecuteVersionWriteRequest{
 		KnowledgeBaseId: kbID,

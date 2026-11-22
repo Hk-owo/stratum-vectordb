@@ -21,7 +21,7 @@ type adminHarness struct {
 	wal      *wal.MockWAL
 }
 
-func newAdminHarness() *adminHarness {
+func newAdminHarness(opts ...AdminOption) *adminHarness {
 	w := wal.NewMockWAL()
 	rn := raft.NewMockRaftNode(w)
 	// Wire index deps with trivial in-memory data sources so the async
@@ -31,7 +31,7 @@ func newAdminHarness() *adminHarness {
 		ListChunkIDsByDocs: func(ctx context.Context, kbID string, docIDs []string) ([]string, error) { return nil, nil },
 		ReadChunkVector:    func(ctx context.Context, kbID, chunkID string) ([]float32, error) { return nil, nil },
 	}, 16, 0)
-	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w, nil, nil)
+	svc := NewAdminService(1, rn, im, docstore.NewMockDocStore(), chunkstore.NewMockChunkStore(), w, nil, nil, opts...)
 	return &adminHarness{svc: svc, raftNode: rn, indexMgr: im, wal: w}
 }
 

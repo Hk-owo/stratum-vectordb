@@ -33,10 +33,10 @@ type controlAdminService struct {
 	pb.UnimplementedAdminServiceServer
 
 	nodeID   int64
-	raftNode raft.RaftNode
+	raftNode raft.ClusterReader
 }
 
-func newControlAdminService(nodeID int64, rn raft.RaftNode) *controlAdminService {
+func newControlAdminService(nodeID int64, rn raft.ClusterReader) *controlAdminService {
 	return &controlAdminService{nodeID: nodeID, raftNode: rn}
 }
 

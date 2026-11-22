@@ -73,8 +73,9 @@ func TestFollower_PullOfADeletedVersionIsRefusedBeforeDialling(t *testing.T) {
 	// No stores: the refusal must happen before anything is opened or dialled. The
 	// address below has no listener, so a dial would fail with a transport error
 	// instead of the verdict this test asserts on.
-	follower := NewFollower(nil, nil, nil, nil, nil)
-	follower.SetVersionTombstones(store)
+	follower := NewFollower(nil, nil, nil, nil, nil,
+		WithFollowerVersionTombstones(store),
+	)
 
 	// A port nothing listens on: if the refusal worked, the dial never happens and
 	// the error is the tombstone verdict rather than a connection failure.

@@ -529,9 +529,6 @@ func (r *testRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID 
 	r.versions[versionID] = v
 	return nil
 }
-func (r *testRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) error     { return nil }
-func (r *testRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, kbID string) error { return nil }
-func (r *testRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error       { return nil }
 func (r *testRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
 	return nil
 }
@@ -1213,64 +1210,6 @@ func TestWriteCoordinator_ReplayVersionStorageWrites(t *testing.T) {
 		if p.Type == types.PendingRecordTypeVersionWrite && p.VersionID == versionID {
 			t.Errorf("version %d still pending after replay: %v", versionID, pending)
 		}
-	}
-}
-
-func TestWriteCoordinator_VersionBloomPersisted(t *testing.T) {
-	ctx := context.Background()
-	ds := newTestDocStore()
-	cdm := newTestChunkDocMapper()
-	vdl := newTestVersionDocList()
-	cs := newTestChunkStore()
-	ec := &testEmbedClient{}
-	im := newTestIndexManager()
-	rn := newTestRaftNode()
-	w := wal.NewMockWAL()
-	chunkBF := bloom.NewMockBloomFilter()
-	splitter := &mockSplitter{windowSize: 100, overlapSize: 20}
-
-	rn.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{
-		KBID: "kb-1", Name: "test",
-		ChunkWindowSize: 100, ChunkOverlapSize: 20,
-		EmbedConfig: types.EmbedConfig{ServiceAddr: "emb:8080", ModelID: "m1"},
-	})
-
-	vbs := bloom.NewVersionBloomStore(t.TempDir(), 1000, 0.01, vdl)
-	coord := NewWriteCoordinatorImpl(WriteCoordinatorConfig{
-		MaxRetries:          2,
-		RetryBaseIntervalMS: 10,
-		WAL:                 w,
-		RaftNode:            rn,
-		Splitter:            splitter,
-		EmbedClient:         ec,
-		ChunkBloom:          chunkBF,
-		VersionBloom:        vbs,
-		ChunkStore:          cs,
-		ChunkDocMapper:      cdm,
-		DocStore:            ds,
-		VersionDocList:      vdl,
-		IndexManager:        im,
-	})
-
-	versionID, err := coord.Execute(ctx, "kb-1", 0, []types.DocChange{
-		{Op: types.ChangeOpAdd, DocID: "doc-1", Content: "hello bloom"},
-		{Op: types.ChangeOpAdd, DocID: "doc-2", Content: "second doc"},
-	}, "")
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-
-	// The version's filter must be available (from disk or cache) and
-	// contain exactly that version's document IDs.
-	f, err := vbs.Get(ctx, "kb-1", versionID)
-	if err != nil {
-		t.Fatalf("VersionBloomStore.Get: %v", err)
-	}
-	if !f.Test("doc-1") || !f.Test("doc-2") {
-		t.Error("version bloom filter missing version's document IDs")
-	}
-	if f.Test("doc-never-added") {
-		t.Error("version bloom filter must not contain unrelated doc IDs")
 	}
 }
 

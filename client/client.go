@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/rpcpool"
 )
 
 // Client talks to a Stratum cluster through ONE address: the service station,
@@ -31,7 +31,7 @@ type Client struct {
 
 // Dial connects to addr and records this client's work under stateDir.
 func Dial(addr, stateDir string) (*Client, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := rpcpool.DefaultDialer().Dial(addr)
 	if err != nil {
 		return nil, fmt.Errorf("client: dial %s: %w", addr, err)
 	}

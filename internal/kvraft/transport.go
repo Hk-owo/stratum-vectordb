@@ -7,10 +7,9 @@ import (
 	"time"
 
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	kvraftpb "stratum/api/proto/kvraft"
+	"stratum/internal/rpcpool"
 )
 
 // defaultRPCTimeout bounds how long a single peer-to-peer Raft RPC
@@ -43,6 +42,7 @@ type peerConn struct {
 // changes are not an online operation).
 type Transport struct {
 	logger *zap.Logger
+	dialer *rpcpool.Dialer
 
 	rpcTimeout time.Duration
 
@@ -70,6 +70,7 @@ func NewTransportWithRPCTimeout(logger *zap.Logger, rpcTimeout time.Duration) *T
 	}
 	return &Transport{
 		logger:     logger,
+		dialer:     rpcpool.DefaultDialer(),
 		rpcTimeout: rpcTimeout,
 		peers:      make(map[int64]*peerConn),
 	}
@@ -81,7 +82,11 @@ func NewTransportWithRPCTimeout(logger *zap.Logger, rpcTimeout time.Duration) *T
 // SendInstallSnapshot). See the Transport doc comment for the
 // call-before-Run invariant.
 func (t *Transport) AddPeer(id int64, raftAddr string, kvAddr string) error {
-	conn, err := grpc.NewClient(raftAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialer := t.dialer
+	if dialer == nil {
+		dialer = rpcpool.DefaultDialer()
+	}
+	conn, err := dialer.Dial(raftAddr)
 	if err != nil {
 		return fmt.Errorf("kvraft: connect peer %d at %s: %w", id, raftAddr, err)
 	}

@@ -50,33 +50,24 @@ func NewChunkGarbageCollectorImpl(cfg ChunkGarbageCollectorConfig) *ChunkGarbage
 	if cfg.Locks == nil {
 		cfg.Locks = NewKBLockSet()
 	}
-	return &ChunkGarbageCollectorImpl{cfg: cfg}
-}
-
-func (g *ChunkGarbageCollectorImpl) SetServiceLease(lease *storage.ServiceLease) {
-	g.serviceLease.Store(lease)
-}
-
-// SetStorageMutationGuard binds the per-KB placement/execution lifetime. Node
-// service authorization alone cannot stop GC after a KB enters fencing.
-func (g *ChunkGarbageCollectorImpl) SetStorageMutationGuard(enter func(context.Context, string) (context.Context, func(), error)) {
-	if enter == nil {
-		g.mutationGuard.Store(nil)
-		return
+	g := &ChunkGarbageCollectorImpl{
+		cfg:    cfg,
+		logger: cfg.Logger,
 	}
-	g.mutationGuard.Store(&gcMutationGuard{enter: enter})
+	if cfg.ServiceLease != nil {
+		g.serviceLease.Store(cfg.ServiceLease)
+	}
+	if cfg.StorageMutationGuard != nil {
+		g.mutationGuard.Store(&gcMutationGuard{enter: cfg.StorageMutationGuard})
+	}
+	return g
 }
+
 func (g *ChunkGarbageCollectorImpl) enterMutation(ctx context.Context, kb string) (context.Context, func(), error) {
 	if guard := g.mutationGuard.Load(); guard != nil {
 		return guard.enter(ctx, kb)
 	}
 	return ctx, func() {}, nil
-}
-
-// SetLogger attaches a logger for sweep progress and errors. Optional:
-// without it the collector runs silently.
-func (g *ChunkGarbageCollectorImpl) SetLogger(l *zap.Logger) {
-	g.logger = l
 }
 
 // Run implements ChunkGarbageCollector.

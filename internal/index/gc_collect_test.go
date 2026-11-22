@@ -25,11 +25,9 @@ func (c *gcCountingCounter) IndexReadyReplicaCount(_ context.Context, _ string, 
 }
 
 // newGCCollectManager builds a manager for the collection tests.
-func newGCCollectManager(t *testing.T, cfg IndexManagerConfig) *IndexManagerImpl {
+func newGCCollectManager(t *testing.T, cfg IndexManagerConfig, opts ...IndexManagerOption) *IndexManagerImpl {
 	t.Helper()
-	im := NewIndexManager(cfg)
-	im.logger = zap.NewNop()
-	return im
+	return NewIndexManager(cfg, append([]IndexManagerOption{WithLogger(zap.NewNop())}, opts...)...)
 }
 
 // TestSearch_RefusesWhileTheVersionIsBeingCollected: the maintenance window has to
@@ -54,6 +52,7 @@ func TestSearch_RefusesWhileTheVersionIsBeingCollected(t *testing.T) {
 // nothing is collected — the artifact keeps its dead weight, which is far cheaper
 // than dropping a replica the readers needed.
 func TestCollectCandidates_SkipsWhenTooFewReplicasWouldServe(t *testing.T) {
+	counter := &gcCountingCounter{others: 1} // one other would remain, two required
 	im := newGCCollectManager(t, IndexManagerConfig{
 		LRUCapacity:            4,
 		LoadWaitTimeout:        time.Second,
@@ -61,9 +60,7 @@ func TestCollectCandidates_SkipsWhenTooFewReplicasWouldServe(t *testing.T) {
 		GCEnabled:              true,
 		IndexServingReplicaMin: 2,
 		NodeID:                 1,
-	})
-	counter := &gcCountingCounter{others: 1} // one other would remain, two required
-	im.SetGCReplicaCounter(counter, 1)
+	}, WithGCReplicaCounter(counter, 1))
 
 	im.collectCandidates(context.Background(), []gcCandidate{{KBID: "kb-1", VersionID: 7, DeadShare: 0.5}})
 
@@ -79,13 +76,12 @@ func TestCollectCandidates_SkipsWhenTooFewReplicasWouldServe(t *testing.T) {
 // TestCollectCandidates_DoesNothingWhenDisabled: the scanner is a reporter until an
 // operator opts in. Asking the control layer at all would be work nobody wanted.
 func TestCollectCandidates_DoesNothingWhenDisabled(t *testing.T) {
+	counter := &gcCountingCounter{others: 9}
 	im := newGCCollectManager(t, IndexManagerConfig{
 		LRUCapacity:     4,
 		LoadWaitTimeout: time.Second,
 		NodeID:          1,
-	})
-	counter := &gcCountingCounter{others: 9}
-	im.SetGCReplicaCounter(counter, 1)
+	}, WithGCReplicaCounter(counter, 1))
 
 	im.collectCandidates(context.Background(), []gcCandidate{{KBID: "kb-1", VersionID: 7, DeadShare: 0.5}})
 
@@ -98,15 +94,14 @@ func TestCollectCandidates_DoesNothingWhenDisabled(t *testing.T) {
 // id cannot tell whether stepping out would leave anyone behind, so it does not
 // step out.
 func TestCollectCandidates_RefusesWithoutATopology(t *testing.T) {
+	counter := &gcCountingCounter{others: 9}
 	im := newGCCollectManager(t, IndexManagerConfig{
 		LRUCapacity:            4,
 		LoadWaitTimeout:        time.Second,
 		GCEnabled:              true,
 		IndexServingReplicaMin: 2,
 		// NodeID deliberately left 0.
-	})
-	counter := &gcCountingCounter{others: 9}
-	im.SetGCReplicaCounter(counter, 0)
+	}, WithGCReplicaCounter(counter, 0))
 
 	im.collectCandidates(context.Background(), []gcCandidate{{KBID: "kb-1", VersionID: 7, DeadShare: 0.5}})
 

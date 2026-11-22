@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/rpcpool"
 	"stratum/internal/wal"
 )
 
@@ -15,13 +16,13 @@ import (
 // the client side of §7.5's delta backfill. It shares PresenceCheckerConfig with
 // the other peer-facing helpers: all of them are just "how to dial a peer".
 type VersionChangesPuller struct {
+	pool *rpcpool.Pool
 	dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 }
 
-// NewVersionChangesPuller returns a puller that dials peers directly.
+// NewVersionChangesPuller returns a puller that shares PresenceCheckerConfig.
 func NewVersionChangesPuller(cfg PresenceCheckerConfig) *VersionChangesPuller {
-	checker := NewPresenceChecker(cfg)
-	return &VersionChangesPuller{dial: checker.dial}
+	return &VersionChangesPuller{pool: cfg.Pool, dial: cfg.Dial}
 }
 
 // ChangesInRange asks the peer at addr for the changes it recorded for
@@ -33,11 +34,11 @@ func NewVersionChangesPuller(cfg PresenceCheckerConfig) *VersionChangesPuller {
 // reported as an error, never as a short or empty map: a truncated history that
 // looks complete is exactly the failure this path must not produce.
 func (p *VersionChangesPuller) ChangesInRange(ctx context.Context, peerAddr, kbID string, fromExclusive, toInclusive int64) (map[int64]wal.VersionDelta, error) {
-	conn, err := p.dial(ctx, peerAddr)
+	conn, release, err := rpcpool.Acquire(ctx, p.pool, p.dial, nil, peerAddr)
 	if err != nil {
 		return nil, fmt.Errorf("sync: dial replica %s: %w", peerAddr, err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer release()
 
 	stream, err := pb.NewDataSyncServiceClient(conn).PullVersionChanges(ctx, &pb.PullVersionChangesRequest{
 		KnowledgeBaseId: kbID,

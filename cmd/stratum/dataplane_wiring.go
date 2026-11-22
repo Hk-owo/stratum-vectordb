@@ -7,7 +7,6 @@ import (
 
 	"go.uber.org/zap"
 
-	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/coordinator"
@@ -16,8 +15,11 @@ import (
 	"stratum/internal/nodestate"
 	"stratum/internal/plane"
 	"stratum/internal/raft"
+	"stratum/internal/rpcpool"
 	"stratum/internal/storage"
+	"stratum/internal/tombstone"
 	"stratum/internal/versiondoc"
+	"stratum/internal/versionview"
 	"stratum/internal/wal"
 
 	stratumsync "stratum/internal/sync"
@@ -42,19 +44,21 @@ type dataPlaneDeps struct {
 
 	// The local stores. Nil on a control node — the same nil fields the literal
 	// carried, so a control node still builds a plane with no local data paths.
-	indexMgr    *index.IndexManagerImpl
-	vd          *versiondoc.PebbleVersionDocList
-	ds          *docstore.PebbleDocStore
-	cdm         *chunkdoc.PebbleChunkDocMapper
-	chunkStore  *chunkstore.VecstoreChunkStore
-	vBloomStore *bloom.VersionBloomStore
-	walImpl     *wal.FileWAL
+	indexMgr     *index.IndexManagerImpl
+	vd           *versiondoc.PebbleVersionDocList
+	ds           *docstore.PebbleDocStore
+	cdm          *chunkdoc.PebbleChunkDocMapper
+	chunkStore   *chunkstore.VecstoreChunkStore
+	versionViews *versionview.Store
+	walImpl      *wal.FileWAL
 
-	// The two halves a write runs through: the transaction executor, and the
-	// follower that pulls what other nodes wrote.
-	writeCoord   *coordinator.WriteCoordinatorImpl
-	syncFollower *stratumsync.Follower
-	syncPusher   *stratumsync.Pusher
+	// The two halves a write runs through: the transaction executor/dropper, and
+	// the follower that pulls what other nodes wrote.
+	executor          plane.VersionWriteExecutor
+	dataDropper       plane.VersionDataDropper
+	versionTombstones *tombstone.PebbleStore
+	syncFollower      *stratumsync.Follower
+	syncPusher        *stratumsync.Pusher
 
 	// Where data comes from: the announced data sources, the holders the
 	// catch-up learned, and the deployment shape they are all derived from.
@@ -66,17 +70,19 @@ type dataPlaneDeps struct {
 	// version been deleted" without a round trip.
 	nodeState *nodestate.Machine
 	liveness  plane.VersionLivenessLister
+	peerPool  *rpcpool.Pool
 }
 
 // config is plane.LocalDataPlaneConfig for this node.
 func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 	cfg, logger := d.cfg, d.logger
 	rn, controlPlane := d.rn, d.controlPlane
-	indexMgr, vd, ds, cdm, chunkStore, vBloomStore := d.indexMgr, d.vd, d.ds, d.cdm, d.chunkStore, d.vBloomStore
-	walImpl, writeCoord := d.walImpl, d.writeCoord
+	indexMgr, vd, ds, cdm, chunkStore, versionViews := d.indexMgr, d.vd, d.ds, d.cdm, d.chunkStore, d.versionViews
+	walImpl, executor, dataDropper := d.walImpl, d.executor, d.dataDropper
 	syncFollower, syncPusher := d.syncFollower, d.syncPusher
 	dataSources, holdersCache, topology := d.dataSources, d.holdersCache, d.topology
 	nodeState, liveness := d.nodeState, d.liveness
+	peerCfg := stratumsync.PresenceCheckerConfig{Pool: d.peerPool}
 
 	return plane.LocalDataPlaneConfig{
 		ExecutionGate: d.executionGate,
@@ -99,13 +105,14 @@ func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 		// inferring it from index artifacts the retention policy may have
 		// deleted. Same file, one more record type.
 		CursorWAL:     walImpl,
-		Executor:      writeCoord,
+		Executor:      executor,
 		Control:       controlPlane,
 		Pusher:        replicaPusher{pusher: syncPusher},
-		CursorQuerier: stratumsync.NewLocalVersionQuerier(stratumsync.PresenceCheckerConfig{}),
+		CursorQuerier: stratumsync.NewLocalVersionQuerier(peerCfg),
 		// §10.6: a permanently failed version's data is reclaimed locally and
 		// on every candidate replica.
-		DataDropper: writeCoord,
+		DataDropper:       dataDropper,
+		VersionTombstones: tombstoneTable(d.versionTombstones),
 		// A whole-KB deletion is ONE entry in the control layer's deletion log
 		// (version 0), so its reclaim needs the KB-level dropper. Without it the
 		// entry stays owed and is reported as such rather than silently dropped.
@@ -115,12 +122,12 @@ func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 			ChunkStore:     chunkStore,
 			ChunkDocMapper: cdm,
 			VersionDocList: vd,
-			VersionBloom:   vBloomStore,
+			VersionViews:   versionViewCleaner(versionViews),
 		},
-		CleanupBroadcaster: stratumsync.NewVersionDataCleaner(stratumsync.PresenceCheckerConfig{}),
+		CleanupBroadcaster: stratumsync.NewVersionDataCleaner(peerCfg),
 		// §7.3: a replica that received a version stands ready to announce it
 		// if the coordinator's confirmation never arrives.
-		Presence: stratumsync.NewPresenceChecker(stratumsync.PresenceCheckerConfig{}),
+		Presence: stratumsync.NewPresenceChecker(peerCfg),
 		Digest:   syncFollower,
 		// The announcement is only worth proposing while the data side is still
 		// PENDING: this reads the local metadata replica so a takeover on an
@@ -128,10 +135,10 @@ func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 		// path, which arms the same check after replaying a version nobody
 		// confirmed (docs/未实施/known-gaps.md §K).
 		DataStatus: controlPlane,
-		Confirmer:  stratumsync.NewConfirmBroadcaster(stratumsync.PresenceCheckerConfig{}),
+		Confirmer:  stratumsync.NewConfirmBroadcaster(peerCfg),
 		// §8.4: "建一次、分发 N 份" — the builder reads its own index files and
 		// ships them; replicas install them instead of building their own.
-		IndexFetcher: stratumsync.NewIndexFetcher(),
+		IndexFetcher: &stratumsync.IndexFetcher{Pool: d.peerPool},
 		// docs/已实施/index-owner-sharding-plan.md §7: where an artifact FETCHED from a
 		// peer lands. The same call the push direction ends in, so a fetched
 		// artifact and a shipped one are indistinguishable once installed.
@@ -147,7 +154,7 @@ func (d dataPlaneDeps) config() plane.LocalDataPlaneConfig {
 		// §7.5: a backfill can replay the changes a peer recorded instead of
 		// pulling each version in full. Same dialer config as the other
 		// peer-facing helpers.
-		ChangesFetcher: stratumsync.NewVersionChangesPuller(stratumsync.PresenceCheckerConfig{}),
+		ChangesFetcher: stratumsync.NewVersionChangesPuller(peerCfg),
 		// The control layer's bounded deletion log, read incrementally. Both shapes
 		// answer it (a voter from its own state machine, a storage node through the
 		// internal service), so the assertion succeeds for either role; a shape that

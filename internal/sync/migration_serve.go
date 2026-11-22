@@ -149,9 +149,9 @@ func (h *NodeHandler) prepareMigrationServing(ctx context.Context, req *pb.Migra
 			return nil, serrors.ToGRPCStatus(err)
 		}
 	}
-	// Document filters and the cursor are local accelerators, but "serviceable"
-	// means they are rebuilt from the data that just landed rather than left over
-	// from whatever the node held before.
+	if h.receiver.follower.versionDoc == nil {
+		return nil, serrors.ToGRPCStatus(serrors.ErrPlacementChangeUnsafe)
+	}
 	durable := make([]storage.MigrationVersion, 0, len(manifest.Versions))
 	for _, v := range manifest.Versions {
 		if v.DataStatus == types.DataStatusDurable {
@@ -160,9 +160,6 @@ func (h *NodeHandler) prepareMigrationServing(ctx context.Context, req *pb.Migra
 	}
 	sort.Slice(durable, func(i, j int) bool { return durable[i].ID < durable[j].ID })
 	for _, v := range durable {
-		if err := h.receiver.follower.rebuildVersionBloomStrict(ctx, manifest.KBID, v.ID); err != nil {
-			return nil, serrors.ToGRPCStatus(err)
-		}
 		h.receiver.follower.markVersionContiguous(manifest.KBID, v.ID)
 	}
 	cursor := h.receiver.localVersion.LocalVersionOf(manifest.KBID)

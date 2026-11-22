@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 	stdsync "sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -52,6 +53,7 @@ import (
 	"stratum/internal/sync"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
+	"stratum/internal/versionview"
 	"stratum/internal/wal"
 	"stratum/service"
 )
@@ -204,22 +206,19 @@ func startMockEmbedForTest(t *testing.T, dim int) string {
 // --- realNode: a fully-wired real Stratum node ---
 
 type realNode struct {
-	t          *testing.T
-	nodeID     int64
-	raftAddr   string
-	grpcAddr   string
-	baseDir    string // root of this node's persistence ("" if ephemeral)
-	raftNode   *raft.RaftNodeImpl
-	fileWAL    *wal.FileWAL
-	docStore   *docstore.PebbleDocStore
-	chunkDoc   *chunkdoc.PebbleChunkDocMapper
-	versionDoc *versiondoc.PebbleVersionDocList
-	chunkStore *chunkstore.VecstoreChunkStore
-	indexMgr   *index.IndexManagerImpl
-	// vBloomStore is the per-version document filter a query applies on top of the
-	// search results. Exposed because it is cached (memory AND disk) the first time
-	// it is asked for, so it is where a good result can disappear for good.
-	vBloomStore *bloom.VersionBloomStore
+	t            *testing.T
+	nodeID       int64
+	raftAddr     string
+	grpcAddr     string
+	baseDir      string // root of this node's persistence ("" if ephemeral)
+	raftNode     *raft.RaftNodeImpl
+	fileWAL      *wal.FileWAL
+	docStore     *docstore.PebbleDocStore
+	chunkDoc     *chunkdoc.PebbleChunkDocMapper
+	versionDoc   *versiondoc.PebbleVersionDocList
+	chunkStore   *chunkstore.VecstoreChunkStore
+	indexMgr     *index.IndexManagerImpl
+	versionViews *versionview.Store
 	// indexDistributor is the §8.4 shipping path, exposed so a test can assert
 	// what a replica received rather than what it built.
 	indexDistributor *plane.LocalDataPlane
@@ -246,7 +245,9 @@ type realNode struct {
 	// pointers to the other fixtures on purpose: a node that RESTARTS is a new
 	// fixture, and a pointer it never got would leave it unable to find the leader
 	// for the rest of the test.
-	peerAddrs map[int64]string
+	peerAddrs     map[int64]string
+	forwardAddrs  *atomic.Pointer[map[int64]string]
+	onCreatedHook *atomic.Pointer[func(kbID string, versionID int64)]
 
 	// logger is where asynchronous work (§8.4 distribution, background index
 	// builds, sync pulls) reports problems. It must NOT be the test's *testing.T:
@@ -347,6 +348,8 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		t.Fatalf("node %d: vecstore client: %v", nodeID, err)
 	}
 
+	var forwardAddrs atomic.Pointer[map[int64]string]
+	var onCreatedHook atomic.Pointer[func(kbID string, versionID int64)]
 	rn, err := raft.NewRaftNodeImpl(raft.Config{
 		NodeID:             nodeID,
 		DataDir:            filepath.Join(baseDir, "raft"),
@@ -357,14 +360,36 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		ElectionTimeoutMax: 120 * time.Millisecond,
 		HeartbeatInterval:  20 * time.Millisecond,
 		MaxLogLength:       cfg.maxLogLength,
-	})
+	},
+		raft.WithNodeID(nodeID),
+		raft.WithForwarder(&raft.GRPCProposeForwarder{
+			AddrByID: func(id int64) (string, bool) {
+				addrs := forwardAddrs.Load()
+				if addrs == nil {
+					return "", false
+				}
+				addr, ok := (*addrs)[id]
+				return addr, ok
+			},
+		}),
+		raft.WithOnVersionCreated(func(kbID string, versionID int64) {
+			if fn := onCreatedHook.Load(); fn != nil {
+				(*fn)(kbID, versionID)
+			}
+		}),
+	)
 	if err != nil {
 		t.Fatalf("node %d: NewRaftNodeImpl: %v", nodeID, err)
 	}
 
 	ec := embed.NewHTTPEmbedClient(embedAddr, 30*time.Second)
 	chunkBF := bloom.NewBitsAndBloomsFilter(4096, 0.01)
-	vBloomStore := bloom.NewVersionBloomStore(t.TempDir(), 4096, 0.01, vd)
+	versionViews := versionview.NewStore(versionview.Config{
+		DataDir:        baseDir,
+		MaxEntries:     12,
+		VersionDocList: vd,
+		ChunkDocMapper: cdm,
+	})
 	sp := splitter.NewSlidingWindowSplitter()
 
 	im := index.NewIndexManager(index.IndexManagerConfig{
@@ -378,52 +403,35 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		// without it every build stays in memory and §8.4 has nothing to ship.
 		IndexDataDir: filepath.Join(baseDir, "indexdata"),
 		// §8.6a: optional cold-version policy, off unless a test asks for it.
-		ColdThreshold: cfg.coldThreshold,
-	})
-	im.SetLogger(nodeLogger)
-	// KB 级量化器的来源，与节点装配（cmd/stratum/storage_stack.go 的
-	// indexMgr.SetKBMetaGetter(rn.GetKB)）逐字一致：异步构建经它读到 KB 元数据
-	// 里的 QuantizerType，再随 Build RPC 转给 vecstore。
-	//
-	// 漏掉这一句的后果不是报错而是静默降级——buildQuantizerFromKB 在
-	// kbMetaGetter == nil 时一律返回 QUANTIZER_OFF，于是这个栈里每个 KB 的每次
-	// 构建都是全精度，量化器"开着"在这套集成/集群用例中从来不成立（integration/
-	// 里对 quantizer 零命中，就是这么来的）。
-	im.SetKBMetaGetter(rn.GetKB)
-	// §8.6(c): wire the parent-version link, like the node assembly does, so
-	// this stack exercises the pure-append reuse end to end.
-	//
-	// One caveat worth knowing when reading integration timings: the reuse
-	// keeps a version's vecstore entry in BUILDING for longer than a plain
-	// Build does (the base artifact is read back from disk first), and these
-	// stacks build/install the same version from several places at once. A
-	// 10-run A/B against the pre-§8.6(c) timing showed FaultTolerance's
-	// `index load timeout` flakiness at 4/10 with the reuse and 3/10 without
-	// — inside the noise for that test, so the reuse is wired here; the
-	// mechanism (a longer BUILDING window) is real and is why the reuse is a
-	// pure optimisation with a full-rebuild fallback.
-	im.SetVersionParentGetter(func(ctx context.Context, kbID string, versionID int64) (int64, error) {
-		versions, err := rn.ListVersions(ctx, kbID)
-		if err != nil {
-			return 0, err
-		}
-		for _, v := range versions {
-			if v.VersionID == versionID {
-				return v.ParentVersionID, nil
-			}
-		}
-		return 0, nil
-	})
-	im.SetBuildDataSources(
-		vd.ListDocIDs,
-		cdm.ListChunkIDsByDocs,
-		func(ctx context.Context, kbID, chunkID string) ([]float32, error) {
-			resp, err := cs.VecstoreClient().Read(ctx, &vecstorepb.ReadChunkRequest{Key: chunkstore.EncodeKey(kbID, chunkID)})
+		ColdThreshold:   cfg.coldThreshold,
+		VersionView:     versionViews,
+		MapChunksByDocs: cdm.MapChunksByDocs,
+	},
+		index.WithLogger(nodeLogger),
+		index.WithKBMetaGetter(rn.GetKB),
+		index.WithVersionParentGetter(func(ctx context.Context, kbID string, versionID int64) (int64, error) {
+			versions, err := rn.ListVersions(ctx, kbID)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
-			return resp.GetVector(), nil
-		},
+			for _, v := range versions {
+				if v.VersionID == versionID {
+					return v.ParentVersionID, nil
+				}
+			}
+			return 0, nil
+		}),
+		index.WithBuildDataSources(index.BuildDataSources{
+			ListDocIDs:         vd.ListDocIDs,
+			ListChunkIDsByDocs: cdm.ListChunkIDsByDocs,
+			ReadChunkVector: func(ctx context.Context, kbID, chunkID string) ([]float32, error) {
+				resp, err := cs.VecstoreClient().Read(ctx, &vecstorepb.ReadChunkRequest{Key: chunkstore.EncodeKey(kbID, chunkID)})
+				if err != nil {
+					return nil, err
+				}
+				return resp.GetVector(), nil
+			},
+		}),
 	)
 	// §8.4: index distribution, now pull-only. The plane is built explicitly so
 	// this stack exercises the same path a node uses — a replica FETCHES a built
@@ -494,7 +502,7 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		DocStore:            ds,
 		VersionDocList:      vd,
 	}))
-	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, vBloomStore)
+	querySvc := service.NewQueryService(rn, im, cdm, vd, ds, versionViews)
 	adminSvc := service.NewAdminService(nodeID, rn, im, ds, cs, w, nil, nil)
 
 	srv := grpc.NewServer()
@@ -504,11 +512,6 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 	// One data-plane service per node, as in the node assembly: the export side
 	// plus the receive side, so this stack can exercise both directions.
 	syncFollower := sync.NewFollower(ds, cdm, vd, cs, im)
-	// §7.8/§? : a replica that receives a version's data builds its document filter,
-	// exactly as the writer's transaction does. Without it a filter built before the
-	// data arrived (an early query) stays empty, and an empty filter drops every hit —
-	// the query then answers "nothing matched", with no error, for data it holds.
-	syncFollower.SetVersionBloom(vBloomStore)
 	pb.RegisterDataSyncServiceServer(srv, sync.NewNodeHandler(
 		sync.NewLeaderHandler(ds.DB(), cdm.DB(), vd.DB(), cs.VecstoreClient()),
 		sync.NewPushHandler(syncFollower, nodeID,
@@ -548,12 +551,14 @@ func newRealNodeWithAddrsAndDirOpts(t *testing.T, nodeID int64, peers []raft.Pee
 		versionDoc:       vd,
 		chunkStore:       cs,
 		indexMgr:         im,
-		vBloomStore:      vBloomStore,
+		versionViews:     versionViews,
 		indexDistributor: indexDistributor,
 		dataSources:      dataSources,
 		srv:              srv,
 		conn:             conn,
 		peerAddrs:        peerAddrByID(peers, nodeID, grpcAddr),
+		forwardAddrs:     &forwardAddrs,
+		onCreatedHook:    &onCreatedHook,
 		KB:               pb.NewKnowledgeBaseServiceClient(conn),
 		Query:            pb.NewQueryServiceClient(conn),
 		Admin:            pb.NewAdminServiceClient(conn),
@@ -610,20 +615,17 @@ func waitForLeader(t *testing.T, nodes ...*realNode) *realNode {
 // proposal there (docs/参考/历史/Stratum_设计文档v13.md §7.3/§7.8).
 func wireProposeForwarding(t *testing.T, n *realNode, addrByID map[int64]string) {
 	t.Helper()
-	n.raftNode.SetNodeID(n.nodeID)
-	n.raftNode.SetForwarder(&raft.GRPCProposeForwarder{
-		AddrByID: func(id int64) (string, bool) {
-			addr, ok := addrByID[id]
-			return addr, ok
-		},
-	})
+	cp := make(map[int64]string, len(addrByID))
+	for k, v := range addrByID {
+		cp[k] = v
+	}
+	n.forwardAddrs.Store(&cp)
 }
 
 func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 	t.Helper()
 	syncFollower := sync.NewFollower(n.docStore, n.chunkDoc, n.versionDoc, n.chunkStore, n.indexMgr)
-	syncFollower.SetVersionBloom(n.vBloomStore)
-	n.raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
+	fn := func(kbID string, versionID int64) {
 		ctx := context.Background()
 		// §7.5: the version EXISTS as of this apply, so the plane records that
 		// fact. A version this node ends up not holding then blocks its cursor
@@ -700,7 +702,8 @@ func wireSyncPull(t *testing.T, n *realNode, addrByID map[int64]string) {
 				backoff *= 2
 			}
 		}
-	})
+	}
+	n.onCreatedHook.Store(&fn)
 }
 
 // sourceAddrFor answers "where do I get this version's data": the §8.5
@@ -875,26 +878,16 @@ func describeLocalState(n *realNode, kbID string, versionID int64, queryDoc stri
 	// EMPTY index, which then answers every query with nothing and reports no error.
 	readable, total, dim := chunkVectorStats(ctx, n, kbID, docs)
 
-	// The version bloom is the LAST place a good result can be dropped, and it is
-	// cached — in memory and on disk — the first time it is asked for. A filter built
-	// before the version's documents arrived holds nothing, and every later query
-	// then discards every hit without an error. The hit count says whether that is
-	// what happened: it should be len(versiondoc).
-	bloomHits, bloomErr := -1, error(nil)
-	if b, err := n.vBloomStore.Get(ctx, kbID, versionID); err != nil {
-		bloomErr = err
+	viewDocs, viewErr := 0, error(nil)
+	if v, err := n.versionViews.Get(ctx, kbID, versionID, ""); err != nil {
+		viewErr = err
 	} else {
-		bloomHits = 0
-		for _, d := range docs {
-			if b.Test(d) {
-				bloomHits++
-			}
-		}
+		viewDocs = len(v.DocIDs)
 	}
 
 	base := fmt.Sprintf("cursor=%d, pull_failure=%q, ", cursor, pullFailure)
-	return base + fmt.Sprintf("versiondoc=%d (err=%v), index_file=%d bytes (sidecar=%d), %s, direct_search=%d results (err=%v) %v, chunk_vectors_readable=%d/%d dim=%d, version_bloom_hits=%d/%d (err=%v)",
-		len(docs), derr, len(indexData), len(sidecar), status, len(direct), searchErr, directDocs, readable, total, dim, bloomHits, len(docs), bloomErr)
+	return base + fmt.Sprintf("versiondoc=%d (err=%v), index_file=%d bytes (sidecar=%d), %s, direct_search=%d results (err=%v) %v, chunk_vectors_readable=%d/%d dim=%d, version_view_docs=%d/%d (err=%v)",
+		len(docs), derr, len(indexData), len(sidecar), status, len(direct), searchErr, directDocs, readable, total, dim, viewDocs, len(docs), viewErr)
 }
 
 // chunkVectorStats reports how many of the version's chunks this node's vecstore can

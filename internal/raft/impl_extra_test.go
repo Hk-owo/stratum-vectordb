@@ -138,14 +138,12 @@ func TestRaftNodeImpl_ProposeRemoveKBMeta_And_ListVersions(t *testing.T) {
 // over once any node may coordinate — a forwarded proposal leaves a waiter on
 // the leader too (which holds no data), and a non-leader coordinator holds data
 // nobody else knows about. Deciding who pulls is the data plane's job.
-func TestRaftNodeImpl_SetOnVersionCreated_FiresForProposerToo(t *testing.T) {
-	impl, _ := newTestRaftNodeImpl(t)
-	ctx := proposeCtx(t)
-
+func TestRaftNodeImpl_OnVersionCreated_FiresForProposerToo(t *testing.T) {
 	called := make(chan struct{}, 1)
-	impl.SetOnVersionCreated(func(kbID string, versionID int64) {
+	impl, _ := newTestRaftNodeImpl(t, WithOnVersionCreated(func(kbID string, versionID int64) {
 		called <- struct{}{}
-	})
+	}))
+	ctx := proposeCtx(t)
 
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
@@ -266,18 +264,16 @@ func TestRaftNodeImpl_ProposeUpdateVersionSummary(t *testing.T) {
 // broadcast goes to the candidate replicas and a partitioned or restarting replica
 // never hears it. Every node applies the same Raft entry, so the verdict has to
 // travel the apply path too, and this is where it does.
-func TestRaftNodeImpl_SetOnVersionFailedPermanent_FiresOnApply(t *testing.T) {
-	impl, _ := newTestRaftNodeImpl(t)
-	ctx := proposeCtx(t)
-
+func TestRaftNodeImpl_OnVersionFailedPermanent_FiresOnApply(t *testing.T) {
 	type event struct {
 		kbID      string
 		versionID int64
 	}
 	called := make(chan event, 1)
-	impl.SetOnVersionFailedPermanent(func(kbID string, versionID int64) {
+	impl, _ := newTestRaftNodeImpl(t, WithOnVersionFailedPermanent(func(kbID string, versionID int64) {
 		called <- event{kbID, versionID}
-	})
+	}))
+	ctx := proposeCtx(t)
 
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
@@ -308,14 +304,12 @@ func TestRaftNodeImpl_SetOnVersionFailedPermanent_FiresOnApply(t *testing.T) {
 // records would destroy what ForceRetryVersion needs. ReclaimTerminalVersions
 // applies the same filter to its startup sweep, and the apply path has to agree
 // with it: otherwise the side is decided in two places with two answers.
-func TestRaftNodeImpl_SetOnVersionFailedPermanent_SkipsTheIndexSide(t *testing.T) {
-	impl, _ := newTestRaftNodeImpl(t)
-	ctx := proposeCtx(t)
-
+func TestRaftNodeImpl_OnVersionFailedPermanent_SkipsTheIndexSide(t *testing.T) {
 	called := make(chan int64, 1)
-	impl.SetOnVersionFailedPermanent(func(_ string, versionID int64) {
+	impl, _ := newTestRaftNodeImpl(t, WithOnVersionFailedPermanent(func(_ string, versionID int64) {
 		called <- versionID
-	})
+	}))
+	ctx := proposeCtx(t)
 
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
@@ -415,11 +409,9 @@ func TestRaftNodeImpl_TerminalParentIsNotARetryableAnswer(t *testing.T) {
 // protects the data if the reclaim hook stays quiet too. A hook firing on it would delete
 // the version on every replica, whatever the state machine recorded.
 func TestRaftNodeImpl_RefusedVerdictOnADurableVersionDoesNotReclaim(t *testing.T) {
-	impl, _ := newTestRaftNodeImpl(t)
-	ctx := proposeCtx(t)
-
 	called := make(chan int64, 1)
-	impl.SetOnVersionFailedPermanent(func(_ string, versionID int64) { called <- versionID })
+	impl, _ := newTestRaftNodeImpl(t, WithOnVersionFailedPermanent(func(_ string, versionID int64) { called <- versionID }))
+	ctx := proposeCtx(t)
 
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
@@ -454,7 +446,8 @@ func TestRaftNodeImpl_RefusedVerdictOnADurableVersionDoesNotReclaim(t *testing.T
 // TestRaftNodeImpl_RefusedCreateVersionFiresNoHook: a refused create allocated nothing, and
 // both hooks would otherwise run with version 0 on every apply of the refusal.
 func TestRaftNodeImpl_RefusedCreateVersionFiresNoHook(t *testing.T) {
-	impl, _ := newTestRaftNodeImpl(t)
+	created := make(chan int64, 4)
+	impl, _ := newTestRaftNodeImpl(t, WithOnVersionCreated(func(_ string, versionID int64) { created <- versionID }))
 	ctx := proposeCtx(t)
 	if err := impl.ProposeCreateKB(ctx, testKB("kb-1")); err != nil {
 		t.Fatalf("ProposeCreateKB: %v", err)
@@ -463,9 +456,11 @@ func TestRaftNodeImpl_RefusedCreateVersionFiresNoHook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProposeCreateVersion: %v", err)
 	}
-
-	created := make(chan int64, 4)
-	impl.SetOnVersionCreated(func(_ string, versionID int64) { created <- versionID })
+	select {
+	case <-created:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for parent apply hook")
+	}
 
 	if _, err := impl.ProposeCreateVersion(ctx, "kb-1", parent); !errors.Is(err, stratumerrors.ErrParentNotDurable) {
 		t.Fatalf("err = %v, want ErrParentNotDurable", err)

@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/rpcpool"
 )
 
 // DefaultHeartbeatInterval is how often a node tells the control leader it is alive. The
@@ -38,6 +39,9 @@ type HeartbeaterConfig struct {
 	// restarts) and are logged at debug so they cannot be mistaken for faults.
 	Logger *zap.Logger
 
+	// Pool supplies long-lived outbound channels when Dial is nil.
+	Pool *rpcpool.Pool
+
 	// Dial overrides the gRPC dialer, so tests can point at an in-process
 	// listener. Optional.
 	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
@@ -64,6 +68,7 @@ type Heartbeater struct {
 	resolveLeader LeaderAddrResolver
 	interval      time.Duration
 	logger        *zap.Logger
+	pool          *rpcpool.Pool
 	dial          func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 
 	// conn is the connection to the leader last resolved, reused between heartbeats so a
@@ -83,12 +88,8 @@ type Heartbeater struct {
 	tailsDirectoryRevision uint64
 }
 
-// NewHeartbeater returns a heartbeater that dials leaders directly.
+// NewHeartbeater returns a heartbeater that uses Pool, Dial, or rpcpool's default dialer.
 func NewHeartbeater(cfg HeartbeaterConfig) *Heartbeater {
-	dial := cfg.Dial
-	if dial == nil {
-		dial = NewPresenceChecker(PresenceCheckerConfig{}).dial
-	}
 	interval := cfg.Interval
 	if interval <= 0 {
 		interval = DefaultHeartbeatInterval
@@ -98,7 +99,8 @@ func NewHeartbeater(cfg HeartbeaterConfig) *Heartbeater {
 		resolveLeader: cfg.ResolveLeader,
 		interval:      interval,
 		logger:        cfg.Logger,
-		dial:          dial,
+		pool:          cfg.Pool,
+		dial:          cfg.Dial,
 		chainTails:    cfg.ChainTails,
 	}
 }
@@ -168,14 +170,25 @@ func (r *Heartbeater) ReportOnce(ctx context.Context) error {
 	return nil
 }
 
-// connTo returns the connection to addr, reusing the last one when the leader has not
-// moved. gRPC reconnects it on its own, so a failed call does not need a new one.
+// connTo returns the connection to addr, using Pool when wired (with Dial
+// unset) or reusing the last dialed connection when the leader has not moved.
 func (r *Heartbeater) connTo(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+	if r.dial == nil && r.pool != nil {
+		return r.pool.GetContext(ctx, addr)
+	}
 	if r.conn != nil && r.connAddr == addr {
 		return r.conn, nil
 	}
 	r.closeConn()
-	conn, err := r.dial(ctx, addr)
+	var (
+		conn *grpc.ClientConn
+		err  error
+	)
+	if r.dial != nil {
+		conn, err = r.dial(ctx, addr)
+	} else {
+		conn, err = rpcpool.DefaultDialer().DialContext(ctx, addr)
+	}
 	if err != nil {
 		return nil, err
 	}

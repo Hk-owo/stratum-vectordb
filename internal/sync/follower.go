@@ -7,15 +7,12 @@ import (
 	"io"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
 	pb "stratum/api/proto/stratum"
-	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/rpcpool"
 	"stratum/internal/storage"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
@@ -42,12 +39,6 @@ type Follower struct {
 	// read falls through to whichever node answers "0 < required".
 	advanceVersion LocalVersionAdvancer
 
-	// versionBloom rebuilds a version's document filter once its data has landed.
-	// Optional, but a replica that never rebuilds keeps whatever filter it built
-	// first — and a filter built before the data arrived is empty, which drops every
-	// search hit (see SetVersionBloom).
-	versionBloom VersionBloomStore
-
 	// docIDSetHash answers the writer's committed document-set digest for a version.
 	// It is the only fact that tells "this version has no documents" apart from "the
 	// source sent nothing for it" — see confirmVersionIsEmpty. Optional, like the
@@ -60,6 +51,9 @@ type Follower struct {
 	// bound does not leak onto the transfer (see PullVersionData).
 	pullDialTimeout time.Duration
 
+	// pool supplies long-lived outbound storage-peer channels when wired.
+	pool *rpcpool.Pool
+
 	// tombstones is this node's record of versions it has been told are deleted.
 	// A pull runs on the receiving side, so it is the one place a version whose
 	// metadata no longer exists can still be recognised — the source cannot know
@@ -69,11 +63,26 @@ type Follower struct {
 	tombstones VersionTombstoneReader
 }
 
-func (f *Follower) SetStoragePlacement(resolver storage.Resolver, nodeID int64) {
-	f.placements, f.nodeID = resolver, nodeID
+// FollowerOption configures optional dependencies and timeouts of a Follower at
+// construction time.
+type FollowerOption func(*Follower)
+
+// WithFollowerStoragePlacement wires the replica placement check for pulls.
+func WithFollowerStoragePlacement(resolver storage.Resolver, nodeID int64) FollowerOption {
+	return func(f *Follower) {
+		f.placements, f.nodeID = resolver, nodeID
+	}
 }
 
-func (f *Follower) SetExecutionGate(gate *storage.ExecutionGate) { f.executionGate = gate }
+// WithFollowerExecutionGate wires the storage execution gate for pulls.
+func WithFollowerExecutionGate(gate *storage.ExecutionGate) FollowerOption {
+	return func(f *Follower) { f.executionGate = gate }
+}
+
+// WithFollowerPool binds a shared outbound peer connection pool for pulls.
+func WithFollowerPool(pool *rpcpool.Pool) FollowerOption {
+	return func(f *Follower) { f.pool = pool }
+}
 
 func (f *Follower) flushReceivedData(ctx context.Context) error {
 	if f.chunkStore == nil {
@@ -82,12 +91,24 @@ func (f *Follower) flushReceivedData(ctx context.Context) error {
 	return f.chunkStore.FlushWAL(ctx)
 }
 
-// SetVersionTombstones wires this node's record of deleted versions.
-//
-// A setter rather than a constructor argument, like the other optional halves of
-// this type: the store is assembled after the follower in every assembly.
-func (f *Follower) SetVersionTombstones(t VersionTombstoneReader) {
-	f.tombstones = t
+// flushAndCommitVersionDocList flushes received chunk vectors and then writes
+// the deferred VersionDocList in one commit so VersionDocList (and its digest)
+// never becomes visible before DocStore, ChunkDocMapper, and ChunkStore land.
+func (f *Follower) flushAndCommitVersionDocList(ctx context.Context, kbID string, versionID int64, docIDs []string) error {
+	if err := f.flushReceivedData(ctx); err != nil {
+		return err
+	}
+	if len(docIDs) > 0 {
+		if err := f.versionDoc.WriteMany(ctx, kbID, versionID, docIDs); err != nil {
+			return fmt.Errorf("sync: write version doc list (%s v%d): %w", kbID, versionID, err)
+		}
+	}
+	return nil
+}
+
+// WithFollowerVersionTombstones wires this node's record of deleted versions.
+func WithFollowerVersionTombstones(t VersionTombstoneReader) FollowerOption {
+	return func(f *Follower) { f.tombstones = t }
 }
 
 // errVersionTombstoned reports that a version was refused because this node knows
@@ -102,10 +123,10 @@ var errVersionTombstoned = errors.New("sync: version was deleted on this node")
 // DefaultPullDialTimeout bounds the connection handshake of a pull.
 const DefaultPullDialTimeout = 15 * time.Second
 
-// SetPullDialTimeout overrides that bound (sync.pull_dial_timeout_ms). A
-// non-positive value keeps the default.
-func (f *Follower) SetPullDialTimeout(d time.Duration) {
-	f.pullDialTimeout = d
+// WithPullDialTimeout overrides the pull handshake bound (sync.pull_dial_timeout_ms).
+// A non-positive value keeps DefaultPullDialTimeout.
+func WithPullDialTimeout(d time.Duration) FollowerOption {
+	return func(f *Follower) { f.pullDialTimeout = d }
 }
 
 // dialTimeout returns the handshake bound, defaulting for a zero-valued Follower.
@@ -116,32 +137,9 @@ func (f *Follower) dialTimeout() time.Duration {
 	return DefaultPullDialTimeout
 }
 
-// VersionBloomStore is the slice of bloom.VersionBloomStore the sync paths need: the
-// REBUILD of a version's document filter from a document set that is now local.
-// Declared here so this package depends on none of the store's read/delete surface.
-type VersionBloomStore interface {
-	BuildAndPersist(kbID string, versionID int64, docIDs []string) (bloom.BloomFilter, error)
-}
-
-// SetLocalVersionAdvancer wires the cursor update a completed pull performs.
-//
-// A setter rather than a constructor argument because the storage plane that
-// implements it is built after the follower in every assembly.
-func (f *Follower) SetLocalVersionAdvancer(a LocalVersionAdvancer) {
-	f.advanceVersion = a
-}
-
-// SetVersionBloom wires the document-filter rebuild a completed transfer performs.
-//
-// The writer builds this filter inside its write transaction; a replica that receives
-// the same data has to build it too. That is not a nicety: the filter drops the search
-// hits that are not in the version, so a replica whose filter was built before the
-// data arrived (a query that came in early, a push racing a read) answers "nothing
-// matched" — with no error — for a version it holds in full. A setter rather than a
-// constructor argument, following SetLocalVersionAdvancer: the store is assembled
-// after the follower in every assembly.
-func (f *Follower) SetVersionBloom(b VersionBloomStore) {
-	f.versionBloom = b
+// WithFollowerLocalVersionAdvancer wires the cursor update a completed pull performs.
+func WithFollowerLocalVersionAdvancer(a LocalVersionAdvancer) FollowerOption {
+	return func(f *Follower) { f.advanceVersion = a }
 }
 
 // VersionDocIDSetHash answers the document-set digest the writer committed for a version
@@ -155,45 +153,9 @@ type VersionDocIDSetHash interface {
 	DocIDSetHash(ctx context.Context, kbID string, versionID int64) (string, error)
 }
 
-// SetVersionDocIDSetHash wires the metadata read that an empty receive is confirmed
-// against. A setter, following SetLocalVersionAdvancer: the metadata channel is assembled
-// alongside the stores, not before them.
-func (f *Follower) SetVersionDocIDSetHash(r VersionDocIDSetHash) {
-	f.docIDSetHash = r
-}
-
-// rebuildVersionBloom re-derives the version's document filter from the document set
-// that just landed. Best effort: the filter is an accelerator, so a failure costs
-// precision and never correctness — the query path confirms every hit against the
-// version doc list anyway.
-func (f *Follower) rebuildVersionBloom(ctx context.Context, kbID string, versionID int64) {
-	if f.versionBloom == nil {
-		return
-	}
-	docIDs, err := f.versionDoc.ListDocIDs(ctx, kbID, versionID)
-	if err != nil {
-		return
-	}
-	if _, err := f.versionBloom.BuildAndPersist(kbID, versionID, docIDs); err != nil {
-		_ = err // non-fatal; the next transfer or the query path rebuilds it
-	}
-}
-
-// rebuildVersionBloomStrict is rebuildVersionBloom for a caller that must know the
-// filter is really rebuilt: a migration target claiming it can serve without its
-// document filter would answer "nothing matched" for a version it holds in full.
-func (f *Follower) rebuildVersionBloomStrict(ctx context.Context, kbID string, versionID int64) error {
-	if f.versionBloom == nil || f.versionDoc == nil {
-		return stratumerrors.ErrPlacementChangeUnsafe
-	}
-	docIDs, err := f.versionDoc.ListDocIDs(ctx, kbID, versionID)
-	if err != nil {
-		return err
-	}
-	if _, err := f.versionBloom.BuildAndPersist(kbID, versionID, docIDs); err != nil {
-		return err
-	}
-	return nil
+// WithVersionDocIDSetHash wires the metadata read that an empty receive is confirmed against.
+func WithVersionDocIDSetHash(r VersionDocIDSetHash) FollowerOption {
+	return func(f *Follower) { f.docIDSetHash = r }
 }
 
 // markVersionContiguous moves the cursor if an advancer is wired.
@@ -261,14 +223,21 @@ func NewFollower(
 	versionDoc versiondoc.VersionDocList,
 	chunkStore chunkstore.ChunkStore,
 	indexManager IndexBuildTrigger,
+	opts ...FollowerOption,
 ) *Follower {
-	return &Follower{
+	f := &Follower{
 		docStore:     docStore,
 		chunkDoc:     chunkDoc,
 		versionDoc:   versionDoc,
 		chunkStore:   chunkStore,
 		indexManager: indexManager,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(f)
+		}
+	}
+	return f
 }
 
 // PullVersionData fetches the version's data and leaves its index unbuilt.
@@ -341,15 +310,12 @@ func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID 
 	// log application: EnsureIndex is reached from the lag catch-up and from the
 	// query path's background pull, both off the apply loop.
 	dialCtx, cancelDial := context.WithTimeout(ctx, f.dialTimeout())
-	conn, err := grpc.DialContext(dialCtx, leaderAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	)
+	conn, release, err := rpcpool.Acquire(dialCtx, f.pool, nil, nil, leaderAddr)
 	cancelDial()
 	if err != nil {
 		return fmt.Errorf("sync: dial leader %s: %w", leaderAddr, err)
 	}
-	defer conn.Close()
+	defer release()
 
 	client := pb.NewDataSyncServiceClient(conn)
 	stream, err := client.PullVersionData(ctx, &pb.PullVersionDataRequest{
@@ -361,6 +327,7 @@ func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID 
 	}
 
 	received := 0
+	var versionDocIDs []string
 	for {
 		entry, err := stream.Recv()
 		if err == io.EOF {
@@ -371,6 +338,15 @@ func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID 
 		}
 
 		received++
+		// ExportVersion streams VERSION_DOC_LIST first. Buffer it until all
+		// DocStore, ChunkDocMapper, and ChunkVector entries have been applied
+		// and flushed so concurrent readers never see a complete DocIDSetHash
+		// while chunks or documents are still landing.
+		if entry.GetEntryType() == pb.SyncEntryType_SYNC_ENTRY_TYPE_VERSION_DOC_LIST &&
+			entry.GetKbId() == kbID && entry.GetVersionId() == versionID {
+			versionDocIDs = append(versionDocIDs, entry.GetDocId())
+			continue
+		}
 		if err := f.applyEntry(ctx, entry); err != nil {
 			return fmt.Errorf("sync: apply %s entry: %w", entry.GetEntryType(), err)
 		}
@@ -387,18 +363,13 @@ func (f *Follower) PullVersionData(ctx context.Context, leaderAddr string, kbID 
 	}
 
 	// Every record is in the local stores, so this node holds the version —
-	if err := f.flushReceivedData(ctx); err != nil {
+	if err := f.flushAndCommitVersionDocList(ctx, kbID, versionID, versionDocIDs); err != nil {
 		return err
 	}
 	// move the cursor now, before the build and before anything can ask about
 	// it. The cursor is what §9.3(2) reads, and a replica whose cursor never
 	// moves is refused as stale however complete its data is.
 	f.markVersionContiguous(kbID, versionID)
-
-	// The data is complete, so the version's document filter can be derived from it —
-	// the same step the writer's transaction performs. See SetVersionBloom for why a
-	// replica has to do this rather than inherit the writer's filter.
-	f.rebuildVersionBloom(ctx, kbID, versionID)
 
 	// All data written. NO BUILD — see the method comment.
 	return nil

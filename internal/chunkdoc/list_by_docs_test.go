@@ -110,3 +110,59 @@ func assertChunkSet(t *testing.T, got, want []string) {
 		t.Fatalf("chunks = %v, want %v", got, want)
 	}
 }
+
+func TestChunkDocBatchMapper_MapChunksByDocs(t *testing.T) {
+	ctx := context.Background()
+
+	run := func(t *testing.T, write func(kbID, chunkID, docID string), mapper ChunkDocBatchMapper) {
+		t.Helper()
+		write("kb1", "chunk-shared", "doc-1")
+		write("kb1", "chunk-1", "doc-1")
+		write("kb1", "chunk-shared", "doc-2")
+		write("kb1", "chunk-3", "doc-3")
+		write("kb1", "chunk-10", "doc-10")
+		write("kb2", "chunk-other", "doc-1")
+
+		docIDs := []string{"doc-1", "doc-2", "doc-3"}
+		chunks, chunkToDocs, err := mapper.MapChunksByDocs(ctx, "kb1", docIDs)
+		if err != nil {
+			t.Fatalf("MapChunksByDocs: %v", err)
+		}
+		assertChunkSet(t, chunks, []string{"chunk-shared", "chunk-1", "chunk-3"})
+		if len(chunkToDocs) != 3 {
+			t.Fatalf("len(chunkToDocs) = %d, want 3", len(chunkToDocs))
+		}
+		if !reflect.DeepEqual(chunkToDocs["chunk-shared"], []uint32{0, 1}) {
+			t.Fatalf("chunk-shared docs = %v, want [0 1]", chunkToDocs["chunk-shared"])
+		}
+		if !reflect.DeepEqual(chunkToDocs["chunk-1"], []uint32{0}) {
+			t.Fatalf("chunk-1 docs = %v, want [0]", chunkToDocs["chunk-1"])
+		}
+		if !reflect.DeepEqual(chunkToDocs["chunk-3"], []uint32{2}) {
+			t.Fatalf("chunk-3 docs = %v, want [2]", chunkToDocs["chunk-3"])
+		}
+
+		// Empty input produces empty slice and non-nil empty map.
+		emptyChunks, emptyMap, err := mapper.MapChunksByDocs(ctx, "kb1", nil)
+		if err != nil {
+			t.Fatalf("MapChunksByDocs(nil): %v", err)
+		}
+		if len(emptyChunks) != 0 || len(emptyMap) != 0 {
+			t.Fatalf("empty MapChunksByDocs = (%v, %v), want empty", emptyChunks, emptyMap)
+		}
+	}
+
+	t.Run("PebbleChunkDocMapper", func(t *testing.T) {
+		m := newTestPebbleChunkDocMapper(t)
+		run(t, func(kbID, chunkID, docID string) { mustWritePebble(t, m, kbID, chunkID, docID) }, m)
+	})
+
+	t.Run("MockChunkDocMapper", func(t *testing.T) {
+		m := NewMockChunkDocMapper()
+		run(t, func(kbID, chunkID, docID string) {
+			if err := m.Write(ctx, kbID, chunkID, docID); err != nil {
+				t.Fatalf("mock Write: %v", err)
+			}
+		}, m)
+	})
+}

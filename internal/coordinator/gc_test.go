@@ -12,14 +12,18 @@ import (
 	"stratum/internal/types"
 )
 
-// gcTestRaftNode is a minimal raft.RaftNode for ChunkGarbageCollector
-// tests: it serves a fixed KB list and per-KB version lists and no-ops
-// everything else.
+// gcTestRaftNode is a minimal raft.MetaReader for ChunkGarbageCollector
+// tests: it serves a fixed KB list and per-KB version lists.
 type gcTestRaftNode struct {
 	kbs      []types.KnowledgeBaseMeta
 	versions map[string][]types.VersionMeta
 }
 
+var _ raft.MetaReader = (*gcTestRaftNode)(nil)
+
+func (r *gcTestRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
+	return types.KnowledgeBaseMeta{}, nil
+}
 func (r *gcTestRaftNode) ListKnowledgeBases(_ context.Context) ([]types.KnowledgeBaseMeta, error) {
 	return r.kbs, nil
 }
@@ -43,7 +47,7 @@ func (r *gcTestRaftNode) ListVersionsInRange(context.Context, string, *int64, *i
 	return nil, nil
 }
 
-// GetVersion satisfies raft.RaftNode, answering from the same fixture data.
+// GetVersion satisfies raft.MetaReader, answering from the same fixture data.
 func (r *gcTestRaftNode) GetVersion(_ context.Context, kbID string, versionID int64) (types.VersionMeta, error) {
 	for _, v := range r.versions[kbID] {
 		if v.VersionID == versionID {
@@ -51,57 +55,6 @@ func (r *gcTestRaftNode) GetVersion(_ context.Context, kbID string, versionID in
 		}
 	}
 	return types.VersionMeta{}, nil
-}
-func (r *gcTestRaftNode) ProposeCreateKB(_ context.Context, kb types.KnowledgeBaseMeta) error {
-	return nil
-}
-func (r *gcTestRaftNode) ProposeMarkKBDeleting(_ context.Context, kbID string) error     { return nil }
-func (r *gcTestRaftNode) ProposeMarkKBDeleteFailed(_ context.Context, kbID string) error { return nil }
-func (r *gcTestRaftNode) ProposeRemoveKBMeta(_ context.Context, kbID string) error       { return nil }
-func (r *gcTestRaftNode) IsLeader() bool                                                 { return true }
-
-func (r *gcTestRaftNode) ProposeCreateVersion(_ context.Context, kbID string, parentVersionID int64, opts ...raft.ProposeOption) (int64, error) {
-	return 0, nil
-}
-func (r *gcTestRaftNode) ProposeMarkVersionFailedPermanent(_ context.Context, _ string, _ int64, _ types.FailureSide, _ string, _ int32) error {
-	return nil
-}
-
-// ProposeRetryVersion mirrors the revocation ForceRetryVersion drives (§10.1):
-// this stub is not exercised by it, so there is nothing to record.
-func (r *gcTestRaftNode) ProposeRetryVersion(_ context.Context, _ string, _ int64, _ types.FailureSide) error {
-	return nil
-}
-
-func (r *gcTestRaftNode) ProposeUpdateVersionStatus(_ context.Context, versionID int64, status types.IndexStatus, _ int64) error {
-	return nil
-}
-func (r *gcTestRaftNode) ProposeMarkVersionDataDurable(_ context.Context, _ int64) error {
-	return nil
-}
-
-func (r *gcTestRaftNode) ProposeUpdateVersionSummary(_ context.Context, versionID int64, docIDSetHash string) error {
-	return nil
-}
-func (r *gcTestRaftNode) ProposeRollback(_ context.Context, kbID string, targetVersionID int64) error {
-	return nil
-}
-func (r *gcTestRaftNode) ProposeMarkVersionDeleting(_ context.Context, _ string, _ int64, _ types.VersionDeleteMode) ([]int64, error) {
-	return nil, nil
-}
-func (r *gcTestRaftNode) ProposeRemoveVersionMeta(_ context.Context, kbID string, versionID int64) error {
-	return nil
-}
-
-// ProposeDiscardVersion satisfies raft.RaftNode; these tests never discard.
-func (r *gcTestRaftNode) ProposeDiscardVersion(_ context.Context, _ string, _ int64) error {
-	return nil
-}
-func (r *gcTestRaftNode) GetKB(_ context.Context, kbID string) (types.KnowledgeBaseMeta, error) {
-	return types.KnowledgeBaseMeta{}, nil
-}
-func (r *gcTestRaftNode) GetClusterStatus(_ context.Context) (types.ClusterStatus, error) {
-	return types.ClusterStatus{}, nil
 }
 
 // gcChunkStore records Deletes so tests can assert exactly which chunk

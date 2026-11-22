@@ -120,13 +120,16 @@ func TestExecutionFenceFailedPersistenceIsNotAnAck(t *testing.T) {
 
 func TestExecutionFenceCorruptionFailsClosedAndKBIDCannotEscape(t *testing.T) {
 	g := testGate(t)
-	if err := g.Fence(context.Background(), "../escaped", 7, "op"); err != nil {
-		t.Fatal(err)
+	if err := g.Fence(context.Background(), "../escaped", 7, "op"); !errors.Is(err, serrors.ErrInvalidArgument) {
+		t.Fatalf("traversal kb_id fence err = %v, want ErrInvalidArgument", err)
 	}
 	if filepath.Dir(g.path("../escaped")) != g.dir {
 		t.Fatal("KB identity escaped fence directory")
 	}
-	if err := os.WriteFile(g.path("../escaped"), []byte("bad JSON"), 0600); err != nil {
+	if err := g.Fence(context.Background(), "kb-corrupt", 7, "op"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(g.path("kb-corrupt"), []byte("bad JSON"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := NewExecutionGate(g.dir); err == nil {

@@ -548,6 +548,10 @@ type LocalDataPlaneConfig struct {
 	// does not produce on its own.
 	State *nodestate.Machine
 
+	// VersionTombstones records deletions this node was told about, guarding landing
+	// paths and draining deferred reclaims. Optional.
+	VersionTombstones VersionTombstones
+
 	// Logger receives progress/retry diagnostics. Optional.
 	Logger *zap.Logger
 }
@@ -580,6 +584,7 @@ func NewLocalDataPlane(cfg LocalDataPlaneConfig) *LocalDataPlane {
 		changesFetcher:        cfg.ChangesFetcher,
 		localVersions:         cfg.LocalVersions,
 		liveness:              cfg.Liveness,
+		tombstones:            cfg.VersionTombstones,
 		kbDropper:             cfg.KBDropper,
 		deletions:             cfg.Deletions,
 		deletionLogPage:       cfg.DeletionLogPage,
@@ -795,7 +800,8 @@ type VersionWriteExecutor interface {
 
 // MetadataLister is the read-only view of replicated metadata the storage
 // layer needs in order to reconcile itself against the control layer.
-// *raft.RaftNode satisfies it; the storage layer never proposes through it.
+// raft.MetaReader (and thus raft.RaftNode) satisfies it; the storage layer never
+// proposes through it.
 type MetadataLister interface {
 	ListKnowledgeBases(ctx context.Context) ([]types.KnowledgeBaseMeta, error)
 	ListVersions(ctx context.Context, kbID string) ([]types.VersionMeta, error)

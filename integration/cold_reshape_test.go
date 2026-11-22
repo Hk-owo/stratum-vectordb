@@ -42,7 +42,7 @@ func waitUntil(timeout time.Duration, cond func() bool) bool {
 func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) {
 	t.Helper()
 	syncFollower := sync.NewFollower(n.docStore, n.chunkDoc, n.versionDoc, n.chunkStore, n.indexMgr)
-	n.raftNode.SetOnVersionCreated(func(kbID string, versionID int64) {
+	fn := func(kbID string, versionID int64) {
 		ctx := context.Background()
 		// §7.5: the same announcement wireSyncPull makes. It matters more here:
 		// the data-only variant pulls records without building an index, so the
@@ -70,7 +70,8 @@ func wireSyncPullDataOnly(t *testing.T, n *realNode, addrByID map[int64]string) 
 				backoff *= 2
 			}
 		}
-	})
+	}
+	n.onCreatedHook.Store(&fn)
 }
 
 // TestRealStack_ColdRebuildReplacesOnlyTheLocalArtifact is the cluster-level proof

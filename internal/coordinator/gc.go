@@ -4,10 +4,13 @@ package coordinator
 import (
 	"context"
 
+	"go.uber.org/zap"
+
 	"stratum/internal/chunkdoc"
 	"stratum/internal/chunkstore"
 	"stratum/internal/docstore"
 	"stratum/internal/raft"
+	"stratum/internal/storage"
 	"stratum/internal/versiondoc"
 )
 
@@ -17,7 +20,7 @@ type ChunkGarbageCollectorConfig struct {
 	// SweepInterval is the delay between two full sweeps.
 	SweepIntervalSec int
 
-	RaftNode       raft.RaftNode
+	RaftNode       raft.MetaReader
 	ChunkDocMapper chunkdoc.ChunkDocMapper
 	DocStore       docstore.DocStore
 	ChunkStore     chunkstore.ChunkStore
@@ -40,6 +43,11 @@ type ChunkGarbageCollectorConfig struct {
 	// concurrent writes; production wiring MUST inject the same set as
 	// WriteCoordinatorConfig.Locks.
 	Locks *KBLockSet
+
+	// Optional storage authorization and mutation guard wired at assembly time.
+	ServiceLease         *storage.ServiceLease
+	StorageMutationGuard func(context.Context, string) (context.Context, func(), error)
+	Logger               *zap.Logger
 }
 
 // ChunkGarbageCollector reclaims orphan chunks — chunk vectors whose every

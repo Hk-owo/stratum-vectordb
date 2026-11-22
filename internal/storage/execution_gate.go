@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	serrors "stratum/internal/errors"
+	"stratum/internal/fsutil"
 )
 
 type fenceRecord struct {
@@ -46,15 +47,7 @@ func NewExecutionGate(dir string) (*ExecutionGate, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	parent, err := os.Open(filepath.Dir(dir))
-	if err != nil {
-		return nil, err
-	}
-	if err := parent.Sync(); err != nil {
-		parent.Close()
-		return nil, err
-	}
-	if err := parent.Close(); err != nil {
+	if err := fsutil.SyncDir(filepath.Dir(dir)); err != nil {
 		return nil, err
 	}
 	g := &ExecutionGate{dir: dir, states: make(map[string]*executionState)}
@@ -77,7 +70,7 @@ func NewExecutionGate(dir string) (*ExecutionGate, error) {
 		if err := json.Unmarshal(data, &record); err != nil {
 			return nil, fmt.Errorf("storage: corrupt fence %s: %w", entry.Name(), err)
 		}
-		if record.KBID == "" || record.Epoch == 0 || record.OperationID == "" || filepath.Base(g.path(record.KBID)) != entry.Name() {
+		if err := fsutil.ValidatePathSegment(record.KBID); err != nil || record.Epoch == 0 || record.OperationID == "" || filepath.Base(g.path(record.KBID)) != entry.Name() {
 			return nil, fmt.Errorf("storage: invalid fence %s", entry.Name())
 		}
 		g.states[record.KBID] = &executionState{changed: make(chan struct{}), fence: record, durable: true}
@@ -250,6 +243,9 @@ func (g *ExecutionGate) Fence(ctx context.Context, kbID string, epoch uint64, op
 	if kbID == "" || epoch == 0 || operationID == "" {
 		return serrors.ErrInvalidArgument
 	}
+	if err := fsutil.ValidatePathSegment(kbID); err != nil {
+		return fmt.Errorf("%w: %v", serrors.ErrInvalidArgument, err)
+	}
 	if lease, ok := ctx.Value(executionLeaseKey{}).(*executionLease); ok && lease.gate == g && lease.kbID == kbID && lease.active.Load() {
 		return serrors.ErrMigrationConflict
 	}
@@ -312,32 +308,14 @@ func (g *ExecutionGate) Fence(ctx context.Context, kbID string, epoch uint64, op
 }
 
 func (g *ExecutionGate) persist(record fenceRecord) error {
-	file, err := os.CreateTemp(g.dir, ".fence-*")
+	if err := fsutil.ValidatePathSegment(record.KBID); err != nil {
+		return fmt.Errorf("%w: %v", serrors.ErrInvalidArgument, err)
+	}
+	data, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
-	name := file.Name()
-	defer os.Remove(name)
-	if err := json.NewEncoder(file).Encode(record); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(name, g.path(record.KBID)); err != nil {
-		return err
-	}
-	dir, err := os.Open(g.dir)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
+	return fsutil.AtomicWriteFile(g.path(record.KBID), append(data, '\n'), fsutil.WithTempPattern(".fence-*"))
 }
 
 // EnterMutation checks the bound operation configuration as well as the durable
@@ -400,6 +378,9 @@ type maintenanceScope struct {
 func (g *ExecutionGate) EnterMaintenance(ctx context.Context, c Cleanup) (context.Context, func(), error) {
 	if g == nil || c.KBID == "" || c.Epoch == 0 || c.ID == "" {
 		return ctx, func() {}, serrors.ErrPlacementChangeUnsafe
+	}
+	if err := fsutil.ValidatePathSegment(c.KBID); err != nil {
+		return ctx, func() {}, fmt.Errorf("%w: %v", serrors.ErrInvalidArgument, err)
 	}
 	for {
 		if err := ctx.Err(); err != nil {

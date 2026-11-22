@@ -236,8 +236,26 @@ func TestFollower_PullVersion_AdvancesTheCursor(t *testing.T) {
 	}
 
 	adv := &recordingAdvancer{}
-	follower, _, _ := startPushServer(t, 5)
-	follower.SetLocalVersionAdvancer(adv)
+	ds, err := docstore.NewPebbleDocStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("docstore: %v", err)
+	}
+	cdm, err := chunkdoc.NewPebbleChunkDocMapper(t.TempDir())
+	if err != nil {
+		t.Fatalf("chunkdoc: %v", err)
+	}
+	vd, err := versiondoc.NewPebbleVersionDocList(t.TempDir())
+	if err != nil {
+		t.Fatalf("versiondoc: %v", err)
+	}
+	t.Cleanup(func() {
+		ds.Close()
+		cdm.Close()
+		vd.Close()
+	})
+	follower := NewFollower(ds, cdm, vd, chunkstore.NewMockChunkStore(), &recordingTrigger{},
+		WithFollowerLocalVersionAdvancer(adv),
+	)
 
 	if err := follower.PullVersionData(ctx, leaderAddr, kbID, versionID); err != nil {
 		t.Fatalf("PullVersionData: %v", err)
@@ -328,4 +346,54 @@ func TestPusher_ReportsWhatEndedTheStream(t *testing.T) {
 			t.Fatalf("err = %v, want the deadline named", err)
 		}
 	})
+}
+
+func TestPushHandler_PushVersionData_DefersVersionDocListUntilCommit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	follower, _, addr := startPushServer(t, 7)
+	stream, err := dialSyncServer(t, addr).PushVersionData(ctx)
+	if err != nil {
+		t.Fatalf("PushVersionData: %v", err)
+	}
+
+	if err := stream.Send(&pb.SyncEntry{
+		EntryType: pb.SyncEntryType_SYNC_ENTRY_TYPE_VERSION_DOC_LIST,
+		KbId:      "kb-push-stage",
+		VersionId: 5,
+		DocId:     "doc-1",
+	}); err != nil {
+		t.Fatalf("Send VERSION_DOC_LIST: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	midDocs, err := follower.versionDoc.ListDocIDs(ctx, "kb-push-stage", 5)
+	if err != nil {
+		t.Fatalf("ListDocIDs mid-push: %v", err)
+	}
+	if len(midDocs) != 0 {
+		t.Fatalf("VersionDocList exposed %v mid-push before chunk/doc rows arrived", midDocs)
+	}
+
+	if err := stream.Send(&pb.SyncEntry{
+		EntryType: pb.SyncEntryType_SYNC_ENTRY_TYPE_CHUNK_DOC_FORWARD,
+		KbId:      "kb-push-stage",
+		ChunkId:   "chunk-1",
+		DocId:     "doc-1",
+	}); err != nil {
+		t.Fatalf("Send CHUNK_DOC_FORWARD: %v", err)
+	}
+	if _, err := stream.CloseAndRecv(); err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	docs, err := follower.versionDoc.ListDocIDs(ctx, "kb-push-stage", 5)
+	if err != nil || len(docs) != 1 || docs[0] != "doc-1" {
+		t.Fatalf("VersionDocList after push = %v, %v, want [doc-1]", docs, err)
+	}
+	chunks, err := follower.chunkDoc.ListChunkIDsByDocs(ctx, "kb-push-stage", docs)
+	if err != nil || len(chunks) != 1 || chunks[0] != "chunk-1" {
+		t.Fatalf("ChunkDocMapper after push = %v, %v, want [chunk-1]", chunks, err)
+	}
 }

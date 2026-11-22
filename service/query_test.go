@@ -12,7 +12,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
-	"stratum/internal/bloom"
 	"stratum/internal/chunkdoc"
 	"stratum/internal/docstore"
 	stratumerrors "stratum/internal/errors"
@@ -20,22 +19,23 @@ import (
 	"stratum/internal/raft"
 	"stratum/internal/types"
 	"stratum/internal/versiondoc"
+	"stratum/internal/versionview"
 	"stratum/internal/wal"
 )
 
 // querySvcHarness bundles the dependencies for QueryService tests.
 type querySvcHarness struct {
-	svc         *QueryServiceImpl
-	raftNode    *raft.MockRaftNode
-	counting    *countingRaftNode
-	indexMgr    *index.MockIndexManager
-	chunkMapper *chunkdoc.MockChunkDocMapper
-	versionDocs *versiondoc.MockVersionDocList
-	docStore    *docstore.MockDocStore
-	vBloomStore *bloom.VersionBloomStore
+	svc          *QueryServiceImpl
+	raftNode     *raft.MockRaftNode
+	counting     *countingRaftNode
+	indexMgr     *index.MockIndexManager
+	chunkMapper  *chunkdoc.MockChunkDocMapper
+	versionDocs  *versiondoc.MockVersionDocList
+	docStore     *docstore.MockDocStore
+	versionViews *versionview.Store
 }
 
-func newQuerySvcHarness(t *testing.T) *querySvcHarness {
+func newQuerySvcHarness(t *testing.T, opts ...QueryOption) *querySvcHarness {
 	w := wal.NewMockWAL()
 	rn := raft.NewMockRaftNode(w)
 	cdm := chunkdoc.NewMockChunkDocMapper()
@@ -50,23 +50,26 @@ func newQuerySvcHarness(t *testing.T) *querySvcHarness {
 		},
 	}, 4, 5*1000*1000*1000) // 5s timeout
 
-	// Version bloom filters are stored under a per-test temp dir and
-	// rebuilt lazily from the version doc list.
-	vBloomStore := bloom.NewVersionBloomStore(t.TempDir(), 1000, 0.01, vd)
+	versionViews := versionview.NewStore(versionview.Config{
+		DataDir:        t.TempDir(),
+		MaxEntries:     8,
+		VersionDocList: vd,
+		ChunkDocMapper: cdm,
+	})
 
 	// The service gets a counting wrapper so a test can assert the ONE thing §F is
 	// about: that a single-version question does not become a whole-chain read.
 	counting := &countingRaftNode{MockRaftNode: rn}
-	svc := NewQueryService(counting, im, cdm, vd, ds, vBloomStore)
+	svc := NewQueryService(counting, im, cdm, vd, ds, versionViews, opts...)
 	return &querySvcHarness{
-		svc:         svc,
-		raftNode:    rn,
-		counting:    counting,
-		indexMgr:    im,
-		chunkMapper: cdm,
-		versionDocs: vd,
-		docStore:    ds,
-		vBloomStore: vBloomStore,
+		svc:          svc,
+		raftNode:     rn,
+		counting:     counting,
+		indexMgr:     im,
+		chunkMapper:  cdm,
+		versionDocs:  vd,
+		docStore:     ds,
+		versionViews: versionViews,
 	}
 }
 
@@ -529,7 +532,7 @@ func TestQueryService_AggregationMedian(t *testing.T) {
 	_ = resp
 }
 
-func TestQueryService_BloomFilterFalsePositive(t *testing.T) {
+func TestQueryService_VersionViewFiltersForeignDocs(t *testing.T) {
 	h := newQuerySvcHarness(t)
 	ctx := context.Background()
 
@@ -537,15 +540,14 @@ func TestQueryService_BloomFilterFalsePositive(t *testing.T) {
 		"doc-real": {"chunk-1"},
 	})
 
-	// Add a key to the version's bloom filter that is NOT in VersionDocList.
-	// This simulates a false positive: bloom says "maybe present",
-	// but VersionDocList confirms it's not.
-	if _, err := h.vBloomStore.BuildAndPersist(kbID, vID, []string{"doc-real", "doc-fake"}); err != nil {
-		t.Fatalf("BuildAndPersist: %v", err)
+	// Attach a foreign document to chunk-1 in ChunkDocMapper (as if another
+	// version wrote it) while leaving it out of vID's VersionDocList.
+	if err := h.chunkMapper.Write(ctx, kbID, "chunk-1", "doc-fake"); err != nil {
+		t.Fatalf("chunkMapper.Write: %v", err)
 	}
-
-	// Make the search return chunks that belong to both doc-real and doc-fake.
-	// Since doc-fake is not in VDL, it should be filtered out.
+	if err := h.docStore.Write(ctx, kbID, "doc-fake", vID, []byte("fake content")); err != nil {
+		t.Fatalf("docStore.Write: %v", err)
+	}
 
 	resp, err := h.svc.Query(ctx, &pb.QueryRequest{
 		KnowledgeBaseId: kbID,
@@ -556,10 +558,8 @@ func TestQueryService_BloomFilterFalsePositive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
-	for _, r := range resp.Results {
-		if r.DocId == "doc-fake" {
-			t.Error("doc-fake should have been filtered by false-positive confirmation")
-		}
+	if len(resp.Results) != 1 || resp.Results[0].DocId != "doc-real" {
+		t.Fatalf("Results = %+v, want only doc-real", resp.Results)
 	}
 }
 
@@ -568,9 +568,8 @@ func TestQueryService_BloomFilterFalsePositive(t *testing.T) {
 // building now could persist an index over part of the write and report it READY, after
 // which nothing repairs it. The first query after the data turns durable warms instead.
 func TestQueryService_PendingWriteWithoutDurableDataIsRejected(t *testing.T) {
-	h := newQuerySvcHarness(t)
 	fetcher := &recordingIndexFetcher{}
-	h.svc.SetIndexFetcher(fetcher)
+	h := newQuerySvcHarness(t, WithIndexFetcher(fetcher))
 	ctx := context.Background()
 
 	kbID := "kb-test"
@@ -885,8 +884,7 @@ func (s stubCursor) LocalVersionOf(string) int64 { return int64(s) }
 // is exactly the silent staleness §9.1 risk 1 describes: the caller would get a
 // well-formed answer from the wrong point in time and no way to tell.
 func TestQueryService_RefusesAStaleNodeForAFreshnessCredential(t *testing.T) {
-	h := newQuerySvcHarness(t)
-	h.svc.SetLocalVersionReporter(stubCursor(5)) // this node's history reaches version 5
+	h := newQuerySvcHarness(t, WithLocalVersionReporter(stubCursor(5))) // this node's history reaches version 5
 
 	required := int64(7)
 	_, err := h.svc.Query(context.Background(), &pb.QueryRequest{
@@ -919,13 +917,13 @@ func TestQueryService_RefusesAStaleNodeForAFreshnessCredential(t *testing.T) {
 // only refuses never catches up, and every query for a version it could serve
 // returns an error it can never clear.
 func TestQueryService_AsksForAPullWhenItIsBehind(t *testing.T) {
-	h := newQuerySvcHarness(t)
-	h.svc.SetLocalVersionReporter(stubCursor(5)) // this node's history reaches version 5
-
 	// Fails twice, then succeeds — an attempt that lands while the control tier
 	// is electing or a peer is restarting must not be the last word.
 	puller := &countingBackfiller{failures: 2}
-	h.svc.SetBackfiller(puller)
+	h := newQuerySvcHarness(t,
+		WithLocalVersionReporter(stubCursor(5)), // this node's history reaches version 5
+		WithBackfiller(puller),
+	)
 
 	required := int64(7)
 	_, err := h.svc.Query(context.Background(), &pb.QueryRequest{
@@ -982,8 +980,7 @@ func (b *countingBackfiller) calls() int {
 // requirement, or a deployment that has not adopted a station would stop
 // working the moment this check landed.
 func TestQueryService_NoCredentialIsNotARefusal(t *testing.T) {
-	h := newQuerySvcHarness(t)
-	h.svc.SetLocalVersionReporter(stubCursor(1))
+	h := newQuerySvcHarness(t, WithLocalVersionReporter(stubCursor(1)))
 
 	_, err := h.svc.Query(context.Background(), &pb.QueryRequest{
 		KnowledgeBaseId: "kb-1",
@@ -1070,9 +1067,8 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // A PENDING version with durable data is answered from the scan, and the index's two-step
 // rule (§4.2) runs BEHIND that answer: peers first, then a local build.
 func TestQueryService_PendingVersionWarmsTheIndexBehindTheAnswer(t *testing.T) {
-	h := newQuerySvcHarness(t)
 	fetcher := &recordingIndexFetcher{}
-	h.svc.SetIndexFetcher(fetcher)
+	h := newQuerySvcHarness(t, WithIndexFetcher(fetcher))
 	ctx := context.Background()
 
 	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
@@ -1103,9 +1099,8 @@ func TestQueryService_PendingVersionWarmsTheIndexBehindTheAnswer(t *testing.T) {
 
 // The other half: when this node already has the artifact, the warm-up asks nobody.
 func TestQueryService_PendingVersionWithALocalArtifactAsksNoPeer(t *testing.T) {
-	h := newQuerySvcHarness(t)
 	fetcher := &recordingIndexFetcher{}
-	h.svc.SetIndexFetcher(fetcher)
+	h := newQuerySvcHarness(t, WithIndexFetcher(fetcher))
 	ctx := context.Background()
 
 	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
@@ -1141,9 +1136,8 @@ func TestQueryService_PendingVersionWithALocalArtifactAsksNoPeer(t *testing.T) {
 // A durable version too large to scan reaches BOTH paths (the scan's "not now" and the
 // refusal). The warm-up is one per version, so the peers are asked once, not twice.
 func TestQueryService_PendingVersionTooLargeToScanAsksPeersOnce(t *testing.T) {
-	h := newQuerySvcHarness(t)
 	fetcher := &recordingIndexFetcher{}
-	h.svc.SetIndexFetcher(fetcher)
+	h := newQuerySvcHarness(t, WithIndexFetcher(fetcher))
 	h.svc.indexManager = &scanRefusingIndexManager{MockIndexManager: h.indexMgr}
 	ctx := context.Background()
 
@@ -1173,10 +1167,9 @@ func TestQueryService_PendingVersionTooLargeToScanAsksPeersOnce(t *testing.T) {
 // the query's latency. The scan answers, the request returns, and the warm-up is still
 // running behind it.
 func TestQueryService_PendingVersionDoesNotWaitForTheWarmUp(t *testing.T) {
-	h := newQuerySvcHarness(t)
 	release := make(chan struct{})
 	fetcher := &recordingIndexFetcher{block: release}
-	h.svc.SetIndexFetcher(fetcher)
+	h := newQuerySvcHarness(t, WithIndexFetcher(fetcher))
 	ctx := context.Background()
 
 	kbID, vID := h.setupDurableDataWithoutIndex(t, map[string][]string{
@@ -1224,9 +1217,8 @@ func assertNoWarmUp(t *testing.T, h *querySvcHarness, fetcher *recordingIndexFet
 // an artifact). Both empty-looking cases are covered: provably empty, and "not here yet".
 func TestQueryService_PendingVersionScanVerdictDoesNotWarm(t *testing.T) {
 	t.Run("provably empty", func(t *testing.T) {
-		h := newQuerySvcHarness(t)
 		fetcher := &recordingIndexFetcher{}
-		h.svc.SetIndexFetcher(fetcher)
+		h := newQuerySvcHarness(t, WithIndexFetcher(fetcher))
 		ctx := context.Background()
 
 		kbID, vID := h.setupDurableDataWithoutIndex(t, nil)
@@ -1242,9 +1234,8 @@ func TestQueryService_PendingVersionScanVerdictDoesNotWarm(t *testing.T) {
 		assertNoWarmUp(t, h, fetcher)
 	})
 	t.Run("data not on this replica", func(t *testing.T) {
-		h := newQuerySvcHarness(t)
 		fetcher := &recordingIndexFetcher{}
-		h.svc.SetIndexFetcher(fetcher)
+		h := newQuerySvcHarness(t, WithIndexFetcher(fetcher))
 		ctx := context.Background()
 
 		kbID, vID := h.setupDurableDataWithoutIndex(t, nil)
@@ -1272,9 +1263,8 @@ func (m *residentIndexManager) Resident(string, int64) bool { return true }
 // cannot see a build until it finishes, so without the residency check every query of a
 // minutes-long build was a fresh round to every replica.
 func TestQueryService_PendingVersionBeingBuiltHereAsksNoPeer(t *testing.T) {
-	h := newQuerySvcHarness(t)
 	fetcher := &recordingIndexFetcher{}
-	h.svc.SetIndexFetcher(fetcher)
+	h := newQuerySvcHarness(t, WithIndexFetcher(fetcher))
 	h.svc.indexManager = &residentIndexManager{scanRefusingIndexManager{MockIndexManager: h.indexMgr}}
 	ctx := context.Background()
 

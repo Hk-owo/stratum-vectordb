@@ -670,21 +670,31 @@ func TestT4_QueryLatency(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
+	// Establish ONE persistent HTTP/2 client channel to the restarted target for
+	// the cold measurement and subsequent warm steady-state loop (measuring real
+	// persistent-connection query latency instead of per-call TCP/HTTP/2 dials).
+	_, qClient, _, qConn, err := dialNode(storageAddrs[coldIdx])
+	if err != nil {
+		t.Fatalf("dial %s for persistent query measurements: %v", storageAddrs[coldIdx], err)
+	}
+	defer qConn.Close()
+	defaultVec := queryVector(768)
+
 	// The port being open is not the same as the artifact being loaded: that is
 	// exactly the work the cold query pays for.
 	coldStart := time.Now()
-	if _, err := serveFrom(ctx, storageAddrs[coldIdx], kbID, versionID); err != nil {
+	if _, err := serveVectorWithClient(ctx, qClient, kbID, versionID, defaultVec, 5); err != nil {
 		t.Fatalf("the cold query on the restarted node failed: %v", err)
 	}
 	cold := time.Since(coldStart)
-	t.Logf("COLD first query on a restarted replica (index loaded from disk): %v", cold)
+	t.Logf("COLD first query on a restarted replica (persistent HTTP/2 client connection, index loaded from disk): %v", cold)
 
-	// --- Warm ---
+	// --- Warm (reusing persistent HTTP/2 connection) ---
 	queries := stressQueries()
 	warm := make([]time.Duration, 0, queries)
 	for i := 0; i < queries; i++ {
 		start := time.Now()
-		resp, err := serveFrom(ctx, storageAddrs[coldIdx], kbID, versionID)
+		resp, err := serveVectorWithClient(ctx, qClient, kbID, versionID, defaultVec, 5)
 		if err != nil {
 			t.Fatalf("warm query %d/%d failed: %v", i+1, queries, err)
 		}
@@ -694,7 +704,7 @@ func TestT4_QueryLatency(t *testing.T) {
 		}
 	}
 	p50, p95, p99, mean := percentiles(warm)
-	t.Logf("WARM queries=%d mean=%v p50=%v p95=%v p99=%v", len(warm), mean, p50, p95, p99)
+	t.Logf("WARM queries=%d conn=persistent-http2 mean=%v p50=%v p95=%v p99=%v", len(warm), mean, p50, p95, p99)
 
 	// Zero-vector control: the same version on the same replica, queried with the
 	// all-zero vector this suite used to send everywhere. Reported in the same run
@@ -705,7 +715,7 @@ func TestT4_QueryLatency(t *testing.T) {
 	control := make([]time.Duration, 0, 20)
 	for i := 0; i < 20; i++ {
 		start := time.Now()
-		resp, err := serveVector(ctx, storageAddrs[coldIdx], kbID, versionID, make([]float32, 768), 5)
+		resp, err := serveVectorWithClient(ctx, qClient, kbID, versionID, make([]float32, 768), 5)
 		if err != nil {
 			t.Fatalf("zero-vector control query %d/20 failed: %v", i+1, err)
 		}
@@ -717,7 +727,7 @@ func TestT4_QueryLatency(t *testing.T) {
 	cp50, cp95, _, cmean := percentiles(control)
 	t.Logf("ZERO-VECTOR CONTROL queries=%d mean=%v p50=%v p95=%v", len(control), cmean, cp50, cp95)
 
-	t.Logf("QUERY-LATENCY SUMMARY: docs=%d queries=%d cold=%v p50=%v p95=%v p99=%v mean=%v zero_p50=%v",
+	t.Logf("QUERY-LATENCY SUMMARY: docs=%d conn=persistent-http2 queries=%d cold=%v p50=%v p95=%v p99=%v mean=%v zero_p50=%v",
 		docCount, len(warm), cold, p50, p95, p99, mean, cp50)
 }
 

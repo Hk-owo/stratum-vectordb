@@ -46,12 +46,11 @@ func createVersionRequest(kbID string) *pb.CreateVersionRequest {
 // is refused here, and refused BEFORE anything is allocated — no version number, no
 // Raft entry, no retry budget spent on an attempt that could never have succeeded.
 func TestKnowledgeBaseService_CreateVersionRefusesWhenStorageIsDegraded(t *testing.T) {
-	h := newKBSvcTestHarness()
-	h.svc.SetStorageDegradationSource(&stubStorageGate{
+	h := newKBSvcTestHarness(WithKBStorageDegradationSource(&stubStorageGate{
 		degraded: true,
 		detail:   "kb-1: 1 of 3 required replicas live, below the quorum of 2; silent: 2 (never reported)",
 		known:    true,
-	})
+	}))
 
 	_, err := h.svc.CreateVersion(context.Background(), createVersionRequest("kb-1"))
 	if err == nil {
@@ -79,8 +78,7 @@ func TestKnowledgeBaseService_CreateVersionRefusesWhenStorageIsDegraded(t *testi
 // Unknown ALLOWS (fail-open, §3.3). An empty aggregate — what a leadership change
 // looks like — must not become a write outage.
 func TestKnowledgeBaseService_CreateVersionAllowsWhenTheVerdictIsUnknown(t *testing.T) {
-	h := newKBSvcTestHarness()
-	h.svc.SetStorageDegradationSource(&stubStorageGate{known: false})
+	h := newKBSvcTestHarness(WithKBStorageDegradationSource(&stubStorageGate{known: false}))
 
 	resp, err := h.svc.CreateVersion(context.Background(), createVersionRequest("kb-1"))
 	if err != nil {
@@ -100,12 +98,11 @@ func TestKnowledgeBaseService_CreateVersionAllowsWhenTheVerdictIsUnknown(t *test
 // refusal itself is identical — retryable, and the write never reaches the
 // coordinator either way.
 func TestKnowledgeBaseService_CreateVersionNamesTheClusterTier(t *testing.T) {
-	h := newKBSvcTestHarness()
-	h.svc.SetStorageDegradationSource(&stubStorageGate{
+	h := newKBSvcTestHarness(WithKBStorageDegradationSource(&stubStorageGate{
 		unavailable: true,
 		detail:      "kb-1: no required replica is live (the quorum is 2); silent: 1 (never reported), 2 (never reported)",
 		known:       true,
-	})
+	}))
 
 	_, err := h.svc.CreateVersion(context.Background(), createVersionRequest("kb-1"))
 	if err == nil {
@@ -140,12 +137,11 @@ func TestKnowledgeBaseService_CreateVersionUnchangedWithoutAGate(t *testing.T) {
 
 // GetSystemStatus inherits the verdict through health, which is where §4.5 puts it.
 func TestAdminService_GetSystemStatusSurfacesStorageDegradation(t *testing.T) {
-	h := newAdminHarness()
-	h.svc.SetStorageDegradationSource(&stubStorageGate{
+	h := newAdminHarness(WithAdminStorageDegradationSource(&stubStorageGate{
 		degraded: true,
 		detail:   "1 of 3 required replicas live, below the quorum of 2; silent: 2 (never reported)",
 		known:    true,
-	})
+	}))
 
 	resp, err := h.svc.GetSystemStatus(context.Background(), &pb.GetSystemStatusRequest{})
 	if err != nil {
@@ -160,12 +156,11 @@ func TestAdminService_GetSystemStatusSurfacesStorageDegradation(t *testing.T) {
 // that turned this node unhealthy would pull traffic off a node whose reads are
 // still being served, which is the trade-off §2 explicitly keeps (§4.5).
 func TestAdminService_HealthCheckPutsStorageDegradationInDetailsOnly(t *testing.T) {
-	h := newAdminHarness()
-	h.svc.SetStorageDegradationSource(&stubStorageGate{
+	h := newAdminHarness(WithAdminStorageDegradationSource(&stubStorageGate{
 		degraded: true,
 		detail:   "1 of 3 required replicas live, below the quorum of 2",
 		known:    true,
-	})
+	}))
 
 	resp, err := h.svc.HealthCheck(context.Background(), &pb.HealthCheckRequest{})
 	if err != nil {
@@ -182,8 +177,7 @@ func TestAdminService_HealthCheckPutsStorageDegradationInDetailsOnly(t *testing.
 // An unknown verdict says nothing, rather than vouching for a storage layer it
 // cannot see.
 func TestAdminService_HealthCheckSaysNothingWhenTheVerdictIsUnknown(t *testing.T) {
-	h := newAdminHarness()
-	h.svc.SetStorageDegradationSource(&stubStorageGate{known: false})
+	h := newAdminHarness(WithAdminStorageDegradationSource(&stubStorageGate{known: false}))
 
 	resp, err := h.svc.HealthCheck(context.Background(), &pb.HealthCheckRequest{})
 	if err != nil {
@@ -199,10 +193,11 @@ func TestAdminService_HealthCheckSaysNothingWhenTheVerdictIsUnknown(t *testing.T
 func TestKnowledgeBaseService_GetStorageDegradation(t *testing.T) {
 	ask := func(t *testing.T, gate StorageDegradationSource) *pb.GetStorageDegradationResponse {
 		t.Helper()
-		h := newKBSvcTestHarness()
+		var opts []KnowledgeBaseOption
 		if gate != nil {
-			h.svc.SetStorageDegradationSource(gate)
+			opts = append(opts, WithKBStorageDegradationSource(gate))
 		}
+		h := newKBSvcTestHarness(opts...)
 		resp, err := h.svc.GetStorageDegradation(context.Background(), &pb.GetStorageDegradationRequest{})
 		if err != nil {
 			t.Fatalf("GetStorageDegradation failed: %v", err)

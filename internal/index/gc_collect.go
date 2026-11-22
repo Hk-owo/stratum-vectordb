@@ -33,19 +33,17 @@ type ReplicaCounter interface {
 	IndexReadyReplicaCount(ctx context.Context, kbID string, versionID int64, except int64) (int, error)
 }
 
-// SetGCReplicaCounter wires the serving-replica lookup and this node's identity.
+// WithGCReplicaCounter wires the serving-replica lookup and this node's identity.
 //
 // nodeID matters because the question is "how many OTHERS are serving": a node
 // about to step out must not count itself among the servers still up. A nil
-// counter or a zero nodeID leaves collection off — without them this node cannot
-// tell whether stepping out would leave anyone behind, and assuming it would not
-// is a gamble with read availability.
-func (im *IndexManagerImpl) SetGCReplicaCounter(counter ReplicaCounter, nodeID int64) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-	im.replicaCounter = counter
-	if nodeID != 0 {
-		im.cfg.NodeID = nodeID
+// counter or a zero nodeID leaves collection off.
+func WithGCReplicaCounter(counter ReplicaCounter, nodeID int64) IndexManagerOption {
+	return func(im *IndexManagerImpl) {
+		im.replicaCounter = counter
+		if nodeID != 0 {
+			im.cfg.NodeID = nodeID
+		}
 	}
 }
 

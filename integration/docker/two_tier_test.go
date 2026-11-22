@@ -122,6 +122,12 @@ func serveVector(ctx context.Context, addr, kbID string, versionID int64, vector
 	}
 	defer conn.Close()
 
+	return serveVectorWithClient(ctx, q, kbID, versionID, vector, topK)
+}
+
+// serveVectorWithClient issues Query over an already-established QueryServiceClient
+// so latency loops measure steady-state HTTP/2 reuse instead of per-call handshakes.
+func serveVectorWithClient(ctx context.Context, q pb.QueryServiceClient, kbID string, versionID int64, vector []float32, topK int) (*pb.QueryResponse, error) {
 	version := versionID
 	return q.Query(ctx, &pb.QueryRequest{
 		KnowledgeBaseId: kbID,

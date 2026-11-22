@@ -322,9 +322,8 @@ func TestAwaitVersion_UnknownVersionAndKnowledgeBase(t *testing.T) {
 // --- data_missing --------------------------------------------------------
 
 func TestProbeDataMissing_RespectsTheAgeThreshold(t *testing.T) {
-	svc, _, _, v := newAwaitHarness(t)
 	checker := &probeSpy{}
-	svc.SetPresenceProbe(checker, func() []string { return []string{"r1", "r2"} })
+	svc, _, _, v := newAwaitHarness(t, WithPresenceProbe(checker, func() []string { return []string{"r1", "r2"} }))
 
 	// The default threshold is what keeps a version allocated a moment ago from
 	// being called missing, and below it the probe must not even ask.
@@ -352,8 +351,7 @@ func TestProbeDataMissing_ThreeStates(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			svc, _, _, v := newAwaitHarness(t)
-			svc.SetPresenceProbe(tc.checker, func() []string { return []string{"r1", "r2"} })
+			svc, _, _, v := newAwaitHarness(t, WithPresenceProbe(tc.checker, func() []string { return []string{"r1", "r2"} }))
 
 			got := svc.probeDataMissing(context.Background(),
 				types.VersionMeta{KBID: "kb", VersionID: v, DataStatus: types.DataStatusPending}, StageDataPending)
@@ -368,9 +366,8 @@ func TestProbeDataMissing_OnlyAsksWhilePending(t *testing.T) {
 	restore := shortenDataMissingMinAge(t)
 	defer restore()
 
-	svc, _, _, v := newAwaitHarness(t)
 	checker := &probeSpy{holds: map[string]bool{}}
-	svc.SetPresenceProbe(checker, func() []string { return []string{"r1"} })
+	svc, _, _, v := newAwaitHarness(t, WithPresenceProbe(checker, func() []string { return []string{"r1"} }))
 
 	if got := svc.probeDataMissing(context.Background(),
 		types.VersionMeta{KBID: "kb", VersionID: v, DataStatus: types.DataStatusDurable}, StageIndexReady); got {
@@ -385,9 +382,8 @@ func TestProbeDataMissing_CachesTheVerdict(t *testing.T) {
 	restore := shortenDataMissingMinAge(t)
 	defer restore()
 
-	svc, _, _, v := newAwaitHarness(t)
 	checker := &probeSpy{holds: map[string]bool{}}
-	svc.SetPresenceProbe(checker, func() []string { return []string{"r1", "r2"} })
+	svc, _, _, v := newAwaitHarness(t, WithPresenceProbe(checker, func() []string { return []string{"r1", "r2"} }))
 	meta := types.VersionMeta{KBID: "kb", VersionID: v, DataStatus: types.DataStatusPending}
 
 	for i := 0; i < 3; i++ {
@@ -415,7 +411,7 @@ func TestProbeDataMissing_SkipsWhenUnwired(t *testing.T) {
 
 // --- helpers -------------------------------------------------------------
 
-func newAwaitHarness(t *testing.T) (*KnowledgeBaseServiceImpl, *raft.MockRaftNode, string, int64) {
+func newAwaitHarness(t *testing.T, opts ...KnowledgeBaseOption) (*KnowledgeBaseServiceImpl, *raft.MockRaftNode, string, int64) {
 	t.Helper()
 	w := wal.NewMockWAL()
 	rn := raft.NewMockRaftNode(w)
@@ -423,6 +419,7 @@ func newAwaitHarness(t *testing.T) (*KnowledgeBaseServiceImpl, *raft.MockRaftNod
 		coordinator.NewMockWriteCoordinator(),
 		coordinator.NewMockDeleteCoordinator(),
 		coordinator.NewMockDeleteVersionCoordinator(),
+		opts...,
 	)
 	ctx := context.Background()
 	resp, err := svc.CreateKnowledgeBase(ctx, &pb.CreateKnowledgeBaseRequest{
@@ -662,9 +659,8 @@ func (f *fakeVersionWatcher) counts() (watches, stops int) {
 // item 1: the wait costs what the change costs. Without the watcher this call
 // would sit out a full awaitPollInterval after the state had already moved.
 func TestAwaitVersion_WakesOnTheWatcherInsteadOfPolling(t *testing.T) {
-	svc, rn, kbID, v := newAwaitHarness(t)
 	watcher := newFakeVersionWatcher()
-	svc.SetVersionWatcher(watcher)
+	svc, rn, kbID, v := newAwaitHarness(t, WithVersionWatcher(watcher))
 
 	go func() {
 		time.Sleep(10 * time.Millisecond)

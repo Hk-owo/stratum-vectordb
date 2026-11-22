@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -147,7 +148,15 @@ func TestRaftNodeImpl_InstalledSnapshotIsPersisted(t *testing.T) {
 // and Deleting versions must be skipped: syncing them could prematurely
 // READY-mark a version whose data is still being written.
 func TestRaftNodeImpl_InstalledSnapshotTriggersVersionSync(t *testing.T) {
-	impl, _ := newTestRaftNodeImpl(t)
+	var seen atomic.Int32
+	var capture atomic.Bool
+	synced := make(chan string, 4)
+	impl, _ := newTestRaftNodeImpl(t, WithOnVersionCreated(func(kbID string, versionID int64) {
+		seen.Add(1)
+		if capture.Load() {
+			synced <- fmt.Sprintf("%s/%d", kbID, versionID)
+		}
+	}))
 	ctx := proposeCtx(t)
 
 	// Snapshot installation must announce PENDING versions just as applying
@@ -169,12 +178,12 @@ func TestRaftNodeImpl_InstalledSnapshotTriggersVersionSync(t *testing.T) {
 	}
 	_ = v3 // stays PENDING: no READY status update
 
-	// Register the hook only now, so it observes only the snapshot-install
-	// trigger — not the normal apply path of the versions above.
-	synced := make(chan string, 4)
-	impl.SetOnVersionCreated(func(kbID string, versionID int64) {
-		synced <- fmt.Sprintf("%s/%d", kbID, versionID)
-	})
+	// Wait until the three initial creates have finished invoking the apply hook
+	// before arming capture, so we observe ONLY the snapshot-install triggers.
+	if !waitForCond(t, 2*time.Second, func() bool { return seen.Load() == 3 }) {
+		t.Fatalf("expected 3 initial create hooks, got %d", seen.Load())
+	}
+	capture.Store(true)
 
 	data, err := impl.sm.serialize()
 	if err != nil {

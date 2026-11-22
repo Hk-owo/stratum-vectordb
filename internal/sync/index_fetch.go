@@ -8,10 +8,10 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	pb "stratum/api/proto/stratum"
+	"stratum/internal/rpcpool"
 )
 
 // indexChunkSize is how much of an index file travels per stream message,
@@ -47,20 +47,15 @@ var ErrIndexNotExported = errors.New("sync: the peer does not hold this version'
 // fetch is an optimisation, and a version that cannot be fetched must still
 // become servable.
 type IndexFetcher struct {
-	// Dial is injectable for tests; nil means a plain insecure dial.
+	// Pool supplies long-lived outbound storage-peer channels when Dial is nil.
+	Pool *rpcpool.Pool
+	// Dial is injectable for tests; nil uses Pool or rpcpool's default dialer.
 	Dial func(ctx context.Context, addr string) (*grpc.ClientConn, error)
 }
 
 // NewIndexFetcher returns a fetcher that dials peers directly.
 func NewIndexFetcher() *IndexFetcher {
 	return &IndexFetcher{}
-}
-
-func (f *IndexFetcher) dial(ctx context.Context, addr string) (*grpc.ClientConn, error) {
-	if f.Dial != nil {
-		return f.Dial(ctx, addr)
-	}
-	return grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 }
 
 // FetchIndex pulls one version's built index from a peer that holds it.
@@ -71,11 +66,11 @@ func (f *IndexFetcher) dial(ctx context.Context, addr string) (*grpc.ClientConn,
 // directions so the two never drift; nothing here validates the CONTENT — the
 // installer does, against the checksum the sidecar carries.
 func (f *IndexFetcher) FetchIndex(ctx context.Context, sourceAddr, kbID string, versionID int64) (indexData, sidecarData []byte, err error) {
-	conn, err := f.dial(ctx, sourceAddr)
+	conn, release, err := rpcpool.Acquire(ctx, f.Pool, f.Dial, nil, sourceAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sync: FetchIndex: dial %s: %w", sourceAddr, err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer release()
 
 	stream, err := pb.NewDataSyncServiceClient(conn).FetchIndexData(ctx, &pb.FetchIndexDataRequest{
 		KnowledgeBaseId: kbID,

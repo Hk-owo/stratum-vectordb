@@ -53,14 +53,14 @@ func (stubLiveness) VersionLiveness(context.Context, string, *int64, *int64) ([]
 func newSweepPlane(t *testing.T, store VersionTombstones, log DeletionLogSource) *LocalDataPlane {
 	t.Helper()
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
-		IndexManager:  &stubIndexStore{},
-		LocalVersions: &stubLocalVersions{},
-		Liveness:      stubLiveness{},
-		DataDropper:   &stubDropper{},
-		Verify:        func(context.Context, string, int64) bool { return true },
-		Resolve:       func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil },
+		IndexManager:      &stubIndexStore{},
+		LocalVersions:     &stubLocalVersions{},
+		Liveness:          stubLiveness{},
+		DataDropper:       &stubDropper{},
+		VersionTombstones: store,
+		Verify:            func(context.Context, string, int64) bool { return true },
+		Resolve:           func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil },
 	})
-	dp.SetVersionTombstones(store)
 	dp.deletions = log
 	// As if a full pass had just run: these cases are about the incremental DECISION.
 	// A fresh process starts with the zero value, which forces one full pass — the
@@ -597,13 +597,13 @@ func TestLocalDataPlane_WriteVersionDataRefusesAVersionKnownDeleted(t *testing.T
 	}
 	tr := &tracer{}
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
-		IndexManager: &stubIndexStore{},
-		WAL:          &stubWAL{t: tr},
-		Executor:     &stubExecutor{t: tr, docIDs: []string{"doc-1"}},
-		Verify:       func(context.Context, string, int64) bool { return true },
-		Resolve:      func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil },
+		IndexManager:      &stubIndexStore{},
+		WAL:               &stubWAL{t: tr},
+		Executor:          &stubExecutor{t: tr, docIDs: []string{"doc-1"}},
+		VersionTombstones: store,
+		Verify:            func(context.Context, string, int64) bool { return true },
+		Resolve:           func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil },
 	})
-	dp.SetVersionTombstones(store)
 
 	err := dp.WriteVersionData(ctx, "kb-1", 5, 4, nil)
 	if !errors.Is(err, stratumerrors.ErrVersionDeleting) {
@@ -625,13 +625,13 @@ func TestLocalDataPlane_ResumeVersionWriteRefusesAVersionKnownDeleted(t *testing
 	}
 	tr := &tracer{}
 	dp := NewLocalDataPlane(LocalDataPlaneConfig{
-		IndexManager: &stubIndexStore{},
-		WAL:          &stubWAL{t: tr},
-		Executor:     &stubExecutor{t: tr, docIDs: []string{"doc-1"}},
-		Verify:       func(context.Context, string, int64) bool { return true },
-		Resolve:      func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil },
+		IndexManager:      &stubIndexStore{},
+		WAL:               &stubWAL{t: tr},
+		Executor:          &stubExecutor{t: tr, docIDs: []string{"doc-1"}},
+		VersionTombstones: store,
+		Verify:            func(context.Context, string, int64) bool { return true },
+		Resolve:           func(context.Context, string, int64) (string, bool, error) { return "peer-a", true, nil },
 	})
-	dp.SetVersionTombstones(store)
 
 	err := dp.ResumeVersionWrite(ctx, "kb-1", 5, 4, nil)
 	if !errors.Is(err, stratumerrors.ErrVersionDeleting) {
