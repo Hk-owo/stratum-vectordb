@@ -18,12 +18,14 @@
  *        都只是文本——所以判定只能落在 grpc_code 上。
  */
 
-/** 网关的错误体形状（cmd/stratum-gateway 的 writeError）。 */
+/** 网关的错误体形状（cmd/stratum-gateway 的 writeError 与 writeOpsError）。 */
 export interface GatewayErrorBody {
   error: string
-  grpc_code: string
+  grpc_code?: string
   /** 稳定错误名（internal/errors）。同一个 grpc_code 下可能有等一等就好和换操作才行两种情况。 */
   reason?: string
+  /** /ops/* 的稳定错误码（例如 DOCKER_DISABLED / FORBIDDEN）。 */
+  code?: string
 }
 
 /** §4.4 的映射里前端会分支处理的那几个（其余按 string 收）。 */
@@ -42,13 +44,16 @@ export class ApiError extends Error {
   readonly grpcCode: GrpcCode
   /** 服务端的稳定错误名；网关没给时为空串。 */
   readonly reason: string
+  /** /ops/* 返回的稳定错误码；未提供时为空串。 */
+  readonly opsCode: string
 
-  constructor(status: number, grpcCode: GrpcCode, message: string, reason = '') {
+  constructor(status: number, grpcCode: GrpcCode, message: string, reason = '', opsCode = '') {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.grpcCode = grpcCode
     this.reason = reason
+    this.opsCode = opsCode
   }
 
   /**
@@ -121,7 +126,7 @@ export interface RequestOptions {
 }
 
 async function request<T>(
-  method: 'GET' | 'POST' | 'PUT',
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE',
   path: string,
   body?: unknown,
   opts?: RequestOptions,
@@ -151,6 +156,7 @@ async function request<T>(
       toGrpcCode(errBody?.grpc_code),
       errBody?.error ?? `HTTP ${res.status}`,
       errBody?.reason ?? '',
+      errBody?.code ?? '',
     )
   }
 
@@ -164,6 +170,7 @@ export const api = {
   // PUT 只在 /ops/* 用得上（保存启动参数与 docker 集群参数），/api/* 的契约
   // 里没有它：那里的写操作都是"提交一件事"，不是"替换一份配置"。
   put: <T>(path: string, body?: unknown): Promise<T> => request<T>('PUT', path, body),
+  del: <T>(path: string, body?: unknown): Promise<T> => request<T>('DELETE', path, body),
 }
 
 /** 路径里的 id 一律过一遍 encodeURIComponent：KB id 是服务端生成的，但不该假设它的字符集。 */

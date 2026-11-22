@@ -1,53 +1,49 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
-import type { HealthStatus } from './api/gen/admin'
-import { useHealth, useSystemStatus } from './api/queries'
+import { ApiError } from './api/client'
+import { HealthStatus } from './api/gen/admin'
+import { useHealth } from './api/queries'
 import { InFlightPanel } from './components/InFlightPanel'
-import { SettingsDialog } from './components/SettingsDialog'
+import { KbManagerDialog } from './components/KbManagerDialog'
 import { KbPicker } from './components/KbPicker'
+import { SettingsDialog } from './components/SettingsDialog'
 import { ExitGuard } from './exit/ExitGuard'
-import { loadPrefs, savePrefs } from './settings/store'
 import { Documents } from './pages/Documents'
 import { History } from './pages/History'
 import { Ops } from './pages/Ops'
 import { Search } from './pages/Search'
 import { SystemStatus } from './pages/SystemStatus'
 import { Versions } from './pages/Versions'
-
-/**
- * 应用壳：知识库选择 + 导航 + 页面。
- *
- * 顶栏刻意只放两样东西：当前知识库，以及**健康指示**。后者要一直在，因为
- * "网关还活着吗"是任何一次失败的第一个分支——但它不该抢占页面内容。
- *
- * 另外注意路由：这里用的是组件内状态，没引 router。原因是 gateway 用
- * `http.FileServer` 提供静态资源，对 `/versions` 这种深链会 404（没有 SPA
- * fallback）。改用状态切换就不必为此动网关，代价是 URL 不反映当前页——对一个
- * 控制台可接受。
- *
- * 「运维」页不是一条指向别处的外链，而是这一层里的一个普通页面：网关的 `/ops/*`
- * 是纯 JSON API（那里没有 HTML），所以运维能力只能由前端自己调它来做——以前 sidebar
- * 底部那个 `<a href="/ops/">` 因此永远只会打开一个 404。
- */
+import { loadPrefs, savePrefs } from './settings/store'
 
 type PageId = 'search' | 'documents' | 'versions' | 'history' | 'status' | 'ops'
 
-const PAGES: ReadonlyArray<{ id: PageId; label: string }> = [
+const WORKSPACE_PAGES: ReadonlyArray<{ id: PageId; label: string }> = [
   { id: 'search', label: '检索' },
   { id: 'documents', label: '文档' },
   { id: 'versions', label: '版本' },
   { id: 'history', label: '历史' },
+]
+
+const ADMIN_PAGES: ReadonlyArray<{ id: PageId; label: string }> = [
   { id: 'status', label: '系统状态' },
   { id: 'ops', label: '运维' },
 ]
 
+const ALL_PAGES = [...WORKSPACE_PAGES, ...ADMIN_PAGES]
+
+function parseHashPage(): PageId {
+  const raw = window.location.hash.replace(/^#/, '')
+  return ALL_PAGES.some((p) => p.id === raw) ? (raw as PageId) : 'search'
+}
+
 function healthLabel(status: HealthStatus | undefined): string {
   switch (status) {
-    case 'HEALTH_STATUS_HEALTHY':
+    case HealthStatus.HEALTH_STATUS_HEALTHY:
       return '健康'
-    case 'HEALTH_STATUS_DEGRADED':
+    case HealthStatus.HEALTH_STATUS_DEGRADED:
       return '降级'
-    case 'HEALTH_STATUS_UNHEALTHY':
+    case HealthStatus.HEALTH_STATUS_UNHEALTHY:
       return '不健康'
     case undefined:
       return '连接中…'
@@ -58,11 +54,11 @@ function healthLabel(status: HealthStatus | undefined): string {
 
 function healthClass(status: HealthStatus | undefined): string {
   switch (status) {
-    case 'HEALTH_STATUS_HEALTHY':
+    case HealthStatus.HEALTH_STATUS_HEALTHY:
       return 'badge ok'
-    case 'HEALTH_STATUS_DEGRADED':
+    case HealthStatus.HEALTH_STATUS_DEGRADED:
       return 'badge warn'
-    case 'HEALTH_STATUS_UNHEALTHY':
+    case HealthStatus.HEALTH_STATUS_UNHEALTHY:
       return 'badge bad'
     default:
       return 'badge'
@@ -70,12 +66,25 @@ function healthClass(status: HealthStatus | undefined): string {
 }
 
 export default function App() {
-  const [page, setPage] = useState<PageId>('search')
+  const [page, setPage] = useState<PageId>(() => parseHashPage())
   const [kbId, setKbId] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [kbManagerOpen, setKbManagerOpen] = useState(false)
+  const [searchVersionPreset, setSearchVersionPreset] = useState<string | null>(null)
 
-  // 恢复上次选中的知识库。读设置失败不阻塞：退回"未选中"，用户重选一次即可
-  // ——总比界面起不来强。
+  const navigate = useCallback((next: PageId) => {
+    setPage(next)
+    if (window.location.hash !== `#${next}`) {
+      window.location.hash = next
+    }
+  }, [])
+
+  useEffect(() => {
+    const onHash = () => setPage(parseHashPage())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+
   useEffect(() => {
     void (async () => {
       const p = await loadPrefs()
@@ -83,85 +92,148 @@ export default function App() {
     })()
   }, [])
 
-  // 选中即持久化。写在 handler 里而不是 effect 里：effect 会在恢复阶段把刚读到
-  // 的值再写回去一次，那一次写没有意义。
   function selectKb(next: string) {
     setKbId(next)
     void savePrefs({ selected_kb_id: next })
   }
 
-  // 5 秒轮询健康：这是控制台唯一需要"自己动"的指标。
-  const health = useHealth(5000)
-  const status = useSystemStatus()
+  function clearKb() {
+    setKbId(null)
+    void savePrefs({ selected_kb_id: null })
+  }
 
-  // 存储层降级是只读用户唯一的降级信号（QueryResponse.storage_degraded 的注释
-  // 写明了理由：低于 quorum 时读照样服务，不主动报出来就永远发现不了）。
-  // 这里把它提到全局，因为它在任何一页都成立，而不是检索页独有的事实。
-  const degraded = status.data?.health?.status === 'HEALTH_STATUS_DEGRADED'
+  const health = useHealth(5000)
+  const degraded = health.data?.status === HealthStatus.HEALTH_STATUS_DEGRADED
 
   return (
     <div className="app">
       <nav className="sidebar" aria-label="主导航">
-        <div className="brand">Stratum</div>
-        {PAGES.map((p) => (
+        <div className="brand-row">
+          <div className="brand">
+            <span className="brand-mark">S</span>
+            <span>Stratum</span>
+          </div>
+        </div>
+
+        <div className="nav-group">
+          <div className="nav-group-label">工作区</div>
+          {WORKSPACE_PAGES.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              className="nav-item"
+              aria-current={p.id === page ? 'page' : undefined}
+              onClick={() => navigate(p.id)}
+            >
+              <span>{p.label}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="nav-group">
+          <div className="nav-group-label">集群运维</div>
+          {ADMIN_PAGES.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              className="nav-item"
+              aria-current={p.id === page ? 'page' : undefined}
+              onClick={() => navigate(p.id)}
+            >
+              <span>{p.label}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="sidebar-footer">
           <button
-            key={p.id}
             type="button"
-            className="nav-item"
-            aria-current={p.id === page ? 'page' : undefined}
-            onClick={() => setPage(p.id)}
+            className="icon-btn"
+            title="连接设置：改 gateway 地址、看本机数据目录"
+            onClick={() => setSettingsOpen(true)}
           >
-            {p.label}
+            连接设置
           </button>
-        ))}
+        </div>
       </nav>
 
       <main className="main">
         <div className="topbar">
-          <h1 className="title">{PAGES.find((p) => p.id === page)?.label ?? ''}</h1>
+          <div className="topbar-left">
+            <h1 className="title">{ALL_PAGES.find((p) => p.id === page)?.label ?? ''}</h1>
+          </div>
           <div className="topbar-right">
-            <KbPicker value={kbId} onChange={selectKb} />
+            <InFlightPanel />
+            <KbPicker
+              value={kbId}
+              onChange={selectKb}
+              onClear={clearKb}
+              onOpenManager={() => setKbManagerOpen(true)}
+            />
             <span className={healthClass(health.data?.status)} title={health.data?.details ?? ''}>
               <span className="dot" />
               {health.isPending ? '连接中…' : healthLabel(health.data?.status)}
             </span>
-            {/* 连哪个 gateway 是客户的部署决定，不该被编译进客户端。 */}
-            <button
-              type="button"
-              className="icon-btn"
-              title="连接设置：改 gateway 地址、看本机数据目录"
-              onClick={() => setSettingsOpen(true)}
-            >
-              连接设置
-            </button>
           </div>
         </div>
 
-        {health.error !== null && (
-          <p className="error-box">
-            网关不可达：{health.error.message}
-          </p>
-        )}
-        {degraded && (
-          <p className="notice warn">
-            集群健康状态为「降级」。读仍在服务，但副本掉得比要求的多——写入可能被拒。
-          </p>
-        )}
+        <div className="page">
+          {health.error !== null && (
+            <p className="error-box">
+              {health.error instanceof ApiError && health.error.status === 401
+                ? '网关拒绝了当前访问（401 未授权）：如果当前不是通过 http://127.0.0.1:8081 或 http://localhost:8081 打开，浏览器在普通 http:// 局域网 IP 下不会发送同源校验头，请改用 localhost / 127.0.0.1（或端口转发）访问。'
+                : `网关不可达：${health.error.message}`}
+            </p>
+          )}
+          {degraded && (
+            <p className="notice warn">
+              集群健康状态为「降级」。读仍在服务，但副本低于 quorum 要求，写入可能被拒。
+              {health.data?.details !== undefined && health.data.details !== ''
+                ? `（${health.data.details}）`
+                : ''}
+            </p>
+          )}
 
-        {page === 'search' && <Search kbId={kbId} />}
-        {page === 'documents' && <Documents kbId={kbId} />}
-        {page === 'versions' && <Versions kbId={kbId} />}
-        {page === 'history' && <History />}
-        {page === 'status' && <SystemStatus />}
-        {page === 'ops' && <Ops />}
+          {page === 'search' && (
+            <Search
+              kbId={kbId}
+              presetVersionId={searchVersionPreset}
+              onClearPreset={() => setSearchVersionPreset(null)}
+              onOpenKbManager={() => setKbManagerOpen(true)}
+            />
+          )}
 
-        <InFlightPanel />
+          {/* 文档页保持挂载，切页不丢失待提交文件队列 */}
+          <div hidden={page !== 'documents'}>
+            <Documents kbId={kbId} onOpenKbManager={() => setKbManagerOpen(true)} />
+          </div>
+
+          {page === 'versions' && (
+            <Versions
+              kbId={kbId}
+              onJumpToSearch={(vid) => {
+                setSearchVersionPreset(vid)
+                navigate('search')
+              }}
+              onOpenKbManager={() => setKbManagerOpen(true)}
+            />
+          )}
+          {page === 'history' && <History />}
+          {page === 'status' && <SystemStatus />}
+          {page === 'ops' && <Ops />}
+        </div>
       </main>
 
-      {/* 退出拦截：桌面壳拦窗口关闭，浏览器拦 beforeunload。判据见 exit/activity.ts。 */}
       <ExitGuard />
 
       <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <KbManagerDialog
+        open={kbManagerOpen}
+        selectedKbId={kbId}
+        onSelectKb={selectKb}
+        onClearKb={clearKb}
+        onClose={() => setKbManagerOpen(false)}
+      />
     </div>
   )
 }

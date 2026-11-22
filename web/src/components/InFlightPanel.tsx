@@ -5,60 +5,39 @@ import type { ListVersionsResponse } from '../api/gen/knowledgebase'
 import { chainTail } from '../ingest/chainTail'
 import { resendPending } from '../pending/resend'
 import { refreshUnsettled, removePending, type PendingWrite } from '../pending/store'
+import { ConfirmButton } from './ConfirmButton'
 
 /**
- * 在途批次面板。
- *
- * 它读的是 IndexedDB 里那些"提交了但还没落地"的记录——**刷新页面之后依然在**。
- * 这不是一个便利功能，而是整套设计里唯一能救回数据的入口：集群不替任何人保存
- * changes（客户端之外的唯一副本要等协调者写下 WAL BEGIN 才出现），所以这份记录
- * 就是"还有东西悬着"的全部证据。
- *
- * 因此这一行**必须带动作**。只显示"有东西悬着"而不给出口，用户唯一能做的就是
- * 丢弃——而那恰好是把数据彻底扔掉。服务端等的正是"调用方按同一个
- * client_request_id 再举一次"（§7.12），这里就是那个动作。
- *
- * 三种可能的结局都在这上面：
- *   · DONE     —— 复用首次分配的版本，数据落地了。
- *   · WAIT     —— 版本还活着但没到 READY（索引在建、或 FAILED 等运维 rebuild）：
- *                 记录留着，可以再点一次。
- *   · DISCARD  —— 没有副本持有数据，而 changes 也已不在别处：数据确实回不来了，
- *                 记录会被清掉，面板上直接说明。
+ * 在途批次面板（挂在顶栏角标 + 抽屉，避免被埋在长页面最底部）。
  */
 export function InFlightPanel() {
   const [rows, setRows] = useState<PendingWrite[]>([])
   const [error, setError] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
-  /** 正在重发的记录 id。 */
   const [busy, setBusy] = useState<string | null>(null)
-  /** 每条记录上一次动作的结果。 */
   const [results, setResults] = useState<Record<string, string>>({})
 
   async function refresh() {
     try {
-      // refreshUnsettled 而不是 loadUnsettled：它顺手更新退出判据读的那份同步
-      // 镜像（exit/activity.ts）。两处用同一个事实来源，就不会出现"面板说有、
-      // 退出拦截说没有"这种各读各的。
       setRows(await refreshUnsettled())
       setError(null)
     } catch (err) {
-      // 读不出来（隐私模式等）要说出来：静默空列表会被误读成"没有在途数据"，
-      // 而那正是最不该误判的一件事。
       setError(err instanceof Error ? err.message : String(err))
     }
   }
 
   useEffect(() => {
     void refresh()
+    const timer = setInterval(() => {
+      void refresh()
+    }, 5000)
+    return () => clearInterval(timer)
   }, [])
 
   async function resend(w: PendingWrite) {
     setBusy(w.id)
     setResults((p) => ({ ...p, [w.id]: '重发中…' }))
     try {
-      // 链尾现取，不用记录里存的：首次提交若压根没分配出版本，这次就是全新的提交，
-      // parent 必须指向真正的链尾；若已分配过版本，服务端按同一个 key 复用，
-      // parent 不参与分配。
       const vs = await api.get<ListVersionsResponse>(kbPath(w.knowledge_base_id, '/versions'))
       const tail = chainTail(vs.versions)
       const outcome = await resendPending(w, tail.kind === 'ok' ? tail.versionId : null, {
@@ -86,62 +65,91 @@ export function InFlightPanel() {
   }
 
   if (error !== null) {
-    return <p className="badge bad">在途记录不可读：{error}</p>
+    return <span className="badge bad">在途记录不可读：{error}</span>
   }
 
   if (rows.length === 0) return null
 
   return (
-    <div className="inflight">
-      <button type="button" className="inflight-toggle" onClick={() => setOpen((v) => !v)}>
-        <span className="badge warn">
-          <span className="dot" />
-          在途 {rows.length} 批
-        </span>
-        <span className="muted small">{open ? '收起' : '展开'}</span>
+    <>
+      <button
+        type="button"
+        className="badge warn"
+        onClick={() => {
+          void refresh()
+          setOpen(true)
+        }}
+        title="查看并恢复未完成确认的提交批次"
+      >
+        <span className="dot" />
+        在途 {rows.length} 批
       </button>
 
       {open && (
-        <ul className="status-list">
-          {rows.map((w) => (
-            <li key={w.id}>
-              <code>{w.knowledge_base_id}</code>{' '}
-              {w.version_id !== '' && <code>v{w.version_id}</code>}{' '}
-              <span className="muted small">
-                {w.changes.length} 个文档 · {new Date(w.submitted_at).toLocaleString()}
-              </span>
-              <br />
-              <span className="muted small">
-                幂等键 <code>{w.client_request_id}</code>（重发必须带同一个）
-              </span>
-              <div className="actions" style={{ marginTop: 6 }}>
-                <button
-                  type="button"
-                  disabled={busy !== null}
-                  title="用同一个 client_request_id 再举一次：服务端认它就会复用首次分配的版本，不会另开一个"
-                  onClick={() => void resend(w)}
+        <div className="modal-backdrop" onClick={() => setOpen(false)}>
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2 className="modal-title">在途提交批次（{rows.length}）</h2>
+              <button type="button" className="btn-sm" onClick={() => void refresh()}>
+                刷新
+              </button>
+            </div>
+            <p className="muted small">
+              以下批次尚未确认到达终态。集群不保存未落地前的 changes，刷新或重连后可在此按原{' '}
+              <code>client_request_id</code> 续传或确认丢弃。
+            </p>
+            <ul className="status-list" style={{ listStyle: 'none', paddingLeft: 0 }}>
+              {rows.map((w) => (
+                <li
+                  key={w.id}
+                  className="status-section"
+                  style={{ marginBottom: 10 }}
                 >
-                  {busy === w.id ? '重发中…' : '重发'}
-                </button>
-                <button
-                  type="button"
-                  className="danger"
-                  disabled={busy !== null}
-                  title="从本机记录中移除——只在确认这个版本已经不可能落地、并且不再需要重发时使用。移除后数据将无法救回"
-                  onClick={() => {
-                    void removePending(w.id).then(refresh)
-                  }}
-                >
-                  丢弃记录
-                </button>
-              </div>
-              {results[w.id] !== undefined && (
-                <span className="muted small">{results[w.id]}</span>
-              )}
-            </li>
-          ))}
-        </ul>
+                  <div className="toolbar">
+                    <div>
+                      <code>{w.knowledge_base_id}</code>{' '}
+                      {w.version_id !== '' && <span className="chip accent">v{w.version_id}</span>}{' '}
+                      <span className="muted small">
+                        {w.changes.length} 个文档 · {new Date(w.submitted_at).toLocaleString()}
+                      </span>
+                    </div>
+                    <div className="actions">
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        disabled={busy !== null}
+                        title="用同一个 client_request_id 重发：服务端认它就会复用首次分配的版本"
+                        onClick={() => void resend(w)}
+                      >
+                        {busy === w.id ? '重发中…' : '重发 / 继续等待'}
+                      </button>
+                      <ConfirmButton
+                        label="丢弃记录"
+                        confirmLabel="确认永久丢弃"
+                        className="danger"
+                        disabled={busy !== null}
+                        title="移除本机记录后，若数据未落盘将无法再救回"
+                        onConfirm={() => void removePending(w.id).then(refresh)}
+                      />
+                    </div>
+                  </div>
+                  <div className="muted small">
+                    幂等键：<code>{w.client_request_id}</code>
+                  </div>
+                  {results[w.id] !== undefined && (
+                    <div className="notice small">{results[w.id]}</div>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setOpen(false)}>
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
       )}
-    </div>
+    </>
   )
 }

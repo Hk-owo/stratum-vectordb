@@ -18,7 +18,7 @@ export const protobufPackage = "stratum";
  * whole cluster state. External applications should prefer
  * GetSystemStatus for diagnostics.
  *
- * See Stratum_接口设计v9.md "AdminService" for the authoritative
+ * See docs/参考/历史/Stratum_接口设计v9.md "AdminService" for the authoritative
  * specification.
  *
  * Reserved (not implemented): GetMetrics, GetAuditLog. Per
@@ -44,7 +44,7 @@ export interface StuckVersion {
 
 /**
  * FailedVersion is a version the control layer declared FAILED_PERMANENT
- * (Stratum_设计文档v13.md §10.1): its Saga spent the retry budget, nothing retries
+ * (docs/参考/历史/Stratum_设计文档v13.md §10.1): its Saga spent the retry budget, nothing retries
  * it automatically, and only an operator can retry or abandon it. The cause
  * chain is carried along so acting on it needs no further digging.
  */
@@ -100,13 +100,19 @@ export interface GetSystemStatusResponse {
    * data_missing_versions lists PENDING versions whose data no candidate
    * replica holds: they cannot become READY on their own and are only
    * recoverable by the writer re-sending its changes under the same
-   * client_request_id (Stratum_设计文档v13.md §7.12).
+   * client_request_id (docs/参考/历史/Stratum_设计文档v13.md §7.12).
    */
   data_missing_versions: StuckVersion[];
   /**
    * failed_permanent_versions lists versions that will never become READY on
    * their own: the control layer has declared them dead and only an operator
-   * can retry or abandon them (Stratum_设计文档v13.md §10.1).
+   * can retry or abandon them (docs/参考/历史/Stratum_设计文档v13.md §10.1).
+   *
+   * The remedy is ForceRetryVersion (index side, revocable) or
+   * ForceAbandonVersion (removes the version from the chain). Abandoning is also
+   * what clears the verdict's leftovers on STORAGE nodes: a verdict travels the
+   * Raft log and so reaches only members, while a deletion is broadcast to every
+   * candidate replica.
    */
   failed_permanent_versions: FailedVersion[];
   /**
@@ -122,6 +128,99 @@ export interface GetSystemStatusResponse {
    * why it has to be visible rather than silently endured.
    */
   gc_blocked_versions: GCBlockedVersion[];
+  /**
+   * reclaim diagnoses the §7.5 reclaim watermark — "which recorded changes may this node
+   * drop" — when it cannot be established at all.
+   *
+   * It exists because that failure is otherwise silent in the other direction: WAL
+   * reclamation simply stops for the knowledge base, and nothing else reports it. The
+   * state is not a fault — the watermark is deliberately conservative, and
+   * a required replica that is merely away holds it still — but it is also not visible
+   * anywhere else, and its remedy (dropping the node from storage.nodes) is a decision an
+   * operator has to make deliberately.
+   */
+  reclaim:
+    | ReclaimDiagnostics
+    | undefined;
+  /**
+   * node_state is THIS node's own lifecycle phase, its own view of storage
+   * redundancy, and what it is currently working on
+   * (docs/已实施/storage-node-state-machine-plan.md §3).
+   *
+   * It is the one place to ask "what state is this node in". Before it, that
+   * answer was computed on demand in six unrelated places and differed by
+   * caller: the process phase was not represented at all, redundancy was
+   * re-derived from a report aggregate per call, and "index build in progress"
+   * was private to the index manager. The other fields of this response
+   * describe conditions that need a human; this one describes the node.
+   */
+  node_state:
+    | NodeState
+    | undefined;
+  /**
+   * version_states lists this node's versions that are NOT at rest — being
+   * built, or with a failed build. Deliberately not every version: data
+   * present with no index is the designed state of a version nobody has asked
+   * for (lazy builds), and a node holding thousands of READY versions has
+   * nothing to report about each. What belongs here is the small, moving set.
+   */
+  version_states: VersionStateEntry[];
+}
+
+/**
+ * NodeState is the storage node's own lifecycle phase and local view
+ * (docs/已实施/storage-node-state-machine-plan.md §3).
+ */
+export interface NodeState {
+  /** state is STARTING / RECONCILING / SERVING / STOPPING. */
+  state: string;
+  /** since is when the current phase was entered, RFC3339. */
+  since: string;
+  /**
+   * redundancy is UNKNOWN / HEALTHY / DEGRADED / UNAVAILABLE.
+   *
+   * UNKNOWN is not a problem state: it is this node saying it has no basis for
+   * a verdict (it does not lead the control plane, or nothing has reported
+   * yet). The write gate fails OPEN on exactly this input, so a reader must
+   * not treat it as evidence of trouble.
+   */
+  redundancy: string;
+  /**
+   * redundancy_detail explains a non-healthy redundancy verdict, and is empty
+   * otherwise.
+   */
+  redundancy_detail: string;
+  /**
+   * actions is what the node is doing right now — "reconciling indexes",
+   * "building 3 index(es)", "catching up kb-1". FOR HUMANS: it is a projection
+   * of the phase and the version states, and nothing may branch on it.
+   */
+  actions: string[];
+}
+
+/**
+ * VersionStateEntry is one version's local state on the node that answered
+ * (docs/已实施/storage-node-state-machine-plan.md §4).
+ */
+export interface VersionStateEntry {
+  kb_id: string;
+  version_id: string;
+  /**
+   * state is ABSENT / DATA_PRESENT / BUILDING / READY / BUILD_FAILED.
+   *
+   * This is a LOCAL fact and is not IndexStatus or DataStatus: those are the
+   * control layer's replicated metadata, identical on every node and copied
+   * through snapshots. The same version is routinely READY on one replica,
+   * BUILDING on the next and DATA_PRESENT on the third, which is healthy
+   * rather than divergent. The control layer's FAILED_PERMANENT does not
+   * appear here at all — that verdict is the retry budget's conclusion, and
+   * this node knows only that its own build failed.
+   */
+  state: string;
+  /** since is when the version entered state, RFC3339. */
+  since: string;
+  /** detail carries the cause for BUILD_FAILED, empty otherwise. */
+  detail: string;
 }
 
 /**
@@ -151,6 +250,46 @@ export interface GCBlockedVersion {
    * knows better than a constant chosen in this repository.
    */
   blocked_since: string;
+}
+
+/**
+ * ReclaimDiagnostics answers "why is the §7.5 reclaim watermark not moving", which the
+ * bare absence of a watermark cannot: reclaiming simply stops, and the only other trace
+ * is a warning line in the node's log.
+ */
+export interface ReclaimDiagnostics {
+  /**
+   * judgement_available=false means THIS NODE cannot answer yet (it has not finished a
+   * reclaim pass, or no replica topology is wired). blocked is then empty because it is
+   * UNKNOWN, not because nothing is blocked — the two fields have to be read together,
+   * or a node that has not judged reads as a clean bill of health.
+   */
+  judgement_available: boolean;
+  blocked: ReclaimBlockedKB[];
+}
+
+/**
+ * ReclaimBlockedKB is one knowledge base whose watermark cannot be established, with the
+ * replicas that are keeping it that way.
+ */
+export interface ReclaimBlockedKB {
+  kb_id: string;
+  blockers: ReclaimBlocker[];
+}
+
+/**
+ * ReclaimBlocker is one replica that kept a knowledge base's watermark unavailable on
+ * the answering node's last reclaim pass.
+ */
+export interface ReclaimBlocker {
+  /**
+   * reason is one of two stable wire names:
+   *   "unreachable"      — the replica could not be asked;
+   *   "no_cursor_for_kb" — it answers, but holds nothing for this knowledge base.
+   */
+  reason: string;
+  /** address is the replica's storage address, or "local" for the answering node itself. */
+  address: string;
 }
 
 /**
@@ -272,7 +411,7 @@ export interface AdminService {
   WarmupVersion(request: WarmupVersionRequest): Promise<WarmupVersionResponse>;
   /**
    * The operator's three verbs for a version the control layer declared
-   * FAILED_PERMANENT (Stratum_设计文档v13.md §10.1): see it, retry it, abandon it.
+   * FAILED_PERMANENT (docs/参考/历史/Stratum_设计文档v13.md §10.1): see it, retry it, abandon it.
    *
    * They live here rather than on KnowledgeBaseService because the caller is an
    * operator acting on a verdict, not an application working with a version — and

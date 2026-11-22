@@ -35,6 +35,6 @@ grep -A3 'export interface QueryResponse' src/api/gen/query.ts
 
 网关设了 `EmitUnpopulated: true`，所以**零值字段也会出现**——枚举总是显式的字符串，不用拿"字段缺失"反推零值。这对前端是好事：不需要为"字段可能不存在"写分支。
 
-## 为什么只生成这三个文件
+## 为什么只生成这四个入口
 
-`query.proto` / `knowledgebase.proto` / `admin.proto` 是网关对外暴露的三个服务。`internal.proto`、`sync.proto`、`kvraft/`、`vecstore/` 是集群内部协议，网关有意不转发（见 README 的服务边界一节），前端不生成它们。
+`query.proto` / `knowledgebase.proto` / `admin.proto` / `storage_admin.proto` 是网关对外暴露的四个服务（`storage_admin.proto` 引用了 `internal.proto` 里的存储目录消息结构，因此会连带生成 `internal.ts`）。`sync.proto`、`kvraft/`、`vecstore/` 是集群内部协议，网关不转发，前端不生成它们。

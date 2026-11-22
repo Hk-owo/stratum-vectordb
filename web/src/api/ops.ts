@@ -348,6 +348,7 @@ export function useNodeLogs(
   localNodeId: number | null,
   service: ServiceId | null,
   lines: number,
+  refetchIntervalMs?: number,
 ) {
   return useQuery({
     queryKey: opsQk.logs(nodeId ?? -1, service ?? 'vecstore', lines),
@@ -357,14 +358,16 @@ export function useNodeLogs(
           `?lines=${lines}`,
       ),
     enabled: nodeId !== null && service !== null,
+    refetchInterval: refetchIntervalMs,
     retry: false,
   })
 }
 
-export function useDockerStatus(refetchIntervalMs = 5000) {
+export function useDockerStatus(refetchIntervalMs = 5000, enabled = true) {
   return useQuery({
     queryKey: opsQk.dockerStatus,
     queryFn: () => api.get<DockerStatus>('/ops/docker/status'),
+    enabled,
     refetchInterval: refetchIntervalMs,
     retry: false,
   })
@@ -379,11 +382,16 @@ export function useDockerConfig() {
 }
 
 /** docker 节点日志用 query 而不是 mutation：它是"看当前状态"，换个节点就是换一份数据。 */
-export function useDockerNodeLogs(nodeId: number | null, lines: number) {
+export function useDockerNodeLogs(
+  nodeId: number | null,
+  lines: number,
+  refetchIntervalMs?: number,
+) {
   return useQuery({
     queryKey: opsQk.dockerLogs(nodeId ?? -1, lines),
     queryFn: () => api.get<DockerNodeLogs>(`/ops/docker/logs/${nodeId as number}?lines=${lines}`),
     enabled: nodeId !== null,
+    refetchInterval: refetchIntervalMs,
     retry: false,
   })
 }

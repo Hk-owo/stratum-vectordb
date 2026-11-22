@@ -88,7 +88,7 @@ export async function awaitUntilTerminal(
       target:
         target === 'DATA_DURABLE'
           ? AwaitTarget.AWAIT_TARGET_DATA_DURABLE
-          : AwaitTarget.AWAIT_TARGET_INDEX_READY,
+          : AwaitTarget.AWAIT_TARGET_QUERYABLE,
       // int64 在 protojson 里是字符串（见 gen/README.md），所以这里要转。
       //
       // 值就取服务端自己的上限。以前这里传的是客户端的 30s 请求超时，而服务端每次

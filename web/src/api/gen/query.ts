@@ -12,7 +12,7 @@ export const protobufPackage = "stratum";
  * query.proto — external QueryService contract: vector queries against a
  * knowledge base version.
  *
- * See Stratum_接口设计v9.md "QueryService" for the authoritative
+ * See docs/参考/历史/Stratum_接口设计v9.md "QueryService" for the authoritative
  * specification.
  *
  * Reserved (not implemented): BatchQuery, HybridQuery. Per
@@ -53,7 +53,7 @@ export interface QueryRequest {
   aggregation: AggregationMethod;
   /**
    * min_version is the freshness credential the service station attaches
-   * (Stratum_设计文档v13.md §9.3): "the version the caller should be seeing".
+   * (docs/参考/历史/Stratum_设计文档v13.md §9.3): "the version the caller should be seeing".
    * A replica whose contiguous history has not reached it must refuse the
    * query rather than answer from a state that is complete but stale — the
    * failure mode §9.1 risk 1 describes, where a lagging node returns an
@@ -68,7 +68,7 @@ export interface QueryRequest {
 }
 
 /**
- * NOTE on authentication (Stratum_设计文档v13.md §9.3(5)): the service station
+ * NOTE on authentication (docs/参考/历史/Stratum_设计文档v13.md §9.3(5)): the service station
  * does not forward the caller's credential, and there is deliberately no
  * "authenticated" field here. The internal trust mark travels as gRPC metadata
  * (see internal/router/auth.go), because it is transport-level context rather
@@ -86,7 +86,7 @@ export interface QueryResponse {
   /**
    * storage_degraded reports that the storage layer is below quorum for this
    * knowledge base: fewer than QuorumSize(replicas) of the replicas that must
-   * hold it are still reporting (docs/storage-degradation-signal-plan.md §10.1).
+   * hold it are still reporting (docs/已实施/storage-degradation-signal-plan.md §10.1).
    *
    * It rides a READ response on purpose, and it is a REPORT rather than an error
    * condition: the results above are complete and were served by a replica that

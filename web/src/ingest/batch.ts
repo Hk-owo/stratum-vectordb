@@ -138,6 +138,10 @@ export interface SubmitOptions {
 export interface SubmitSummary {
   /** 每个落地批次分配到的版本号，按提交顺序。 */
   versions: string[]
+  /** 真正落地的 UPDATE/ADD 文档 doc_id 列表（用于精确更新本地指纹）。 */
+  succeededDocIds: string[]
+  /** 真正落地的 DELETE 文档 doc_id 列表（用于清除本地指纹）。 */
+  deletedDocIds: string[]
   /** 没能走到 READY 的文档，附原因。 */
   failed: Array<{ docId: string; message: string }>
   /** 有内容落地的最后一个版本号，用作下一批的 parent。 */
@@ -261,6 +265,8 @@ async function submitBatchWithRecovery(
 export async function submitBatches(opts: SubmitOptions): Promise<SubmitSummary> {
   const batches = planBatches(opts.items)
   const versions: string[] = []
+  const succeededDocIds: string[] = []
+  const deletedDocIds: string[] = []
   const failed: Array<{ docId: string; message: string }> = []
   let parent = opts.parentVersionId
 
@@ -269,12 +275,12 @@ export async function submitBatches(opts: SubmitOptions): Promise<SubmitSummary>
 
     for (const it of batch.items) opts.onItem?.(it.docId, { status: 'submitting' })
 
-    // 全部用 UPDATE：服务端对不存在的 doc_id 就是 ADD（§2.2），不必区分。
-    const changes: Change[] = batch.items.map((it) => ({
-      op: ChangeOp.CHANGE_OP_UPDATE,
-      doc_id: it.docId,
-      content: it.content,
-    }))
+    // 默认用 UPDATE：服务端对不存在的 doc_id 就是 ADD（§2.2）；DELETE 只带 doc_id。
+    const changes: Change[] = batch.items.map((it) =>
+      it.op === 'DELETE'
+        ? { op: ChangeOp.CHANGE_OP_DELETE, doc_id: it.docId, content: '' }
+        : { op: ChangeOp.CHANGE_OP_UPDATE, doc_id: it.docId, content: it.content },
+    )
 
     let outcome: BatchOutcome
     try {
@@ -294,6 +300,11 @@ export async function submitBatches(opts: SubmitOptions): Promise<SubmitSummary>
         versions.push(outcome.versionId)
         parent = outcome.versionId
         for (const it of batch.items) {
+          if (it.op === 'DELETE') {
+            deletedDocIds.push(it.docId)
+          } else {
+            succeededDocIds.push(it.docId)
+          }
           opts.onItem?.(it.docId, { status: 'done', versionId: outcome.versionId })
         }
         break
@@ -325,5 +336,5 @@ export async function submitBatches(opts: SubmitOptions): Promise<SubmitSummary>
     }
   }
 
-  return { versions, failed, lastVersionId: parent }
+  return { versions, succeededDocIds, deletedDocIds, failed, lastVersionId: parent }
 }

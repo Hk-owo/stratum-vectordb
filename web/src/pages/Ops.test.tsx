@@ -171,4 +171,14 @@ describe('Ops 渲染', () => {
     // 没有表单：那一栏的字段不该出现。
     expect(html).not.toContain('container_prefix')
   })
+
+  it('GET /ops/docker/config 返回 enabled=false 时也渲染启用卡片而非表单', () => {
+    const qc = emptyClient()
+    qc.setQueryData(opsQk.nodes, nodes())
+    qc.setQueryData(opsQk.dockerConfig, { ...dockerConfig(), enabled: false })
+    const html = render(qc)
+    expect(html).toContain('未启用')
+    expect(html).toContain('启用 docker 集群管理')
+    expect(html).not.toContain('container_prefix')
+  })
 })

@@ -47,6 +47,9 @@ function status(): GetSystemStatusResponse {
       },
     ],
     gc_blocked_versions: [],
+    reclaim: undefined,
+    node_state: undefined,
+    version_states: [],
   }
 }
 
@@ -76,5 +79,59 @@ describe('SystemStatus', () => {
     const html = render()
     expect(html).toContain('重试索引')
     expect(html).toContain('放弃')
+  })
+
+  it('渲染新增的 node_state、version_states、reclaim 与存储目录', () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    qc.setQueryData(qk.systemStatus, {
+      ...status(),
+      node_state: {
+        state: 'SERVING',
+        since: '2026-11-19T00:00:00Z',
+        redundancy: 'DEGRADED',
+        redundancy_detail: '2 of 3 replicas live',
+        actions: ['building 1 index(es)'],
+      },
+      version_states: [
+        {
+          kb_id: 'kb-1',
+          version_id: '3',
+          state: 'BUILDING',
+          since: '2026-11-19T00:00:01Z',
+          detail: '',
+        },
+      ],
+      reclaim: {
+        judgement_available: true,
+        blocked: [
+          {
+            kb_id: 'kb-blocked',
+            blockers: [{ reason: 'unreachable', address: '127.0.0.1:7102' }],
+          },
+        ],
+      },
+    } satisfies GetSystemStatusResponse)
+    qc.setQueryData(qk.storageDirectory, {
+      revision: '12',
+      nodes: [{ node_id: '1', address: '127.0.0.1:7100', management_state: 'active' }],
+      placements: [],
+      tombstones: [],
+      active_versions: {},
+      health: {},
+      migrations: [],
+      service_blocks: {},
+      cleanups: [],
+    })
+    const html = renderToString(
+      <QueryClientProvider client={qc}>
+        <SystemStatus />
+      </QueryClientProvider>,
+    )
+    expect(html).toContain('SERVING')
+    expect(html).toContain('2 of 3 replicas live')
+    expect(html).toContain('BUILDING')
+    expect(html).toContain('kb-blocked')
+    expect(html).toContain('127.0.0.1:7102')
+    expect(html).toContain('127.0.0.1:7100')
   })
 })

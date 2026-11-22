@@ -70,7 +70,7 @@ async function awaitTarget(
       wait_timeout_ms: String(SERVER_WAIT_TIMEOUT_MS),
     })
     const reached =
-      target === AwaitTarget.AWAIT_TARGET_INDEX_READY
+      target === AwaitTarget.AWAIT_TARGET_QUERYABLE
         ? resp.stage === 'INDEX_READY'
         : resp.stage !== 'DATA_PENDING'
     if (reached || Date.now() > deadline) return resp.stage
@@ -143,7 +143,7 @@ describe.skipIf(!alive)('与真实 gateway 的契约', () => {
     expect(typeof durableStage).toBe('string')
 
     // 轮询到 READY：单次窗口只有 5s，靠一个大的 timeout 是等不到的。
-    expect(await awaitTarget(kbId, vid, AwaitTarget.AWAIT_TARGET_INDEX_READY)).toBe('INDEX_READY')
+    expect(await awaitTarget(kbId, vid, AwaitTarget.AWAIT_TARGET_QUERYABLE)).toBe('INDEX_READY')
   })
 
   it('GET …/versions → 两个状态位都是字符串枚举', async () => {
@@ -234,7 +234,7 @@ describe.skipIf(!alive)('与真实 gateway 的契约', () => {
     // **必须先等就绪**：还没落地的 PENDING 版本属于 `discard-version` 的辖区，
     // 对它调 delete-version 服务端会以 `router: no leader available` 回绝
     // （那个错名是误导性的，见下面的用例）。
-    await awaitTarget(kbId, created.version_id, AwaitTarget.AWAIT_TARGET_INDEX_READY)
+    await awaitTarget(kbId, created.version_id, AwaitTarget.AWAIT_TARGET_QUERYABLE)
 
     const r = await api.post<{ success: boolean }>(kbPath(kbId, '/delete-version'), {
       knowledge_base_id: kbId,

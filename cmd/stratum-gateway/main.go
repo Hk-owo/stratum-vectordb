@@ -63,9 +63,10 @@ var (
 // routing layer (stratum-router). The router handles leader discovery,
 // write forwarding and read load-balancing across the cluster.
 type gateway struct {
-	kb    pb.KnowledgeBaseServiceClient
-	query pb.QueryServiceClient
-	admin pb.AdminServiceClient
+	kb           pb.KnowledgeBaseServiceClient
+	query        pb.QueryServiceClient
+	admin        pb.AdminServiceClient
+	storageAdmin pb.StorageAdminServiceClient
 
 	// embedClients keeps one HTTP embed client per service address, for
 	// /api/query-text. A search is a short-lived request, so re-dialing per call
@@ -126,9 +127,10 @@ func main() {
 	defer conn.Close()
 
 	g := &gateway{
-		kb:    pb.NewKnowledgeBaseServiceClient(conn),
-		query: pb.NewQueryServiceClient(conn),
-		admin: pb.NewAdminServiceClient(conn),
+		kb:           pb.NewKnowledgeBaseServiceClient(conn),
+		query:        pb.NewQueryServiceClient(conn),
+		admin:        pb.NewAdminServiceClient(conn),
+		storageAdmin: pb.NewStorageAdminServiceClient(conn),
 	}
 
 	// --- Ops console (control plane) ---
@@ -232,6 +234,14 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 			return g.kb.DeleteKnowledgeBase(ctx, r)
 		},
 	))
+	mux.HandleFunc("DELETE /api/knowledge-bases/{id}", func(w http.ResponseWriter, r *http.Request) {
+		resp, err := g.kb.DeleteKnowledgeBase(r.Context(), &pb.DeleteKnowledgeBaseRequest{KnowledgeBaseId: r.PathValue("id")})
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, resp)
+	})
 	mux.HandleFunc("GET /api/knowledge-bases/{id}/versions", func(w http.ResponseWriter, r *http.Request) {
 		resp, err := g.kb.ListVersions(r.Context(), &pb.ListVersionsRequest{KnowledgeBaseId: r.PathValue("id")})
 		if err != nil {
@@ -259,13 +269,15 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 			return g.kb.AwaitVersion(ctx, r)
 		},
 	))
-	mux.HandleFunc("POST /api/knowledge-bases/{id}/rollback", handleWithID(
+	activateHandler := handleWithID(
 		func() *pb.RollbackVersionRequest { return &pb.RollbackVersionRequest{} },
 		func(r *pb.RollbackVersionRequest, id string) { r.KnowledgeBaseId = id },
 		func(ctx context.Context, r *pb.RollbackVersionRequest) (*pb.RollbackVersionResponse, error) {
 			return g.kb.RollbackVersion(ctx, r)
 		},
-	))
+	)
+	mux.HandleFunc("POST /api/knowledge-bases/{id}/rollback", activateHandler)
+	mux.HandleFunc("POST /api/knowledge-bases/{id}/activate", activateHandler)
 	mux.HandleFunc("POST /api/knowledge-bases/{id}/rebuild", handleWithID(
 		func() *pb.RebuildIndexRequest { return &pb.RebuildIndexRequest{} },
 		func(r *pb.RebuildIndexRequest, id string) { r.KnowledgeBaseId = id },
@@ -287,6 +299,32 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 			return g.kb.DeleteVersion(ctx, r)
 		},
 	))
+	mux.HandleFunc("DELETE /api/knowledge-bases/{id}/versions/{vid}", func(w http.ResponseWriter, r *http.Request) {
+		vid, err := strconv.ParseInt(r.PathValue("vid"), 10, 64)
+		if err != nil {
+			writeError(w, status.Errorf(codes.InvalidArgument, "invalid version_id %q", r.PathValue("vid")))
+			return
+		}
+		mode := pb.VersionDeleteMode_VERSION_DELETE_MODE_SUBTREE
+		if rawMode := strings.TrimSpace(r.URL.Query().Get("mode")); rawMode != "" {
+			v, ok := parseVersionDeleteMode(rawMode)
+			if !ok {
+				writeError(w, status.Errorf(codes.InvalidArgument, "unknown delete mode %q", rawMode))
+				return
+			}
+			mode = v
+		}
+		resp, err := g.kb.DeleteVersion(r.Context(), &pb.DeleteVersionRequest{
+			KnowledgeBaseId: r.PathValue("id"),
+			VersionId:       vid,
+			Mode:            mode,
+		})
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, resp)
+	})
 
 	// DiscardVersion abandons a version whose write never landed: a write to the
 	// leader, admissible only while the version is still PENDING
@@ -350,6 +388,102 @@ func (g *gateway) registerRoutes(mux *http.ServeMux) {
 	// "a vector", and this is a convenience for callers that have no embedder of
 	// their own (web/src/api/queries.ts describes the same split from the UI side).
 	mux.HandleFunc("POST /api/query-text", g.handleQueryText)
+
+	// --- StorageAdminService ---
+	mux.HandleFunc("GET /api/storage/directory", func(w http.ResponseWriter, r *http.Request) {
+		req := &pb.GetStorageDirectoryRequest{
+			KnowledgeBaseId: r.URL.Query().Get("knowledge_base_id"),
+		}
+		if rawNodeID := strings.TrimSpace(r.URL.Query().Get("node_id")); rawNodeID != "" {
+			nid, err := strconv.ParseInt(rawNodeID, 10, 64)
+			if err != nil {
+				writeError(w, status.Errorf(codes.InvalidArgument, "invalid node_id %q", rawNodeID))
+				return
+			}
+			req.NodeId = nid
+		}
+		resp, err := g.storageAdmin.GetDirectory(r.Context(), req)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, resp)
+	})
+	mux.HandleFunc("POST /api/storage/nodes/register", handle(
+		func() *pb.RegisterStorageNodesRequest { return &pb.RegisterStorageNodesRequest{} },
+		func(ctx context.Context, r *pb.RegisterStorageNodesRequest) (*pb.StorageAdminResult, error) {
+			return g.storageAdmin.RegisterNodes(ctx, r)
+		},
+	))
+	mux.HandleFunc("POST /api/storage/nodes/{node_id}/manage", func(w http.ResponseWriter, r *http.Request) {
+		nid, err := strconv.ParseInt(r.PathValue("node_id"), 10, 64)
+		if err != nil {
+			writeError(w, status.Errorf(codes.InvalidArgument, "invalid node_id %q", r.PathValue("node_id")))
+			return
+		}
+		req := &pb.ManageStorageNodeRequest{}
+		if err := readBody(r, req); err != nil {
+			writeError(w, err)
+			return
+		}
+		req.NodeId = nid
+		resp, err := g.storageAdmin.ManageNode(r.Context(), req)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, resp)
+	})
+	mux.HandleFunc("POST /api/storage/nodes/{node_id}/drain", func(w http.ResponseWriter, r *http.Request) {
+		nid, err := strconv.ParseInt(r.PathValue("node_id"), 10, 64)
+		if err != nil {
+			writeError(w, status.Errorf(codes.InvalidArgument, "invalid node_id %q", r.PathValue("node_id")))
+			return
+		}
+		req := &pb.DrainStorageNodeRequest{}
+		if err := readBody(r, req); err != nil {
+			writeError(w, err)
+			return
+		}
+		req.NodeId = nid
+		resp, err := g.storageAdmin.DrainNode(r.Context(), req)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, resp)
+	})
+	mux.HandleFunc("POST /api/storage/migrations", handle(
+		func() *pb.MigrateStorageKBRequest { return &pb.MigrateStorageKBRequest{} },
+		func(ctx context.Context, r *pb.MigrateStorageKBRequest) (*pb.StorageAdminResult, error) {
+			return g.storageAdmin.MigrateKB(ctx, r)
+		},
+	))
+	mux.HandleFunc("POST /api/storage/migrations/{operation_id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		req := &pb.CancelStorageMigrationRequest{}
+		if err := readBody(r, req); err != nil {
+			writeError(w, err)
+			return
+		}
+		req.OperationId = r.PathValue("operation_id")
+		resp, err := g.storageAdmin.CancelMigration(r.Context(), req)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, resp)
+	})
+}
+
+func parseVersionDeleteMode(raw string) (pb.VersionDeleteMode, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(raw))
+	if v, ok := pb.VersionDeleteMode_value[upper]; ok {
+		return pb.VersionDeleteMode(v), true
+	}
+	if v, ok := pb.VersionDeleteMode_value["VERSION_DELETE_MODE_"+upper]; ok {
+		return pb.VersionDeleteMode(v), true
+	}
+	return pb.VersionDeleteMode_VERSION_DELETE_MODE_SUBTREE, false
 }
 
 // handle adapts a no-path-parameter gRPC method into an http.HandlerFunc.
@@ -432,6 +566,10 @@ func writeError(w http.ResponseWriter, err error) {
 		httpCode = http.StatusNotFound
 	case codes.FailedPrecondition:
 		httpCode = http.StatusPreconditionFailed
+	case codes.Unauthenticated:
+		httpCode = http.StatusUnauthorized
+	case codes.PermissionDenied:
+		httpCode = http.StatusForbidden
 	case codes.Unavailable:
 		httpCode = http.StatusServiceUnavailable
 	case codes.Unimplemented:

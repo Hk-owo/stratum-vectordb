@@ -12,7 +12,7 @@ export const protobufPackage = "stratum";
  * knowledgebase.proto — external KnowledgeBaseService contract: knowledge
  * base lifecycle and version management.
  *
- * See Stratum_接口设计v9.md "KnowledgeBaseService" for the authoritative
+ * See docs/参考/历史/Stratum_接口设计v9.md "KnowledgeBaseService" for the authoritative
  * specification.
  *
  * Reserved (not implemented): DiffVersions, TagVersion. Per
@@ -23,12 +23,19 @@ export const protobufPackage = "stratum";
  *
  * GetVersion is no longer on this list: the control layer reads a single
  * version through raft.RaftNode.GetVersion, and callers reach the same
- * information through AwaitVersion below (docs/await-version-plan.md §7).
+ * information through AwaitVersion below (docs/已实施/await-version-plan.md §7).
  */
 
 /** IndexStatus mirrors internal/types.IndexStatus. */
 export enum IndexStatus {
-  /** INDEX_STATUS_PENDING - metadata allocated, storage-layer write in progress; not queryable */
+  /**
+   * INDEX_STATUS_PENDING - The index has not been built and reported READY yet. That covers BOTH halves
+   * of a write — "the storage-layer write is in progress" and "the data is
+   * durable, the index is a read-side product nobody has built" — so it does not
+   * by itself mean "not queryable": a version is queryable once its DATA is
+   * durable (DATA_STATUS), because a small one is answered by scanning its chunks
+   * until a build catches up (§8.6(b)).
+   */
   INDEX_STATUS_PENDING = "INDEX_STATUS_PENDING",
   /** INDEX_STATUS_READY - index build complete; queryable */
   INDEX_STATUS_READY = "INDEX_STATUS_READY",
@@ -43,7 +50,7 @@ export enum IndexStatus {
  * DataStatus mirrors internal/types.DataStatus: a version's DATA-side state,
  * kept separate from IndexStatus because the two fail apart — a version whose
  * data is durable may still have no working index, and an index that never built
- * says nothing about whether the data landed (Stratum_设计文档v13.md §10.1b).
+ * says nothing about whether the data landed (docs/参考/历史/Stratum_设计文档v13.md §10.1b).
  */
 export enum DataStatus {
   /** DATA_STATUS_PENDING - metadata allocated, storage-layer write in flight */
@@ -89,7 +96,7 @@ export enum Similarity {
 
 /**
  * QuantizerType mirrors the vecstore-side QuantizerTypeProto
- * (Stratum_设计文档v12.md 2.4): how the in-memory index stores vector
+ * (docs/参考/历史/Stratum_设计文档v12.md 2.4): how the in-memory index stores vector
  * payloads. QUANTIZER_OFF keeps full-precision HNSW (single-stage exact
  * search); the others build quantized coarse retrievers whose results are
  * re-ranked against full-precision vectors on disk.
@@ -120,14 +127,23 @@ export enum ChangeOp {
 }
 
 /**
- * AwaitTarget is what a caller is waiting for. It is deliberately NOT
- * DataStatus: INDEX_READY is an IndexStatus value, so a DataStatus-typed field
- * could not represent the default target at all (docs/await-version-plan.md §5).
+ * AwaitTarget is what a caller is waiting for.
+ *
+ * BOTH values now mean the same thing — the version's DATA is durable — and the
+ * second exists only so a caller can say it explicitly. INDEX_READY used to be
+ * the default and to mean "an index is on disk", which §8.6(b) made un-waitable:
+ * a version is built when something asks for it, so a version nobody has queried
+ * never reaches INDEX_READY however long a caller waits. Waiting for a state the
+ * design deliberately does not produce is not a contract, it is a deadlock with
+ * a timeout (docs/已实施/index-owner-sharding-plan.md §4).
+ *
+ * A caller that needs the INDEX ready should ask for it (WarmupVersion) or query
+ * the version, rather than wait for it to happen.
  */
 export enum AwaitTarget {
-  /** AWAIT_TARGET_INDEX_READY - default: queryable — also the precondition for activating a version */
-  AWAIT_TARGET_INDEX_READY = "AWAIT_TARGET_INDEX_READY",
-  /** AWAIT_TARGET_DATA_DURABLE - data durable only: batch imports that rebuild indexes afterwards */
+  /** AWAIT_TARGET_QUERYABLE - default: the version's data is durable here */
+  AWAIT_TARGET_QUERYABLE = "AWAIT_TARGET_QUERYABLE",
+  /** AWAIT_TARGET_DATA_DURABLE - the same thing, said explicitly */
   AWAIT_TARGET_DATA_DURABLE = "AWAIT_TARGET_DATA_DURABLE",
   UNRECOGNIZED = "UNRECOGNIZED",
 }
@@ -241,6 +257,28 @@ export interface KnowledgeBaseInfo {
   pq_nbits: number;
 }
 
+export interface GetStorageDegradationRequest {
+}
+
+export interface GetStorageDegradationResponse {
+  /**
+   * known=false means this node cannot judge: it is not the control leader, or no
+   * heartbeat has arrived yet. It is neither healthy nor unavailable, and a caller MUST
+   * allow the write: the verdict is soft state, so a leadership change must not become
+   * a write outage.
+   */
+  known: boolean;
+  /** degraded: fewer than a quorum of the required replicas are live, but someone answers. */
+  degraded: boolean;
+  /**
+   * storage_unavailable: not one required replica is live. Exclusive with degraded, so
+   * the two refusals (kb_storage_degraded, storage_unavailable) stay distinguishable.
+   */
+  storage_unavailable: boolean;
+  /** detail is the diagnosis a refusal carries. Empty when known is false. */
+  detail: string;
+}
+
 export interface CreateKnowledgeBaseRequest {
   name: string;
   chunk_window_size: number;
@@ -258,13 +296,18 @@ export interface CreateKnowledgeBaseRequest {
   pq_m: number;
   /** PQ only; 0 = default 8 */
   pq_nbits: number;
+  /**
+   * Initial placement for a NEW KB only. Empty preserves the full deployment
+   * policy. Changing an existing KB's members requires a migration.
+   */
+  storage_replica_ids: string[];
 }
 
 export interface CreateKnowledgeBaseResponse {
   knowledge_base_id: string;
   /**
    * initial_version_id is always 0: creating a knowledge base no longer creates
-   * a version (docs/cursor-persistence-plan.md §5). A version's document set is
+   * a version (docs/已实施/cursor-persistence-plan.md §5). A version's document set is
    * inherited from its parent, so a version created with an empty changes list
    * would mean "unchanged", not "empty" — and the two were only ever the same
    * thing at the root of a chain. A first version now appears when something is
@@ -293,7 +336,7 @@ export interface CreateVersionRequest {
    * (for the same knowledge base) reuses the version the first attempt
    * allocated instead of allocating another one — which is what lets a client
    * re-send the changes for a version whose data never landed
-   * (Stratum_设计文档v13.md §7.12). Empty keeps the historical behaviour: every
+   * (docs/参考/历史/Stratum_设计文档v13.md §7.12). Empty keeps the historical behaviour: every
    * call allocates a new version.
    */
   client_request_id: string;
@@ -307,7 +350,7 @@ export interface CreateVersionResponse {
    * caller's own when it sent one, otherwise the one the control layer generated.
    * It travels back so a caller that omitted it still has something to re-send
    * under — the only way to recover a version whose data never landed
-   * (Stratum_设计文档v13.md §7.12, docs/await-version-plan.md §7 Step 4).
+   * (docs/参考/历史/Stratum_设计文档v13.md §7.12, docs/已实施/await-version-plan.md §7 Step 4).
    *
    * What it is NOT: a promise that the version will complete. It is a handle for
    * a decision the caller owns (§2.1).
@@ -341,7 +384,7 @@ export interface AwaitVersionRequest {
   /** required: a version id is unique within a knowledge base */
   knowledge_base_id: string;
   version_id: string;
-  /** default AWAIT_TARGET_INDEX_READY */
+  /** default AWAIT_TARGET_QUERYABLE */
   target: AwaitTarget;
   /** this call's longest wait; the server caps it */
   wait_timeout_ms: string;
@@ -362,7 +405,7 @@ export interface AwaitVersionResponse {
    * while the version is PENDING and older than the probe's age threshold, and
    * it does NOT change stage — it is the fact a caller needs in order to decide
    * between re-sending its changes and discarding the version. The server never
-   * makes that choice for the caller (docs/await-version-plan.md §4.3).
+   * makes that choice for the caller (docs/已实施/await-version-plan.md §4.3).
    */
   data_missing: boolean;
 }
@@ -425,28 +468,6 @@ export interface GetKnowledgeBaseResponse {
   knowledge_base: KnowledgeBaseInfo | undefined;
 }
 
-export interface GetStorageDegradationRequest {
-}
-
-export interface GetStorageDegradationResponse {
-  /**
-   * known=false means this node cannot judge: it is not the control leader, or no
-   * heartbeat has arrived yet. It is neither healthy nor unavailable, and a caller MUST
-   * allow the write: the verdict is soft state, so a leadership change must not become
-   * a write outage.
-   */
-  known: boolean;
-  /** degraded: fewer than a quorum of the required replicas are live, but someone answers. */
-  degraded: boolean;
-  /**
-   * storage_unavailable: not one required replica is live. Exclusive with degraded, so
-   * the two refusals (kb_storage_degraded, storage_unavailable) stay distinguishable.
-   */
-  storage_unavailable: boolean;
-  /** detail is the diagnosis a refusal carries. Empty when known is false. */
-  detail: string;
-}
-
 export interface KnowledgeBaseService {
   CreateKnowledgeBase(request: CreateKnowledgeBaseRequest): Promise<CreateKnowledgeBaseResponse>;
   DeleteKnowledgeBase(request: DeleteKnowledgeBaseRequest): Promise<DeleteKnowledgeBaseResponse>;
@@ -455,7 +476,7 @@ export interface KnowledgeBaseService {
   /**
    * AwaitVersion waits for a version to reach a target state. It reports the
    * version's current stage instead of failing when the target has not been
-   * reached yet ("not yet" is not an error — docs/await-version-plan.md §5).
+   * reached yet ("not yet" is not an error — docs/已实施/await-version-plan.md §5).
    *
    * It is a READ: it holds no state, may be repeated, run concurrently, and
    * sent to any control node, so a caller that reconnects or moves does not
@@ -466,7 +487,7 @@ export interface KnowledgeBaseService {
   DeleteVersion(request: DeleteVersionRequest): Promise<DeleteVersionResponse>;
   /**
    * DiscardVersion is the CALLER's declaration that it is abandoning a version
-   * whose write never landed (docs/await-version-plan.md §5 contract 7, §7
+   * whose write never landed (docs/已实施/await-version-plan.md §5 contract 7, §7
    * Step 6). It is not DeleteVersion under another name: discarding has no data
    * to reclaim and no children to rewire — removing the metadata is the whole
    * operation.

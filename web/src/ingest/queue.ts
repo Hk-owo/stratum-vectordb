@@ -32,6 +32,8 @@ export interface QueueItem {
   /** 本地唯一键 = doc_id（它本来就是"文档身份"）。 */
   docId: string
   file: File
+  /** 操作类型：默认 UPDATE（覆盖/新增）；DELETE 表示从知识库删除该 doc_id。 */
+  op?: 'UPDATE' | 'DELETE'
   status: QueueStatus
   /** 解析出的全文；未解析时为 ''。 */
   content: string
@@ -50,13 +52,17 @@ export type SubmittedDigests = Record<string, string>
 
 const DIGEST_KEY = 'stratum:submitted-digests'
 
+function digestKey(kbId?: string): string {
+  return kbId === undefined || kbId === '' ? DIGEST_KEY : `${DIGEST_KEY}:${kbId}`
+}
+
 /**
- * 读物化记录。localStorage 够用：它只存 doc_id → 一个 64 字符的哈希，
+ * 读物化记录（按知识库隔离）。localStorage 够用：它只存 doc_id → 一个 64 字符的哈希，
  * 几千个文档也就几百 KB，且读是同步的（队列渲染时每项都要查一次）。
  */
-export function loadDigests(): SubmittedDigests {
+export function loadDigests(kbId?: string): SubmittedDigests {
   try {
-    const raw = localStorage.getItem(DIGEST_KEY)
+    const raw = localStorage.getItem(digestKey(kbId))
     return raw === null ? {} : (JSON.parse(raw) as SubmittedDigests)
   } catch {
     // 读不出来就当作"没有记录"：后果只是可能多提交一次内容没变的批次
@@ -65,9 +71,9 @@ export function loadDigests(): SubmittedDigests {
   }
 }
 
-export function saveDigests(d: SubmittedDigests): void {
+export function saveDigests(d: SubmittedDigests, kbId?: string): void {
   try {
-    localStorage.setItem(DIGEST_KEY, JSON.stringify(d))
+    localStorage.setItem(digestKey(kbId), JSON.stringify(d))
   } catch {
     // 写不进去（配额/隐私模式）不影响本次提交，只影响下次的去重。不拦。
   }

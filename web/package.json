@@ -11,7 +11,7 @@
     "desktop": "tauri",
     "desktop:dev": "tauri dev",
     "desktop:build": "tauri build",
-    "gen:api": "protoc --plugin=protoc-gen-ts_proto=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/api/gen --ts_proto_opt=useJsonWireFormat=true,snakeToCamel=false,forceLong=string,onlyTypes=true,esModuleInterop=true -I ../api/proto query.proto knowledgebase.proto admin.proto"
+    "gen:api": "protoc --plugin=protoc-gen-ts_proto=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/api/gen --ts_proto_opt=useJsonWireFormat=true,snakeToCamel=false,forceLong=string,onlyTypes=true,esModuleInterop=true -I ../api/proto query.proto knowledgebase.proto admin.proto storage_admin.proto"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.103.1",

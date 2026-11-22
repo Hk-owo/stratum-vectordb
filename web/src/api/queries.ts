@@ -38,12 +38,22 @@ import type {
   ForceRetryVersionRequest,
   ForceRetryVersionResponse,
 } from './gen/admin'
+import type { GetStorageDirectoryResponse } from './gen/internal'
 import type { QueryRequest, QueryResponse } from './gen/query'
+import type {
+  CancelStorageMigrationRequest,
+  DrainStorageNodeRequest,
+  ManageStorageNodeRequest,
+  MigrateStorageKBRequest,
+  RegisterStorageNodesRequest,
+  StorageAdminResult,
+} from './gen/storage_admin'
 
 /** 按实体+参数组织，以便 invalidate 精确命中。 */
 export const qk = {
   health: ['health'] as const,
   systemStatus: ['system-status'] as const,
+  storageDirectory: ['storage-directory'] as const,
   knowledgeBases: ['knowledge-bases'] as const,
   knowledgeBase: (kbId: string) => ['knowledge-bases', kbId] as const,
   versions: (kbId: string) => ['knowledge-bases', kbId, 'versions'] as const,
@@ -66,10 +76,20 @@ export function useHealth(refetchIntervalMs?: number) {
   })
 }
 
-export function useSystemStatus() {
+export function useSystemStatus(refetchIntervalMs?: number) {
   return useQuery({
     queryKey: qk.systemStatus,
     queryFn: () => api.get<GetSystemStatusResponse>('/api/system-status'),
+    refetchInterval: refetchIntervalMs,
+  })
+}
+
+export function useStorageDirectory(enabled = true) {
+  return useQuery({
+    queryKey: qk.storageDirectory,
+    queryFn: () => api.get<GetStorageDirectoryResponse>('/api/storage/directory'),
+    enabled,
+    retry: false,
   })
 }
 
@@ -115,9 +135,11 @@ export function useDeleteKnowledgeBase() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (req: DeleteKnowledgeBaseRequest) =>
-      api.post<DeleteKnowledgeBaseResponse>('/api/knowledge-bases/delete', req),
-    onSuccess: () => {
+      api.del<DeleteKnowledgeBaseResponse>(kbPath(req.knowledge_base_id)),
+    onSuccess: (_resp, req) => {
       void qc.invalidateQueries({ queryKey: qk.knowledgeBases })
+      void qc.removeQueries({ queryKey: qk.knowledgeBase(req.knowledge_base_id) })
+      void qc.removeQueries({ queryKey: qk.versions(req.knowledge_base_id) })
     },
   })
 }
@@ -148,9 +170,10 @@ export function useRollbackVersion(kbId: string) {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (req: RollbackVersionRequest) =>
-      api.post<RollbackVersionResponse>(kbPath(kbId, '/rollback'), req),
+      api.post<RollbackVersionResponse>(kbPath(kbId, '/activate'), req),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.knowledgeBase(kbId) })
+      void qc.invalidateQueries({ queryKey: qk.versions(kbId) })
     },
   })
 }
@@ -159,8 +182,12 @@ export function useRollbackVersion(kbId: string) {
 export function useDeleteVersion(kbId: string) {
   const qc = useQueryClient()
   return useMutation({
-    mutationFn: (req: DeleteVersionRequest) =>
-      api.post<DeleteVersionResponse>(kbPath(kbId, '/delete-version'), req),
+    mutationFn: (req: DeleteVersionRequest) => {
+      const mode = req.mode ?? 'VERSION_DELETE_MODE_SUBTREE'
+      return api.del<DeleteVersionResponse>(
+        kbPath(kbId, `/versions/${encodeURIComponent(req.version_id)}?mode=${encodeURIComponent(mode)}`),
+      )
+    },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.versions(kbId) })
     },
@@ -300,4 +327,70 @@ export function awaitVersionOnce(
   req: AwaitVersionRequest,
 ): Promise<AwaitVersionResponse> {
   return api.post<AwaitVersionResponse>(kbPath(kbId, '/await'), req)
+}
+
+// ---------------------------------------------------------------- 存储拓扑运维（StorageAdminService）
+
+export function useRegisterStorageNodes() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (req: RegisterStorageNodesRequest) =>
+      api.post<StorageAdminResult>('/api/storage/nodes/register', req),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.storageDirectory })
+    },
+  })
+}
+
+export function useManageStorageNode() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (req: ManageStorageNodeRequest) =>
+      api.post<StorageAdminResult>(
+        `/api/storage/nodes/${encodeURIComponent(req.node_id)}/manage`,
+        req,
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.storageDirectory })
+    },
+  })
+}
+
+export function useDrainStorageNode() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (req: DrainStorageNodeRequest) =>
+      api.post<StorageAdminResult>(
+        `/api/storage/nodes/${encodeURIComponent(req.node_id)}/drain`,
+        req,
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.storageDirectory })
+    },
+  })
+}
+
+export function useMigrateKB() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (req: MigrateStorageKBRequest) =>
+      api.post<StorageAdminResult>('/api/storage/migrations', req),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.storageDirectory })
+    },
+  })
+}
+
+export function useCancelMigration() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (req: CancelStorageMigrationRequest) =>
+      api.post<StorageAdminResult>(
+        `/api/storage/migrations/${encodeURIComponent(req.operation_id)}/cancel`,
+        req,
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.storageDirectory })
+    },
+  })
 }

@@ -142,7 +142,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
             {testing ? '测试中…' : '测试连接'}
           </button>
           <button type="button" disabled={!editable || url.trim() === ''} onClick={() => void save()}>
-            保存
+            {editable ? '保存' : '保存（仅桌面端）'}
           </button>
           <button type="button" onClick={onClose}>
             关闭

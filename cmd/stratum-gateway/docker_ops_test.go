@@ -227,9 +227,22 @@ func TestOpsDockerDisabled(t *testing.T) {
 	m.mu.Lock()
 	m.cfg.Docker.Enabled = false
 	m.mu.Unlock()
+
 	code, body := doOps(t, srv.URL+"/ops/docker/status", "GET", nil)
 	if code != http.StatusBadRequest {
-		t.Errorf("disabled: code=%d body=%v, want 400", code, body)
+		t.Errorf("disabled status: code=%d body=%v, want 400", code, body)
+	}
+	if body["code"] != "DOCKER_DISABLED" {
+		t.Errorf("disabled status code field = %v, want DOCKER_DISABLED", body["code"])
+	}
+
+	// GET /ops/docker/config 即使在禁用时也应返回 200，方便前端直接渲染开关和配置
+	code, cfgBody := doOps(t, srv.URL+"/ops/docker/config", "GET", nil)
+	if code != http.StatusOK {
+		t.Fatalf("disabled config: code=%d body=%v, want 200", code, cfgBody)
+	}
+	if cfgBody["enabled"] != false {
+		t.Errorf("disabled config enabled = %v, want false", cfgBody["enabled"])
 	}
 }
 
