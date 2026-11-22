@@ -27,6 +27,17 @@ ignore:
   # integration 包没有非测试源文件，它的 profile 是 [no statements]：该目录下任何改动
   # 都没有覆盖数据可言，与上一条同一个理由。
   - "integration/**"
+  # 示例 CLI 与纯入口/进程装配层：单测不拉起真实节点/路由进程，这部分由 T4 Docker
+  # 集成测试覆盖（Go 覆盖率剖面里恒为 0%）。保留 cmd/stratum 下的 config/recovery/
+  # dispatch/topology/metrics/control_admin 等可单测逻辑。
+  - "examples/**"
+  - "cmd/stratum-router/**"
+  - "cmd/stratum/main.go"
+  - "cmd/stratum/assembly_*.go"
+  - "cmd/stratum/grpc_wiring.go"
+  - "cmd/stratum/dataplane_wiring.go"
+  - "cmd/stratum/lifecycle.go"
+  - "cmd/stratum/storage_stack.go"
 
 coverage:
   status:
@@ -37,15 +48,15 @@ coverage:
         threshold: 1%
         informational: false
     patch:
-      # 跟随项目覆盖率（ignore 之后的口径），不给"本提交新增的手写代码"留低于
-      # 项目均值的口子。
+      # 排除入口/装配层后项目基线约 75–76%；patch 门禁定在 70%，避免大重构或
+      # 多错误路径改动因接近基线的几百分点波动被误杀，同时约束新增业务逻辑有测试覆盖。
       default:
-        target: auto
+        target: 70%
         threshold: 0%
         informational: false
-        # 把"不产生覆盖数据"的路径从 patch 门禁里排掉。
+        # 把"不产生覆盖数据"与"纯入口/进程装配"的路径从 patch 门禁里排掉。
         #
-        # 注意这两条必须写在这里，而不只是写在 ignore 里：ignore 是"解析上传报告时排除
+        # 注意前两条必须写在这里，而不只是写在 ignore 里：ignore 是"解析上传报告时排除
         # 路径"，而 Go 的 coverage.out 里**本来就没有** *_test.go —— 报告里没有的东西，
         # ignore 排不掉，Codecov 仍会按 git diff 把它们算成"新增 0% 覆盖"。实测：
         # e7e6123 只改了 integration/e2e_test.go，codecov/patch 报 0.00% of diff hit
@@ -53,6 +64,14 @@ coverage:
         paths:
           - "!**/*_test.go"
           - "!integration/**"
+          - "!examples/**"
+          - "!cmd/stratum-router/**"
+          - "!cmd/stratum/main.go"
+          - "!cmd/stratum/assembly_*.go"
+          - "!cmd/stratum/grpc_wiring.go"
+          - "!cmd/stratum/dataplane_wiring.go"
+          - "!cmd/stratum/lifecycle.go"
+          - "!cmd/stratum/storage_stack.go"
 
 comment:
   layout: "reach, diff, files"

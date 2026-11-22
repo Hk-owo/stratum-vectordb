@@ -8,6 +8,7 @@ import (
 	"time"
 
 	stratumerrors "stratum/internal/errors"
+	"stratum/internal/storage"
 	"stratum/internal/types"
 	"stratum/internal/wal"
 )
@@ -396,5 +397,169 @@ func mustUpdateStatusImpl(t *testing.T, impl *RaftNodeImpl, versionID int64, sta
 	}
 	if err := impl.ProposeUpdateVersionStatus(proposeCtx(t), versionID, status, 0); err != nil {
 		t.Fatalf("ProposeUpdateVersionStatus(%d, %v): %v", versionID, status, err)
+	}
+}
+
+func TestRaftNodeImpl_StorageAndVersionHelpers(t *testing.T) {
+	ctx := proposeCtx(t)
+	impl, _ := newTestRaftNodeImpl(t)
+
+	// StorageDirectoryRevision, ProposeAssignKBPlacement, migration stage/install/serve/activate,
+	// cleanup ack, node manage/drain, and service block/resume.
+	if err := impl.ProposeCreateKB(ctx, types.KnowledgeBaseMeta{KBID: "kb-init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := impl.ProposeRegisterStorageNodes(ctx, 0, directoryTestNodes); err != nil {
+		t.Fatal(err)
+	}
+	rev0 := impl.StorageDirectoryRevision()
+	if rev0 == 0 {
+		t.Fatal("expected non-zero StorageDirectoryRevision after node registration")
+	}
+
+	if err := impl.ProposeAssignKBPlacement(ctx, storage.Placement{
+		KBID:             "kb-init",
+		Epoch:            1,
+		ReplicaIDs:       []int64{1, 2, 3},
+		RequiredReplicas: 3,
+		OperationID:      "init-place",
+	}); err != nil {
+		t.Fatalf("ProposeAssignKBPlacement: %v", err)
+	}
+	if err := impl.ProposeCreateKBWithPlacement(ctx, types.KnowledgeBaseMeta{KBID: "kb-mig"}, []int64{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	op := "mig-op-1"
+	if err := impl.ProposeBeginKBMigration(ctx, storage.MigrationRequest{
+		OperationID:   op,
+		KBID:          "kb-mig",
+		ExpectedEpoch: 1,
+		FromID:        2,
+		ToID:          3,
+	}); err != nil {
+		t.Fatalf("ProposeBeginKBMigration: %v", err)
+	}
+	if err := impl.ProposeFenceKBMigration(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	for _, nid := range []int64{1, 2, 3} {
+		if err := impl.ProposeAckKBMigrationFence(ctx, op, 1, nid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest, err := storage.BuildMigrationManifest("kb-mig", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageReceipt := storage.MigrationStageReceipt{
+		SourceID:     1,
+		TargetID:     3,
+		ManifestHash: manifest.Hash(),
+		PayloadHash:  types.EmptyDocIDSetHash,
+		Bytes:        64,
+	}
+	if err := impl.ProposeRecordKBMigrationStage(ctx, op, stageReceipt); err != nil {
+		t.Fatalf("ProposeRecordKBMigrationStage: %v", err)
+	}
+	installReceipt := storage.MigrationInstallReceipt{
+		SourceID:     1,
+		TargetID:     3,
+		ManifestHash: manifest.Hash(),
+		StageHash:    stageReceipt.PayloadHash,
+	}
+	if err := impl.ProposeRecordKBMigrationInstall(ctx, op, installReceipt); err != nil {
+		t.Fatalf("ProposeRecordKBMigrationInstall: %v", err)
+	}
+	serveReceipt := storage.MigrationServeReceipt{
+		TargetID:     3,
+		ManifestHash: manifest.Hash(),
+		IndexReady:   true,
+	}
+	if err := impl.ProposeRecordKBMigrationServe(ctx, op, serveReceipt); err != nil {
+		t.Fatalf("ProposeRecordKBMigrationServe: %v", err)
+	}
+	if err := impl.ProposeActivateKBMigration(ctx, op, storage.MigrationActivation{
+		Epoch:   1,
+		Install: installReceipt,
+		Serve:   serveReceipt,
+	}); err != nil {
+		t.Fatalf("ProposeActivateKBMigration: %v", err)
+	}
+	dirAfterAct, err := impl.StorageDirectory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for cid, c := range dirAfterAct.Cleanups {
+		if c.KBID == "kb-mig" {
+			if err := impl.ProposeAckStorageCleanup(ctx, cid); err != nil {
+				t.Fatalf("ProposeAckStorageCleanup(%s): %v", cid, err)
+			}
+		}
+	}
+
+	rev := impl.StorageDirectoryRevision()
+	if err := impl.ProposeRegisterStorageNodes(ctx, rev, append(append([]storage.Node(nil), directoryTestNodes...), storage.Node{ID: 4, Addr: "s4"})); err != nil {
+		t.Fatal(err)
+	}
+	rev = impl.StorageDirectoryRevision()
+	if err := impl.ProposeBlockStorageService(ctx, storage.ServiceRequest{NodeID: 3, ExpectedRevision: rev, OperationID: "svc-op"}); err != nil {
+		t.Fatalf("ProposeBlockStorageService: %v", err)
+	}
+	dir, err := impl.StorageDirectory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := impl.ProposeResumeStorageService(ctx, storage.ServiceRequest{
+		NodeID:           3,
+		ExpectedRevision: dir.Revision,
+		OperationID:      "svc-op",
+		BlockRevision:    dir.ServiceBlocks[3].Revision,
+	}); err != nil {
+		t.Fatalf("ProposeResumeStorageService: %v", err)
+	}
+	rev = impl.StorageDirectoryRevision()
+	if err := impl.ProposeManageStorageNode(ctx, storage.NodeChange{NodeID: 2, ExpectedRevision: rev, Action: "drain"}); err != nil {
+		t.Fatalf("ProposeManageStorageNode: %v", err)
+	}
+	rev = impl.StorageDirectoryRevision()
+	if err := impl.ProposeDrainStorageNode(ctx, storage.DrainRequest{OperationID: "drain-op", NodeID: 2, ExpectedRevision: rev, TargetIDs: []int64{4}}); err != nil {
+		t.Fatalf("ProposeDrainStorageNode: %v", err)
+	}
+
+	// ChainGeneration, VersionLiveness, ProposeRetryVersion, DeletingKBIDs.
+	term, seq0 := impl.ChainGeneration()
+	if term == 0 {
+		t.Fatal("expected non-zero term from ChainGeneration")
+	}
+	v1, err := impl.ProposeCreateVersion(ctx, "kb-mig", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := impl.ProposeMarkVersionFailedPermanent(ctx, "kb-mig", v1, types.FailureSideIndex, "boom", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := impl.ProposeRetryVersion(ctx, "kb-mig", v1, types.FailureSideIndex); err != nil {
+		t.Fatalf("ProposeRetryVersion: %v", err)
+	}
+	_, seq1 := impl.ChainGeneration()
+	if seq1 <= seq0 {
+		t.Fatalf("expected ChainGeneration seq to advance (%d -> %d)", seq0, seq1)
+	}
+	from := int64(0)
+	to := v1
+	alive, alloc, err := impl.VersionLiveness(ctx, "kb-mig", &from, &to)
+	if err != nil || len(alive) != 1 || alive[0] != v1 || alloc < v1 {
+		t.Fatalf("VersionLiveness = (%v, %d, %v)", alive, alloc, err)
+	}
+	if _, _, err := impl.VersionLiveness(ctx, "missing", nil, nil); !errors.Is(err, stratumerrors.ErrKnowledgeBaseNotFound) {
+		t.Fatalf("VersionLiveness missing err = %v", err)
+	}
+	if err := impl.ProposeMarkKBDeleting(ctx, "kb-mig"); err != nil {
+		t.Fatal(err)
+	}
+	delKBs, err := impl.DeletingKBIDs(ctx)
+	if err != nil || len(delKBs) != 1 || delKBs[0] != "kb-mig" {
+		t.Fatalf("DeletingKBIDs = (%v, %v)", delKBs, err)
 	}
 }

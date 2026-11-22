@@ -204,3 +204,192 @@ func TestAcquire_PooledVsDialOwnership(t *testing.T) {
 		t.Fatalf("dialed conn state after release = %v, want Shutdown", st)
 	}
 }
+
+func TestDialerAndPoolEdgeCases(t *testing.T) {
+	if DefaultDialer() == nil {
+		t.Fatal("DefaultDialer() returned nil")
+	}
+
+	d := NewDialer(DialConfig{
+		MaxCallRecvMsgSize: 4 << 20,
+		MaxCallSendMsgSize: 4 << 20,
+		DialOptions:        []grpc.DialOption{grpc.WithDefaultCallOptions()},
+	})
+	if _, err := d.Dial(""); !errors.Is(err, ErrEmptyAddr) {
+		t.Fatalf("Dial empty addr = %v, want ErrEmptyAddr", err)
+	}
+	conn, err := d.Dial("passthrough:///127.0.0.1:0", grpc.WithAuthority("test"))
+	if err != nil {
+		t.Fatalf("Dial standard non-blocking: %v", err)
+	}
+	_ = conn.Close()
+
+	var nilDialer *Dialer
+	conn, err = nilDialer.DialContext(context.Background(), "passthrough:///127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("nil Dialer.DialContext: %v", err)
+	}
+	_ = conn.Close()
+
+	// NewPool(nil) uses DefaultDialer; Close on nil pool is a no-op.
+	var nilPool *Pool
+	if err := nilPool.Close(); err != nil {
+		t.Fatalf("nil Pool.Close = %v", err)
+	}
+	nilPool.Evict("a:1")
+	if _, err := nilPool.Get("a:1"); !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("nil Pool.Get = %v, want ErrPoolClosed", err)
+	}
+
+	pDefault := NewPool(nil)
+	if _, err := pDefault.Get(""); !errors.Is(err, ErrEmptyAddr) {
+		t.Fatalf("Get empty addr = %v, want ErrEmptyAddr", err)
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := pDefault.GetContext(canceledCtx, "a:1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetContext canceled = %v, want context.Canceled", err)
+	}
+	pDefault.Evict("")
+	_ = pDefault.Close()
+}
+
+func TestPool_WaiterCancelAndInflightEvictCloseError(t *testing.T) {
+	baseDial := newBufconnDialFunc(t, nil)
+
+	// 1. Waiter cancels while dial is inflight; leader still caches conn.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	p := NewPool(NewDialer(DialConfig{
+		DialFunc: func(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+			close(started)
+			<-release
+			return baseDial(ctx, addr)
+		},
+	}))
+	defer func() { _ = p.Close() }()
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := p.Get("node-1:7000")
+		leaderDone <- err
+	}()
+	<-started
+
+	waiterCtx, cancelWaiter := context.WithCancel(context.Background())
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, err := p.GetContext(waiterCtx, "node-1:7000")
+		waiterDone <- err
+	}()
+	cancelWaiter()
+	if err := <-waiterDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiter error = %v, want context.Canceled", err)
+	}
+	close(release)
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader Get error = %v", err)
+	}
+
+	// 2. Evict while inflight drops the newly dialed conn and returns an error.
+	evictStarted := make(chan struct{})
+	evictRelease := make(chan struct{})
+	pEvict := NewPool(NewDialer(DialConfig{
+		DialFunc: func(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+			close(evictStarted)
+			<-evictRelease
+			return baseDial(ctx, addr)
+		},
+	}))
+	defer func() { _ = pEvict.Close() }()
+	evictErrCh := make(chan error, 1)
+	go func() {
+		_, err := pEvict.Get("node-2:7000")
+		evictErrCh <- err
+	}()
+	<-evictStarted
+	pEvict.Evict("node-2:7000")
+	close(evictRelease)
+	if err := <-evictErrCh; err == nil {
+		t.Fatal("expected error when Evict raced with inflight dial")
+	}
+
+	// 3. Close while inflight returns ErrPoolClosed.
+	closeStarted := make(chan struct{})
+	closeRelease := make(chan struct{})
+	pClose := NewPool(NewDialer(DialConfig{
+		DialFunc: func(ctx context.Context, addr string) (*grpc.ClientConn, error) {
+			close(closeStarted)
+			<-closeRelease
+			return baseDial(ctx, addr)
+		},
+	}))
+	closeErrCh := make(chan error, 1)
+	go func() {
+		_, err := pClose.Get("node-3:7000")
+		closeErrCh <- err
+	}()
+	<-closeStarted
+	_ = pClose.Close()
+	close(closeRelease)
+	if err := <-closeErrCh; !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("Get raced with Close = %v, want ErrPoolClosed", err)
+	}
+
+	// 4. Dial error propagates to concurrent waiter.
+	dialErr := errors.New("boom")
+	errStarted := make(chan struct{})
+	errRelease := make(chan struct{})
+	var errOnce sync.Once
+	var errDials atomic.Int64
+	pErr := NewPool(NewDialer(DialConfig{
+		DialFunc: func(context.Context, string) (*grpc.ClientConn, error) {
+			errDials.Add(1)
+			errOnce.Do(func() { close(errStarted) })
+			<-errRelease
+			return nil, dialErr
+		},
+	}))
+	defer func() { _ = pErr.Close() }()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var e1, e2 error
+	go func() { defer wg.Done(); _, e1 = pErr.Get("bad:7000") }()
+	<-errStarted
+	go func() { defer wg.Done(); _, e2 = pErr.Get("bad:7000") }()
+	// Let the second goroutine enter inflight wait before releasing DialFunc.
+	for {
+		pErr.mu.Lock()
+		_, hasInflight := pErr.inflight["bad:7000"]
+		pErr.mu.Unlock()
+		if hasInflight {
+			break
+		}
+	}
+	close(errRelease)
+	wg.Wait()
+	if !errors.Is(e1, dialErr) || !errors.Is(e2, dialErr) {
+		t.Fatalf("propagated errors = (%v, %v), want %v", e1, e2, dialErr)
+	}
+
+	// 5. Acquire unpooled and error paths.
+	if _, _, err := Acquire(context.Background(), nil, func(context.Context, string) (*grpc.ClientConn, error) {
+		return nil, dialErr
+	}, nil, "a:1"); !errors.Is(err, dialErr) {
+		t.Fatalf("Acquire dial error = %v", err)
+	}
+	if _, _, err := Acquire(context.Background(), pErr, nil, nil, ""); !errors.Is(err, ErrEmptyAddr) {
+		t.Fatalf("Acquire pool error = %v", err)
+	}
+	if _, _, err := Acquire(context.Background(), nil, nil, nil, ""); !errors.Is(err, ErrEmptyAddr) {
+		t.Fatalf("Acquire unpooled empty addr = %v", err)
+	}
+	unpooled, rel, err := Acquire(context.Background(), nil, nil, nil, "passthrough:///127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Acquire unpooled default dialer: %v", err)
+	}
+	rel()
+	if st := unpooled.GetState(); st != connectivity.Shutdown {
+		t.Fatalf("unpooled conn after release = %v, want Shutdown", st)
+	}
+}

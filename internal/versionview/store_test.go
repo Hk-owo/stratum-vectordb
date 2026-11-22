@@ -354,3 +354,53 @@ func TestStore_LegacyChunkDocMapperFallbackAndConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestStore_WarmNormalizeAndNoDiskPaths(t *testing.T) {
+	ctx := context.Background()
+	// Memory-only store (empty DataDir).
+	memStore := versionview.NewStore(versionview.Config{MaxEntries: 4})
+	if err := memStore.Warm("kb-m", 1, nil, nil); err != nil {
+		t.Fatalf("Warm empty: %v", err)
+	}
+	// Duplicate sorted docIDs + empty/out-of-range postings are normalized cleanly.
+	if err := memStore.Warm("kb-m", 2, []string{"a", "a", "b"}, map[string][]uint32{
+		"empty": nil,
+		"oob":   {99},
+		"c1":    {2, 0, 1},
+	}); err != nil {
+		t.Fatalf("Warm duplicate docIDs: %v", err)
+	}
+	wantHash := stratinternalsync.ComputeDocIDSetHash([]string{"a", "b"})
+	v, src, err := memStore.Lookup(ctx, "kb-m", 2, wantHash)
+	if err != nil || src != versionview.HitL0 {
+		t.Fatalf("Lookup = (%s, %v)", src, err)
+	}
+	if !reflect.DeepEqual(v.DocIDs, []string{"a", "b"}) || !reflect.DeepEqual(v.ChunkToDocs["c1"], []uint32{0, 1}) {
+		t.Fatalf("normalized view = %+v", v)
+	}
+	if _, ok := v.ChunkToDocs["empty"]; ok {
+		t.Fatal("expected empty chunk entry to be dropped")
+	}
+	if _, ok := v.ChunkToDocs["oob"]; ok {
+		t.Fatal("expected out-of-range chunk entry to be dropped")
+	}
+
+	if err := memStore.DeleteVersion("kb-m", 2); err != nil {
+		t.Fatalf("memStore.DeleteVersion: %v", err)
+	}
+	if err := memStore.DeleteKB("kb-m"); err != nil {
+		t.Fatalf("memStore.DeleteKB: %v", err)
+	}
+	if err := memStore.DeleteVersion("../bad", 1); err == nil {
+		t.Fatal("expected DeleteVersion invalid kbID error")
+	}
+
+	// Disk store: DeleteVersion on non-existent file is idempotent.
+	diskStore := versionview.NewStore(versionview.Config{DataDir: t.TempDir()})
+	if err := diskStore.DeleteVersion("kb-missing", 42); err != nil {
+		t.Fatalf("DeleteVersion missing file: %v", err)
+	}
+	if err := diskStore.Warm("../bad", 1, []string{"a"}, nil); err == nil {
+		t.Fatal("expected Warm invalid kbID error")
+	}
+}
